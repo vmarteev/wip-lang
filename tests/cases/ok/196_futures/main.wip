@@ -1,0 +1,92 @@
+// Work on another thread: futures that run at once and
+// hand their values back, a stream of owned values over a channel read as
+// a loop, a future polled until it is there, two senders to one queue, a
+// sender sent through a channel, one sending after its receiver is gone,
+// and a future dropped without being asked, which waits for its thread.
+// The case runs with the leak check on.
+
+import std::io
+import std::future::{Future, channel, Sender, Received}
+
+fn slowSum(from: i64, to: i64): i64 = {
+    var total = 0
+    for i in from..to { total += i % 7 }
+    total
+}
+
+fn main() = {
+    // Several at once, each with what it was given.
+    var futures: Vec<Future<i64>> = Vec()
+    for part in 0..8 {
+        futures.push(Future::run(own () => slowSum(part * 1000000, (part + 1) * 1000000)))
+    }
+    var total = 0
+    while futures.pop() is .Some(f) {
+        total += f.get()
+    }
+    assert(total == slowSum(0, 8000000))
+
+    // A stream of owned values, read as a loop.
+    val (tx, rx) = channel<String>()
+    val producer = Future::run(own () => {
+        for i in 0..100 {
+            tx.send("line \(i)")
+        }
+        100
+    })
+    var count = 0
+    var last = String()
+    for line in move rx {
+        count += 1
+        last = move line
+    }
+    assert(count == 100)
+    assert(last == "line 99")
+    assert(producer.get() == 100)
+
+    // Polled until it is there.
+    var waited = Future::run(own () => slowSum(0, 3000000))
+    var polls = 0
+    var answer = -1
+    while answer < 0 {
+        match waited.poll() {
+            .Some(v) => answer = v
+            .None => polls += 1
+        }
+    }
+    assert(waited.isDone())
+    assert(answer == slowSum(0, 3000000))
+
+    // Two senders; the queue closes when both are gone.
+    val (a, results) = channel<i64>()
+    val b = a.another()
+    val first = Future::run(own () => { a.send(1); 0 })
+    val second = Future::run(own () => { b.send(2); 0 })
+    first.get()
+    second.get()
+    var sum = 0
+    for n in move results { sum += n }
+    assert(sum == 3)
+
+    // A sender sent through a channel, and one sending after its receiver
+    // is gone: nothing leaks.
+    val (outer, inner) = channel<Sender<String>>()
+    val (words, heard) = channel<String>()
+    outer.send(move words)
+    match inner.tryReceive() {
+        .Value(sender) => sender.send(String::of("passed on"))
+        _ => assert(false, "the sender came through")
+    }
+    assert(heard.receive() == .Some(String::of("passed on")))
+    val (orphan, gone) = channel<String>()
+    destroy(move gone)
+    orphan.send(String::of("nobody hears this"))
+
+    // Work that answers nothing: a `Future<void>`, whose `get` only waits.
+    val quiet = Future::run(own () => io::println("from a thread"))
+    quiet.get()
+
+    // Dropped without being asked: it waits for its thread.
+    val ignored = Future::run(own () => slowSum(0, 1000000))
+    io::println("done")
+}

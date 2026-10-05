@@ -1,0 +1,516 @@
+// Starting another program. A `Command` names a program,
+// its arguments and what it changes of the environment; no shell reads
+// them, so each argument is one argument of the program, whatever it
+// holds. A program is run and waited for, run for what it prints, started
+// and kept — and waited for where it is dropped — or launched and let go.
+//
+// It is started by `posix_spawnp`, which finds it on `PATH`, and waited
+// for by `waitpid`, over `std::libc`.
+
+import std::io
+import std::libc::{EAGAIN, ENOMEM, EINTR, F_SETFL, Hidden, O_NONBLOCK, O_RDONLY, O_WRONLY, POLLIN, POLLOUT, PollFd, Pipe, SIGKILL, SIGPIPE, SIG_BLOCK, SIG_SETMASK, WNOHANG, calloc, close, environ, errno, errnoAt, fcntl, free, hidden, kill, malloc, pipe, poll, posix_spawn_file_actions_addchdir_np, posix_spawn_file_actions_addclose, posix_spawn_file_actions_adddup2, posix_spawn_file_actions_addopen, posix_spawn_file_actions_destroy, posix_spawn_file_actions_init, posix_spawnp, pthread_create, pthread_detach, pthread_sigmask, read, sigaddset, sigemptyset, sigismember, sigpending, sigwait, waitpid, write}
+
+/// A program to start: its name, found on `PATH` where it has no `/`, its
+/// arguments, the variables it sets in the environment it is given, the
+/// directory it starts in, and the text its standard input reads, where it
+/// is given one.
+pub struct Command {
+	program: String
+	arguments: Vec<String>
+	sets: Vec<String>
+	place: String
+	given: Option<String> = .None
+}
+
+/// How a program ended: the code it exited with, or the signal that ended
+/// it.
+@derive(Eq)
+pub enum Exit {
+	Code(code: i64)
+	Signal(signal: i64)
+}
+
+/// What a program printed, and how it ended.
+pub struct Output {
+	/// How it ended.
+	pub exit: Exit
+	/// What it wrote on its standard output.
+	pub stdout: String
+	/// What it wrote on its standard error.
+	pub stderr: String
+}
+
+/// A program started and kept. Where it is dropped, it is waited for.
+pub struct Child {
+	pid: i64
+	finished: bool = false
+}
+
+extend Exit {
+	/// Whether it ended well: with code 0.
+	pub fn success(): bool = self == .Code(0)
+}
+
+extend Exit: Text {
+	fn toString(): String = match self {
+		.Code(code) => "exited with \(code)"
+		.Signal(signal) => "ended by signal \(signal)"
+	}
+}
+
+extend Command {
+	/// The program named `program`, with no arguments yet.
+	pub static fn of(program: str): Command = Command(
+		program: String::of(program),
+		arguments: Vec(),
+		sets: Vec(),
+		place: String(),
+	)
+
+	/// One more argument, as it is: no shell reads it.
+	pub move fn arg(argument: str): Command = {
+		var command = move self
+		command.arguments.push(String::of(argument))
+		return move command
+	}
+
+	/// More arguments, each as it is.
+	pub move fn args(arguments: &[str]): Command = {
+		var command = move self
+		for argument in arguments {
+			command.arguments.push(String::of(argument))
+		}
+		return move command
+	}
+
+	/// A variable of the environment it is given, in place of this
+	/// program's where it has one of that name.
+	pub move fn env(name: str, value: str): Command = {
+		var command = move self
+		command.sets.push("\(name)=\(value)")
+		return move command
+	}
+
+	/// The directory it starts in; otherwise, this program's.
+	pub move fn directory(path: str): Command = {
+		var command = move self
+		command.place = String::of(path)
+		return move command
+	}
+
+	/// The text its standard input reads, which ends where the text does:
+	/// written by `output()` while it reads what the program prints, and by
+	/// `run()` before it waits. `start()` and `launch()` give it none.
+	pub move fn input(text: str): Command = {
+		var command = move self
+		command.given = .Some(String::of(text))
+		return move command
+	}
+
+	/// Starts it with this program's terminal, and waits for it.
+	pub fn run(): Result<Exit, io::IoError> = {
+		var (pid, _, _, input) = self.spawn(0, self.given.isSome())?
+		if self.given is .Some(text) {
+			var written = 0
+			val held = holdPipeSignal()
+			while input >= 0 {
+				writeSome(&var input, text.toStr(), &var written)
+			}
+			releasePipeSignal(&held)
+		}
+		return waitFor(pid)
+	}
+
+	/// Starts it with its standard output and errors read into `String`s,
+	/// both at once, and waits for it. Its standard input reads what
+	/// `input` gave it, written as the program reads it, or nothing.
+	pub fn output(): Result<Output, io::IoError> = {
+		var (pid, output, errors, input) = self.spawn(2, self.given.isSome())?
+		val text = match self.given {
+			.Some(text) => text.toStr()
+			.None => ""
+		}
+		var written = 0
+		var held = hidden()
+		// Whether there is an input to write, which the loop closes.
+		val writes = input >= 0
+		if writes {
+			// The input's end does not wait for room, so that a program
+			// that writes while it reads is read from in the meantime.
+			fcntl(input as c_int, F_SETFL, O_NONBLOCK)
+			held = holdPipeSignal()
+		}
+		var stdout = String()
+		var stderr = String()
+		var buffer = own [0 as u8; 65536]
+		var which = 0
+		while true {
+			val got = readOrWrite(
+				&var output,
+				&var errors,
+				&var input,
+				text,
+				&var written,
+				&var buffer,
+				&var which,
+			)
+			if got <= 0 then break
+			val read = str::fromBytes(&buffer[0..got])
+			if which == 1 then stdout.push(read) else stderr.push(read)
+		}
+		if writes then releasePipeSignal(&held)
+		val exit = waitFor(pid)?
+		return .Ok(Output(exit: exit, stdout: move stdout, stderr: move stderr))
+	}
+
+	/// Starts it with this program's terminal, and goes on.
+	pub fn start(): Result<Child, io::IoError> = {
+		val (pid, _, _, _) = self.spawn(0, false)?
+		return .Ok(Child(pid: pid))
+	}
+
+	/// Starts it with its streams reading and writing nothing, and lets it
+	/// go: it runs on, after this program too, and a thread of its own
+	/// waits for it, so that nothing is left behind.
+	pub fn launch(): Result<void, io::IoError> = {
+		val (pid, _, _, _) = self.spawn(1, false)?
+		letGo(pid)
+		return .Ok()
+	}
+
+	/// Starts it: 0 with this program's streams, 1 with none, 2 with its
+	/// output and errors in pipes; and where `fed`, its standard input a
+	/// pipe too. The child, the reading ends of its output's pipes, and the
+	/// writing end of its input's, each -1 where there is none.
+	fn spawn(mode: i64, fed: bool): Result<(i64, i64, i64, i64), io::IoError> = {
+		var program = String::of(self.program.toStr())
+		var arguments: Vec<String> = Vec()
+		for argument in self.arguments {
+			arguments.push(String::of(argument.toStr()))
+		}
+		var sets: Vec<String> = Vec()
+		for set in self.sets {
+			sets.push(String::of(set.toStr()))
+		}
+		var place = String::of(self.place.toStr())
+		// The lists C takes: the program's name first, then its arguments;
+		// this program's environment with what the command sets in place.
+		// Each ends with a null, which `calloc` has put there already, and
+		// points into the strings above, which outlive the call.
+		val argv = calloc((arguments.len() + 2) as size_t, 8 as size_t) as ptr<cstring>
+		val envp = environment(&var sets)
+		if argv.isNull || envp.isNull {
+			free(argv as ptr<u8>)
+			free(envp as ptr<u8>)
+			return .Err(io::IoError::Other(ENOMEM))
+		}
+		argv[0] = program.toCstring()
+		for i in 0..arguments.len() {
+			argv[i + 1] = arguments[i].toCstring()
+		}
+		var actions = hidden()
+		posix_spawn_file_actions_init(&var actions)
+		var output = Pipe(reading: -1, writing: -1)
+		var errors = Pipe(reading: -1, writing: -1)
+		var input = Pipe(reading: -1, writing: -1)
+		if fed {
+			if pipe(&var input) != 0 {
+				val failed = io::lastError()
+				posix_spawn_file_actions_destroy(&var actions)
+				free(argv as ptr<u8>)
+				free(envp as ptr<u8>)
+				return .Err(failed)
+			}
+			posix_spawn_file_actions_adddup2(&var actions, input.reading, 0)
+			posix_spawn_file_actions_addclose(&var actions, input.reading)
+			posix_spawn_file_actions_addclose(&var actions, input.writing)
+		} else if mode == 1 || mode == 2 {
+			posix_spawn_file_actions_addopen(&var actions, 0, "/dev/null", O_RDONLY, 0)
+		}
+		if mode == 1 {
+			posix_spawn_file_actions_addopen(&var actions, 1, "/dev/null", O_WRONLY, 0)
+			posix_spawn_file_actions_addopen(&var actions, 2, "/dev/null", O_WRONLY, 0)
+		}
+		if mode == 2 {
+			if pipe(&var output) != 0 || pipe(&var errors) != 0 {
+				val failed = io::lastError()
+				closeEnd(output.reading)
+				closeEnd(output.writing)
+				closeEnd(input.reading)
+				closeEnd(input.writing)
+				posix_spawn_file_actions_destroy(&var actions)
+				free(argv as ptr<u8>)
+				free(envp as ptr<u8>)
+				return .Err(failed)
+			}
+			posix_spawn_file_actions_adddup2(&var actions, output.writing, 1)
+			posix_spawn_file_actions_adddup2(&var actions, errors.writing, 2)
+			posix_spawn_file_actions_addclose(&var actions, output.reading)
+			posix_spawn_file_actions_addclose(&var actions, errors.reading)
+			posix_spawn_file_actions_addclose(&var actions, output.writing)
+			posix_spawn_file_actions_addclose(&var actions, errors.writing)
+		}
+		// An empty directory is this program's own.
+		if !place.isEmpty() then
+			posix_spawn_file_actions_addchdir_np(&var actions, place.toCstring())
+		var child: c_int = 0
+		val failed = posix_spawnp(&var child, program.toCstring(), &actions, null, argv, envp)
+		posix_spawn_file_actions_destroy(&var actions)
+		free(argv as ptr<u8>)
+		free(envp as ptr<u8>)
+		if mode == 2 {
+			closeEnd(output.writing)
+			closeEnd(errors.writing)
+			if failed != 0 {
+				closeEnd(output.reading)
+				closeEnd(errors.reading)
+			}
+		}
+		closeEnd(input.reading)
+		if failed != 0 {
+			closeEnd(input.writing)
+			// `posix_spawnp` answers the error rather than setting it.
+			errnoAt()[0] = failed
+			return .Err(io::lastError())
+		}
+		return .Ok(
+			(child as i64, output.reading as i64, errors.reading as i64, input.writing as i64),
+		)
+	}
+}
+
+// Reads what is there in either pipe: into `buffer`, with 1 in `which`
+// for standard output and 2 for standard error; and writes what there is
+// room for of `text` from `written` on into `input`, closing it after the
+// last byte. A pipe that ends is closed, and its number set to -1; 0 is
+// answered once both output pipes have ended, and -1 where reading
+// failed.
+fn readOrWrite(
+	output: &var i64,
+	errors: &var i64,
+	input: &var i64,
+	text: str,
+	written: &var i64,
+	buffer: &var [u8],
+	which: &var i64,
+): i64 = {
+	while true {
+		var watched = [PollFd(fd: 0, events: 0, answered: 0); 3]
+		var ends = [0; 3]
+		var count = 0
+		if input >= 0 {
+			watched[count] = PollFd(fd: input as c_int, events: POLLOUT, answered: 0)
+			ends[count] = 3
+			count += 1
+		}
+		if output >= 0 {
+			watched[count] = PollFd(fd: output as c_int, events: POLLIN, answered: 0)
+			ends[count] = 1
+			count += 1
+		}
+		if errors >= 0 {
+			watched[count] = PollFd(fd: errors as c_int, events: POLLIN, answered: 0)
+			ends[count] = 2
+			count += 1
+		}
+		if output < 0 && errors < 0 {
+			if input >= 0 {
+				closeEnd(input as c_int)
+				input = -1
+			}
+			return 0
+		}
+		if poll(&var watched[0..count], -1) < 0 {
+			if errno() == EINTR then continue
+			return -1
+		}
+		for k in 0..count {
+			if watched[k].answered == 0 then continue
+			if ends[k] == 3 {
+				writeSome(&var input, text, &var written)
+				continue
+			}
+			val end = watched[k].fd
+			val got = read(end, &var buffer) as i64
+			if got < 0 && errno() == EINTR then continue
+			if got <= 0 {
+				close(end)
+				if ends[k] == 1 then output = -1 else errors = -1
+				continue
+			}
+			which = ends[k]
+			return got
+		}
+	}
+	return 0
+}
+
+fn closeEnd(end: c_int) = {
+	if end >= 0 then close(end)
+}
+
+// Writes what the pipe takes of `text` from `written` on, and closes it
+// after the last byte, or where the program has stopped reading: then the
+// rest is dropped.
+fn writeSome(input: &var i64, text: str, written: &var i64) = {
+	if written < text.len() {
+		val wrote = write(input as c_int, &text.items()[written..text.len()]) as i64
+		if wrote > 0 then written += wrote
+		else if wrote < 0 && (errno() == EINTR || errno() == EAGAIN) then return
+		else written = text.len()
+	}
+	if written >= text.len() {
+		closeEnd(input as c_int)
+		input = -1
+	}
+}
+
+// Holds back `SIGPIPE` on this thread, which a write to a pipe no one
+// reads raises and which would end the program: the write answers `EPIPE`
+// instead. The signals held back before, to be put back.
+fn holdPipeSignal(): Hidden = {
+	var pipeSignal = hidden()
+	sigemptyset(&var pipeSignal)
+	sigaddset(&var pipeSignal, SIGPIPE)
+	var before = hidden()
+	pthread_sigmask(SIG_BLOCK, &pipeSignal, &var before)
+	return before
+}
+
+// Puts back the signals held back `before`, having taken a `SIGPIPE` the
+// writing raised, so that it is not let through afterwards.
+fn releasePipeSignal(before: &Hidden) = {
+	var pending = hidden()
+	sigemptyset(&var pending)
+	sigpending(&var pending)
+	if sigismember(&pending, SIGPIPE) == 1 && sigismember(before, SIGPIPE) != 1 {
+		var pipeSignal = hidden()
+		sigemptyset(&var pipeSignal)
+		sigaddset(&var pipeSignal, SIGPIPE)
+		var taken: c_int = 0
+		sigwait(&pipeSignal, &var taken)
+	}
+	var ignored = hidden()
+	pthread_sigmask(SIG_SETMASK, before, &var ignored)
+}
+
+// This program's environment, with each `NAME=value` of `sets` in place of
+// the variable of that name, or added: a list C takes, ended by a null,
+// or null where there was no memory for it.
+fn environment(sets: &var Vec<String>): ptr<cstring> = {
+	// `environ` is read twice over: as the strings it is, and as the
+	// pointers they are, to find the null at its end.
+	val inherited = environ
+	val words = inherited as ptr<ptr<u8>>
+	var count = 0
+	while !words[count].isNull {
+		count += 1
+	}
+	val list = calloc((count + sets.len() + 1) as size_t, 8 as size_t) as ptr<cstring>
+	if list.isNull then return list
+	var length = 0
+	while length < count {
+		list[length] = inherited[length]
+		length += 1
+	}
+	for i in 0..sets.len() {
+		val set = sets[i].toStr()
+		val name = match set.find("=") {
+			.Some(at) => set[0..at + 1]
+			.None => set
+		}
+		var j = 0
+		while j < length && !list[j].toStr().startsWith(name) {
+			j += 1
+		}
+		list[j] = sets[i].toCstring()
+		if j == length then length += 1
+	}
+	return list
+}
+
+/// Waits for a child, and says how it ended.
+fn waitFor(pid: i64): Result<Exit, io::IoError> = match waitOn(pid, true) {
+	.Ok(.Some(exit)) => .Ok(exit)
+	.Ok(.None) => .Ok(.Code(-1))
+	.Err(error) => .Err(error)
+}
+
+// How a child ended, if it has; waiting for it where `block` says to.
+fn waitOn(pid: i64, block: bool): Result<Option<Exit>, io::IoError> = {
+	var status: c_int = 0
+	var got = waitpid(pid as c_int, &var status, if block then 0 else WNOHANG)
+	while got < 0 && errno() == EINTR {
+		got = waitpid(pid as c_int, &var status, if block then 0 else WNOHANG)
+	}
+	if got < 0 then return .Err(io::lastError())
+	if got == 0 then return .Ok(.None)
+	return .Ok(.Some(exitOf(status as i64)))
+}
+
+// What `waitpid` says of how it ended: the low seven bits are the signal
+// that ended it, or 0 where it exited, with its code in the next eight.
+// The same on every system Wip targets.
+fn exitOf(status: i64): Exit = {
+	val signal = status & 127
+	return if signal == 0 then .Code((status >> 8) & 255) else .Signal(signal)
+}
+
+// Where a launched child is waited for, on a thread of its own, so that it
+// is not left a zombie; it may run on after this program has ended.
+fn reap(argument: ptr<u8>): ptr<u8> = {
+	val pid = (argument as ptr<i64>)[0]
+	free(argument)
+	var status: c_int = 0
+	while waitpid(pid as c_int, &var status, 0) < 0 && errno() == EINTR {}
+	return null
+}
+
+fn letGo(pid: i64) = {
+	val argument = malloc(8 as size_t)
+	if argument.isNull then return
+	(argument as ptr<i64>)[0] = pid
+	var thread: u64 = 0
+	var attributes = hidden()
+	// No attributes: a null would do, and this is one C reads as the
+	// defaults once `pthread_attr_init` has.
+	if pthread_create(&var thread, &attributes, reap, argument) == 0 then pthread_detach(thread)
+	else free(argument)
+}
+
+extend Child {
+	/// Its process number.
+	pub fn id(): i64 = self.pid
+
+	/// How it ended, if it has, without waiting.
+	pub var fn tryWait(): Option<Exit> = {
+		if self.finished then return .None
+		val .Ok(.Some(exit)) = waitOn(self.pid, false) else {
+			return .None
+		}
+		self.finished = true
+		return .Some(exit)
+	}
+
+	/// Waits for it, and says how it ended. Asked after `tryWait` said so
+	/// already, it has nothing more to say, and answers `.Code(-1)`.
+	pub move fn wait(): Exit = {
+		var child = move self
+		if child.finished then return .Code(-1)
+		child.finished = true
+		return waitFor(child.pid).unwrapOr(.Code(-1))
+	}
+
+	/// Ends it, as `SIGKILL` does; it is still waited for.
+	pub fn kill() = {
+		kill(self.pid as c_int, SIGKILL)
+	}
+}
+
+extend Child: Destroy {
+	/// What a program starts is part of it until it ends: a dropped child
+	/// is waited for.
+	var fn destroy() = {
+		if !self.finished then waitOn(self.pid, true)
+	}
+}

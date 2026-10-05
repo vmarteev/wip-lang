@@ -1,0 +1,163 @@
+// JSON (RFC 8259), read into a tree and written back.
+//
+// `json::parse(text)` reads a whole document into a `Json`, and a `Json`
+// interpolated, `"\(value)"`, is its JSON, compact. A number is `Int` where
+// it is written without a fraction or an exponent and fits an `i64`, so a
+// large identifier is not rounded on its way through, and `Float`
+// otherwise. An object keeps its fields in the order they are written, as
+// pairs: the objects a program reads are mostly small, and one that reads
+// a large one makes a `Map` of what it needs.
+
+/// A JSON value.
+@derive(Clone, Eq)
+pub enum Json {
+	Null
+	Bool(value: bool)
+	/// A number written without a fraction or an exponent, that fits.
+	Int(value: i64)
+	/// Any other number.
+	Float(value: f64)
+	Text(text: String)
+	Array(items: Vec<Json>)
+	/// The fields, in the order they are written.
+	Object(fields: Vec<(String, Json)>)
+}
+
+// Written compact: no white space between the parts. A float that is not a
+// number or is infinite has no JSON, and is written `null`, as JavaScript
+// writes it.
+extend Json: Text {
+	fn appendTo(out: &var String) = match self {
+		.Null => out.push("null")
+		.Bool(value) => out.pushBool(value)
+		.Int(value) => out.pushInt(value)
+		.Float(value) => writeFloat(value, &var out)
+		.Text(text) => writeString(text.toStr(), &var out)
+		.Array(items) => {
+			out.pushByte('[' as u8)
+			items.joinTo(&var out, ",")
+			out.pushByte(']' as u8)
+		}
+		.Object(fields) => {
+			out.pushByte('{' as u8)
+			fields.joinToBy(&var out, ",", (field, out) => {
+				writeString(field.0.toStr(), &var out)
+				out.pushByte(':' as u8)
+				field.1.appendTo(&var out)
+			})
+			out.pushByte('}' as u8)
+		}
+	}
+}
+
+/// A float as `"\(value)"` writes it, which reads back as the same value,
+/// with `.0` after it where it would otherwise read back
+/// as an `Int`.
+fn writeFloat(value: f64, out: &var String) = {
+	if !value.isFinite() {
+		out.push("null")
+		return
+	}
+	val start = out.len()
+	out.pushFloat(value)
+	val written = out.toStr()[start..out.len()]
+	if !written.contains(".") && !written.contains("e") then out.push(".0")
+}
+
+/// A string between quotes, with `"`, `\` and the control characters
+/// escaped: by a letter where JSON has one, and as `\u00XX` otherwise.
+fn writeString(text: str, out: &var String) = {
+	out.pushByte('"' as u8)
+	// Where the text not yet written starts: runs with nothing to escape are
+	// copied whole.
+	var from = 0
+	for i in 0..text.len() {
+		val byte = text[i]
+		if byte is b'"' | b'\\' | ..0x20 {
+			out.push(text[from..i])
+			out.pushByte('\\' as u8)
+			match byte as char {
+				'"' => out.pushByte('"' as u8)
+				'\\' => out.pushByte('\\' as u8)
+				'\n' => out.pushByte('n' as u8)
+				'\r' => out.pushByte('r' as u8)
+				'\t' => out.pushByte('t' as u8)
+				'\u{8}' => out.pushByte('b' as u8)
+				'\u{c}' => out.pushByte('f' as u8)
+				_ => {
+					out.push("u00")
+					out.pushByte(HEX_DIGITS[(byte / 16) as i64])
+					out.pushByte(HEX_DIGITS[(byte % 16) as i64])
+				}
+			}
+			from = i + 1
+		}
+	}
+	out.push(text[from..text.len()])
+	out.pushByte('"' as u8)
+}
+
+/// The digits of a byte written in hexadecimal.
+val HEX_DIGITS: str = "0123456789abcdef"
+
+/// What was wrong with a document, and where: the line and the column,
+/// each from 1, the column counted in characters.
+@derive(Eq)
+pub struct JsonError {
+	pub line: i64
+	pub column: i64
+	pub problem: Problem
+}
+
+/// What can be wrong with a document.
+@derive(Eq)
+pub enum Problem {
+	/// Where a value belongs, something that is not one, or the end.
+	ExpectedValue
+	/// A field's name that is not a string.
+	ExpectedName
+	/// A field's name with no `:` after it.
+	ExpectedColon
+	/// An element of an array followed by neither `,` nor `]`.
+	ExpectedCommaOrBracket
+	/// A field of an object followed by neither `,` nor `}`.
+	ExpectedCommaOrBrace
+	/// A string with no `"` at its end.
+	UnclosedString
+	/// A character below U+0020, which a string holds only escaped.
+	ControlInString
+	/// A `\` before what it does not escape, or a `\u` without four
+	/// hexadecimal digits.
+	BadEscape
+	/// A `\u` escape of half a UTF-16 pair, with no other half.
+	LoneSurrogate
+	/// A number not written as JSON writes one: `01`, `.5`, `1.`, `+1`.
+	BadNumber
+	/// A number beyond the largest `f64`.
+	NumberTooLarge
+	/// Arrays and objects nested deeper than `MOST_NESTED`.
+	TooDeep
+	/// Something after the value that is not white space.
+	TrailingText
+}
+
+extend JsonError: Text {
+	fn appendTo(out: &var String) = {
+		val what = match self.problem {
+			.ExpectedValue => "expected a value"
+			.ExpectedName => "expected a field's name, which is a string"
+			.ExpectedColon => "expected `:` after a field's name"
+			.ExpectedCommaOrBracket => "expected `,` or `]`"
+			.ExpectedCommaOrBrace => "expected `,` or `}`"
+			.UnclosedString => "a string is not closed"
+			.ControlInString => "a control character in a string, which must be escaped"
+			.BadEscape => "a `\\` escapes nothing JSON knows"
+			.LoneSurrogate => "a `\\u` escape is half of a UTF-16 pair"
+			.BadNumber => "a number is not written as JSON writes one"
+			.NumberTooLarge => "a number is too large for an f64"
+			.TooDeep => "arrays and objects are nested too deeply"
+			.TrailingText => "text after the value"
+		}
+		out.push("\(what), at line \(self.line), column \(self.column)")
+	}
+}

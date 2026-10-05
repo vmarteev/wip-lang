@@ -1,0 +1,520 @@
+// What C wrote, as a Wip type.
+//
+// The C compiler hands back the type as it was written — `const char *`,
+// `struct Point *`, `unsigned long` — so this reads that spelling rather
+// than parsing C. The names Wip has for C's types are fixed per target,
+// so `int` stays `c_int` rather than becoming `i32`: what
+// the header said is what the binding says.
+
+import std::collections::{Map, Set}
+
+/// A C type as the binding writes it.
+pub enum Ty {
+	/// A name Wip writes as it is: `c_int`, `f64`, `cstring`.
+	Named(name: String)
+	/// A type the header declared: a struct, a union, or one whose
+	/// contents are not known.
+	Tag(name: String)
+	Pointer(target: own<Ty>)
+	/// `const T *` and `T *` where the header says what a `T` holds: passed
+	/// as a reference, since a `ptr<T>` to a struct Wip can hold has no way
+	/// of being made.
+	Ref(target: own<Ty>, writable: bool)
+	/// A fixed array, which is a field's type rather than a parameter's.
+	Array(element: own<Ty>, length: i64)
+	/// A C function pointer: a Wip function type, which is one address
+	/// as C's is.
+	Function(params: Vec<Ty>, result: own<Ty>)
+	/// A function pointer that may be null, where C keeps one: `.None` is
+	/// the null.
+	Nullable(target: own<Ty>)
+	Void
+}
+
+extend Ty {
+	pub fn isVoid(): bool = self is .Void
+
+	/// How Wip writes it.
+	pub fn text(): String = match self {
+		.Named(name) => name.clone()
+		.Tag(name) => name.clone()
+		.Pointer(target) => "ptr<\(target.text())>"
+		.Ref(target, writable) => if writable then "&var \(target.text())" else "&\(target.text())"
+		.Array(element, length) => "[\(element.text()); \(length)]"
+		.Function(params, result) => {
+			var written: Vec<String> = Vec()
+			for i in 0..params.len() {
+				written.push("a\(i): \(params[i].text())")
+			}
+			"(\(written.join(", "))) => \(result.text())"
+		}
+		.Nullable(target) => "Option<\(target.text())>"
+		.Void => String::of("void")
+	}
+}
+
+/// The type a field or a variable of C's is: a function pointer, which C
+/// may leave null there, as an `Option` of it; any other
+/// type as it is.
+pub fn stored(ty: Ty): Ty = match ty {
+	.Function(..) => .Nullable(target: own (move ty))
+	_ => move ty
+}
+
+/// A constant the binding writes: its name, its Wip type, and its value
+/// as Wip writes it.
+pub struct Constant {
+	pub var name: String
+	pub var ty: String
+	pub var value: String
+}
+
+/// An enumerator of a C enum, which is a `c_int`.
+pub fn enumerator(name: str, value: i64): Constant = Constant(
+	name: String::of(name),
+	ty: String::of("c_int"),
+	value: "\(value)",
+)
+
+/// C's scalar spellings, and the name Wip has for each.
+val SCALARS: [(str, str); 36] = [
+	("void", "void"),
+	("_Bool", "bool"),
+	("bool", "bool"),
+	("char", "c_char"),
+	("signed char", "c_schar"),
+	("unsigned char", "c_uchar"),
+	("short", "c_short"),
+	("short int", "c_short"),
+	("unsigned short", "c_ushort"),
+	("unsigned short int", "c_ushort"),
+	("int", "c_int"),
+	("signed int", "c_int"),
+	("unsigned", "c_uint"),
+	("unsigned int", "c_uint"),
+	("long", "c_long"),
+	("long int", "c_long"),
+	("unsigned long", "c_ulong"),
+	("unsigned long int", "c_ulong"),
+	("long long", "c_longlong"),
+	("long long int", "c_longlong"),
+	("unsigned long long", "c_ulonglong"),
+	("unsigned long long int", "c_ulonglong"),
+	("float", "f32"),
+	("double", "f64"),
+	("size_t", "size_t"),
+	("ssize_t", "ssize_t"),
+	("int8_t", "i8"),
+	("int16_t", "i16"),
+	("int32_t", "i32"),
+	("int64_t", "i64"),
+	("uint8_t", "u8"),
+	("uint16_t", "u16"),
+	("uint32_t", "u32"),
+	("uint64_t", "u64"),
+	("intptr_t", "intptr_t"),
+	("uintptr_t", "uintptr_t"),
+]
+
+/// The names C gives its list of variadic arguments, and the ones its
+/// system headers spell it as.
+val VA_LISTS: [str; 5] = [
+	"va_list",
+	"__gnuc_va_list",
+	"__darwin_va_list",
+	"__builtin_va_list",
+	"__va_list",
+]
+
+/// Where the type is written, which decides how a pointer crosses: a
+/// parameter may be a reference, and a field may not.
+pub enum Where {
+	Parameter
+	Field
+}
+
+/// What the header declares, for reading a type: the structs and unions
+/// it defines, and the second names it gave them.
+pub struct Known {
+	pub var records: Set<String> = Set()
+	pub var aliases: Map<String, String> = Map()
+	/// The enums the header names, `enum Color` and a `typedef` of one:
+	/// C's integers, whose enumerators the binding writes as constants.
+	pub var enums: Set<String> = Set()
+	/// The structs the binding leaves out, which what uses them is too.
+	pub var left: Set<String> = Set()
+}
+
+extend Known {
+	/// What a typedef'd name was declared as: `Texture2D` is `Texture`,
+	/// and `ModelAnimPose` is `Transform *`.
+	fn writtenAs(name: str): Option<&String> = self.aliases.get(String::of(name))
+}
+
+/// The Wip type for a C type as the compiler wrote it, or nothing for one
+/// this tool does not write: a function pointer, or a name it does not
+/// know. `known` holds the structs and unions the header defines, since a
+/// pointer to one of those is a reference and a pointer to a handle is a
+/// `ptr<T>`.
+pub fn at(written: str, position: Where, known: &Known): Option<Ty> = atDepth(
+	written,
+	position,
+	known,
+	0,
+)
+
+fn atDepth(text: str, position: Where, known: &Known, depth: i64): Option<Ty> = {
+	val written = text.trim()
+	// A function pointer is a Wip function type; anything
+	// else with a parenthesis in it is not a type the tool writes.
+	if written.contains("(") then return functionPointer(written, known, depth)
+
+	// `char name[8]`, as a field's type is written.
+	if written.splitOnce("[") is .Some((before, rest)) && rest.stripSuffix("]") is .Some(count) {
+		val .Ok(length) = count.trim().toInt() else {
+			return .None
+		}
+
+		if length < 0 then return .None
+
+		val .Some(element) = atDepth(before, position, known, depth) else {
+			return .None
+		}
+
+		return .Some(.Array(element: own (move element), length: length))
+	}
+
+	// C's string, which Wip has a type for.
+	if written == "const char *" || written == "const char*" then
+		return .Some(.Named(name: String::of("cstring")))
+
+	if written.stripSuffix("*") is .Some(pointee) {
+		val writable = !pointee.trimStart().startsWith("const ")
+
+		// Only the outermost pointer of a parameter may be a reference:
+		// `Rectangle **` is a pointer to pointers, and a `ptr<&var T>`
+		// would hold a reference, which nothing may.
+		val .Some(inner) = atDepth(pointee.trim(), .Field, known, depth) else {
+			return .None
+		}
+
+		// A pointer to a struct the header defines is a reference, which
+		// is how Wip lends a value to C. Anything
+		// else — a handle, a scalar, `void` — stays a pointer, since it
+		// may be null, an array, or something C keeps.
+		val lendable =
+			position is .Parameter &&
+			match inner {
+				.Tag(name) => known.records.contains(&name)
+				_ => false
+			}
+
+		if lendable then return .Some(.Ref(target: own (move inner), writable: writable))
+
+		return .Some(.Pointer(target: own (move inner)))
+	}
+
+	val unqualified = written.stripPrefix("const ").unwrapOr(written)
+	val bare = unqualified.stripPrefix("volatile ").unwrapOr(unqualified).trim()
+
+	for (c, wip) in SCALARS {
+		if c == bare {
+			if wip == "void" then return .Some(.Void)
+			return .Some(.Named(name: String::of(wip)))
+		}
+	}
+
+	// `struct Point`, `union Event`, `enum Color`, and the names a header
+	// gave with `typedef`.
+	val tag = tagName(bare)
+
+	// C's list of variadic arguments is each system's own: a pointer on
+	// one, an array of structs on another, whatever its `typedef`s say
+	// here. Wip has no type for it.
+	for list in VA_LISTS {
+		if tag == list then return .None
+	}
+
+	// A second name for a type is read as what it was declared as: a
+	// struct, a pointer to one, or a function pointer, which is none of
+	// Wip's business yet. A header may give a name a
+	// name, and ten steps is more than any of them takes.
+	// A C enum is an `int`, whose values the binding writes as `c_int`
+	// constants.
+	if known.enums.contains(String::of(tag)) then return .Some(.Named(name: String::of("c_int")))
+
+	if depth < 10 && known.writtenAs(tag) is .Some(target) then
+		return atDepth(target.toStr(), position, known, depth + 1)
+
+	// A name C's compiler keeps for itself — `__builtin_va_list`, what
+	// `va_list` is — is not one Wip has, and neither is a struct the
+	// binding left out.
+	if !isName(tag) || tag.startsWith("__builtin_") || known.left.contains(String::of(tag)) then
+		return .None
+
+	return .Some(.Tag(name: String::of(tag)))
+}
+
+/// `int (*)(const void *, const void *)`, as clang spells a pointer to a
+/// function: its parameters and result read as a field's are, and each
+/// parameter named by where it is. Nothing for a variadic
+/// one, or one whose parts the tool does not write.
+fn functionPointer(written: str, known: &Known, depth: i64): Option<Ty> = {
+	val (result, rest) = written.splitOnce("(*)")?
+	val list = rest.trim().stripPrefix("(")?.stripSuffix(")")?
+	val returned = atDepth(result, .Field, known, depth)?
+	var params: Vec<Ty> = Vec()
+	val pieces = topLevel(list)
+
+	if !(pieces.len() == 1 && pieces[0].trim() == "void") {
+		for piece in pieces.items() {
+			if piece.trim() == "..." || piece.trim().isEmpty() then return .None
+			val param = atDepth(piece.toStr(), .Field, known, depth)?
+			if param.isVoid() then return .None
+			params.push(move param)
+		}
+	}
+
+	// A struct or a union by value, C passes in registers, where a Wip
+	// function value takes the address of one: such a function pointer
+	// does not cross.
+	if byValue(&returned, known) || params.any((param) => byValue(param, &known)) then return .None
+
+	return .Some(.Function(params: move params, result: own (move returned)))
+}
+
+/// Whether `ty` is a struct or a union the header defines, by value.
+fn byValue(ty: &Ty, known: &Known): bool = match ty {
+	.Tag(name) => known.records.contains(&name)
+	_ => false
+}
+
+/// A list's items, split at the commas outside any parentheses.
+fn topLevel(list: str): Vec<String> = {
+	var pieces: Vec<String> = Vec()
+	var depth = 0
+	var from = 0
+
+	for i in 0..list.len() {
+		match list[i] {
+			b'(' => depth += 1
+			b')' => depth -= 1
+			b',' if depth == 0 => {
+				pieces.push(String::of(list[from..i]))
+				from = i + 1
+			}
+			_ => {}
+		}
+	}
+
+	pieces.push(String::of(list[from..list.len()]))
+
+	return move pieces
+}
+
+/// A type's name without the `struct`, `union` or `enum` before it.
+pub fn tagName(written: str): str = {
+	for keyword in ["struct ", "union ", "enum "] {
+		if written.stripPrefix(keyword) is .Some(name) then return name.trim()
+	}
+	return written.trim()
+}
+
+/// Whether C could name something this: letters, digits and `_`, not
+/// starting with a digit.
+pub fn isName(text: str): bool = {
+	if text.isEmpty() || text[0] is b'0'..=b'9' then return false
+	for byte in text.items() {
+		if !(byte is b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_') then return false
+	}
+	return true
+}
+
+/// A `#define` that is a constant Wip can write: a whole number, or a
+/// string. Anything else — an expression, a cast, a call — is left out.
+pub fn constant(name: str, value: str): Option<Constant> = {
+	if value.stripPrefix("\"") is .Some(quoted) {
+		val .Some(text) = quoted.stripSuffix("\"") else {
+			return .None
+		}
+
+		val .Some(escaped) = wipEscapes(text) else {
+			return .None
+		}
+
+		return .Some(Constant(
+			name: String::of(name),
+			ty: String::of("str"),
+			value: "\"\(escaped)\"",
+		))
+	}
+
+	var digits = value
+
+	while digits.len() > 0 && digits[digits.len() - 1] is b'u' | b'U' | b'l' | b'L' {
+		digits = digits[0..digits.len() - 1]
+	}
+
+	while digits.len() > 0 && digits[0] == b'+' {
+		digits = digits[1..digits.len()]
+	}
+
+	val hex = digits.stripPrefix("0x").or(digits.stripPrefix("0X"))
+
+	val number = match hex {
+		.Some(hex) => hex.toInt(radix: 16)
+		.None => digits.toInt()
+	}
+
+	val .Ok(number) = number else {
+		return .None
+	}
+
+	return .Some(Constant(name: String::of(name), ty: String::of("i64"), value: "\(number)"))
+}
+
+/// C's escapes, as Wip writes them. The two agree about `\n`, `\t`, `\r`,
+/// `\\`, `\"` and `\'`; C also has `\xNN`, `\NNN` in octal, and the
+/// control characters `\a`, `\b`, `\f`, `\v` and `\e`, each of which Wip
+/// writes as the code point it is: `\u{1b}`.
+/// Nothing where the escape is one this does not know, so that a
+/// constant is left out rather than written wrongly.
+pub fn wipEscapes(text: str): Option<String> = {
+	var out = String()
+	var i = 0
+
+	while i < text.len() {
+		val byte = text[i]
+		i += 1
+
+		if byte != b'\\' {
+			out.pushByte(byte)
+			continue
+		}
+
+		if i >= text.len() then return .None
+		val escape = text[i]
+		i += 1
+
+		match escape {
+			// What both write the same way. `\0` is not among them: in C
+			// it is octal, so `\033` is one escape and not two.
+			b'n' | b't' | b'r' | b'\\' | b'"' | b'\'' => {
+				out.pushByte(b'\\')
+				out.pushByte(escape)
+			}
+			// A code point in hexadecimal, as many digits as follow.
+			b'x' => {
+				val start = i
+
+				while i < text.len() && text[i] is b'0'..=b'9' | b'a'..=b'f' | b'A'..=b'F' {
+					i += 1
+				}
+
+				if i == start then return .None
+
+				val .Ok(code) = text[start..i].toInt(radix: 16) else {
+					return .None
+				}
+
+				if code > 0xFFFFFFFF then return .None
+				out.push("\\u{\(hex(code))}")
+			}
+			// The control characters C names, and octal.
+			b'a' => out.push("\\u{7}")
+			b'b' => out.push("\\u{8}")
+			b'f' => out.push("\\u{c}")
+			b'v' => out.push("\\u{b}")
+			b'e' => out.push("\\u{1b}")
+			b'?' => out.pushByte(b'?')
+			b'0'..=b'7' => {
+				val start = i - 1
+
+				while i < text.len() && i - start < 3 && text[i] is b'0'..=b'7' {
+					i += 1
+				}
+
+				val .Ok(code) = text[start..i].toInt(radix: 8) else {
+					return .None
+				}
+
+				out.push("\\u{\(hex(code))}")
+			}
+			_ => return .None
+		}
+	}
+
+	return .Some(move out)
+}
+
+/// `value` in lowercase hexadecimal, as `\u{…}` writes a code point.
+fn hex(value: i64): String = {
+	if value == 0 then return String::of("0")
+	var digits: Vec<u8> = Vec()
+	var left = value
+
+	while left > 0 {
+		digits.push("0123456789abcdef"[left % 16])
+		left /= 16
+	}
+
+	var out = String()
+	var i = digits.len()
+
+	while i > 0 {
+		i -= 1
+		out.pushByte(digits[i])
+	}
+
+	return move out
+}
+
+/// Every word Wip keeps for itself, which a C name may be: the binding
+/// renames it and `@symbol` says what C calls it. The list is the
+/// lexer's, which a test of the compiler checks it against.
+val KEYWORDS: [str; 36] = [
+	"as",
+	"assert",
+	"break",
+	"continue",
+	"defer",
+	"dyn",
+	"else",
+	"enum",
+	"extern",
+	"false",
+	"fn",
+	"for",
+	"if",
+	"impl",
+	"import",
+	"in",
+	"interface",
+	"is",
+	"lend",
+	"let",
+	"match",
+	"move",
+	"null",
+	"own",
+	"pub",
+	"return",
+	"self",
+	"static",
+	"struct",
+	"then",
+	"true",
+	"type",
+	"val",
+	"var",
+	"while",
+	"yield",
+]
+
+/// The name as Wip may write it: a keyword with `_` after it.
+pub fn wipName(name: str): String = {
+	for keyword in KEYWORDS {
+		if keyword == name then return "\(name)_"
+	}
+	return String::of(name)
+}

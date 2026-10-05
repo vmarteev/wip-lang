@@ -1,0 +1,393 @@
+// Time as a program measures it: how long something takes,
+// and waiting. A `Duration` is a length of time, to the nanosecond; an
+// `Instant` is a moment on a clock that only goes forward, whatever the
+// time of day is set to, so the difference of two is how long passed
+// between them. `now` is the date it is, as seconds since 1970, and a
+// `Utc` is such a moment as a calendar has it; time zones
+// are not here.
+
+import std::libc
+
+@header("<time.h>")
+extern "C" {
+	struct timespec {
+		tv_sec: i64
+		tv_nsec: c_long
+	}
+
+	fn clock_gettime(clock: c_int, time: &var timespec): c_int
+	fn nanosleep(wanted: &timespec, left: &var timespec): c_int
+}
+
+// `CLOCK_MONOTONIC`, which each system numbers its own way.
+@target(vendor = "apple")
+val MONOTONIC: c_int = 6
+
+@target(os = "linux")
+val MONOTONIC: c_int = 1
+
+/// `nanosleep` was woken by a signal before its time was up, the same on
+/// both systems.
+val EINTR: c_int = 4
+
+val NANOS_PER_MICRO: i64 = 1000
+val NANOS_PER_MILLI: i64 = 1000000
+val NANOS_PER_SECOND: i64 = 1000000000
+
+/// A length of time, to the nanosecond, which may be negative. Two compare
+/// and add as the lengths they are, and one is written in the largest unit
+/// it fills: `250ms`, `1.5s`.
+@derive(Eq, Ord, Hash, Clone)
+pub struct Duration {
+	// In nanoseconds.
+	length: i64
+}
+
+extend Duration {
+	pub static fn nanos(count: i64): Duration = Duration(length: count)
+
+	pub static fn micros(count: i64): Duration = Duration(length: count * NANOS_PER_MICRO)
+
+	pub static fn millis(count: i64): Duration = Duration(length: count * NANOS_PER_MILLI)
+
+	pub static fn seconds(count: i64): Duration = Duration(length: count * NANOS_PER_SECOND)
+
+	/// How many whole nanoseconds it is.
+	pub fn asNanos(): i64 = self.length
+
+	/// How many whole microseconds it is, the rest left out.
+	pub fn asMicros(): i64 = self.length / NANOS_PER_MICRO
+
+	/// How many whole milliseconds it is, the rest left out.
+	pub fn asMillis(): i64 = self.length / NANOS_PER_MILLI
+
+	/// How many seconds it is, with what is left of one as a fraction.
+	pub fn asSeconds(): f64 = (self.length as f64) / (NANOS_PER_SECOND as f64)
+
+	/// Whether it is no time at all, or less.
+	pub fn isZero(): bool = self.length <= 0
+}
+
+extend Duration: Add {
+	fn add(other: &Duration): Duration = Duration(length: self.length + other.length)
+}
+
+extend Duration: Subtract {
+	fn subtract(other: &Duration): Duration = Duration(length: self.length - other.length)
+}
+
+extend Duration: Text {
+	fn appendTo(out: &var String) = {
+		var nanos = self.length
+		if nanos < 0 {
+			out.push("-")
+			nanos = -nanos
+		}
+		val (size, unit) =
+			if nanos >= NANOS_PER_SECOND then (NANOS_PER_SECOND, "s")
+			else if nanos >= NANOS_PER_MILLI then (NANOS_PER_MILLI, "ms")
+			else if nanos >= NANOS_PER_MICRO then (NANOS_PER_MICRO, "µs")
+			else (1, "ns")
+		out.pushInt(nanos / size)
+		// Three places after the point at most, and none that are zero at
+		// the end: `1.5s`, `1.25ms`.
+		var fraction = (nanos % size) * 1000 / size
+		if fraction > 0 {
+			var places = 3
+			while fraction % 10 == 0 {
+				fraction = fraction / 10
+				places -= 1
+			}
+			out.push(".")
+			var digits = String()
+			digits.pushInt(fraction)
+			for i in digits.len()..places {
+				out.push("0")
+			}
+			out.push(digits.toStr())
+		}
+		out.push(unit)
+	}
+}
+
+/// A moment on a clock that only goes forward, whatever the time of day is
+/// set to: what a wait or a measurement is taken with. It means nothing on
+/// its own, only against another.
+@derive(Eq, Ord, Hash, Clone)
+pub struct Instant {
+	// Since some moment the system chose, which may be when it started.
+	nanos: i64
+}
+
+extend Instant {
+	/// Now, on the clock that only goes forward.
+	pub static fn now(): Instant = {
+		var time = timespec(tv_sec: 0, tv_nsec: 0)
+		clock_gettime(MONOTONIC, &var time)
+		return Instant(nanos: time.tv_sec * NANOS_PER_SECOND + (time.tv_nsec as i64))
+	}
+
+	/// How long has passed since this moment.
+	pub fn elapsed(): Duration = Instant::now().since(&self)
+
+	/// How long after `earlier` this moment is: negative where it is before
+	/// it.
+	pub fn since(earlier: &Instant): Duration = Duration(length: self.nanos - earlier.nanos)
+
+	/// The moment `length` after this one.
+	pub fn after(length: Duration): Instant = Instant(nanos: self.nanos + length.length)
+
+	/// The moment `length` before this one.
+	pub fn before(length: Duration): Instant = Instant(nanos: self.nanos - length.length)
+}
+
+/// Waits for `length`, or returns at once for no time at all. A signal that
+/// wakes the wait early does not end it.
+pub fn sleep(length: Duration) = {
+	if length.isZero() then return
+	var wanted = timespec(
+		tv_sec: length.length / NANOS_PER_SECOND,
+		tv_nsec: (length.length % NANOS_PER_SECOND) as c_long,
+	)
+	var left = timespec(tv_sec: 0, tv_nsec: 0)
+	while nanosleep(&wanted, &var left) != 0 && libc::errno() == EINTR {
+		wanted = left
+	}
+}
+
+// The date it is: seconds since 1970 as the system's clock
+// says, and those seconds as a calendar has them, in UTC.
+
+/// `CLOCK_REALTIME`, the same on both systems.
+val REALTIME: c_int = 0
+
+val SECONDS_PER_DAY: i64 = 86400
+
+/// The seconds since the start of 1970, in UTC, as the system's clock says:
+/// C's `time()`. The clock may be set back, so two of these need not be in
+/// the order they were taken; `Instant` is for measuring.
+pub fn now(): i64 = {
+	var time = timespec(tv_sec: 0, tv_nsec: 0)
+	clock_gettime(REALTIME, &var time)
+	return time.tv_sec
+}
+
+/// A moment as a calendar has it, in UTC: no time zone, and no leap
+/// second. It keeps the seconds since 1970, and works the date out of them
+/// when asked, so there is no day a month does not have. Two compare in
+/// the order they happen.
+@derive(Eq, Ord, Hash, Clone)
+pub struct Utc {
+	since: i64
+}
+
+/// A date, as `civilFrom` works it out: year, month from 1, day from 1.
+struct Civil {
+	year: i64
+	month: i64
+	day: i64
+}
+
+val WEEKDAYS: [str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
+val MONTHS: [str; 12] = [
+	"Jan",
+	"Feb",
+	"Mar",
+	"Apr",
+	"May",
+	"Jun",
+	"Jul",
+	"Aug",
+	"Sep",
+	"Oct",
+	"Nov",
+	"Dec",
+]
+
+extend Utc {
+	/// The moment `seconds` after the start of 1970, or before it where
+	/// they are negative.
+	pub static fn of(seconds: i64): Utc = Utc(since: seconds)
+
+	/// The date as HTTP writes it, `Sun, 06 Nov 1994 08:49:37 GMT`, read
+	/// back; nothing for any other form, or for a day the month does not
+	/// have. The weekday is read, and not checked against the date, as
+	/// C's `strptime` does not.
+	pub static fn parseHttpDate(text: str): Option<Utc> = {
+		if text.len() != 29 ||
+			text[3] != b',' ||
+			text[4] != b' ' ||
+			text[7] != b' ' ||
+			text[11] != b' ' ||
+			text[16] != b' ' ||
+			text[19] != b':' ||
+			text[22] != b':' ||
+			text[25..29] != " GMT" {
+			return .None
+		}
+		indexOf(&WEEKDAYS, text[0..3])?
+		val month = indexOf(&MONTHS, text[8..11])? + 1
+		val day = digits(text, 5, 2)?
+		val year = digits(text, 12, 4)?
+		val hour = digits(text, 17, 2)?
+		val minute = digits(text, 20, 2)?
+		val second = digits(text, 23, 2)?
+		if day < 1 || day > daysIn(year, month) || hour > 23 || minute > 59 || second > 59 then
+			return .None
+		val days = daysFrom(year, month, day)
+		return .Some(Utc(since: days * SECONDS_PER_DAY + hour * 3600 + minute * 60 + second))
+	}
+
+	/// The seconds since the start of 1970: what `of` was given.
+	pub fn seconds(): i64 = self.since
+
+	/// The year, which may be before 1 or after 9999.
+	pub fn year(): i64 = self.date().year
+
+	/// The month, from 1 for January to 12.
+	pub fn month(): i64 = self.date().month
+
+	/// The day of the month, from 1.
+	pub fn day(): i64 = self.date().day
+
+	/// The hour, from 0 to 23.
+	pub fn hour(): i64 = self.ofDay() / 3600
+
+	/// The minute, from 0 to 59.
+	pub fn minute(): i64 = self.ofDay() % 3600 / 60
+
+	/// The second, from 0 to 59.
+	pub fn second(): i64 = self.ofDay() % 60
+
+	/// The day of the week, from 0 for Sunday to 6 for Saturday. The first
+	/// of January 1970 was a Thursday.
+	pub fn weekday(): i64 = floorRemainder(self.days() + 4, 7)
+
+	/// As HTTP writes a date (RFC 9110's IMF-fixdate):
+	/// `Sun, 06 Nov 1994 08:49:37 GMT`.
+	pub fn httpDate(): String = {
+		val date = self.date()
+		var out = String()
+		out.push(WEEKDAYS[self.weekday()])
+		out.push(", ")
+		pushPadded(&var out, date.day, 2)
+		out.push(" ")
+		out.push(MONTHS[date.month - 1])
+		out.push(" ")
+		pushPadded(&var out, date.year, 4)
+		out.push(" ")
+		self.pushTime(&var out)
+		out.push(" GMT")
+		return move out
+	}
+
+	/// As ISO 8601 writes a moment in UTC: `1994-11-06T08:49:37Z`.
+	pub fn iso(): String = {
+		val date = self.date()
+		var out = String()
+		pushPadded(&var out, date.year, 4)
+		out.push("-")
+		pushPadded(&var out, date.month, 2)
+		out.push("-")
+		pushPadded(&var out, date.day, 2)
+		out.push("T")
+		self.pushTime(&var out)
+		out.push("Z")
+		return move out
+	}
+
+	/// The whole days since 1970, rounded down.
+	fn days(): i64 = floorDivide(self.since, SECONDS_PER_DAY)
+
+	/// The seconds since the day began.
+	fn ofDay(): i64 = self.since - self.days() * SECONDS_PER_DAY
+
+	fn date(): Civil = civilFrom(self.days())
+
+	fn pushTime(out: &var String) = {
+		pushPadded(&var out, self.hour(), 2)
+		out.push(":")
+		pushPadded(&var out, self.minute(), 2)
+		out.push(":")
+		pushPadded(&var out, self.second(), 2)
+	}
+}
+
+extend Utc: Text {
+	/// As ISO 8601 writes it.
+	fn appendTo(out: &var String) = out.push(self.iso().toStr())
+}
+
+/// `value` in at least `width` digits, zeroes before; a negative year with
+/// its sign before them.
+fn pushPadded(out: &var String, value: i64, width: i64) = {
+	var digits = String()
+	digits.pushInt(if value < 0 then -value else value)
+	if value < 0 then out.push("-")
+	for i in digits.len()..width {
+		out.push("0")
+	}
+	out.push(digits.toStr())
+}
+
+/// The number written in `count` digits at `at`, or nothing where one of
+/// them is not a digit.
+fn digits(text: str, at: i64, count: i64): Option<i64> = {
+	var value = 0
+	for i in at..at + count {
+		val byte = text[i]
+		if !(byte is b'0'..=b'9') then return .None
+		value = value * 10 + ((byte - b'0') as i64)
+	}
+	return .Some(value)
+}
+
+fn indexOf(names: &[str], name: str): Option<i64> = {
+	for i in 0..names.len() {
+		if names[i] == name then return .Some(i)
+	}
+	return .None
+}
+
+fn isLeap(year: i64): bool = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
+
+fn daysIn(year: i64, month: i64): i64 = {
+	if month == 2 then return if isLeap(year) then 29 else 28
+	return if month is 4 | 6 | 9 | 11 then 30 else 31
+}
+
+/// `a / b` rounded down, where Wip's division rounds toward zero.
+fn floorDivide(a: i64, b: i64): i64 = {
+	val quotient = a / b
+	return if a % b != 0 && (a < 0) != (b < 0) then quotient - 1 else quotient
+}
+
+fn floorRemainder(a: i64, b: i64): i64 = a - floorDivide(a, b) * b
+
+// Howard Hinnant's algorithms for the proleptic Gregorian calendar, in
+// eras of 400 years, each 146097 days; a year here starts in March, so
+// that the leap day is the last of it.
+
+/// The days since the start of 1970 of a date.
+fn daysFrom(year: i64, month: i64, day: i64): i64 = {
+	val y = if month <= 2 then year - 1 else year
+	val era = floorDivide(y, 400)
+	val yearOfEra = y - era * 400
+	val dayOfYear = (153 * (if month > 2 then month - 3 else month + 9) + 2) / 5 + day - 1
+	val dayOfEra = yearOfEra * 365 + yearOfEra / 4 - yearOfEra / 100 + dayOfYear
+	return era * 146097 + dayOfEra - 719468
+}
+
+/// The date `days` after the start of 1970.
+fn civilFrom(days: i64): Civil = {
+	val z = days + 719468
+	val era = floorDivide(z, 146097)
+	val dayOfEra = z - era * 146097
+	val yearOfEra = (dayOfEra - dayOfEra / 1460 + dayOfEra / 36524 - dayOfEra / 146096) / 365
+	val dayOfYear = dayOfEra - (365 * yearOfEra + yearOfEra / 4 - yearOfEra / 100)
+	val shifted = (5 * dayOfYear + 2) / 153
+	val day = dayOfYear - (153 * shifted + 2) / 5 + 1
+	val month = if shifted < 10 then shifted + 3 else shifted - 9
+	val year = yearOfEra + era * 400 + (if month <= 2 then 1 else 0)
+	return Civil(year: year, month: month, day: day)
+}

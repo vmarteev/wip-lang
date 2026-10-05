@@ -1,0 +1,101 @@
+// e^x of an `f64`, ported from Arm's optimized-routines,
+// which glibc and musl compute it with, on the path that needs neither a
+// fused multiply-add nor an instruction that rounds to a whole number, so
+// that every machine gives one answer:
+//
+// Copyright (c) 2018-2025, Arm Limited.
+// SPDX-License-Identifier: MIT OR Apache-2.0 WITH LLVM-exception
+//
+// From `math/exp.c`, and its last step, `expScaled`, from `math/pow.c`,
+// which is that of `exp` with a sign and a tail; within 0.511 ulp.
+//
+// x = k ln2/128 + r, with k whole and |r| <= ln2/256, and e^x is
+// 2^(k/128) e^r: the first from `EXP_TAIL` and `EXP_SCALE`, and the second a polynomial.
+
+/// The sign `pow` gives an odd power of a negative number, added to `k`:
+/// it lands on the sign bit of the scale.
+val SIGN_BIAS: u64 = 0x40000
+
+/// e^x; infinity past about 709.78, and zero below about -745.13.
+fn exponential(x: f64): f64 = expScaled(x, 0.0, false, 0)
+
+/// e^(x + tail), negative where `signBias` is `SIGN_BIAS`; e^x where
+/// `tailed` is false. The tail is what a sum leaves out: under 2^-8/128
+/// and under |x|.
+@inline
+fn expScaled(x: f64, tail: f64, tailed: bool, signBias: u64): f64 = {
+	val bits = x.toBits()
+	var abstop = ((bits >> 52) & 0x7ff) as i64
+	// |x| < 2^-54, or |x| >= 512, or not a number.
+	if abstop < 0x3c9 || abstop >= 0x408 {
+		// So small that the answer is 1.
+		if abstop < 0x3c9 then return if signBias != 0 then -1.0 else 1.0
+		// |x| >= 1024
+		if abstop >= 0x409 {
+			if bits == 0xFFF0000000000000 then return 0.0
+			if abstop >= 0x7ff then return 1.0 + x
+			if bits >> 63 != 0 then return underflow(signBias != 0)
+			return overflow(signBias != 0)
+		}
+		// Large: the scale may not be a double, which `expSpecial` deals
+		// with.
+		abstop = 0
+	}
+	// k = x 128/ln2, rounded to the nearest: adding 1.5 2^52 rounds it,
+	// and leaves it in the low bits.
+	val z = EXP_INV_LN2_N * x
+	var kd = z + EXP_SHIFT
+	val ki = kd.toBits()
+	kd -= EXP_SHIFT
+	var r = x + kd * EXP_NEG_LN2_HI_N + kd * EXP_NEG_LN2_LO_N
+	if tailed then r += tail
+	// 2^(k/128) ~= scale (1 + t)
+	val j = (ki & 127) as i64
+	val top = (ki +% signBias) << 45
+	val t = f64::fromBits(EXP_TAIL[j])
+	val sbits = EXP_SCALE[j] +% top
+	// e^x ~= scale + scale (t + e^r - 1)
+	val r2 = r * r
+	val tmp =
+		t + r + r2 * (EXP_POLY[0] + r * EXP_POLY[1]) + r2 * r2 * (EXP_POLY[2] + r * EXP_POLY[3])
+	if abstop == 0 then return expSpecial(tmp, sbits, ki)
+	val scale = f64::fromBits(sbits)
+	return scale + scale * tmp
+}
+
+/// scale (1 + tmp) where the scale's exponent, in `sbits`, went past a
+/// double's: up by as much as 460 for a k above 0, and down for one below,
+/// where the answer may be subnormal.
+fn expSpecial(tmp: f64, sbits: u64, ki: u64): f64 = {
+	if ki & 0x80000000 == 0 {
+		val scale = f64::fromBits(sbits -% (1009 << 52))
+		val y = scale + scale * tmp
+		// 2^1009
+		return y * f64::fromBits(0x7F00000000000000)
+	}
+	val signed = sbits +% (1022 << 52)
+	val scale = f64::fromBits(signed)
+	var y = scale + scale * tmp
+	if y.abs() < 1.0 {
+		// Rounded to its precision before it is scaled down, so that a
+		// subnormal answer is rounded once, not twice.
+		val one = if y < 0.0 then -1.0 else 1.0
+		var lo = scale - y + scale * tmp
+		val hi = one + y
+		lo = one - hi + y + lo
+		y = (hi + lo) - one
+		// A zero has the sign of the scale.
+		if y == 0.0 then y = f64::fromBits(signed & 0x8000000000000000)
+	}
+	// 2^-1022
+	return f64::fromBits(0x0010000000000000) * y
+}
+
+/// Infinity, negative where `negative` says: what an answer too large for
+/// a double rounds to.
+fn overflow(negative: bool): f64 =
+	if negative then f64::fromBits(0xFFF0000000000000) else f64::fromBits(0x7FF0000000000000)
+
+/// Zero, negative where `negative` says: what an answer too small for a
+/// double rounds to.
+fn underflow(negative: bool): f64 = if negative then -0.0 else 0.0

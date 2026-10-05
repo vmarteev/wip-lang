@@ -1,0 +1,329 @@
+// What clang says a `#define` is, where its value is not a literal the
+// tool reads itself. clang is given the header and a line
+// that asks for each, on its standard input, and its syntax tree answers:
+// first what each is — its type, and its value as a tree — and then, for
+// each that is an integer, what it is worth.
+
+import std::json::{Json}
+import std::path
+import clang
+import clang::{only, qualType, textOf}
+import declared::{Item, Reading}
+import types::{Constant, Known, Ty, wipName}
+import types
+
+/// What becomes of a `#define`: a constant the module has, or a line at
+/// the end of the file saying why it has not.
+pub enum Answer {
+	Written(constant: Constant)
+	Left(why: String)
+}
+
+/// What each of `names`, `#define`s of the header, is, in their order.
+/// `items` are what the header declares, whose structs a constant may be
+/// one of.
+pub fn ask(
+	header: str,
+	reading: &Reading,
+	names: &Vec<String>,
+	items: &Vec<Item>,
+	known: &Known,
+): Result<Vec<Answer>, String> = {
+	if names.isEmpty() then return .Ok(Vec())
+	var asked = String::of("#include \"\(path::name(header))\"\n")
+
+	for name in names.items() {
+		asked.push("static const __typeof__((\(name))) wip_probe_\(name) = (\(name));\n")
+	}
+
+	val tree = probed(header, reading, asked.toStr())?
+	var answers: Vec<Option<Answer>> = Vec()
+	var integers: Vec<String> = Vec()
+
+	for name in names.items() {
+		val answer = match valueOf(&tree, "wip_probe_\(name)") {
+			.Some(value) => {
+				val written = qualType(value)
+				what(name.toStr(), value, written, items, known, &var integers)
+			}
+			.None => .Some(.Left("`\(name)`, a `#define` that is not a constant"))
+		}
+
+		answers.push(move answer)
+	}
+
+	// What each integer is worth, as clang works out an enumerator's.
+	if !integers.isEmpty() {
+		var valued = String::of("#include \"\(path::name(header))\"\n")
+
+		for name in integers.items() {
+			valued.push("enum { wip_probe_\(name) = (\(name)) };\n")
+		}
+
+		val values = probed(header, reading, valued.toStr())?
+
+		for i in 0..names.len() {
+			if answers[i].isSome() then continue
+			val name = names[i].toStr()
+
+			answers[i] = match enumerator(&values, "wip_probe_\(name)") {
+				.Some(value) => .Some(.Written(constant: Constant(
+					name: String::of(name),
+					ty: String::of("i64"),
+					value: "\(value)",
+				)))
+				.None => .Some(.Left("`\(name)`, a `#define` whose value clang did not work out"))
+			}
+		}
+	}
+
+	var out: Vec<Answer> = Vec()
+
+	for answer in move answers {
+		out.push(answer.unwrap())
+	}
+
+	return .Ok(move out)
+}
+
+/// clang's syntax tree of the header and the lines `asked`, read with the
+/// settings the header was. clang marks what it could not read and goes
+/// on, so a run that failed is read too.
+fn probed(header: str, reading: &Reading, asked: str): Result<Json, String> = {
+	val cc = clang::compiler("clang")
+	val options = ["-Xclang", "-ast-dump=json", "-fsyntax-only", "-x", "c"]
+	val inputs = ["-I", path::parent(header), "-"]
+	val output = clang::run(cc.toStr(), &options, &reading, &inputs, .Some(asked))?
+
+	return clang::tree(cc.toStr(), &output, "the header's constants")
+}
+
+/// The value the declaration `name` was given, where clang read it.
+fn valueOf(tree: &Json, name: str): Option<&Json> = {
+	val .Some(nodes) = tree.get("inner")?.asArray() else {
+		return .None
+	}
+
+	for node in nodes.items() {
+		if textOf(node, "name") == .Some(name) {
+			if node.get("isInvalid").flatMap((invalid) => invalid.asBool()) == .Some(true) then
+				return .None
+			return node.get("inner")?.item(0)
+		}
+	}
+
+	return .None
+}
+
+/// What the enumerator `name` is worth, where clang worked it out.
+fn enumerator(tree: &Json, name: str): Option<i64> = {
+	val .Some(nodes) = tree.get("inner")?.asArray() else {
+		return .None
+	}
+
+	for node in nodes.items() {
+		val .Some(constants) = node.get("inner").flatMap((inner) => inner.asArray()) else {
+			continue
+		}
+		for constant in constants.items() {
+			if textOf(constant, "name") == .Some(name) then return evaluated(constant)
+		}
+	}
+
+	return .None
+}
+
+/// The value clang worked out for an enumerator, where it wrote one down.
+pub fn evaluated(node: &Json): Option<i64> = {
+	val .Some(nodes) = node.get("inner")?.asArray() else {
+		return .None
+	}
+
+	for child in nodes.items() {
+		if textOf(child, "value") is .Some(value) then return value.toInt().toOption()
+		if evaluated(child) is .Some(found) then return .Some(found)
+	}
+
+	return .None
+}
+
+/// What a `#define` is, from the tree of its value and the type C gives
+/// it: a constant, a line saying why not, or nothing yet where it is an
+/// integer, whose name goes into `integers` to be worked out.
+fn what(
+	name: str,
+	value: &Json,
+	written: str,
+	items: &Vec<Item>,
+	known: &Known,
+	integers: &var Vec<String>,
+): Option<Answer> = {
+	val left: Option<Answer> = .Some(.Left("`\(name)`, a `#define` of `\(written)`"))
+	val plain = under(value).unwrapOr(value)
+
+	if textOf(plain, "kind") == .Some("StringLiteral") {
+		val .Some(text) = textOf(plain, "value") else {
+			return move left
+		}
+
+		return match types::constant(name, text) {
+			.Some(constant) => .Some(.Written(constant: move constant))
+			.None => move left
+		}
+	}
+
+	val .Some(ty) = types::at(written, .Field, known) else {
+		return move left
+	}
+
+	match ty {
+		.Named(named) if named == "f32" || named == "f64" => {
+			// Its own parentheses, and the ones the question put round it,
+			// are not the value's.
+			return match floatText(plain) {
+				.Some(float) => .Some(.Written(constant: Constant(
+					name: String::of(name),
+					ty: named.clone(),
+					value: move float,
+				)))
+				.None => move left
+			}
+		}
+		.Named(named) if named != "cstring" => {
+			integers.push(String::of(name))
+			return .None
+		}
+		.Tag(record) => return match structText(plain, record.toStr(), items) {
+			.Some(built) => .Some(.Written(constant: Constant(
+				name: String::of(name),
+				ty: record.clone(),
+				value: move built,
+			)))
+			.None => move left
+		}
+		_ => return move left
+	}
+}
+
+/// A value under what C wraps around it of its own — the casts it makes,
+/// a constant's evaluation, and parentheses — where it wraps it in any.
+fn under(node: &Json): Option<&Json> = {
+	if !(textOf(node, "kind") is .Some("ImplicitCastExpr" | "ConstantExpr" | "ParenExpr")) then
+		return .None
+	val inner = only(node)?
+	return .Some(under(inner).unwrapOr(inner))
+}
+
+/// A float as Wip writes it: literals, a cast of a number, `-`, and `+`,
+/// `-`, `*` and `/` of those, with C's parentheses kept.
+fn floatText(node: &Json): Option<String> = {
+	val kind = textOf(node, "kind").unwrapOr("")
+
+	return match kind {
+		"FloatingLiteral" => .Some(floatLiteral(textOf(node, "value")?))
+		"IntegerLiteral" => .Some("\(textOf(node, "value")?).0")
+		"ImplicitCastExpr" | "CStyleCastExpr" | "ConstantExpr" => floatText(only(node)?)
+		"ParenExpr" => .Some("(\(floatText(only(node)?)?))")
+		"UnaryOperator" => match textOf(node, "opcode") {
+			.Some("-") => .Some("-\(floatText(only(node)?)?)")
+			.Some("+") => floatText(only(node)?)
+			_ => .None
+		}
+		"BinaryOperator" => {
+			val op = textOf(node, "opcode")?
+			if !(op is "+" | "-" | "*" | "/") then return .None
+			val left = floatText(node.get("inner")?.item(0)?)?
+			val right = floatText(node.get("inner")?.item(1)?)?
+			.Some("\(left) \(op) \(right)")
+		}
+		_ => .None
+	}
+}
+
+/// A float literal as clang wrote its value, with the point Wip wants:
+/// `180` is `180.0`, and `1E-5` is `1.0e-5`.
+fn floatLiteral(value: str): String = {
+	var out = String()
+	var point = false
+
+	for byte in value.items() {
+		if byte == b'.' then point = true
+
+		if byte is b'e' | b'E' {
+			if !point {
+				out.push(".0")
+				point = true
+			}
+			out.pushByte(b'e')
+			continue
+		}
+
+		out.pushByte(byte)
+	}
+
+	if !point then out.push(".0")
+
+	return move out
+}
+
+/// A whole number as Wip writes it: a literal under C's casts, or `-`
+/// before one.
+fn intText(node: &Json): Option<String> = {
+	val plain = under(node).unwrapOr(node)
+
+	return match textOf(plain, "kind").unwrapOr("") {
+		"IntegerLiteral" => .Some(String::of(textOf(plain, "value")?))
+		"CStyleCastExpr" => intText(only(plain)?)
+		"UnaryOperator" => match textOf(plain, "opcode") {
+			.Some("-") => .Some("-\(intText(only(plain)?)?)")
+			_ => .None
+		}
+		_ => .None
+	}
+}
+
+/// A struct the header defines, built from C's `(Color){ 200, 200, 200,
+/// 255 }` with its fields named, as Wip builds one: each
+/// field given, as a number or a float; not a union, nor one with
+/// bitfields.
+fn structText(value: &Json, record: str, items: &Vec<Item>): Option<String> = {
+	var list: &Json = value
+
+	if textOf(list, "kind") == .Some("CompoundLiteralExpr") {
+		val inner = only(list)?
+		list = under(inner).unwrapOr(inner)
+	}
+
+	if textOf(list, "kind") != .Some("InitListExpr") then return .None
+
+	val .Some(elements) = list.get("inner").flatMap((inner) => inner.asArray()) else {
+		return .None
+	}
+
+	for item in items.items() {
+		val .Record(name, isUnion, opaque, fields) = item else {
+			continue
+		}
+
+		if name != record then continue
+		if isUnion || opaque || fields.len() != elements.len() then return .None
+		var parts: Vec<String> = Vec()
+
+		for i in 0..fields.len() {
+			val element: &Json = &elements[i]
+			if textOf(element, "kind") == .Some("ImplicitValueInitExpr") then return .None
+			val ty = fields[i].ty.text()
+
+			val text = match ty.toStr() {
+				"f32" | "f64" => floatText(element)?
+				_ => intText(element)?
+			}
+
+			parts.push("\(wipName(fields[i].name.toStr())): \(text)")
+		}
+
+		return .Some("\(wipName(record))(\(parts.join(", ")))")
+	}
+
+	return .None
+}

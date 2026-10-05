@@ -1,0 +1,301 @@
+// An arena: values named by handle, for what links back up
+// a structure — a tree's parents, a list linked both ways, a graph — where
+// no one owner could hold the links. A handle is a slot and a generation:
+// plain data, kept anywhere, and a handle to a value removed is caught
+// where it is used, not read as whatever took its place.
+//
+// It is laid out as a map is (map.wip): the values packed in a `Vec`, each
+// beside its handle, and a table of slots that says where each is. That is
+// what lets an arena be walked as a slice. A slot's
+// generation is odd while it holds a value and even while it is free, and
+// the free slots are a list threaded through the table, taken before the
+// table grows.
+//
+// A handle's type says what it names: `Arena<Node>`'s are `Handle<Node>`.
+// Where the code that keeps handles cannot name the values' type — a game's
+// rules, which know a ball by its handle, below the module that says what a
+// ball is — the arena takes a second type, which its handles name instead:
+// `Arena<Ball, Balls>` gives `Handle<Balls>`, and `Balls` is declared where
+// the rules can name it.
+//
+// Handles are not tied to the arena they came from: a `Handle<Node>` from
+// one arena of nodes, used on another, may name a value there. They do name
+// the same values in the arena's `clone()`.
+
+import std::iter::{Taking}
+
+/// The value of a slot's `place` that stands for no slot at all: the end of
+/// the free list.
+val NO_SLOT: u32 = 4294967295
+
+/// The last generation a slot can have. A slot that reaches it is retired
+/// when its value is removed, rather than starting again at 1, where a
+/// handle from long before would name a new value.
+val LAST_GENERATION: u32 = 4294967295
+
+/// The name of a value in an arena: what `add` answers, and what
+/// `arena[handle]` finds. It is plain data, copied as a number is, and a
+/// `Handle<Node>` is not taken where a `Handle<Edge>` is. `T` is what it
+/// names: the values' type, or the arena's second type where it has one.
+pub struct Handle<T> {
+	// The slot the value is found through.
+	slot: u32
+	// The slot's generation when the value was added; always odd.
+	generation: u32
+}
+
+// A handle compares, orders and hashes by its slot and generation, whatever
+// `T` is; so these are written here, where a derived one would ask `T`.
+extend Handle<T>: Eq {
+	@inline
+	fn equals(other: &Handle<T>): bool =
+		self.slot == other.slot && self.generation == other.generation
+}
+
+extend Handle<T>: Ord {
+	fn compare(other: &Handle<T>): Ordering = match self.slot.compare(&other.slot) {
+		.Same => self.generation.compare(&other.generation)
+		order => order
+	}
+}
+
+extend Handle<T>: Hash {
+	fn hashInto(out: &var Hasher) = out.writeInt(
+		((self.slot as u64) << 32) | (self.generation as u64),
+	)
+}
+
+extend Handle<T>: Text {
+	fn appendTo(out: &var String) = {
+		out.push("Handle(slot: ")
+		self.slot.appendTo(&var out)
+		out.push(", generation: ")
+		self.generation.appendTo(&var out)
+		out.push(")")
+	}
+}
+
+/// A value in an arena, beside the handle that names it: what `for entry in
+/// arena` visits.
+pub struct ArenaEntry<T, K = T> {
+	/// The handle that names the value.
+	pub handle: Handle<K>
+	pub value: T
+}
+
+// One slot of the table.
+struct Slot {
+	// Odd while the slot holds a value, even while it is free, and 0 once
+	// it is retired.
+	generation: u32
+	// Where the value is among the entries while the slot holds one; the
+	// next free slot while it does not.
+	place: u32
+}
+
+/// Values of type `T`, named by `Handle<K>`, where `K` is `T` unless it is
+/// written. `Arena()` is an empty one, which takes no memory until a value
+/// is added.
+pub struct Arena<T, K = T> {
+	// A slot for every handle given out, in use, free or retired.
+	slots: Vec<Slot> = Vec()
+	// The first free slot, or `NO_SLOT`.
+	free: u32 = NO_SLOT
+	// The values, packed, each beside its handle, kept in the part
+	// `values()` lends.
+	row: ArenaValues<T, K> = ArenaValues(entries: Vec())
+}
+
+/// An arena's values, one place at a time: what `arena.values()` lends, and
+/// what `for value in arena.values()` walks, writing them in a `var`. The
+/// handles and the order stay the arena's.
+pub struct ArenaValues<T, K = T> {
+	entries: Vec<ArenaEntry<T, K>>
+}
+
+extend ArenaValues<T, K>: Sequence<T> {
+	fn len(): i64 = self.entries.len()
+
+	/// The value at position `i`, to read, or to write where a walk in a
+	/// `var` lends it.
+	lend fn at(i: i64): &T = lend self.entries.at(i).value
+}
+
+extend Arena<T, K>: Items<ArenaEntry<T, K>> {
+	// The entries, lent as a slice to read, which is what `for entry in
+	// arena` walks.
+	fn items(): &[ArenaEntry<T, K>] = lend self.row.entries.items()
+}
+
+// `for ArenaEntry(handle, value) in move arena`: each value, the loop's to
+// keep.
+extend Arena<T, K>: IntoIterator<Taking<ArenaEntry<T, K>>> {
+	move fn intoIterator(): Taking<ArenaEntry<T, K>> = {
+		var all = move self
+		return (move all.row.entries).intoIterator()
+	}
+}
+
+// `arena[handle]`: the value, to read or to write; a handle to a value
+// removed panics.
+extend Arena<T, K>: Index<Handle<K>, T> {
+	@inline
+	lend fn at(handle: Handle<K>): &T = {
+		val .Some(position) = self.find(handle) else {
+			panic("\(handle) names a value removed from the arena")
+		}
+		lend self.row.entries.at(position).value
+	}
+}
+
+extend Arena<T, K> {
+	/// The values, to walk one at a time: `for node in tree.values()`
+	/// writes each in a `var`.
+	pub lend fn values(): &ArenaValues<T, K> = lend self.row
+
+	/// How many values it holds.
+	pub fn len(): i64 = self.row.entries.len()
+
+	/// Whether it holds nothing.
+	pub fn isEmpty(): bool = self.row.entries.isEmpty()
+
+	/// Whether `handle` still names a value.
+	@inline
+	pub fn contains(handle: Handle<K>): bool = self.find(handle).isSome()
+
+	/// The value `handle` names, or nothing where it was removed.
+	@inline
+	pub fn get(handle: Handle<K>): Option<&T> = match self.find(handle) {
+		.Some(position) => .Some(&self.row.entries.at(position).value)
+		.None => .None
+	}
+
+	/// Moves `value` in, and answers the handle that names it.
+	pub var fn add(value: T): Handle<K> = {
+		val position = self.row.entries.len() as u32
+		var handle: Handle<K> = Handle(slot: self.free, generation: 1)
+		if self.free != NO_SLOT {
+			handle.generation = self.slots[self.free as i64].generation + 1
+			self.free = self.slots[self.free as i64].place
+			self.slots[handle.slot as i64] = Slot(generation: handle.generation, place: position)
+		} else {
+			if self.slots.len() >= (NO_SLOT as i64) then
+				panic("an arena holds at most \(NO_SLOT) slots")
+			handle.slot = self.slots.len() as u32
+			self.slots.push(Slot(generation: 1, place: position))
+		}
+		self.row.entries.push(ArenaEntry(handle: handle, value: move value))
+		return handle
+	}
+
+	/// Takes out the value `handle` names, or nothing where it was removed
+	/// already. Every handle to it is stale from here on. The last value
+	/// moves into its place, so this is quick whatever the size, and the
+	/// order a walk visits is no longer the order the values went in.
+	pub var fn remove(handle: Handle<K>): Option<T> = {
+		val .Some(position) = self.find(handle) else {
+			return .None
+		}
+		val last = self.row.entries.len() - 1
+		if position != last {
+			val moved = self.row.entries.at(last).handle.slot as i64
+			self.slots[moved].place = position as u32
+		}
+		self.vacate(handle.slot)
+		val entry = self.row.entries.swapRemove(position)
+		return .Some(move entry.value)
+	}
+
+	/// Keeps the values `keep` answers true for, and removes the rest, as
+	/// `remove` does, each in turn. `keep` is given each value to write,
+	/// so it may change what it keeps: a collector's sweep clears the mark
+	/// of what survives.
+	pub var fn retain(keep: &var (handle: Handle<K>, value: &var T) => bool) = {
+		var at = 0
+		while at < self.row.entries.len() {
+			val handle = self.row.entries[at].handle
+			if keep(handle, &var self.row.entries.at(at).value) {
+				at += 1
+			} else {
+				// The last value moves here, and is asked about next.
+				self.remove(handle)
+			}
+		}
+	}
+
+	/// Ends every value. Every handle given out is stale from here on; the
+	/// memory is kept.
+	pub var fn clear() = {
+		for at in 0..self.row.entries.len() {
+			self.vacate(self.row.entries[at].handle.slot)
+		}
+		self.row.entries.clear()
+	}
+
+	/// Lends the values `first` and `second` name to `body`, both to write
+	/// at once: what moves something from one value to another in place.
+	/// The same handle twice, or one to a value removed, panics.
+	pub var fn pair<R>(
+		first: Handle<K>,
+		second: Handle<K>,
+		body: &var (a: &var T, b: &var T) => R,
+	): R = {
+		if first == second then panic("\(first) is lent twice by `pair`")
+		val .Some(at) = self.find(first) else {
+			panic("\(first) names a value removed from the arena")
+		}
+		val .Some(to) = self.find(second) else {
+			panic("\(second) names a value removed from the arena")
+		}
+		// The slice is split before the later of the two, which begins the
+		// second half.
+		if at < to then
+			return self.row.entries.items().split(to, (before, after) => body(
+				&var before[at].value,
+				&var after[0].value,
+			))
+		return self.row.entries.items().split(at, (before, after) => body(
+			&var after[0].value,
+			&var before[to].value,
+		))
+	}
+
+	// Where the value `handle` names is among the entries, or nothing
+	// where it was removed.
+	@inline
+	fn find(handle: Handle<K>): Option<i64> = {
+		val slot = handle.slot as i64
+		if slot >= self.slots.len() || self.slots[slot].generation != handle.generation then
+			return .None
+		return .Some(self.slots[slot].place as i64)
+	}
+
+	// Frees a slot whose value is going: its generation turns even, and it
+	// heads the free list; or, where it has had its last generation, it is
+	// retired and never used again.
+	var fn vacate(slot: u32) = {
+		val at = slot as i64
+		if self.slots[at].generation == LAST_GENERATION {
+			self.slots[at] = Slot(generation: 0, place: NO_SLOT)
+			return
+		}
+		self.slots[at] = Slot(generation: self.slots[at].generation + 1, place: self.free)
+		self.free = slot
+	}
+}
+
+// An arena's values, each cloned, under the same handles: a handle names
+// the same value in the copy.
+extend Arena<T: Clone, K>: Clone {
+	fn clone(): Arena<T, K> = {
+		var entries: Vec<ArenaEntry<T, K>> = Vec::withCapacity(self.len())
+		for entry in self.row.entries {
+			entries.push(ArenaEntry(handle: entry.handle, value: entry.value.clone()))
+		}
+		return Arena(
+			slots: self.slots.clone(),
+			free: self.free,
+			row: ArenaValues(entries: move entries),
+		)
+	}
+}

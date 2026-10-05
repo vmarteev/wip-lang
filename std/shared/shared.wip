@@ -1,0 +1,175 @@
+// A value several owners hold, read by all of them and changed by none:
+// what a compiled function's code is to the function and
+// to every call of it running, what an undo history's unchanged parts are
+// to each version. Answer 5 sketched it as `ref<T>`; it is a library.
+//
+// The value lives on the heap beside two counts. `Shared::of` makes the
+// first owner; `share()` makes another, and that is the only place a count
+// goes up, so a line that shares says so. Each owner reads the value
+// through a `&T` for as long as it holds it. The last to let go drops the
+// value, and the memory goes with the last `Weak` — a link back that does
+// not keep the value, as a child's to its parent.
+//
+// Nothing is written through a `Shared`: `edit()` writes the value in place
+// where nothing else holds it, and otherwise copies it first, so the owner
+// that edits holds a value of its own. The counts are atomic, so owners may
+// be on different threads; the value they share is only read.
+
+import std::sync::{Atomic}
+
+/// What the heap holds: the counts and the value.
+struct Header<T> {
+	// How many `Shared` hold the value.
+	strong: Atomic<i64>
+	// How many `Weak` there are, and one more for every `Shared` together,
+	// so that whoever brings it to nothing frees the memory.
+	weak: Atomic<i64>
+	// Nothing once the last `Shared` has gone, while a `Weak` remains.
+	value: Option<T>
+}
+
+/// A value several owners hold, and read.
+pub struct Shared<T> {
+	// Nothing only while the `Shared` is ending: `destroy` takes it, to free
+	// it or to leave it to the others.
+	held: Option<own<Header<T>>>
+}
+
+/// A link to a shared value that does not keep it: `upgrade()` is a
+/// `Shared` while one remains, and nothing after.
+pub struct Weak<T> {
+	held: Option<own<Header<T>>>
+}
+
+extend Shared<T> {
+	/// `value`, on the heap, held by this one owner.
+	pub static fn of(value: T): Shared<T> = Shared(
+		held: .Some(own Header(
+			strong: Atomic::of(1),
+			weak: Atomic::of(1),
+			value: .Some(move value),
+		)),
+	)
+
+	/// The value, to read, for as long as this owner holds it.
+	@inline
+	pub fn value(): &T = lend assumed(&assumed(&self.held).value)
+
+	/// Another owner of the value: the one place a count goes up.
+	pub fn share(): Shared<T> = {
+		self.header().strong.add(1)
+		return Shared(held: .Some(again(&assumed(&self.held))))
+	}
+
+	/// A link to the value that does not keep it.
+	pub fn downgrade(): Weak<T> = {
+		self.header().weak.add(1)
+		return Weak(held: .Some(again(&assumed(&self.held))))
+	}
+
+	/// How many `Shared` hold the value: this one and the others.
+	pub fn owners(): i64 = self.header().strong.load()
+
+	/// Whether `other` holds the same value, rather than an equal one.
+	pub fn same(other: &Shared<T>): bool =
+		boxAddress<Header<T>>(&assumed(&self.held)) == boxAddress<Header<T>>(&assumed(&other.held))
+
+	fn header(): &Header<T> = lend assumed(&self.held)
+}
+
+extend Shared<T: Clone> {
+	/// The value, to write: in place where this owner is the only one and
+	/// no `Weak` links to it; otherwise a copy, which this owner holds
+	/// alone from here on, and the others keep what they had.
+	pub var fn edit(): &var T = {
+		val alone = self.header().strong.load() == 1 && self.header().weak.load() == 1
+		if !alone {
+			val copy = self.value().clone()
+			var mine = Shared::of(move copy)
+			// The old one is let go as an owner is, by ending.
+			val theirs = Shared(held: self.held.take())
+			self.held = mine.held.take()
+			destroy(move theirs)
+		}
+		lend assumedVar(&var assumedVar(&var self.held).value)
+	}
+}
+
+// The last owner drops the value; the memory goes with the last `Weak`,
+// or with it where there is none.
+extend Shared<T>: Destroy {
+	var fn destroy() = {
+		val .Some(held) = self.held.take() else {
+			return
+		}
+		if held.strong.subtract(1) != 1 {
+			// Others hold it still: this box is theirs too.
+			intoAddress(move held)
+			return
+		}
+		var last = move held
+		destroy(last.value.take())
+		release(move last)
+	}
+}
+
+extend Weak<T> {
+	/// An owner of the value, where one remains; nothing once the last has
+	/// let go.
+	pub fn upgrade(): Option<Shared<T>> = {
+		val header: &Header<T> = &assumed(&self.held)
+		while true {
+			val owners = header.strong.load()
+			if owners == 0 then return .None
+			if header.strong.replaceIf(owners, owners + 1) then
+				return .Some(Shared(held: .Some(again(&assumed(&self.held)))))
+		}
+		return .None
+	}
+}
+
+extend Weak<T>: Destroy {
+	var fn destroy() = {
+		val .Some(held) = self.held.take() else {
+			return
+		}
+		release(move held)
+	}
+}
+
+/// Lets go of the weak count a box holds: frees it where that was the
+/// last, and leaves it to the rest otherwise.
+fn release<T>(held: own<Header<T>>) = {
+	if held.weak.subtract(1) != 1 then intoAddress(move held)
+}
+
+/// Another `own` of the box `held` is, which the counts say is shared: it
+/// is let go by `destroy`, never dropped by more than one.
+fn again<T>(held: &own<Header<T>>): own<Header<T>> = fromAddress<Header<T>>(
+	boxAddress<Header<T>>(&held) as ptr<u8>,
+)
+
+// What an owner's `held` and its header's `value` hold, not checked. While
+// an owner is held, both hold something: `held` is empty only while its
+// `destroy` runs, and `value` only once the last owner's has, when no owner
+// is left to read it. A `Weak` reads only `held`, which is its own.
+
+/// What `option` holds, lent to read; it must hold something.
+@intrinsic
+fn assumed<T>(option: &Option<T>): &T
+
+/// What `option` holds, lent to write; it must hold something.
+@intrinsic
+fn assumedVar<T>(option: &var Option<T>): &var T
+
+/// The box an `own` holds, as an address the `own` keeps.
+@intrinsic
+fn boxAddress<T>(value: &own<T>): ptr<void>
+
+/// The box, given up: nothing frees it until `fromAddress` has it back.
+@intrinsic
+fn intoAddress<T>(value: own<T>): ptr<u8>
+
+/// The box at an address, owned again.
+@intrinsic
+fn fromAddress<T>(address: ptr<u8>): own<T>

@@ -1,0 +1,186 @@
+// `std::args` reads a program's arguments as `getopt_long` does: clusters,
+// values attached or apart, `--name=value`, `--`, `-`, and options in any
+// order. Each test gives it the arguments a program would get, the
+// program's name first.
+
+import std::args::{Argument, ArgumentError, Arguments}
+
+/// What a program that takes `-o`/`--output` with a value, and anything
+/// else as a flag, makes of `args`, one word each: `-v`, `--name`,
+/// `o=value`, `[positional]`, or the error it stopped at.
+fn seen(args: &[cstring]): String = {
+	var out = String()
+	var arguments = Arguments::of(&args)
+	while true {
+		val next = match arguments.next() {
+			.Ok(next) => next
+			.Err(error) => {
+				if !out.isEmpty() then out.push(" ")
+				out.push("error: \(error)")
+				return move out
+			}
+		}
+		val .Some(argument) = next else {
+			return move out
+		}
+		if !out.isEmpty() then out.push(" ")
+		match argument {
+			.Short('o') | .Long("output") => match arguments.value() {
+				.Ok(value) => out.push("o=\(value)")
+				.Err(error) => {
+					out.push("error: \(error)")
+					return move out
+				}
+			}
+			.Short(name) => out.push("-\(name)")
+			.Long(name) => out.push("--\(name)")
+			.Positional(text) => out.push("[\(text)]")
+		}
+	}
+	return move out
+}
+
+@test
+fn argsReadClustersOfShortOptions() = {
+	val args: [cstring; 2] = ["prog", "-abc"]
+	assert(seen(&args) == "-a -b -c")
+	val unicode: [cstring; 2] = ["prog", "-éx"]
+	assert(seen(&unicode) == "-é -x")
+}
+
+@test
+fn argsReadAValueAttachedOrApart() = {
+	val apart: [cstring; 3] = ["prog", "-o", "file"]
+	assert(seen(&apart) == "o=file")
+	val attached: [cstring; 2] = ["prog", "-ofile"]
+	assert(seen(&attached) == "o=file")
+	val inCluster: [cstring; 3] = ["prog", "-vo", "file"]
+	assert(seen(&inCluster) == "-v o=file")
+	val restOfCluster: [cstring; 2] = ["prog", "-vofile"]
+	assert(seen(&restOfCluster) == "-v o=file")
+	// Only a long option's `=` divides its name from its value.
+	val equals: [cstring; 2] = ["prog", "-o=x"]
+	assert(seen(&equals) == "o==x")
+}
+
+@test
+fn argsReadLongOptionsWithAndWithoutEquals() = {
+	val equals: [cstring; 3] = ["prog", "--output=a.txt", "--verbose"]
+	assert(seen(&equals) == "o=a.txt --verbose")
+	val apart: [cstring; 3] = ["prog", "--output", "a.txt"]
+	assert(seen(&apart) == "o=a.txt")
+	val empty: [cstring; 2] = ["prog", "--output="]
+	assert(seen(&empty) == "o=")
+}
+
+@test
+fn argsTakeTheNextArgumentAsAValueWhateverItLooksLike() = {
+	val dash: [cstring; 3] = ["prog", "-o", "-"]
+	assert(seen(&dash) == "o=-")
+	val option: [cstring; 3] = ["prog", "--output", "-v"]
+	assert(seen(&option) == "o=-v")
+	val negative: [cstring; 3] = ["prog", "-o", "-5"]
+	assert(seen(&negative) == "o=-5")
+}
+
+@test
+fn argsEndOptionsAtTwoDashes() = {
+	val args: [cstring; 5] = ["prog", "-v", "--", "-x", "--y"]
+	assert(seen(&args) == "-v [-x] [--y]")
+}
+
+@test
+fn argsReadOneDashAndAnyOrder() = {
+	val args: [cstring; 5] = ["prog", "a.txt", "-", "-v", "b.txt"]
+	assert(seen(&args) == "[a.txt] [-] -v [b.txt]")
+	val none: [cstring; 1] = ["prog"]
+	assert(seen(&none) == "")
+	// A negative number on its own reads as an option.
+	val negative: [cstring; 2] = ["prog", "-5"]
+	assert(seen(&negative) == "-5")
+}
+
+@test
+fn argsSayWhatIsWrongInWords() = {
+	val missing: [cstring; 2] = ["prog", "-o"]
+	assert(seen(&missing) == "error: `-o` needs a value")
+	val missingLong: [cstring; 2] = ["prog", "--output"]
+	assert(seen(&missingLong) == "error: `--output` needs a value")
+	val unwanted: [cstring; 3] = ["prog", "--verbose=yes", "x"]
+	assert(seen(&unwanted) == "--verbose error: `--verbose` takes no value, and was given `yes`")
+	assert("\(Argument::Short('x').unexpected())" == "`-x` is not an option")
+	assert("\(Argument::Long("frobnicate").unexpected())" == "`--frobnicate` is not an option")
+	assert("\(Argument::Positional("extra").unexpected())" == "unexpected argument `extra`")
+}
+
+@test
+fn argsReadNumbers() = {
+	val args: [cstring; 5] = ["prog", "-n", "12", "--ratio=0.5", "-n0x"]
+	var arguments = Arguments::of(&args)
+	assert(arguments.next() == .Ok(.Some(.Short('n'))))
+	assert(arguments.int() == .Ok(12))
+	assert(arguments.next() == .Ok(.Some(.Long("ratio"))))
+	assert(arguments.float() == .Ok(0.5))
+	assert(arguments.next() == .Ok(.Some(.Short('n'))))
+	val .Err(error) = arguments.int() else {
+		assert(false, "`0x` is not a number")
+		return
+	}
+	assert(error == .NotANumber(option: "-n", value: "0x", error: .BadDigit(at: 1)))
+	assert("\(error)" == "`-n` takes a number, and `0x` is not one: not a digit at 1")
+	val hex: [cstring; 3] = ["prog", "--mask", "ff"]
+	var masks = Arguments::of(&hex)
+	assert(masks.next() == .Ok(.Some(.Long("mask"))))
+	assert(masks.int(radix: 16) == .Ok(255))
+}
+
+@test
+fn argsReadAnOptionalValueOnlyWhereItIsWritten() = {
+	val args: [cstring; 4] = ["prog", "--color=always", "--color", "-cnever"]
+	var arguments = Arguments::of(&args)
+	assert(arguments.next() == .Ok(.Some(.Long("color"))))
+	assert(arguments.optionalValue() == .Some("always"))
+	assert(arguments.next() == .Ok(.Some(.Long("color"))))
+	assert(arguments.optionalValue().isNone())
+	assert(arguments.next() == .Ok(.Some(.Short('c'))))
+	assert(arguments.optionalValue() == .Some("never"))
+	assert(arguments.next() == .Ok(.None))
+}
+
+@test
+fn argsHandTheRestOnAsItIs() = {
+	val args: [cstring; 5] = ["prog", "-v", "run", "-x", "--y"]
+	var arguments = Arguments::of(&args)
+	assert(arguments.next() == .Ok(.Some(.Short('v'))))
+	assert(arguments.next() == .Ok(.Some(.Positional("run"))))
+	assert(arguments.rest() == Vec::of(own ["-x", "--y"]))
+	assert(arguments.next() == .Ok(.None))
+}
+
+@test
+fn argsReadASubcommandsOwnOptions() = {
+	val args: [cstring; 4] = ["prog", "build", "--release", "game"]
+	var arguments = Arguments::of(&args)
+	assert(arguments.program() == "prog")
+	val .Ok(.Some(.Positional(command))) = arguments.next() else {
+		assert(false, "a subcommand comes first")
+		return
+	}
+	assert(command == "build")
+	assert(build(&var arguments) == .Ok("game, released"))
+	val none: [cstring; 0] = []
+	assert(Arguments::of(&none).program() == "")
+}
+
+fn build(arguments: &var Arguments): Result<String, ArgumentError> = {
+	var release = false
+	var target = ""
+	while arguments.next()? is .Some(argument) {
+		match argument {
+			.Long("release") => release = true
+			.Positional(name) => target = name
+			_ => return .Err(argument.unexpected())
+		}
+	}
+	return .Ok("\(target), \(if release then "released" else "debug")")
+}

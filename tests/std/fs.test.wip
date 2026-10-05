@@ -1,0 +1,208 @@
+// `std::fs`: what a path is, what a directory holds, and what the
+// filesystem says about a file. The tests read the repository they are
+// run from, and write only into a directory of their own making.
+
+import std::fs
+import std::io
+import std::net::{Listener}
+import std::path
+import std::process::{Command, Exit}
+
+/// Where the tests write: a directory beside the program, made once.
+val SCRATCH: str = "target/fs-tests"
+
+fn scratch(): str = {
+    if !fs::exists(SCRATCH) {
+        fs::makeDir(SCRATCH)
+    }
+    SCRATCH
+}
+
+@test
+fn fsReadsADirectory() = {
+    val .Ok(entries) = fs::readDir("std/collections") else {
+        assert(false, "the standard library's collections are there")
+        return
+    }
+    assert(entries.len() >= 2, "map.wip and set.wip at least")
+    var names: Vec<str> = Vec()
+    for entry in entries.items() {
+        names.push(entry.name.toStr())
+        assert(entry.kind == .File, "every one of them is a file")
+    }
+    assert(names.contains("map.wip"))
+    assert(names.contains("set.wip"))
+    // `.` and `..` are not entries: every caller would drop them.
+    assert(!names.contains("."))
+    assert(!names.contains(".."))
+}
+
+@test
+fn fsSaysWhatAPathIs() = {
+    val .Ok(directory) = fs::meta("std") else {
+        assert(false, "`std` is a directory here")
+        return
+    }
+    assert(directory.kind == .Directory)
+    assert(directory.isDirectory() && !directory.isFile())
+
+    val .Ok(file) = fs::meta("std/prelude/option.wip") else {
+        assert(false, "the prelude's option is a file")
+        return
+    }
+    assert(file.kind == .File)
+    assert(file.size > 100, "a file with something in it")
+    assert(file.modified > 1600000000, "written after 2020")
+    assert(file.mode > 0, "and readable by someone")
+}
+
+@test
+fn fsAnswersNothingForWhatIsNotThere() = {
+    assert(fs::meta("no/such/path").isErr())
+    assert(!fs::exists("no/such/path"))
+    assert(fs::readDir("no/such/directory").isErr())
+    assert(fs::exists("std/prelude/option.wip"))
+}
+
+@test
+fn fsMakesADirectoryAndReadsItBack() = {
+    val root = scratch()
+    var path = String::of(root)
+    path.push("/made")
+    // A run before this one may have made it, or the other build's run
+    // beside this one; the test is about what is there afterwards either
+    // way.
+    match fs::makeDir(path.toStr()) {
+        .Ok(..) => {}
+        .Err(.AlreadyExists) => {}
+        .Err(error) => assert(false, "a directory can be made: \(error)")
+    }
+    val .Ok(made) = fs::meta(path.toStr()) else {
+        assert(false, "it is there once it is made")
+        return
+    }
+    assert(made.isDirectory())
+    // Making it again fails: nothing is replaced without being asked.
+    assert(fs::makeDir(path.toStr()).isErr())
+}
+
+@test
+fn fsFollowsALinkOrLooksAtIt() = {
+    // A link to the directory it is in.
+    val link = freshFile("link")
+    fs::removeFile(link.toStr())
+    val made: Result<Exit, io::IoError> = Command::of("ln").arg("-s").arg(".").arg(link.toStr()).run()
+    assert(made == .Ok(.Code(0)), "ln is there")
+    val .Ok(followed) = fs::meta(link.toStr()) else {
+        assert(false, "a link is followed")
+        return
+    }
+    val .Ok(itself) = fs::linkMeta(link.toStr()) else {
+        assert(false, "a link is looked at")
+        return
+    }
+    assert(followed.kind == .Directory, "followed, it is the directory")
+    assert(itself.kind == .Link, "looked at, it is a link")
+    fs::removeFile(link.toStr())
+}
+
+/// A file of its own in the scratch directory, made empty, and its name.
+/// The name is claimed by making the file, where nothing may be there yet:
+/// the tests run in two processes at once, debug and release, and a name
+/// that was free when asked may not be when made.
+fn freshFile(stem: str): String = {
+    var n = 0
+    while true {
+        val name = "\(scratch())/\(stem)-\(n).txt"
+        match fs::File::createNew(name.toStr()) {
+            .Ok(..) => return move name
+            .Err(.AlreadyExists) => n += 1
+            .Err(error) => panic("the scratch directory takes a file: \(error)")
+        }
+    }
+    return String()
+}
+
+@test
+fn fsSaysWhichFileAPathIs() = {
+    // The same file answers the same device and inode each time it is
+    // asked about, and two files answer two.
+    val (.Ok(first), .Ok(again), .Ok(other)) = (fs::meta("std/fs/fs.wip"), fs::meta("std/fs/fs.wip"), fs::meta("std/io/io.wip")) else {
+        assert(false, "the standard library's sources are there")
+        return
+    }
+    assert(first.inode == again.inode && first.device == again.device, "one file is one identity")
+    assert(first.inode != other.inode || first.device != other.device, "two files are two")
+}
+
+@test
+fn fsMakesANewFileAndNoOtherWay() = {
+    // `freshFile` made it with `createNew`, where nothing was.
+    val path = freshFile("new")
+    assert(fs::File::createNew(path.toStr()) is .Err(.AlreadyExists), "and it is refused the second time")
+    assert(fs::removeFile(path.toStr()).isOk())
+}
+
+@test
+fn fsRemovesAFileAndNotADirectory() = {
+    val path = freshFile("removed")
+    assert(fs::writeFile(path.toStr(), "gone soon").isOk())
+    assert(fs::removeFile(path.toStr()).isOk(), "a file is removed")
+    assert(!fs::exists(path.toStr()), "and is not there after")
+    assert(fs::removeFile(path.toStr()) is .Err(.NotFound), "nor the second time")
+    assert(fs::removeFile(scratch()).isErr(), "a directory is not a file")
+}
+
+@test
+fn fsReadsAFileWhereItIsAsked() = {
+    val path = freshFile("at")
+    assert(fs::writeFile(path.toStr(), "0123456789").isOk())
+    val .Ok(file) = fs::File::open(path.toStr()) else {
+        assert(false, "it was just written")
+        return
+    }
+    assert(file.size() is .Ok(10))
+    var into: [u8; 4] = [0; 4]
+    assert(file.readAt(0, &var into) is .Ok(4))
+    assert(str::fromBytes(&into) == "0123")
+    assert(file.readAt(7, &var into) is .Ok(3), "the end comes first")
+    assert(str::fromBytes(&into[0..3]) == "789")
+    assert(file.readAt(3, &var into) is .Ok(4), "and nothing moved")
+    assert(str::fromBytes(&into) == "3456")
+    assert(file.readAt(10, &var into) is .Ok(0))
+    assert(file.readAt(100, &var into) is .Ok(0))
+    destroy(move file)
+    assert(fs::removeFile(path.toStr()).isOk())
+}
+
+@test
+fn fsSaysWhatSpecialFilesAre() = {
+    // A pipe, a socket and a character device, by `meta` and by what a
+    // directory's entries say.
+    val pipe = freshFile("pipe")
+    fs::removeFile(pipe.toStr())
+    val made: Result<Exit, io::IoError> = Command::of("mkfifo").arg(pipe.toStr()).run()
+    assert(made == .Ok(.Code(0)), "mkfifo is there")
+    val socketPath = freshFile("socket")
+    fs::removeFile(socketPath.toStr())
+    val listener = Listener::unix(socketPath.toStr()).unwrap()
+    assert(fs::meta(pipe.toStr()) is .Ok(meta) && meta.kind == .Pipe)
+    assert(fs::meta(socketPath.toStr()) is .Ok(meta) && meta.kind == .Socket)
+    assert(fs::meta("/dev/null") is .Ok(meta) && meta.kind == .CharDevice)
+    assert(fs::Kind::Pipe.isSpecial() && fs::Kind::BlockDevice.isSpecial())
+    assert(!fs::Kind::File.isSpecial() && !fs::Kind::Link.isSpecial())
+    val .Ok(entries) = fs::readDir(scratch()) else {
+        assert(false, "the scratch directory lists")
+        return
+    }
+    for entry in entries.items() {
+        if path::name(pipe.toStr()) == entry.name.toStr() {
+            assert(entry.kind == .Pipe)
+        }
+        if path::name(socketPath.toStr()) == entry.name.toStr() {
+            assert(entry.kind == .Socket)
+        }
+    }
+    fs::removeFile(pipe.toStr())
+    fs::removeFile(socketPath.toStr())
+}

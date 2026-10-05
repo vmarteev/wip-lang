@@ -1,0 +1,152 @@
+// 128-bit division, and 128-bit integers to and from floats: what the
+// code generator cannot emit on every target, and so
+// calls by name, as it called the C that did this before.
+// A 128-bit value crosses as its two 64-bit halves, low first, and an
+// answer is written to where `out` points.
+//
+// Nothing here may divide a 128-bit integer or convert one to or from a
+// float, since that is a call back into this file.
+
+import std::libc::{abort}
+
+val TWO_TO_64: f64 = 18446744073709551616.0
+val TWO_TO_127: f64 = 170141183460469231731687303715884105728.0
+val TWO_TO_128: f64 = 340282366920938463463374607431768211456.0
+
+fn joined(low: u64, high: u64): u128 = ((high as u128) << 64) | (low as u128)
+
+fn written(value: u128, out: ptr<u64>) = {
+	out[0] = value as u64
+	out[1] = (value >> 64) as u64
+}
+
+fn isNegative(bits: u128): bool = (bits >> 127) != 0
+
+// Minus a two's-complement value: its magnitude where it is negative,
+// and the most negative value is its own.
+fn negated(bits: u128): u128 = 0 -% bits
+
+// Long division of the magnitudes, a bit at a time, the quotient and the
+// remainder at once; by 64-bit division where both fit in 64 bits.
+fn divided(dividend: u128, divisor: u128, remainder: bool): u128 = {
+	if (dividend >> 64) == 0 && (divisor >> 64) == 0 {
+		val a = dividend as u64
+		val b = divisor as u64
+		return if remainder then (a % b) as u128 else (a / b) as u128
+	}
+	var quotient: u128 = 0
+	var left: u128 = 0
+	var bit: u128 = 128
+	while bit > 0 {
+		bit -= 1
+		// The bit shifted out of the top is what says `left` is past the
+		// divisor even where it no longer looks it.
+		val carried = isNegative(left)
+		left = (left << 1) | ((dividend >> bit) & 1)
+		if carried || left >= divisor {
+			left = left -% divisor
+			quotient = quotient | ((1 as u128) << bit)
+		}
+	}
+	return if remainder then left else quotient
+}
+
+/// `op` is 0 for unsigned division, 1 for unsigned remainder, 2 for signed
+/// division and 3 for signed remainder. Division by zero, and the most
+/// negative value divided by -1, end the program as 64-bit division does.
+@export("C")
+fn wip_int128_div(aLow: u64, aHigh: u64, bLow: u64, bHigh: u64, op: i64, out: ptr<u64>) = {
+	val a = joined(aLow, aHigh)
+	val b = joined(bLow, bHigh)
+	if b == 0 then abort()
+	if op < 2 {
+		written(divided(a, b, op == 1), out)
+		return
+	}
+	val minusOne = 0 -% (1 as u128)
+	if a == ((1 as u128) << 127) && b == minusOne then abort()
+	val aMagnitude = if isNegative(a) then negated(a) else a
+	val bMagnitude = if isNegative(b) then negated(b) else b
+	val answer = divided(aMagnitude, bMagnitude, op == 3)
+	// A quotient is negative where the signs differ, and a remainder has
+	// the dividend's sign.
+	val negative = if op == 2 then isNegative(a) != isNegative(b) else isNegative(a)
+	written(if negative then negated(answer) else answer, out)
+}
+
+// How far a magnitude must be shifted right to fit in 64 bits.
+fn excess(magnitude: u128): u128 = {
+	var shift: u128 = 0
+	while (magnitude >> shift) >> 64 != 0 {
+		shift += 1
+	}
+	return shift
+}
+
+// Its top 64 bits, the lowest of them set where any bit below them was:
+// rounded to a float from there, it is rounded once, as from the whole.
+fn topBits(magnitude: u128, shift: u128): u64 = {
+	val lost = magnitude & (((1 as u128) << shift) -% 1)
+	val top = (magnitude >> shift) as u64
+	return if shift > 0 && lost != 0 then top | 1 else top
+}
+
+fn toF64(magnitude: u128): f64 = {
+	val shift = excess(magnitude)
+	var value = topBits(magnitude, shift) as f64
+	for i in 0..shift as i64 {
+		value = value * 2.0
+	}
+	return value
+}
+
+fn toF32(magnitude: u128): f32 = {
+	val shift = excess(magnitude)
+	var value = topBits(magnitude, shift) as f32
+	for i in 0..shift as i64 {
+		value = value * 2.0
+	}
+	return value
+}
+
+/// `flags` has bit 0 set for a signed integer, and bit 1 where the float is
+/// an `f32`, which is rounded to one here so that it is not rounded twice.
+@export("C")
+fn wip_int128_to_float(low: u64, high: u64, flags: i64): f64 = {
+	val bits = joined(low, high)
+	val negative = (flags & 1) != 0 && isNegative(bits)
+	val magnitude = if negative then negated(bits) else bits
+	val value = if (flags & 2) != 0 then toF32(magnitude) as f64 else toF64(magnitude)
+	return if negative then -value else value
+}
+
+// A float at least 0 and less than 2^128, toward zero.
+fn truncated(value: f64): u128 = {
+	if value < TWO_TO_64 then return (value as u64) as u128
+	// A float this large is a whole number, and its halves are floats
+	// exactly.
+	val high = (value / TWO_TO_64) as u64
+	val low = (value - (high as f64) * TWO_TO_64) as u64
+	return joined(low, high)
+}
+
+/// Toward zero, saturating at the ends of the range, with NaN becoming 0,
+/// as `as` does for the other integer types.
+@export("C")
+fn wip_float_to_int128(value: f64, isSigned: i64, out: ptr<u64>) = {
+	val answer: u128 = if value != value {
+		0
+	} else if isSigned != 0 {
+		if value >= TWO_TO_127 then ((1 as u128) << 127) - 1
+		else if value <= -TWO_TO_127 then (1 as u128) << 127
+		else if value < 0.0 then negated(truncated(-value))
+		else truncated(value)
+	} else if value <= 0.0 {
+		0
+	} else if value >= TWO_TO_128 {
+		0 -% (1 as u128)
+	} else {
+		truncated(value)
+	}
+	written(answer, out)
+}

@@ -1,0 +1,106 @@
+// The logarithm to base 10 of an `f64`, ported from musl's
+// libm by way of the `libm` crate, which keep FreeBSD's msun, which is
+// Sun's fdlibm. The natural logarithm and the logarithm to base 2 are
+// Arm's, which has no `log10` of its own:
+//
+// ====================================================
+// Copyright (C) 1993 by Sun Microsystems, Inc. All rights reserved.
+//
+// Developed at SunSoft, a Sun Microsystems, Inc. business.
+// Permission to use, copy, modify, and distribute this
+// software is freely granted, provided that this notice
+// is preserved.
+// ====================================================
+//
+// musl's and the `libm` crate's changes are MIT-licensed. Within an ulp.
+//
+// It writes x as 2^k (1 + f) with 1 + f in [√2/2, √2], and log(1 + f) as
+// f - f²/2 + s (f²/2 + R(s²)), where s = f/(2 + f).
+
+val LOG_TERMS: [f64; 7] = [
+	6.666666666666735130e-01, 3.999999999940941908e-01, 2.857142874366239149e-01,
+	2.222219843214978396e-01, 1.818357216161805012e-01, 1.531383769920937332e-01,
+	1.479819860511658591e-01,
+]
+
+/// x as 2^k (1 + f): what is left when there is no logarithm to take —
+/// zero, a negative number, infinity or NaN — or `k` and `f`.
+enum Reduced {
+	Answer(value: f64)
+	Parts(exponent: i64, fraction: f64)
+}
+
+@inline
+fn reduced(x0: f64): Reduced = {
+	var x = x0
+	var bits = x.toBits()
+	var hx = (bits >> 32) as i64
+	var k = 0
+	// x < 2^-1022, or negative
+	if hx < 0x00100000 || (hx >> 31) != 0 {
+		// log(±0) = -∞
+		if bits << 1 == 0 then return .Answer(-1.0 / (x * x))
+		// log(negative) = NaN
+		if (hx >> 31) != 0 then return .Answer((x - x) / 0.0)
+		// Subnormal: scaled up.
+		k -= 54
+		x *= 18014398509481984.0
+		bits = x.toBits()
+		hx = (bits >> 32) as i64
+	} else if hx >= 0x7ff00000 {
+		return .Answer(x)
+	} else if hx == 0x3ff00000 && bits << 32 == 0 {
+		return .Answer(0.0)
+	}
+	// Into [√2/2, √2].
+	hx += 0x3ff00000 - 0x3fe6a09e
+	k += (hx >> 20) - 0x3ff
+	hx = (hx & 0x000fffff) + 0x3fe6a09e
+	bits = ((hx as u64) << 32) | (bits & 0xffffffff)
+	return .Parts(exponent: k, fraction: f64::fromBits(bits) - 1.0)
+}
+
+/// s (f²/2 + R(s²)), where s = f/(2 + f), and f²/2.
+@inline
+fn logTail(f: f64): (f64, f64) = {
+	val hfsq = 0.5 * f * f
+	val s = f / (2.0 + f)
+	val z = s * s
+	val w = z * z
+	val t1 = w * (LOG_TERMS[1] + w * (LOG_TERMS[3] + w * LOG_TERMS[5]))
+	val t2 = z * (LOG_TERMS[0] + w * (LOG_TERMS[2] + w * (LOG_TERMS[4] + w * LOG_TERMS[6])))
+	return (s * (hfsq + (t2 + t1)), hfsq)
+}
+
+/// log(1 + f) as hi + lo, hi having the upper 32 bits only, so that a
+/// product with it is exact.
+@inline
+fn splitLog(f: f64): (f64, f64) = {
+	val (tail, hfsq) = logTail(f)
+	val hi = f64::fromBits((f - hfsq).toBits() & 0xFFFFFFFF00000000)
+	val lo = f - hi - hfsq + tail
+	return (hi, lo)
+}
+
+/// 1/ln 10 and log10(2), and what each leaves out.
+val INV_LN10_HI: f64 = 4.34294481878168880939e-01
+val INV_LN10_LO: f64 = 2.50829467116452752298e-11
+val LOG10_2_HI: f64 = 3.01029995663611771306e-01
+val LOG10_2_LO: f64 = 3.69423907715893078616e-13
+
+/// log10(x); -∞ at zero, NaN below it.
+fn logarithm10(x: f64): f64 = {
+	val (k, f) = match reduced(x) {
+		.Answer(value) => return value
+		.Parts(exponent, fraction) => (exponent, fraction)
+	}
+	val (hi, lo) = splitLog(f)
+	var valHi = hi * INV_LN10_HI
+	val dk = k as f64
+	val y = dk * LOG10_2_HI
+	var valLo = dk * LOG10_2_LO + (lo + hi) * INV_LN10_LO + lo * INV_LN10_HI
+	val w = y + valHi
+	valLo += (y - w) + valHi
+	valHi = w
+	return valLo + valHi
+}

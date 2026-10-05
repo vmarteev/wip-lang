@@ -1,0 +1,515 @@
+// Files. A `File` owns its descriptor and closes it where it ends, which is
+// what `Destroy` is for, and holds the reader that `std::io` gives it — the
+// bytes read and not yet given out, which somebody has to keep.
+
+import std::io
+import std::libc
+
+/// An open file, closed where it ends.
+pub struct File {
+	reader: io::Reader
+}
+
+extend File: Destroy {
+	var fn destroy() = {
+		libc::close(io::descriptorOf(&self.reader))
+	}
+}
+
+/// How a file is opened.
+enum Opening {
+	/// An existing file, to read.
+	Read
+	/// A file to write, made if it is not there and emptied if it is.
+	Create
+	/// A file to write at the end of, made if it is not there.
+	Append
+	/// A file to write, made, where nothing may be there yet.
+	CreateNew
+}
+
+extend File {
+	/// An existing file, to read.
+	pub static fn open(path: str): Result<File, io::IoError> = opened(path, .Read)
+
+	/// A file to write, made if it is not there and emptied if it is.
+	pub static fn create(path: str): Result<File, io::IoError> = opened(path, .Create)
+
+	/// A file to write at the end of, made if it is not there.
+	pub static fn append(path: str): Result<File, io::IoError> = opened(path, .Append)
+
+	/// A new file to write, which fails with `.AlreadyExists` where
+	/// anything is there already, so that nothing is emptied by mistake.
+	pub static fn createNew(path: str): Result<File, io::IoError> = opened(path, .CreateNew)
+
+	/// The next line, appended to `into` without its line break. `false` at
+	/// the end of the file.
+	pub var fn readLine(into: &var String): Result<bool, io::IoError> = self.reader.readLine(
+		&var into,
+	)
+
+	/// The rest of the file, appended. What comes back is how many bytes.
+	pub var fn readAll(into: &var String): Result<i64, io::IoError> = self.reader.readAll(&var into)
+
+	/// The text, all of it: a write cut short is carried on with, since a
+	/// caller that has to loop for itself will one day forget.
+	pub var fn write(text: str): Result<void, io::IoError> = self.writeBytes(&text)
+
+	/// The same, for bytes that are not text.
+	pub var fn writeBytes(bytes: &[u8]): Result<void, io::IoError> = {
+		val fd = io::descriptorOf(&self.reader)
+		var start = 0
+		while start < bytes.len() {
+			val put = libc::write(fd, &bytes[start..bytes.len()])
+			if put < 0 {
+				// Cut short by a signal, which is tried again.
+				if io::lastError() == .Interrupted then continue
+				return .Err(io::lastError())
+			}
+			start += put
+		}
+		return .Ok()
+	}
+
+	/// Reads up to `into.len()` bytes from `offset`, and answers how many,
+	/// `0` at the end: C's `pread`. Nothing later reads from where it
+	/// stopped, so threads may read one file at once, each where it asks.
+	pub fn readAt(offset: i64, into: &var [u8]): Result<i64, io::IoError> = {
+		val fd = io::descriptorOf(&self.reader)
+		while true {
+			val got = libc::pread(fd, &var into, offset)
+			if got >= 0 then return .Ok(got)
+			if io::lastError() != .Interrupted then return .Err(io::lastError())
+		}
+		return .Ok(0)
+	}
+
+	/// How many bytes the file holds, as `fstat` says.
+	pub fn size(): Result<i64, io::IoError> = {
+		val stated = descriptorNumbers(io::descriptorOf(&self.reader))?
+		return .Ok(stated.size)
+	}
+}
+
+/// The whole file, as text. It opens, reads and closes: the `File` ends
+/// here, and its `destroy` is what closes it.
+pub fn readFile(path: str): Result<String, io::IoError> = {
+	var file = File::open(path)?
+	var text = String()
+	file.readAll(&var text)?
+	return .Ok(move text)
+}
+
+/// The text, as the whole of a file that is made or emptied first.
+pub fn writeFile(path: str, text: str): Result<void, io::IoError> = {
+	var file = File::create(path)?
+	file.write(text)?
+	return .Ok()
+}
+
+/// What a file made here may be: read and written by anyone, as the
+/// process's umask allows.
+val MADE_MODE: c_uint = 0o666
+
+fn opened(path: str, how: Opening): Result<File, io::IoError> = {
+	var name = String::of(path)
+	val c = name.toCstring()
+	val fd = match how {
+		.Read => libc::open(c, libc::O_RDONLY)
+		.Create => libc::open(c, libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC, MADE_MODE)
+		.Append => libc::open(c, libc::O_WRONLY | libc::O_CREAT | libc::O_APPEND, MADE_MODE)
+		.CreateNew => libc::open(c, libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL, MADE_MODE)
+	}
+	if fd < 0 then return .Err(io::lastError())
+	return .Ok(File(reader: io::reader(fd)))
+}
+
+/// What a path is: the three kinds a program acts on differently, and the
+/// special files a filesystem holds besides, which a file manager shows
+/// and does not open.
+@derive(Eq, Text)
+pub enum Kind {
+	File
+	Directory
+	Link
+	/// A named pipe, a FIFO.
+	Pipe
+	/// A Unix-domain socket.
+	Socket
+	/// A device read a character at a time: a terminal, `/dev/null`.
+	CharDevice
+	/// A device read in blocks: a disk.
+	BlockDevice
+	/// Anything else a filesystem may hold.
+	Other
+}
+
+extend Kind {
+	/// Whether it is none of a file, a directory and a link: what a copy or
+	/// a listing passes over or shows apart.
+	pub fn isSpecial(): bool = !(self is .File | .Directory | .Link)
+}
+
+/// What a filesystem says about a path: the part of `stat` a program acts
+/// on, read from the struct each system lays out its own way.
+@derive(Eq)
+pub struct Meta {
+	/// A file, a directory, a link or something else.
+	pub kind: Kind
+	/// In bytes, and for a directory whatever the filesystem says.
+	pub size: i64
+	/// When it last changed, in seconds since 1970.
+	pub modified: i64
+	/// The permission bits, as `chmod` writes them: `0o755`.
+	pub mode: i64
+	/// The filesystem it is on, as the system numbers it.
+	pub device: i64
+	/// Its number on that filesystem. `device` and `inode` together are
+	/// which file it is, whatever its name: what was listed as `a` is still
+	/// that file after a rename, and a new `a` is another.
+	pub inode: i64
+}
+
+/// One entry of a directory. The name is the entry's own, not a path.
+pub struct Entry {
+	/// The entry's name in its directory.
+	pub name: String
+	/// What the directory says it is; where the filesystem does not say,
+	/// what `lstat` does.
+	pub kind: Kind
+}
+
+extend Meta {
+	/// Whether the path is a directory, a link to one not followed.
+	pub fn isDirectory(): bool = self.kind == .Directory
+
+	/// Whether the path is a file, a link to one not followed.
+	pub fn isFile(): bool = self.kind == .File
+}
+
+extend Entry {
+	/// Whether this is a directory, which is what a listing sorts by.
+	pub fn isDirectory(): bool = self.kind == .Directory
+}
+
+/// What the filesystem says about `path`, following a symbolic link to
+/// what it points at.
+pub fn meta(path: str): Result<Meta, io::IoError> = metaOf(path, true)
+
+/// The same, about the link itself rather than what it points at.
+pub fn linkMeta(path: str): Result<Meta, io::IoError> = metaOf(path, false)
+
+/// Whether there is anything at `path`.
+pub fn exists(path: str): bool = meta(path).isOk()
+
+/// Where `path` really is: absolute, with no `.`, `..` or link on the way,
+/// as C's `realpath` answers; an error where there is nothing there.
+pub fn realPath(path: str): Result<String, io::IoError> = {
+	var name = String::of(path)
+	val found = libc::realpath(name.toCstring(), null)
+	if found.isNull then return .Err(io::lastError())
+	var out = String()
+	for i in 0..libc::strlen(found) as i64 {
+		out.pushByte(found[i])
+	}
+	libc::free(found)
+	return .Ok(move out)
+}
+
+/// The entries of a directory, in the order the filesystem gives them,
+/// without `.` and `..`. Sorting is the caller's.
+pub fn readDir(path: str): Result<Vec<Entry>, io::IoError> = {
+	var name = String::of(path)
+	val dir = opendir(name.toCstring())
+	if dir.isNull then return .Err(io::lastError())
+	var entries: Vec<Entry> = Vec()
+	while true {
+		// `readdir` answers null at the end and where it fails, and only
+		// `errno` tells them apart.
+		libc::errnoAt()[0] = 0
+		val entry = readdir(dir)
+		if entry.isNull {
+			if libc::errno() != 0 {
+				val why = io::lastError()
+				closedir(dir)
+				return .Err(why)
+			}
+			closedir(dir)
+			return .Ok(move entries)
+		}
+		// The name is C's, ended by a NUL within the room it has.
+		var text = String()
+		var i = 0
+		while entry.name[i] != 0 {
+			text.pushByte(entry.name[i])
+			i += 1
+		}
+		if text.toStr() == "." || text.toStr() == ".." then continue
+		val kind = kindOfEntry(entry.kind, path, text.toStr())
+		entries.push(Entry(name: move text, kind: kind))
+	}
+	closedir(dir)
+	return .Ok(move entries)
+}
+
+/// Makes a directory, and fails where one is already there.
+pub fn makeDir(path: str): Result<void, io::IoError> = {
+	var name = String::of(path)
+	// Read and entered by anyone, written by its owner, as the process's
+	// umask allows.
+	if libc::mkdir(name.toCstring(), 0o755) != 0 then return .Err(io::lastError())
+	return .Ok()
+}
+
+/// Removes a file, or a link without what it names; a directory is
+/// refused.
+pub fn removeFile(path: str): Result<void, io::IoError> = {
+	var name = String::of(path)
+	if libc::unlink(name.toCstring()) != 0 then return .Err(io::lastError())
+	return .Ok()
+}
+
+fn metaOf(path: str, following: bool): Result<Meta, io::IoError> = {
+	var name = String::of(path)
+	val stated = statNumbers(name.toCstring(), following)?
+	val mode = stated.mode
+	// The kind is in the mode's top bits, numbered alike on every system
+	// Wip targets.
+	val kind = match mode & 0o170000 {
+		0o100000 => Kind::File
+		0o040000 => Kind::Directory
+		0o120000 => Kind::Link
+		0o010000 => Kind::Pipe
+		0o140000 => Kind::Socket
+		0o020000 => Kind::CharDevice
+		0o060000 => Kind::BlockDevice
+		_ => Kind::Other
+	}
+	return .Ok(Meta(
+		kind: kind,
+		size: stated.size,
+		modified: stated.modified,
+		mode: mode & 0o7777,
+		device: stated.device,
+		inode: stated.inode,
+	))
+}
+
+/// What `stat` says, as numbers: the mode with its kind, the size, when it
+/// was last modified in seconds, and the device and inode that are which
+/// file it is.
+struct Stated {
+	mode: i64
+	size: i64
+	modified: i64
+	device: i64
+	inode: i64
+}
+
+// A directory entry's `d_type`, as the kind it stands for, numbered alike
+// on every system Wip targets. A filesystem that does not say is asked
+// with `lstat` instead.
+val DT_UNKNOWN: u8 = 0
+val DT_FIFO: u8 = 1
+val DT_CHR: u8 = 2
+val DT_DIR: u8 = 4
+val DT_BLK: u8 = 6
+val DT_REG: u8 = 8
+val DT_LNK: u8 = 10
+val DT_SOCK: u8 = 12
+
+fn kindOfEntry(code: u8, directory: str, name: str): Kind = match code {
+	DT_REG => .File
+	DT_DIR => .Directory
+	DT_LNK => .Link
+	DT_FIFO => .Pipe
+	DT_SOCK => .Socket
+	DT_CHR => .CharDevice
+	DT_BLK => .BlockDevice
+	DT_UNKNOWN => match linkMeta("\(directory)/\(name)") {
+		.Ok(meta) => meta.kind
+		.Err(..) => .Other
+	}
+	_ => .Other
+}
+
+// `stat` and `readdir` fill in structs each system lays out its own way.
+// Each is written here as far as the fields read, at the
+// offsets the system has them; what they are filled into is room enough
+// for the whole, which is at most 256 bytes on any of them.
+val ROOM: i64 = 256
+
+// A Mac's, the same on arm64 and x86-64, where the names with 64-bit inode
+// numbers are the ones with `$INODE64` after them.
+@target(vendor = "apple")
+extern struct Stat {
+	device: i32
+	mode: u16
+	links: u16
+	inode: u64
+	user: u32
+	group: u32
+	rdev: i32
+	accessed: [i64; 2]
+	modified: [i64; 2]
+	changed: [i64; 2]
+	born: [i64; 2]
+	size: i64
+}
+
+@target(vendor = "apple")
+extern struct Dirent {
+	inode: u64
+	seekOffset: u64
+	recordLength: u16
+	nameLength: u16
+	kind: u8
+	name: [u8; 1024]
+}
+
+@target(vendor = "apple", arch = "arm64")
+extern "C" {
+	fn stat(path: cstring, info: ptr<Stat>): c_int
+	fn lstat(path: cstring, info: ptr<Stat>): c_int
+	fn fstat(fd: c_int, info: ptr<Stat>): c_int
+	fn opendir(path: cstring): ptr<u8>
+	fn readdir(dir: ptr<u8>): ptr<Dirent>
+}
+
+@target(vendor = "apple", arch = "x86_64")
+extern "C" {
+	@symbol("stat$INODE64")
+	fn stat(path: cstring, info: ptr<Stat>): c_int
+	@symbol("lstat$INODE64")
+	fn lstat(path: cstring, info: ptr<Stat>): c_int
+	@symbol("fstat$INODE64")
+	fn fstat(fd: c_int, info: ptr<Stat>): c_int
+	@symbol("opendir$INODE64")
+	fn opendir(path: cstring): ptr<u8>
+	@symbol("readdir$INODE64")
+	fn readdir(dir: ptr<u8>): ptr<Dirent>
+}
+
+@target(vendor = "apple")
+fn statNumbers(path: cstring, following: bool): Result<Stated, io::IoError> = statInto((info) => {
+	return if following then stat(path, info) else lstat(path, info)
+})
+
+/// What the filesystem says about an open file.
+@target(vendor = "apple")
+fn descriptorNumbers(fd: c_int): Result<Stated, io::IoError> = statInto((info) => fstat(fd, info))
+
+/// What `call` fills in, into room it is given.
+@target(vendor = "apple")
+fn statInto(call: &(info: ptr<Stat>) => c_int): Result<Stated, io::IoError> = {
+	val info = libc::calloc(1, ROOM as size_t) as ptr<Stat>
+	if info.isNull then return .Err(io::lastError())
+	val got = call(info)
+	val answer: Result<Stated, io::IoError> =
+		if got == 0 then
+			.Ok(Stated(
+				mode: info.mode as i64,
+				size: info.size,
+				modified: info.modified[0],
+				device: info.device as i64,
+				inode: info.inode as i64,
+			))
+		else .Err(io::lastError())
+	libc::free(info as ptr<u8>)
+	return answer
+}
+
+// Linux's `statx`, whose struct is one on every architecture, as
+// `stat`'s is not.
+@target(os = "linux")
+extern struct Statx {
+	mask: u32
+	blockSize: u32
+	attributes: u64
+	links: u32
+	user: u32
+	group: u32
+	mode: u16
+	spare: u16
+	inode: u64
+	size: u64
+	blocks: u64
+	attributesMask: u64
+	accessed: [i64; 2]
+	born: [i64; 2]
+	changed: [i64; 2]
+	modified: [i64; 2]
+	// The device a special file is, and the one this file is on, each as
+	// a major and a minor number.
+	rdevMajor: u32
+	rdevMinor: u32
+	devMajor: u32
+	devMinor: u32
+}
+
+// glibc's, on every 64-bit architecture.
+@target(os = "linux")
+extern struct Dirent {
+	inode: u64
+	offset: i64
+	recordLength: u16
+	kind: u8
+	name: [u8; 256]
+}
+
+@target(os = "linux")
+extern "C" {
+	fn statx(directory: c_int, path: cstring, flags: c_int, mask: c_uint, info: ptr<Statx>): c_int
+	fn opendir(path: cstring): ptr<u8>
+	fn readdir(dir: ptr<u8>): ptr<Dirent>
+}
+
+// Paths from the current directory; a link itself, not what it points at;
+// and the fields `stat` has.
+@target(os = "linux")
+val AT_FDCWD: c_int = -100
+@target(os = "linux")
+val AT_SYMLINK_NOFOLLOW: c_int = 256
+@target(os = "linux")
+val AT_EMPTY_PATH: c_int = 4096
+@target(os = "linux")
+val STATX_BASIC_STATS: c_uint = 2047
+
+@target(os = "linux")
+fn statNumbers(path: cstring, following: bool): Result<Stated, io::IoError> = statInto((info) => {
+	val flags: c_int = if following then 0 else AT_SYMLINK_NOFOLLOW
+	return statx(AT_FDCWD, path, flags, STATX_BASIC_STATS, info)
+})
+
+/// What the filesystem says about an open file: `statx` of an empty path
+/// from the descriptor, which is the descriptor itself.
+@target(os = "linux")
+fn descriptorNumbers(fd: c_int): Result<Stated, io::IoError> = {
+	var empty = String()
+	val path = empty.toCstring()
+	return statInto((info) => statx(fd, path, AT_EMPTY_PATH, STATX_BASIC_STATS, info))
+}
+
+/// What `call` fills in, into room it is given.
+@target(os = "linux")
+fn statInto(call: &(info: ptr<Statx>) => c_int): Result<Stated, io::IoError> = {
+	val info = libc::calloc(1, ROOM as size_t) as ptr<Statx>
+	if info.isNull then return .Err(io::lastError())
+	val got = call(info)
+	val answer: Result<Stated, io::IoError> =
+		if got == 0 then
+			.Ok(Stated(
+				mode: info.mode as i64,
+				size: info.size as i64,
+				modified: info.modified[0],
+				device: ((info.devMajor as i64) << 32) | (info.devMinor as i64),
+				inode: info.inode as i64,
+			))
+		else .Err(io::lastError())
+	libc::free(info as ptr<u8>)
+	return answer
+}
+
+extern "C" {
+	fn closedir(dir: ptr<u8>): c_int
+}

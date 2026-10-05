@@ -1,0 +1,249 @@
+// A program's arguments, read one at a time: each is a short option, a long
+// one or a positional argument, and the program says what each means in a
+// `match`, asking for an option's value where it takes one.
+//
+// The conventions are POSIX's utility syntax with GNU's long options, as
+// `getopt_long` reads them: `-abc` is `-a`, `-b` and `-c`; `-ofile` and
+// `-o file` are one option with a value, as are `--output=file` and
+// `--output file`; `--` ends the options; `-` alone is positional; and
+// options and positional arguments come in any order.
+
+import std::text::{ParseError}
+
+/// One argument, as `Arguments::next` reads it. What it holds borrows the
+/// program's arguments, not the `Arguments` that read it.
+@derive(Eq, Text)
+pub view enum Argument {
+	/// One letter of `-abc`, each in turn.
+	Short(name: char)
+	/// `--name`, or the name of `--name=value`.
+	Long(name: str)
+	/// Anything else: a name, `-` alone, or anything after `--`.
+	Positional(text: str)
+}
+
+extend Argument {
+	/// The error for an argument the program does not take, which says it
+	/// as it was written.
+	pub fn unexpected(): ArgumentError = match self {
+		.Short(name) => .UnknownOption(option: "-\(name)")
+		.Long(name) => .UnknownOption(option: "--\(name)")
+		.Positional(text) => .UnexpectedArgument(text: String::of(text))
+	}
+}
+
+/// What is wrong with the arguments a program was given. Its text is what
+/// `main` prints after `error: `, where `main` answers it.
+@derive(Eq)
+pub enum ArgumentError {
+	/// An option that takes a value, with none after it.
+	MissingValue(option: String)
+	/// `--name=value`, where the option takes no value.
+	UnexpectedValue(option: String, value: String)
+	/// An option the program does not take.
+	UnknownOption(option: String)
+	/// A positional argument the program does not take.
+	UnexpectedArgument(text: String)
+	/// An option's value that is not the number it takes.
+	NotANumber(option: String, value: String, error: ParseError)
+}
+
+extend ArgumentError: Text {
+	fn toString(): String = match self {
+		.MissingValue(option) => "`\(option)` needs a value"
+		.UnexpectedValue(option, value) => "`\(option)` takes no value, and was given `\(value)`"
+		.UnknownOption(option) => "`\(option)` is not an option"
+		.UnexpectedArgument(text) => "unexpected argument `\(text)`"
+		.NotANumber(option, value, error) =>
+			"`\(option)` takes a number, and `\(value)` is not one: \(error)"
+	}
+}
+
+/// The option `next` answered last, whose value may be asked for.
+view enum Last {
+	Nothing
+	Short(name: char)
+	Long(name: str)
+}
+
+/// A program's arguments, read one at a time:
+///
+///     var arguments = Arguments::of(&args)
+///     while arguments.next()? is .Some(argument) {
+///         match argument {
+///             .Short('n') | .Long("lines") => count = arguments.int()?
+///             .Positional(file) => files.push(file)
+///             _ => return .Err(argument.unexpected())
+///         }
+///     }
+pub view struct Arguments {
+	args: &[cstring]
+	/// The next argument to read.
+	at: i64
+	/// The letters of a cluster not read yet: `bc` once `-a` of `-abc` is.
+	cluster: str
+	/// A long option's value written onto it, `--name=value`, not taken yet.
+	attached: Option<str>
+	last: Last
+	/// Whether `--` has been read, after which everything is positional.
+	ended: bool
+}
+
+extend Arguments {
+	/// `main`'s arguments, read from the one after the program's name.
+	pub static fn of(args: &[cstring]): Arguments = Arguments(
+		args: args,
+		at: 1,
+		cluster: "",
+		attached: .None,
+		last: .Nothing,
+		ended: false,
+	)
+
+	/// The program's name as it was run, `args[0]`: empty where the system
+	/// gave none.
+	pub fn program(): str = if self.args.isEmpty() then "" else self.args[0].toStr()
+
+	/// The next argument, or nothing where all are read. It is an error only
+	/// where `--name=value` gave the option before it a value it did not
+	/// take.
+	pub var fn next(): Result<Option<Argument>, ArgumentError> = {
+		// A value written onto a long option, which it did not take.
+		val attached = self.attached
+		val last = self.last
+		self.attached = .None
+		if attached is .Some(value) && last is .Long(name) {
+			self.last = .Nothing
+			return .Err(.UnexpectedValue(option: "--\(name)", value: String::of(value)))
+		}
+		if !self.cluster.isEmpty() then return .Ok(.Some(self.short(self.cluster)))
+		self.last = .Nothing
+		while self.at < self.args.len() {
+			val text = self.args[self.at].toStr()
+			self.at += 1
+			if self.ended then return .Ok(.Some(.Positional(text)))
+			if text == "--" {
+				self.ended = true
+				continue
+			}
+			if text.startsWith("--") {
+				val body = text[2..]
+				val name = match body.find("=") {
+					.Some(at) => {
+						self.attached = .Some(body[at + 1..])
+						body[0..at]
+					}
+					.None => body
+				}
+				self.last = .Long(name)
+				return .Ok(.Some(.Long(name)))
+			}
+			if text.startsWith("-") && text.len() > 1 then return .Ok(.Some(self.short(text[1..])))
+			return .Ok(.Some(.Positional(text)))
+		}
+		return .Ok(.None)
+	}
+
+	/// The first letter of a cluster, keeping the rest for later.
+	var fn short(letters: str): Argument = {
+		val (name, size) = letters.charAt(0)
+		self.cluster = letters[size..]
+		self.last = .Short(name)
+		return .Short(name)
+	}
+
+	/// The value of the option just read: what follows `=` in
+	/// `--name=value`, what is left of `-ofile`, or else the next argument,
+	/// whatever it looks like, so `-o -` and `--pattern -x` are values.
+	/// Asked for anywhere but after an option, it panics: that is the
+	/// program's mistake, not its user's.
+	pub var fn value(): Result<str, ArgumentError> = {
+		val option = self.taking()
+		val attached = self.attached
+		if attached is .Some(value) {
+			self.attached = .None
+			return .Ok(value)
+		}
+		if !self.cluster.isEmpty() {
+			val value = self.cluster
+			self.cluster = ""
+			return .Ok(value)
+		}
+		if self.at >= self.args.len() then return .Err(.MissingValue(option: move option))
+		self.at += 1
+		return .Ok(self.args[self.at - 1].toStr())
+	}
+
+	/// A value written onto its option, `--color=always` or `-cnever`, and
+	/// never the next argument: for an option whose value may be left out.
+	pub var fn optionalValue(): Option<str> = {
+		self.taking()
+		val attached = self.attached
+		if attached is .Some(value) {
+			self.attached = .None
+			return .Some(value)
+		}
+		if self.cluster.isEmpty() then return .None
+		val value = self.cluster
+		self.cluster = ""
+		return .Some(value)
+	}
+
+	/// `value()` read as a whole number, in the radix asked for.
+	pub var fn int(radix: i64 = 10): Result<i64, ArgumentError> = {
+		val option = self.written()
+		val text = self.value()?
+		return match text.toInt(radix: radix) {
+			.Ok(n) => .Ok(n)
+			.Err(error) => .Err(.NotANumber(
+				option: move option,
+				value: String::of(text),
+				error: error,
+			))
+		}
+	}
+
+	/// `value()` read as a number with a fraction.
+	pub var fn float(): Result<f64, ArgumentError> = {
+		val option = self.written()
+		val text = self.value()?
+		return match text.toFloat() {
+			.Ok(n) => .Ok(n)
+			.Err(error) => .Err(.NotANumber(
+				option: move option,
+				value: String::of(text),
+				error: error,
+			))
+		}
+	}
+
+	/// Every argument after the one read last, as it is, with no option
+	/// recognised: what a program hands on to another.
+	pub var fn rest(): Vec<str> = {
+		var rest: Vec<str> = Vec()
+		while self.at < self.args.len() {
+			rest.push(self.args[self.at].toStr())
+			self.at += 1
+		}
+		self.cluster = ""
+		self.attached = .None
+		self.last = .Nothing
+		return move rest
+	}
+
+	/// The option just read, as it was written, for a message.
+	fn written(): String = match self.last {
+		.Short(name) => "-\(name)"
+		.Long(name) => "--\(name)"
+		.Nothing => String()
+	}
+
+	/// The option whose value is being taken, as it was written; after it,
+	/// none is.
+	var fn taking(): String = {
+		if self.last is .Nothing then panic("an option's value is asked for after an option")
+		val option = self.written()
+		self.last = .Nothing
+		return move option
+	}
+}

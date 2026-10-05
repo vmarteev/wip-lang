@@ -1,0 +1,215 @@
+// `String`, of the prelude: text that owns its bytes. A
+// `str` is a view of bytes that live somewhere else, so it cannot be built,
+// only looked at; a `String` is where bytes are put, and it is a `Vec<u8>`
+// with the operations text wants.
+
+import std::libc
+
+/// Text that owns its bytes, and grows.
+/// `String()` is the empty text, which takes no memory until something is
+/// pushed.
+pub struct String {
+	bytes: Vec<u8> = Vec()
+}
+
+extend String {
+	/// The empty text, with room for `count` bytes.
+	pub static fn withCapacity(count: i64): String = String(bytes: Vec::withCapacity(count))
+
+	/// A `String` that holds a copy of `text`, which is how a `str` becomes
+	/// a value that can be kept.
+	pub static fn of(text: str): String = {
+		var made = String::withCapacity(text.len())
+		made.push(text)
+		return move made
+	}
+
+	/// The text, as bytes that live in this `String`. It is a view: what it
+	/// points at ends when the `String` does, or changes when it does.
+	pub fn toStr(): str = str::fromBytes(&self.bytes)
+
+	/// How many bytes the text is, not how many characters.
+	pub fn len(): i64 = self.bytes.len()
+
+	/// Whether the text has no bytes.
+	pub fn isEmpty(): bool = self.bytes.len() == 0
+
+	/// One byte, at the end.
+	pub var fn pushByte(byte: u8) = self.bytes.push(byte)
+
+	/// The text, at the end.
+	pub var fn push(text: str) = self.pushBytes(&text)
+
+	/// The bytes, as they are. It is what a module that reads them uses to
+	/// build text.
+	pub var fn pushBytes(bytes: &[u8]) = self.bytes.pushAll(bytes)
+
+	/// `true` or `false`, at the end.
+	pub var fn pushBool(value: bool) = self.push(if value then "true" else "false")
+
+	/// The character, in the one to four bytes UTF-8 writes it in.
+	pub var fn pushChar(c: char) = {
+		val code = c as u32
+		if code < 0x80 {
+			self.bytes.push(code as u8)
+		} else if code < 0x800 {
+			self.bytes.push((0xC0 | (code >> 6)) as u8)
+			self.bytes.push((0x80 | (code & 0x3F)) as u8)
+		} else if code < 0x10000 {
+			self.bytes.push((0xE0 | (code >> 12)) as u8)
+			self.bytes.push((0x80 | ((code >> 6) & 0x3F)) as u8)
+			self.bytes.push((0x80 | (code & 0x3F)) as u8)
+		} else {
+			self.bytes.push((0xF0 | (code >> 18)) as u8)
+			self.bytes.push((0x80 | ((code >> 12) & 0x3F)) as u8)
+			self.bytes.push((0x80 | ((code >> 6) & 0x3F)) as u8)
+			self.bytes.push((0x80 | (code & 0x3F)) as u8)
+		}
+	}
+
+	/// The number, written in decimal. The digits are counted out in
+	/// negatives, so that the smallest `i64` — which has no positive of its
+	/// own — is written like any other.
+	pub var fn pushInt(value: i64) = {
+		if value < 0 then self.pushByte('-' as u8)
+		var digits = [0 as u8; 20]
+		var count = 0
+		var rest = if value < 0 then value else -value
+		while true {
+			digits[count] = ('0' as u8 as i64 - rest % 10) as u8
+			rest = rest / 10
+			count += 1
+			if rest == 0 then break
+		}
+		self.pushDigits(&digits[0..count])
+	}
+
+	/// The number, written in decimal, where it has no sign to write.
+	pub var fn pushUnsigned(value: u64) = {
+		var digits = [0 as u8; 20]
+		var count = 0
+		var rest = value
+		while true {
+			digits[count] = '0' as u8 + (rest % 10) as u8
+			rest = rest / 10
+			count += 1
+			if rest == 0 then break
+		}
+		self.pushDigits(&digits[0..count])
+	}
+
+	/// Digits counted out from the last, written from the first.
+	var fn pushDigits(backwards: &[u8]) = {
+		var i = backwards.len()
+		while i > 0 {
+			i -= 1
+			self.pushByte(backwards[i])
+		}
+	}
+
+	/// The float, as C's `%g` writes it, with as many digits as it takes to
+	/// read back as the same `f64`, and six at the least: `0.1`, `1e+20`,
+	/// `0.30000000000000004`.
+	pub var fn pushFloat(value: f64) = self.pushFewestDigits(value, false)
+
+	/// An `f32` the same way, with the digits it takes to read back as the
+	/// same `f32`, which are at most 9.
+	var fn pushFloat32(value: f32) = self.pushFewestDigits(value as f64, true)
+
+	/// `%.6g`, `%.7g` and on, until what is written reads back as `value`:
+	/// 17 digits always do for an `f64`, and 9 for an `f32`. Six or fewer
+	/// are written as `%g` always wrote them.
+	var fn pushFewestDigits(value: f64, single: bool) = {
+		val most = if single then 9 else 17
+		var digits = [0 as u8; 32]
+		for precision in 6..most + 1 {
+			// `%.<precision>g`, and a NUL, as C reads a format.
+			var format = [0 as u8; 8]
+			format[0] = '%' as u8
+			format[1] = '.' as u8
+			var at = 2
+			if precision >= 10 {
+				format[at] = '1' as u8
+				at += 1
+			}
+			format[at] = '0' as u8 + (precision % 10) as u8
+			format[at + 1] = 'g' as u8
+			val written = libc::formatDouble(value, cstring::fromBytes(&format), &var digits)
+			// `formatDouble` wrote a NUL after the digits.
+			val text = cstring::fromBytes(&digits)
+			val back = if single then libc::strtof(text, null) as f64 else libc::strtod(text, null)
+			if back == value || !value.isFinite() || precision == most {
+				self.pushBytes(&digits[0..written])
+				return
+			}
+		}
+	}
+
+	/// The text with a NUL after it, which is what C calls a string.
+	/// The NUL goes past the end, so the `String`'s own
+	/// length does not count it; what comes back borrows these bytes, and
+	/// lasts until the `String` is changed or ends.
+	pub var fn toCstring(): cstring = {
+		self.bytes.push(0)
+		self.bytes.length -= 1
+		return cstring::fromBytes(&self.bytes)
+	}
+
+	/// Empties the text, keeping its memory.
+	pub var fn clear() = self.bytes.clear()
+
+	/// `count` copies of `c` put in at byte `at`, which is where a
+	/// character begins or the end, the bytes after it moving along; for
+	/// the width of an interpolation's piece. Nothing is
+	/// made but the room.
+	var fn insertCopies(at: i64, c: char, count: i64) = {
+		if count <= 0 then return
+		val old = self.bytes.len()
+		for _ in 0..count {
+			self.pushChar(c)
+		}
+		val added = self.bytes.len() - old
+		val width = added / count
+		// One copy's bytes, kept while the ones after `at` move along.
+		var copy = [0 as u8; 4]
+		for i in 0..width {
+			copy[i] = self.bytes[old + i]
+		}
+		var from = old - 1
+		while from >= at {
+			self.bytes[from + added] = self.bytes[from]
+			from -= 1
+		}
+		for i in 0..added {
+			self.bytes[at + i] = copy[i % width]
+		}
+	}
+
+	/// The last character taken off, or nothing where the text is empty,
+	/// as `Vec::pop` takes an element. The `String` keeps
+	/// its memory. Where its last bytes are not a character's, the last
+	/// byte is taken, as U+FFFD, which is what reading the text finds
+	/// there.
+	pub var fn popChar(): Option<char> = {
+		val length = self.bytes.len()
+		if length == 0 then return .None
+		// A character is at most four bytes, all but the first of the form
+		// `10xxxxxx`.
+		var start = length - 1
+		while start > 0 && length - start < 4 && (self.bytes[start] & 0xC0) == 0x80 {
+			start -= 1
+		}
+		val (c, width) = self.toStr().charAt(start)
+		if start + width != length {
+			self.bytes.truncate(length - 1)
+			return .Some('\u{FFFD}')
+		}
+		self.bytes.truncate(start)
+		return .Some(c)
+	}
+}
+
+// The bytes it holds, so that `for byte in text` walks them.
+extend String: Items<u8> {
+	fn items(): &[u8] = lend self.bytes.items()
+}

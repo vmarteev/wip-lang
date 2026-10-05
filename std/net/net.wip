@@ -1,0 +1,536 @@
+// Network sockets: a `Listener`, which accepts connections,
+// a `Stream`, one connection, and an `Address`, where one is — over TCP,
+// IPv4 or IPv6, or a Unix-domain socket. Each owns its descriptor and closes
+// it where it ends; reads and writes answer `io::IoError`, as a file's do.
+//
+// Calls block until they can answer, unless `setBlocking(false)` says not
+// to, when they answer `.WouldBlock` instead and an event queue says when
+// to try again. The queue is the program's: epoll and kqueue differ in more
+// than their layout. `descriptor()` is the number it is given.
+//
+// A write to a connection the other end has closed answers `.BrokenPipe`.
+// C would deliver `SIGPIPE`, which ends a program by default; here Linux's
+// writes pass `MSG_NOSIGNAL` and a Mac's sockets carry `SO_NOSIGPIPE`, so no
+// program has to change what it does with signals.
+
+import std::io
+import std::libc
+
+/// Where a connection is: an IPv4 or IPv6 address and a port, or a
+/// Unix-domain socket's path, empty for one with no name.
+@derive(Eq)
+pub enum Address {
+	V4(octets: [u8; 4], port: u16)
+	V6(octets: [u8; 16], port: u16)
+	Unix(path: String)
+}
+
+/// Waits for connections, and answers each.
+pub struct Listener {
+	fd: c_int
+}
+
+/// One connection, read and written as bytes.
+pub struct Stream {
+	fd: c_int
+}
+
+extend Listener: Destroy {
+	var fn destroy() = {
+		libc::close(self.fd)
+	}
+}
+
+extend Stream: Destroy {
+	var fn destroy() = {
+		libc::close(self.fd)
+	}
+}
+
+extend Listener {
+	/// A listener on `port` of `host` — a name or an address, IPv4 or IPv6,
+	/// the first `getaddrinfo` answers that binds — or, for no host, of this
+	/// machine's loopback, as `getaddrinfo` answers no host. `0.0.0.0` and
+	/// `::` listen on every address. It listens with the longest queue the
+	/// system allows.
+	pub static fn tcp(host: Option<str>, port: u16): Result<Listener, io::IoError> = {
+		val fd = resolved(host, port, (fd, address, length) => bindTo(fd, address, length) == 0)?
+		if listen(fd, SOMAXCONN) < 0 {
+			val error = io::lastError()
+			libc::close(fd)
+			return .Err(error)
+		}
+		return .Ok(Listener(fd: fd))
+	}
+
+	/// A listener on a Unix-domain socket made at `path`, which must not be
+	/// there yet; the program removes it when it is done.
+	pub static fn unix(path: str): Result<Listener, io::IoError> = {
+		var address = SockAddr()
+		val length = unixAddress(path, &var address)?
+		val fd = socket(AF_UNIX, SOCK_STREAM, 0)
+		if fd < 0 then return .Err(io::lastError())
+		if bindLocal(fd, &address, length) < 0 || listen(fd, SOMAXCONN) < 0 {
+			val error = io::lastError()
+			libc::close(fd)
+			return .Err(error)
+		}
+		return .Ok(Listener(fd: fd))
+	}
+
+	/// The next connection, and where it came from. Any number of threads
+	/// may accept from one listener at once: the queue is the system's.
+	pub fn accept(): Result<(Stream, Address), io::IoError> = {
+		var address = SockAddr()
+		var length = SOCKADDR_ROOM
+		val fd = accept(self.fd, &var address, &var length)
+		if fd < 0 then return .Err(io::lastError())
+		quiet(fd)
+		return .Ok((Stream(fd: fd), addressOf(&address, length)))
+	}
+
+	/// Where it listens: the port the system chose for port 0 among it.
+	pub fn localAddress(): Result<Address, io::IoError> = local(self.fd)
+
+	/// Whether `accept` waits for a connection, or answers `.WouldBlock`.
+	pub fn setBlocking(blocking: bool): Result<void, io::IoError> = setBlockingOf(self.fd, blocking)
+
+	/// The descriptor, for an event queue to watch.
+	pub fn descriptor(): i32 = self.fd
+}
+
+extend Stream {
+	/// A connection to `port` of `host`, the first of its addresses that
+	/// answers.
+	pub static fn tcp(host: str, port: u16): Result<Stream, io::IoError> = {
+		val fd =
+			resolved(
+				.Some(host),
+				port,
+				(fd, address, length) => connectTo(fd, address, length) == 0,
+			)?
+		quiet(fd)
+		return .Ok(Stream(fd: fd))
+	}
+
+	/// A connection to the Unix-domain socket at `path`.
+	pub static fn unix(path: str): Result<Stream, io::IoError> = {
+		var address = SockAddr()
+		val length = unixAddress(path, &var address)?
+		val fd = socket(AF_UNIX, SOCK_STREAM, 0)
+		if fd < 0 then return .Err(io::lastError())
+		if connectLocal(fd, &address, length) < 0 {
+			val error = io::lastError()
+			libc::close(fd)
+			return .Err(error)
+		}
+		quiet(fd)
+		return .Ok(Stream(fd: fd))
+	}
+
+	/// Reads what has come, up to `into.len()` bytes, and answers how many;
+	/// `0` where the other end has closed.
+	pub fn read(into: &var [u8]): Result<i64, io::IoError> = {
+		val got = libc::read(self.fd, &var into)
+		if got < 0 then return .Err(io::lastError())
+		return .Ok(got as i64)
+	}
+
+	/// Writes what the connection takes now of `bytes`, and answers how
+	/// many; it may be fewer than given.
+	pub fn write(bytes: &[u8]): Result<i64, io::IoError> = {
+		val sent = send(self.fd, &bytes, SEND_FLAGS)
+		if sent < 0 then return .Err(io::lastError())
+		return .Ok(sent as i64)
+	}
+
+	/// Writes all of `bytes`, waiting as it needs to. On a stream that does
+	/// not block it answers `.WouldBlock` where the connection would make it
+	/// wait, having written some of them.
+	pub fn writeAll(bytes: &[u8]): Result<void, io::IoError> = {
+		var written = 0
+		while written < bytes.len() {
+			match self.write(&bytes[written..]) {
+				.Ok(count) => written += count
+				.Err(.Interrupted) => {}
+				.Err(error) => return .Err(error)
+			}
+		}
+		return .Ok()
+	}
+
+	/// Writes all of `text`.
+	pub fn writeText(text: str): Result<void, io::IoError> = self.writeAll(&text)
+
+	/// Ends the connection in both directions; the descriptor stays open
+	/// until the stream ends.
+	pub fn shutdown(): Result<void, io::IoError> = {
+		if shutdown(self.fd, SHUT_RDWR) < 0 then return .Err(io::lastError())
+		return .Ok()
+	}
+
+	/// Whether reading and writing wait, or answer `.WouldBlock`.
+	pub fn setBlocking(blocking: bool): Result<void, io::IoError> = setBlockingOf(self.fd, blocking)
+
+	/// The descriptor, for an event queue to watch.
+	pub fn descriptor(): i32 = self.fd
+}
+
+// What `inet_ntop` writes: `127.0.0.1:8080`, `[::1]:8080`, a path as it is.
+extend Address: Text {
+	fn appendTo(out: &var String) = match self {
+		.V4(octets, port) => {
+			appendV4(&var out, &octets)
+			out.push(":")
+			out.pushInt(port as i64)
+		}
+		.V6(octets, port) => {
+			out.push("[")
+			appendV6(&var out, &octets)
+			out.push("]:")
+			out.pushInt(port as i64)
+		}
+		.Unix(path) => out.push(path)
+	}
+}
+
+extend Address {
+	/// The address without its port: `127.0.0.1`, `::1`, or the path.
+	pub fn host(): String = {
+		var out = String()
+		match self {
+			.V4(octets, ..) => appendV4(&var out, &octets)
+			.V6(octets, ..) => appendV6(&var out, &octets)
+			.Unix(path) => out.push(path)
+		}
+		return move out
+	}
+}
+
+fn appendV4(out: &var String, octets: &[u8]) = {
+	for i in 0..4 {
+		if i > 0 then out.push(".")
+		out.pushInt(octets[i] as i64)
+	}
+}
+
+/// As RFC 5952 writes it, as `inet_ntop` does: groups in lowercase hex
+/// without leading zeros, the longest run of two or more zero groups — the
+/// first of the longest — written `::`, and an IPv4 address mapped into
+/// IPv6 written with its dots.
+fn appendV6(out: &var String, octets: &[u8]) = {
+	var groups: [i64; 8] = [0; 8]
+	for i in 0..8 {
+		groups[i] = ((octets[i * 2] as i64) << 8) | (octets[i * 2 + 1] as i64)
+	}
+	val mapped =
+		groups[0] == 0 &&
+		groups[1] == 0 &&
+		groups[2] == 0 &&
+		groups[3] == 0 &&
+		groups[4] == 0 &&
+		groups[5] == 0xffff
+	if mapped {
+		out.push("::ffff:")
+		appendV4(&var out, &octets[12..16])
+		return
+	}
+	// The longest run of zero groups, where it is two or more.
+	var bestStart = -1
+	var bestLength = 0
+	var i = 0
+	while i < 8 {
+		if groups[i] == 0 {
+			var j = i
+			while j < 8 && groups[j] == 0 {
+				j += 1
+			}
+			if j - i > bestLength {
+				bestStart = i
+				bestLength = j - i
+			}
+			i = j
+		} else {
+			i += 1
+		}
+	}
+	if bestLength < 2 then bestStart = -1
+	i = 0
+	while i < 8 {
+		if i == bestStart {
+			out.push("::")
+			i += bestLength
+			continue
+		}
+		if i > 0 && i != bestStart + bestLength then out.push(":")
+		appendHex(&var out, groups[i])
+		i += 1
+	}
+}
+
+fn appendHex(out: &var String, value: i64) = {
+	val digits = "0123456789abcdef"
+	var shift = 12
+	var started = false
+	while shift >= 0 {
+		val digit = (value >> shift) & 15
+		if digit != 0 || started || shift == 0 {
+			out.pushByte(digits[digit])
+			started = true
+		}
+		shift -= 4
+	}
+}
+
+// --- C's sockets, as each system lays them out ---------
+
+/// Room for any address the system has: C's `sockaddr_storage`.
+extern struct SockAddr {
+	bytes: [u8; 128] = [0; 128]
+}
+
+val SOCKADDR_ROOM: u32 = 128
+
+@target(vendor = "apple")
+extern struct AddrInfo {
+	flags: c_int
+	family: c_int
+	socktype: c_int
+	protocol: c_int
+	addressLength: u32
+	canonicalName: ptr<u8>
+	address: ptr<u8>
+	next: ptr<AddrInfo>
+}
+
+@target(os = "linux")
+extern struct AddrInfo {
+	flags: c_int
+	family: c_int
+	socktype: c_int
+	protocol: c_int
+	addressLength: u32
+	address: ptr<u8>
+	canonicalName: ptr<u8>
+	next: ptr<AddrInfo>
+}
+
+extern "C" {
+	fn socket(family: c_int, kind: c_int, protocol: c_int): c_int
+	@symbol("bind")
+	fn bindTo(fd: c_int, address: ptr<u8>, length: u32): c_int
+	@symbol("bind")
+	fn bindLocal(fd: c_int, address: &SockAddr, length: u32): c_int
+	@symbol("connect")
+	fn connectTo(fd: c_int, address: ptr<u8>, length: u32): c_int
+	@symbol("connect")
+	fn connectLocal(fd: c_int, address: &SockAddr, length: u32): c_int
+	fn listen(fd: c_int, backlog: c_int): c_int
+	fn accept(fd: c_int, address: &var SockAddr, length: &var u32): c_int
+	fn getsockname(fd: c_int, address: &var SockAddr, length: &var u32): c_int
+	fn setsockopt(fd: c_int, level: c_int, name: c_int, value: &c_int, length: u32): c_int
+	fn shutdown(fd: c_int, how: c_int): c_int
+	fn send(fd: c_int, bytes: &[u8], flags: c_int): ssize_t
+	fn getaddrinfo(
+		host: cstring,
+		service: cstring,
+		hints: &AddrInfo,
+		answers: &var ptr<AddrInfo>,
+	): c_int
+	/// The same with no host: its pointer is null.
+	@symbol("getaddrinfo")
+	fn getaddrinfoLocal(
+		host: ptr<u8>,
+		service: cstring,
+		hints: &AddrInfo,
+		answers: &var ptr<AddrInfo>,
+	): c_int
+	fn freeaddrinfo(answers: ptr<AddrInfo>)
+}
+
+val AF_UNSPEC: c_int = 0
+val AF_UNIX: c_int = 1
+val AF_INET: c_int = 2
+@target(vendor = "apple")
+val AF_INET6: c_int = 30
+@target(os = "linux")
+val AF_INET6: c_int = 10
+
+val SOCK_STREAM: c_int = 1
+val SHUT_RDWR: c_int = 2
+val F_GETFL: c_int = 3
+
+@target(vendor = "apple")
+val SOL_SOCKET: c_int = 0xffff
+@target(os = "linux")
+val SOL_SOCKET: c_int = 1
+
+@target(vendor = "apple")
+val SO_REUSEADDR: c_int = 4
+@target(os = "linux")
+val SO_REUSEADDR: c_int = 2
+
+/// A Mac's socket option for a write to a closed connection to fail with
+/// `EPIPE`, not deliver `SIGPIPE`.
+@target(vendor = "apple")
+val SO_NOSIGPIPE: c_int = 0x1022
+
+/// Linux's flag for one write to do the same.
+@target(vendor = "apple")
+val SEND_FLAGS: c_int = 0
+@target(os = "linux")
+val SEND_FLAGS: c_int = 0x4000
+
+@target(vendor = "apple")
+val SOMAXCONN: c_int = 128
+@target(os = "linux")
+val SOMAXCONN: c_int = 4096
+
+val AI_PASSIVE: c_int = 1
+@target(vendor = "apple")
+val AI_NUMERICSERV: c_int = 0x1000
+@target(os = "linux")
+val AI_NUMERICSERV: c_int = 0x400
+
+/// What `getaddrinfo` answers for a host it cannot find.
+@target(vendor = "apple")
+val EAI_NONAME: c_int = 8
+@target(os = "linux")
+val EAI_NONAME: c_int = -2
+
+/// The longest path a Unix-domain socket may have, without its NUL.
+@target(vendor = "apple")
+val UNIX_PATH_MOST: i64 = 103
+@target(os = "linux")
+val UNIX_PATH_MOST: i64 = 107
+
+/// The first socket of `host`'s addresses for which `use` answers true —
+/// bound, or connected — closing the others. With no host, the loopback
+/// for a connection, and the loopback too for a listener, as `getaddrinfo`
+/// answers no host without `AI_PASSIVE`.
+fn resolved(
+	host: Option<str>,
+	port: u16,
+	use: &(fd: c_int, address: ptr<u8>, length: u32) => bool,
+): Result<c_int, io::IoError> = {
+	var hints = AddrInfo(
+		flags: AI_NUMERICSERV,
+		family: AF_UNSPEC,
+		socktype: SOCK_STREAM,
+		protocol: 0,
+		addressLength: 0,
+		canonicalName: null,
+		address: null,
+		next: null,
+	)
+	var service = port.toString()
+	var answers: ptr<AddrInfo> = null
+	val failed = match host {
+		.Some(name) => {
+			var named = String::of(name)
+			getaddrinfo(named.toCstring(), service.toCstring(), &hints, &var answers)
+		}
+		.None => getaddrinfoLocal(null, service.toCstring(), &hints, &var answers)
+	}
+	if failed != 0 then return .Err(if failed == EAI_NONAME then .NotFound else .Other(failed))
+	var error: io::IoError = .NotFound
+	var at = answers
+	while !at.isNull {
+		val fd = socket(at.family, at.socktype, at.protocol)
+		if fd >= 0 {
+			setOption(fd, SO_REUSEADDR)
+			if use(fd, at.address, at.addressLength) {
+				freeaddrinfo(answers)
+				return .Ok(fd)
+			}
+			error = io::lastError()
+			libc::close(fd)
+		} else {
+			error = io::lastError()
+		}
+		at = at.next
+	}
+	freeaddrinfo(answers)
+	return .Err(error)
+}
+
+fn setOption(fd: c_int, name: c_int) = {
+	val on: c_int = 1
+	setsockopt(fd, SOL_SOCKET, name, &on, 4)
+}
+
+/// A new connection's socket, made to answer `EPIPE` for a write the other
+/// end will not read, where the system says so per socket.
+@target(vendor = "apple")
+fn quiet(fd: c_int) = setOption(fd, SO_NOSIGPIPE)
+@target(os = "linux")
+fn quiet(fd: c_int) = {}
+
+fn setBlockingOf(fd: c_int, blocking: bool): Result<void, io::IoError> = {
+	val flags = libc::fcntl(fd, F_GETFL, 0)
+	if flags < 0 then return .Err(io::lastError())
+	val wanted = if blocking then flags & !libc::O_NONBLOCK else flags | libc::O_NONBLOCK
+	if libc::fcntl(fd, libc::F_SETFL, wanted) < 0 then return .Err(io::lastError())
+	return .Ok()
+}
+
+fn local(fd: c_int): Result<Address, io::IoError> = {
+	var address = SockAddr()
+	var length = SOCKADDR_ROOM
+	if getsockname(fd, &var address, &var length) < 0 then return .Err(io::lastError())
+	return .Ok(addressOf(&address, length))
+}
+
+/// A Unix-domain socket's address for `path`, and how long it is.
+fn unixAddress(path: str, address: &var SockAddr): Result<u32, io::IoError> = {
+	if path.len() > UNIX_PATH_MOST then return .Err(.Other(libc::ENAMETOOLONG))
+	setFamily(&var address, AF_UNIX, (2 + path.len() + 1) as u8)
+	for i in 0..path.len() {
+		address.bytes[2 + i] = path[i]
+	}
+	address.bytes[2 + path.len()] = 0
+	return .Ok((2 + path.len() + 1) as u32)
+}
+
+// The family's place: a Mac's address starts with its length and a byte of
+// family, Linux's with two bytes of family.
+@target(vendor = "apple")
+fn setFamily(address: &var SockAddr, family: c_int, length: u8) = {
+	address.bytes[0] = length
+	address.bytes[1] = family as u8
+}
+@target(os = "linux")
+fn setFamily(address: &var SockAddr, family: c_int, length: u8) = {
+	address.bytes[0] = family as u8
+	address.bytes[1] = 0
+}
+
+@target(vendor = "apple")
+fn familyOf(address: &SockAddr): c_int = address.bytes[1] as c_int
+@target(os = "linux")
+fn familyOf(address: &SockAddr): c_int =
+	(address.bytes[0] as c_int) | ((address.bytes[1] as c_int) << 8)
+
+/// What C wrote of an address, read: the family says the layout, which is
+/// the same past the family on both systems.
+fn addressOf(address: &SockAddr, length: u32): Address = {
+	val bytes: &[u8; 128] = &address.bytes
+	val port = (((bytes[2] as u16) << 8) | (bytes[3] as u16))
+	val family = familyOf(&address)
+	if family == AF_INET then
+		return .V4(octets: [bytes[4], bytes[5], bytes[6], bytes[7]], port: port)
+	if family == AF_INET6 {
+		var octets: [u8; 16] = [0; 16]
+		for i in 0..16 {
+			octets[i] = bytes[8 + i]
+		}
+		return .V6(octets: octets, port: port)
+	}
+	var path = String()
+	var i = 2
+	while i < (length as i64) && i < 128 && bytes[i] != 0 {
+		path.pushByte(bytes[i])
+		i += 1
+	}
+	return .Unix(path: move path)
+}

@@ -1,0 +1,741 @@
+// Regular expressions. A pattern is parsed, compiled to a
+// small program, and run by a Pike VM: every thread of the pattern's
+// automaton is stepped together over the text, each with the groups it
+// has seen, so a match takes time in proportion to the text times the
+// pattern, whatever either holds. No pattern backtracks without end, as
+// Rust's `regex` promises, whose syntax this is, in part:
+//
+//     a  .  [abc]  [a-z]  [^a]  \d \w \s  \D \W \S    one character
+//     ^  $                                          the start, the end
+//     (…)  (?:…)  a|b                               a group, which captures
+//                                                   unless it is `?:`; either
+//     *  +  ?  {n}  {n,}  {n,m}                      how many, as many as can
+//     *?  +?  ??  {n,m}?                             be — or, with `?`, as few
+//     \.  \*  \\  \n  \t  \r                          as itself
+//
+// A character is a Unicode scalar value read from UTF-8,
+// so `.` and a class take a whole character; `\d` is `0`–`9`, `\w`
+// ASCII's letters, digits and `_`, and `\s` Unicode's white space. A
+// replacement names what was matched as `$0`, a group as `$1` or `${1}`,
+// and `$$` is a `$`.
+//
+// Positions are byte offsets into the text, as a `str`'s slices are.
+
+/// The most times a bounded repetition may name: `{0,1000}` is a program
+/// a thousand copies long, and more would be a program no one meant.
+val MOST_REPEATS: i64 = 1000
+
+/// What was wrong with a pattern, and where.
+@derive(Eq)
+pub struct RegexError {
+	/// The byte offset in the pattern where it was found.
+	pub at: i64
+	pub problem: Problem
+}
+
+/// What can be wrong with a pattern.
+@derive(Eq)
+pub enum Problem {
+	/// A `(` with no `)`.
+	UnclosedGroup
+	/// A `)` with no `(`.
+	UnopenedGroup
+	/// A `[` with no `]`.
+	UnclosedClass
+	/// A `*`, `+`, `?` or `{…}` with nothing before it to repeat.
+	NothingToRepeat
+	/// A `{…}` that is not `{n}`, `{n,}` or `{n,m}` with `n <= m`, or that
+	/// names more than a thousand.
+	BadRepeat
+	/// A `\` before a letter that means nothing, or at the end.
+	BadEscape
+	/// A range whose end comes before its start: `[z-a]`.
+	BackwardsRange
+	/// A group of a kind this does not have: named ones, flags.
+	UnknownGroup
+}
+
+extend RegexError: Text {
+	fn appendTo(out: &var String) = {
+		val what = match self.problem {
+			.UnclosedGroup => "a group is not closed"
+			.UnopenedGroup => "a `)` closes no group"
+			.UnclosedClass => "a `[` is not closed"
+			.NothingToRepeat => "there is nothing before it to repeat"
+			.BadRepeat => "a repetition is not {n}, {n,} or {n,m} of at most a thousand"
+			.BadEscape => "a `\\` escapes nothing it knows"
+			.BackwardsRange => "a range ends before it starts"
+			.UnknownGroup => "a group of a kind there is not: only (…) and (?:…)"
+		}
+		out.push("\(what), at byte \(self.at)")
+	}
+}
+
+/// A compiled pattern, to match and replace with.
+pub struct Regex {
+	program: Vec<Op>
+	sets: Vec<CharSet>
+	/// How many groups capture, not counting the whole match.
+	groupCount: i64
+}
+
+/// Where a pattern matched: the whole match, and each group's span, or
+/// nothing for a group that took no part.
+pub struct Found {
+	/// Where the match starts and ends, in bytes.
+	pub start: i64
+	pub end: i64
+	/// Two offsets for each group, from 1; -1 where it took no part.
+	spans: Vec<i64>
+}
+
+extend Found {
+	/// Where group `n` matched, `0` being the whole match; nothing where it
+	/// took no part, or there is no such group.
+	pub fn group(n: i64): Option<(i64, i64)> = {
+		if n < 0 || n * 2 + 1 >= self.spans.len() || self.spans[n * 2] < 0 then return .None
+		return .Some((self.spans[n * 2], self.spans[n * 2 + 1]))
+	}
+}
+
+/// One instruction of a compiled pattern.
+enum Op {
+	/// This character.
+	Char(c: char)
+	/// Any character but a line break.
+	Any
+	/// A character the set at this index accepts.
+	Set(index: i64)
+	/// Both ways, `first` before `second`.
+	Split(first: i64, second: i64)
+	Jump(to: i64)
+	/// The position, into this slot.
+	Save(slot: i64)
+	/// Only at the start of the text.
+	AtStart
+	/// Only at its end.
+	AtEnd
+	/// A match.
+	Done
+}
+
+/// The characters a class accepts: ranges, or everything but them.
+struct CharSet {
+	ranges: Vec<(u32, u32)>
+	negated: bool
+}
+
+extend CharSet {
+	fn holds(c: char): bool = {
+		val code = c as u32
+		for range in self.ranges {
+			if code >= range.0 && code <= range.1 then return !self.negated
+		}
+		return self.negated
+	}
+}
+
+/// A pattern parsed, before it is compiled.
+enum Node {
+	Empty
+	Char(c: char)
+	Any
+	Set(index: i64)
+	Start
+	End
+	/// A group: which one it is, from 1, or -1 where it does not capture.
+	Group(capture: i64, inner: own<Node>)
+	Sequence(parts: Vec<Node>)
+	Either(options: Vec<Node>)
+	/// `inner`, `least` times and at most `most`, -1 for no bound.
+	Repeat(inner: own<Node>, least: i64, most: i64, greedy: bool)
+}
+
+/// What parsing builds beside the tree: the classes, and how many groups.
+struct Building {
+	sets: Vec<CharSet>
+	groups: i64
+}
+
+/// A thread of the automaton: where it is in the program, and what its
+/// groups have seen.
+struct Thread {
+	pc: i64
+	spans: Vec<i64>
+}
+
+extend Regex {
+	/// The pattern compiled, or what is wrong with it.
+	pub static fn new(pattern: str): Result<Regex, RegexError> = Regex::compiled(pattern, false)
+
+	/// The pattern compiled to match ASCII letters in either case, as
+	/// POSIX's `REG_ICASE` does: `example` matches `EXAMPLE`, and `[a-c]`
+	/// takes `B`. A letter beyond ASCII matches as written.
+	pub static fn anyCase(pattern: str): Result<Regex, RegexError> = Regex::compiled(pattern, true)
+
+	static fn compiled(pattern: str, anyCase: bool): Result<Regex, RegexError> = {
+		var building = Building(sets: Vec(), groups: 0)
+		var at = 0
+		val tree = parseEither(pattern, &var at, &var building)?
+		if at < pattern.len() {
+			// Only an unopened `)` stops a parse short of the end.
+			return .Err(RegexError(at: at, problem: .UnopenedGroup))
+		}
+		var program: Vec<Op> = Vec()
+		program.push(.Save(slot: 0))
+		emit(&tree, &var program)
+		program.push(.Save(slot: 1))
+		program.push(.Done)
+		if anyCase then foldCase(&var program, &var building.sets)
+		return .Ok(Regex(
+			program: move program,
+			sets: move building.sets,
+			groupCount: building.groups,
+		))
+	}
+
+	/// How many groups capture, not counting the whole match.
+	pub fn groups(): i64 = self.groupCount
+
+	/// Whether the pattern matches anywhere in `text`.
+	pub fn isMatch(text: str): bool = self.findFrom(text, 0).isSome()
+
+	/// The first match in `text`, leftmost, and of the ways to match there
+	/// the one the pattern prefers: an alternative written first, and a
+	/// repetition as long, or as short, as it says.
+	pub fn find(text: str): Option<Found> = self.findFrom(text, 0)
+
+	/// The first match at or after byte `from`.
+	pub fn findFrom(text: str, from: i64): Option<Found> = {
+		val slots = (self.groupCount + 1) * 2
+		var current: Vec<Thread> = Vec()
+		var next: Vec<Thread> = Vec()
+		// Which list each instruction was last added to, so that a thread
+		// is on a list once, whatever the ways it arrived there.
+		var seen: Vec<i64> = Vec::filled(self.program.len(), -1)
+		var list = 0
+		var matched: Option<Vec<i64>> = .None
+		var at = from
+		while true {
+			// A thread starting here, while nothing has matched further
+			// to the left.
+			if matched.isNone() then
+				self.add(&var current, &var seen, list, 0, Vec::filled(slots, -1), at, text)
+			if current.isEmpty() then break
+			val (c, width) = if at < text.len() then text.charAt(at) else ('\u{0}', 0)
+			list += 1
+			for i in 0..current.len() {
+				val pc = current[i].pc
+				val moves = match self.program[pc] {
+					.Done => {
+						matched = .Some(current[i].spans.clone())
+						// Threads after this one are ways the pattern
+						// prefers less: they are dropped.
+						break
+					}
+					.Char(wanted) => width > 0 && c == wanted
+					.Any => width > 0 && c != '\n'
+					.Set(index) => width > 0 && self.sets[index].holds(c)
+					_ => false
+				}
+				if moves then
+					self.add(
+						&var next,
+						&var seen,
+						list,
+						pc + 1,
+						current[i].spans.clone(),
+						at + width,
+						text,
+					)
+			}
+			if width == 0 then break
+			current = move next
+			next = Vec()
+			at += width
+		}
+		val .Some(spans) = move matched else {
+			return .None
+		}
+		return .Some(Found(start: spans[0], end: spans[1], spans: move spans))
+	}
+
+	/// Every match in `text` replaced by `replacement`, from the left, none
+	/// overlapping another: `$0` is what matched, `$1` or `${1}` a group,
+	/// `$$` a `$`. Empty matches are counted as Rust's `replace_all` counts
+	/// them.
+	pub fn replaceAll(text: str, replacement: str): String = {
+		var out = String()
+		var last = 0
+		var at = 0
+		// Where the last match that took something ended: an empty match
+		// right there is not one, as Rust's `replace_all` has it, so `a*`
+		// makes `baaa` into `-b-`.
+		var ended = -1
+		while at <= text.len() {
+			val .Some(found) = self.findFrom(text, at) else {
+				break
+			}
+			if found.start == found.end && found.start == ended {
+				if found.end >= text.len() then break
+				val (c, width) = text.charAt(found.end)
+				at = found.end + width
+				continue
+			}
+			out.push(text[last..found.start])
+			expand(&var out, replacement, text, &found)
+			last = found.end
+			at = found.end
+			if found.end > found.start {
+				ended = found.end
+				continue
+			}
+			// After an empty match, the next is looked for a character on,
+			// and the character is kept as it was.
+			if found.end >= text.len() then break
+			val (c, width) = text.charAt(found.end)
+			out.pushChar(c)
+			last = found.end + width
+			at = last
+		}
+		out.push(text[last..text.len()])
+		return move out
+	}
+
+	/// A thread at `pc`, with what it has seen, on `list`: where `pc` moves
+	/// without reading a character — a jump, a split, a saved position, an
+	/// assertion — it is followed there instead, in the order the pattern
+	/// prefers.
+	fn add(
+		list: &var Vec<Thread>,
+		seen: &var Vec<i64>,
+		id: i64,
+		pc: i64,
+		spans: Vec<i64>,
+		at: i64,
+		text: str,
+	) = {
+		if seen[pc] == id then return
+		seen[pc] = id
+		match self.program[pc] {
+			.Jump(to) => self.add(&var list, &var seen, id, to, move spans, at, text)
+			.Split(first, second) => {
+				self.add(&var list, &var seen, id, first, spans.clone(), at, text)
+				self.add(&var list, &var seen, id, second, move spans, at, text)
+			}
+			.Save(slot) => {
+				var saved = move spans
+				saved[slot] = at
+				self.add(&var list, &var seen, id, pc + 1, move saved, at, text)
+			}
+			.AtStart => {
+				if at == 0 then self.add(&var list, &var seen, id, pc + 1, move spans, at, text)
+			}
+			.AtEnd => {
+				if at == text.len() then
+					self.add(&var list, &var seen, id, pc + 1, move spans, at, text)
+			}
+			_ => list.push(Thread(pc: pc, spans: move spans))
+		}
+	}
+}
+
+/// A replacement written out for one match.
+fn expand(out: &var String, replacement: str, text: str, found: &Found) = {
+	var i = 0
+	while i < replacement.len() {
+		val (c, width) = replacement.charAt(i)
+		if c != '$' || i + 1 >= replacement.len() {
+			out.pushChar(c)
+			i += width
+			continue
+		}
+		val after = replacement[i + 1]
+		if after == '$' as u8 {
+			out.push("$")
+			i += 2
+			continue
+		}
+		// `${12}`, or `$12`: as many digits as there are.
+		val braced = after == '{' as u8
+		var start = if braced then i + 2 else i + 1
+		var end = start
+		while end < replacement.len() && replacement[end] is b'0'..=b'9' {
+			end += 1
+		}
+		val closed = !braced || (end < replacement.len() && replacement[end] == '}' as u8)
+		if end == start || !closed {
+			// Not a group: the `$` is itself.
+			out.push("$")
+			i += 1
+			continue
+		}
+		if replacement[start..end].toInt() is .Ok(n) {
+			if found.group(n) is .Some(span) then out.push(text[span.0..span.1])
+		}
+		i = if braced then end + 1 else end
+	}
+}
+
+// Parsing: `either` is sequences between `|`, a sequence is repeated
+// atoms, and an atom is a character, a class, an anchor or a group.
+
+fn parseEither(pattern: str, at: &var i64, building: &var Building): Result<Node, RegexError> = {
+	var options: Vec<Node> = Vec()
+	options.push(parseSequence(pattern, &var at, &var building)?)
+	while at < pattern.len() && pattern[at] == '|' as u8 {
+		at += 1
+		options.push(parseSequence(pattern, &var at, &var building)?)
+	}
+	if options.len() == 1 then return .Ok(options.pop().unwrap())
+	return .Ok(.Either(options: move options))
+}
+
+fn parseSequence(pattern: str, at: &var i64, building: &var Building): Result<Node, RegexError> = {
+	var parts: Vec<Node> = Vec()
+	while at < pattern.len() && pattern[at] != '|' as u8 && pattern[at] != ')' as u8 {
+		val atom = parseAtom(pattern, &var at, &var building)?
+		parts.push(parseRepeats(pattern, &var at, move atom)?)
+	}
+	if parts.isEmpty() then return .Ok(.Empty)
+	if parts.len() == 1 then return .Ok(parts.pop().unwrap())
+	return .Ok(.Sequence(parts: move parts))
+}
+
+/// Each `*`, `+`, `?` or `{…}` after an atom, and a `?` after it that asks
+/// for as few as can be.
+fn parseRepeats(pattern: str, at: &var i64, atom: Node): Result<Node, RegexError> = {
+	var node = move atom
+	while at < pattern.len() {
+		val here = at
+		val (least, most) = if pattern[at] == '*' as u8 {
+			at += 1
+			(0, -1)
+		} else if pattern[at] == '+' as u8 {
+			at += 1
+			(1, -1)
+		} else if pattern[at] == '?' as u8 {
+			at += 1
+			(0, 1)
+		} else if pattern[at] == '{' as u8 {
+			parseCount(pattern, &var at)?
+		} else {
+			return .Ok(move node)
+		}
+		var greedy = true
+		if at < pattern.len() && pattern[at] == '?' as u8 {
+			greedy = false
+			at += 1
+		}
+		if node is .Empty || node is .Start || node is .End then
+			return .Err(RegexError(at: here, problem: .NothingToRepeat))
+		node = .Repeat(inner: own (move node), least: least, most: most, greedy: greedy)
+	}
+	return .Ok(move node)
+}
+
+/// `{n}`, `{n,}` or `{n,m}`, from its `{`.
+fn parseCount(pattern: str, at: &var i64): Result<(i64, i64), RegexError> = {
+	val start = at
+	val bad = RegexError(at: start, problem: .BadRepeat)
+	val .Some(close) = pattern[at..pattern.len()].find("}") else {
+		return .Err(bad)
+	}
+	val inside = pattern[at + 1..at + close]
+	at = at + close + 1
+	val (least, most) = match inside.splitOnce(",") {
+		.None => match inside.toInt() {
+			.Ok(n) => (n, n)
+			.Err(..) => return .Err(bad)
+		}
+		.Some((first, rest)) => {
+			val .Ok(n) = first.toInt() else {
+				return .Err(bad)
+			}
+			if rest.isEmpty() {
+				(n, -1)
+			} else {
+				val .Ok(m) = rest.toInt() else {
+					return .Err(bad)
+				}
+				(n, m)
+			}
+		}
+	}
+	if least < 0 || least > MOST_REPEATS || most > MOST_REPEATS || (most >= 0 && most < least) then
+		return .Err(bad)
+	return .Ok((least, most))
+}
+
+fn parseAtom(pattern: str, at: &var i64, building: &var Building): Result<Node, RegexError> = {
+	val start = at
+	val (c, width) = pattern.charAt(at)
+	at += width
+	if c == '.' then return .Ok(.Any)
+	if c == '^' then return .Ok(.Start)
+	if c == '$' then return .Ok(.End)
+	if c == '[' then return parseClass(pattern, &var at, &var building, start)
+	if c == '(' {
+		var capture = -1
+		if at < pattern.len() && pattern[at] == '?' as u8 {
+			if !pattern[at..pattern.len()].startsWith("?:") then
+				return .Err(RegexError(at: start, problem: .UnknownGroup))
+			at += 2
+		} else {
+			building.groups += 1
+			capture = building.groups
+		}
+		val inner = parseEither(pattern, &var at, &var building)?
+		if at >= pattern.len() || pattern[at] != ')' as u8 then
+			return .Err(RegexError(at: start, problem: .UnclosedGroup))
+		at += 1
+		return .Ok(.Group(capture: capture, inner: own (move inner)))
+	}
+	if c is '*' | '+' | '?' | '{' then return .Err(RegexError(at: start, problem: .NothingToRepeat))
+	if c == '\\' then return escaped(pattern, &var at, &var building, start)
+	return .Ok(.Char(c))
+}
+
+/// What follows a `\`, outside a class: a class of its own, or a character
+/// as itself.
+fn escaped(
+	pattern: str,
+	at: &var i64,
+	building: &var Building,
+	start: i64,
+): Result<Node, RegexError> = {
+	if at >= pattern.len() then return .Err(RegexError(at: start, problem: .BadEscape))
+	val (c, width) = pattern.charAt(at)
+	at += width
+	if isClassEscape(c) {
+		var ranges: Vec<(u32, u32)> = Vec()
+		classRanges(c, &var ranges)
+		building.sets.push(CharSet(ranges: move ranges, negated: false))
+		return .Ok(.Set(index: building.sets.len() - 1))
+	}
+	val .Some(literal) = escapedChar(c) else {
+		return .Err(RegexError(at: start, problem: .BadEscape))
+	}
+	return .Ok(.Char(literal))
+}
+
+/// `[…]`, from after its `[`.
+fn parseClass(
+	pattern: str,
+	at: &var i64,
+	building: &var Building,
+	start: i64,
+): Result<Node, RegexError> = {
+	var ranges: Vec<(u32, u32)> = Vec()
+	var negated = false
+	if at < pattern.len() && pattern[at] == '^' as u8 {
+		negated = true
+		at += 1
+	}
+	// A `]` first is itself, as it closes nothing yet.
+	var first = true
+	while true {
+		if at >= pattern.len() then return .Err(RegexError(at: start, problem: .UnclosedClass))
+		if pattern[at] == ']' as u8 && !first {
+			at += 1
+			break
+		}
+		first = false
+		val itemAt = at
+		val (c, width) = pattern.charAt(at)
+		at += width
+		var low = c
+		if c == '\\' {
+			if at >= pattern.len() then return .Err(RegexError(at: itemAt, problem: .BadEscape))
+			val (e, escapedWidth) = pattern.charAt(at)
+			at += escapedWidth
+			if isClassEscape(e) {
+				classRanges(e, &var ranges)
+				continue
+			}
+			val .Some(literal) = escapedChar(e) else {
+				return .Err(RegexError(at: itemAt, problem: .BadEscape))
+			}
+			low = literal
+		}
+		// `a-z`, where a `-` is followed by something other than the `]`.
+		if at + 1 < pattern.len() && pattern[at] == '-' as u8 && pattern[at + 1] != ']' as u8 {
+			at += 1
+			val (high, highWidth) = pattern.charAt(at)
+			at += highWidth
+			if high < low then return .Err(RegexError(at: itemAt, problem: .BackwardsRange))
+			ranges.push((low as u32, high as u32))
+		} else {
+			ranges.push((low as u32, low as u32))
+		}
+	}
+	building.sets.push(CharSet(ranges: move ranges, negated: negated))
+	return .Ok(.Set(index: building.sets.len() - 1))
+}
+
+fn isClassEscape(c: char): bool = c is 'd' | 'w' | 's' | 'D' | 'W' | 'S'
+
+/// The ranges of `\d`, `\w` or `\s`, or of everything but them for the
+/// capital.
+fn classRanges(c: char, into: &var Vec<(u32, u32)>) = {
+	var ranges: Vec<(u32, u32)> = Vec()
+	if c is 'd' | 'D' {
+		ranges.push(('0' as u32, '9' as u32))
+	} else if c is 'w' | 'W' {
+		ranges.push(('0' as u32, '9' as u32))
+		ranges.push(('A' as u32, 'Z' as u32))
+		ranges.push(('_' as u32, '_' as u32))
+		ranges.push(('a' as u32, 'z' as u32))
+	} else {
+		// What `char::isWhitespace` accepts, in order.
+		ranges.push((9, 13))
+		ranges.push((32, 32))
+		ranges.push((0x85, 0x85))
+		ranges.push((0xA0, 0xA0))
+		ranges.push((0x1680, 0x1680))
+		ranges.push((0x2000, 0x200A))
+		ranges.push((0x2028, 0x2029))
+		ranges.push((0x202F, 0x202F))
+		ranges.push((0x205F, 0x205F))
+		ranges.push((0x3000, 0x3000))
+	}
+	if c is 'D' | 'W' | 'S' {
+		// Everything the ranges leave, from 0 to the last character.
+		var next: u32 = 0
+		for range in ranges {
+			if range.0 > next then into.push((next, range.0 - 1))
+			next = range.1 + 1
+		}
+		into.push((next, 0x10FFFF))
+		return
+	}
+	for range in ranges {
+		into.push(range)
+	}
+}
+
+/// The character a `\` before `c` stands for, where it stands for one: a
+/// line break or a tab by its letter, and anything but a letter or a
+/// digit as itself.
+fn escapedChar(c: char): Option<char> = {
+	if c == 'n' then return .Some('\n')
+	if c == 't' then return .Some('\t')
+	if c == 'r' then return .Some('\r')
+	if c.isAsciiLetter() || c.isDigit() then return .None
+	return .Some(c)
+}
+
+// Compiling: each node is written as the instructions that match it, one
+// after another, with a split where there is a choice.
+
+fn emit(node: &Node, program: &var Vec<Op>) = match node {
+	.Empty => {}
+	.Char(c) => program.push(.Char(c: c))
+	.Any => program.push(.Any)
+	.Set(index) => program.push(.Set(index: index))
+	.Start => program.push(.AtStart)
+	.End => program.push(.AtEnd)
+	.Group(capture, inner) => {
+		if capture > 0 then program.push(.Save(slot: capture * 2))
+		emit(&inner, &var program)
+		if capture > 0 then program.push(.Save(slot: capture * 2 + 1))
+	}
+	.Sequence(parts) => {
+		for part in parts {
+			emit(&part, &var program)
+		}
+	}
+	.Either(options) => {
+		// A split before each option but the last, and from the end of
+		// each a jump past the rest.
+		var jumps: Vec<i64> = Vec()
+		for i in 0..options.len() {
+			if i + 1 < options.len() {
+				val split = program.len()
+				program.push(.Split(first: split + 1, second: -1))
+				emit(&options[i], &var program)
+				jumps.push(program.len())
+				program.push(.Jump(to: -1))
+				program[split] = .Split(first: split + 1, second: program.len())
+			} else {
+				emit(&options[i], &var program)
+			}
+		}
+		for jump in jumps {
+			program[jump] = .Jump(to: program.len())
+		}
+	}
+	.Repeat(inner, least, most, greedy) => emitRepeat(&inner, least, most, greedy, &var program)
+}
+
+fn emitRepeat(inner: &Node, least: i64, most: i64, greedy: bool, program: &var Vec<Op>) = {
+	for i in 0..least {
+		emit(&inner, &var program)
+	}
+	if most < 0 {
+		// As many more as there are: a split into the body or past it,
+		// and from the body back to the split.
+		val split = program.len()
+		program.push(.Split(first: -1, second: -1))
+		emit(&inner, &var program)
+		program.push(.Jump(to: split))
+		val out = program.len()
+		program[split] = if greedy then .Split(first: split + 1, second: out)
+		else .Split(first: out, second: split + 1)
+		return
+	}
+	// Up to `most - least` more, each a split into it or past them all.
+	var splits: Vec<i64> = Vec()
+	for i in least..most {
+		splits.push(program.len())
+		program.push(.Split(first: -1, second: -1))
+		emit(&inner, &var program)
+	}
+	val out = program.len()
+	for split in splits {
+		program[split] = if greedy then .Split(first: split + 1, second: out)
+		else .Split(first: out, second: split + 1)
+	}
+}
+
+/// Makes a compiled pattern match ASCII letters in either case: a letter
+/// becomes a set of both, and a set takes the other case of every letter
+/// it holds, before it is negated, so `[^a]` refuses `A` too.
+fn foldCase(program: &var Vec<Op>, sets: &var Vec<CharSet>) = {
+	for i in 0..sets.len() {
+		foldRanges(&var sets[i].ranges)
+	}
+	for i in 0..program.len() {
+		if program[i] is .Char(c: c) && c.isAsciiLetter() {
+			val lower = c.toAsciiLower() as u32
+			val upper = c.toAsciiUpper() as u32
+			var ranges: Vec<(u32, u32)> = Vec()
+			ranges.push((lower, lower))
+			ranges.push((upper, upper))
+			program[i] = .Set(index: sets.len())
+			sets.push(CharSet(ranges: move ranges, negated: false))
+		}
+	}
+}
+
+val UPPER_FIRST: u32 = 65
+val UPPER_LAST: u32 = 90
+val LOWER_FIRST: u32 = 97
+val LOWER_LAST: u32 = 122
+val CASE_DISTANCE: u32 = 32
+
+/// Adds, for the letters of each range, the same letters in the other case.
+fn foldRanges(ranges: &var Vec<(u32, u32)>) = {
+	val count = ranges.len()
+	for i in 0..count {
+		val (low, high) = ranges[i]
+		val upperLow = low.max(UPPER_FIRST)
+		val upperHigh = high.min(UPPER_LAST)
+		if upperLow <= upperHigh then
+			ranges.push((upperLow + CASE_DISTANCE, upperHigh + CASE_DISTANCE))
+		val lowerLow = low.max(LOWER_FIRST)
+		val lowerHigh = high.min(LOWER_LAST)
+		if lowerLow <= lowerHigh then
+			ranges.push((lowerLow - CASE_DISTANCE, lowerHigh - CASE_DISTANCE))
+	}
+}

@@ -1,0 +1,255 @@
+// A buffer that grows. `Vec<T>` is written here, in Wip, on
+// top of one primitive: `Slots<T>`, a block of slots none of which holds a
+// value. Only the prelude may name it, and the six operations on it are
+// the only bodies the compiler writes.
+
+import std::iter::{Taking}
+
+// `Slots<T>` is the compiler's: a pointer and how many slots it has, with a
+// `destroy` that frees the block and nothing in it. These six bodies are the
+// compiler's too, and they are the only ones in the language.
+extend Slots<T> {
+	/// A block of `count` slots, holding nothing.
+	@intrinsic
+	pub static fn alloc(count: i64): Slots<T>
+
+	/// The value goes into the slot. Nothing is dropped: the slot held
+	/// nothing.
+	@intrinsic
+	pub var fn moveIn(index: i64, value: T)
+
+	/// The value comes out, and the slot holds nothing again.
+	@intrinsic
+	pub var fn moveOut(index: i64): T
+
+	/// The slot, lent where it lies, to read or to write. Not checked: the
+	/// caller has checked `index` against what it knows holds a value,
+	/// which is the bound that matters.
+	@intrinsic
+	pub lend fn slot(index: i64): &T
+
+	/// The block, as a buffer of its first `length` slots, which must hold
+	/// values; the slots are left with no block, so nothing is freed twice.
+	@intrinsic
+	pub var fn takeBuffer(length: i64): own<[T]>
+
+	/// A buffer's block, as slots that all hold values; the buffer is left
+	/// empty, and frees nothing.
+	@intrinsic
+	pub static fn takeFrom(buffer: &var own<[T]>): Slots<T>
+}
+
+/// Values of one type, one after another, in memory that grows.
+/// `Vec()` is an empty one, which takes no memory until something is
+/// pushed.
+pub struct Vec<T> {
+	slots: Slots<T> = Slots<T>::alloc(0)
+	// How many of the slots hold a value: what `len()` answers.
+	length: i64 = 0
+}
+
+// The values it holds, lent as a slice to read or to write: everything
+// written for `&[T]` works on a vector, and `for x in v` walks it.
+extend Vec<T>: Items<T> {
+	@inline
+	lend fn items(): &[T] = lend self.slots[0..self.length]
+}
+
+// A vector is a sequence: `v.len()`, and `v[0]`, `v[0] = x`
+// and `v.at(0)` by its own name, the element at a position lent where it
+// lies, to read or to write as the call needs.
+extend Vec<T>: Sequence<T> {
+	/// How many values it holds.
+	@inline
+	fn len(): i64 = self.length
+
+	/// The element at `index`, which must be one of the vector's: the slots
+	/// past its length hold nothing. Checked once, against the length; the
+	/// slot is then lent as it lies.
+	@inline
+	lend fn at(index: i64): &T = {
+		if (index as u64) >= (self.length as u64) then
+			panic("index \(index) is out of bounds for length \(self.length)")
+		lend self.slots.slot(index)
+	}
+}
+
+// A value repeated is cloned, and plain data is its own clone.
+extend Vec<T: Clone> {
+	/// `count` of `value`: clones of it, and `value` itself last.
+	pub static fn filled(count: i64, value: T): Vec<T> = {
+		var all: Vec<T> = Vec::withCapacity(count)
+		if count <= 0 then return move all
+		for i in 1..count {
+			all.push(value.clone())
+		}
+		all.push(move value)
+		return move all
+	}
+}
+
+extend Vec<T>: Destroy {
+	var fn destroy() = self.clear()
+}
+
+// `for x in move v`: each element, taken from the front, the loop's to
+// keep.
+extend Vec<T>: IntoIterator<Taking<T>> {
+	move fn intoIterator(): Taking<T> = {
+		// The block goes to the iterator, and the vector is left with none
+		// and nothing in it, so its own end frees nothing.
+		var all = move self
+		val length = all.length
+		var buffer = all.slots.takeBuffer(length)
+		all.length = 0
+		return Taking::of(Slots<T>::takeFrom(&var buffer), length)
+	}
+}
+
+extend Vec<T> {
+	/// An empty vector, with room for `count` values.
+	pub static fn withCapacity(count: i64): Vec<T> = Vec(slots: Slots<T>::alloc(count), length: 0)
+
+	/// Whether it holds nothing, as a slice, a `String` and a map say.
+	@inline
+	pub fn isEmpty(): bool = self.length == 0
+
+	/// The values `own [ … ]` built, taken without moving one:
+	/// `Vec::of(own [1, 2, 3])`.
+	pub static fn of(buffer: own<[T]>): Vec<T> = {
+		var taken = move buffer
+		val length = taken.len()
+		return Vec(slots: Slots<T>::takeFrom(&var taken), length: length)
+	}
+
+	/// Its values, as a buffer of exactly their number, handed over without
+	/// moving one: what `own [ … ]` builds is a vector made into this.
+	pub move fn intoBuffer(): own<[T]> = {
+		var all = move self
+		val length = all.length
+		// Emptied, it drops nothing when it ends here, and its slots,
+		// which hand over their block, free nothing either.
+		all.length = 0
+		return all.slots.takeBuffer(length)
+	}
+
+	/// The value, at the end.
+	@inline
+	pub var fn push(value: T) = {
+		if self.length == self.slots.count then self.reserve(self.length + 1)
+		self.slots.moveIn(self.length, move value)
+		self.length += 1
+	}
+
+	/// The last value, taken out, or nothing where there is none.
+	@inline
+	pub var fn pop(): Option<T> = {
+		if self.length == 0 then return .None
+		self.length -= 1
+		return .Some(self.slots.moveOut(self.length))
+	}
+
+	/// Room for `count` values, doubling so that pushing costs the same on
+	/// average however many there are.
+	pub var fn reserve(count: i64) = {
+		if count > self.slots.count {
+			var room = self.slots.count * 2
+			if room < count then room = count
+			if room < 4 then room = 4
+			var bigger: Slots<T> = Slots<T>::alloc(room)
+			for i in 0..self.length {
+				bigger.moveIn(i, self.slots.moveOut(i))
+			}
+			self.slots = move bigger
+		}
+	}
+
+	/// The value at `index`, with the last one put in its place. It is how
+	/// a container that does not care about order removes in one step; the
+	/// order of what is left changes.
+	pub var fn swapRemove(index: i64): T = {
+		if index < 0 || index >= self.length then
+			panic("index out of bounds for removing from a vector")
+		self.length -= 1
+		val last = self.slots.moveOut(self.length)
+		if index == self.length then return move last
+		val taken = self.slots.moveOut(index)
+		self.slots.moveIn(index, move last)
+		return move taken
+	}
+
+	/// The value at `index`, with the ones after it moved down one, so the
+	/// order of what is left is kept.
+	pub var fn remove(index: i64): T = {
+		if index < 0 || index >= self.length then
+			panic("index out of bounds for removing from a vector")
+		val taken = self.slots.moveOut(index)
+		for i in index..self.length - 1 {
+			val next = self.slots.moveOut(i + 1)
+			self.slots.moveIn(i, move next)
+		}
+		self.length -= 1
+		return move taken
+	}
+
+	/// `value` at `index`, with the ones from there moved up one. An index
+	/// of `len` pushes it.
+	pub var fn insert(index: i64, value: T) = {
+		if index < 0 || index > self.length then
+			panic("index out of bounds for inserting into a vector")
+		if self.length == self.slots.count then self.reserve(self.length + 1)
+		var i = self.length
+		while i > index {
+			val before = self.slots.moveOut(i - 1)
+			self.slots.moveIn(i, move before)
+			i -= 1
+		}
+		self.slots.moveIn(index, move value)
+		self.length += 1
+	}
+
+	/// Keeps the first `count` values, and ends the rest.
+	pub var fn truncate(count: i64) = {
+		while self.length > count && self.length > 0 {
+			self.length -= 1
+			destroy(self.slots.moveOut(self.length))
+		}
+	}
+
+	/// Keeps the values `keep` answers true for, in their order, and ends
+	/// the rest: C++'s `erase_if`.
+	pub var fn retain(keep: &(x: &T) => bool) = {
+		var kept = 0
+		for i in 0..self.length {
+			val value = self.slots.moveOut(i)
+			if keep(&value) {
+				self.slots.moveIn(kept, move value)
+				kept += 1
+			} else {
+				destroy(move value)
+			}
+		}
+		self.length = kept
+	}
+
+	/// Ends what it holds, keeping the block.
+	pub var fn clear() = {
+		while self.length > 0 {
+			self.length -= 1
+			destroy(self.slots.moveOut(self.length))
+		}
+	}
+}
+
+// Elements that are plain data are pushed many at once, in one copy of the
+// memory; elements that own something are pushed one at a
+// time, by `push`.
+extend Vec<T: copy> {
+	/// The elements of `items`, at the end.
+	pub var fn pushAll(items: &[T]) = {
+		val start = self.length
+		self.reserve(start + items.len())
+		self.length = start + items.len()
+		self.slots[start..self.length].copyFrom(items)
+	}
+}

@@ -1,0 +1,137 @@
+// The memory an `own` lives in: what the code generator
+// calls `wip_alloc` and `wip_free`, over C's `malloc` and `free`. Every
+// allocation has 16 bytes in front of what is handed out, which keeps that
+// memory aligned as `malloc`'s is, and holds the allocation's number where
+// it was counted, or 0.
+//
+// Allocations are counted only where something asks:
+// `WIP_CHECK_LEAKS` in the environment, which makes a program that ends
+// with allocations not yet freed say how many and end with status 70, so
+// that the tests check every `own` is freed exactly once; and
+// `wip_trace_allocs`, which a test declares and calls, and which prints
+// each allocation and each free, to check the order of drops. Counted, an
+// allocation is numbered from 1 in the order it is made, from where the
+// counting began. Otherwise an allocation is `malloc` and a free is `free`:
+// the counters are words every thread would write, and each write would
+// wait for the others'.
+//
+// A future's thread allocates too, so what changes, changes
+// by atomic steps. Nothing here may allocate, and nothing here panics but
+// on memory C has none of.
+
+import std::libc::{abort, atexit, exitAtOnce, fflush, fprintf, free, getenv, malloc, stderr, stdout}
+
+@intrinsic
+fn atomicAdd(at: ptr<i64>, amount: i64): i64
+
+@intrinsic
+fn atomicLoad(at: ptr<i64>): i64
+
+@intrinsic
+fn atomicStore(at: ptr<i64>, value: i64)
+
+@intrinsic
+fn atomicCompareSwap(at: ptr<i64>, expected: i64, value: i64): bool
+
+@intrinsic
+fn offsetBytes(pointer: ptr<u8>, bytes: i64): ptr<u8>
+
+@intrinsic
+fn runtimeWords(): ptr<i64>
+
+// The runtime's words, one per counter: allocations not yet freed, those
+// made so far, whether the first has been made, whether each is printed,
+// whether the program has panicked, and whether allocations are counted.
+val LIVE: i64 = 0
+val MADE: i64 = 1
+val STARTED: i64 = 2
+val TRACING: i64 = 3
+val PANICKED: i64 = 4
+val COUNTING: i64 = 5
+
+// What `COUNTING` holds: not yet decided, which the first allocation does;
+// and then whether allocations are counted.
+val UNDECIDED: i64 = 0
+val NOT_COUNTED: i64 = 1
+val COUNTED: i64 = 2
+
+val HEADER: i64 = 16
+
+@inline
+fn word(which: i64): ptr<i64> = offsetBytes(runtimeWords() as ptr<u8>, which * 8) as ptr<i64>
+
+/// Every allocation and every free, printed as it happens; allocations are
+/// counted from here, if they were not already.
+@export("C")
+fn wip_trace_allocs() = {
+	atomicStore(word(COUNTING), COUNTED)
+	atomicStore(word(TRACING), 1)
+}
+
+/// The program is panicking: it ends without freeing what it holds, which is
+/// not a leak.
+fn notePanic() = {
+	atomicStore(word(PANICKED), 1)
+}
+
+// At the end of the program: what was never freed, unless it panicked.
+fn checkLeaks() = {
+	if atomicLoad(word(PANICKED)) != 0 then return
+	val live = atomicLoad(word(LIVE))
+	if live != 0 {
+		fflush(stdout)
+		val was: cstring = if live == 1 then " was" else "s were"
+		fprintf(stderr, "wip: %lld allocation%s never freed\n", live, was)
+		exitAtOnce(70)
+	}
+}
+
+/// Whether this allocation is counted: what the first allocation decides
+/// from the environment, before it is made, and the trace turns on. Read
+/// on every allocation, it is a word no one writes once it is decided.
+fn counted(): bool = {
+	val decided = atomicLoad(word(COUNTING))
+	if decided != UNDECIDED then return decided == COUNTED
+	// The leak check is asked for once, and registered once, however many
+	// threads make their first allocation together. What they decide is the
+	// same, and a trace started meanwhile is not undone.
+	val checking = !getenv("WIP_CHECK_LEAKS").isNull
+	if atomicAdd(word(STARTED), 1) == 0 && checking then atexit(checkLeaks)
+	atomicCompareSwap(word(COUNTING), UNDECIDED, if checking then COUNTED else NOT_COUNTED)
+	return atomicLoad(word(COUNTING)) == COUNTED
+}
+
+@export("C")
+fn wip_alloc(size: i64): ptr<u8> = {
+	val counting = counted()
+	val wanted = if size <= 0 then 1 else size
+	val block = malloc((wanted + HEADER) as size_t)
+	if block.isNull {
+		fflush(stdout)
+		fprintf(stderr, "wip: out of memory (failed to allocate %lld bytes)\n", wanted)
+		abort()
+	}
+	if !counting {
+		(block as ptr<i64>)[0] = 0
+		return offsetBytes(block, HEADER)
+	}
+	val number = atomicAdd(word(MADE), 1) + 1
+	(block as ptr<i64>)[0] = number
+	atomicAdd(word(LIVE), 1)
+	if atomicLoad(word(TRACING)) != 0 then fprintf(stdout, "alloc #%lld\n", number)
+	return offsetBytes(block, HEADER)
+}
+
+@export("C")
+fn wip_free(memory: ptr<u8>) = {
+	if memory.isNull then return
+	val block = offsetBytes(memory, -HEADER)
+	// A block that was counted says its number; one made before counting
+	// began was not, and is not counted out.
+	val number = (block as ptr<i64>)[0]
+	if number != 0 {
+		if atomicLoad(word(TRACING)) != 0 then fprintf(stdout, "free #%lld\n", number)
+		atomicAdd(word(LIVE), -1)
+	}
+	free(block)
+}

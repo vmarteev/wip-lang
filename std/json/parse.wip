@@ -1,0 +1,272 @@
+// Reading a document. The text is read by byte position,
+// as `std::regex` reads a pattern: what JSON writes around its values is
+// ASCII, a string with no escape in it is copied from the text whole, and
+// an error's line and column are worked out from where it was found, once.
+
+/// How deeply arrays and objects may be nested. Each level is a call, and a
+/// document nested deeper is refused rather than running out of stack:
+/// RFC 8259 lets a reader set this.
+pub val MOST_NESTED: i64 = 512
+
+/// The value `text` holds: one JSON value, with white space around it and
+/// nothing else.
+pub fn parse(text: str): Result<Json, JsonError> = {
+	var reader = Reader(text: text, at: 0, depth: 0)
+	val value = reader.value()?
+	reader.skipSpace()
+	if reader.at < text.len() then return .Err(reader.error(.TrailingText))
+	return .Ok(move value)
+}
+
+/// Where reading has got to in a document.
+view struct Reader {
+	text: str
+	/// The byte offset of what is read next.
+	at: i64
+	/// How many arrays and objects the value being read is inside.
+	depth: i64
+}
+
+extend Reader {
+	/// The byte read next, or nothing at the end.
+	fn peek(): Option<u8> = if self.at < self.text.len() then .Some(self.text[self.at]) else .None
+
+	/// Whether the byte read next is `byte`, which is then taken.
+	var fn take(byte: u8): bool = {
+		if self.peek() != .Some(byte) then return false
+		self.at += 1
+		return true
+	}
+
+	/// Past the white space JSON allows between its parts.
+	var fn skipSpace() = {
+		while self.peek() is .Some(b' ' | b'\t' | b'\n' | b'\r') {
+			self.at += 1
+		}
+	}
+
+	/// A value, after any white space before it.
+	var fn value(): Result<Json, JsonError> = {
+		self.skipSpace()
+		val .Some(byte) = self.peek() else {
+			return .Err(self.error(.ExpectedValue))
+		}
+		return match byte as char {
+			'{' => self.object()
+			'[' => self.array()
+			'"' => .Ok(.Text(text: self.string()?))
+			't' => self.word("true", .Bool(value: true))
+			'f' => self.word("false", .Bool(value: false))
+			'n' => self.word("null", .Null)
+			'-' | '0'..='9' => self.number()
+			_ => .Err(self.error(.ExpectedValue))
+		}
+	}
+
+	/// `true`, `false` or `null`, which is `value`.
+	var fn word(written: str, value: Json): Result<Json, JsonError> = {
+		if !self.text[self.at..self.text.len()].startsWith(written) then
+			return .Err(self.error(.ExpectedValue))
+		self.at += written.len()
+		return .Ok(move value)
+	}
+
+	/// One more array or object around what is read next.
+	var fn enter(): Result<void, JsonError> = {
+		if self.depth == MOST_NESTED then return .Err(self.error(.TooDeep))
+		self.depth += 1
+		self.at += 1
+		return .Ok()
+	}
+
+	/// An array, from its `[`.
+	var fn array(): Result<Json, JsonError> = {
+		self.enter()?
+		var items: Vec<Json> = Vec()
+		self.skipSpace()
+		if !self.take(']' as u8) {
+			while true {
+				items.push(self.value()?)
+				self.skipSpace()
+				if self.take(']' as u8) then break
+				if !self.take(',' as u8) then return .Err(self.error(.ExpectedCommaOrBracket))
+			}
+		}
+		self.depth -= 1
+		return .Ok(.Array(items: move items))
+	}
+
+	/// An object, from its `{`.
+	var fn object(): Result<Json, JsonError> = {
+		self.enter()?
+		var fields: Vec<(String, Json)> = Vec()
+		self.skipSpace()
+		if !self.take('}' as u8) {
+			while true {
+				self.skipSpace()
+				if self.peek() != .Some('"' as u8) then return .Err(self.error(.ExpectedName))
+				val name = self.string()?
+				self.skipSpace()
+				if !self.take(':' as u8) then return .Err(self.error(.ExpectedColon))
+				val value = self.value()?
+				fields.push((move name, move value))
+				self.skipSpace()
+				if self.take('}' as u8) then break
+				if !self.take(',' as u8) then return .Err(self.error(.ExpectedCommaOrBrace))
+			}
+		}
+		self.depth -= 1
+		return .Ok(.Object(fields: move fields))
+	}
+
+	/// A string, from its `"`, with its escapes read.
+	var fn string(): Result<String, JsonError> = {
+		self.at += 1
+		var out = String()
+		// Where the run not yet copied starts: the text between escapes is
+		// copied whole.
+		var from = self.at
+		while self.peek() is .Some(byte) {
+			if byte == '"' as u8 {
+				out.push(self.text[from..self.at])
+				self.at += 1
+				return .Ok(move out)
+			}
+			if byte == '\\' as u8 {
+				out.push(self.text[from..self.at])
+				out.pushChar(self.escape()?)
+				from = self.at
+			} else if byte < 0x20 {
+				return .Err(self.error(.ControlInString))
+			} else {
+				self.at += 1
+			}
+		}
+		return .Err(self.error(.UnclosedString))
+	}
+
+	/// The character an escape stands for, from its `\`.
+	var fn escape(): Result<char, JsonError> = {
+		val start = self.at
+		self.at += 1
+		val .Some(byte) = self.peek() else {
+			return .Err(self.errorAt(start, .BadEscape))
+		}
+		self.at += 1
+		return match byte as char {
+			'"' => .Ok('"')
+			'\\' => .Ok('\\')
+			'/' => .Ok('/')
+			'b' => .Ok('\u{8}')
+			'f' => .Ok('\u{c}')
+			'n' => .Ok('\n')
+			'r' => .Ok('\r')
+			't' => .Ok('\t')
+			'u' => self.unicode(start)
+			_ => .Err(self.errorAt(start, .BadEscape))
+		}
+	}
+
+	/// The character of a `\u` escape, from after its `u`: four hexadecimal
+	/// digits, or two escapes where the character takes a UTF-16 pair.
+	var fn unicode(start: i64): Result<char, JsonError> = {
+		val first = self.hexDigits(start)?
+		// A low half on its own, or a high half with no low half after it.
+		val lone = self.errorAt(start, .LoneSurrogate)
+		if first is 0xDC00..=0xDFFF then return .Err(lone)
+		var code = first
+		if first is 0xD800..=0xDBFF {
+			if !self.text[self.at..self.text.len()].startsWith("\\u") then return .Err(lone)
+			self.at += 2
+			val second = self.hexDigits(start)?
+			if second < 0xDC00 || second > 0xDFFF then return .Err(lone)
+			code = 0x10000 + (first - 0xD800) * 0x400 + (second - 0xDC00)
+		}
+		val .Some(c) = char::fromInt(code) else {
+			return .Err(lone)
+		}
+		return .Ok(c)
+	}
+
+	/// The four hexadecimal digits of a `\u` escape, as a number.
+	var fn hexDigits(start: i64): Result<i64, JsonError> = {
+		var code = 0
+		for n in 0..4 {
+			val digit = match self.peek() {
+				.Some(byte) => hexValue(byte)
+				.None => .None
+			}
+			val .Some(value) = digit else {
+				return .Err(self.errorAt(start, .BadEscape))
+			}
+			code = code * 16 + value
+			self.at += 1
+		}
+		return .Ok(code)
+	}
+
+	/// A number, from its `-` or first digit: `Int` where it has no fraction
+	/// or exponent and fits, `Float` otherwise.
+	var fn number(): Result<Json, JsonError> = {
+		val start = self.at
+		self.take('-' as u8)
+		// The whole part is `0`, or digits that do not start with one.
+		if !self.take('0' as u8) && self.digits() == 0 then
+			return .Err(self.errorAt(start, .BadNumber))
+		var whole = true
+		if self.take('.' as u8) {
+			whole = false
+			if self.digits() == 0 then return .Err(self.errorAt(start, .BadNumber))
+		}
+		if self.take('e' as u8) || self.take('E' as u8) {
+			whole = false
+			if !self.take('+' as u8) then self.take('-' as u8)
+			if self.digits() == 0 then return .Err(self.errorAt(start, .BadNumber))
+		}
+		val written = self.text[start..self.at]
+		if whole && written.toInt() is .Ok(value) then return .Ok(.Int(value: value))
+		return match written.toFloat() {
+			.Ok(value) => .Ok(.Float(value: value))
+			.Err(..) => .Err(self.errorAt(start, .NumberTooLarge))
+		}
+	}
+
+	/// Past the digits read next: how many there were.
+	var fn digits(): i64 = {
+		val start = self.at
+		while self.peek() is .Some(b'0'..=b'9') {
+			self.at += 1
+		}
+		return self.at - start
+	}
+
+	/// `problem`, where reading has got to.
+	fn error(problem: Problem): JsonError = self.errorAt(self.at, problem)
+
+	/// `problem`, at the byte offset `at`: its line, and its column in
+	/// characters, each from 1.
+	fn errorAt(at: i64, problem: Problem): JsonError = {
+		var line = 1
+		var column = 1
+		for i in 0..at {
+			val byte = self.text[i]
+			if byte == '\n' as u8 {
+				line += 1
+				column = 1
+			} else if byte & 0xC0 != 0x80 {
+				// A character's first byte: the bytes after it in UTF-8 are
+				// `10xxxxxx`.
+				column += 1
+			}
+		}
+		return JsonError(line: line, column: column, problem: problem)
+	}
+}
+
+/// What a hexadecimal digit is worth, or nothing for another byte.
+fn hexValue(byte: u8): Option<i64> = match byte {
+	b'0'..=b'9' => .Some((byte - b'0') as i64)
+	b'a'..=b'f' => .Some((byte - b'a') as i64 + 10)
+	b'A'..=b'F' => .Some((byte - b'A') as i64 + 10)
+	_ => .None
+}

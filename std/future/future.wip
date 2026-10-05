@@ -1,0 +1,413 @@
+// Work on another thread. A future runs an owned closure
+// on a thread of its own, and hands back what it answers; a channel moves
+// values between threads, one at a time. Nothing else is shared: an owned
+// closure holds only what it owns, so what it touches is
+// the thread's alone, and what crosses a channel is moved.
+//
+// The threads are pthreads, and a channel is a queue of addresses under
+// a lock, both in memory C and Wip reach alike. What
+// crosses is the address of a box, which `intoAddress` and `fromAddress`
+// make of an `own` and back.
+
+import std::collections::{Deque}
+import std::sync::{Atomic, Mutex}
+import std::libc::{SC_NPROCESSORS_ONLN, abort, fflush, fprintf, hidden, pthread_attr_destroy, pthread_attr_init, pthread_attr_setstacksize, pthread_create, pthread_join, stderr, stdout, strerror, sysconf}
+
+/// The box an `own` points to, as an address C can hold. The `own` is
+/// gone; `fromAddress` is the only way back to it.
+@intrinsic
+fn intoAddress<T>(value: own<T>): ptr<u8>
+
+/// The box at an address `intoAddress` gave, owned again.
+@intrinsic
+fn fromAddress<T>(address: ptr<u8>): own<T>
+
+/// What a box holds, taken out; the box is freed.
+@intrinsic
+fn unbox<T>(boxed: own<T>): T
+
+@intrinsic
+fn atomicLoad(at: ptr<i64>): i64
+
+@intrinsic
+fn atomicStore(at: ptr<i64>, value: i64)
+
+@intrinsic
+fn offsetBytes(pointer: ptr<u8>, bytes: i64): ptr<u8>
+
+// A channel's queue, which both ends reach from their threads:
+// the addresses sent and not yet received, with how many
+// senders there are and whether anyone receives, under a `Mutex`; and how
+// many ends hold it, an `Atomic`, the last of which to let go frees it.
+// The ends hold its address: two owners of one value is shared ownership,
+// which Wip has not (Answer 5), so this much is by hand.
+struct Queue {
+	state: Mutex<QueueState>
+	holders: Atomic<i64>
+}
+
+struct QueueState {
+	items: Deque<ptr<u8>>
+	senders: i64
+	receiving: bool
+}
+
+fn newQueue(): ptr<Queue> = {
+	val state = QueueState(items: Deque(), senders: 1, receiving: true)
+	val made = own Queue(state: Mutex::of(move state), holders: Atomic::of(2 as i64))
+	return intoAddress(move made) as ptr<Queue>
+}
+
+// One end lets go of the queue; the last frees it.
+fn letGo(queue: ptr<Queue>) = {
+	if queue.holders.subtract(1) == 1 {
+		val gone: own<Queue> = fromAddress(queue as ptr<u8>)
+	}
+}
+
+// True where the item was queued; false where nobody receives any more,
+// and the item is the sender's to drop.
+fn queueSend(queue: ptr<Queue>, item: ptr<u8>): bool = queue.state.lock((state) => {
+	if !state.receiving then return false
+	state.items.pushBack(item)
+	return true
+})
+
+// 1 with the next item in `out`, 0 where there is none yet, and -1 where
+// there is none and every sender is gone. Waiting, it answers 0 never.
+fn queueReceive(queue: ptr<Queue>, out: &var ptr<u8>, wait: bool): i64 = {
+	if wait then
+		return queue.state.lockWhen(
+			(state) => !state.items.isEmpty() || state.senders == 0,
+			(state) => taken(&var state, &var out),
+		)
+	return queue.state.lock((state) => taken(&var state, &var out))
+}
+
+fn taken(state: &var QueueState, out: &var ptr<u8>): i64 = {
+	if state.items.popFront() is .Some(item) {
+		out = item
+		return 1
+	}
+	return if state.senders > 0 then 0 else -1
+}
+
+fn queueAddSender(queue: ptr<Queue>) = {
+	queue.holders.add(1)
+	queue.state.lock((state) => { state.senders += 1 })
+}
+
+// A receiver that waits hears that nothing more is coming: the lock's end
+// wakes it.
+fn queueDropSender(queue: ptr<Queue>) = {
+	queue.state.lock((state) => { state.senders -= 1 })
+	letGo(queue)
+}
+
+// The receiver has taken what was queued; what a sender sends from now on
+// is handed back to it.
+fn queueDropReceiver(queue: ptr<Queue>) = {
+	queue.state.lock((state) => { state.receiving = false })
+	letGo(queue)
+}
+
+// A thread: its pthread, the job it runs, and whether it has finished,
+// which the thread writes and the future reads at once.
+extern struct Thread {
+	id: u64
+	job: ptr<u8>
+	finished: i64
+}
+
+fn finishedFlag(thread: ptr<Thread>): ptr<i64> = offsetBytes(thread as ptr<u8>, 16) as ptr<i64>
+
+// Where a thread starts: the job, then word that it is done.
+fn threadMain(argument: ptr<u8>): ptr<u8> = {
+	val thread = argument as ptr<Thread>
+	runJob(thread.job)
+	atomicStore(finishedFlag(thread), 1)
+	return null
+}
+
+fn startThread(entry: (argument: ptr<u8>) => ptr<u8>, job: ptr<u8>): ptr<Thread> = {
+	val made = own Thread(id: 0, job: job, finished: 0)
+	val thread = intoAddress(move made) as ptr<Thread>
+	// As much stack as the main thread has, so that what runs there runs
+	// here too.
+	var attributes = hidden()
+	pthread_attr_init(&var attributes)
+	pthread_attr_setstacksize(&var attributes, (8 * 1024 * 1024) as size_t)
+	val failed = pthread_create(&var thread.id, &attributes, entry, thread as ptr<u8>)
+	pthread_attr_destroy(&var attributes)
+	if failed != 0 {
+		fflush(stdout)
+		fprintf(stderr, "wip: cannot start a thread: %s\n", strerror(failed))
+		abort()
+	}
+	return thread
+}
+
+fn threadDone(thread: ptr<Thread>): bool = atomicLoad(finishedFlag(thread)) != 0
+
+fn joinThread(thread: ptr<Thread>) = {
+	pthread_join(thread.id, null)
+	val gone: own<Thread> = fromAddress(thread as ptr<u8>)
+}
+
+/// The end of a channel that sends. There may be several, one for each
+/// thread that sends: `another()` makes one.
+pub struct Sender<T> {
+	channel: ptr<Queue>
+}
+
+/// The end of a channel that receives. There is one.
+pub struct Receiver<T> {
+	channel: ptr<Queue>
+}
+
+/// What `tryReceive` finds.
+pub enum Received<T> {
+	Value(value: T)
+	/// Nothing yet.
+	Empty
+	/// Nothing, and nothing will come: every sender is gone.
+	Closed
+}
+
+/// A queue of values of `T`, with no bound: the end that sends, and the
+/// end that receives.
+pub fn channel<T>(): (Sender<T>, Receiver<T>) = {
+	val queue = newQueue()
+	return (Sender(channel: queue), Receiver(channel: queue))
+}
+
+extend Sender<T> {
+	/// Moves `value` into the queue; it never waits. Where nobody receives
+	/// any more, the value is dropped here.
+	pub fn send(value: T) = {
+		val address = intoAddress(own (move value))
+		if !queueSend(self.channel, address) {
+			val unwanted: own<T> = fromAddress(address)
+		}
+	}
+
+	/// Another sender to the same queue, for another thread.
+	pub fn another(): Sender<T> = {
+		queueAddSender(self.channel)
+		return Sender(channel: self.channel)
+	}
+}
+
+extend Sender<T>: Destroy {
+	var fn destroy() = queueDropSender(self.channel)
+}
+
+extend Receiver<T> {
+	/// The next value, waiting for it; nothing once every sender is gone
+	/// and the queue is empty.
+	pub fn receive(): Option<T> = match self.take(true) {
+		.Value(value) => .Some(move value)
+		_ => .None
+	}
+
+	/// The next value if there is one, without waiting.
+	pub fn tryReceive(): Received<T> = self.take(false)
+
+	fn take(wait: bool): Received<T> = {
+		var address: ptr<u8> = null
+		val got = queueReceive(self.channel, &var address, wait)
+		if got == 1 {
+			val boxed: own<T> = fromAddress(address)
+			return .Value(unbox(move boxed))
+		}
+		return if got == 0 then .Empty else .Closed
+	}
+}
+
+extend Receiver<T>: Iterator<T> {
+	/// `for value in receiver`: each value as it comes, until every sender
+	/// is gone.
+	var fn next(): Option<T> = self.receive()
+}
+
+extend Receiver<T>: Destroy {
+	/// What is still queued is dropped, and what is sent from now on is
+	/// dropped by its sender.
+	var fn destroy() = {
+		while self.take(false) is .Value(..) {}
+		queueDropReceiver(self.channel)
+	}
+}
+
+/// What a thread is given: its work, with its answer's sender inside.
+struct Job {
+	work: own<() => void>
+}
+
+/// Where every future's thread starts.
+fn runJob(job: ptr<u8>) = {
+	val given: own<Job> = fromAddress(job)
+	given.work()
+}
+
+/// A value being made on a thread of its own.
+pub struct Future<T> {
+	thread: ptr<Thread>
+	answer: Receiver<T>
+	/// `poll` handed the value over.
+	taken: bool = false
+}
+
+extend Future<T> {
+	/// Starts a thread that runs `work`, and keeps what it answers. What
+	/// `work` captured is moved into it, and is the thread's alone.
+	pub static fn run(work: own<() => T>): Future<T> = {
+		val (sender, receiver) = channel<T>()
+		val job = own Job(work: own () => sender.send(work()))
+		val thread = startThread(threadMain, intoAddress(move job))
+		Future(thread: thread, answer: move receiver)
+	}
+
+	/// Whether the work has finished: its value was handed over, or its
+	/// thread has ended.
+	pub fn isDone(): bool = self.taken || threadDone(self.thread)
+
+	/// The value, if it is there, without waiting. It is handed over once;
+	/// after that the future holds nothing, and is done.
+	pub var fn poll(): Option<T> = match self.answer.tryReceive() {
+		.Value(value) => {
+			self.taken = true
+			.Some(move value)
+		}
+		_ => .None
+	}
+
+	/// Waits for the value, and hands it over. `poll` may have taken it
+	/// already, and then there is nothing to hand over.
+	pub move fn get(): T = match self.answer.receive() {
+		.Some(value) => move value
+		.None => panic("get of a Future whose value poll took already")
+	}
+}
+
+extend Future<T>: Destroy {
+	/// A future waits for its thread: work never outlives what started it.
+	var fn destroy() = joinThread(self.thread)
+}
+
+// Work that borrows: closures lent to a call that runs them
+// on threads and answers only once every one has ended, so that what they
+// borrow outlives them. What they capture is checked as the call's
+// arguments are: what one writes, no other touches.
+
+/// A closure lent to a thread: the address of its code, and of what it
+/// captured, which the call that lent it keeps until the thread has ended.
+struct Lent {
+	code: (captures: ptr<u8>) => void
+	captures: ptr<u8>
+}
+
+// Where a thread that runs a lent closure starts.
+fn lentMain(argument: ptr<u8>): ptr<u8> = {
+	val thread = argument as ptr<Thread>
+	val lent = thread.job as ptr<Lent>
+	val code = lent.code
+	code(lent.captures)
+	atomicStore(finishedFlag(thread), 1)
+	return null
+}
+
+// Runs `elsewhere` on a thread of its own and `here` on this one, and
+// answers once both have ended.
+fn runBeside(elsewhere: &var () => void, here: &var () => void) = {
+	var lent = Lent(code: closureCode(elsewhere), captures: closureCaptures(elsewhere))
+	val thread = startThread(lentMain, addressOf(&var lent) as ptr<u8>)
+	here()
+	joinThread(thread)
+}
+
+/// Runs `first` on a thread of its own and `second` on this one, at once,
+/// and answers what each answered once both are done. Each may borrow what
+/// is around the call — the call is not over until they are — and what one
+/// changes, the other may not touch.
+pub fn together<A, B>(first: &var () => A, second: &var () => B): (A, B) = {
+	var one: Option<A> = .None
+	var two: Option<B> = .None
+	runBeside(() => { one = .Some(first()) }, () => { two = .Some(second()) })
+	return (answered(move one), answered(move two))
+}
+
+fn answered<T>(value: Option<T>): T = match move value {
+	.Some(done) => move done
+	.None => panic("a closure that `together` ran answered nothing")
+}
+
+/// Runs `work` on every element, the elements split among as many threads
+/// as the machine has processors, each changing its own part; answers once
+/// every element is done.
+pub fn each<T>(items: &var [T], work: &(item: &var T) => void) = eachAcross(
+	&var items,
+	work,
+	cores(),
+)
+
+fn eachAcross<T>(items: &var [T], work: &(item: &var T) => void, threads: i64) = {
+	if threads <= 1 || items.len() <= 1 {
+		for item in items {
+			work(&var item)
+		}
+		return
+	}
+	val half = threads / 2
+	items.split(
+		items.len() * half / threads,
+		(first, second) => {
+			runBeside(
+				() => eachAcross(&var first, work, half),
+				() => eachAcross(&var second, work, threads - half),
+			)
+		},
+	)
+}
+
+/// What `work` answers for every element, in the elements' order, the
+/// elements split among as many threads as the machine has processors.
+pub fn map<T, R>(items: &[T], work: &(item: &T) => R): Vec<R> = mapAcross(&items, work, cores())
+
+fn mapAcross<T, R>(items: &[T], work: &(item: &T) => R, threads: i64): Vec<R> = {
+	if threads <= 1 || items.len() <= 1 {
+		var answers: Vec<R> = Vec()
+		for item in items {
+			answers.push(work(&item))
+		}
+		return move answers
+	}
+	val half = threads / 2
+	val at = items.len() * half / threads
+	var (answers, rest) = together(
+		() => mapAcross(&items[0..at], work, half),
+		() => mapAcross(&items[at..], work, threads - half),
+	)
+	for answer in move rest {
+		answers.push(move answer)
+	}
+	return move answers
+}
+
+/// How many processors are working: how many threads `each` and `map` use.
+fn cores(): i64 = {
+	val working = sysconf(SC_NPROCESSORS_ONLN)
+	return if working < 1 then 1 else working
+}
+
+/// A closure lent for a call, as the address of its code.
+@intrinsic
+fn closureCode(work: &var () => void): (captures: ptr<u8>) => void
+
+/// A closure lent for a call, as the address of what it captured.
+@intrinsic
+fn closureCaptures(work: &var () => void): ptr<u8>
+
+/// A value's address, which a thread the caller waits for is given.
+@intrinsic
+fn addressOf<T>(value: &var T): ptr<void>

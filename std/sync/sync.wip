@@ -1,0 +1,202 @@
+// What several threads may change at once: `Atomic<T>`,
+// changed in one step that no thread sees half of, and `Mutex<T>`, reached
+// by one thread at a time. They are the two ways to change a place through
+// a `&`, which is what makes them safe to borrow from threads that
+// `future::together` and `future::each` run.
+//
+// Every atomic operation is sequentially consistent: there is one ordering,
+// as in Go and Java, not C's five. What adds and takes away wraps, as `+%`
+// and `-%` do.
+
+import std::libc::{Hidden, hidden, pthread_cond_broadcast, pthread_cond_destroy, pthread_cond_init, pthread_cond_wait, pthread_mutex_destroy, pthread_mutex_init, pthread_mutex_lock, pthread_mutex_unlock}
+
+/// What an `Atomic` may hold: `bool`, and the integers of up to 64 bits.
+pub interface AtomicValue {}
+
+/// What an `Atomic` may add to and take from: the integers of up to 64
+/// bits.
+pub interface AtomicInteger {}
+
+extend bool: AtomicValue {}
+
+extend i8: AtomicValue {}
+
+extend i8: AtomicInteger {}
+
+extend i16: AtomicValue {}
+
+extend i16: AtomicInteger {}
+
+extend i32: AtomicValue {}
+
+extend i32: AtomicInteger {}
+
+extend i64: AtomicValue {}
+
+extend i64: AtomicInteger {}
+
+extend isize: AtomicValue {}
+
+extend isize: AtomicInteger {}
+
+extend u8: AtomicValue {}
+
+extend u8: AtomicInteger {}
+
+extend u16: AtomicValue {}
+
+extend u16: AtomicInteger {}
+
+extend u32: AtomicValue {}
+
+extend u32: AtomicInteger {}
+
+extend u64: AtomicValue {}
+
+extend u64: AtomicInteger {}
+
+extend usize: AtomicValue {}
+
+extend usize: AtomicInteger {}
+
+/// A value several threads may read and change at once, each change one
+/// step that no thread sees half of. It is moved, never copied: a copy
+/// would be a read that is not one step.
+@intrinsic
+pub struct Atomic<T> {
+	value: T
+}
+
+extend Atomic<T: AtomicValue + copy> {
+	/// An atomic holding `value`.
+	pub static fn of(value: T): Atomic<T> = Atomic(value: value)
+
+	/// What it holds.
+	pub fn load(): T = atomicLoad(&self.value)
+
+	/// Makes it hold `value`.
+	pub fn store(value: T) = atomicStore(&self.value, value)
+
+	/// Makes it hold `value`, and answers what it held.
+	pub fn swap(value: T): T = atomicSwap(&self.value, value)
+
+	/// Makes it hold `value` where it holds `expected`, and answers whether
+	/// it did: no other thread changed it in between.
+	pub fn replaceIf(expected: T, value: T): bool = atomicCompareSwap(&self.value, expected, value)
+}
+
+extend Atomic<T: AtomicInteger + copy> {
+	/// Adds `amount` to it, wrapping, and answers what it held.
+	pub fn add(amount: T): T = atomicAdd(&self.value, amount)
+
+	/// Takes `amount` from it, wrapping, and answers what it held.
+	pub fn subtract(amount: T): T = atomicSubtract(&self.value, amount)
+}
+
+@intrinsic
+fn atomicLoad<T>(at: &T): T
+
+@intrinsic
+fn atomicStore<T>(at: &T, value: T)
+
+@intrinsic
+fn atomicSwap<T>(at: &T, value: T): T
+
+@intrinsic
+fn atomicCompareSwap<T>(at: &T, expected: T, value: T): bool
+
+@intrinsic
+fn atomicAdd<T>(at: &T, amount: T): T
+
+@intrinsic
+fn atomicSubtract<T>(at: &T, amount: T): T
+
+/// A value one thread at a time may reach. A `&` to the mutex is enough to
+/// lock it, so threads that `future::together` runs share one by borrowing
+/// it; what is inside is lent to one of them at a time, as a `&var`, for as
+/// long as a call.
+pub struct Mutex<T> {
+	state: ptr<MutexState>
+}
+
+// The lock, what waits for a change, and the value, boxed: a pthread mutex
+// must not move once made, and a `Mutex` may.
+extern struct MutexState {
+	lock: Hidden
+	changed: Hidden
+	value: ptr<u8>
+}
+
+extend Mutex<T> {
+	/// A mutex holding `value`.
+	pub static fn of(value: T): Mutex<T> = {
+		val made = own MutexState(
+			lock: hidden(),
+			changed: hidden(),
+			value: intoAddress(own (move value)),
+		)
+		val state = intoAddress(move made) as ptr<MutexState>
+		pthread_mutex_init(&var state.lock, null)
+		pthread_cond_init(&var state.changed, null)
+		return Mutex(state: state)
+	}
+
+	/// Runs `body` with what is inside, which no other thread reaches until
+	/// it answers; what `body` answers, this answers. The threads waiting in
+	/// `lockWhen` are told it may have changed.
+	pub fn lock<R>(body: &var (value: &var T) => R): R = {
+		pthread_mutex_lock(&var self.state.lock)
+		val answer = body(&var referenceAt<T>(self.state.value as ptr<void>))
+		pthread_cond_broadcast(&var self.state.changed)
+		pthread_mutex_unlock(&var self.state.lock)
+		return move answer
+	}
+
+	/// Waits until `ready` says what is inside is ready — asking again each
+	/// time another thread's `lock` or `lockWhen` ends — and then runs `body`
+	/// with it, as `lock` does.
+	pub fn lockWhen<R>(ready: &(value: &T) => bool, body: &var (value: &var T) => R): R = {
+		pthread_mutex_lock(&var self.state.lock)
+		while !ready(&referenceAt<T>(self.state.value as ptr<void>)) {
+			pthread_cond_wait(&var self.state.changed, &var self.state.lock)
+		}
+		val answer = body(&var referenceAt<T>(self.state.value as ptr<void>))
+		pthread_cond_broadcast(&var self.state.changed)
+		pthread_mutex_unlock(&var self.state.lock)
+		return move answer
+	}
+
+	/// What is inside, taken out: the mutex is used up.
+	pub move fn take(): T = {
+		val boxed: own<T> = fromAddress(self.state.value)
+		self.state.value = null
+		return unbox(move boxed)
+	}
+}
+
+extend Mutex<T>: Destroy {
+	var fn destroy() = {
+		if self.state.value != null {
+			val gone: own<T> = fromAddress(self.state.value)
+		}
+		pthread_cond_destroy(&var self.state.changed)
+		pthread_mutex_destroy(&var self.state.lock)
+		val freed: own<MutexState> = fromAddress(self.state as ptr<u8>)
+	}
+}
+
+/// The box an `own` points to, as an address C can hold.
+@intrinsic
+fn intoAddress<T>(value: own<T>): ptr<u8>
+
+/// The box at an address `intoAddress` gave, owned again.
+@intrinsic
+fn fromAddress<T>(address: ptr<u8>): own<T>
+
+/// What a box holds, taken out; the box is freed.
+@intrinsic
+fn unbox<T>(boxed: own<T>): T
+
+/// What is at an address, lent for writing.
+@intrinsic
+fn referenceAt<T>(data: ptr<void>): &var T

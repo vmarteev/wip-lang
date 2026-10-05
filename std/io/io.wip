@@ -1,0 +1,222 @@
+// Printing, reading and the environment, over C's library.
+// Standard output is C's, and buffered, so everything written to it goes
+// through `stdout`, in order.
+
+import std::libc
+
+/// Text as it is, with nothing added. A `String` may stand
+/// here too: it lends its bytes for the call. A
+/// NUL in it is written like any other byte.
+pub fn print(text: str) = {
+	libc::fwrite(text, 1, libc::stdout)
+}
+
+/// Text, and a line break after it.
+pub fn println(text: str) = {
+	libc::fwrite(text, 1, libc::stdout)
+	libc::fputc('\n' as c_int, libc::stdout)
+}
+
+/// A number on a line of its own. These build no text, so they cost no
+/// memory: `println("\(value)")` is the way to write one inside a sentence.
+pub fn printInt(value: i64) = {
+	libc::printf("%lld\n", value)
+}
+
+/// A number with no sign on a line of its own.
+pub fn printUnsigned(value: u64) = {
+	libc::printf("%llu\n", value)
+}
+
+/// A float, as `"\(value)"` writes it, on a line of its own. Unlike the
+/// two above, it builds the text, since what the digits are is worked out
+/// by reading them back.
+pub fn printFloat(value: f64) = println("\(value)")
+
+/// C's bytes, which end with a NUL, on a line of their own.
+pub fn printCstring(text: cstring) = {
+	libc::puts(text)
+}
+
+/// Standard error, which is not buffered: what the program printed goes out
+/// first, so a report arrives after the output it is about.
+pub fn eprint(text: str) = {
+	libc::fflush(libc::stdout)
+	libc::fwrite(text, 1, libc::stderr)
+}
+
+/// Text on standard error, and a line break after it.
+pub fn eprintln(text: str) = {
+	libc::fflush(libc::stdout)
+	libc::fwrite(text, 1, libc::stderr)
+	libc::fputc('\n' as c_int, libc::stderr)
+}
+
+/// Standard output, emptied. The buffer Wip prints through is C's, so this
+/// is its flush.
+pub fn flush(): Result<void, IoError> =
+	if libc::fflush(libc::stdout) == 0 then .Ok() else .Err(lastError())
+
+/// Why a read or a write could not be done. The names are
+/// the families a program acts on; `Other` keeps the number for the rest,
+/// and says it.
+@derive(Eq)
+pub enum IoError {
+	NotFound
+	Denied
+	AlreadyExists
+	Interrupted
+	/// A descriptor that does not block had nothing to give, or no room to
+	/// take more.
+	WouldBlock
+	/// The address a socket was to listen on is in use.
+	AddressInUse
+	/// Nothing was listening where a connection was made to.
+	ConnectionRefused
+	/// The other end broke the connection off.
+	ConnectionReset
+	/// The other end had closed what was written to.
+	BrokenPipe
+	/// A socket was used that is not connected.
+	NotConnected
+	Other(code: i32)
+}
+
+extend IoError: Text {
+	fn toString(): String = match self {
+		.NotFound => "no such file or directory"
+		.Denied => "permission denied"
+		.AlreadyExists => "already exists"
+		.Interrupted => "interrupted"
+		.WouldBlock => "would block"
+		.AddressInUse => "address in use"
+		.ConnectionRefused => "connection refused"
+		.ConnectionReset => "connection reset"
+		.BrokenPipe => "broken pipe"
+		.NotConnected => "not connected"
+		.Other(code) => "input or output failed, error \(code)"
+	}
+}
+
+/// What C last failed with, as one of the above. It is `pub` for the
+/// modules that call C themselves — `std::fs` opens the descriptors it
+/// reads from.
+pub fn lastError(): IoError = {
+	val code = libc::errno()
+	if code == libc::ENOENT then return .NotFound
+	if code == libc::EACCES then return .Denied
+	if code == libc::EEXIST then return .AlreadyExists
+	if code == libc::EINTR then return .Interrupted
+	if code == libc::EAGAIN then return .WouldBlock
+	if code == libc::EADDRINUSE then return .AddressInUse
+	if code == libc::ECONNREFUSED then return .ConnectionRefused
+	if code == libc::ECONNRESET then return .ConnectionReset
+	if code == libc::EPIPE then return .BrokenPipe
+	if code == libc::ENOTCONN then return .NotConnected
+	return .Other(code)
+}
+
+/// A descriptor, and the bytes read from it but not yet given out.
+/// A reader has to remember them between calls, and the
+/// library has nowhere to keep them, so the program holds one of these:
+/// `io::stdin()` for standard input, and a `File` for a file, which holds
+/// one of these and closes its descriptor where it ends.
+pub struct Reader {
+	fd: i32
+	held: Vec<u8>
+	// How many of `held` have been given out.
+	given: i64
+	ended: bool
+}
+
+/// Standard input. It closes nothing: descriptor 0 is not a program's to
+/// close.
+pub fn stdin(): Reader = reader(0)
+
+/// A reader over a descriptor, for the module that opened it.
+pub fn reader(fd: i32): Reader = Reader(fd: fd, held: Vec(), given: 0, ended: false)
+
+/// The descriptor a reader reads from, for the module that owns it.
+pub fn descriptorOf(reader: &Reader): i32 = reader.fd
+
+extend Reader {
+	/// The next line, appended to `into` without its line break. `false` at
+	/// the end of the input, where nothing was appended.
+	pub var fn readLine(into: &var String): Result<bool, IoError> = {
+		var any = false
+		while true {
+			val .Some(end) = self.lineEnd() else {
+				any = self.handOver(&var into) > 0 || any
+				if self.ended then return .Ok(any)
+				self.fill()?
+				continue
+			}
+			into.pushBytes(&self.held.items()[self.given..end])
+			self.given = end + 1
+			return .Ok(true)
+		}
+		return .Ok(any)
+	}
+
+	/// Everything that is left, appended. What comes back is how many bytes.
+	pub var fn readAll(into: &var String): Result<i64, IoError> = {
+		var total = self.handOver(&var into)
+		while !self.ended {
+			self.fill()?
+			total += self.handOver(&var into)
+		}
+		return .Ok(total)
+	}
+
+	/// The bytes held and not yet given out, appended, and how many.
+	var fn handOver(into: &var String): i64 = {
+		val count = self.held.len() - self.given
+		into.pushBytes(&self.held.items()[self.given..self.held.len()])
+		self.held.clear()
+		self.given = 0
+		return count
+	}
+
+	/// Where the next line break is, or nothing when the bytes held have
+	/// none.
+	fn lineEnd(): Option<i64> = {
+		for i in self.given..self.held.len() {
+			if self.held.items()[i] == '\n' as u8 then return .Some(i)
+		}
+		return .None
+	}
+
+	/// More bytes, or the end of the input.
+	var fn fill(): Result<void, IoError> = {
+		var chunk = [0 as u8; 4096]
+		// A read cut short by a signal is tried again, so that no program
+		// has to.
+		var got = libc::read(self.fd, &var chunk)
+		while got < 0 && lastError() == .Interrupted {
+			got = libc::read(self.fd, &var chunk)
+		}
+		if got < 0 then return .Err(lastError())
+		if got == 0 {
+			self.ended = true
+			return .Ok()
+		}
+		for byte in chunk[0..got as i64] {
+			self.held.push(byte)
+		}
+		return .Ok()
+	}
+}
+
+/// What the environment holds for `name`, copied, or nothing.
+/// It copies because what C points at is not a program's to
+/// keep, and because `Option<str>` cannot exist.
+pub fn env(name: str): Option<String> = {
+	var key = String::of(name)
+	val found = libc::getenv(key.toCstring())
+	if found.isNull then return .None
+	var value = String()
+	for i in 0..libc::strlen(found) as i64 {
+		value.pushByte(found[i])
+	}
+	return .Some(move value)
+}

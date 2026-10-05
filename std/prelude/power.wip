@@ -1,0 +1,138 @@
+// x^y of an `f64`, ported from Arm's optimized-routines,
+// which glibc and musl compute it with, on the path that needs neither a
+// fused multiply-add nor an instruction that rounds to a whole number, so
+// that every machine gives one answer:
+//
+// Copyright (c) 2018-2026, Arm Limited.
+// SPDX-License-Identifier: MIT OR Apache-2.0 WITH LLVM-exception
+//
+// From `math/pow.c` and `math/pow_common.h`; within 0.54 ulp.
+//
+// x^y is e^(y ln x), with ln x to 68 bits, as a double and what it leaves
+// out, from the tables of `power_table.wip`; and y ln x the same, which `expScaled` takes.
+// C's rules for the edges: anything to the power 0 is 1, 1 to any power is
+// 1, and a negative number to a power that is not whole is NaN.
+
+/// x^y.
+fn power(x: f64, y: f64): f64 = {
+	var signBias: u64 = 0
+	var ix = x.toBits()
+	val iy = y.toBits()
+	var topx = (ix >> 52) as i64
+	val topy = (iy >> 52) as i64
+	// x below 2^-1022, infinite, NaN or negative; or |y| below 2^-65, at
+	// 2^63 or above, or NaN.
+	if topx == 0 || topx >= 0x7ff || topy & 0x7ff < 0x3be || topy & 0x7ff >= 0x43e {
+		if zeroInfiniteOrNaN(iy) {
+			if iy << 1 == 0 then return if isSignaling(x) then x + y else 1.0
+			if ix == 0x3FF0000000000000 then return if isSignaling(y) then x + y else 1.0
+			if ix << 1 > 0xFFE0000000000000 || iy << 1 > 0xFFE0000000000000 then return x + y
+			if ix << 1 == 0x7FE0000000000000 then return 1.0
+			// |x| < 1 and y = ∞, or |x| > 1 and y = -∞
+			if (ix << 1 < 0x7FE0000000000000) == (iy >> 63 == 0) then return 0.0
+			return y * y
+		}
+		if zeroInfiniteOrNaN(ix) {
+			var x2 = x * x
+			if ix >> 63 != 0 && wholeKind(iy) == 1 then x2 = -x2
+			return if iy >> 63 != 0 then 1.0 / x2 else x2
+		}
+		// x and y are finite and not zero.
+		if ix >> 63 != 0 {
+			val kind = wholeKind(iy)
+			if kind == 0 then return (x - x) / (x - x)
+			if kind == 1 then signBias = SIGN_BIAS
+			ix = ix & 0x7FFFFFFFFFFFFFFF
+			topx = topx & 0x7ff
+		}
+		if topy & 0x7ff < 0x3be || topy & 0x7ff >= 0x43e {
+			// y is not odd here, so the sign is positive.
+			if ix == 0x3FF0000000000000 then return 1.0
+			// |y| < 2^-65: x^y rounds to 1.
+			if topy & 0x7ff < 0x3be then return 1.0
+			if (ix > 0x3FF0000000000000) == (topy < 0x800) then return overflow(false)
+			return underflow(false)
+		}
+		// Subnormal: scaled up by 2^52, so that the exponent is negative.
+		if topx == 0 then
+			ix = ((x * 4503599627370496.0).toBits() & 0x7FFFFFFFFFFFFFFF) -% (52 << 52)
+	}
+	val (hi, lo) = powerLogarithm(ix)
+	// y ln x as ehi + elo, with y and ln x split so that ehi is exact.
+	val yhi = f64::fromBits(iy & (0xFFFFFFFFFFFFFFFF << 27))
+	val ylo = y - yhi
+	val lhi = f64::fromBits(hi.toBits() & (0xFFFFFFFFFFFFFFFF << 27))
+	val llo = hi - lhi + lo
+	val ehi = yhi * lhi
+	val elo = ylo * lhi + y * llo
+	return expScaled(ehi, elo, true, signBias)
+}
+
+/// ln x as a double and what it leaves out, some 15 bits more, for `ix`,
+/// x's bits, a subnormal's scaled so that its exponent is negative.
+@inline
+fn powerLogarithm(ix: u64): (f64, f64) = {
+	// x = 2^k z, z in [0.7056, 1.4112)
+	val tmp = ix -% 0x3FE6955500000000
+	val i = ((tmp >> 45) & 127) as i64
+	val k = (tmp as i64) >> 52
+	val iz = ix -% (tmp & (0xfff << 52))
+	val z = f64::fromBits(iz)
+	val kd = k as f64
+	val invc = f64::fromBits(POW_INVERSE[i])
+	val logc = f64::fromBits(POW_LOG_C[i])
+	val logctail = f64::fromBits(POW_LOG_C_TAIL[i])
+	// r = z/c - 1, exact, as rhi + rlo: z split so that rhi, rlo and rhi²
+	// are exact.
+	val zhi = f64::fromBits((iz +% (1 << 31)) & 0xFFFFFFFF00000000)
+	val zlo = z - zhi
+	val rhi = zhi * invc - 1.0
+	val rlo = zlo * invc
+	val r = rhi + rlo
+	// k ln2 + ln c + r
+	val t1 = kd * POW_LN2_HI + logc
+	val t2 = t1 + r
+	val lo1 = kd * POW_LN2_LO + logctail
+	val lo2 = t1 - t2 + r
+	// ... + A0 r², with A0 = -1/2
+	val ar = POW_POLY[0] * r
+	val ar2 = r * ar
+	val ar3 = r * ar2
+	val arhi = POW_POLY[0] * rhi
+	val arhi2 = rhi * arhi
+	val hi = t2 + arhi2
+	val lo3 = rlo * (ar + arhi)
+	val lo4 = t2 - hi + arhi2
+	// log1p(r) - r - A0 r²
+	val p =
+		ar3 *
+		(POW_POLY[1] +
+			r * POW_POLY[2] +
+			ar2 * (POW_POLY[3] + r * POW_POLY[4] + ar2 * (POW_POLY[5] + r * POW_POLY[6])))
+	val lo = lo1 + lo2 + lo3 + lo4 + p
+	val y = hi + lo
+	return (y, hi - y + lo)
+}
+
+/// Whether a finite, non-zero `y`, by its bits, is not whole (0), an odd
+/// whole number (1) or an even one (2).
+fn wholeKind(iy: u64): i64 = {
+	val e = ((iy >> 52) & 0x7ff) as i64
+	if e < 0x3ff then return 0
+	if e > 0x3ff + 52 then return 2
+	val unit: u64 = 1 << ((0x3ff + 52 - e) as u64)
+	if iy & (unit - 1) != 0 then return 0
+	if iy & unit != 0 then return 1
+	return 2
+}
+
+/// Whether the bits are those of a zero, an infinity or NaN: twice them,
+/// less 1, is at least twice infinity's, less 1, which only a zero wraps
+/// round to.
+@inline
+fn zeroInfiniteOrNaN(bits: u64): bool = (bits << 1) -% 1 >= 0xFFDFFFFFFFFFFFFF
+
+/// Whether a NaN is a signaling one, which `pow` does not take as 1 to the
+/// power 0, nor 0 as a power of 1.
+@inline
+fn isSignaling(x: f64): bool = (x.toBits() ^ 0x0008000000000000) << 1 > 0xFFF0000000000000

@@ -1,0 +1,208 @@
+// A map from keys to values, written in Wip over `Vec<T>` and `Hash`.
+//
+// Its entries lie one after another, in the order they were put in, and a
+// table of positions (table.wip) says where each key's entry is. That is
+// what lets a map be walked as a slice: `for entry in map`
+// visits `entry.key` and `entry.value`. The order holds through `remove`
+// too; `swapRemove` trades it for speed.
+
+import std::iter::{Taking}
+
+/// One key and the value under it: what `for entry in map` visits.
+pub struct MapEntry<K, V> {
+	/// The key, which the map finds the entry by.
+	pub key: K
+	/// The value under the key.
+	pub value: V
+}
+
+/// Keys and the values under them, in the order the keys went in.
+/// `Map()` is an empty one, which takes no memory until a key goes in.
+pub struct Map<K: Hash + Eq, V> {
+	// Where each key's entry is.
+	table: Table = Table()
+	// The entries themselves, packed, in the order they were put in, kept
+	// in the part `values()` lends.
+	row: MapValues<K, V> = MapValues(entries: Vec())
+}
+
+/// A map's values, one place at a time: what `map.values()` lends, and what
+/// `for value in map.values()` walks, writing them in a `var`.
+/// It is a door onto the values: the keys, the order and
+/// the table stay the map's.
+pub struct MapValues<K, V> {
+	entries: Vec<MapEntry<K, V>>
+}
+
+extend MapValues<K, V>: Sequence<V> {
+	fn len(): i64 = self.entries.len()
+
+	/// The value at position `i`, to read, or to write where a walk in a
+	/// `var` lends it and `map.values()[i] = v` writes it.
+	lend fn at(i: i64): &V = lend self.entries.at(i).value
+}
+
+extend Map<K, V>: Items<MapEntry<K, V>> {
+	// The entries, lent as a slice, which is what `for entry in map`
+	// walks.
+	fn items(): &[MapEntry<K, V>] = lend self.row.entries.items()
+}
+
+// `for MapEntry(key, value) in move map`: each entry, the loop's to keep,
+// in the order they were put in.
+extend Map<K, V>: IntoIterator<Taking<MapEntry<K, V>>> {
+	move fn intoIterator(): Taking<MapEntry<K, V>> = {
+		var all = move self
+		return (move all.row.entries).intoIterator()
+	}
+}
+
+extend Map<K, V> {
+	/// The values, to walk one at a time: `for ball in balls.values()`
+	/// writes each in a `var`.
+	pub lend fn values(): &MapValues<K, V> = lend self.row
+
+	/// The key at position `at`, counted from 0 in the order the keys went
+	/// in.
+	pub fn keyAt(at: i64): &K = lend self.row.entries.at(at).key
+
+	/// The value at position `at`.
+	pub lend fn valueAt(at: i64): &V = lend self.row.entries.at(at).value
+
+	/// How many keys the map holds.
+	pub fn len(): i64 = self.row.entries.len()
+
+	/// Whether the map holds no keys.
+	pub fn isEmpty(): bool = self.row.entries.isEmpty()
+
+	/// Whether the map holds `key`.
+	pub fn contains(key: &K): bool = self.find(&key).isSome()
+
+	/// Where `key`'s entry is, or nothing where the map does not hold it:
+	/// one lookup, which `keyAt` and `valueAt` take from
+	/// there. The position holds until an entry before it is removed.
+	pub fn find(key: &K): Option<i64> = self.table.find(
+		hashOf(&key),
+		(position) => self.row.entries.at(position).key == key,
+	)
+
+	/// The value under `key`, by reference, or nothing where the map does
+	/// not hold it. It reads; what changes the value is
+	/// `at`, whose writing half a reference to it cannot be.
+	pub fn get(key: &K): Option<&V> = match self.find(&key) {
+		.Some(position) => .Some(&self.row.entries.at(position).value)
+		.None => .None
+	}
+
+	/// The value under `key`, or a panic when there is none. It lends what
+	/// the map holds, so nothing is copied, to read or to
+	/// write: `map.at(key) = value`.
+	pub lend fn at(key: &K): &V = {
+		val .Some(position) = self.find(&key) else {
+			panic("no such key in the map")
+		}
+		lend self.row.entries.at(position).value
+	}
+
+	/// Puts `value` under `key`, dropping the value that was there.
+	pub var fn put(key: K, value: V) = {
+		val slot = self.slotFor(&key)
+		val position = self.table.at(slot)
+		if position >= 0 {
+			self.row.entries.at(position).value = move value
+			return
+		}
+		self.table.point(slot, self.row.entries.len())
+		self.row.entries.push(MapEntry(key: move key, value: move value))
+	}
+
+	/// The value under `key`, put there first where there was none. This is
+	/// what counting is written with: `map.atOrPut(word, 0) += 1`.
+	pub var fn atOrPut(key: K, value: V): &var V = {
+		val slot = self.slotFor(&key)
+		val position = self.table.at(slot)
+		if position >= 0 {
+			lend self.row.entries.at(position).value
+		} else {
+			self.table.point(slot, self.row.entries.len())
+			self.row.entries.push(MapEntry(key: move key, value: move value))
+			lend self.row.entries.at(self.row.entries.len() - 1).value
+		}
+	}
+
+	/// Takes `key` out, with the value it held. The keys after it keep
+	/// their order, each one place further forward, so this costs the
+	/// entries after it, as `Vec::remove` does.
+	pub var fn remove(key: &K): Option<V> = {
+		val .Some(position) = self.vacate(&key) else {
+			return .None
+		}
+		val entry = self.row.entries.remove(position)
+		self.table.closeGap(position)
+		return .Some(move entry.value)
+	}
+
+	/// Takes `key` out, with the value it held, moving the last entry into
+	/// the gap: quick whatever the size, and the order is lost, as with
+	/// `Vec::swapRemove`.
+	pub var fn swapRemove(key: &K): Option<V> = {
+		val .Some(position) = self.vacate(&key) else {
+			return .None
+		}
+		// The last entry moves into the gap, so the table is told where it
+		// went; its slot is still found by its key, since only the removed
+		// key's slot has changed.
+		val last = self.row.entries.len() - 1
+		if position != last {
+			val moved = self.slotOf(&self.row.entries.at(last).key)
+			self.table.point(moved, position)
+		}
+		val entry = self.row.entries.swapRemove(position)
+		return .Some(move entry.value)
+	}
+
+	/// Ends every key and value, keeping the memory.
+	pub var fn clear() = {
+		self.row.entries.clear()
+		self.table.clear()
+	}
+
+	// The slot `key` sits in, or would go in; the table holds some slots.
+	fn slotOf(key: &K): i64 = self.table.slotOf(
+		hashOf(&key),
+		(position) => self.row.entries.at(position).key == key,
+	)
+
+	// The slot for a key about to be put, with room made for it first.
+	var fn slotFor(key: &K): i64 = {
+		if self.table.full() {
+			var hashes: Vec<u64> = Vec::withCapacity(self.row.entries.len())
+			for entry in self.row.entries {
+				hashes.push(hashOf(&entry.key))
+			}
+			self.table.rebuild(&hashes)
+		}
+		return self.slotOf(&key)
+	}
+
+	// Where `key`'s entry is, with its slot marked removed, or nothing
+	// where the map does not hold it.
+	var fn vacate(key: &K): Option<i64> = {
+		val .Some(position) = self.find(&key) else {
+			return .None
+		}
+		self.table.forget(self.slotOf(&key))
+		return .Some(position)
+	}
+}
+
+// A map's entries, each key and value cloned, in the order they went in.
+extend Map<K: Clone, V: Clone>: Clone {
+	fn clone(): Map<K, V> = {
+		var copy: Map<K, V> = Map()
+		for at in 0..self.len() {
+			copy.put(self.keyAt(at).clone(), self.valueAt(at).clone())
+		}
+		return move copy
+	}
+}

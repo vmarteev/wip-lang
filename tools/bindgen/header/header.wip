@@ -1,0 +1,353 @@
+// A C header in, what it declares out.
+//
+// Nothing here parses C. The C compiler is already required for Wip's
+// runtime, so it is asked instead: `clang -Xclang -ast-dump=json` for the
+// declarations, and `cc -E -dD` for the constants a header `#define`s.
+
+import std::json::{Json}
+import std::path
+import clang
+import clang::{children, flag, inner, qualType, textOf, writtenType}
+import declared::{Header, Item, Reading, Typed}
+import probe
+import types::{Constant, Known, Ty}
+import types
+
+/// Reads `header` with the C compiler, as `reading` says to, and answers
+/// what it declares, or why it cannot.
+pub fn read(
+	header: str,
+	include: str,
+	link: Option<String>,
+	reading: &Reading,
+): Result<Header, String> = {
+	val tree = syntaxTree(header, reading)?
+
+	var read = Header(
+		include: String::of(include),
+		link: move link,
+		defines: reading.defines.clone(),
+	)
+
+	// What the header says a value of is, which decides whether a pointer
+	// to one is a reference.
+	var known = Known()
+	definedRecords(&tree, &var known)
+	enumNames(&tree, &var known)
+	aliases(&tree, &var known)
+	declarations(&tree, path::name(header), &var known, &var read)
+	constants(header, reading, &known, &var read)?
+
+	return .Ok(move read)
+}
+
+/// The compiler's own view of the header, as JSON. It is clang's, and
+/// clang says the format is for testing, so what is not understood is
+/// said rather than guessed at.
+fn syntaxTree(header: str, reading: &Reading): Result<Json, String> = {
+	val cc = clang::compiler("clang")
+	val options = ["-Xclang", "-ast-dump=json", "-fsyntax-only"]
+	val output = clang::run(cc.toStr(), &options, &reading, [header], .None)?
+
+	if !output.exit.success() then
+		return .Err("`\(cc)` could not read the header:\n\(output.stderr)")
+
+	return clang::tree(cc.toStr(), &output, "the header")
+}
+
+/// The macros a header defines, which are what C libraries use for
+/// constants. The preprocessor is asked to keep the `#define`s in place
+/// (`-dD`) rather than to list them all (`-dM`), so that the line markers
+/// say which file each one came from: a header that includes `<stdint.h>`
+/// is not also binding `INT8_MAX`.
+fn constants(
+	header: str,
+	reading: &Reading,
+	known: &Known,
+	out: &var Header,
+): Result<void, String> = {
+	val cc = clang::compiler("cc")
+	val output = clang::run(cc.toStr(), ["-E", "-dD", "-x", "c"], &reading, [header], .None)?
+
+	if !output.exit.success() then
+		return .Err("`\(cc)` could not read the header:\n\(output.stderr)")
+
+	val name = path::name(header)
+	var here = false
+	// Each `#define`, in the header's order, and what a literal it is; the
+	// rest are asked of clang, all at once.
+	var found: Vec<(String, Option<Constant>)> = Vec()
+	var asked: Vec<String> = Vec()
+
+	for line in output.stdout.lines() {
+		// `# 12 "shapes.h"`: what follows comes from that file.
+		if line.stripPrefix("# ") is .Some(marker) && quotedIn(marker) is .Some(quoted) {
+			here = quoted.endsWith(name)
+			continue
+		}
+
+		if !here then continue
+
+		val .Some(rest) = line.stripPrefix("#define ") else {
+			continue
+		}
+
+		val .Some((defined, value)) = rest.splitOnce(" ") else {
+			continue
+		}
+
+		// A macro that takes arguments is not a constant, and what it
+		// means depends on what is passed.
+		if defined.contains("(") || !types::isName(defined) || value.trim().isEmpty() then continue
+		val literal = types::constant(defined, value.trim())
+		if literal.isNone() then asked.push(String::of(defined))
+		found.push((String::of(defined), move literal))
+	}
+
+	var answers = probe::ask(header, reading, &asked, &out.items, known)?
+
+	for (_, literal) in move found {
+		match move literal {
+			.Some(constant) => out.items.push(.Constant(constant: move constant))
+			.None => {
+				match answers.remove(0) {
+					.Written(constant) => out.items.push(.Constant(constant: move constant))
+					.Left(why) => out.skipped.push(move why)
+				}
+			}
+		}
+	}
+
+	return .Ok()
+}
+
+/// What a line marker names, `shapes.h` of `12 "shapes.h" 2`: what comes
+/// after the first `"`, up to the next.
+fn quotedIn(marker: str): Option<str> = {
+	val (_, rest) = marker.splitOnce("\"")?
+	return match rest.splitOnce("\"") {
+		.Some((quoted, _)) => .Some(quoted)
+		.None => .Some(rest)
+	}
+}
+
+/// The structs and unions this translation unit defines, anywhere in it:
+/// a header may use one another header defined.
+fn definedRecords(node: &Json, known: &var Known) = {
+	if textOf(node, "kind") == .Some("RecordDecl") &&
+		flag(node, "completeDefinition") &&
+		textOf(node, "name") is .Some(name) {
+		known.records.add(String::of(name))
+	}
+
+	if inner(node) is .Some(children) {
+		for child in children.items() {
+			definedRecords(child, &var known)
+		}
+	}
+}
+
+/// The enums the translation unit names — `enum Color { … }`, and
+/// `typedef enum { … } Color;` — which a type that names one is read as
+/// `c_int`, as their enumerators are written.
+fn enumNames(node: &Json, known: &var Known) = {
+	if textOf(node, "kind") == .Some("EnumDecl") && textOf(node, "name") is .Some(name) then
+		known.enums.add(String::of(name))
+
+	if textOf(node, "kind") == .Some("TypedefDecl") &&
+		textOf(node, "name") is .Some(name) &&
+		writtenType(node) is .Some(written) &&
+		written.trim().startsWith("enum ") {
+		known.enums.add(String::of(name))
+	}
+
+	if inner(node) is .Some(children) {
+		for child in children.items() {
+			enumNames(child, &var known)
+		}
+	}
+}
+
+/// `typedef Texture Texture2D;`: a second name for a type the header
+/// already declares. Wip writes the first one, so a use of the second is
+/// read as it. A typedef of a struct written in place —
+/// `typedef struct { … } Color;` — names the struct itself and is not one
+/// of these.
+fn aliases(node: &Json, known: &var Known) = {
+	if textOf(node, "kind") == .Some("TypedefDecl") &&
+		textOf(node, "name") is .Some(name) &&
+		writtenType(node) is .Some(written) {
+		val trimmed = written.trim()
+		var target = trimmed
+		for keyword in ["struct ", "union ", "enum "] {
+			if trimmed.stripPrefix(keyword) is .Some(name) {
+				target = name
+				break
+			}
+		}
+		if target != name then known.aliases.put(String::of(name), String::of(target))
+	}
+
+	if inner(node) is .Some(children) {
+		for child in children.items() {
+			aliases(child, &var known)
+		}
+	}
+}
+
+/// Walks the translation unit, keeping what the named header declared.
+/// clang writes a declaration's file only when it changes, so the file it
+/// last named is the one that holds what follows.
+fn declarations(tree: &Json, header: str, known: &var Known, out: &var Header) = {
+	val .Some(nodes) = inner(tree) else {
+		return
+	}
+
+	var file = String()
+
+	for node in nodes.items() {
+		if node.get("loc").flatMap((loc) => textOf(loc, "file")) is .Some(named) then
+			file = String::of(named)
+
+		if !file.endsWith(header) || flag(node, "isImplicit") then continue
+
+		match textOf(node, "kind") {
+			.Some("FunctionDecl") => function(node, &known, &var out)
+			.Some("RecordDecl") => record(node, &var known, &var out)
+			.Some("VarDecl") => variable(node, &known, &var out)
+			.Some("EnumDecl") => enumeration(node, &var out)
+			// A typedef of a struct is the struct, which is declared beside
+			// it; a typedef of a scalar is a name for a type Wip has.
+			.Some("TypedefDecl" | "EmptyDecl" | "StaticAssertDecl") => {}
+			.Some(kind) => out.skipped.push("a \(kind) the tool does not read")
+			.None => {}
+		}
+	}
+}
+
+fn function(node: &Json, known: &Known, out: &var Header) = {
+	val .Some(name) = textOf(node, "name") else {
+		return
+	}
+
+	// A `static` function that is not `inline` belongs to one translation
+	// unit, so nothing outside the header could call it.
+	val inline = flag(node, "inline")
+	if textOf(node, "storageClass") == .Some("static") && !inline then return
+	val signature = qualType(node)
+	val variadic = flag(node, "variadic")
+
+	val found = match signature.splitOnce("(") {
+		.Some((before, _)) => types::at(before.trim(), .Field, known)
+		.None => .None
+	}
+
+	val .Some(ret) = move found else {
+		out.skipped.push("`\(name)`, whose result Wip has no type for")
+		return
+	}
+
+	var params: Vec<Typed> = Vec()
+	var i = 0
+
+	for param in children(node, "ParmVarDecl") {
+		val written = qualType(param)
+
+		val .Some(ty) = types::at(written, .Parameter, known) else {
+			out.skipped.push("`\(name)`, whose parameter \(i) is `\(written)`")
+			return
+		}
+
+		val given = match textOf(param, "name") {
+			.Some(given) if !given.isEmpty() => String::of(given)
+			_ => "a\(i)"
+		}
+
+		params.push(Typed(name: move given, ty: move ty))
+		i += 1
+	}
+
+	val result: Option<Ty> = if ret.isVoid() then .None else .Some(move ret)
+
+	out.items.push(.Function(
+		name: String::of(name),
+		params: move params,
+		ret: move result,
+		variadic: variadic,
+		inline: inline,
+	))
+}
+
+fn record(node: &Json, known: &var Known, out: &var Header) = {
+	val .Some(name) = textOf(node, "name") else {
+		// An anonymous struct or union is a field's type, and needs a name
+		// of its own before Wip can write it.
+		out.skipped.push(String::of("an anonymous struct or union, which needs a name"))
+		return
+	}
+
+	val isUnion = textOf(node, "tagUsed") == .Some("union")
+
+	// `struct sqlite3;` with no body: a type whose contents Wip does not
+	// know.
+	if !flag(node, "completeDefinition") {
+		out.items.push(.Opaque(name: String::of(name)))
+		return
+	}
+
+	var fields: Vec<Typed> = Vec()
+	var opaque = false
+
+	for field in children(node, "FieldDecl") {
+		// A bitfield's place in the storage unit differs between ABIs, so
+		// Wip lays the struct out not at all.
+		if flag(field, "isBitfield") then opaque = true
+		val written = qualType(field)
+		val given = textOf(field, "name").unwrapOr("")
+		val found = types::at(written, .Field, &known)
+
+		if given.isEmpty() || found.isNone() {
+			out.skipped.push("`\(name)`, whose field `\(given)` is `\(written)`")
+			// What uses it is left out too: the type is not in the file.
+			known.left.add(String::of(name))
+			return
+		}
+
+		fields.push(Typed(name: String::of(given), ty: types::stored(found.unwrap())))
+	}
+
+	out.items.push(.Record(
+		name: String::of(name),
+		isUnion: isUnion,
+		opaque: opaque,
+		fields: move fields,
+	))
+}
+
+fn variable(node: &Json, known: &Known, out: &var Header) = {
+	val .Some(name) = textOf(node, "name") else {
+		return
+	}
+
+	val written = qualType(node)
+	val found = types::at(written, .Field, known)
+
+	if found.all((ty) => !ty.isVoid()) && found.isSome() then
+		out.items.push(.Variable(name: String::of(name), ty: types::stored(found.unwrap())))
+	else out.skipped.push("`\(name)`, a variable of type `\(written)`")
+}
+
+/// C's enums are integers, and a value outside the listed ones is legal
+/// C, so each enumerator becomes a constant rather than a Wip enum.
+fn enumeration(node: &Json, out: &var Header) = {
+	var next = 0
+
+	for constant in children(node, "EnumConstantDecl") {
+		val .Some(name) = textOf(constant, "name") else {
+			continue
+		}
+		val value = probe::evaluated(constant).unwrapOr(next)
+		next = value + 1
+		out.items.push(.Constant(constant: types::enumerator(name, value)))
+	}
+}

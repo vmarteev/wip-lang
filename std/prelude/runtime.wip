@@ -1,0 +1,306 @@
+// What the code generator calls by name, written in Wip: a
+// panic, from the checks it inserts; a C string's length, for `toStr`; two
+// strings' bytes compared; and a piece of text, from the runner `wip test`
+// builds. Each keeps the name and the signature it had when it was C. The
+// allocator (allocator.wip) and 128-bit division (int128.wip) are the
+// rest of it, and what was the runtime's besides is where it is used —
+// `std::io`, `std::fs`, `std::future`, `std::process` and the prelude's
+// own `String` — over `std::libc`.
+
+import std::libc::{_Unwind_Backtrace, _Unwind_GetIP, cstringLength, fflush, fprintf, fwrite, exit, memcmp, stdout, stderr}
+
+/// Text on standard output, with nothing added: what `wip test` prints
+/// around each test.
+@export("C")
+fn wip_print_text(text: str) = {
+	fwrite(text, 1, stdout)
+}
+
+/// Two strings' bytes, in order: -1, 0 or 1, and the
+/// shorter first where the bytes they share are the same. `memcmp` takes
+/// each as the pointer alone, which is what a `cstring` crosses as.
+@export("C")
+fn wip_str_cmp(a: str, b: str): i64 = {
+	val shared = if a.len() < b.len() then a.len() else b.len()
+	if shared > 0 {
+		val order = memcmp(cstring::fromBytes(&a), cstring::fromBytes(&b), shared as size_t)
+		if order != 0 then return if order < 0 then -1 else 1
+	}
+	if a.len() == b.len() then return 0
+	return if a.len() < b.len() then -1 else 1
+}
+
+/// The bytes before a C string's NUL: what `text.toStr()` counts to see
+/// C's bytes as a `str`.
+@export("C")
+fn wip_cstr_len(text: cstring): i64 = cstringLength(text) as i64
+
+// A panic ends the program: the message and where it was written go to
+// standard error, and the status is 101. Nothing is unwound and nothing is
+// freed. Nothing here may panic itself, so there is no
+// arithmetic and no indexing. What the program printed goes out first:
+// standard output is buffered and standard error is not.
+
+fn panicking() = {
+	notePanic()
+	fflush(stdout)
+	fwrite("panicked: ", 1, stderr)
+}
+
+fn panicAt(file: str, line: i64, column: i64): never = {
+	fwrite("\n  at ", 1, stderr)
+	fwrite(file, 1, stderr)
+	fprintf(stderr, ":%lld:%lld\n", line, column)
+	printCalls()
+	exit(101)
+}
+
+// The calls that led to a panic. The system's unwinder
+// walks the frames, Wip's and C's alike, by the unwind information each
+// function has, and gives each frame's return address; the program's tables
+// say which function of Wip's holds an address and at which line: for each
+// module, how many functions, their files, the calls inlined, and for each
+// function seven words — its code, the code's length, its name and the
+// name's length, its rows and how many, and whether a panic passes over it.
+// A row is four `u32`s: where a run of the code begins, the file, the line,
+// and the call inlined the code is in, counting from 1, or 0. A call
+// inlined is six words: what was called, the name's length, the file and
+// line of the call, the call inlined it is in, and whether a panic passes
+// over it.
+
+/// How many calls are shown at most, and how many frames are walked.
+val MOST_CALLS: i64 = 64
+val MOST_FRAMES: i64 = 256
+
+/// The words before the functions in a module's table, the words a
+/// function takes, the `u32`s a row takes, and the words a call inlined
+/// takes.
+val HEADER_WORDS: i64 = 3
+val ENTRY_WORDS: i64 = 7
+val ROW_WORDS: i64 = 4
+val INLINED_WORDS: i64 = 6
+
+/// The list of the modules' tables: how many, and each one's address.
+@intrinsic
+fn frameTables(): ptr<i64>
+
+/// The address of what a reference refers to, for C to hand back.
+@intrinsic
+fn addressOf<T>(value: &var T): ptr<void>
+
+/// The `&var` at an address `addressOf` gave.
+@intrinsic
+fn referenceAt<T>(data: ptr<void>): &var T
+
+/// The frames the unwinder has given: the address each returns to.
+struct Frames {
+	addresses: [i64; 256]
+	count: i64
+}
+
+/// What the unwinder calls for each frame, with the `Frames` it was given.
+fn noteFrame(context: ptr<void>, state: ptr<void>): c_int = note(
+	&var referenceAt<Frames>(state),
+	_Unwind_GetIP(context) as i64,
+)
+
+/// Notes a frame's return address, while there is room.
+fn note(frames: &var Frames, address: i64): c_int = {
+	if frames.count >= MOST_FRAMES {
+		// Anything but `_URC_NO_REASON` ends the walk.
+		return 1
+	}
+	frames.addresses[frames.count] = address
+	frames.count = frames.count +% 1
+	return 0
+}
+
+/// What the calls printed so far are: how many, and whether frames of C
+/// have been passed since the last.
+struct Shown {
+	count: i64
+	throughC: bool
+}
+
+/// Prints each call that led here, innermost first, from the function that
+/// panicked out, passing over the runtime's own frames and the code the
+/// compiler writes on its own, such as a drop function. A run of frames of
+/// C between two of Wip's is one line, `in C`; those before the first of
+/// Wip's and after the last say nothing of the program.
+fn printCalls() = {
+	var frames = Frames(addresses: [0; 256], count: 0)
+	_Unwind_Backtrace(noteFrame, addressOf<Frames>(&var frames))
+	var shown = Shown(count: 0, throughC: false)
+	var i = 0
+	while i < frames.count && shown.count < MOST_CALLS {
+		// The call is the instruction before the one it returns to.
+		val address = frames.addresses[i] -% 1
+		val found = lookUp(address)
+		if found.entry.isNull then shown.throughC = shown.count > 0
+		else printFrame(&var shown, found, address -% found.entry[0])
+		i = i +% 1
+	}
+}
+
+/// A function's entry in its module's table, and that module's files and
+/// calls inlined.
+struct Found {
+	entry: ptr<i64>
+	files: ptr<i64>
+	inlined: ptr<i64>
+}
+
+/// The entry of the function that holds `address`, null where no table
+/// knows it.
+fn lookUp(address: i64): Found = {
+	val tables = frameTables()
+	val modules = tables[0]
+	var module = 1
+	while module <= modules {
+		val table = tables[module] as ptr<i64>
+		val count = table[0]
+		var function = 0
+		while function < count {
+			val at = (HEADER_WORDS +% function *% ENTRY_WORDS) *% 8
+			val entry = offsetBytes(table as ptr<u8>, at) as ptr<i64>
+			val start = entry[0]
+			if address >= start && address < start +% entry[1] then
+				return Found(
+					entry: entry,
+					files: table[1] as ptr<i64>,
+					inlined: table[2] as ptr<i64>,
+				)
+			function = function +% 1
+		}
+		module = module +% 1
+	}
+	return Found(entry: 0 as ptr<i64>, files: 0 as ptr<i64>, inlined: 0 as ptr<i64>)
+}
+
+/// The calls a frame holds, at `offset` into its function's code: the
+/// calls inlined there, innermost first, then the function, each at the
+/// line of the last run of code that begins at or before it — the
+/// innermost's own, and each other's where it makes the call inside it.
+fn printFrame(shown: &var Shown, found: Found, offset: i64) = {
+	val entry = found.entry
+	val rows = entry[4] as ptr<u32>
+	val count = entry[5]
+	if count == 0 {
+		if entry[6] == 0 then printCall(&var shown, entry[2], entry[3], found.files, -1, 0)
+		return
+	}
+	var row = 0
+	var at = 0
+	while at < count && rows[at *% ROW_WORDS] as i64 <= offset {
+		row = at
+		at = at +% 1
+	}
+	var file = rows[row *% ROW_WORDS +% 1] as i64
+	var line = rows[row *% ROW_WORDS +% 2] as i64
+	var inlined = rows[row *% ROW_WORDS +% 3] as i64
+	while inlined != 0 && shown.count < MOST_CALLS {
+		val call =
+			offsetBytes(found.inlined as ptr<u8>, (inlined -% 1) *% INLINED_WORDS *% 8) as ptr<i64>
+		if call[5] == 0 then printCall(&var shown, call[0], call[1], found.files, file, line)
+		file = call[2]
+		line = call[3]
+		inlined = call[4]
+	}
+	if entry[6] == 0 && shown.count < MOST_CALLS then
+		printCall(&var shown, entry[2], entry[3], found.files, file, line)
+}
+
+/// `in name (file:line)`, or `in name` where `file` is -1, after `in C` if
+/// frames of C were passed since the last call printed.
+fn printCall(
+	shown: &var Shown,
+	name: i64,
+	nameLength: i64,
+	files: ptr<i64>,
+	file: i64,
+	line: i64,
+) = {
+	if shown.throughC {
+		fwrite("  in C\n", 1, stderr)
+		shown.throughC = false
+	}
+	if file < 0 {
+		fprintf(stderr, "  in %.*s\n", nameLength as c_int, name as ptr<u8>)
+	} else {
+		val fileName = files[file *% 2] as ptr<u8>
+		val fileLength = files[file *% 2 +% 1] as c_int
+		fprintf(
+			stderr,
+			"  in %.*s (%.*s:%lld)\n",
+			nameLength as c_int,
+			name as ptr<u8>,
+			fileLength,
+			fileName,
+			line,
+		)
+	}
+	shown.count = shown.count +% 1
+}
+
+@export("C")
+fn wip_panic(message: str, file: str, line: i64, column: i64): never = {
+	panicking()
+	fwrite(message, 1, stderr)
+	panicAt(file, line, column)
+}
+
+/// A panic whose message was built when it happened, then what the program
+/// wrote after it: an assert's condition.
+@export("C")
+fn wip_panic_noted(note: str, message: str, file: str, line: i64, column: i64): never = {
+	panicking()
+	fwrite(note, 1, stderr)
+	fwrite(message, 1, stderr)
+	panicAt(file, line, column)
+}
+
+@export("C")
+fn wip_panic_index(index: i64, length: i64, file: str, line: i64, column: i64): never = {
+	panicking()
+	fprintf(stderr, "index %lld is out of bounds for length %lld", index, length)
+	panicAt(file, line, column)
+}
+
+@export("C")
+fn wip_panic_length(length: i64, file: str, line: i64, column: i64): never = {
+	panicking()
+	fprintf(stderr, "a buffer cannot have length %lld", length)
+	panicAt(file, line, column)
+}
+
+@export("C")
+fn wip_panic_division(file: str, line: i64, column: i64): never = {
+	panicking()
+	fwrite("divided by zero", 1, stderr)
+	panicAt(file, line, column)
+}
+
+/// A value about to be dropped after it was moved away, which a build that
+/// checks moves finds by the poison the move left: a bug
+/// in the compiler, or in a `move` the checker let through.
+@export("C")
+fn wip_panic_moved(file: str, line: i64, column: i64): never = {
+	panicking()
+	fwrite("a value was dropped after it was moved away", 1, stderr)
+	panicAt(file, line, column)
+}
+
+/// An answer that does not fit its type: `op` is 0 for
+/// `+`, 1 for `-`, 2 for `*` and 3 for anything else.
+@export("C")
+fn wip_panic_overflow(op: i64, file: str, line: i64, column: i64): never = {
+	panicking()
+	val message = match op {
+		0 => "the sum does not fit"
+		1 => "the difference does not fit"
+		2 => "the product does not fit"
+		_ => "the answer does not fit"
+	}
+	fwrite(message, 1, stderr)
+	panicAt(file, line, column)
+}
