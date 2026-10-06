@@ -10,7 +10,8 @@
 // make of an `own` and back.
 
 import std::collections::{Deque}
-import std::sync::{Atomic, Mutex}
+import std::shared::{Shared}
+import std::sync::{Mutex}
 import std::libc::{SC_NPROCESSORS_ONLN, abort, fflush, fprintf, hidden, pthread_attr_destroy, pthread_attr_init, pthread_attr_setstacksize, pthread_create, pthread_join, stderr, stdout, strerror, sysconf}
 
 /// The box an `own` points to, as an address C can hold. The `own` is
@@ -35,15 +36,12 @@ fn atomicStore(at: ptr<i64>, value: i64)
 @intrinsic
 fn offsetBytes(pointer: ptr<u8>, bytes: i64): ptr<u8>
 
-// A channel's queue, which both ends reach from their threads:
-// the addresses sent and not yet received, with how many
-// senders there are and whether anyone receives, under a `Mutex`; and how
-// many ends hold it, an `Atomic`, the last of which to let go frees it.
-// The ends hold its address: two owners of one value is shared ownership,
-// which Wip has not (Answer 5), so this much is by hand.
+// A channel's queue, which both ends reach from their threads: the
+// addresses sent and not yet received, with how many senders there are and
+// whether anyone receives, under a `Mutex`. Each end holds it as a
+// `Shared`, and the last to let go frees it.
 struct Queue {
 	state: Mutex<QueueState>
-	holders: Atomic<i64>
 }
 
 struct QueueState {
@@ -52,36 +50,40 @@ struct QueueState {
 	receiving: bool
 }
 
-fn newQueue(): ptr<Queue> = {
+fn newQueue(): Shared<Queue> = {
 	val state = QueueState(items: Deque(), senders: 1, receiving: true)
-	val made = own Queue(state: Mutex::of(move state), holders: Atomic::of(2 as i64))
-	return intoAddress(move made) as ptr<Queue>
+	return Shared::of(Queue(state: Mutex::of(move state)))
 }
 
-// One end lets go of the queue; the last frees it.
-fn letGo(queue: ptr<Queue>) = {
-	if queue.holders.subtract(1) == 1 {
-		val gone: own<Queue> = fromAddress(queue as ptr<u8>)
+extend Queue {
+	// True where the item was queued; false where nobody receives any more,
+	// and the item is the sender's to drop.
+	fn send(item: ptr<u8>): bool = self.state.lock((state) => {
+		if !state.receiving then return false
+		state.items.pushBack(item)
+		return true
+	})
+
+	// 1 with the next item in `out`, 0 where there is none yet, and -1 where
+	// there is none and every sender is gone. Waiting, it answers 0 never.
+	fn receive(out: &var ptr<u8>, wait: bool): i64 = {
+		if wait then
+			return self.state.lockWhen(
+				(state) => !state.items.isEmpty() || state.senders == 0,
+				(state) => taken(&var state, &var out),
+			)
+		return self.state.lock((state) => taken(&var state, &var out))
 	}
-}
 
-// True where the item was queued; false where nobody receives any more,
-// and the item is the sender's to drop.
-fn queueSend(queue: ptr<Queue>, item: ptr<u8>): bool = queue.state.lock((state) => {
-	if !state.receiving then return false
-	state.items.pushBack(item)
-	return true
-})
+	fn addSender() = self.state.lock((state) => { state.senders += 1 })
 
-// 1 with the next item in `out`, 0 where there is none yet, and -1 where
-// there is none and every sender is gone. Waiting, it answers 0 never.
-fn queueReceive(queue: ptr<Queue>, out: &var ptr<u8>, wait: bool): i64 = {
-	if wait then
-		return queue.state.lockWhen(
-			(state) => !state.items.isEmpty() || state.senders == 0,
-			(state) => taken(&var state, &var out),
-		)
-	return queue.state.lock((state) => taken(&var state, &var out))
+	// A receiver that waits hears that nothing more is coming: the lock's end
+	// wakes it.
+	fn dropSender() = self.state.lock((state) => { state.senders -= 1 })
+
+	// The receiver has taken what was queued; what a sender sends from now on
+	// is handed back to it.
+	fn dropReceiver() = self.state.lock((state) => { state.receiving = false })
 }
 
 fn taken(state: &var QueueState, out: &var ptr<u8>): i64 = {
@@ -90,25 +92,6 @@ fn taken(state: &var QueueState, out: &var ptr<u8>): i64 = {
 		return 1
 	}
 	return if state.senders > 0 then 0 else -1
-}
-
-fn queueAddSender(queue: ptr<Queue>) = {
-	queue.holders.add(1)
-	queue.state.lock((state) => { state.senders += 1 })
-}
-
-// A receiver that waits hears that nothing more is coming: the lock's end
-// wakes it.
-fn queueDropSender(queue: ptr<Queue>) = {
-	queue.state.lock((state) => { state.senders -= 1 })
-	letGo(queue)
-}
-
-// The receiver has taken what was queued; what a sender sends from now on
-// is handed back to it.
-fn queueDropReceiver(queue: ptr<Queue>) = {
-	queue.state.lock((state) => { state.receiving = false })
-	letGo(queue)
 }
 
 // A thread: its pthread, the job it runs, and whether it has finished,
@@ -157,12 +140,12 @@ fn joinThread(thread: ptr<Thread>) = {
 /// The end of a channel that sends. There may be several, one for each
 /// thread that sends: `another()` makes one.
 pub struct Sender<T> {
-	channel: ptr<Queue>
+	channel: Shared<Queue>
 }
 
 /// The end of a channel that receives. There is one.
 pub struct Receiver<T> {
-	channel: ptr<Queue>
+	channel: Shared<Queue>
 }
 
 /// What `tryReceive` finds.
@@ -178,7 +161,7 @@ pub enum Received<T> {
 /// end that receives.
 pub fn channel<T>(): (Sender<T>, Receiver<T>) = {
 	val queue = newQueue()
-	return (Sender(channel: queue), Receiver(channel: queue))
+	return (Sender(channel: queue.share()), Receiver(channel: move queue))
 }
 
 extend Sender<T> {
@@ -186,20 +169,20 @@ extend Sender<T> {
 	/// any more, the value is dropped here.
 	pub fn send(value: T) = {
 		val address = intoAddress(own (move value))
-		if !queueSend(self.channel, address) {
+		if !self.channel.value().send(address) {
 			val unwanted: own<T> = fromAddress(address)
 		}
 	}
 
 	/// Another sender to the same queue, for another thread.
 	pub fn another(): Sender<T> = {
-		queueAddSender(self.channel)
-		return Sender(channel: self.channel)
+		self.channel.value().addSender()
+		return Sender(channel: self.channel.share())
 	}
 }
 
 extend Sender<T>: Destroy {
-	var fn destroy() = queueDropSender(self.channel)
+	var fn destroy() = self.channel.value().dropSender()
 }
 
 extend Receiver<T> {
@@ -215,7 +198,7 @@ extend Receiver<T> {
 
 	fn take(wait: bool): Received<T> = {
 		var address: ptr<u8> = null
-		val got = queueReceive(self.channel, &var address, wait)
+		val got = self.channel.value().receive(&var address, wait)
 		if got == 1 {
 			val boxed: own<T> = fromAddress(address)
 			return .Value(unbox(move boxed))
@@ -235,7 +218,7 @@ extend Receiver<T>: Destroy {
 	/// dropped by its sender.
 	var fn destroy() = {
 		while self.take(false) is .Value(..) {}
-		queueDropReceiver(self.channel)
+		self.channel.value().dropReceiver()
 	}
 }
 

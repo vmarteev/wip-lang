@@ -1,0 +1,225 @@
+// `std::future`: a channel's values in the order they were sent, from one
+// thread or several; what `tryReceive` finds; a queue that closes when the
+// last sender goes; values nobody receives, dropped once; work on another
+// thread, waited for or polled; and `together`, `each` and `map`, which
+// split work across threads and answer once it is done.
+
+import std::future
+import std::future::{Future, Received, Sender, channel}
+import std::shared::{Shared}
+import std::sync::{Atomic}
+
+/// A value sent over a channel, which counts how many times it is dropped.
+struct Parcel {
+	drops: Shared<Atomic<i64>>
+	value: i64
+}
+
+extend Parcel: Destroy {
+	var fn destroy() = {
+		self.drops.value().add(1)
+	}
+}
+
+fn parcel(drops: &Shared<Atomic<i64>>, value: i64): Parcel = Parcel(
+	drops: drops.share(),
+	value: value,
+)
+
+@test
+fn valuesArriveInTheOrderSent() = {
+	val (tx, rx) = channel<i64>()
+	for i in 0..5 {
+		tx.send(i)
+	}
+	destroy(move tx)
+	var seen: Vec<i64> = Vec()
+	for value in move rx {
+		seen.push(value)
+	}
+	assert(seen == Vec::of(own [0, 1, 2, 3, 4]))
+}
+
+@test
+fn tryReceiveFindsNothingThenAValueThenTheEnd() = {
+	val (tx, rx) = channel<String>()
+	assert(rx.tryReceive() is .Empty, "nothing sent yet")
+	tx.send(String::of("one"))
+	match rx.tryReceive() {
+		.Value(text) => assert(text == "one")
+		_ => assert(false, "the value sent is there")
+	}
+	assert(rx.tryReceive() is .Empty, "taken, and the sender remains")
+	destroy(move tx)
+	assert(rx.tryReceive() is .Closed, "empty, and every sender gone")
+	assert(rx.receive() == .None, "a wait for nothing ends at once")
+}
+
+@test
+fn valuesSentBeforeTheSenderWentStillArrive() = {
+	val (tx, rx) = channel<i64>()
+	tx.send(7)
+	tx.send(8)
+	destroy(move tx)
+	assert(rx.receive() == .Some(7))
+	assert(rx.receive() == .Some(8))
+	assert(rx.receive() == .None)
+}
+
+@test
+fn theQueueClosesWithItsLastSender() = {
+	val (first, rx) = channel<i64>()
+	val second = first.another()
+	first.send(1)
+	destroy(move first)
+	second.send(2)
+	assert(rx.receive() == .Some(1))
+	assert(rx.receive() == .Some(2))
+	assert(rx.tryReceive() is .Empty, "one sender remains")
+	destroy(move second)
+	assert(rx.tryReceive() is .Closed)
+}
+
+@test
+fn sendersOnManyThreads() = {
+	val (tx, rx) = channel<i64>()
+	var workers: Vec<Future<void>> = Vec()
+	for thread in 0..8 {
+		val sender = tx.another()
+		workers.push(
+			Future::run(own () => {
+				for i in 0..100 {
+					sender.send(thread * 100 + i)
+				}
+			}),
+		)
+	}
+	destroy(move tx)
+	var count = 0
+	var total = 0
+	for value in move rx {
+		count += 1
+		total += value
+	}
+	assert(count == 800, "every value from every thread")
+	assert(total == 799 * 800 / 2)
+}
+
+@test
+fn aSenderCrossesAChannel() = {
+	val (outer, inner) = channel<Sender<i64>>()
+	val (tx, rx) = channel<i64>()
+	outer.send(move tx)
+	match inner.receive() {
+		.Some(sender) => sender.send(42)
+		.None => assert(false, "the sender came through")
+	}
+	assert(rx.receive() == .Some(42))
+	assert(rx.receive() == .None, "the sender went with the match")
+}
+
+@test
+fn valuesNobodyReceivesAreDroppedOnce() = {
+	val drops = Shared::of(Atomic::of(0))
+	val (tx, rx) = channel<Parcel>()
+	tx.send(parcel(&drops, 1))
+	tx.send(parcel(&drops, 2))
+	assert(drops.value().load() == 0, "queued, not dropped")
+	destroy(move rx)
+	assert(drops.value().load() == 2, "the queue's values go with the receiver")
+	tx.send(parcel(&drops, 3))
+	assert(drops.value().load() == 3, "one sent to nobody is dropped by its sender")
+	destroy(move tx)
+	assert(drops.value().load() == 3, "and nothing twice")
+}
+
+@test
+fn aValueReceivedIsTheReceiversAlone() = {
+	val drops = Shared::of(Atomic::of(0))
+	val (tx, rx) = channel<Parcel>()
+	tx.send(parcel(&drops, 5))
+	destroy(move tx)
+	val got = rx.receive()
+	destroy(move rx)
+	assert(drops.value().load() == 0, "the receiver keeps what it took")
+	match move got {
+		.Some(value) => {
+			assert(value.value == 5)
+			destroy(move value)
+		}
+		.None => assert(false, "the value sent is there")
+	}
+	assert(drops.value().load() == 1)
+}
+
+@test
+fn aFutureAnswersWhatItsWorkAnswered() = {
+	val text = String::of("moved in")
+	val future = Future::run(own () => text.len())
+	assert(future.get() == 8)
+}
+
+@test
+fn pollHandsTheValueOverOnce() = {
+	var future = Future::run(own () => 6 * 7)
+	var answer: Option<i64> = .None
+	while answer.isNone() {
+		answer = future.poll()
+	}
+	assert(answer == .Some(42))
+	assert(future.isDone())
+	assert(future.poll() == .None, "handed over already")
+}
+
+@test
+fn aFutureDroppedUnaskedWaitsForItsWork() = {
+	val done = Shared::of(Atomic::of(0))
+	{
+		val mark = done.share()
+		val future = Future::run(own () => {
+			var total = 0
+			for i in 0..100000 {
+				total += i % 3
+			}
+			mark.value().store(total)
+		})
+	}
+	assert(done.value().load() == 99999, "the work finished before the future went")
+}
+
+@test
+fn togetherAnswersBothAndMayBorrow() = {
+	val numbers = [1, 2, 3, 4]
+	val (sum, product) = future::together(
+		() => numbers[0] + numbers[1] + numbers[2] + numbers[3],
+		() => numbers[0] * numbers[1] * numbers[2] * numbers[3],
+	)
+	assert(sum == 10 && product == 24)
+}
+
+@test
+fn eachChangesEveryElement() = {
+	var values: Vec<i64> = Vec()
+	for i in 0..1000 {
+		values.push(i)
+	}
+	future::each(&var values.items(), (value) => { value = value * 2 })
+	for i in 0..1000 {
+		assert(values[i] == i * 2)
+	}
+	var none: [i64; 0] = []
+	future::each(&var none, (value) => { value = 1 })
+}
+
+@test
+fn mapAnswersInTheElementsOrder() = {
+	var words: Vec<String> = Vec()
+	for i in 0..500 {
+		words.push("w\(i)")
+	}
+	val lengths = future::map(&words.items(), (word) => word.len())
+	assert(lengths.len() == 500)
+	assert(lengths[0] == 2 && lengths[10] == 3 && lengths[499] == 4)
+	val empty: [i64; 0] = []
+	assert(future::map(&empty, (n) => n + 1).isEmpty())
+}

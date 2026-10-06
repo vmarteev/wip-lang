@@ -1,8 +1,9 @@
 #!/bin/bash
 # Everything that must pass before a commit: the Rust in `cargo fmt`'s
-# layout and the standard library in `wip fmt`'s, the generated tables as
-# their scripts write them, the editors' grammar, no decision cited, every
-# test, and clippy with warnings denied. Prints ALL OK when they all pass.
+# layout and the standard library and its tests in `wip fmt`'s, the
+# generated tables as their scripts write them, the editors' grammar,
+# nothing pointing at a private document, every test, and clippy with
+# warnings denied. Prints ALL OK when they all pass.
 #
 # The tests are run by starting every test binary at once rather than
 # letting `cargo test` walk them one at a time, which is what it does. On
@@ -78,8 +79,8 @@ for line in sys.stdin:
 "
 )
 
-# The standard library is written in `wip fmt`'s layout.
-if ! cargo run -q --bin wip -- fmt --check std >"$out/wip-fmt" 2>&1; then
+# The standard library and its tests are written in `wip fmt`'s layout.
+if ! cargo run -q --bin wip -- fmt --check std tests/std >"$out/wip-fmt" 2>&1; then
     say "wip fmt (std)" "FAILED"
     cat "$out/wip-fmt"
     failed=1
@@ -118,7 +119,7 @@ else
     say "editors' grammar" "skipped: no tree-sitter"
 fi
 
-# Nothing published cites a design record by its number.
+# Nothing published points at a document that is not.
 if ! scripts/citations.sh >"$out/citations" 2>&1; then
     say "citations" "FAILED"
     cat "$out/citations"

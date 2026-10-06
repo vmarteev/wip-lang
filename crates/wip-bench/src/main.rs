@@ -25,7 +25,7 @@ use wip_lang::{SourceFile, Timings};
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 #[derive(Parser)]
-#[command(name = "wip-bench", about = "Compile-time measurements for question 4")]
+#[command(name = "wip-bench", about = "How fast wip compiles, against clang")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -227,8 +227,8 @@ struct Row {
 const FRONT_END: [&str; 5] = ["read", "lex", "parse", "type check", "move check"];
 
 fn measure(sizes: &[usize], runs: usize, out: &Path, cc: &str) -> Result<(), String> {
-    // Against clang, which compiles a file on one thread, wip uses one too
-    // (answer 4); `modules` measures what more threads buy.
+    // Against clang, which compiles a file on one thread, wip uses one too;
+    // `modules` measures what more threads buy.
     wip_syntax::parallel::set_threads(1);
     let mut rows = Vec::new();
     for &size in sizes {

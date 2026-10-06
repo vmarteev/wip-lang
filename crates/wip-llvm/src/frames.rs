@@ -326,7 +326,7 @@ fn read_unit<'a>(
                 while let Some(range) = iter.next()? {
                     ranges.push((range.begin, range.end));
                 }
-                let call_file = file_index(entry, gimli::DW_AT_call_file).map_or(0, &file_of);
+                let call_file = file_index(entry, gimli::DW_AT_call_file).map_or(0, file_of);
                 let call_line = entry
                     .attr_value(gimli::DW_AT_call_line)
                     .and_then(|value| value.udata_value())
