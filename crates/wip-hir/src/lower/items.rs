@@ -1143,6 +1143,12 @@ impl<'a> Lowerer<'a> {
                 // the implementation of an interface.
                 ast::Item::Extend(block) => {
                     self.annotations(&block.annotations, annotations::Target::Extend);
+                    // `extend Iterator<T: Ord> { … }`: methods every
+                    // implementer has where its types meet the condition.
+                    if let Some(interface) = self.extended_interface(block) {
+                        self.declare_extension(block, interface, &mut bodies);
+                        continue;
+                    }
                     self.derived = block.derived.is_some();
                     if let Some((owner, type_params)) = self.impl_target(block) {
                         match block.interface {
@@ -1311,6 +1317,7 @@ impl<'a> Lowerer<'a> {
                 .first()
                 .cloned()
                 .unwrap_or_else(|| ast::GenericParam {
+                    decided: None,
                     name: elem,
                     bounds: Vec::new(),
                     default: None,
@@ -1479,6 +1486,7 @@ impl<'a> Lowerer<'a> {
                 }
             }
             params.push(GenericParamDef {
+                decided: false,
                 // The type's parameter, under the name the block writes.
                 name: declared.name,
                 written: param.name.sym,
@@ -1529,6 +1537,7 @@ impl<'a> Lowerer<'a> {
                     accesses: Some(Access::Field(id, index as u32)),
                     is_variadic: false,
                     variadic_of: None,
+                    lends_from: None,
                     is_lambda: false,
                     generator: None,
                     is_tailrec: false,
@@ -1606,6 +1615,7 @@ impl<'a> Lowerer<'a> {
                 accesses: None,
                 is_variadic: false,
                 variadic_of: None,
+                lends_from: None,
                 is_lambda: false,
                 generator: None,
                 is_tailrec: false,
@@ -1714,8 +1724,11 @@ impl<'a> Lowerer<'a> {
         // method's `Self`, in scope.
         self.type_params = generics.clone();
         self.self_ty = member.as_ref().map(|member| self.member_self_ty(member));
+        let pins = self.decided_pins(&generics);
+        self.program.types.set_pins(pins);
         let (params, deferred) = self.fn_params(sig, member.as_ref(), is_extern);
         let (ret, yields, generator_args) = self.fn_result(sig, member.as_ref(), is_extern);
+        self.program.types.set_pins(Vec::new());
         self.type_params.clear();
         self.self_ty = None;
         let intrinsic = if annotations.intrinsic {
@@ -1724,6 +1737,7 @@ impl<'a> Lowerer<'a> {
             None
         };
         self.check_variadic(sig, is_extern);
+        let lends_from = self.lends_from(sig, &params);
         let exported = self.fn_exported(&annotations, &params, sig, ret);
         let def = FnDef {
             name: sig.name.sym,
@@ -1758,6 +1772,7 @@ impl<'a> Lowerer<'a> {
             accesses: None,
             is_variadic: sig.variadic.is_some(),
             variadic_of: None,
+            lends_from,
             is_lambda: false,
             generator: None,
             is_tailrec: annotations.tailrec,
@@ -1863,6 +1878,109 @@ impl<'a> Lowerer<'a> {
 
     /// A function's parameters, a method's receiver first, and the defaults
     /// to check once every function is declared, by the parameter's place.
+    /// What `from` names the result as borrowing: a parameter named alone,
+    /// with its place and what it borrows; and what a parameter borrows,
+    /// where a `&` or view field of it is named, `self.ast`.
+    fn lends_from(&mut self, sig: &ast::FnSig, params: &[ParamDef]) -> Option<Vec<LendFrom>> {
+        if sig.lends_from.is_empty() {
+            return None;
+        }
+        let note = "`from` names what the result borrows: a parameter that is a `str`, a reference or a view, `self`, or a `&` or view field reached from one";
+        let mut lends = Vec::new();
+        for path in &sig.lends_from {
+            let name = path
+                .root
+                .map_or(self.interner.self_symbol(), |name| name.sym);
+            let written = self.text(name).to_string();
+            let Some(index) = params.iter().position(|p| p.name == name) else {
+                let diagnostic = Diagnostic::error(
+                    codes::LENDS_FROM,
+                    format!(
+                        "`{written}` is not a parameter of `{}`",
+                        self.text(sig.name.sym)
+                    ),
+                    path.span,
+                    "not a parameter",
+                )
+                .with_note(note);
+                self.report(diagnostic);
+                continue;
+            };
+            if path.fields.is_empty() {
+                let ty = params[index].ty;
+                if !self.program.holds_view(ty) {
+                    let diagnostic = Diagnostic::error(
+                        codes::LENDS_FROM,
+                        format!(
+                            "`{written}` is {}, which a result cannot borrow from",
+                            self.ty_name(ty)
+                        ),
+                        path.span,
+                        "borrows nothing",
+                    )
+                    .with_note(note);
+                    self.report(diagnostic);
+                    continue;
+                }
+                lends.push(LendFrom::Param(index as u32));
+                continue;
+            }
+            // Each field is a `&` or a view, which points outside what holds
+            // it; a field held as its own is part of the view.
+            let mut ty = params[index].ty;
+            let mut reached = written.clone();
+            let mut lent = true;
+            for field in &path.fields {
+                let owner = match self.kind(ty) {
+                    TyKind::Ref(inner, _) => inner,
+                    _ => ty,
+                };
+                let found = match self.kind(owner) {
+                    TyKind::Struct(id, _) => self.program.structs[id]
+                        .fields
+                        .iter()
+                        .position(|f| f.name == field.sym),
+                    _ => None,
+                };
+                let Some(at) = found else {
+                    let diagnostic = Diagnostic::error(
+                        codes::LENDS_FROM,
+                        format!("`{reached}` has no field `{}`", self.text(field.sym)),
+                        field.span,
+                        "no such field",
+                    )
+                    .with_note(note);
+                    self.report(diagnostic);
+                    lent = false;
+                    break;
+                };
+                ty = self.program.field_ty(owner, at as u32);
+                reached = format!("{reached}.{}", self.text(field.sym));
+                let points_out = matches!(self.kind(ty), TyKind::Ref(..))
+                    || matches!(self.kind(ty), TyKind::Struct(id, _) if self.program.structs[id].is_view);
+                if !points_out {
+                    let diagnostic = Diagnostic::error(
+                        codes::LENDS_FROM,
+                        format!("`{reached}` is held by `{written}`, not borrowed by it"),
+                        path.span,
+                        format!("{} of its own", self.ty_name(ty)),
+                    )
+                    .with_help(format!(
+                        "name `{written}`, which the result then borrows whole"
+                    ))
+                    .with_note("a field names what the result borrows where it is a `&`, or a view, which points outside what holds it");
+                    self.report(diagnostic);
+                    lent = false;
+                    break;
+                }
+            }
+            if lent {
+                lends.push(LendFrom::Borrowed(index as u32));
+            }
+        }
+        Some(lends)
+    }
+
     fn fn_params(
         &mut self,
         sig: &ast::FnSig,
@@ -1987,6 +2105,8 @@ impl<'a> Lowerer<'a> {
                 "slot" => Some(Intrinsic::SlotsSlot),
                 "takeBuffer" => Some(Intrinsic::SlotsTakeBuffer),
                 "takeFrom" => Some(Intrinsic::SlotsTakeFrom),
+                "over" => Some(Intrinsic::SlotsOver),
+                "release" => Some(Intrinsic::SlotsRelease),
                 _ => None,
             },
             Some(MemberOwner::Type(TypeDef::Builtin(BuiltinOwner::Str))) => match name.as_str() {
@@ -2013,6 +2133,9 @@ impl<'a> Lowerer<'a> {
             Some(MemberOwner::Type(TypeDef::Builtin(BuiltinOwner::Int(_)))) => {
                 match name.as_str() {
                     "countOnes" => Some(Intrinsic::IntCountOnes),
+                    "addOverflows" => Some(Intrinsic::IntAddOverflows),
+                    "subOverflows" => Some(Intrinsic::IntSubOverflows),
+                    "mulOverflows" => Some(Intrinsic::IntMulOverflows),
                     "leadingZeros" => Some(Intrinsic::IntLeadingZeros),
                     "trailingZeros" => Some(Intrinsic::IntTrailingZeros),
                     "swapBytes" => Some(Intrinsic::IntSwapBytes),
@@ -2470,6 +2593,7 @@ impl<'a> Lowerer<'a> {
                     let elem = args.first().copied().unwrap_or(Types::ERROR);
                     self.intern(TyKind::Slots(elem))
                 }
+                BuiltinOwner::Void => Types::UNIT,
             },
         }
     }
@@ -2533,11 +2657,16 @@ impl<'a> Lowerer<'a> {
             // could have written, so its own types cross too. A `str` and a
             // slice do not, since they would take two parameters of C's
             // where the pointer's type says one.
-            // A struct by value does not either: C passes one in registers
-            // and a Wip function value takes its address.
+            // A struct by value does not either, nor a function pointer
+            // that may be null, which Wip holds as an `Option`: C passes
+            // either in registers, and a Wip function C calls through a
+            // pointer takes its address.
             TyKind::Fn(params, ret) => {
                 let params = self.program.types.list(params).to_vec();
-                let by_value = |ty: Ty| matches!(self.kind(ty), TyKind::Struct(..));
+                let by_value = |ty: Ty| {
+                    matches!(self.kind(ty), TyKind::Struct(..))
+                        || self.program.nullable_function(ty)
+                };
                 params.iter().all(|&p| {
                     !matches!(self.kind(p), TyKind::Str)
                         && !by_value(p)
@@ -2611,7 +2740,7 @@ impl<'a> Lowerer<'a> {
                 span,
                 "not a C-compatible type",
             )
-            .with_note("extern functions can take and return only integers of up to 64 bits, `f32`, `f64`, `bool`, `cstring`, `ptr<T>` and C's structs; a parameter may also be a `str` or a `&[T]`, which pass as a pointer and a length, an array by reference, which passes as a pointer to its first element, or a function that takes and answers no struct by value and whose own types cross, which passes as a C function pointer; a result may be `never`, for a C function that does not return");
+            .with_note("extern functions can take and return only integers of up to 64 bits, `f32`, `f64`, `bool`, `cstring`, `ptr<T>` and C's structs; a parameter may also be a `str` or a `&[T]`, which pass as a pointer and a length, an array by reference, which passes as a pointer to its first element, or a function that takes and answers no struct by value, and no function that may be null, and whose own types cross, which passes as a C function pointer; a result may be `never`, for a C function that does not return");
             // An `extern struct` is C's layout; what it cannot do yet is
             // cross by value.
             if ty == Types::STR {

@@ -396,13 +396,32 @@ fn the_debugger_shows_wip_values() {
         line.to_string()
     };
     let (lldb, gdb) = (script("lldb"), script("gdb"));
+    // Where the program stopped at the breakpoint, which is what the
+    // debugger says only once it has run it there.
+    let stopped = match cfg!(target_vendor = "apple") {
+        true => "stop reason = breakpoint",
+        false => "Breakpoint 1, ",
+    };
+    // A debugger launches the program through a server of its own, and on
+    // a machine busy with every other test that launch can time out: a
+    // run that did not stop is tried again before it counts as one the
+    // debugger cannot make here.
     let run = |tool: &str, args: &[&str]| {
-        Command::new(tool)
-            .current_dir(dir.path())
-            .args(args)
-            .output()
-            .ok()
-            .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
+        let mut why = String::new();
+        for _ in 0..3 {
+            let out = Command::new(tool)
+                .current_dir(dir.path())
+                .args(args)
+                .output()
+                .ok()?;
+            let said = String::from_utf8_lossy(&out.stdout).into_owned();
+            if said.contains(stopped) {
+                return Some(said);
+            }
+            why = String::from_utf8_lossy(&out.stderr).into_owned();
+        }
+        eprintln!("{tool} did not stop the program, so its values are not checked: {why}");
+        None
     };
     let said = match cfg!(target_vendor = "apple") {
         true => run(
@@ -447,7 +466,7 @@ fn the_debugger_shows_wip_values() {
         ),
     };
     // No debugger, or one the system does not let run the program.
-    let Some(said) = said.filter(|said| said.contains("main.wip:10")) else {
+    let Some(said) = said else {
         return;
     };
     // Each as the debugger prints a variable, and not as the source it

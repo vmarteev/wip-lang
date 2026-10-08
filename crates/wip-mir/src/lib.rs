@@ -9,6 +9,7 @@
 mod bodies;
 mod build;
 pub mod c_abi;
+mod c_bools;
 mod dump;
 mod eval;
 mod frame;
@@ -25,6 +26,7 @@ mod validate;
 
 pub use bodies::function_body;
 pub use build::{generator_frames, lower_drop_fn, lower_drop_in_place_fn, lower_fn};
+pub use c_bools::convert_c_bools;
 pub use dump::dump;
 pub use eval::{Locate, evaluate_constants};
 pub use initialized::reads_before_writes;
@@ -253,6 +255,10 @@ pub enum Rvalue {
     /// An integer's bits turned by an amount of its own type, taken modulo
     /// its width.
     Rotate(Turn, Operand, Operand),
+    /// Whether `lhs op rhs` — `+`, `-` or `*` on integers of up to 64 bits,
+    /// signed by their type — does not fit that type: a `bool`, from the
+    /// instruction a checked `+` uses, which panics on it instead.
+    Overflows(BinaryOp, Operand, Operand),
     /// A scalar's bits, as the type of the place it is assigned: a float's
     /// as the unsigned integer of its width, and back.
     Bits(Operand),

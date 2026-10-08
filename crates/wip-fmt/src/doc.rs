@@ -69,6 +69,27 @@ pub fn choice(first: Doc, second: Doc) -> Doc {
     Doc::Choice(Box::new(first), Box::new(second))
 }
 
+/// The document laid out on one line, where it can be: nothing in it
+/// breaks a line whatever the width, a comment that ends one included.
+pub fn flat(doc: &Doc) -> Option<String> {
+    let mut out = String::new();
+    let mut stack = vec![doc];
+    while let Some(doc) = stack.pop() {
+        match doc {
+            Doc::Text(s) => out.push_str(s),
+            Doc::Line => out.push(' '),
+            Doc::Soft | Doc::RigidEnd => {}
+            Doc::Hard | Doc::Blank | Doc::LineEnd(_) => return None,
+            Doc::Concat(parts) => stack.extend(parts.iter().rev()),
+            Doc::Group(inner) | Doc::Indent(inner) | Doc::Rigid(inner) => stack.push(inner),
+            Doc::IfBreak(_, flat) => stack.push(flat),
+            Doc::Choice(first, _) => stack.push(first),
+            Doc::Fill(words) => out.push_str(&words.join(" ")),
+        }
+    }
+    Some(out)
+}
+
 /// `parts` with `sep` between them.
 pub fn join(parts: Vec<Doc>, sep: Doc) -> Doc {
     let mut out = Vec::with_capacity(parts.len() * 2);

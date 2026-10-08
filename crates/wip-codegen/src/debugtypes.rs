@@ -52,7 +52,9 @@ impl<'a> DebugTypes<'a> {
         let root = unit.root();
         let name = self.program.ty_name(ty, self.interner);
         let id = match self.program.types.kind(ty) {
-            TyKind::Unit | TyKind::Never | TyKind::Error | TyKind::Param(_) => None,
+            TyKind::Unit | TyKind::Never | TyKind::Error | TyKind::Param(_) | TyKind::Assoc(..) => {
+                None
+            }
             TyKind::Int(t) => {
                 let encoding = match t.signed() {
                     true => gimli::DW_ATE_signed,

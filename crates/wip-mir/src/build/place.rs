@@ -7,6 +7,13 @@ impl Builder<'_> {
     /// and dereferences are places already; anything else is built in a
     /// temporary.
     pub(super) fn aggregate(&mut self, id: ExprId) -> Place {
+        // Worked out already, where its place was written.
+        if let Some(value) = self.early.remove(&id) {
+            match value {
+                Value::Place(place) => return place,
+                _ => unreachable!("an aggregate worked out as a scalar"),
+            }
+        }
         // A reference to a slice is the slice's pointer and length, which is
         // what the slice's place already holds.
         if let ExprKind::Ref(inner) = self.hir.exprs[id].kind
@@ -126,6 +133,9 @@ impl Builder<'_> {
                 }
                 ptr.project(Projection::Deref)
             }
+            // A `String` over a `str`'s bytes lives until the statement ends
+            // and is never dropped: what it holds is not its own.
+            ExprKind::Undropped(inner) => self.aggregate(*inner),
             // `&make()`: the value lives in a temporary until the statement
             // ends.
             _ => {
@@ -140,6 +150,88 @@ impl Builder<'_> {
                 place
             }
         }
+    }
+
+    /// Works out what a place's expression computes, in the order written —
+    /// each index, the bounds of a sub-slice, and what a projection is given
+    /// but the place it lends from — and keeps it for `place`, which finds
+    /// the place later. A place is lent where it is used; what its
+    /// expression computes is computed where it is written.
+    pub(super) fn place_operands(&mut self, id: ExprId) {
+        let hir = self.hir;
+        match &hir.exprs[id].kind {
+            ExprKind::Field { base, .. } => self.base_operands(*base),
+            ExprKind::Index { base, index } => {
+                self.base_operands(*base);
+                self.keep_early(*index);
+            }
+            ExprKind::SubSlice { base, lo, hi } => {
+                self.base_operands(*base);
+                for bound in [lo, hi].into_iter().flatten() {
+                    self.keep_early(*bound);
+                }
+            }
+            ExprKind::Deref(pointer) => self.pointer_operands(*pointer),
+            // A local is where it is; anything else is not a place, and is
+            // made where the place is found.
+            _ => {}
+        }
+    }
+
+    /// The operands of what a field or element is taken from: a place's, or
+    /// a value's own, made now.
+    fn base_operands(&mut self, base: ExprId) {
+        if self.is_place_kind(base) {
+            self.place_operands(base);
+        } else {
+            self.keep_early(base);
+        }
+    }
+
+    /// The operands of what a place is behind. A projection's call is the
+    /// finding of its place: its arguments are worked out now, in order,
+    /// but for the place it lends from, whose own operands are; the call
+    /// is made where the place is used. A pointer held in a place is read
+    /// there too.
+    fn pointer_operands(&mut self, pointer: ExprId) {
+        let hir = self.hir;
+        if let ExprKind::Call {
+            callee,
+            args,
+            order,
+            ..
+        } = &hir.exprs[pointer].kind
+            && let Some(hir::Lent::Param(from)) = self.program.fns[*callee].projects
+        {
+            for i in evaluation_order(order, args.len()) {
+                match hir.exprs[args[i]].kind {
+                    ExprKind::Ref(place) if i == from as usize && self.is_place_kind(place) => {
+                        self.place_operands(place)
+                    }
+                    _ => self.keep_early(args[i]),
+                }
+            }
+        } else if self.is_place_kind(pointer) {
+            self.place_operands(pointer);
+        } else {
+            self.keep_early(pointer);
+        }
+    }
+
+    /// Works out `id` now, for `place` to take later. An aggregate that is a
+    /// place is copied, so that what runs before the place is found cannot
+    /// change it.
+    fn keep_early(&mut self, id: ExprId) {
+        let value = match self.expr(id) {
+            Value::Place(place) if self.hir.is_place(id) => {
+                let ty = self.ty(id);
+                let temp = Place::local(self.temp(ty));
+                self.assign(temp.clone(), Rvalue::Use(Operand::Copy(place)));
+                Value::Place(temp)
+            }
+            value => value,
+        };
+        self.early.insert(id, value);
     }
 
     /// The place of an array's or slice's elements, and how many there are.

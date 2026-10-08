@@ -263,16 +263,20 @@ impl<'a> Parser<'a> {
         }
         let open = self.bump();
         let (params, _) = self.in_type_args(|p| {
-            p.list(open, T::Gt, "a type parameter", is_ident, |p| {
+            let starts = |kind| is_ident(kind) || kind == T::Type;
+            p.list(open, T::Gt, "a type parameter", starts, |p| {
+                // `type Item`: a type each implementation decides.
+                let decided = p.at(T::Type).then(|| p.bump());
                 let name = p.name("a type parameter")?;
                 let bounds = p.bounds()?;
                 // `K = T`: what a use that leaves it out means.
                 let default = p.eat(T::Eq).then(|| p.ty());
                 Some(GenericParam {
+                    decided,
                     name,
                     bounds,
                     default,
-                    span: name.span.to(p.prev_span()),
+                    span: decided.unwrap_or(name.span).to(p.prev_span()),
                 })
             })
         });

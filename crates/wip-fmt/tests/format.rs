@@ -3,7 +3,7 @@
 
 use std::path::{Path, PathBuf};
 
-use wip_fmt::{Error, Style, format};
+use wip_fmt::{Error, Style, format, switched_off};
 
 fn spaces(width: usize) -> Style {
     Style {
@@ -208,6 +208,19 @@ fn comments_and_blank_lines_are_kept() {
 }
 
 #[test]
+fn a_long_import_puts_a_name_on_each_line() {
+    // On one line where it fits; otherwise one name to a line, one deeper,
+    // with no comma after the last.
+    let short = "import std::libc::{free, malloc}\n";
+    assert_eq!(formatted(short, spaces(40)), short);
+    let long = "import std::libc::{Hidden, hidden, pthread_cond_init, pthread_cond_wait as wait}\n";
+    assert_eq!(
+        formatted(long, spaces(40)),
+        "import std::libc::{\n    Hidden,\n    hidden,\n    pthread_cond_init,\n    pthread_cond_wait as wait\n}\n"
+    );
+}
+
+#[test]
 fn literals_are_written_as_they_were() {
     let src = "fn main() = {\n    val a = 0xFF_00\n    val b = \"tab\\there \\(a) and \\u{e9}\"\n    val c = 1_000.5\n}\n";
     assert_eq!(formatted(src, spaces(120)), src);
@@ -288,4 +301,69 @@ fn tables_of_numbers_fill_their_lines() {
         formatted(named, spaces(20)),
         "val NAMED = [\n    first,\n    second,\n    third,\n]\n"
     );
+}
+
+/// A file is left as written where one of its leading comments is the line
+/// that says so: before anything else, blank lines between them allowed,
+/// whether or not the file parses. The same words below the code, in a doc
+/// comment, or with more after them do not count.
+#[test]
+fn a_leading_comment_leaves_a_file_as_written() {
+    assert!(switched_off("// wip fmt: off\nfn main() = {}\n"));
+    assert!(switched_off(
+        "// Written by a tool.\n\n// wip fmt: off   \n\nfn main( = {\n"
+    ));
+    assert!(switched_off("\n  // wip fmt: off\n"));
+    assert!(!switched_off("fn main() = {}\n// wip fmt: off\n"));
+    assert!(!switched_off("/// wip fmt: off\nfn main() = {}\n"));
+    assert!(!switched_off("// wip fmt: off, mostly\nfn main() = {}\n"));
+    assert!(!switched_off("// wip fmt: on\nfn main() = {}\n"));
+    assert!(!switched_off(""));
+}
+
+/// A struct with no fields and no methods is written as its name alone,
+/// however it was written; one whose braces hold a comment keeps them, and
+/// so do a `view` and an `extern` one, which are refused without them.
+#[test]
+fn an_empty_struct_is_its_name_alone() {
+    let style = spaces(80);
+    assert_eq!(
+        formatted(
+            "pub struct Csv {}\n@derive(Eq)\nstruct Tag<T> {\n}\n",
+            style
+        ),
+        "pub struct Csv\n@derive(Eq)\nstruct Tag<T>\n"
+    );
+    assert_eq!(formatted("struct Csv\n", style), "struct Csv\n");
+    assert_eq!(
+        formatted("struct Kept {\n// nothing yet\n}\n", style),
+        "struct Kept {\n    // nothing yet\n}\n"
+    );
+    assert_eq!(
+        formatted("view struct Seen {}\nextern struct Opaque {}\n", style),
+        "view struct Seen {}\nextern struct Opaque {}\n"
+    );
+}
+
+/// An `if` whose branch holds a comment keeps its braces as a value after
+/// `=` and after `=>`, and keeps the comment where it was: the forms it may
+/// take are asked for once, since printing it writes its comments.
+#[test]
+fn a_comment_in_a_branch_keeps_its_braces() {
+    let style = spaces(80);
+    let assigned = "fn pick(key: i64): i64 = {\n    val named = if key == 1 {\n        .Some(1)\n    } else if key == 2 {\n        // Two is said at once.\n        return 2\n    } else {\n        .None\n    }\n    // The rest are zero.\n    return 0\n}\n";
+    assert_eq!(formatted(assigned, style), assigned);
+    let arm = "fn pick(key: i64): i64 = match key {\n    1 => if key > 0 {\n        // Said at once.\n        return 1\n    } else {\n        2\n    }\n    _ => 0\n}\n";
+    assert_eq!(formatted(arm, style), arm);
+}
+
+#[test]
+fn alternatives_that_do_not_fit_fill_lines_broken_before_a_bar() {
+    let src = "fn f(v: &View): i64 = match v {\n    .Text(size, ..) | .Label(size, ..) | .Column(size, ..) | .Row(size, ..) | .Block(size, ..) => size\n    _ => 0\n}\n";
+    assert_eq!(
+        formatted(src, spaces(60)),
+        "fn f(v: &View): i64 = match v {\n    .Text(size, ..) | .Label(size, ..) | .Column(size, ..)\n    | .Row(size, ..) | .Block(size, ..) => size\n    _ => 0\n}\n"
+    );
+    let short = "fn f(v: &View): i64 = match v {\n    .Text(size, ..) | .Row(size, ..) => size\n    _ => 0\n}\n";
+    assert_eq!(formatted(short, spaces(60)), short);
 }

@@ -112,6 +112,7 @@ const KEYWORDS: &[&str] = &[
     "own",
     "move",
     "lend",
+    "from",
     "defer",
     "assert",
     "true",
@@ -181,6 +182,7 @@ impl Items<'_> {
             TyKind::Array(..) => builtin(p, BuiltinOwner::Slice),
             kind => BuiltinOwner::of(kind).map_or_else(Vec::new, |owner| builtin(p, owner)),
         };
+        let methods = methods.into_iter().chain(extensions(p, ty));
         for id in methods {
             let def = &p.fns[id];
             if matches!(def.receiver, None | Some(Receiver::Static)) {
@@ -291,6 +293,50 @@ impl Items<'_> {
             .or(found.first())
             .map(|&(_, def)| def)
     }
+}
+
+/// What the interfaces `ty` implements give it through their extensions,
+/// where the implementation's types meet the condition:
+/// `text.chars().` lists `max`, and not `sum`.
+fn extensions(program: &Program, ty: Ty) -> Vec<FnId> {
+    let kind = program.types.kind(ty);
+    let owner = match kind {
+        TyKind::Struct(id, _) => TypeDef::Struct(id),
+        TyKind::Enum(id, _) => TypeDef::Enum(id),
+        kind => match BuiltinOwner::of(kind) {
+            Some(builtin) => TypeDef::Builtin(builtin),
+            None => return Vec::new(),
+        },
+    };
+    let own: Vec<Ty> = match kind {
+        TyKind::Struct(_, list) | TyKind::Enum(_, list) => program.types.list(list).to_vec(),
+        _ => Vec::new(),
+    };
+    let mut found = Vec::new();
+    for implementation in program.impls.iter().filter(|i| i.ty == owner) {
+        let args: Option<Vec<Ty>> = program
+            .types
+            .list(implementation.args)
+            .iter()
+            .map(|&arg| program.types.try_subst_find(arg, &own))
+            .collect();
+        let Some(args) = args else { continue };
+        for &method in &program.interfaces[implementation.interface].extensions {
+            let generics = &program.fns[method].generics;
+            let met = args.iter().enumerate().all(|(at, &arg)| {
+                generics.get(at + 1).is_none_or(|param| {
+                    param
+                        .interfaces
+                        .iter()
+                        .all(|c| program.implements(arg, c.interface))
+                })
+            });
+            if met {
+                found.push(method);
+            }
+        }
+    }
+    found
 }
 
 fn builtin(program: &Program, owner: BuiltinOwner) -> Vec<FnId> {

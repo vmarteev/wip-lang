@@ -249,7 +249,7 @@ fn rewrite_rvalue(rvalue: &mut Rvalue, facts: &Facts) {
         | Rvalue::Integer(_, o)
         | Rvalue::Bits(o)
         | Rvalue::VTableFn { table: o, .. } => rewrite_operand(o, facts),
-        Rvalue::Binary(_, l, r) | Rvalue::Rotate(_, l, r) => {
+        Rvalue::Binary(_, l, r) | Rvalue::Rotate(_, l, r) | Rvalue::Overflows(_, l, r) => {
             rewrite_operand(l, facts);
             rewrite_operand(r, facts);
         }

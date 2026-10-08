@@ -91,6 +91,7 @@ impl<'a> Lowerer<'a> {
             accesses: None,
             is_variadic: false,
             variadic_of: None,
+            lends_from: None,
             is_lambda: false,
             generator: None,
             is_tailrec: false,
@@ -303,16 +304,27 @@ impl<'a> Lowerer<'a> {
         });
         def.module = self.current as u32;
         let owner = TypeDef::Struct(id);
-        if let Some(implementation) = self.program.impls.iter_mut().find(|i| {
-            i.ty == owner
-                && Some(i.interface)
-                    == self
-                        .program
-                        .prelude_items
-                        .interface(KnownInterface::Iterator)
-        }) {
-            implementation.args = elem_list;
-            implementation.conditions = generics;
+        if let Some(interface) = self
+            .program
+            .prelude_items
+            .interface(KnownInterface::Iterator)
+        {
+            // What it decides: its element, for `I::Item` once `I` is known.
+            let params = self.param_tys(&generics);
+            let list = self.program.types.intern_list(&params);
+            let pattern = self.intern(TyKind::Struct(id, list));
+            self.program
+                .types
+                .add_decided(interface, pattern, elem_list);
+            if let Some(implementation) = self
+                .program
+                .impls
+                .iter_mut()
+                .find(|i| i.ty == owner && i.interface == interface)
+            {
+                implementation.args = elem_list;
+                implementation.conditions = generics;
+            }
         }
         let order: Vec<u32> = (0..values.len() as u32).collect();
         self.alloc(
@@ -513,6 +525,13 @@ impl<'a> Lowerer<'a> {
                 self.add_default(owner, want.id);
                 methods.push(want.id);
             }
+            // What it decides: its element, for `I::Item` once `I` is known.
+            let params = self.param_tys(&generics);
+            let list = self.program.types.intern_list(&params);
+            let pattern = self.intern(TyKind::Struct(gen_id, list));
+            self.program
+                .types
+                .add_decided(interface, pattern, elem_list);
             self.program.impls.push(ImplDef {
                 interface,
                 args: elem_list,

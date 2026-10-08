@@ -50,11 +50,6 @@ impl<'a> Lowerer<'a> {
                 self.alloc(ExprKind::Float(*v), ty, span)
             }
             ast::ExprKind::Str(s) => {
-                // Where a `String` is expected, the literal is one, made
-                // from its text as an interpolated literal is.
-                if let Some(made) = self.literal_as_string(*s, hint, span) {
-                    return made;
-                }
                 let ty = if hint == Some(Types::CSTRING) {
                     Types::CSTRING
                 } else {
@@ -449,14 +444,14 @@ impl<'a> Lowerer<'a> {
         }
         // A function named as a value.
         if let Some(&id) = self.modules[module].fns.get(&item) {
-            return self.fn_value(id, ItemUse::plain(None, hint, span));
+            return self.fn_value(id, ItemUse::plain(None, hint, span), None);
         }
         if let Some(id) = self.prelude_const(item) {
             let value = self.const_use(id, span);
             return self.referent(value, hint, span);
         }
         if let Some(id) = self.prelude_fn(item) {
-            return self.fn_value(id, ItemUse::plain(None, hint, span));
+            return self.fn_value(id, ItemUse::plain(None, hint, span), None);
         }
         // A name of the function around a lambda is captured.
         if let Some(captured) = self.captured_name(sym, span) {
@@ -1523,27 +1518,35 @@ impl<'a> Lowerer<'a> {
             _ => None,
         };
         let unmet = wanted.filter(|_| lt == rt).and_then(|interface| {
-            self.unmet_for(
-                lt,
-                crate::Constraint {
-                    interface,
-                    args: crate::TyList::EMPTY,
-                },
-            )
+            let wanted = crate::Constraint {
+                interface,
+                args: crate::TyList::EMPTY,
+            };
+            let chain = self.unmet_chain(lt, wanted);
+            (!chain.is_empty()).then_some((wanted, chain))
         });
         // A type says it compares with `@derive(Eq)` and that it is ordered
         // with `@derive(Ord)`, and the compiler writes both.
         let declared = matches!(self.kind(lt), TyKind::Struct(..) | TyKind::Enum(..));
-        if let Some((arg, condition)) = unmet {
+        if let Some((wanted, chain)) = unmet {
+            diagnostic = diagnostic.with_help(self.unmet_help(lt, wanted, &chain));
+            // The type that lacks it is the innermost, which is where it is
+            // written, if the program may write it.
+            let (arg, condition) = chain[chain.len() - 1];
             let name = self.constraint_name(condition, arg);
-            let (whole, inside) = (self.ty_name(lt), self.ty_name(arg));
-            diagnostic = diagnostic.with_help(format!(
-                "{whole} implements `{name}` where {inside} does, and {inside} does not"
-            ));
-            if matches!(self.kind(arg), TyKind::Struct(..) | TyKind::Enum(..)) {
-                let plain = inside.trim_matches('`').to_string();
+            let inside = self.ty_name(arg).trim_matches('`').to_string();
+            if let Some(module) = self.std_module_of(arg) {
+                let module = if module == crate::PRELUDE {
+                    "the prelude".to_string()
+                } else {
+                    format!("`{module}`")
+                };
                 diagnostic = diagnostic.with_help(format!(
-                    "write `@derive({name})` on `{plain}`, and the compiler writes it field by field"
+                    "`{inside}` is declared in {module}, which does not implement `{name}` for it"
+                ));
+            } else if matches!(self.kind(arg), TyKind::Struct(..) | TyKind::Enum(..)) {
+                diagnostic = diagnostic.with_help(format!(
+                    "write `@derive({name})` on `{inside}`, and the compiler writes it field by field"
                 ));
             }
             diagnostic = diagnostic.with_note(
@@ -1727,30 +1730,5 @@ impl<'a> Lowerer<'a> {
         }
         self.report(diagnostic);
         self.error_expr(span)
-    }
-}
-
-/// The prelude's interface behind an arithmetic operator.
-impl Lowerer<'_> {
-    /// A string literal where a `String` is expected: `String::of` of it,
-    /// which allocates as `"\(x)"` does, where `String` is the prelude's.
-    fn literal_as_string(&mut self, text: Symbol, hint: Option<Ty>, span: Span) -> Option<ExprId> {
-        let string = self.program.prelude_items.structure(KnownStruct::String)?;
-        let string_ty = self.intern(TyKind::Struct(string, crate::TyList::EMPTY));
-        if hint != Some(string_ty) {
-            return None;
-        }
-        let of = self.method_of(TypeDef::Struct(string), Symbol::of())?;
-        let literal = self.alloc(ExprKind::Str(text), Types::STR, span);
-        Some(self.alloc(
-            ExprKind::Call {
-                callee: of,
-                args: vec![literal],
-                type_args: crate::TyList::EMPTY,
-                order: vec![0],
-            },
-            string_ty,
-            span,
-        ))
     }
 }

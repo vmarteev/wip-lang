@@ -139,6 +139,17 @@ impl Checker<'_> {
                     }
                     e = inner;
                 }
+                // What a projection lends lies in the argument it lends
+                // from, `names[0]` in `names`; and `&place` is the place.
+                ExprKind::Call {
+                    callee, ref args, ..
+                } => {
+                    let wip_hir::Lent::Param(base) = self.program.fns[callee].projects? else {
+                        return None;
+                    };
+                    e = *args.get(base as usize)?;
+                }
+                ExprKind::Ref(inner) => e = inner,
                 _ => return None,
             }
         }
@@ -532,7 +543,8 @@ impl Checker<'_> {
         label: &str,
     ) {
         let Some(root) = roots.iter().find(|root| {
-            root.local != param
+            !root.is_lent()
+                && root.local != param
                 && self.body.locals[root.local].kind == LocalKind::Param
                 && matches!(
                     self.program.types.kind(self.body.locals[root.local].ty),
@@ -580,11 +592,7 @@ impl Checker<'_> {
         let stale: Vec<LocalId> = state
             .roots
             .iter()
-            .filter(|(_, roots)| {
-                roots
-                    .iter()
-                    .any(|root| root.within(path) || path.within(root))
-            })
+            .filter(|(_, roots)| roots.iter().any(|root| root.overlaps(path)))
             .map(|(&local, _)| local)
             .collect();
         for local in stale {
@@ -857,12 +865,10 @@ impl Checker<'_> {
                 continue;
             }
             let roots = self.str_roots(arg, state);
-            let Some((var_arg, path)) = vars.iter().find(|(_, path)| {
-                roots
-                    .paths
-                    .iter()
-                    .any(|root| root.within(path) || path.within(root))
-            }) else {
+            let Some((var_arg, path)) = vars
+                .iter()
+                .find(|(_, path)| roots.paths.iter().any(|root| root.overlaps(path)))
+            else {
                 continue;
             };
             let root = self.root_name(path);
@@ -936,7 +942,7 @@ impl Checker<'_> {
         // the signature lends it: its callers keep only what the signature
         // says.
         if matches!(leaving, Leaving::Result)
-            && let Some((root, param)) = roots.paths.iter().find_map(|p| {
+            && let Some((root, param)) = roots.paths.iter().filter(|p| !p.is_lent()).find_map(|p| {
                 let param = self.body.params.iter().position(|&l| l == p.local)?;
                 let lends = self.lends.get(param)?;
                 (self.is_ref_param(p.local) && !lends.place).then_some((p, param))
@@ -961,14 +967,55 @@ impl Checker<'_> {
                 self.body.locals[self.body.params[param]].span,
                 format!("`{name}` is `{}`", self.ty_name(self.body.locals[root.local].ty)),
             )
-            .with_note(format!(
-                "{declared} answers what its parameters' types can hold, and `{name}`'s does not hold, as its own, what the result refers to; its callers keep only that"
-            ))
+            .with_note(if self.says_from {
+                format!(
+                    "{declared} says with `from` what its result borrows, and `{name}` itself is not among it; its callers keep only that"
+                )
+            } else {
+                format!(
+                    "{declared} answers what its parameters' types can hold, and `{name}`'s does not hold, as its own, what the result refers to; its callers keep only that"
+                )
+            })
             .with_help(format!("answer what `{name}` borrows, or a value that owns its data"));
             self.report(diagnostic);
             return;
         }
-        let Some(root) = roots.paths.iter().find(|p| !self.is_ref_param(p.local)) else {
+        // What a parameter borrows leaves only where `from` names it.
+        if matches!(leaving, Leaving::Result)
+            && let Some((root, param)) = roots.paths.iter().filter(|p| p.is_lent()).find_map(|p| {
+                let param = self.body.params.iter().position(|&l| l == p.local)?;
+                (!self.lends.get(param)?.borrows).then_some((p, param))
+            })
+        {
+            let name = self.root_name(root);
+            let diagnostic = Diagnostic::error(
+                codes::STR_OUTLIVES_ITS_ROOT,
+                format!(
+                    "cannot {what} {} that borrows what `{name}` borrows",
+                    self.a_view(value)
+                ),
+                span,
+                format!("borrows what `{name}` borrows"),
+            )
+            .with_secondary(
+                self.body.locals[self.body.params[param]].span,
+                format!("`{name}` is not named after `from`"),
+            )
+            .with_note(format!(
+                "`{}` says with `from` what its result borrows, and its callers keep only that",
+                self.fn_name
+            ))
+            .with_help(format!(
+                "name `{name}` after `from`, or answer from what it names"
+            ));
+            self.report(diagnostic);
+            return;
+        }
+        let Some(root) = roots
+            .paths
+            .iter()
+            .find(|p| !p.is_lent() && !self.is_ref_param(p.local))
+        else {
             return;
         };
         let name = self.root_name(root);

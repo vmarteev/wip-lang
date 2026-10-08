@@ -104,6 +104,7 @@ if ! command -v clang-19 >/dev/null || ! command -v gdb >/dev/null; then
         echo "note: clang-19 and gdb could not be installed; the release builds here are Cranelift'"'"'s" >&2
 fi
 export WIP_CLANG=clang-19
+printf "%-34s %-8s %ss\\n" "the guest made ready" "ok" "$SECONDS"
 exec ./"$WIP_LINUX_RUN" "$@"'
 run=${WIP_LINUX_RUN:-scripts/verify.sh}
 if [ ! -x "$run" ]; then
@@ -129,6 +130,9 @@ if [ "$runtime" = "container" ] && ! container volume inspect "$volume" >/dev/nu
 fi
 
 echo "verifying on $image (${arch:-arm64}, $runtime, ${cpus} cpus, ${memory})"
+# How long it took with the container around it: the guest says how long
+# it took to be made ready, and the run what each step took.
+started=$SECONDS
 "$runtime" run --rm -t \
     ${platform[@]+"${platform[@]}"} \
     -c "$cpus" \
@@ -142,3 +146,7 @@ echo "verifying on $image (${arch:-arm64}, $runtime, ${cpus} cpus, ${memory})"
     -e WIP_LINUX_RUN="$run" \
     "$image" \
     bash -c "$inside" verify "$@"
+status=$?
+took=$((SECONDS - started))
+printf '%-34s %dm%02ds\n' "on Linux, with the container" $((took / 60)) $((took % 60))
+exit $status

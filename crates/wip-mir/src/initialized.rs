@@ -123,7 +123,7 @@ fn statement_effect(statement: &Statement, written: &mut [bool], read: &mut impl
                 | Rvalue::Float(_, o)
                 | Rvalue::Integer(_, o)
                 | Rvalue::Bits(o) => operand_reads(o, read),
-                Rvalue::Binary(_, a, b) | Rvalue::Rotate(_, a, b) => {
+                Rvalue::Binary(_, a, b) | Rvalue::Rotate(_, a, b) | Rvalue::Overflows(_, a, b) => {
                     operand_reads(a, read);
                     operand_reads(b, read);
                 }

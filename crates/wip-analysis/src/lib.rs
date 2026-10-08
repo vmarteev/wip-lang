@@ -38,6 +38,7 @@ use wip_hir::{
 use wip_syntax::{Code, Diagnostic, Edit, Interner, Span, parallel};
 
 mod borrowed;
+mod copied;
 mod expr;
 mod heap;
 mod lends;
@@ -151,8 +152,25 @@ fn check_body(
         implements,
         kept_bindings: FxHashSet::default(),
         callee_lends: RefCell::new(FxHashMap::default()),
+        says_from: def.lends_from.is_some(),
+        kept_elements: FxHashSet::default(),
+        copies: Vec::new(),
+        copies_read: FxHashSet::default(),
     };
     let mut state = State::default();
+    // Where `from` says what the result borrows, what each parameter
+    // borrows is a root of its own, so the body is held to it.
+    if def.lends_from.is_some() {
+        for &param in &body.params {
+            if program.holds_view(body.locals[param].ty) {
+                let lent = Path {
+                    local: param,
+                    projs: vec![Proj::Lent],
+                };
+                state.roots.insert(param, std::iter::once(lent).collect());
+            }
+        }
+    }
     let value = body.value();
     checker.expr(value, Ctx::Value, &mut state);
     if body.exprs[value].ty != Types::NEVER && checker.is_view(def.ret) {
@@ -163,6 +181,7 @@ fn check_body(
         let end = Span::new(span.hi.saturating_sub(1), span.hi);
         checker.check_var_params(end, &state);
     }
+    checker.report_copies();
     checker.diagnostics
 }
 
@@ -219,11 +238,70 @@ fn bindings_of(pattern: &Pattern, base: Option<Path>, out: &mut Vec<(LocalId, Op
         | Pattern::Range { .. }
         | Pattern::Bool(_)
         | Pattern::Str(_) => {}
-        Pattern::Any(alternatives) => {
+        // Each binds the same names, each to its own field: the binding's
+        // place is what their places share, which is no stricter than a
+        // binding of the whole.
+        Pattern::Any { alternatives, .. } => {
+            let mut merged: Vec<(LocalId, Option<Path>)> = Vec::new();
             for alternative in alternatives {
-                bindings_of(alternative, base.clone(), out);
+                let mut found = Vec::new();
+                bindings_of(alternative, base.clone(), &mut found);
+                for (local, path) in found {
+                    match merged.iter_mut().find(|(seen, _)| *seen == local) {
+                        Some((_, shared)) => *shared = common_path(shared.take(), path),
+                        None => merged.push((local, path)),
+                    }
+                }
+            }
+            out.extend(merged);
+        }
+        // What lies behind a reference is not part of the place: its
+        // bindings are kept references, which borrow what the reference
+        // does ([`behind_references`]).
+        Pattern::Deref(inner) => bindings_of(inner, None, out),
+    }
+}
+
+/// The place two paths share: the longest path both lie within, or
+/// nothing where either is not a place.
+fn common_path(a: Option<Path>, b: Option<Path>) -> Option<Path> {
+    let (mut a, b) = (a?, b?);
+    if a.local != b.local {
+        return None;
+    }
+    let shared = a
+        .projs
+        .iter()
+        .zip(&b.projs)
+        .take_while(|(x, y)| x == y)
+        .count();
+    a.projs.truncate(shared);
+    Some(a)
+}
+
+/// The names a pattern binds behind a reference it tests through, at any
+/// depth.
+fn behind_references(pattern: &Pattern, out: &mut Vec<LocalId>) {
+    let nested = |binders: &[Binder], out: &mut Vec<LocalId>| {
+        for binder in binders {
+            if let Binder::Nested(pattern) = binder {
+                behind_references(pattern, out);
             }
         }
+    };
+    match pattern {
+        Pattern::Deref(inner) => inner.locals(out),
+        Pattern::Variant { binders, .. } | Pattern::Fields(binders) => nested(binders, out),
+        Pattern::Slice { prefix, suffix, .. } => {
+            nested(prefix, out);
+            nested(suffix, out);
+        }
+        Pattern::Any { alternatives, .. } => {
+            for alternative in alternatives {
+                behind_references(alternative, out);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -248,6 +326,11 @@ enum Proj {
     /// The elements a slice pattern's bindings refer to: one, or the
     /// slice of those between. Only the bindings reach them.
     Elements,
+    /// What a parameter borrows, as a root of its own where the function
+    /// says with `from` what its result borrows: nothing the call does
+    /// changes it, so it is never stale, and a result may hold it only
+    /// where `from` names the parameter.
+    Lent,
 }
 
 /// A tracked place: a local and a path of projections into it.
@@ -279,6 +362,10 @@ struct State {
     /// The `str` variables whose roots changed since they were given their
     /// value.
     stale: BTreeMap<LocalId, borrowed::Stale>,
+    /// The `String` variables whose text was copied whole, with where, and
+    /// not read since: a copy that nothing reads the variable after could
+    /// have been a move.
+    copied: BTreeMap<LocalId, Vec<Span>>,
 }
 
 /// What a place expression refers to, as far as ownership is concerned.
@@ -367,6 +454,15 @@ struct Checker<'a> {
     /// What each parameter of a function called here lends its result,
     /// worked out once per function.
     callee_lends: RefCell<FxHashMap<FnId, Rc<[lends::Lends]>>>,
+    /// The function says with `from` what its result borrows.
+    says_from: bool,
+    /// The bindings of a `for` over a list behind a kept reference, which
+    /// are kept references to its elements.
+    kept_elements: FxHashSet<LocalId>,
+    /// Each copy of a `String` variable's whole text, and its variable.
+    copies: Vec<(Span, LocalId)>,
+    /// The copies after which the variable was read again.
+    copies_read: FxHashSet<Span>,
 }
 
 /// A place that must stay as it is for a while: borrowed by a reference
@@ -389,6 +485,12 @@ struct Borrow {
 enum Holder {
     /// A reference argument, until the call starts.
     Argument,
+    /// What an argument borrows from where it is written until the call
+    /// starts — a `str` or a view it makes, or what the expression of a
+    /// place it lends lends: `&k` in `&var m.at(&k)` — so a later argument
+    /// may not change it. It is not one of the call's references: the call
+    /// is checked against what it is given where it begins.
+    View,
     /// The bindings of a `match` arm.
     Match,
     /// The bindings of an `is` test, for its block.
@@ -397,15 +499,12 @@ enum Holder {
     Guard,
     /// The binding of a `for` loop.
     Loop,
-    /// The target of an assignment, found before its value is computed.
-    /// With `replace`, for `=` on a variable or a field of
-    /// one, the value may take or replace the target itself, but not a place
-    /// that contains it. `compound` is for `op=`.
-    Assign {
-        target: ExprId,
-        replace: bool,
-        compound: bool,
-    },
+    /// The target of `op=`, found and read before its value is computed.
+    Assign { target: ExprId },
+    /// What an assignment's target lends from its expression — a
+    /// projection's `&` argument, `&k` in `m.at(&k) = …` — taken before the
+    /// value. The target itself is found after the value, where it is used.
+    Operand { target: ExprId },
 }
 
 /// The states with which the `break`s and `continue`s of a loop leave its

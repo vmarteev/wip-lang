@@ -78,6 +78,21 @@ pub enum TyKind {
     /// value in Wip whose contents may be nothing at all. Only the prelude
     /// may name it, and `Vec<T>` is what it is for.
     Slots(Ty),
+    /// `I::Item`: the type an implementation of the interface decides, its
+    /// parameter at the index, for a type that is a parameter still. Once
+    /// the type is known it is what that type's implementation says, which
+    /// interning it answers; a known type never stands in one.
+    Assoc(Ty, crate::InterfaceId, u32),
+}
+
+/// What one implementation of an interface with decided types decides:
+/// for a type of the pattern's shape, with the pattern's parameters bound to
+/// its parts, the interface's arguments.
+#[derive(Debug, Clone)]
+struct Decided {
+    interface: crate::InterfaceId,
+    pattern: Ty,
+    args: TyList,
 }
 
 /// The integer types.
@@ -202,6 +217,12 @@ pub struct Types {
     /// Types and lists, in the order they were interned, so that another
     /// interner can absorb them in the same order.
     log: Vec<Interned>,
+    /// What each implementation of an interface with decided types decides,
+    /// in the order they were made.
+    decided: Vec<Decided>,
+    /// In the body being checked, the decided types its constraints pin:
+    /// `I::Item` is `T` under `I: Iterator<T>`.
+    pins: Vec<(Ty, crate::InterfaceId, u32, Ty)>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -243,6 +264,8 @@ impl Types {
             facts: Vec::new(),
             lists: IndexSet::new(),
             log: Vec::new(),
+            decided: Vec::new(),
+            pins: Vec::new(),
         };
         types.lists.insert(Box::new([]));
         let builtins = [
@@ -284,7 +307,8 @@ impl Types {
                 | TyKind::Array(t, _)
                 | TyKind::Slice(t)
                 | TyKind::Ptr(t)
-                | TyKind::Slots(t) => {
+                | TyKind::Slots(t)
+                | TyKind::Assoc(t, _, _) => {
                     vec![t]
                 }
                 TyKind::Struct(_, args) | TyKind::Enum(_, args) => self.list(args).to_vec(),
@@ -344,9 +368,11 @@ impl Types {
         let kind = self.kind(ty);
         test(kind)
             || match kind {
-                TyKind::Own(t) | TyKind::Ref(t, _) | TyKind::Array(t, _) | TyKind::Slice(t) => {
-                    self.any(t, test)
-                }
+                TyKind::Own(t)
+                | TyKind::Ref(t, _)
+                | TyKind::Array(t, _)
+                | TyKind::Slice(t)
+                | TyKind::Assoc(t, _, _) => self.any(t, test),
                 TyKind::Struct(_, list) | TyKind::Enum(_, list) => {
                     self.list(list).iter().any(|&t| self.any(t, test))
                 }
@@ -391,6 +417,10 @@ impl Types {
             TyKind::Slice(t) => TyKind::Slice(self.subst(t, args)),
             TyKind::Ptr(t) => TyKind::Ptr(self.subst(t, args)),
             TyKind::Slots(t) => TyKind::Slots(self.subst(t, args)),
+            TyKind::Assoc(t, interface, index) => {
+                let base = self.subst(t, args);
+                return self.assoc(base, interface, index);
+            }
             TyKind::Struct(id, list) => TyKind::Struct(id, self.subst_list(list, args)),
             TyKind::Enum(id, list) => TyKind::Enum(id, self.subst_list(list, args)),
             TyKind::Fn(params, ret) => {
@@ -418,6 +448,10 @@ impl Types {
             TyKind::Slice(t) => TyKind::Slice(self.replace_param(t, name, with)),
             TyKind::Ptr(t) => TyKind::Ptr(self.replace_param(t, name, with)),
             TyKind::Slots(t) => TyKind::Slots(self.replace_param(t, name, with)),
+            TyKind::Assoc(t, interface, index) => {
+                let base = self.replace_param(t, name, with);
+                return self.assoc(base, interface, index);
+            }
             TyKind::Struct(id, list) => {
                 let tys: Vec<Ty> = self.list(list).to_vec();
                 let tys: Vec<Ty> = tys
@@ -478,6 +512,10 @@ impl Types {
             TyKind::Slice(t) => TyKind::Slice(self.try_subst_find(t, args)?),
             TyKind::Ptr(t) => TyKind::Ptr(self.try_subst_find(t, args)?),
             TyKind::Slots(t) => TyKind::Slots(self.try_subst_find(t, args)?),
+            TyKind::Assoc(t, interface, index) => {
+                let base = self.try_subst_find(t, args)?;
+                return self.find_assoc(base, interface, index);
+            }
             TyKind::Struct(id, list) => TyKind::Struct(id, self.subst_list_find(list, args)?),
             TyKind::Enum(id, list) => TyKind::Enum(id, self.subst_list_find(list, args)?),
             TyKind::Fn(params, ret) => TyKind::Fn(
@@ -543,6 +581,9 @@ impl Types {
                         TyKind::Slice(t) => TyKind::Slice(map.get(t)),
                         TyKind::Ptr(t) => TyKind::Ptr(map.get(t)),
                         TyKind::Slots(t) => TyKind::Slots(map.get(t)),
+                        TyKind::Assoc(t, interface, index) => {
+                            TyKind::Assoc(map.get(t), interface, index)
+                        }
                         TyKind::Struct(id, list) => TyKind::Struct(id, map.get_list(list)),
                         TyKind::Enum(id, list) => TyKind::Enum(id, map.get_list(list)),
                         TyKind::Fn(params, ret) => TyKind::Fn(map.get_list(params), map.get(ret)),
@@ -571,7 +612,128 @@ impl Types {
                 }
             }
         }
+        // What the other's implementations decided, a generator's among
+        // them, made while its bodies were checked.
+        for rule in &other.decided[mark.decided..] {
+            self.decided.push(Decided {
+                interface: rule.interface,
+                pattern: map.get(rule.pattern),
+                args: map.get_list(rule.args),
+            });
+        }
         map
+    }
+
+    /// Records what an implementation of an interface with decided types
+    /// decides: for `pattern`, the implementing type with its parameters,
+    /// the interface's `args`.
+    pub fn add_decided(&mut self, interface: crate::InterfaceId, pattern: Ty, args: TyList) {
+        self.decided.push(Decided {
+            interface,
+            pattern,
+            args,
+        });
+    }
+
+    /// `base::Item`, the interface's parameter at `index` for `base`: what
+    /// the implementation for `base` decides, where `base` is known and has
+    /// one, and the type that stands for it otherwise.
+    pub fn assoc(&mut self, base: Ty, interface: crate::InterfaceId, index: u32) -> Ty {
+        if let Some(&(.., pinned)) = self
+            .pins
+            .iter()
+            .find(|&&(b, i, k, _)| b == base && i == interface && k == index)
+        {
+            return pinned;
+        }
+        if self.has_shape(base) {
+            for i in 0..self.decided.len() {
+                if self.decided[i].interface != interface {
+                    continue;
+                }
+                let (pattern, args) = (self.decided[i].pattern, self.decided[i].args);
+                let mut bound = Vec::new();
+                if self.bind(pattern, base, &mut bound) {
+                    let arg = self.list(args)[index as usize];
+                    let bound: Vec<Ty> = bound
+                        .into_iter()
+                        .map(|t| t.unwrap_or(Types::ERROR))
+                        .collect();
+                    return self.subst(arg, &bound);
+                }
+            }
+        }
+        self.intern(TyKind::Assoc(base, interface, index))
+    }
+
+    /// The decided types the body being checked pins, in place of the last
+    /// body's.
+    pub fn set_pins(&mut self, pins: Vec<(Ty, crate::InterfaceId, u32, Ty)>) {
+        self.pins = pins;
+    }
+
+    /// Whether an implementation's rule can be matched against `ty`: it is
+    /// built from what it is, as `Mapped<I, U>` is even where `I` is still
+    /// a parameter, not a parameter itself, which only a constraint pins.
+    fn has_shape(&self, ty: Ty) -> bool {
+        !matches!(self.kind(ty), TyKind::Param(_) | TyKind::Assoc(..))
+    }
+
+    /// [`Types::assoc`], for phases that share the types read-only.
+    fn find_assoc(&self, base: Ty, interface: crate::InterfaceId, index: u32) -> Option<Ty> {
+        if self.has_shape(base) {
+            for rule in self.decided.iter().filter(|r| r.interface == interface) {
+                let mut bound = Vec::new();
+                if self.bind(rule.pattern, base, &mut bound) {
+                    let arg = self.list(rule.args)[index as usize];
+                    let bound: Vec<Ty> = bound
+                        .into_iter()
+                        .map(|t| t.unwrap_or(Types::ERROR))
+                        .collect();
+                    return self.try_subst_find(arg, &bound);
+                }
+            }
+        }
+        self.find(TyKind::Assoc(base, interface, index))
+    }
+
+    /// Whether `ty` has the shape of `pattern`, binding each of the
+    /// pattern's parameters to the part of `ty` where it stands.
+    fn bind(&self, pattern: Ty, ty: Ty, bound: &mut Vec<Option<Ty>>) -> bool {
+        if let TyKind::Param(p) = self.kind(pattern) {
+            let at = p.index as usize;
+            if bound.len() <= at {
+                bound.resize(at + 1, None);
+            }
+            return match bound[at] {
+                Some(earlier) => earlier == ty,
+                None => {
+                    bound[at] = Some(ty);
+                    true
+                }
+            };
+        }
+        if !self.is_generic(pattern) {
+            return pattern == ty;
+        }
+        let both = |a: TyList, b: TyList, this: &Self, bound: &mut Vec<Option<Ty>>| {
+            let (a, b) = (this.list(a), this.list(b));
+            a.len() == b.len() && a.iter().zip(b).all(|(&x, &y)| this.bind(x, y, bound))
+        };
+        match (self.kind(pattern), self.kind(ty)) {
+            (TyKind::Own(a), TyKind::Own(b))
+            | (TyKind::Array(a, _), TyKind::Array(b, _))
+            | (TyKind::Slice(a), TyKind::Slice(b))
+            | (TyKind::Ptr(a), TyKind::Ptr(b))
+            | (TyKind::Slots(a), TyKind::Slots(b)) => self.bind(a, b, bound),
+            (TyKind::Ref(a, k), TyKind::Ref(b, l)) if k == l => self.bind(a, b, bound),
+            (TyKind::Struct(i, a), TyKind::Struct(j, b)) if i == j => both(a, b, self, bound),
+            (TyKind::Enum(i, a), TyKind::Enum(j, b)) if i == j => both(a, b, self, bound),
+            (TyKind::Fn(a, r), TyKind::Fn(b, s)) => {
+                both(a, b, self, bound) && self.bind(r, s, bound)
+            }
+            _ => false,
+        }
     }
 
     /// Where interning has got to, for [`Types::absorb`].
@@ -580,6 +742,7 @@ impl Types {
             types: self.set.len(),
             lists: self.lists.len(),
             log: self.log.len(),
+            decided: self.decided.len(),
         }
     }
 
@@ -648,6 +811,7 @@ pub(crate) struct Mark {
     types: usize,
     lists: usize,
     log: usize,
+    decided: usize,
 }
 
 /// Where the types of one interner are in another ([`Types::absorb`]).

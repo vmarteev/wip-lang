@@ -7,7 +7,8 @@ use super::*;
 fn pattern_has_error(pattern: &Pattern) -> bool {
     match pattern {
         Pattern::Error => true,
-        Pattern::Any(alternatives) => alternatives.iter().any(pattern_has_error),
+        Pattern::Any { alternatives, .. } => alternatives.iter().any(pattern_has_error),
+        Pattern::Deref(inner) => pattern_has_error(inner),
         Pattern::Variant { binders, .. } | Pattern::Fields(binders) => {
             binders.iter().any(|b| match b {
                 Binder::Nested(nested) => pattern_has_error(nested),
@@ -37,6 +38,14 @@ pub(crate) struct Binds {
     /// The bindings are variables of their own, which hold their parts and
     /// can be written: a `var` pattern's.
     variables: bool,
+}
+
+/// What the alternatives of one `|` bind: the first's names, which every
+/// other binds again, and the one being checked's.
+#[derive(Default)]
+pub(crate) struct Alternatives {
+    first: Option<FxHashMap<Symbol, (LocalId, Ty, Span)>>,
+    bound: FxHashMap<Symbol, (LocalId, Ty, Span)>,
 }
 
 /// What a pattern writes of a struct's or a variant's fields: the binders,
@@ -1023,7 +1032,9 @@ impl<'a> Lowerer<'a> {
         if self.is_poisoned(ty) || self.is_poisoned(scrut_ty) {
             return Pattern::Error;
         }
-        if ty != scrut_ty {
+        // Text matches a `String` by what it holds, as a literal does.
+        let text_of_string = ty == Types::STR && self.program.is_string(scrut_ty);
+        if ty != scrut_ty && !text_of_string {
             let diagnostic = Diagnostic::error(
                 codes::MISMATCHED_TYPES,
                 format!(
@@ -1149,6 +1160,16 @@ impl<'a> Lowerer<'a> {
     /// value itself otherwise. It records which, and the place an alias
     /// refers into.
     fn declare_binding(&mut self, name: Symbol, ty: Ty, span: Span, binds: Binds) -> LocalId {
+        // An alternative after the first binds the first's local.
+        if let Some(local) = self.bound_before(name, ty, span) {
+            return local;
+        }
+        let local = self.declare_new_binding(name, ty, span, binds);
+        self.note_bound(name, local, ty, span);
+        local
+    }
+
+    fn declare_new_binding(&mut self, name: Symbol, ty: Ty, span: Span, binds: Binds) -> LocalId {
         let copied = self.copied_binding(ty, binds);
         let alias = binds.alias.filter(|_| !copied && !self.is_poisoned(ty));
         let local_ty = match alias {
@@ -1186,6 +1207,27 @@ impl<'a> Lowerer<'a> {
         scrut_ty: Ty,
         binds: Binds,
     ) -> Pattern {
+        // A pattern that tests a value, met where the value is a reference,
+        // tests what it refers to, at any depth: `.Some(3)` on an
+        // `Option<&i64>`. A name or `_` there takes the reference itself.
+        if let TyKind::Ref(referent, kind) = self.kind(scrut_ty)
+            && self.tests_a_value(pattern)
+        {
+            // What it binds aliases what it names there, which can be
+            // written only through a `&var` in a place that can be.
+            let alias = match (kind, binds.alias) {
+                (crate::RefKind::Var, Some(crate::RefKind::Var)) => crate::RefKind::Var,
+                _ => crate::RefKind::Shared,
+            };
+            let through = Binds {
+                alias: Some(alias),
+                ..binds
+            };
+            return match self.pattern(pattern, referent, through) {
+                Pattern::Error => Pattern::Error,
+                tested => Pattern::Deref(Box::new(tested)),
+            };
+        }
         match &pattern.kind {
             ast::PatternKind::Wildcard => Pattern::Wildcard,
             // A number, a `bool` or text the value must equal.
@@ -1196,9 +1238,16 @@ impl<'a> Lowerer<'a> {
             ast::PatternKind::Bool(value) => self
                 .literal_pattern(scrut_ty, Types::BOOL, "a `bool`", pattern.span)
                 .unwrap_or(Pattern::Bool(*value)),
-            ast::PatternKind::Str(sym) => self
-                .literal_pattern(scrut_ty, Types::STR, "text", pattern.span)
-                .unwrap_or(Pattern::Str(*sym)),
+            // Text matches a `str`, and a `String` by the text it holds.
+            ast::PatternKind::Str(sym) => {
+                let text = if self.program.is_string(scrut_ty) {
+                    scrut_ty
+                } else {
+                    Types::STR
+                };
+                self.literal_pattern(scrut_ty, text, "text", pattern.span)
+                    .unwrap_or(Pattern::Str(*sym))
+            }
             // A character is matched as the number it is.
             ast::PatternKind::Char(c) => self
                 .literal_pattern(scrut_ty, Types::CHAR, "a character", pattern.span)
@@ -1211,34 +1260,37 @@ impl<'a> Lowerer<'a> {
             ast::PatternKind::Range { lo, hi, inclusive } => {
                 self.range_pattern(lo.as_ref(), hi.as_ref(), *inclusive, scrut_ty, pattern.span)
             }
-            // `.Round(..) | .Square(..)`: any one of them.
+            // `.Round(..) | .Square(..)`: any one of them. Where they bind,
+            // each binds the same names, and whichever matched gives the
+            // arm its fields.
             ast::PatternKind::Any(alternatives) => {
+                self.state.alternatives.push(Alternatives::default());
                 let mut lowered = Vec::new();
                 for alternative in alternatives {
                     let pattern = self.pattern(alternative, scrut_ty, binds);
-                    // What an alternative binds would have to be bound by
-                    // every other one, and the arm would have to know
-                    // which it came from.
-                    let mut names = Vec::new();
-                    pattern.locals(&mut names);
-                    if !names.is_empty() {
-                        let diagnostic = Diagnostic::error(
-                            codes::INVALID_PATTERN,
-                            "a pattern among alternatives binds nothing",
-                            alternative.span,
-                            "binds a name",
-                        )
-                        .with_help("name the whole value in one arm, or write an arm for each")
-                        .with_note(
-                            "each alternative is a separate test, and what one binds the others would have to bind too",
-                        );
-                        self.report(diagnostic);
-                        lowered.push(Pattern::Error);
-                        continue;
+                    let top = self.state.alternatives.last_mut().expect("pushed above");
+                    let bound = std::mem::take(&mut top.bound);
+                    match &top.first {
+                        None => top.first = Some(bound),
+                        Some(first) => {
+                            let first = first.clone();
+                            if !pattern_has_error(&pattern) {
+                                self.alternative_differs(&first, &bound, alternative.span);
+                            }
+                        }
                     }
                     lowered.push(pattern);
                 }
-                Pattern::Any(lowered)
+                let done = self.state.alternatives.pop().expect("pushed above");
+                let binds_names = done.first.is_some_and(|first| !first.is_empty());
+                let binding = binds_names.then(|| {
+                    self.state.binding_alternatives += 1;
+                    self.state.binding_alternatives - 1
+                });
+                Pattern::Any {
+                    alternatives: lowered,
+                    binding,
+                }
             }
             ast::PatternKind::Binding(sym) => {
                 // A constant's name is the value it stands for, as a
@@ -1381,6 +1433,121 @@ impl<'a> Lowerer<'a> {
                 self.slice_pattern(elements, scrut_ty, pattern.span, binds)
             }
             ast::PatternKind::Error => Pattern::Error,
+        }
+    }
+
+    /// The local an earlier alternative of an enclosing `|` bound `name`
+    /// to, where there is one: this alternative binds it too, which it
+    /// notes. A name of another type is reported.
+    fn bound_before(&mut self, name: Symbol, ty: Ty, span: Span) -> Option<LocalId> {
+        let (local, first_ty, first_span) = self
+            .state
+            .alternatives
+            .iter()
+            .rev()
+            .find_map(|alternatives| alternatives.first.as_ref()?.get(&name).copied())?;
+        if first_ty != ty && !self.is_poisoned(ty) && !self.is_poisoned(first_ty) {
+            let text = self.text(name).to_string();
+            let diagnostic = Diagnostic::error(
+                codes::INVALID_PATTERN,
+                format!(
+                    "`{text}` is {} here and {} in the first alternative",
+                    self.ty_name(ty),
+                    self.ty_name(first_ty)
+                ),
+                span,
+                self.ty_name(ty).to_string(),
+            )
+            .with_secondary(first_span, self.ty_name(first_ty).to_string())
+            .with_note("the arm is checked once, so a name its alternatives bind has one type");
+            self.report(diagnostic);
+        }
+        self.note_bound(name, local, ty, span);
+        Some(local)
+    }
+
+    /// `name` is bound in the alternative of each enclosing `|`.
+    fn note_bound(&mut self, name: Symbol, local: LocalId, ty: Ty, span: Span) {
+        for alternatives in &mut self.state.alternatives {
+            alternatives.bound.entry(name).or_insert((local, ty, span));
+        }
+    }
+
+    /// Reports a name an alternative binds that the first does not, or
+    /// one the first binds that it does not.
+    fn alternative_differs(
+        &mut self,
+        first: &FxHashMap<Symbol, (LocalId, Ty, Span)>,
+        bound: &FxHashMap<Symbol, (LocalId, Ty, Span)>,
+        span: Span,
+    ) {
+        let mut extra: Vec<(Symbol, Span)> = bound
+            .iter()
+            .filter(|(name, _)| !first.contains_key(name))
+            .map(|(&name, &(_, _, at))| (name, at))
+            .collect();
+        extra.sort_by_key(|&(_, at)| at.lo);
+        // One name for another: the field is renamed.
+        let missed: Vec<Symbol> = first
+            .keys()
+            .filter(|name| !bound.contains_key(name))
+            .copied()
+            .collect();
+        let rename = match (&extra[..], &missed[..]) {
+            ([(field, _)], [name]) => Some((*field, *name)),
+            _ => None,
+        };
+        for (name, at) in extra {
+            let text = self.text(name).to_string();
+            let diagnostic = Diagnostic::error(
+                codes::INVALID_PATTERN,
+                format!("`{text}` is bound here and not in the first alternative"),
+                at,
+                "bound in this alternative only",
+            )
+            .with_note("whichever alternative matches gives the arm its names, so each binds the same ones");
+            let diagnostic = match rename {
+                Some((field, wanted)) => diagnostic.with_help(format!(
+                    "to bind one name from each, rename: `{}: {}`",
+                    self.text(field),
+                    self.text(wanted)
+                )),
+                None => diagnostic,
+            };
+            self.report(diagnostic);
+        }
+        let mut missing: Vec<(Symbol, Span)> = first
+            .iter()
+            .filter(|(name, _)| !bound.contains_key(name))
+            .map(|(&name, &(_, _, at))| (name, at))
+            .collect();
+        missing.sort_by_key(|&(_, at)| at.lo);
+        for (name, at) in missing {
+            let text = self.text(name).to_string();
+            let diagnostic = Diagnostic::error(
+                codes::INVALID_PATTERN,
+                format!("this alternative does not bind `{text}`"),
+                span,
+                format!("binds no `{text}`"),
+            )
+            .with_secondary(at, "bound in the first alternative")
+            .with_note("whichever alternative matches gives the arm its names, so each binds the same ones");
+            self.report(diagnostic);
+        }
+    }
+
+    /// Whether a pattern tests the value it meets, rather than naming it or
+    /// passing over it: a constant's name tests, as its value does.
+    fn tests_a_value(&self, pattern: &ast::Pattern) -> bool {
+        match &pattern.kind {
+            ast::PatternKind::Wildcard | ast::PatternKind::Error => false,
+            ast::PatternKind::Binding(sym) => self
+                .pattern_const(ast::Name {
+                    sym: *sym,
+                    span: pattern.span,
+                })
+                .is_some(),
+            _ => true,
         }
     }
 
@@ -1609,6 +1776,9 @@ impl<'a> Lowerer<'a> {
             slice,
             binds.alias.unwrap_or(crate::RefKind::Shared),
         ));
+        if let Some(local) = self.bound_before(name.sym, ty, name.span) {
+            return crate::SliceRest::Bind(local);
+        }
         // A `var` pattern's rest is a variable of its own, which holds a
         // reference.
         let kind = if binds.variables {
@@ -1617,6 +1787,7 @@ impl<'a> Lowerer<'a> {
             LocalKind::Binding
         };
         let local = self.declare(name.sym, ty, kind, name.span);
+        self.note_bound(name.sym, local, ty, name.span);
         if binds.alias.is_some() {
             self.state.body.alias_bindings.insert(local);
             if let Some(source) = binds.source {

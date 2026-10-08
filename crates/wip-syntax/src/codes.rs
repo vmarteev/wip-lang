@@ -103,7 +103,10 @@ codes! {
     FLOAT_PATTERN = "E0131": "A float literal as a pattern.";
     ASSERT_ARGUMENTS = "E0132": "An `assert` given something other than a condition and a note.";
     BRACE_LITERAL = "E0133": "A struct built with braces, which is written `Row(…)`.";
-    INTERPOLATION_OPTION = "E0134": "A piece of an interpolation with an option other than `width`, `fill` and `align`, one given twice, or no width.";
+    INTERPOLATION_OPTION = "E0134": "A piece of an interpolation with an option it does not take, one given twice, a fill with no width, or a precision or radix its value cannot be written to.";
+    /// A `view` or `extern` struct, or a union, written without braces, or a
+    /// struct whose `{` is on the line after its name.
+    STRUCT_BODY = "E0135": "A struct written without the braces it needs, or with its body on the next line.";
 
     // Names, modules and packages: the checker's.
     DUPLICATE_DEFINITION = "E0201": "A name defined, or imported, twice.";
@@ -193,6 +196,18 @@ codes! {
     /// Directly or through another: it would be endlessly large.
     GENERATOR_HOLDS_ITSELF = "E0359": "A generator that holds itself.";
     SLICE_PATTERN_REST = "E0360": "A slice pattern with more than one `..`.";
+    /// `draw(height, width)` for `draw(width: i64, height: i64)`.
+    ARGUMENTS_SWAPPED = "E0361": "A warning: arguments that are the parameters' own names, in each other's places.";
+    /// Outside the interface's module, with no condition, or with a method
+    /// the interface or another of its extensions has.
+    EXTENSION = "E0362": "An `extend` of an interface that may not be written.";
+    /// Each an interface's default or extension: which one is meant is in
+    /// question.
+    AMBIGUOUS_METHOD = "E0363": "A method of one name that two interfaces give a type.";
+    /// Not a parameter, one that borrows nothing, or a field the view owns.
+    LENDS_FROM = "E0364": "A `from` naming what a result cannot borrow from.";
+    /// Outside an interface, before an undecided one, or with a default.
+    DECIDED_TYPE = "E0365": "A type an implementation decides, declared where it cannot be, or read where which one is in question.";
 
     // Moves, references and borrows: the checker's and the analysis's.
     USE_OF_MOVED_VALUE = "E0401": "A value used after it was moved.";
@@ -251,6 +266,8 @@ codes! {
     /// outside the package, or text that is not UTF-8.
     EMBED = "E0446": "A file embedded where it cannot be, or one that cannot be read as asked.";
     VAR_CONTENTS_KEPT = "E0447": "What a `&var` parameter reaches, kept in another parameter past the call.";
+    /// `names.push(line.toStr())`, where `line` could be given itself.
+    STRING_COPIED = "E0448": "A warning: a `String` copied where nothing reads it again, so it could be moved.";
 
     // `defer`: the checker's.
     RETURN_IN_DEFER = "E0501": "`return` inside a deferred expression.";

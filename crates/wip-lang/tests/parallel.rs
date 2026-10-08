@@ -3,6 +3,7 @@
 //! numbered, and the same diagnostics in the same order.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use wip_hir::ModuleAst;
 use wip_lang::LoadedModule;
@@ -48,20 +49,48 @@ fn case_entries() -> Vec<PathBuf> {
     mains
 }
 
+/// The thread counts a case that checks differently on, against one.
+fn differs(main: &Path) -> Vec<usize> {
+    let loaded = wip_lang::load(main).expect("a loadable program");
+    let modules: Vec<ModuleAst<'_>> = loaded.modules.iter().map(LoadedModule::syntax).collect();
+    let one = checked(&modules, &loaded.interner, 1);
+    [2, 3, 8]
+        .into_iter()
+        .filter(|&threads| one != checked(&modules, &loaded.interner, threads))
+        .collect()
+}
+
 #[test]
 fn cases_check_the_same_on_any_number_of_threads() {
     let mains = case_entries();
     assert!(mains.len() > 100, "found only {} cases", mains.len());
-    for main in mains {
-        let loaded = wip_lang::load(&main).expect("a loadable program");
-        let modules: Vec<ModuleAst<'_>> = loaded.modules.iter().map(LoadedModule::syntax).collect();
-        let one = checked(&modules, &loaded.interner, 1);
-        for threads in [2, 3, 8] {
-            assert!(
-                one == checked(&modules, &loaded.interner, threads),
-                "`{}` checks differently on {threads} threads",
-                main.display()
-            );
-        }
-    }
+    // The cases are independent, so they are checked side by side, each
+    // taken by whichever thread is free; each is still checked on one
+    // thread and on several, and compared.
+    let next = AtomicUsize::new(0);
+    let workers = std::thread::available_parallelism().map_or(4, |n| n.get());
+    let mut different: Vec<String> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..workers)
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut found = Vec::new();
+                    while let Some(main) = mains.get(next.fetch_add(1, Ordering::Relaxed)) {
+                        for threads in differs(main) {
+                            found.push(format!(
+                                "`{}` checks differently on {threads} threads",
+                                main.display()
+                            ));
+                        }
+                    }
+                    found
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|handle| handle.join().unwrap())
+            .collect()
+    });
+    different.sort();
+    assert!(different.is_empty(), "{}", different.join("\n"));
 }

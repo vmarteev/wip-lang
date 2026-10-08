@@ -143,6 +143,14 @@ impl Signature<'_> {
                     refers.values.insert(ty);
                 }
             },
+            // What an implementation decides may be a reference, as a
+            // parameter may.
+            TyKind::Assoc(..) => match env {
+                Some(_) => refers.any = true,
+                None => {
+                    refers.values.insert(ty);
+                }
+            },
             _ => {}
         }
     }
@@ -382,7 +390,7 @@ impl Signature<'_> {
     /// The type parameters `ty` holds values of directly, as itself.
     fn values_in(&self, ty: Ty, values: &mut FxHashSet<Ty>) {
         match self.program.types.kind(ty) {
-            TyKind::Param(_) => {
+            TyKind::Param(_) | TyKind::Assoc(..) => {
                 values.insert(ty);
             }
             TyKind::Ref(inner, _) => self.values_in(inner, values),
@@ -394,5 +402,16 @@ impl Signature<'_> {
 /// What each parameter of `def` lends to its result.
 pub(super) fn signature_lends(program: &Program, def: &FnDef) -> Vec<Lends> {
     let params: Vec<Ty> = def.params.iter().map(|p| p.ty).collect();
-    lends_to(program, &def.generics, &params, def.ret)
+    let mut lends = lends_to(program, &def.generics, &params, def.ret);
+    // `from` narrows it to what it names: a parameter named alone lends
+    // its place and what it borrows, one whose field is named what it
+    // borrows alone, and the others nothing.
+    if let Some(named) = &def.lends_from {
+        for (i, lend) in lends.iter_mut().enumerate() {
+            let whole = named.contains(&wip_hir::LendFrom::Param(i as u32));
+            lend.place &= whole;
+            lend.borrows &= whole || named.contains(&wip_hir::LendFrom::Borrowed(i as u32));
+        }
+    }
+    lends
 }

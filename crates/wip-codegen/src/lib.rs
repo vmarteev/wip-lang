@@ -266,6 +266,14 @@ fn program_wide(program: &Program) -> rustc_hash::FxHashSet<FnId> {
                 .flat_map(|table| table.methods.iter().copied()),
         )
         .collect();
+    // What the prelude declares for the compiler to call is called from
+    // whatever module the compiler meets the need in: `String::over`,
+    // where text is lent as a `String`, is the prelude's own and not `pub`.
+    program_wide.extend(
+        wip_hir::KnownFn::ALL
+            .iter()
+            .filter_map(|&known| program.prelude_items.function(known)),
+    );
     // A test is called by the runner `wip test` writes, which belongs
     // to no module: it is the program's, wherever it was declared.
     program_wide.extend(

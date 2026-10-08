@@ -203,6 +203,9 @@ pub struct ImportItem {
 /// A type parameter, `T` or `T: copy`, of a generic item.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GenericParam {
+    /// `type` before it, in an interface's header: a type each
+    /// implementation decides, where the word was written.
+    pub decided: Option<Span>,
     pub name: Name,
     /// The constraints after `:`, separated by `+`: `copy`, and the
     /// interfaces the type must implement.
@@ -315,6 +318,21 @@ pub struct FnSig {
     pub variadic: Option<Span>,
     /// `None` means the function returns nothing.
     pub ret: Option<TypeId>,
+    /// `from a, self.ast` after the result type: what the result borrows,
+    /// each a parameter or a path of fields from one. Empty where nothing is
+    /// written.
+    pub lends_from: Vec<LendPath>,
+    pub span: Span,
+}
+
+/// One name after `from`: a parameter, `self`, or a field reached from one,
+/// `self.ast`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LendPath {
+    /// The parameter, or `None` for `self`.
+    pub root: Option<Name>,
+    /// The fields reached from it, in order.
+    pub fields: Vec<Name>,
     pub span: Span,
 }
 

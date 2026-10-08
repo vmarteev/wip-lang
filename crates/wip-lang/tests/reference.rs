@@ -121,6 +121,11 @@ fn unformatted(example: &Example) -> Option<String> {
         // The blank line before the next `// file:` is the page's, not the
         // file's.
         let text = &format!("{}\n", written.trim_end_matches('\n'));
+        // One that asks to be left as written is left, as `wip fmt` leaves
+        // it.
+        if wip_fmt::switched_off(text) {
+            continue;
+        }
         let formatted = if name.ends_with("package.wip") {
             wip_fmt::format(text, style(80), true)
         } else if index == 0 && !text.lines().any(starts_item) {

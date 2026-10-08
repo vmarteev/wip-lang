@@ -100,13 +100,7 @@ extend char {{
 extend str {{
 	/// How many columns it takes on a terminal: its characters' widths
 	/// together.
-	pub fn width(): i64 = {{
-		var total = 0
-		for c in self.chars() {{
-			total += c.width()
-		}}
-		return total
-	}}
+	pub fn width(): i64 = self.chars().map(own (c) => c.width()).sum()
 }}
 
 /// The characters from U+0300 whose width is not 1: the first and the last

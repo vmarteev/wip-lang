@@ -781,7 +781,7 @@ impl Builder<'_> {
                         return None;
                     }
                 }
-                hir::Pattern::Any(alternatives) => {
+                hir::Pattern::Any { alternatives, .. } => {
                     for alternative in alternatives {
                         let hir::Pattern::Int(bits) = alternative else {
                             return None;
@@ -939,8 +939,27 @@ impl Builder<'_> {
                     otherwise: next,
                 });
             }
-            // Text is compared by its bytes, wherever they are.
+            // Text is compared by its bytes, wherever they are: a `String`
+            // by the text it lends, `toStr()`.
             hir::Pattern::Str(text) => {
+                let held = if self.program.is_string(scrutinee_ty) {
+                    let to_str = self
+                        .program
+                        .prelude_items
+                        .function(hir::KnownFn::StringToStr)
+                        .expect("the prelude declares `String.toStr`");
+                    let receiver_ty = self.program.fns[to_str].params[0].ty;
+                    let receiver = self.value(receiver_ty, Rvalue::AddressOf(place.clone()));
+                    let lent = Place::local(self.temp(Types::STR));
+                    self.push(Statement::Call {
+                        callee: Callee::Fn(to_str),
+                        args: vec![receiver],
+                        dest: Some(lent.clone()),
+                    });
+                    lent
+                } else {
+                    place.clone()
+                };
                 let literal = Place::local(self.temp(Types::STR));
                 let len = self.interner.resolve(*text).len() as u128;
                 self.assign(
@@ -955,8 +974,8 @@ impl Builder<'_> {
                 self.push(Statement::Call {
                     callee: Callee::StrCmp,
                     args: vec![
-                        Operand::Copy(place.clone().project(Projection::Field(0))),
-                        Operand::Copy(place.clone().project(Projection::Field(1))),
+                        Operand::Copy(held.clone().project(Projection::Field(0))),
+                        Operand::Copy(held.project(Projection::Field(1))),
                         Operand::Copy(literal.clone().project(Projection::Field(0))),
                         Operand::Copy(literal.project(Projection::Field(1))),
                     ],
@@ -973,15 +992,33 @@ impl Builder<'_> {
                 });
             }
             // Any one of several: each is tried, and the last one that
-            // fails goes on to the next arm.
-            hir::Pattern::Any(alternatives) => {
+            // fails goes on to the next arm. Where they bind, which one
+            // matched is kept, for the arm to bind from once all of its
+            // pattern has matched.
+            hir::Pattern::Any {
+                alternatives,
+                binding,
+            } => {
+                let which = binding.map(|id| self.alternative_matched(id));
                 for (i, alternative) in alternatives.iter().enumerate() {
                     let otherwise = if i + 1 == alternatives.len() {
                         next
                     } else {
                         self.new_block()
                     };
-                    self.test_pattern(alternative, place, scrutinee_ty, matched, otherwise);
+                    let pass = match which {
+                        Some(_) => self.new_block(),
+                        None => matched,
+                    };
+                    self.test_pattern(alternative, place, scrutinee_ty, pass, otherwise);
+                    if let Some(which) = which {
+                        self.switch_to(pass);
+                        self.assign(
+                            Place::local(which),
+                            Rvalue::Use(Self::int(i as u128, Types::I32)),
+                        );
+                        self.terminate(Terminator::Goto(matched));
+                    }
                     if i + 1 < alternatives.len() {
                         self.switch_to(otherwise);
                     }
@@ -1035,9 +1072,27 @@ impl Builder<'_> {
                     self.terminate(Terminator::Goto(matched));
                 }
             }
+            // What the reference refers to is tested.
+            hir::Pattern::Deref(inner) => {
+                let (referent, ty) = self.referent(place, scrutinee_ty);
+                self.test_pattern(inner, &referent, ty, matched, next);
+            }
             // Reported already; nothing reaches the arm.
             hir::Pattern::Error => self.terminate(Terminator::Goto(next)),
         }
+    }
+
+    /// The place a reference at `place` refers to, and its type: through
+    /// the pointer, or the reference itself where it is a slice's, whose
+    /// pointer and length are the slice's place.
+    fn referent(&self, place: &Place, ty: Ty) -> (Place, Ty) {
+        let TyKind::Ref(pointee, _) = self.kind(ty) else {
+            unreachable!("a pattern tests through a value that is not a reference")
+        };
+        if crate::is_slice_pointer(self.program, ty) {
+            return (place.clone(), pointee);
+        }
+        (place.clone().project(Projection::Deref), pointee)
     }
 
     /// The place of an array's or a slice's elements, and how many there
@@ -1245,12 +1300,66 @@ impl Builder<'_> {
             | hir::Pattern::Range { .. }
             | hir::Pattern::Bool(_)
             | hir::Pattern::Str(_) => {}
-            hir::Pattern::Any(alternatives) => {
-                for alternative in alternatives {
-                    self.bind(alternative, place, scrutinee_ty);
-                }
+            // From whichever alternative matched.
+            hir::Pattern::Any {
+                alternatives,
+                binding: Some(id),
+            } => {
+                let which = self.alternative_matched(*id);
+                self.each_alternative(alternatives, which, |this, alternative| {
+                    this.bind(alternative, place, scrutinee_ty);
+                });
+            }
+            hir::Pattern::Any { binding: None, .. } => {}
+            // Aliases of what the reference refers to.
+            hir::Pattern::Deref(inner) => {
+                let (referent, ty) = self.referent(place, scrutinee_ty);
+                self.bind(inner, &referent, ty);
             }
         }
+    }
+
+    /// The local that says which alternative of the `|` numbered `id`
+    /// matched.
+    fn alternative_matched(&mut self, id: u32) -> Local {
+        if let Some(&which) = self.alternatives_matched.get(&id) {
+            return which;
+        }
+        let which = self.temp(Types::I32);
+        self.alternatives_matched.insert(id, which);
+        which
+    }
+
+    /// Does `each` for the alternative `which` says matched, on its own
+    /// path, the paths joining after.
+    fn each_alternative<'p>(
+        &mut self,
+        alternatives: &'p [hir::Pattern],
+        which: Local,
+        mut each: impl FnMut(&mut Self, &'p hir::Pattern),
+    ) {
+        let join = self.new_block();
+        let blocks: Vec<BlockId> = alternatives.iter().map(|_| self.new_block()).collect();
+        let Some((&last, rest)) = blocks.split_last() else {
+            self.terminate(Terminator::Goto(join));
+            self.switch_to(join);
+            return;
+        };
+        self.terminate(Terminator::Switch {
+            value: Operand::Copy(Place::local(which)),
+            cases: rest
+                .iter()
+                .enumerate()
+                .map(|(i, &block)| (i as u32, block))
+                .collect(),
+            otherwise: last,
+        });
+        for (alternative, &block) in alternatives.iter().zip(&blocks) {
+            self.switch_to(block);
+            each(self, alternative);
+            self.terminate(Terminator::Goto(join));
+        }
+        self.switch_to(join);
     }
 
     /// What a binder does with the field it took: bind it, or take it apart
@@ -1277,6 +1386,18 @@ impl Builder<'_> {
     }
 
     fn drop_untaken_parts(&mut self, pattern: &hir::Pattern, place: &Place, ty: Ty) {
+        // What the alternative that matched left.
+        if let hir::Pattern::Any {
+            alternatives,
+            binding: Some(id),
+        } = pattern
+        {
+            let which = self.alternative_matched(*id);
+            self.each_alternative(alternatives, which, |this, alternative| {
+                this.drop_untaken_parts(alternative, place, ty);
+            });
+            return;
+        }
         let program = self.program;
         let parts: Vec<(Place, Ty, &hir::Binder)> = match pattern {
             hir::Pattern::Variant { variant, binders } => binders
@@ -1353,6 +1474,14 @@ impl Builder<'_> {
                 .chain(suffix)
                 .map(|binder| (program.element_ty(ty), binder))
                 .collect(),
+            hir::Pattern::Any {
+                alternatives,
+                binding: Some(_),
+            } => {
+                return alternatives
+                    .iter()
+                    .any(|alternative| self.takes(alternative, ty));
+            }
             _ => return false,
         };
         fields.into_iter().any(|(field_ty, binder)| match binder {
@@ -1435,6 +1564,7 @@ fn tests(pattern: &hir::Pattern) -> bool {
             hir::Binder::Nested(nested) => tests(nested),
             _ => false,
         }),
+        hir::Pattern::Deref(inner) => tests(inner),
         _ => true,
     }
 }

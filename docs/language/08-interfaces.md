@@ -122,9 +122,9 @@ fn main() = {
 }
 ```
 
-An interface may take types of its own — `Items<T>`, `Iterator<T>`,
-`Sequence<T>`, `From<E>` — and a constraint names them: `C: Items<i64>`
-above. Several are joined with `+`: `<K: Hash + Eq>`.
+An interface may take types of its own — `From<T>`, `Items<Item>`,
+`Iterator<Item>` — and a constraint names them: `C: Items<i64>` above.
+Several are joined with `+`: `<K: Hash + Eq>`.
 
 The last of an interface's types may have defaults, which may name `Self`,
 the type that implements it, and the types before them: the operators'
@@ -132,8 +132,106 @@ interfaces are declared `interface Add<Rhs = Self, Out = Self>`, so
 `extend Money: Add` is `Add<Money, Money>`, and so is the constraint
 `T: Add`, while `extend Vec2: Multiply<f32>` scales a vector.
 
+Every built-in number implements the operators' interfaces, each answered
+by the operator itself and checked as it is, and `Zero` and `One`, what
+adding and multiplying start from. `a + b` between two numbers is still
+the machine's instruction; the implementations are what a type parameter
+reaches, so code generic over numbers is written once:
+
+```wip,run
+fn total<T: Add + Zero + copy>(items: &[T]): T = {
+    var sum = T::zero()
+    for x in items {
+        sum = sum + x
+    }
+    return sum
+}
+
+fn main() = {
+    val counts = [1, 2, 3]
+    val weights = [0.5, 0.25]
+    assert(total(&counts) == 6 && total(&weights) == 0.75)
+}
+```
+
 `copy` is a constraint too, and holds for a type that is plain data:
 `fn pair<T: copy>(value: T): (T, T) = (value, value)`.
+
+## Types an implementation decides
+
+Some of an interface's types are not for whoever names it to choose: a
+container has one kind of element, and its implementation says which. The
+interface marks such a type `type`, and each implementation decides it
+where it names the interface, as it names any other type:
+
+```wip,run
+interface Shelf<type Book> {
+    fn first(): Book
+}
+
+struct Range {
+    from: i64
+    to: i64
+}
+
+extend Range: Shelf<i64> {
+    fn first(): i64 = self.from
+}
+
+// Any shelf: what it holds is read as `S::Book`.
+fn firstOf<S: Shelf>(shelf: &S): S::Book = shelf.first()
+
+// A shelf of numbers, pinned, so that it can be added to.
+fn firstPlusOne<S: Shelf<i64>>(shelf: &S): i64 = shelf.first() + 1
+
+fn main() = {
+    val range = Range(from: 3, to: 9)
+    assert(firstOf(&range) == 3)
+    assert(firstPlusOne(&range) == 4)
+    val book: Range::Book = 7
+    assert(book == 7)
+}
+```
+
+- **A constraint may leave it out.** `S: Shelf` asks for a shelf of
+  anything; `S: Shelf<i64>` pins what it holds, positionally. So decided
+  types come after the ones a constraint names, and have no default
+  (E0365).
+- **It is read as `S::Book`,** wherever a type is written, by the name the
+  interface gives it; a concrete type's is what its implementation says:
+  `Range::Book` is `i64`, and `Chars::Item` is `char`. Where two interfaces
+  a parameter is constrained by each decide a `Book`, which one `S::Book`
+  means is in question, and it is refused (E0365).
+- **A type implements the interface once.** It is the same implementation
+  whatever it decides, so a second, deciding another type, is refused where
+  it is declared (E0340): which one applies is never in question.
+- **What is asked of it is said of a parameter.** A constraint is written
+  on a parameter, never on `S::Book`, so code that needs the element to be
+  something names it, `fn largest<I: Iterator<T>, T: Ord>(values: I)`,
+  where code that only passes it on reads `I::Item`.
+
+```wip,error=E0340
+interface Shelf<type Book> {
+    fn count(): i64
+}
+
+struct Library
+
+extend Library: Shelf<String> {
+    fn count(): i64 = 0
+}
+
+extend Library: Shelf<i64> {
+    fn count(): i64 = 1
+}
+
+fn main() = {}
+```
+
+The prelude's `Iterator`, `Items`, `Sequence`, `IntoIterator` and
+`Index` decide their element, so what an adapter holds names only the
+iterator it was made from: `it.map(f)` is a `Mapped<I, U>`, with `f`
+taking an `I::Item`.
 
 ## `@derive`
 
@@ -241,6 +339,70 @@ fn main() = {
 }
 ```
 
+## Methods for every implementer, where its types allow
+
+An interface that takes types may be extended under a condition on them:
+the block's methods are every implementer's whose types meet it, and no
+other's. The prelude gives an iterator `sum` where its element adds up and
+`max` where it is ordered this way:
+
+```wip,run
+interface Source<T> {
+    var fn take(): Option<T>
+}
+
+extend Source<T: Add + Zero> {
+    var fn total(): T = {
+        var sum = T::zero()
+        while self.take() is .Some(x) {
+            sum = sum + x
+        }
+        return move sum
+    }
+}
+
+struct Countdown {
+    left: i64
+}
+
+extend Countdown: Source<i64> {
+    var fn take(): Option<i64> = {
+        if self.left == 0 then return .None
+        self.left -= 1
+        return .Some(self.left + 1)
+    }
+}
+
+fn through<S: Source<i64>>(source: &var S): i64 = source.total()
+
+fn main() = {
+    var countdown = Countdown(3)
+    assert(countdown.total() == 6)
+    var more = Countdown(4)
+    assert(through(&var more) == 10)
+}
+```
+
+The body is a default's, with the condition in scope: `self` is whatever
+implements the interface, and `T::zero()` and `+` are what `T: Add + Zero`
+promises. A call on a type whose types do not meet the condition says
+which lacks what, and so does one through a constraint that does not
+promise it.
+
+- **It adds methods, and implements nothing.** No type comes to implement
+  an interface by it, so a constraint asks what it always asked.
+- **It is written in the interface's module,** as an implementation is
+  written with its type or its interface: a method comes with its type or
+  its interface, and is never imported on its own.
+- **It has a condition.** A method every implementer has is a default, and
+  is written in the interface.
+- **Its names are its own.** A method the interface or another of its
+  extensions has is refused, whatever the conditions, and an
+  implementation does not write one: it is the same for every implementer.
+- **A type's own method of the name is its own,** as it is over a default.
+  A name that two interfaces give a type, each a default or an extension,
+  is not chosen between: the call is refused, and says which (E0363).
+
 ## What a reference implements
 
 A `&T` answers what `T` answers about itself: an interface whose methods
@@ -316,11 +478,12 @@ other way to write the same thing, and compiles to a direct call per type;
 | `Text` | `\(value)`, printing, and `toString()`: a type writes `toString` or `appendTo` |
 | `Clone` | `clone()`, a copy that owns what it holds |
 | `Destroy` | what to do when a value ends ([page 6](06-ownership.md)) |
-| `Items<T>` | a container walked as a slice: `for x in container` |
-| `Iterator<T>` | values one at a time, with the adapters ([page 10](10-library.md)) |
-| `IntoIterator<I>` | a container that gives its elements up, as the iterator `I`: `for x in move container` ([page 4](04-expressions.md)) |
-| `Sequence<T>` | `len()` and `at(i)`, both constant time: `x[i]` and `for` |
-| `Index<K, V>` | a lookup whose key is not a position |
+| `Items<type Item>` | a container walked as a slice: `for x in container` |
+| `Iterator<type Item>` | values one at a time, with the adapters ([page 10](10-library.md)) |
+| `IntoIterator<type Iter>` | a container that gives its elements up, as the iterator `Iter`: `for x in move container` ([page 4](04-expressions.md)) |
+| `Sequence<type Item>` | `len()` and `at(i)`, both constant time: `x[i]` and `for` |
+| `Index<K, type V>` | a lookup whose key is not a position |
 | `From<T>` | a value made from another, which `?` uses ([page 9](09-errors.md)) |
-| `Add`, `Subtract`, `Multiply`, `Divide`, `Remainder` | `+`, `-`, `*`, `/` and `%`, for a type of a program's own, with what is on the other side and what the answer is |
-| `Negate`, `Not` | `-x` and `!x`, for a type of a program's own |
+| `Add`, `Subtract`, `Multiply`, `Divide`, `Remainder` | `+`, `-`, `*`, `/` and `%`, with what is on the other side and what the answer is: every number has them, and a type of a program's own may |
+| `Negate`, `Not` | `-x` and `!x`: every signed number and float negates |
+| `Zero`, `One` | what adding and multiplying start from: every number has them, and `sum` and `product` ask for them |

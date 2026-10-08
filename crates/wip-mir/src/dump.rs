@@ -130,6 +130,9 @@ fn statement_text(program: &Program, interner: &Interner, statement: &Statement)
                     format!("rotate{turn:?}({}, {})", operand(value), operand(amount))
                         .to_lowercase()
                 }
+                Rvalue::Overflows(op, l, r) => {
+                    format!("overflows({} {op:?} {})", operand(l), operand(r)).to_lowercase()
+                }
                 Rvalue::Bits(o) => format!("bits({})", operand(o)),
                 Rvalue::VTableFn { table, index, .. } => {
                     format!("method {index} of {}", operand(table))

@@ -131,7 +131,9 @@ impl Rewrite {
             | Rvalue::Integer(_, operand)
             | Rvalue::Bits(operand)
             | Rvalue::VTableFn { table: operand, .. } => self.operand(operand, copies),
-            Rvalue::Binary(_, lhs, rhs) | Rvalue::Rotate(_, lhs, rhs) => {
+            Rvalue::Binary(_, lhs, rhs)
+            | Rvalue::Rotate(_, lhs, rhs)
+            | Rvalue::Overflows(_, lhs, rhs) => {
                 self.operand(lhs, copies);
                 self.operand(rhs, copies);
             }

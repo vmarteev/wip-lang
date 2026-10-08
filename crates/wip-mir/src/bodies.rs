@@ -7,7 +7,7 @@ use wip_hir::{FnId, Generated, Program, TyList, TypeDef};
 use wip_syntax::Interner;
 
 use crate::build::{lower_all_variants_fn, lower_count_fn, lower_fn, lower_from_index_fn};
-use crate::{Body, inline, simplify, validate};
+use crate::{Body, convert_c_bools, inline, simplify, validate};
 
 /// The body of function `id`: the program's, or the one the compiler writes
 /// for it; `None` for a function with neither, as C's are.
@@ -17,6 +17,7 @@ pub fn function_body(program: &Program, interner: &Interner, id: FnId) -> Option
         Some(hir) => {
             let mut body = lower_fn(program, interner, def, hir);
             inline(program, interner, &mut body);
+            convert_c_bools(program, id, &mut body);
             body
         }
         None => generated_body(program, interner, id)?,

@@ -57,6 +57,8 @@ impl Shape {
     pub(super) fn of(program: &Program, pattern: &Pattern, ty: Ty) -> Shape {
         match pattern {
             Pattern::Wildcard | Pattern::Binding(_) | Pattern::Error => Shape::Wild,
+            // A reference is seen through: its column is its referent's.
+            Pattern::Deref(inner) => Shape::of(program, inner, referent(program, ty)),
             Pattern::Bool(value) => Shape::Ctor(Ctor::Bool(*value), Vec::new()),
             Pattern::Int(bits) => {
                 let ctor = match program.types.order_key(ty, *bits) {
@@ -86,14 +88,14 @@ impl Shape {
                 suffix,
             } => {
                 let named: Vec<Binder> = prefix.iter().chain(suffix).cloned().collect();
-                let tys = vec![program.element_ty(ty); named.len()];
+                let tys = vec![referent(program, program.element_ty(ty)); named.len()];
                 let ctor = match rest {
                     Some(_) => Ctor::AtLeast(prefix.len() as u64, suffix.len() as u64),
                     None => Ctor::Length(named.len() as u64),
                 };
                 Shape::Ctor(ctor, binder_shapes(program, &named, &tys))
             }
-            Pattern::Any(alternatives) => Shape::Any(
+            Pattern::Any { alternatives, .. } => Shape::Any(
                 alternatives
                     .iter()
                     .map(|p| Shape::of(program, p, ty))
@@ -117,6 +119,15 @@ impl Shape {
             }
         }
     }
+}
+
+/// What a column of `ty` is matched as: a reference is seen through, at
+/// any depth, since a pattern tests what it refers to.
+fn referent(program: &Program, mut ty: Ty) -> Ty {
+    while let TyKind::Ref(inner, _) = program.types.kind(ty) {
+        ty = inner;
+    }
+    ty
 }
 
 fn binder_shapes(program: &Program, binders: &[Binder], tys: &[Ty]) -> Vec<Shape> {
@@ -143,10 +154,11 @@ fn field_tys(program: &Program, ty: Ty) -> Vec<Ty> {
         .fields
         .iter()
         .map(|field| {
-            program
+            let ty = program
                 .types
                 .try_subst_find(field.ty, args)
-                .unwrap_or(crate::ty::Types::ERROR)
+                .unwrap_or(crate::ty::Types::ERROR);
+            referent(program, ty)
         })
         .collect()
 }
@@ -199,17 +211,19 @@ fn variant_field_tys(program: &Program, ty: Ty, variant: u32) -> Vec<Ty> {
         .fields
         .iter()
         .map(|field| {
-            program
+            let ty = program
                 .types
                 .try_subst_find(field.ty, args)
-                .unwrap_or(crate::ty::Types::ERROR)
+                .unwrap_or(crate::ty::Types::ERROR);
+            referent(program, ty)
         })
         .collect()
 }
 
 /// The constructors a type has, where they can be listed: an enum's
-/// variants, and `true` and `false`. A struct has the one. Numbers and text
-/// have too many, and a column of them is complete only with a `_`.
+/// variants, and `true` and `false`. A struct has the one. Numbers and text,
+/// a `str` or a `String`, have too many, and a column of them is complete
+/// only with a `_`.
 fn every_ctor(program: &Program, ty: Ty) -> Option<Vec<Ctor>> {
     match program.types.kind(ty) {
         TyKind::Enum(id, _) => Some(
@@ -218,6 +232,9 @@ fn every_ctor(program: &Program, ty: Ty) -> Option<Vec<Ctor>> {
                 .collect(),
         ),
         TyKind::Bool => Some(vec![Ctor::Bool(false), Ctor::Bool(true)]),
+        // A `String` is matched by the text it holds, of which there are as
+        // many as of a `str`'s.
+        TyKind::Struct(..) if program.is_string(ty) => None,
         TyKind::Struct(..) => Some(vec![Ctor::Only]),
         TyKind::Array(_, len) => Some(vec![Ctor::Length(len)]),
         _ => None,
@@ -229,8 +246,8 @@ fn ctor_tys(program: &Program, ty: Ty, ctor: Ctor) -> Vec<Ty> {
     match ctor {
         Ctor::Variant(variant) => variant_field_tys(program, ty, variant),
         Ctor::Only => field_tys(program, ty),
-        Ctor::Length(n) => vec![program.element_ty(ty); n as usize],
-        Ctor::AtLeast(p, s) => vec![program.element_ty(ty); (p + s) as usize],
+        Ctor::Length(n) => vec![referent(program, program.element_ty(ty)); n as usize],
+        Ctor::AtLeast(p, s) => vec![referent(program, program.element_ty(ty)); (p + s) as usize],
         _ => Vec::new(),
     }
 }
@@ -440,7 +457,7 @@ pub(super) fn useful(
     let Some((head, rest)) = row.split_first() else {
         return matrix.is_empty().then(|| Witness(Vec::new()));
     };
-    let ty = tys[0];
+    let ty = referent(program, tys[0]);
     // `a | b` is useful where either is.
     if let Shape::Any(alternatives) = head {
         for alternative in alternatives {

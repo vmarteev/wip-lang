@@ -114,6 +114,12 @@ pub enum KnownFn {
     /// `String::toStr`, called where a `String` is passed to what takes a
     /// `str`.
     StringToStr,
+    /// `String::over`, a `String` over a `str`'s own bytes, made where a
+    /// `str` is passed to what takes a `&String`.
+    StringOver,
+    /// `String::of`, a copy of text, made where a `str` is given where a
+    /// `String` is expected.
+    StringOf,
     /// What a `main` that returns a `Result` with an `i64` goes through.
     ExitCode,
     /// What a `main` that returns a `Result` with nothing goes through.
@@ -122,13 +128,20 @@ pub enum KnownFn {
 
 impl KnownFn {
     /// Every one, in the order declared.
-    pub const ALL: &'static [KnownFn] =
-        &[KnownFn::StringToStr, KnownFn::ExitCode, KnownFn::ExitVoid];
+    pub const ALL: &'static [KnownFn] = &[
+        KnownFn::StringToStr,
+        KnownFn::StringOver,
+        KnownFn::StringOf,
+        KnownFn::ExitCode,
+        KnownFn::ExitVoid,
+    ];
 
     /// What the prelude calls it.
     pub fn name(self) -> &'static str {
         match self {
             KnownFn::StringToStr => "toStr",
+            KnownFn::StringOver => "over",
+            KnownFn::StringOf => "of",
             KnownFn::ExitCode => "exitCode",
             KnownFn::ExitVoid => "exitVoid",
         }
@@ -137,7 +150,9 @@ impl KnownFn {
     /// The struct it is a method of, or nothing for a free function.
     pub fn owner(self) -> Option<KnownStruct> {
         match self {
-            KnownFn::StringToStr => Some(KnownStruct::String),
+            KnownFn::StringToStr | KnownFn::StringOver | KnownFn::StringOf => {
+                Some(KnownStruct::String)
+            }
             KnownFn::ExitCode | KnownFn::ExitVoid => None,
         }
     }

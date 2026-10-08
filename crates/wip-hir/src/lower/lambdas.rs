@@ -117,6 +117,7 @@ impl<'a> Lowerer<'a> {
                 accesses: None,
                 is_variadic: false,
                 variadic_of: None,
+                lends_from: None,
                 is_lambda: true,
                 generator: None,
                 is_tailrec: false,
@@ -640,18 +641,22 @@ impl<'a> Lowerer<'a> {
         }
     }
 
-    /// A named function where a closure lent for a call is expected: a
-    /// closure of its own, whose code takes an environment that holds
-    /// nothing and calls the function with what it is given. A plain
-    /// function converts to a lent closure because it captures nothing.
+    /// A named function where a closure is expected, lent for a call or
+    /// owned: a closure of its own, whose code takes an environment that
+    /// holds nothing and calls the function with what it is given. A plain
+    /// function converts to either because it captures nothing; an owned
+    /// one's environment, on the heap, holds the function that drops it, as
+    /// every owned closure's does.
     ///
     /// Bodies are checked on threads of their own, which cannot add a
     /// function to the program, so this only marks the closure: its code is
     /// the named function itself, until [`Self::make_fn_closures`] writes the
     /// function that takes the environment, once the bodies are in.
     pub(super) fn fn_as_closure(&mut self, value: ExprId, expected: Ty) -> Option<ExprId> {
-        let TyKind::Ref(want, _) = self.kind(expected) else {
-            return None;
+        let (want, owned) = match self.kind(expected) {
+            TyKind::Ref(want, _) => (want, false),
+            TyKind::Own(want) => (want, true),
+            _ => return None,
         };
         if !matches!(self.kind(want), TyKind::Fn(..)) {
             return None;
@@ -668,26 +673,47 @@ impl<'a> Lowerer<'a> {
         if self.ty_of(value) != want {
             return None;
         }
-        let env_id = self.program.fn_closure_env?;
         let span = self.state.body.exprs[value].span;
         let empty = self.program.types.intern_list(&[]);
-        let env_ty = self.intern(TyKind::Struct(env_id, empty));
-        let env = self.alloc(
-            ExprKind::Struct {
-                id: env_id,
-                fields: Vec::new(),
-                order: Vec::new(),
-            },
-            env_ty,
-            span,
-        );
+        let env = if owned {
+            let env_id = self.program.fn_owned_closure_env?;
+            let env_ty = self.intern(TyKind::Struct(env_id, empty));
+            let drop_ty = self.program.structs[env_id].fields[0].ty;
+            let drop = self.alloc(ExprKind::DropRef(env_ty), drop_ty, span);
+            let fields = self.alloc(
+                ExprKind::Struct {
+                    id: env_id,
+                    fields: vec![drop],
+                    order: vec![0],
+                },
+                env_ty,
+                span,
+            );
+            let owned_ty = self.intern(TyKind::Own(env_ty));
+            self.alloc(ExprKind::Own(fields), owned_ty, span)
+        } else {
+            let env_id = self.program.fn_closure_env?;
+            let env_ty = self.intern(TyKind::Struct(env_id, empty));
+            self.alloc(
+                ExprKind::Struct {
+                    id: env_id,
+                    fields: Vec::new(),
+                    order: Vec::new(),
+                },
+                env_ty,
+                span,
+            )
+        };
         Some(self.alloc(ExprKind::Closure { id: target, env }, expected, span))
     }
 
     /// Writes the code of every closure [`Self::fn_as_closure`] marked: the
     /// environment, then the function's parameters, passed on to it.
     pub(super) fn make_fn_closures(&mut self) {
-        let Some(env_id) = self.program.fn_closure_env else {
+        let (Some(lent_env), Some(owned_env)) = (
+            self.program.fn_closure_env,
+            self.program.fn_owned_closure_env,
+        ) else {
             return;
         };
         let mut marked: Vec<(FnId, ExprId, FnId, Ty, Span)> = Vec::new();
@@ -702,12 +728,16 @@ impl<'a> Lowerer<'a> {
             }
         }
         let empty = self.program.types.intern_list(&[]);
-        let env_ty = self.intern(TyKind::Struct(env_id, empty));
-        let env_ref = self.intern(TyKind::Ref(env_ty, crate::RefKind::Var));
         for (owner, at, target, ty, span) in marked {
-            let TyKind::Ref(want, _) = self.kind(ty) else {
-                continue;
+            // A lent closure's code is lent its environment to write, and an
+            // owned one's to read, as a lambda's is.
+            let (want, env_id, env_kind) = match self.kind(ty) {
+                TyKind::Ref(want, _) => (want, lent_env, crate::RefKind::Var),
+                TyKind::Own(want) => (want, owned_env, crate::RefKind::Shared),
+                _ => continue,
             };
+            let env_ty = self.intern(TyKind::Struct(env_id, empty));
+            let env_ref = self.intern(TyKind::Ref(env_ty, env_kind));
             let TyKind::Fn(params, ret) = self.kind(want) else {
                 continue;
             };
@@ -794,6 +824,7 @@ impl<'a> Lowerer<'a> {
                 accesses: None,
                 is_variadic: false,
                 variadic_of: None,
+                lends_from: None,
                 is_lambda: true,
                 generator: None,
                 is_tailrec: false,

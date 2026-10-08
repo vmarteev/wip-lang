@@ -13,6 +13,10 @@ impl Builder<'_> {
     }
 
     pub(super) fn expr(&mut self, id: ExprId) -> Value {
+        // Worked out already, where its place was written.
+        if let Some(value) = self.early.remove(&id) {
+            return value;
+        }
         let hir = self.hir;
         let expr = &hir.exprs[id];
         if self.is_aggregate(expr.ty) {
@@ -156,9 +160,11 @@ impl Builder<'_> {
                 rhs,
                 wrapping,
             } => Value::Scalar(self.binary(*op, *lhs, *rhs, *wrapping, expr.ty)),
-            // The place is found first, then the value; the old value is
-            // dropped just before it is replaced. `op=` reads the old value
-            // before the value is computed.
+            // `place = value`: what the place's expression computes, then
+            // the value, then the place found, where the value has left
+            // things; the old value is dropped just before it is replaced.
+            // `op=` reads the old value before the value is computed, so it
+            // finds its place first.
             ExprKind::Assign {
                 place,
                 op,
@@ -166,33 +172,48 @@ impl Builder<'_> {
                 value,
             } => {
                 let place_ty = self.ty(*place);
-                let dest = self.place(*place);
+                // An assignment in the value has operands of its own, and
+                // uses them before this one's are.
+                let pending = self.early.len();
                 if let Some(op) = op {
                     // Checked as the operator is: an answer that does not
                     // fit, and a division by zero, panic where they happen.
+                    let dest = self.place(*place);
                     let at = self.span(*value);
                     let old = self.value(place_ty, Rvalue::Use(Operand::Copy(dest.clone())));
                     let value = self.scalar(*value);
                     let answer = self.arithmetic(*op, old, value, *wrapping, place_ty, at);
                     self.assign(dest, Rvalue::Use(answer));
                 } else if self.is_aggregate(place_ty) {
+                    self.place_operands(*place);
                     let temp = Place::local(self.temp(place_ty));
                     self.store_expr(*value, temp.clone());
+                    let dest = self.place(*place);
                     self.drop_replaced(*place, &dest, place_ty);
                     self.assign(dest, Rvalue::Use(Operand::Copy(temp)));
                     self.assigned_to(*place);
                 } else {
+                    self.place_operands(*place);
                     let value = self.scalar(*value);
+                    let dest = self.place(*place);
                     self.drop_replaced(*place, &dest, place_ty);
                     self.assign(dest, Rvalue::Use(value));
                     self.assigned_to(*place);
                 }
+                debug_assert_eq!(
+                    self.early.len(),
+                    pending,
+                    "an operand worked out early was not used"
+                );
                 Value::Unit
             }
             ExprKind::Ref(inner) => {
                 let place = self.place(*inner);
                 Value::Scalar(self.value(expr.ty, Rvalue::AddressOf(place)))
             }
+            // Only ever lent, which `place` builds; as a value it is the
+            // same `String`, still never dropped.
+            ExprKind::Undropped(inner) => Value::Place(self.aggregate(*inner)),
             // An owned closure lent for a call is the pair it already is.
             ExprKind::LendClosure(inner) => Value::Place(self.aggregate(*inner)),
             // The address of a drop function, which an owned closure's
@@ -540,8 +561,19 @@ impl Builder<'_> {
         let mut pending = Vec::new();
         let skip = usize::from(first.is_some());
         operands[..skip].fill(first);
+        // A place lent to the call is lent when the call begins: what its
+        // expression computes is worked out where it is written, and the
+        // place is found once every argument is.
+        let mut lent = Vec::new();
         for (n, i) in evaluation_order(order, args.len()).enumerate() {
             if i < skip {
+                continue;
+            }
+            if let ExprKind::Ref(place) = self.hir.exprs[args[i]].kind
+                && self.is_place_kind(place)
+            {
+                self.place_operands(place);
+                lent.push(i);
                 continue;
             }
             let mut operand = match self.expr(args[i]) {
@@ -573,6 +605,14 @@ impl Builder<'_> {
             {
                 self.pending_part(place.clone(), self.ty(args[i]), &mut pending);
             }
+            operands[i] = Some(operand);
+        }
+        for i in lent {
+            let operand = match self.expr(args[i]) {
+                Value::Scalar(operand) => operand,
+                Value::Place(place) => Operand::Copy(place),
+                Value::Unit => unreachable!("a reference is a value"),
+            };
             operands[i] = Some(operand);
         }
         self.forget_parts(pending);
@@ -669,8 +709,9 @@ impl Builder<'_> {
         }))
     }
 
-    /// A body the compiler writes: the five operations on
-    /// `Slots<T>`, the one type that holds memory holding nothing.
+    /// A body the compiler writes: the operations on `Slots<T>`, the one
+    /// type that holds memory holding nothing, and the others the prelude
+    /// declares `@intrinsic`.
     pub(super) fn intrinsic_call(
         &mut self,
         callee: FnId,
@@ -785,6 +826,22 @@ impl Builder<'_> {
                 self.assign(dest.clone(), Rvalue::Use(Operand::Copy(buffer.clone())));
                 self.push(Statement::Zero(buffer));
                 Value::Place(dest)
+            }
+            // `Slots::over(elements)`: a slice and a block of slots are both
+            // a pointer and a count, so the slots are the slice's pair. They
+            // own nothing, and what holds them is never dropped.
+            Intrinsic::SlotsOver => {
+                let elements = self.aggregate(args[0]);
+                let dest = dest.unwrap_or_else(|| Place::local(self.temp(ty)));
+                self.assign(dest.clone(), Rvalue::Use(Operand::Copy(elements)));
+                Value::Place(dest)
+            }
+            // `slots.release()`: zeroed, the slots free nothing when they
+            // are dropped, and the block stays its owner's.
+            Intrinsic::SlotsRelease => {
+                let block = self.behind_reference(args[0]);
+                self.push(Statement::Zero(block));
+                Value::Unit
             }
             // `str::fromBytes(bytes)`: the same pointer and the same
             // length, read as text. Nothing is copied but the pair itself.
@@ -1131,6 +1188,26 @@ impl Builder<'_> {
                         Value::Place(dest)
                     }
                     None => Value::Scalar(self.value(ty, rvalue)),
+                }
+            }
+            // Whether the answer would not fit: the receiver is lent.
+            Intrinsic::IntAddOverflows
+            | Intrinsic::IntSubOverflows
+            | Intrinsic::IntMulOverflows => {
+                let op = match which {
+                    Intrinsic::IntAddOverflows => BinaryOp::Add,
+                    Intrinsic::IntSubOverflows => BinaryOp::Sub,
+                    _ => BinaryOp::Mul,
+                };
+                let lhs = Operand::Copy(self.behind_reference(args[0]));
+                let rhs = self.scalar(args[1]);
+                let rvalue = Rvalue::Overflows(op, lhs, rhs);
+                match dest {
+                    Some(dest) => {
+                        self.assign(dest.clone(), rvalue);
+                        Value::Place(dest)
+                    }
+                    None => Value::Scalar(self.value(Types::BOOL, rvalue)),
                 }
             }
             // Both are the slice's pointer, alone: a C string's first byte,

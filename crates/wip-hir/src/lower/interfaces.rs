@@ -30,6 +30,7 @@ impl<'a> Lowerer<'a> {
                 methods: Vec::new(),
                 // Checked against the methods once they are declared.
                 one_of: annotations.one_of,
+                extensions: Vec::new(),
                 module: self.current as u32,
                 is_pub: decl.is_pub,
                 span: decl.name.span,
@@ -236,6 +237,226 @@ impl<'a> Lowerer<'a> {
         }
     }
 
+    /// The interface an `extend` block names, where it names one rather
+    /// than a type: `extend Iterator<T: Ord> { … }`.
+    pub(super) fn extended_interface(&self, block: &ast::ExtendBlock) -> Option<InterfaceId> {
+        let [name] = block.path.as_slice() else {
+            return None;
+        };
+        if block.slice_of.is_some()
+            || block.derived.is_some()
+            || self.types().contains_key(&name.sym)
+            || self.aliases().contains_key(&name.sym)
+        {
+            return None;
+        }
+        self.interface_named(*name)
+    }
+
+    /// `extend Iterator<T: Add + Zero> { move fn sum(): T … }`: methods every
+    /// type that implements the interface has, where the interface's types
+    /// meet the block's condition. Each is declared as a default is, generic
+    /// in `Self` and then the interface's types, whose constraints are the
+    /// condition; it adds nothing to the interface's table, and nothing
+    /// implements anything by it.
+    pub(super) fn declare_extension(
+        &mut self,
+        block: &'a ast::ExtendBlock,
+        id: InterfaceId,
+        bodies: &mut Vec<BodyWork>,
+    ) {
+        let name = block.path[0];
+        let text = self.text(name.sym).to_string();
+        let interface = &self.program.interfaces[id];
+        let (module, declared, expected) =
+            (interface.module, interface.span, interface.generics.len());
+        let refuse = |message: String, span: Span, label: &str| {
+            Diagnostic::error(codes::EXTENSION, message, span, label.to_string())
+        };
+        // A method comes with its type or its interface, and is never
+        // imported on its own: one another module added would make what a
+        // call means depend on the imports.
+        if module != self.current as u32 {
+            let diagnostic = refuse(
+                format!("`{text}` is declared in another module"),
+                name.span,
+                "not an interface of this module",
+            )
+            .with_secondary(declared, "declared here")
+            .with_note("only the module that declares an interface may extend it");
+            self.report(diagnostic);
+            return;
+        }
+        if let Some(implemented) = block.interface {
+            let diagnostic = refuse(
+                "an interface implements no interface".to_string(),
+                implemented.span,
+                "implemented",
+            )
+            .with_note(format!(
+                "`extend {text}<…> {{ … }}` gives methods to every type that implements `{text}`, where its types meet a condition"
+            ));
+            self.report(diagnostic);
+            return;
+        }
+        if block.generics.len() != expected {
+            let diagnostic = refuse(
+                format!(
+                    "`{text}` takes {}, and the block names {}",
+                    plural(expected, "type", "types"),
+                    block.generics.len()
+                ),
+                name.span,
+                "the interface's types",
+            )
+            .with_note(format!(
+                "an extension names each of `{text}`'s types, with what it asks of it: `extend {text}<T: Ord>`"
+            ));
+            self.report(diagnostic);
+            return;
+        }
+        // A method every implementer has is a default, written in the
+        // interface; an extension is for those whose types allow it.
+        if block.generics.iter().all(|param| param.bounds.is_empty()) {
+            let diagnostic = refuse(
+                format!("an extension of `{text}` with no condition"),
+                name.span,
+                "asks nothing of its types",
+            )
+            .with_secondary(declared, "the interface")
+            .with_help("write the methods in the interface, as defaults");
+            self.report(diagnostic);
+            return;
+        }
+        if let Some(copy) = block
+            .generics
+            .iter()
+            .flat_map(|param| &param.bounds)
+            .find(|bound| self.text(bound.name.sym) == "copy")
+        {
+            let diagnostic = refuse(
+                "`copy` is not a condition an extension can have".to_string(),
+                copy.span,
+                "not an interface",
+            )
+            .with_note("an extension's condition is what the interface's types implement");
+            self.report(diagnostic);
+            return;
+        }
+        // The block's parameters follow `Self`, so they are read with a
+        // stand-in for it in scope.
+        let self_name = self.interner.self_type_symbol();
+        let stand_in = GenericParamDef {
+            decided: false,
+            name: self_name,
+            written: self_name,
+            copy: false,
+            interfaces: Vec::new(),
+            default: crate::ParamDefault::None,
+            span: name.span,
+        };
+        self.type_params = vec![stand_in.clone()];
+        let params = self.generic_params(&block.generics);
+        self.type_params.clear();
+        let args: Vec<Ty> = params
+            .iter()
+            .enumerate()
+            .map(|(i, param)| {
+                self.intern(TyKind::Param(crate::TyParam {
+                    index: i as u32 + 1,
+                    name: param.name,
+                    copy: param.copy,
+                }))
+            })
+            .collect();
+        let args = self.program.types.intern_list(&args);
+        let mut type_params = vec![GenericParamDef {
+            decided: false,
+            interfaces: vec![crate::Constraint {
+                interface: id,
+                args,
+            }],
+            ..stand_in
+        }];
+        type_params.extend(params);
+        let is_pub = self.program.interfaces[id].is_pub;
+        let mut seen: FxHashMap<Symbol, Span> = FxHashMap::default();
+        for method in &block.methods {
+            let Some((receiver, keyword)) = method.receiver else {
+                continue;
+            };
+            let method_name = method.sig.name;
+            let method_text = self.text(method_name.sym).to_string();
+            if matches!(receiver, Receiver::Static | Receiver::Lend) {
+                let diagnostic = refuse(
+                    format!("`{method_text}` is not called on a value"),
+                    keyword,
+                    "not `fn`, `var fn` or `move fn`",
+                )
+                .with_note("an extension's methods are called on a value of a type that implements the interface");
+                self.report(diagnostic);
+                continue;
+            }
+            // One name, one method: the interface's own, or one extension's,
+            // whatever their conditions, since two conditions may both hold.
+            let own = self.program.interfaces[id]
+                .methods
+                .iter()
+                .map(|m| m.id)
+                .chain(self.program.interfaces[id].extensions.iter().copied())
+                .find(|&other| self.program.fns[other].name == method_name.sym);
+            let first = own
+                .map(|other| self.program.fns[other].name_span)
+                .or_else(|| seen.get(&method_name.sym).copied());
+            if let Some(first) = first {
+                let diagnostic = refuse(
+                    format!("`{text}` has a method `{method_text}` already"),
+                    method_name.span,
+                    "declared again",
+                )
+                .with_secondary(first, "declared here")
+                .with_note("an extension adds methods of names the interface and its other extensions do not have, so a call means one of them");
+                self.report(diagnostic);
+                continue;
+            }
+            seen.insert(method_name.sym, method_name.span);
+            let member = Member {
+                receiver,
+                keyword,
+                owner: MemberOwner::Interface(id),
+                type_params: type_params.clone(),
+                overloaded: false,
+                lent: false,
+            };
+            let fn_id = self.declare_fn(
+                &method.sig,
+                &method.annotations,
+                false,
+                is_pub,
+                Some(member),
+            );
+            match method.body {
+                Some(body) => bodies.push(BodyWork {
+                    body,
+                    id: fn_id,
+                    span: method.span,
+                }),
+                None => {
+                    let diagnostic = refuse(
+                        format!("`{method_text}` has no body"),
+                        method_name.span,
+                        "no body",
+                    )
+                    .with_note(
+                        "an extension's methods are written there: no implementation writes them",
+                    );
+                    self.report(diagnostic);
+                }
+            }
+            self.program.interfaces[id].extensions.push(fn_id);
+        }
+    }
+
     /// Each `@oneOf` of an interface names two of its methods or more, each
     /// once, and each with a default, since one without is written anyway;
     /// a group that does not is reported, and dropped.
@@ -436,8 +657,11 @@ impl<'a> Lowerer<'a> {
         let args = self.interface_defaults(id, args, implementing);
         // An operator a built-in type answers itself is an instruction and
         // never calls an implementation: `extend f32: Multiply<f32, Vec2>`
-        // would never run, so it is refused where it is written.
+        // would never run, so it is refused where it is written. The
+        // prelude's own are the exception: `a + b` between numbers is still
+        // the instruction, and they are what a type parameter reaches.
         if matches!(owner, TypeDef::Builtin(_))
+            && self.prelude != Some(self.current)
             && let Some(op) = KnownInterface::named(self.text(interface_name))
                 .filter(|known| self.program.prelude_items.interface(*known) == Some(id))
                 .and_then(|known| known.binary_op())
@@ -459,12 +683,25 @@ impl<'a> Lowerer<'a> {
         if !self.visible(interface_module, interface_pub) {
             self.private_item(interface_module, "interface", interface);
         }
-        // One implementation per interface and type.
+        // One implementation per interface and type. A type an
+        // implementation decides is not part of which one it is: a second
+        // `Items<…>` for one type is a second implementation.
+        let undecided = |list: crate::TyList, this: &Self| -> Vec<Ty> {
+            this.program
+                .types
+                .list(list)
+                .iter()
+                .zip(&generics)
+                .filter(|(_, param)| !param.decided)
+                .map(|(&ty, _)| ty)
+                .collect()
+        };
+        let which = undecided(args, self);
         if let Some(first) = self
             .program
             .impls
             .iter()
-            .find(|i| i.interface == id && i.ty == owner && i.args == args)
+            .find(|i| i.interface == id && i.ty == owner && undecided(i.args, self) == which)
         {
             let first = first.span;
             let text = self.text(interface_name).to_string();
@@ -644,6 +881,10 @@ impl<'a> Lowerer<'a> {
             .with_note("every method without a default must be implemented");
             self.report(diagnostic);
         }
+        // What it decides, for `I::Item` once `I` is known.
+        if generics.iter().any(|param| param.decided) {
+            self.program.types.add_decided(id, implementing, args);
+        }
         self.program.impls.push(ImplDef {
             interface: id,
             args,
@@ -768,6 +1009,9 @@ impl<'a> Lowerer<'a> {
                     .any(|constraint| constraint.interface == interface)
             });
         }
+        if self.holds_its_value_elsewhere(ty) {
+            return false;
+        }
         let Some(owner) = self.owner_of(ty) else {
             return false;
         };
@@ -784,6 +1028,16 @@ impl<'a> Lowerer<'a> {
             .enumerate()
             .filter(|(_, i)| i.interface == interface && i.ty == owner)
             .any(|(at, _)| self.unmet_condition(at, &owner_args).is_none())
+    }
+
+    /// Whether `ty` is an `own<T>`, or a reference that is not answered by
+    /// what it refers to (`&var T`): a method is looked up through it, as a
+    /// field is, but it implements nothing itself. `own<Point>` is not a
+    /// `Point`, and the code an implementation's call becomes is
+    /// `Point`'s, which takes a `Point` where it is given; asked as a
+    /// constraint, `own<Point>: Eq` would pass and leave nothing to call.
+    fn holds_its_value_elsewhere(&self, ty: Ty) -> bool {
+        matches!(self.kind(ty), TyKind::Own(_) | TyKind::Ref(..))
     }
 
     /// The same, for an interface that takes types: the implementation must
@@ -805,12 +1059,35 @@ impl<'a> Lowerer<'a> {
             return self.program.answered_through_references(interface)
                 && self.implements_args(inner, interface, wanted);
         }
+        // A decided type asked as the type's own, `I::Item` of `I:
+        // Iterator`, is whatever its implementation decides: it asks
+        // nothing.
+        let generics = &self.program.interfaces[interface].generics;
+        let open: Vec<bool> = wanted
+            .iter()
+            .enumerate()
+            .map(|(at, &w)| {
+                generics.get(at).is_some_and(|p| p.decided)
+                    && matches!(self.kind(w), TyKind::Assoc(base, i, index)
+                        if base == ty && i == interface && index as usize == at)
+            })
+            .collect();
         if let TyKind::Param(param) = self.kind(ty) {
             return self.type_params.get(param.index as usize).is_some_and(|p| {
-                p.interfaces
-                    .iter()
-                    .any(|c| c.interface == interface && self.program.types.list(c.args) == wanted)
+                p.interfaces.iter().any(|c| {
+                    let have = self.program.types.list(c.args);
+                    c.interface == interface
+                        && have.len() == wanted.len()
+                        && have
+                            .iter()
+                            .zip(wanted)
+                            .zip(&open)
+                            .all(|((&h, &w), &open)| open || h == w)
+                })
             });
+        }
+        if self.holds_its_value_elsewhere(ty) {
+            return false;
         }
         let Some(owner) = self.owner_of(ty) else {
             return false;
@@ -827,7 +1104,13 @@ impl<'a> Lowerer<'a> {
             .filter(|(_, i)| {
                 i.interface == interface
                     && i.ty == owner
-                    && crate::args_match_with(&self.program.types, i.args, &owner_args, wanted)
+                    && crate::args_match_open(
+                        &self.program.types,
+                        i.args,
+                        &owner_args,
+                        wanted,
+                        &open,
+                    )
             })
             .map(|(at, _)| at)
             .collect();
@@ -882,6 +1165,71 @@ impl<'a> Lowerer<'a> {
                 && crate::args_match(&self.program.types, i.args, &args, wanted.args)
         })?;
         self.unmet_condition(at, &args)
+    }
+
+    /// Why `ty` does not implement `wanted` where an implementation would
+    /// hold but for its conditions: each argument whose condition is not
+    /// met, in turn, down to one that has no implementation at all.
+    /// `Result<Option<Argument>, E>` compares where `Option<Argument>` does,
+    /// and that where `Argument` does. Empty where no condition holds it
+    /// back.
+    pub(super) fn unmet_chain(
+        &self,
+        ty: Ty,
+        wanted: crate::Constraint,
+    ) -> Vec<(Ty, crate::Constraint)> {
+        let mut chain: Vec<(Ty, crate::Constraint)> = Vec::new();
+        let mut at = (ty, wanted);
+        while let Some(next) = self.unmet_for(at.0, at.1) {
+            // A type that holds itself would lead round for ever.
+            if next.0 == ty || chain.iter().any(|&(seen, _)| seen == next.0) {
+                break;
+            }
+            chain.push(next);
+            at = next;
+        }
+        chain
+    }
+
+    /// The chain [`Self::unmet_chain`] found, in words: `X` implements `Eq`
+    /// where `Y` does, `Y` where `Z` does, and `Z` does not.
+    pub(super) fn unmet_help(
+        &self,
+        ty: Ty,
+        wanted: crate::Constraint,
+        chain: &[(Ty, crate::Constraint)],
+    ) -> String {
+        let mut asked = self.constraint_name(wanted, ty);
+        let mut text = format!("{} implements `{asked}`", self.ty_name(ty));
+        for (index, &(inside, constraint)) in chain.iter().enumerate() {
+            let name = self.constraint_name(constraint, inside);
+            if index > 0 {
+                text.push_str(&format!(", {}", self.ty_name(chain[index - 1].0)));
+            }
+            let what = if name == asked {
+                "does".to_string()
+            } else {
+                format!("implements `{name}`")
+            };
+            text.push_str(&format!(" where {} {what}", self.ty_name(inside)));
+            asked = name;
+        }
+        if let Some(&(last, _)) = chain.last() {
+            text.push_str(&format!(", and {} does not", self.ty_name(last)));
+        }
+        text
+    }
+
+    /// The module of the standard library that declares `ty`, where one
+    /// does: a program cannot derive or implement an interface for it.
+    pub(super) fn std_module_of(&self, ty: Ty) -> Option<String> {
+        let module = match self.kind(ty) {
+            TyKind::Struct(id, _) => self.program.structs[id].module,
+            TyKind::Enum(id, _) => self.program.enums[id].module,
+            _ => return None,
+        };
+        let path = &self.modules[module as usize].path;
+        (path == "std" || path.starts_with("std::")).then(|| path.clone())
     }
 
     /// The condition an implementation asks for that this type's arguments
@@ -1075,7 +1423,7 @@ impl<'a> Lowerer<'a> {
             let name = self.constraint_name(constraint, ty);
             // An implementation that would hold but for a condition says
             // which one.
-            let unmet = self.unmet_for(ty, constraint);
+            let unmet = self.unmet_chain(ty, constraint);
             let param_name = self.text(written).to_string();
             let mut diagnostic = Diagnostic::error(
                 codes::UNSATISFIED_CONSTRAINT,
@@ -1084,20 +1432,29 @@ impl<'a> Lowerer<'a> {
                 format!("`{param_name}` requires `{name}`"),
             )
             .with_secondary(declared, format!("`{param_name}: {name}` declared here"))
-            .with_note(match self.program.referred(ty) {
+            .with_note(match (self.program.referred(ty), self.kind(ty)) {
                 // A reference answers only what reads its value.
-                Some(_) if !self.program.answered_through_references(interface) => format!(
+                (Some(_), _) if !self.program.answered_through_references(interface) => format!(
                     "a `&` reference answers what its value answers about itself, through `&` alone — `Eq`, `Ord`, `Hash`, `Text` — and is `Clone`; `{name}` takes, changes or answers a `Self`"
                 ),
+                // A box is not what it holds: what it holds may implement
+                // it, and where a reference to it would do, lends it.
+                (_, TyKind::Own(inner))
+                    if self.program.answered_through_references(interface)
+                        && self.implements_with(inner, constraint) =>
+                {
+                    format!(
+                    "an `own<T>` implements nothing itself, whatever its `T` does; where {} is wanted, `&` of the box lends it, and a type argument written out, `<{}>`, asks for it",
+                    self.ty_name(inner),
+                    self.ty_name(inner).trim_matches('`'),
+                )
+                }
                 _ => format!(
                     "a type implements an interface by `extend …: {name}`"
                 ),
             });
             // Text is left out of the sequences on purpose, and says so.
-            let text = self.kind(ty) == TyKind::Str
-                || matches!(self.kind(ty), TyKind::Struct(id, _)
-                    if self.text(self.program.structs[id].name) == "String"
-                        && Some(self.program.structs[id].module as usize) == self.prelude);
+            let text = self.kind(ty) == TyKind::Str || self.program.is_string(ty);
             if text
                 && Some(interface)
                     == self
@@ -1120,21 +1477,12 @@ impl<'a> Lowerer<'a> {
                 Some(KnownInterface::Clone) => Some("@derive(Clone)"),
                 _ => None,
             };
-            if let Some((argument, asked)) = unmet {
-                let asked = self.constraint_name(asked, argument);
-                diagnostic = diagnostic
-                    .with_help(format!(
-                        "{} implements `{name}` when its argument does `{asked}`",
-                        self.ty_name(ty)
-                    ))
-                    .with_note(format!(
-                        "{} does not implement `{asked}`",
-                        self.ty_name(argument)
-                    ));
+            if !unmet.is_empty() {
+                diagnostic = diagnostic.with_help(self.unmet_help(ty, constraint, &unmet));
             }
             if let Some(annotation) = annotation
                 && declares
-                && unmet.is_none()
+                && unmet.is_empty()
             {
                 diagnostic = diagnostic.with_help(format!(
                     "`{annotation}` on the declaration writes it from the fields"
@@ -1296,6 +1644,7 @@ impl<'a> Lowerer<'a> {
             .collect();
         let args = self.program.types.intern_list(&args);
         GenericParamDef {
+            decided: false,
             name,
             written: name,
             copy: false,

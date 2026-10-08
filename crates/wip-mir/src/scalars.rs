@@ -330,7 +330,9 @@ fn each_operand(rvalue: &Rvalue, f: &mut impl FnMut(&Operand)) {
         | Rvalue::Integer(_, operand)
         | Rvalue::Bits(operand)
         | Rvalue::VTableFn { table: operand, .. } => f(operand),
-        Rvalue::Binary(_, lhs, rhs) | Rvalue::Rotate(_, lhs, rhs) => {
+        Rvalue::Binary(_, lhs, rhs)
+        | Rvalue::Rotate(_, lhs, rhs)
+        | Rvalue::Overflows(_, lhs, rhs) => {
             f(lhs);
             f(rhs);
         }
@@ -369,7 +371,9 @@ fn each_place_mut(statement: &mut Statement, f: &mut impl FnMut(&mut Place)) {
                 | Rvalue::Integer(_, o)
                 | Rvalue::Bits(o)
                 | Rvalue::VTableFn { table: o, .. } => operand(o, f),
-                Rvalue::Binary(_, lhs, rhs) | Rvalue::Rotate(_, lhs, rhs) => {
+                Rvalue::Binary(_, lhs, rhs)
+                | Rvalue::Rotate(_, lhs, rhs)
+                | Rvalue::Overflows(_, lhs, rhs) => {
                     operand(lhs, f);
                     operand(rhs, f);
                 }

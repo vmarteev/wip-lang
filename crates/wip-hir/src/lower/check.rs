@@ -115,6 +115,9 @@ impl<'a> Lowerer<'a> {
         if let Some(coerced) = self.string_argument(id, expected, argument) {
             return coerced;
         }
+        if let Some(copied) = self.text_copied(id, expected) {
+            return copied;
+        }
         if let Some(coerced) = self.container_argument(id, expected, argument) {
             return coerced;
         }
@@ -238,6 +241,9 @@ impl<'a> Lowerer<'a> {
         if expected == Types::STR {
             return self.lend_string(id);
         }
+        if let Some(lent) = self.text_as_string(id, expected) {
+            return Some(lent);
+        }
         if self.kind(expected) != TyKind::Ref(Types::STR, crate::RefKind::Shared)
             || !matches!(self.kind(self.ty_of(id)), TyKind::Struct(..))
         {
@@ -246,6 +252,56 @@ impl<'a> Lowerer<'a> {
         let lent = self.lend_string(id)?;
         let span = self.state.body.exprs[id].span;
         Some(self.alloc(ExprKind::Ref(lent), expected, span))
+    }
+
+    /// Text where a `String` is expected is copied into one, by
+    /// `String::of`, which allocates as `"\(x)"` does: `names.push(word)`
+    /// is `names.push(String::of(word))`. Where the `String` is only read,
+    /// a `&String`, the text is lent instead ([`Self::text_as_string`]).
+    fn text_copied(&mut self, id: ExprId, expected: Ty) -> Option<ExprId> {
+        if self.ty_of(id) != Types::STR || !self.program.is_string(expected) {
+            return None;
+        }
+        let of = self.program.prelude_items.function(KnownFn::StringOf)?;
+        let span = self.state.body.exprs[id].span;
+        Some(self.alloc(
+            ExprKind::Call {
+                callee: of,
+                args: vec![id],
+                type_args: crate::TyList::EMPTY,
+                order: vec![0],
+            },
+            expected,
+            span,
+        ))
+    }
+
+    /// Text given where a `&String` is taken is lent as a `String` whose
+    /// bytes are its own: `f("the")` is `f(&String::over("the"))`, which
+    /// allocates nothing and is never dropped. Behind a `&`, nothing can
+    /// grow it or free it. Not where a `&var String` is taken, which may
+    /// grow it, nor a `String` by value, which is the copy asked for.
+    fn text_as_string(&mut self, id: ExprId, expected: Ty) -> Option<ExprId> {
+        let TyKind::Ref(string, crate::RefKind::Shared) = self.kind(expected) else {
+            return None;
+        };
+        if self.ty_of(id) != Types::STR || !self.program.is_string(string) {
+            return None;
+        }
+        let over = self.program.prelude_items.function(KnownFn::StringOver)?;
+        let span = self.state.body.exprs[id].span;
+        let made = self.alloc(
+            ExprKind::Call {
+                callee: over,
+                args: vec![id],
+                type_args: crate::TyList::EMPTY,
+                order: vec![0],
+            },
+            string,
+            span,
+        );
+        let kept = self.alloc(ExprKind::Undropped(made), string, span);
+        Some(self.alloc(ExprKind::Ref(kept), expected, span))
     }
 
     /// A container given where a call expects a slice is lent as the elements
@@ -488,6 +544,15 @@ impl<'a> Lowerer<'a> {
             diagnostic = diagnostic.with_note(
                 "a `String` is lent as a `str` where its text is read; writing a `str` would not write the `String`",
             );
+        } else if let TyKind::Ref(string, crate::RefKind::Var) = self.kind(expected)
+            && self.program.is_string(string)
+            && matches!(self.kind(actual), TyKind::Ref(text, _) if text == Types::STR)
+        {
+            // Text is copied where a `String` is kept and lent where one is
+            // read; one that is written would be a copy the caller never sees.
+            diagnostic = diagnostic.with_note(
+                "text is copied into a `String` where one is kept, and lent as one where it is read; a `&var String` is written, and a copy would lose what is written",
+            ).with_help("keep the text in a `String` to be written: `var text: String = …`");
         } else if let TyKind::Own(target) = self.kind(expected)
             && let TyKind::Slice(elem) = self.kind(target)
             && matches!(self.kind(actual), TyKind::Array(e, _) if e == elem)

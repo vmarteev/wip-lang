@@ -41,14 +41,49 @@ pub(super) enum Walked {
     Items(ExprId, Ty),
     /// Nothing, and nothing reported: the caller says so.
     No,
-    /// Nothing, and the reason is already reported.
-    Reported,
 }
 
 impl<'a> Lowerer<'a> {
     /// Checks one body: a function's, a method's, or an interface method's
-    /// default.
+    /// default. Where a constraint pins a decided type — `I: Iterator<T>`,
+    /// and `Self: Iterator<Item>` in the interface's own methods — `I::Item`
+    /// is that type in the body.
     pub(super) fn check_fn(&mut self, body: ast::ExprId, id: FnId) {
+        let generics = self.program.fns[id].generics.clone();
+        let pins = self.decided_pins(&generics);
+        self.program.types.set_pins(pins);
+        self.check_body_of(body, id);
+        self.program.types.set_pins(Vec::new());
+    }
+
+    /// The decided types the constraints of `generics` pin: `I::Item` is `T`
+    /// under `I: Iterator<T>`.
+    pub(super) fn decided_pins(
+        &mut self,
+        generics: &[GenericParamDef],
+    ) -> Vec<(Ty, crate::InterfaceId, u32, Ty)> {
+        let mut pins = Vec::new();
+        for (index, param) in generics.iter().enumerate() {
+            let ty = self.intern(TyKind::Param(crate::TyParam {
+                index: index as u32,
+                name: param.name,
+                copy: param.copy,
+            }));
+            for constraint in &param.interfaces {
+                let decided = &self.program.interfaces[constraint.interface].generics;
+                let args = self.program.types.list(constraint.args);
+                for (at, (&arg, param)) in args.iter().zip(decided).enumerate() {
+                    let left_to_it = matches!(self.program.types.kind(arg), TyKind::Assoc(base, ..) if base == ty);
+                    if param.decided && !left_to_it {
+                        pins.push((ty, constraint.interface, at as u32, arg));
+                    }
+                }
+            }
+        }
+        pins
+    }
+
+    fn check_body_of(&mut self, body: ast::ExprId, id: FnId) {
         let def = &self.program.fns[id];
         self.type_params = def.generics.clone();
         self.derived = self.program.derived.contains(&id);
@@ -604,8 +639,7 @@ impl<'a> Lowerer<'a> {
 
     /// What one element of the slice a container lends is, where it lends one
     /// kind: what `items_of` finds, without the call, for inference and for an
-    /// argument lent as its elements. Nothing for a type that lends none, or
-    /// more than one kind.
+    /// argument lent as its elements. Nothing for a type that lends none.
     pub(super) fn items_element(&self, ty: Ty) -> Option<Ty> {
         let interface = self
             .program
@@ -619,15 +653,13 @@ impl<'a> Lowerer<'a> {
                 .and_then(|c| self.program.types.list(c.args).first().copied());
         }
         let owner = self.owner_of(ty)?;
-        let mut found = self
+        let items = *self
             .program
             .impls
             .iter()
-            .filter(|i| i.interface == interface && i.ty == owner);
-        let items = *found.next()?.methods.first()?;
-        if found.next().is_some() {
-            return None;
-        }
+            .find(|i| i.interface == interface && i.ty == owner)?
+            .methods
+            .first()?;
         let args: Vec<Ty> = match self.kind(ty) {
             TyKind::Struct(_, args) | TyKind::Enum(_, args) => {
                 self.program.types.list(args).to_vec()
@@ -673,41 +705,16 @@ impl<'a> Lowerer<'a> {
                 let Some(owner) = self.owner_of(ty) else {
                     return Walked::No;
                 };
-                let found: Vec<&crate::ImplDef> = self
+                // Its element is what its implementation decides, and it
+                // has one.
+                let Some(items) = self
                     .program
                     .impls
                     .iter()
-                    .filter(|i| i.interface == interface && i.ty == owner)
-                    .collect();
-                // A type may lend one kind of element, or say which.
-                if found.len() > 1 {
-                    let kinds: Vec<String> = found
-                        .iter()
-                        .map(|i| {
-                            self.constraint_name(
-                                crate::Constraint {
-                                    interface,
-                                    args: i.args,
-                                },
-                                ty,
-                            )
-                        })
-                        .collect();
-                    let type_name = self.ty_name(ty);
-                    let span = self.state.body.exprs[receiver].span;
-                    let diagnostic = Diagnostic::error(
-                        codes::NOT_ITERABLE,
-                        format!("{type_name} lends more than one kind of element"),
-                        span,
-                        format!("{} both apply", kinds.join(" and ")),
-                    )
-                    .with_note(
-                        "a walk visits one kind of element, and which one must not be in question",
-                    );
-                    self.report(diagnostic);
-                    return Walked::Reported;
-                }
-                let Some(items) = found.first().and_then(|i| i.methods.first()).copied() else {
+                    .find(|i| i.interface == interface && i.ty == owner)
+                    .and_then(|i| i.methods.first())
+                    .copied()
+                else {
                     return Walked::No;
                 };
                 // A method of a generic container is generic in the
@@ -836,9 +843,6 @@ impl<'a> Lowerer<'a> {
                             e = items;
                             Some(elem)
                         }
-                        // What lends more than one kind of element has been
-                        // reported already.
-                        Walked::Reported => None,
                         // What lends no slice may lend its elements one
                         // place at a time …
                         Walked::No if let Some(sequence) = self.sequence_of(ty) => {

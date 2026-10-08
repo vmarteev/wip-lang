@@ -420,12 +420,18 @@ impl<'a> Parser<'a> {
         let mut piece = (first, start, 3);
         loop {
             capacity += self.push_text(&mut stmts, piece);
-            let (value, fitting) = self.in_parens(|p| {
+            let (value, options) = self.in_parens(|p| {
                 let value = p.expr();
-                (value, p.fitting())
+                (value, p.piece_options())
             });
             capacity += 8;
-            match fitting {
+            // A number written to a precision or in a radix is written as
+            // the value `withPrecision` or `inRadix` makes of it.
+            let value = match options.written {
+                Some(written) => self.written_as(value, written),
+                None => value,
+            };
+            match options.fitting {
                 Some(fitting) => self.push_fitted(&mut stmts, value, fitting),
                 None => self.push_append(&mut stmts, value),
             }
@@ -529,20 +535,28 @@ impl<'a> Parser<'a> {
         bytes
     }
 
-    /// `value.appendTo(&var text#)`, for a value between `\(` and `)`.
-    /// What a piece of an interpolation says of its width, after a comma:
-    /// `\(name, width: 16)`, `\(n, width: 4, fill: '0')`, `align: .Center`.
-    /// Nothing where it says nothing.
-    fn fitting(&mut self) -> Option<Fitting> {
+    /// What a piece of an interpolation says after a comma: its width,
+    /// `\(name, width: 16)`, `\(n, width: 4, fill: '0')`, `align: .Center`;
+    /// and how a number is written, `\(seconds, precision: 3)`,
+    /// `\(byte, radix: 16)`. Nothing where it says nothing.
+    fn piece_options(&mut self) -> PieceOptions {
+        let mut options = PieceOptions {
+            fitting: None,
+            written: None,
+        };
         if !self.at(T::Comma) {
-            return None;
+            return options;
         }
         let start = self.span();
-        let names = Symbol::fitting_options();
-        let mut given: [Option<(Span, ExprId)>; 3] = [None; 3];
-        let mut refused = false;
+        let [width, fill, align] = Symbol::fitting_options();
+        let [precision, radix, with_precision, in_radix] = Symbol::written();
+        let upper = Symbol::upper();
+        let names = [width, fill, align, precision, radix, upper];
+        let mut given: [Option<(Span, ExprId)>; 6] = [None; 6];
         while self.eat(T::Comma) {
-            let Some(name) = self.name("an option: `width`, `fill` or `align`") else {
+            let Some(name) =
+                self.name("an option: `width`, `fill`, `align`, `precision`, `radix` or `upper`")
+            else {
                 break;
             };
             self.expect(T::Colon);
@@ -550,13 +564,12 @@ impl<'a> Parser<'a> {
             let Some(which) = names.iter().position(|&n| n == name.sym) else {
                 let diagnostic = Diagnostic::error(
                     codes::INTERPOLATION_OPTION,
-                    "a piece of an interpolation takes `width`, `fill` and `align`",
+                    "a piece of an interpolation takes `width`, `fill`, `align`, `precision`, `radix` and `upper`",
                     name.span,
                     "not one of them",
                 )
-                .with_note("`\\(value, width: 4, fill: '0', align: .Right)` pads the text to a width; nothing else is said there");
+                .with_note("`\\(value, width: 4, fill: '0', align: .Right)` pads the text to a width; `precision: 3` writes a float with three digits after its point, `radix: 16` an integer in hexadecimal, and `upper: true` its digits above 9 in upper case");
                 self.report(diagnostic);
-                refused = true;
                 continue;
             };
             if let Some((first, _)) = given[which] {
@@ -572,23 +585,102 @@ impl<'a> Parser<'a> {
             }
             given[which] = Some((name.span, value));
         }
-        let [width, fill, align] = given.map(|g| g.map(|(_, value)| value));
-        let Some(width) = width else {
-            // An option that was not one of them has said so already.
-            if refused {
-                return None;
-            }
+        let [width, fill, align, precision, radix, upper] = given;
+        // Upper-case digits are a radix's.
+        if let (Some((span, _)), None) = (upper, radix) {
             let diagnostic = Diagnostic::error(
                 codes::INTERPOLATION_OPTION,
-                "a fill or an alignment needs a width",
-                start.to(self.prev_span()),
-                "no `width:`",
+                "upper-case digits are a radix's",
+                span,
+                "no `radix:`",
             )
-            .with_note("the fill makes up the text to the width, and the alignment says where");
+            .with_note("`\\(byte, radix: 16, upper: true)` writes an integer in hexadecimal with `A` to `F`");
             self.report(diagnostic);
-            return None;
+        }
+        // A precision is a float's and a radix an integer's, so no value
+        // takes both.
+        if let (Some((first, _)), Some((second, _))) = (precision, radix) {
+            let diagnostic = Diagnostic::error(
+                codes::INTERPOLATION_OPTION,
+                "a piece is written to a precision or in a radix, not both",
+                second,
+                "and a radix",
+            )
+            .with_secondary(first, "a precision")
+            .with_note("a precision is the digits after a float's point, and a radix the base an integer is written in");
+            self.report(diagnostic);
+        }
+        options.written = match (precision, radix) {
+            (Some((span, value)), _) => Some(Written {
+                method: with_precision,
+                span,
+                value,
+                upper: None,
+            }),
+            (None, Some((span, value))) => Some(Written {
+                method: in_radix,
+                span,
+                value,
+                upper,
+            }),
+            (None, None) => None,
         };
-        Some(Fitting { width, fill, align })
+        match width {
+            Some((_, width)) => {
+                options.fitting = Some(Fitting {
+                    width,
+                    fill: fill.map(|(_, value)| value),
+                    align: align.map(|(_, value)| value),
+                });
+            }
+            None if fill.is_some() || align.is_some() => {
+                let diagnostic = Diagnostic::error(
+                    codes::INTERPOLATION_OPTION,
+                    "a fill or an alignment needs a width",
+                    start.to(self.prev_span()),
+                    "no `width:`",
+                )
+                .with_note("the fill makes up the text to the width, and the alignment says where");
+                self.report(diagnostic);
+            }
+            None => {}
+        }
+        options
+    }
+
+    /// `value.withPrecision(digits)` or `value.inRadix(radix)`: what a piece
+    /// written to a precision or in a radix writes, named where the option
+    /// is, so that a value of the wrong type is reported there.
+    fn written_as(&mut self, value: ExprId, written: Written) -> ExprId {
+        let span = self.expr_span(value);
+        let callee = self.alloc_expr(
+            ExprKind::Field {
+                base: value,
+                name: Name {
+                    sym: written.method,
+                    span: written.span,
+                },
+            },
+            span,
+        );
+        let mut args = vec![written.value];
+        let mut names = vec![None];
+        if let Some((name_span, upper)) = written.upper {
+            args.push(upper);
+            names.push(Some(Name {
+                sym: Symbol::upper(),
+                span: name_span,
+            }));
+        }
+        self.alloc_expr(
+            ExprKind::Call {
+                callee,
+                args,
+                names,
+                rest: None,
+            },
+            span,
+        )
     }
 
     /// `value.appendFitted(&var text#, width: …, fill: …, align: .Some(…))`:
@@ -979,10 +1071,10 @@ impl<'a> Parser<'a> {
 
     /// A `(` that opens a lambda's parameters rather than a parenthesized
     /// expression: what follows its `)` is `=>`, or `:` and a type and then
-    /// `=>`.
+    /// `=>`. In a guard, the `=>` after a `)` is the arm's.
     pub(super) fn looks_like_lambda(&self) -> bool {
         // `(x): i64 => …`, a result type between the two.
-        self.paren_before(T::FatArrow) || self.paren_before(T::Colon)
+        !self.guard && (self.paren_before(T::FatArrow) || self.paren_before(T::Colon))
     }
 
     /// Whether the token after the `)` that closes the `(` the parser is at
@@ -1624,4 +1716,21 @@ struct Fitting {
     width: ExprId,
     fill: Option<ExprId>,
     align: Option<ExprId>,
+}
+
+/// How a piece of an interpolation is written: the method that makes the
+/// value it writes, `withPrecision` or `inRadix`, where its option was
+/// written, and what the option says.
+struct Written {
+    method: Symbol,
+    span: Span,
+    value: ExprId,
+    /// `upper: …`, with a radix, and where it was written.
+    upper: Option<(Span, ExprId)>,
+}
+
+/// What a piece of an interpolation says after its value.
+struct PieceOptions {
+    fitting: Option<Fitting>,
+    written: Option<Written>,
 }

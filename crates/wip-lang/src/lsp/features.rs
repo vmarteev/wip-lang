@@ -517,8 +517,12 @@ pub fn rename(
 }
 
 /// The file laid out by `wip fmt`, as one edit; `null` when it cannot be,
-/// so the editor keeps what it has.
+/// so the editor keeps what it has, and no edits for a file that asks to
+/// be left as written.
 pub fn format(path: &Path, text: &str) -> Value {
+    if wip_fmt::switched_off(text) {
+        return json!([]);
+    }
     let Ok(style) = crate::format_style(path) else {
         return Value::Null;
     };

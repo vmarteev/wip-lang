@@ -74,3 +74,11 @@ pub(super) fn edit_distance(a: &str, b: &str) -> usize {
 pub(super) fn plural(n: usize, one: &str, many: &str) -> String {
     format!("{n} {}", if n == 1 { one } else { many })
 }
+
+/// "a" or "an", for a word as it is said: `an \`Iterator\``, `a \`Source\``.
+pub(super) fn article(word: &str) -> &'static str {
+    match word.trim_start_matches('`').chars().next() {
+        Some(c) if "AEIOUaeiou".contains(c) => "an",
+        _ => "a",
+    }
+}

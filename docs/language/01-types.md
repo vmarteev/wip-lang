@@ -32,6 +32,20 @@ state = state *% 1099511628211
 assert(state != 0)
 ```
 
+Where a program asks whether the answer fits, every integer type has
+`checkedAdd`, `checkedSub`, `checkedMul`, `checkedDiv`, `checkedRem`,
+`checkedNeg` and `checkedShl`, which answer nothing where the operator
+would panic — a division by zero too — and `saturatingAdd`,
+`saturatingSub` and `saturatingMul`, which answer the least or the
+greatest value there is instead:
+
+```wip,run
+val count: u8 = 200
+assert(count.checkedAdd(100) == .None && count.checkedAdd(50) == .Some(250))
+assert(count.saturatingAdd(100) == 255 && (3 as u8).saturatingSub(5) == 0)
+assert((7 as i64).checkedDiv(0) == .None)
+```
+
 `as` converts between number types, and truncates or rounds as that
 conversion does in C:
 
@@ -133,10 +147,12 @@ val built = "\(greeting.len()) bytes"
 assert(built == "12 bytes")
 ```
 
-A literal takes the type expected of it, as a number does: where a
-`String` is expected, it is one, made from its text — a field, an argument,
-what a function answers, an element pushed. Where nothing
-expects a `String`, it is a `str`, which costs nothing.
+Text becomes a `String` where one is expected, copied: a literal, as a
+number takes the type expected of it, and any other `str` — a parameter, a
+piece of a line, what a call answers. That is a field, an argument, what a
+function answers, an element pushed, a variable declared or assigned as a
+`String`. Where nothing expects a `String`, text is a `str`, which costs
+nothing.
 
 ```wip,run
 struct Dialog {
@@ -144,12 +160,20 @@ struct Dialog {
 }
 
 fn main() = {
-    val dialog = Dialog(title: " Cannot edit ")
+    val dialog = Dialog(" Cannot edit ")
     var names: Vec<String> = Vec()
     names.push("first")
+    for word in "second third".split(" ") {
+        names.push(word)
+    }
     assert(dialog.title == " Cannot edit " && names[0] == "first")
+    assert(names[2] == "third")
 }
 ```
+
+The copy owns its bytes, so it outlives the text it was made from. Where
+the text is the whole of a `String` the function is done with, the
+`String` itself is given, and moved; copying it there is a warning.
 
 Text of several lines is a **text block**: the lines between two `"""`s,
 the opening one ending its line and the closing one beginning its own.
@@ -323,8 +347,9 @@ so anything true of a struct is true of it.
 ## Structs
 
 A struct is named fields, and is built as a variant is: its name, with the
-fields as a call's arguments, each named where there are two or more, and a
-variable with a field's name standing for `name: name`. A field is private
+fields as a call's arguments, by a call's rules. Where there are two or
+more, each is named, a variable of a field's name too: `File(fileNo: fileNo,
+name: n)`. One field is given by position or by name. A field is private
 to the module unless it says `pub`, and may have a default, which a literal
 that leaves it out takes:
 
@@ -367,6 +392,35 @@ fn main() = {
     assert(first.waiting.len() == 1 && second.waiting.len() == 0)
 }
 ```
+
+A struct with no fields is its name alone, as a variant with none is: the
+declaration ends at its line, and its value is built as any struct's is,
+`Csv()`. Such a type is one an interface is implemented for, for its own
+sake — a format, a strategy, a marker:
+
+```wip,run
+interface Format {
+    fn extension(): str
+}
+
+pub struct Csv
+pub struct Markdown
+
+extend Csv: Format {
+    fn extension(): str = "csv"
+}
+
+extend Markdown: Format {
+    fn extension(): str = "md"
+}
+
+fn main() = {
+    assert(Csv().extension() == "csv" && Markdown().extension() == "md")
+}
+```
+
+A `view struct` and an `extern struct` keep their braces: a struct with no
+fields borrows nothing, and C has no struct without members.
 
 ## Enums
 
@@ -479,7 +533,7 @@ fn largest<T: Ord>(values: &[T]): &T = {
 }
 
 fn main() = {
-    val boxed = Box(value: "in here")
+    val boxed = Box("in here")
     assert(boxed.value == "in here")
     val numbers = [3, 9, 4]
     assert(largest(&numbers) == 9)
@@ -508,7 +562,7 @@ struct Pool<T, K = T> {
 extend Pool<T, K> {
     var fn add(value: T): Tag<K> = {
         self.items.push(move value)
-        return Tag(number: self.items.len())
+        return Tag(self.items.len())
     }
 }
 
@@ -564,4 +618,23 @@ fn main() = {
 }
 ```
 
-`void` is not compared or printed: it holds nothing to compare.
+`void` has one value, so every `void` is equal to every other, comes before
+none, and is written `{}`. What holds one compares where the rest of it
+does, and a function that can fail and answers nothing is tested as any
+other:
+
+```wip,run
+@derive(Eq, Text)
+enum Missing {
+    Item(index: i64)
+}
+
+fn markDone(index: i64): Result<void, Missing> =
+    if index < 3 then .Ok({}) else .Err(.Item(index))
+
+fn main() = {
+    assert(markDone(2) == .Ok({}))
+    assert(markDone(5) == .Err(.Item(5)))
+    assert("\(markDone(2))" == ".Ok({})")
+}
+```

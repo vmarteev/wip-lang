@@ -194,6 +194,31 @@ impl Symbol {
         ]
     }
 
+    /// The options a piece of an interpolation may say of how a number is
+    /// written, `precision` and `radix`, and the methods each becomes,
+    /// `withPrecision` and `inRadix`.
+    pub fn written() -> [Symbol; 4] {
+        [
+            Symbol::well_known(WRITTEN_INDEX),
+            Symbol::well_known(WRITTEN_INDEX + 1),
+            Symbol::well_known(WRITTEN_INDEX + 2),
+            Symbol::well_known(WRITTEN_INDEX + 3),
+        ]
+    }
+
+    /// The option of a piece written in a radix that says its digits above
+    /// 9 are upper case: `\(byte, radix: 16, upper: true)`.
+    pub fn upper() -> Symbol {
+        Symbol::well_known(UPPER_INDEX)
+    }
+
+    /// `from`, after a function's result type: what the result borrows,
+    /// `fn text(i: i64): str from self.ast`. A word only there, so a
+    /// method may be named `from`.
+    pub fn from_word() -> Symbol {
+        Symbol::well_known(FROM_INDEX)
+    }
+
     fn well_known(index: usize) -> Symbol {
         Symbol(Spur::try_from_usize(index).expect("a symbol index"))
     }
@@ -257,6 +282,11 @@ impl Default for Interner {
         for name in INDEX_OF {
             rodeo.get_or_intern(name);
         }
+        for name in WRITTEN {
+            rodeo.get_or_intern(name);
+        }
+        rodeo.get_or_intern(UPPER);
+        rodeo.get_or_intern(FROM);
         Interner { rodeo }
     }
 }
@@ -360,6 +390,16 @@ const FITTED_INDEX: usize = IGNORED_INDEX + 1;
 /// What an index of 64 bits or more is made a position through.
 const INDEX_OF: [&str; 2] = ["indexOfUnsigned", "indexOfSigned"];
 const INDEX_OF_INDEX: usize = FITTED_INDEX + FITTED.len();
+/// A piece of an interpolation written to a precision or in a radix: the
+/// two options, and the methods that make the value they write.
+const WRITTEN: [&str; 4] = ["precision", "radix", "withPrecision", "inRadix"];
+const WRITTEN_INDEX: usize = INDEX_OF_INDEX + INDEX_OF.len();
+/// The option that writes a radix's digits above 9 in upper case.
+const UPPER: &str = "upper";
+const UPPER_INDEX: usize = WRITTEN_INDEX + WRITTEN.len();
+/// The word after a result type that says what the result borrows.
+const FROM: &str = "from";
+const FROM_INDEX: usize = UPPER_INDEX + 1;
 
 impl Interner {
     pub fn new() -> Interner {
@@ -441,6 +481,10 @@ mod tests {
         assert_eq!(interner.resolve(fill), "fill");
         assert_eq!(interner.resolve(align), "align");
         assert_eq!(interner.resolve(Symbol::some()), "Some");
+        let written = Symbol::written().map(|sym| interner.resolve(sym).to_string());
+        assert_eq!(written, ["precision", "radix", "withPrecision", "inRadix"]);
+        assert_eq!(interner.resolve(Symbol::upper()), "upper");
+        assert_eq!(interner.resolve(Symbol::from_word()), "from");
         let [unsigned, signed] = Symbol::index_of();
         assert_eq!(interner.resolve(unsigned), "indexOfUnsigned");
         assert_eq!(interner.resolve(signed), "indexOfSigned");

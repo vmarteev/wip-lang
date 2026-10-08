@@ -52,19 +52,35 @@ pub fn args_match(types: &ty::Types, declared: TyList, owner: &[Ty], wanted: TyL
 
 /// The same, where the wanted arguments are already a slice.
 pub fn args_match_with(types: &ty::Types, declared: TyList, owner: &[Ty], wanted: &[Ty]) -> bool {
+    args_match_open(types, declared, owner, wanted, &[])
+}
+
+/// The same, where the positions `open` marks match whatever is there: a
+/// type the implementation decides, which the one asking leaves to it.
+pub fn args_match_open(
+    types: &ty::Types,
+    declared: TyList,
+    owner: &[Ty],
+    wanted: &[Ty],
+    open: &[bool],
+) -> bool {
     let declared = types.list(declared);
     declared.len() == wanted.len()
         && declared
             .iter()
             .zip(wanted)
-            .all(|(&d, &w)| match types.kind(d) {
-                ty::TyKind::Param(p) => owner.get(p.index as usize) == Some(&w),
-                // An argument written in the type's own parameters rather
-                // than being one — `extend Zipped<I, T, J, V>:
-                // Iterator<(T, V)>` — is read with them before it is
-                // compared.
-                _ if types.is_generic(d) => types.try_subst_find(d, owner) == Some(w),
-                _ => d == w,
+            .enumerate()
+            .all(|(at, (&d, &w))| {
+                open.get(at).copied().unwrap_or(false)
+                    || match types.kind(d) {
+                        ty::TyKind::Param(p) => owner.get(p.index as usize) == Some(&w),
+                        // An argument written in the type's own parameters rather
+                        // than being one — `extend Zipped<I, T, J, V>:
+                        // Iterator<(T, V)>` — is read with them before it is
+                        // compared.
+                        _ if types.is_generic(d) => types.try_subst_find(d, owner) == Some(w),
+                        _ => d == w,
+                    }
             })
 }
 

@@ -141,7 +141,9 @@ impl Layouts {
                 }
             }
             TyKind::Enum(..) => self.enum_layout(program, ty),
-            TyKind::Param(_) => unreachable!("only instances of generic items are laid out"),
+            TyKind::Param(_) | TyKind::Assoc(..) => {
+                unreachable!("only instances of generic items are laid out")
+            }
         }
     }
 

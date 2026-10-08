@@ -7,7 +7,7 @@ use wip_syntax::ast::*;
 use wip_syntax::{Interner, MAX_TUPLE, MIN_TUPLE, Span, Symbol};
 
 use crate::comments::{Comment, blank_between};
-use crate::doc::{Doc, choice, concat, group, if_break, indent, join, rigid, text};
+use crate::doc::{Doc, choice, concat, flat, group, if_break, indent, join, rigid, text};
 
 pub struct Printer<'a> {
     src: &'a str,
@@ -228,26 +228,29 @@ impl<'a> Printer<'a> {
         }
     }
 
+    /// `import a::b::{c, d}` on one line where it fits, and otherwise the
+    /// names one to a line, one deeper, with no comma after the last.
     fn import(&mut self, i: &ImportDecl) -> Doc {
         let path: Vec<&str> = i.path.iter().map(|n| self.sym(n.sym)).collect();
-        let mut out = format!("import {}", path.join("::"));
+        let mut parts = vec![text(format!("import {}", path.join("::")))];
         if let Some(items) = &i.items {
-            let names: Vec<String> = items
+            let names: Vec<Doc> = items
                 .iter()
                 .map(|item| {
                     let name = item.name.map_or("self", |n| self.sym(n.sym));
-                    match item.alias {
+                    text(match item.alias {
                         Some(alias) => format!("{name} as {}", self.sym(alias.sym)),
                         None => name.to_string(),
-                    }
+                    })
                 })
                 .collect();
-            out.push_str(&format!("::{{{}}}", names.join(", ")));
+            parts.push(text("::"));
+            parts.push(self.list_ending("{", names, "}", false));
         }
         if let Some(alias) = i.alias {
-            out.push_str(&format!(" as {}", self.sym(alias.sym)));
+            parts.push(text(format!(" as {}", self.sym(alias.sym))));
         }
-        text(out)
+        concat(parts)
     }
 
     fn generics(&self, generics: &[GenericParam]) -> String {
@@ -258,7 +261,11 @@ impl<'a> Printer<'a> {
             .iter()
             .map(|g| {
                 let name = self.sym(g.name.sym);
-                let mut text = name.to_string();
+                // `type Item`: a type each implementation decides.
+                let mut text = match g.decided {
+                    Some(_) => format!("type {name}"),
+                    None => name.to_string(),
+                };
                 if !g.bounds.is_empty() {
                     let bounds: Vec<String> = g.bounds.iter().map(|b| self.bound(b)).collect();
                     text.push_str(&format!(": {}", bounds.join(" + ")));
@@ -313,6 +320,28 @@ impl<'a> Printer<'a> {
             body.push((method.span, concat(vec![lead, self.fn_decl(method)])));
         }
         let annotations = self.annotations(&s.annotations);
+        // A struct with no fields and no methods is its name alone, unless
+        // its braces hold a comment, which keeps them. A `view` or `extern`
+        // one keeps its braces: it is refused without them.
+        if body.is_empty() && !s.is_view && !s.is_extern {
+            let braced = s.span.hi > 0 && self.src.as_bytes()[s.span.hi as usize - 1] == b'}';
+            let inside = if braced {
+                self.trailing(s.span.hi - 1)
+            } else {
+                concat(vec![])
+            };
+            return match inside {
+                Doc::Concat(ref parts) if parts.is_empty() => concat(vec![annotations, text(head)]),
+                inside => concat(vec![
+                    annotations,
+                    text(head),
+                    text(" {"),
+                    indent(inside),
+                    Doc::Hard,
+                    text("}"),
+                ]),
+            };
+        }
         let braces = self.braced(
             body,
             s.span.hi,
@@ -410,11 +439,30 @@ impl<'a> Printer<'a> {
                 self.sym(sig.name.sym),
                 self.generics(&sig.generics)
             )),
-            self.list_no_trailing_after_variadic("(", params, ")", sig.variadic.is_some()),
+            self.list_ending("(", params, ")", sig.variadic.is_none()),
         ];
         if let Some(ret) = sig.ret {
             parts.push(text(": "));
             parts.push(self.ty(ret));
+        }
+        // What the result borrows: `from a, self.ast`.
+        if !sig.lends_from.is_empty() {
+            let paths: Vec<String> = sig
+                .lends_from
+                .iter()
+                .map(|path| {
+                    let mut written = match path.root {
+                        Some(name) => self.sym(name.sym).to_string(),
+                        None => "self".to_string(),
+                    };
+                    for field in &path.fields {
+                        written.push('.');
+                        written.push_str(self.sym(field.sym));
+                    }
+                    written
+                })
+                .collect();
+            parts.push(text(format!(" from {}", paths.join(", "))));
         }
         concat(parts)
     }
@@ -574,23 +622,20 @@ impl<'a> Printer<'a> {
     /// `open a, b close` on one line if it fits, and otherwise each on a
     /// line of its own, one deeper, with a trailing comma.
     fn list(&self, open: &str, items: Vec<Doc>, close: &str) -> Doc {
-        self.list_no_trailing_after_variadic(open, items, close, false)
+        self.list_ending(open, items, close, true)
     }
 
-    fn list_no_trailing_after_variadic(
-        &self,
-        open: &str,
-        items: Vec<Doc>,
-        close: &str,
-        variadic: bool,
-    ) -> Doc {
+    /// The same, with a comma after the last item where it is broken or
+    /// none: none after `...`, which ends a C function's parameters, and
+    /// none after an import's last name.
+    fn list_ending(&self, open: &str, items: Vec<Doc>, close: &str, comma: bool) -> Doc {
         if items.is_empty() {
             return text(format!("{open}{close}"));
         }
-        let trailing = if variadic {
-            text("")
-        } else {
+        let trailing = if comma {
             if_break(text(","), text(""))
+        } else {
+            text("")
         };
         group(concat(vec![
             text(open),
@@ -1048,19 +1093,22 @@ impl<'a> Printer<'a> {
     /// block, a call, a literal of several parts — and otherwise tried on
     /// the next line, one deeper, before the value itself is broken.
     fn assigned(&mut self, value: ExprId) -> Doc {
-        if let ExprKind::If { .. } = self.ast.exprs[value].kind
-            && let (Some(then), braced) = self.if_forms(value, false)
-        {
-            return choice(
-                concat(vec![
-                    text(" ="),
-                    group(indent(concat(vec![Doc::Line, then]))),
-                ]),
-                concat(vec![text(" = "), braced]),
-            );
-        }
         let hugs = hugs(&self.ast.exprs[value].kind) || self.is_text(value);
+        // An `if` is asked for its forms once: printing it writes the
+        // comments inside it, and a second print would find none.
         let doc = match self.ast.exprs[value].kind {
+            ExprKind::If { .. } => match self.if_forms(value, false) {
+                (Some(then), braced) => {
+                    return choice(
+                        concat(vec![
+                            text(" ="),
+                            group(indent(concat(vec![Doc::Line, then]))),
+                        ]),
+                        concat(vec![text(" = "), braced]),
+                    );
+                }
+                (None, braced) => braced,
+            },
             ExprKind::Binary { .. } => self.binary_as(value, false),
             _ => self.expr(value),
         };
@@ -1577,23 +1625,27 @@ impl<'a> Printer<'a> {
         // than the pattern being broken to make room for it.
         // An interpolated string is a block to the parser, and is asked
         // about as text first.
-        if let ExprKind::If { .. } = self.ast.exprs[body].kind
-            && let (Some(then), braced) = self.if_forms(body, false)
-        {
-            return choice(
-                concat(vec![
-                    text(" =>"),
-                    group(indent(concat(vec![Doc::Line, then]))),
-                ]),
-                concat(vec![text(" => "), braced]),
-            );
-        }
         let hugs = if self.is_text(body) {
             self.is_text_block(body)
         } else {
             hugs(&self.ast.exprs[body].kind)
         };
-        let doc = self.expr(body);
+        // An `if` is asked for its forms once, as in `assigned`.
+        let doc = match self.ast.exprs[body].kind {
+            ExprKind::If { .. } => match self.if_forms(body, false) {
+                (Some(then), braced) => {
+                    return choice(
+                        concat(vec![
+                            text(" =>"),
+                            group(indent(concat(vec![Doc::Line, then]))),
+                        ]),
+                        concat(vec![text(" => "), braced]),
+                    );
+                }
+                (None, braced) => braced,
+            },
+            _ => self.expr(body),
+        };
         if hugs {
             concat(vec![text(" => "), doc])
         } else {
@@ -1710,9 +1762,22 @@ impl<'a> Printer<'a> {
                 let dots = if *inclusive { "..=" } else { ".." };
                 text(format!("{}{dots}{}", end(lo), end(hi)))
             }
+            // On one line where they fit, and otherwise as many to a line
+            // as fit, broken before a `|`; one to a line where one cannot
+            // be laid out on a line of its own.
             PatternKind::Any(alternatives) => {
                 let parts: Vec<Doc> = alternatives.iter().map(|a| self.pattern(a)).collect();
-                join(parts, text(" | "))
+                let words: Option<Vec<String>> = parts.iter().map(flat).collect();
+                match words {
+                    Some(words) => Doc::Fill(
+                        words
+                            .into_iter()
+                            .enumerate()
+                            .map(|(i, word)| if i == 0 { word } else { format!("| {word}") })
+                            .collect(),
+                    ),
+                    None => group(join(parts, concat(vec![Doc::Line, text("| ")]))),
+                }
             }
             PatternKind::Variant {
                 leading_dot,

@@ -162,8 +162,20 @@ module.exports = grammar({
       field('name', $.identifier),
       optional(field('type_parameters', $.type_parameters)),
       field('parameters', $.parameters),
-      optional(seq(':', field('return_type', $._type))),
+      optional(seq(
+        ':',
+        field('return_type', $._type),
+        optional(field('lends_from', $.lends_from)),
+      )),
       optional(seq('=', field('body', $._expression))),
+    ),
+
+    // What a result borrows: `from a, self.ast`. A word only here.
+    lends_from: $ => prec.right(seq('from', commaSep1($.lend_path))),
+
+    lend_path: $ => seq(
+      choice($.self, $.identifier),
+      repeat(seq('.', field('field', $.identifier))),
     ),
 
     receiver: _ => choice('var', 'move', 'static', 'lend'),
@@ -183,8 +195,10 @@ module.exports = grammar({
     type_parameters: $ => seq('<', commaSep1($.type_parameter), '>'),
 
     // `T: Ord + Hash`, and `K = T`, a default naming the parameters
-    // before it.
+    // before it; `type Item`, an interface's, which each implementation
+    // decides.
     type_parameter: $ => seq(
+      optional('type'),
       field('name', $._type_identifier),
       optional(seq(':', $.constraint, repeat(seq('+', $.constraint)))),
       optional(seq('=', field('default', $._type))),
@@ -199,7 +213,8 @@ module.exports = grammar({
       choice('struct', 'union'),
       field('name', $._type_identifier),
       optional(field('type_parameters', $.type_parameters)),
-      field('body', $.declaration_list),
+      // A struct with no fields is its name alone: `struct Csv`.
+      optional(field('body', $.declaration_list)),
     ),
 
     // `view enum`: its variants may borrow.
@@ -387,11 +402,11 @@ module.exports = grammar({
     ),
 
     // A pattern after `val` or `var` starts with `.` or a path, or is a
-    // tuple or a slice: a bare name is a `val` (grammar §2). One that can
-    // fail has an `else`.
+    // tuple or a slice, or is alternatives: a bare name is a `val`
+    // (grammar §2). One that can fail has an `else`.
     guard_statement: $ => prec(1, seq(
       choice('val', 'var'),
-      field('pattern', choice($.tuple_pattern, $.variant_pattern, $.slice_pattern)),
+      field('pattern', choice($.tuple_pattern, $.variant_pattern, $.slice_pattern, $.or_pattern)),
       '=',
       field('value', $._expression),
       optional(seq('else', field('else', $.block))),

@@ -79,8 +79,8 @@ extend Loud: Destroy {
 }
 
 fn main() = {
-    val first = Loud(id: 1)
-    val second = Loud(id: 2)
+    val first = Loud(1)
+    val second = Loud(2)
     // `second` ends first: values end in the reverse of the order they
     // were declared.
     assert(first.id + second.id == 3)

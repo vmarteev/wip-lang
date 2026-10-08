@@ -210,6 +210,22 @@ package game
 wip fmt --width 120 --spaces 2 main.wip
 ```
 
+A file whose leading comments include the line `// wip fmt: off` is left as
+written: what a tool generated and a program keeps as generated, or a table
+laid out by hand. Only the `//` lines before anything else count, so the
+same words further down are a comment like any other. `wip fmt` does not
+parse such a file, `--check` does not list it, and formatting a directory
+says how many it left; an editor that formats on save is given no edits.
+
+```wip,run
+// The opcodes and their widths, aligned by hand.
+// wip fmt: off
+
+val OPS = [("add",  1), ("jump", 3)]
+
+fn main() = assert(OPS[1].1 == 3)
+```
+
 A file that does not parse is left as it is, with its errors shown. Before
 anything is written the result is parsed again, and it must be the same
 program with the same comments; where it is not, the file is left as it

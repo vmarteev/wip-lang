@@ -244,6 +244,124 @@ fn an_editor_sees_what_is_wrong_and_how_to_fix_it() {
     );
     assert_eq!(session.diagnostics(&area), Vec::<Value>::new());
 
+    // A struct of two fields built without their names: the fix names the
+    // field a variable is named for, and gives the other value the field
+    // left.
+    let built = "pub struct File {\n\tname: String\n\tfileNo: i64\n}\n\npub fn open(name: str, fileNo: i64): File = File(fileNo, String::of(name))\n";
+    session.notify(
+        "textDocument/didChange",
+        json!({
+            "textDocument": { "uri": area, "version": 3 },
+            "contentChanges": [{ "text": built }],
+        }),
+    );
+    let shown = session.diagnostics(&area);
+    let unnamed = shown
+        .iter()
+        .find(|d| d["code"] == "E0331")
+        .unwrap_or_else(|| panic!("no diagnostic about the names: {shown:?}"));
+    let actions = session.request(
+        "textDocument/codeAction",
+        json!({
+            "textDocument": { "uri": area },
+            "range": unnamed["range"],
+            "context": { "diagnostics": [unnamed] },
+        }),
+    );
+    let edits = actions
+        .as_array()
+        .and_then(|a| {
+            a.iter().find(|a| {
+                a["title"]
+                    .as_str()
+                    .is_some_and(|t| t.contains("name the fields"))
+            })
+        })
+        .map(|a| a["edit"]["changes"][&area].clone())
+        .unwrap_or_else(|| panic!("no fix offered: {actions}"));
+    let line = built.lines().nth(5).expect("the function");
+    let at = |text: &str| line.find(text).expect("in the line") as u64;
+    let inserted: Vec<(u64, &str)> = edits
+        .as_array()
+        .expect("a list")
+        .iter()
+        .map(|e| {
+            assert_eq!(e["range"]["start"]["line"], json!(5), "{edits}");
+            let column = e["range"]["start"]["character"]
+                .as_u64()
+                .unwrap_or_default();
+            (column, e["newText"].as_str().unwrap_or_default())
+        })
+        .collect();
+    assert_eq!(
+        inserted,
+        [
+            (at("fileNo, String"), "fileNo: "),
+            (at("String::of(name))"), "name: ")
+        ],
+        "{edits}"
+    );
+    // Arguments in each other's places: the fix names them.
+    let swapped = "fn draw(width: i64, height: i64) = {}\n\nfn frame(width: i64, height: i64) = draw(height, width)\n";
+    session.notify(
+        "textDocument/didChange",
+        json!({
+            "textDocument": { "uri": area, "version": 4 },
+            "contentChanges": [{ "text": swapped }],
+        }),
+    );
+    let shown = session.diagnostics(&area);
+    let warned = shown
+        .iter()
+        .find(|d| d["code"] == "E0361")
+        .unwrap_or_else(|| panic!("no warning about the order: {shown:?}"));
+    assert_eq!(warned["severity"], json!(2), "{warned}");
+    let actions = session.request(
+        "textDocument/codeAction",
+        json!({
+            "textDocument": { "uri": area },
+            "range": warned["range"],
+            "context": { "diagnostics": [warned] },
+        }),
+    );
+    let edits = actions
+        .as_array()
+        .and_then(|a| {
+            a.iter()
+                .find(|a| a["title"].as_str().is_some_and(|t| t.contains("name them")))
+        })
+        .map(|a| a["edit"]["changes"][&area].clone())
+        .unwrap_or_else(|| panic!("no fix offered: {actions}"));
+    let line = swapped.lines().nth(2).expect("the call");
+    let at = |text: &str| line.find(text).expect("in the line") as u64;
+    let inserted: Vec<(u64, &str)> = edits
+        .as_array()
+        .expect("a list")
+        .iter()
+        .map(|e| {
+            let column = e["range"]["start"]["character"]
+                .as_u64()
+                .unwrap_or_default();
+            (column, e["newText"].as_str().unwrap_or_default())
+        })
+        .collect();
+    assert_eq!(
+        inserted,
+        [
+            (at("height, width)"), "width: "),
+            (at("width)"), "height: ")
+        ],
+        "{edits}"
+    );
+    session.notify(
+        "textDocument/didChange",
+        json!({
+            "textDocument": { "uri": area, "version": 5 },
+            "contentChanges": [{ "text": right }],
+        }),
+    );
+    assert_eq!(session.diagnostics(&area), Vec::<Value>::new());
+
     // Formatting lays the file out as `wip fmt` does.
     session.notify(
         "textDocument/didOpen",
@@ -259,6 +377,19 @@ fn an_editor_sees_what_is_wrong_and_how_to_fix_it() {
         json!("import shapes\n\nfn main() = {\n\tval x = shapes::area()\n}\n"),
         "{formatted}"
     );
+    // A file whose leading comments ask to be left as written is given no
+    // edits.
+    let kept = uri(&root.join("kept.wip"));
+    session.notify(
+        "textDocument/didOpen",
+        json!({ "textDocument": { "uri": kept, "languageId": "wip", "version": 1,
+            "text": "// wip fmt: off\nval  KEPT = [1,2]\n" } }),
+    );
+    let untouched = session.request(
+        "textDocument/formatting",
+        json!({ "textDocument": { "uri": kept }, "options": { "tabSize": 4, "insertSpaces": false } }),
+    );
+    assert_eq!(untouched, json!([]), "{untouched}");
 
     // What names mean: hover shows what a name is and what its
     // declaration's comment says, and definition goes there, in another
@@ -325,6 +456,11 @@ fn an_editor_sees_what_is_wrong_and_how_to_fix_it() {
     assert!(module.contains(&"area".to_string()), "{module:?}");
     let methods = complete("\tval y = x.");
     assert!(methods.contains(&"compare".to_string()), "{methods:?}");
+    // What an interface's extensions give, where the condition holds: a
+    // character is ordered, and does not add up.
+    let chars = complete("\tval y = \"ab\".chars().");
+    assert!(chars.contains(&"max".to_string()), "{chars:?}");
+    assert!(!chars.contains(&"sum".to_string()), "{chars:?}");
     let scope = complete("\tval y = ");
     for name in ["x", "main", "shapes", "Option", "while"] {
         assert!(

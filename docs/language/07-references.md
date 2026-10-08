@@ -95,6 +95,58 @@ fn main() = {
 }
 ```
 
+A place given to a call is lent when the call starts, once every argument
+is worked out, in the order written. So a later argument may change it:
+a method's receiver may be changed by the method's own argument.
+
+```wip,run
+struct Counter {
+    items: Vec<i64> = Vec()
+    seen: i64 = 0
+}
+
+extend Counter {
+    var fn add(n: i64): i64 = {
+        self.items.push(n)
+        return self.items.len()
+    }
+
+    var fn record(n: i64) = {
+        self.seen = n
+    }
+}
+
+fn main() = {
+    var counter = Counter()
+    counter.record(counter.add(7))
+    assert(counter.seen == 1)
+}
+```
+
+What borrows where it is made — a `str`, a view, a closure — borrows from
+there, so a later argument may not change what it borrows; and one that
+moves a place an earlier argument names leaves nothing to lend:
+
+```wip,error=E0414
+struct Tag {
+    name: String
+}
+
+extend Tag {
+    var fn rename(): i64 = {
+        self.name = String::of("renamed")
+        return 0
+    }
+}
+
+fn show(text: str, n: i64) = {}
+
+fn main() = {
+    var tag = Tag(String::of("first"))
+    show(tag.name.toStr(), tag.rename())
+}
+```
+
 ## Projections: lending a place out of a call
 
 A function may answer a reference where that reference is a place inside one
@@ -113,7 +165,7 @@ extend Board {
 }
 
 fn main() = {
-    var board = Board(cells: Vec::of(own [1, 2, 3]))
+    var board = Board(Vec::of(own [1, 2, 3]))
     assert(board.at(0) == 1)
     board.at(0) = 10
     board.at(0) += 5
@@ -173,7 +225,7 @@ extend Board {
 }
 
 fn main() = {
-    var board = Board(cells: Vec::of(own [1, 2, 3]))
+    var board = Board(Vec::of(own [1, 2, 3]))
     assert(board.at(2) == 3)
     board.at(2) = 30
     assert(board.at(2) == 30)
@@ -247,7 +299,7 @@ extend Tree {
 }
 
 fn main() = {
-    val tree = Tree(nodes: Vec::of(own [Node(size: 3)]))
+    val tree = Tree(Vec::of(own [Node(size: 3)]))
     var name = String::of("a")
     val found = tree.first(name.toStr())
     name.clear()
@@ -324,7 +376,7 @@ extend Tree {
 }
 
 fn main() = {
-    val tree = Tree(nodes: Vec::of(own [Node(size: 1), Node(size: 2)]))
+    val tree = Tree(Vec::of(own [Node(size: 1), Node(size: 2)]))
     val found = tree.find(2)
     assert(found.isSome())
     var at = &tree.nodes[0]
@@ -386,6 +438,87 @@ fn main() = {
 }
 ```
 
+A place read through a view's `&` field — `self.ast.names[0]` in a
+checker that holds the syntax tree it checks — borrows what that field
+borrows, not the view. A view holds no `&var`, so nothing done to the view
+changes what its `&` points at: in its own methods that is the caller's,
+as a reference parameter's referent is, so an element read through the
+field is kept across a call that writes the view, given to one, or walked
+while the view changes, and text read through it is answered as the
+view's. A place the view owns is part of it, as before:
+
+```wip,run
+struct Ast {
+    names: Vec<String>
+}
+
+view struct Lowerer {
+    ast: &Ast
+    errors: Vec<String>
+}
+
+extend Lowerer {
+    var fn report(text: str) = self.errors.push("unknown: \(text)")
+
+    var fn check() = {
+        for name in self.ast.names.items() {
+            if name.isEmpty() then self.report(self.ast.names[0].toStr())
+        }
+        val first = &self.ast.names[0]
+        self.errors.clear()
+        assert(first == "a")
+    }
+}
+
+fn main() = {
+    val ast = Ast(names: Vec::of(own ["a", ""]))
+    var lowerer = Lowerer(ast: &ast, errors: Vec())
+    lowerer.check()
+}
+```
+
+What a call answers borrows what its arguments' types can hold, which is
+read from the signature alone; a helper of a view that owns as well as
+borrows answers what borrows the whole view, and a function of two texts
+answers what borrows both. `from` after the result type says what it
+borrows instead, and nothing else: a parameter, whose place and what it
+borrows, or `self.ast`, a `&` or view field of one, what the parameter
+borrows and not its place. The body is held to it (E0437), so changing the
+body never breaks a caller, and the caller keeps only what it names:
+
+```wip,run
+struct Ast {
+    names: Vec<String>
+}
+
+view struct Lowerer {
+    ast: &Ast
+    errors: Vec<String>
+}
+
+extend Lowerer {
+    fn text(i: i64): str from self.ast = self.ast.names[i].toStr()
+}
+
+fn label(name: str, fallback: str): str from name =
+    if name.isEmpty() then "?" else name
+
+fn main() = {
+    val ast = Ast(names: Vec::of(own ["ab"]))
+    var lowerer = Lowerer(ast: &ast, errors: Vec())
+    val text = lowerer.text(0)
+    lowerer.errors.push("the view changes; the text is the tree's")
+    assert(text == "ab")
+    var fallback = String::of("none")
+    val named = label("given", fallback.toStr())
+    fallback.push("!")
+    assert(named == "given")
+}
+```
+
+`from` is a word only after a result type, so a method may still be named
+`from`.
+
 A `&var` is kept nowhere: a view may be copied, and two copies of a
 `&var` would each write one place. A struct or an enum that holds a `&`
 is declared `view`, as one that holds a `str` is.
@@ -408,7 +541,7 @@ view struct Parser {
 
 extend Parser {
     var fn step(vm: &var Vm) = {
-        vm.names.push(String::of(self.source[self.at..self.at + 1]))
+        vm.names.push(self.source[self.at..self.at + 1])
         self.at += 1
     }
 }

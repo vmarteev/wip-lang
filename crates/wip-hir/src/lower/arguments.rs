@@ -165,6 +165,105 @@ impl<'a> Lowerer<'a> {
         matched
     }
 
+    /// A warning for a call whose arguments by position include two or more
+    /// that are the parameters' own names, each in another's place:
+    /// `draw(height, width)` for `draw(width, height)`. One named as
+    /// another parameter whose own argument is something else — `rhs` in
+    /// `lhs` and `size` in `rhs` — is a chain a program writes on purpose,
+    /// and is not one. Naming the arguments says the order is meant.
+    pub(super) fn swapped_arguments(
+        &mut self,
+        params: &[ParamDef],
+        args: &[ast::ExprId],
+        names: &[Option<ast::Name>],
+        callee: &str,
+    ) {
+        let given: Vec<Option<Symbol>> = args
+            .iter()
+            .zip(names)
+            .take_while(|(_, name)| name.is_none())
+            .map(|(&arg, _)| self.argument_name(arg))
+            .collect();
+        let param = |sym: Symbol| params.iter().position(|p| p.name == sym);
+        // A parameter given a value named as another parameter, not itself.
+        let elsewhere = |at: usize| {
+            given
+                .get(at)
+                .copied()
+                .flatten()
+                .and_then(param)
+                .filter(|&other| other != at)
+        };
+        let swapped: Vec<usize> = (0..given.len())
+            .filter(|&i| elsewhere(i).is_some_and(|j| elsewhere(j).is_some()))
+            .collect();
+        if swapped.len() < 2 {
+            return;
+        }
+        let quoted: Vec<String> = swapped
+            .iter()
+            .filter_map(|&i| given[i])
+            .map(|sym| format!("`{}`", self.text(sym)))
+            .collect();
+        let message = match quoted.as_slice() {
+            [a, b] => format!("{a} and {b} are passed in each other's places"),
+            _ => format!(
+                "{} and {} are passed in one another's places",
+                quoted[..quoted.len() - 1].join(", "),
+                quoted[quoted.len() - 1]
+            ),
+        };
+        let mut diagnostic = Diagnostic::warning(
+            codes::ARGUMENTS_SWAPPED,
+            message,
+            self.ast.exprs[args[swapped[0]]].span,
+            format!("given as `{}`", self.text(params[swapped[0]].name)),
+        );
+        for &i in &swapped[1..] {
+            diagnostic = diagnostic.with_secondary(
+                self.ast.exprs[args[i]].span,
+                format!("given as `{}`", self.text(params[i].name)),
+            );
+        }
+        // Named from the first of them on, since nothing by position may
+        // follow a named argument.
+        let edits: Vec<Edit> = (swapped[0]..given.len())
+            .map(|i| {
+                Edit::insert(
+                    self.ast.exprs[args[i]].span.lo,
+                    format!("{}: ", self.text(params[i].name)),
+                )
+            })
+            .collect();
+        let order: Vec<String> = params[..given.len()]
+            .iter()
+            .map(|p| format!("`{}`", self.text(p.name)))
+            .collect();
+        diagnostic = diagnostic
+            .with_fix("if that is meant, name them", edits)
+            .with_note(format!(
+                "`{callee}` takes {}, in that order",
+                order.join(", ")
+            ));
+        self.report(diagnostic);
+    }
+
+    /// The name an argument is written by: a variable's, or a field's that
+    /// is read, through `&`, `&var`, `move` and parentheses.
+    fn argument_name(&self, arg: ast::ExprId) -> Option<Symbol> {
+        match self.ast.exprs[arg].kind {
+            ast::ExprKind::Name(sym) => Some(sym),
+            ast::ExprKind::Field { name, .. } => Some(name.sym),
+            ast::ExprKind::Paren(inner)
+            | ast::ExprKind::Unary {
+                op: ast::UnaryOp::Ref | ast::UnaryOp::RefVar | ast::UnaryOp::Move,
+                operand: inner,
+                ..
+            } => self.argument_name(inner),
+            _ => None,
+        }
+    }
+
     /// The checked values of matched arguments, in slot order, with defaults
     /// copied in and error expressions for what is missing, and the order in
     /// which they are evaluated: the written arguments as written, then the
@@ -377,6 +476,7 @@ impl<'a> Lowerer<'a> {
             accesses: None,
             is_variadic: false,
             variadic_of: None,
+            lends_from: None,
             is_lambda: false,
             generator: None,
             is_tailrec: false,

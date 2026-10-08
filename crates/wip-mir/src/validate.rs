@@ -58,7 +58,9 @@ pub fn validate(body: &Body) {
                         | Rvalue::Float(_, o)
                         | Rvalue::Integer(_, o)
                         | Rvalue::Bits(o) => operand(o),
-                        Rvalue::Binary(_, l, r) | Rvalue::Rotate(_, l, r) => {
+                        Rvalue::Binary(_, l, r)
+                        | Rvalue::Rotate(_, l, r)
+                        | Rvalue::Overflows(_, l, r) => {
                             operand(l);
                             operand(r);
                         }

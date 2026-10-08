@@ -8,6 +8,18 @@ impl Path {
     pub(super) fn within(&self, other: &Path) -> bool {
         self.local == other.local && self.projs.starts_with(&other.projs)
     }
+
+    /// Whether it stands for what a parameter borrows, which nothing the
+    /// call does changes.
+    pub(super) fn is_lent(&self) -> bool {
+        self.projs.first() == Some(&Proj::Lent)
+    }
+
+    /// Whether a root and a place overlap, so that changing the place
+    /// changes what borrows the root.
+    pub(super) fn overlaps(&self, place: &Path) -> bool {
+        !self.is_lent() && (self.within(place) || place.within(self))
+    }
 }
 
 impl State {
@@ -98,10 +110,21 @@ impl State {
                 ..o.clone()
             });
         }
+        // A copy is unread where it is unread on any path.
+        let mut copied = self.copied.clone();
+        for (local, spans) in &other.copied {
+            let merged = copied.entry(*local).or_default();
+            for span in spans {
+                if !merged.contains(span) {
+                    merged.push(*span);
+                }
+            }
+        }
         State {
             moved,
             roots,
             stale,
+            copied,
         }
     }
 }

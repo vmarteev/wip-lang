@@ -23,8 +23,9 @@ impl<'a> Parser<'a> {
         let pattern = self.pattern();
         // `if …` between the pattern and `=>`: a guard.
         // The condition holds no struct literal, since a `{` there would
-        // read as the arm's body (grammar R1).
-        let guard = self.eat(T::If).then(|| self.cond());
+        // read as the arm's body (grammar R1), and no lambda, since its
+        // `=>` is the arm's.
+        let guard = self.eat(T::If).then(|| self.guard_cond());
         if !self.eat(T::FatArrow) {
             let diagnostic = self.expected("`=>`");
             self.report(diagnostic);
@@ -443,7 +444,9 @@ impl<'a> Parser<'a> {
                 self.report(diagnostic);
                 None
             }
-            T::Ident(sym) => {
+            // A name followed by `(` or `::` begins a pattern, a struct
+            // taken apart or a variant by its path, and is not a field's.
+            T::Ident(sym) if !matches!(self.nth(1), T::LParen | T::ColonColon) => {
                 let field = Name {
                     sym,
                     span: self.bump(),

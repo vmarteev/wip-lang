@@ -53,8 +53,9 @@ BYTE        = "b'" ( charChar | escape ) "'" ;
 (* A literal with "\(" in it is interpolated, and its value is a String
    rather than a str. *)
 INTERP      = '"' piece ( "\(" expr ( "," IDENT ":" expr )* ")" piece )+ '"' ;
-                                         (* after the value, `width`, `fill`
-                                            and `align` *)
+                                         (* after the value, `width`, `fill`,
+                                            `align`, and `precision` or `radix`,
+                                            with `upper` beside `radix` *)
 piece       = ( strChar | escape )* ;
 
 (* A text block: nothing but space after the opening '"""',
@@ -250,9 +251,14 @@ path        = IDENT ( "::" IDENT )* ;
 
 (* ---- declarations ---- *)
 
-structDecl  = ( "extern" | "view" )? "struct" IDENT generics? "{" ( member ( lsep member )* lsep? )? "}" ;
+structDecl  = ( "extern" | "view" )? "struct" IDENT generics?
+              ( "{" ( member ( lsep member )* lsep? )? "}" )? ;
                                          (* `view struct`: it may borrow. `view` is a word
                                             only here. *)
+                                         (* no body: a struct with no fields is its
+                                            name alone, and the declaration ends at
+                                            its line; a body starts on that line. A
+                                            `view` or `extern` one has its braces *)
                             (* `extern struct` is C's layout, and takes no
                                generics *)
                                          (* a member is a field or a method *)
@@ -274,7 +280,9 @@ variant     = IDENT ( "(" params ")" )? ;
 
 extendBlock = "extend" extendType ( ":" IDENT typeArgs? )?
               "{" ( method ( lsep method )* lsep? )? "}" ;
-extendType  = path generics?              (* a type of this module *)
+extendType  = path generics?              (* a type of this module, or an
+                                             interface of it, extended under
+                                             a condition on its types *)
             | "[" IDENT bounds? "]" ;     (* a slice, whose element is named
                                              here; the prelude's *)
             (* a type's methods, outside its declaration, and after ":" the
@@ -293,11 +301,21 @@ method      = annotation* "pub"? ( "var" | "move" | "static" | "lend" )? fnDecl 
                                             method does with its receiver;
                                             `lend` both ways *)
 
-fnDecl      = "fn" IDENT generics? "(" params? ")" ( ":" type )? "=" expr ;
+fnDecl      = "fn" IDENT generics? "(" params? ")" ( ":" type lendsFrom? )? "=" expr ;
+lendsFrom   = "from" lendPath ( "," lendPath )* ;
+                                         (* what the result borrows, and
+                                            nothing else; `from` is a word
+                                            here alone *)
+lendPath    = ( IDENT | "self" ) ( "." IDENT )* ;
 generics    = "<" typeParam ( "," typeParam )* ","? ">" ;
-typeParam   = IDENT ( ":" constraint ( "+" constraint )* )? ( "=" type )? ;
+typeParam   = "type"? IDENT ( ":" constraint ( "+" constraint )* )?
+              ( "=" type )? ;
                                          (* a default: a struct's or an
-                                            enum's, last *)
+                                            enum's, last; `type`: an
+                                            interface's, which each
+                                            implementation decides, after
+                                            the others and with no
+                                            default *)
 constraint  = IDENT typeArgs? ;          (* `copy`, or an interface with the
                                             types it takes *)
 params      = param ( "," param )* ","? ;
@@ -348,7 +366,9 @@ type        = "own" "<" type ">"           (* `own<(…) => R>` is an owned
             | "(" type ( "," type )+ ","? ")"
                                            (* a tuple, two elements to four:
                                               the prelude's `TupleN` *)
-            | path typeArgs? ;             (* a module's type is `a::b::Point` *)
+            | path typeArgs? ;             (* a module's type is `a::b::Point`;
+                                              `I::Item`, what the
+                                              implementation of `I` decides *)
 typeArgs    = "<" type ( "," type )* ","? ">" ;
 
 (* ---- blocks and statements ---- *)
@@ -447,7 +467,7 @@ branch      = expr | jump ;          (* one expression, no braces; an `else
 matchExpr   = "match" cond "{" ( arm ( lsep arm )* lsep? )? "}" ;
 arm         = pattern ( "if" cond )? "=>" ( expr | jump ) ;
                                          (* a guard: the arm matches only where
-                                            it is true *)
+                                            it is true; its `=>`, see R8 *)
 jump        = "return" expr? | "break" IDENT? | "continue" IDENT? ;
                                          (* the arm ends the function or the
                                             loop *)
@@ -472,7 +492,8 @@ forElement  = "for" pattern "in" expr ( ( ".." | "..=" ) expr )? block ;
             (* a count that is not an INT literal needs `own`: own<[T]> *)
 
 pattern     = onePattern ( "|" onePattern )* ;
-                                         (* any one of them *)
+                                         (* any one of them; each binds the
+                                            same names, each of one type *)
 onePattern  = "_"
             | IDENT
             | "-"? INT | "true" | "false" | STRING | CHAR | BYTE
@@ -522,9 +543,9 @@ token: `::` → `pathExpr`, anything else → `IDENT`. `IDENT {` is not a
 struct: it is refused as the way one used to be written (E0133), with a fix
 that writes the call. A `{` where an expression is expected begins a block.
 A `.` where an expression or a pattern is expected begins a variant of the
-expected enum; it is never field access, which only follows a primary. Apart
-from R7, no production needs more than one token of lookahead; §1.1 needs
-one token of line information.
+expected enum; it is never field access, which only follows a primary.
+Apart from R7 and R8, no production needs more than one token of
+lookahead; §1.1 needs one token of line information.
 
 ---
 
@@ -612,6 +633,16 @@ bool>`. In an expression, `<` after a name starts type arguments when:
   is for a generic function named as a value, as in `sort(&var xs,
   less<i64>)`;
 - and the `<` is not half of `<<`.
+
+### R8 — `(` before `=>`
+
+A `(` whose matching `)` is followed by `=>`, or by `:` and then `=>`
+after a type, begins a lambda; any other `(` begins parentheses or a
+tuple. In a match arm's guard, the `=>` after a `)` at the guard's top
+level is the arm's, so the guard's `( … )` is parentheses there, even
+around one name: `n if (n < 5) => …`. A lambda inside the guard's
+parentheses, brackets or arguments is still one: `_ if
+values.any((v) => v > 0) => …`.
 
 Otherwise `<` is a comparison. The parser looks ahead no further than the
 matching `>`.

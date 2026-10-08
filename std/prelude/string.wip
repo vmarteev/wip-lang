@@ -13,8 +13,16 @@ pub struct String {
 }
 
 extend String {
+	/// A `String` whose bytes are `text`'s own, made where a `&String` is
+	/// taken and a `str` is given. The compiler never drops it: what it
+	/// holds is not its own to free.
+	static fn over(text: str): String = String(Vec(
+		slots: Slots<u8>::over(&text.items()),
+		length: text.len(),
+	))
+
 	/// The empty text, with room for `count` bytes.
-	pub static fn withCapacity(count: i64): String = String(bytes: Vec::withCapacity(count))
+	pub static fn withCapacity(count: i64): String = String(Vec::withCapacity(count))
 
 	/// A `String` that holds a copy of `text`, which is how a `str` becomes
 	/// a value that can be kept.
@@ -118,30 +126,32 @@ extend String {
 
 	/// `%.6g`, `%.7g` and on, until what is written reads back as `value`:
 	/// 17 digits always do for an `f64`, and 9 for an `f32`. Six or fewer
-	/// are written as `%g` always wrote them.
+	/// are written as `%g` always wrote them, but for a value written with
+	/// an exponent that fewer still read back as: a subnormal's.
 	var fn pushFewestDigits(value: f64, single: bool) = {
 		val most = if single then 9 else 17
 		var digits = [0 as u8; 32]
 		for precision in 6..most + 1 {
-			// `%.<precision>g`, and a NUL, as C reads a format.
-			var format = [0 as u8; 8]
-			format[0] = '%' as u8
-			format[1] = '.' as u8
-			var at = 2
-			if precision >= 10 {
-				format[at] = '1' as u8
-				at += 1
+			var written = formatG(value, precision, &var digits)
+			if !(readsBack(&digits, value, single) || !value.isFinite() || precision == most) then
+				continue
+			// Six digits written with an exponent may be more than the value
+			// has: a subnormal keeps fewer bits, and `5e-324` reads back as
+			// well as `4.94066e-324`. Fewer digits than six cannot move the
+			// exponent to a point, so the first of them that reads back is
+			// shorter text of the same kind.
+			if precision == 6 && value.isFinite() && digits[0..written].contains(b'e') {
+				for fewer in 1..6 {
+					val shorter = formatG(value, fewer, &var digits)
+					if readsBack(&digits, value, single) {
+						self.pushBytes(&digits[0..shorter])
+						return
+					}
+				}
+				written = formatG(value, precision, &var digits)
 			}
-			format[at] = '0' as u8 + (precision % 10) as u8
-			format[at + 1] = 'g' as u8
-			val written = libc::formatDouble(value, cstring::fromBytes(&format), &var digits)
-			// `formatDouble` wrote a NUL after the digits.
-			val text = cstring::fromBytes(&digits)
-			val back = if single then libc::strtof(text, null) as f64 else libc::strtod(text, null)
-			if back == value || !value.isFinite() || precision == most {
-				self.pushBytes(&digits[0..written])
-				return
-			}
+			self.pushBytes(&digits[0..written])
+			return
 		}
 	}
 
@@ -212,4 +222,68 @@ extend String {
 // The bytes it holds, so that `for byte in text` walks them.
 extend String: Items<u8> {
 	fn items(): &[u8] = lend self.bytes.items()
+}
+
+// Text made from text: each occurrence of a pattern replaced, the whole
+// repeated. Each is a new `String`, which a `str` and a `String` both make.
+extend str {
+	/// The text with each occurrence of `pattern` replaced by `by`, left to
+	/// right, none overlapping another: `"a-b-c".replace("-", by: "+")` is
+	/// `a+b+c`. `count: .Some(n)` replaces the first `n` alone,
+	/// `"a-b-c".replace("-", by: "+", count: .Some(1))` being `a+b-c`. An
+	/// empty pattern panics: there is no occurrence of nothing that is not
+	/// also a choice of where. So does a count below 0.
+	pub fn replace(pattern: str, by: str, count: Option<i64> = .None): String = {
+		if pattern.isEmpty() then
+			panic("an empty pattern occurs everywhere, so nothing says where to replace it")
+		if count is .Some(n) && n < 0 then panic("a count of replacements is 0 or more, not \(n)")
+		// No text holds more occurrences than it has bytes.
+		val most = count.unwrapOr(self.len())
+		var out = String::withCapacity(self.len())
+		var at = 0
+		var replaced = 0
+		while replaced < most && self[at..self.len()].find(pattern) is .Some(found) {
+			out.push(self[at..at + found])
+			out.push(by)
+			at += found + pattern.len()
+			replaced += 1
+		}
+		out.push(self[at..self.len()])
+		return move out
+	}
+
+	/// The text `times` times over: `"ab".repeat(3)` is `ababab`, and no
+	/// times is the empty text. A negative count panics.
+	pub fn repeat(times: i64): String = {
+		if times < 0 then panic("text is repeated 0 or more times, not \(times)")
+		var out = String::withCapacity(self.len() * times)
+		for _ in 0..times {
+			out.push(self)
+		}
+		return move out
+	}
+}
+
+/// `value` written by C's `%.<precision>g` into `digits`, with a NUL after
+/// it; answers how many bytes before the NUL.
+fn formatG(value: f64, precision: i64, digits: &var [u8; 32]): i64 = {
+	var format = [0 as u8; 8]
+	format[0] = '%' as u8
+	format[1] = '.' as u8
+	var at = 2
+	if precision >= 10 {
+		format[at] = '1' as u8
+		at += 1
+	}
+	format[at] = '0' as u8 + (precision % 10) as u8
+	format[at + 1] = 'g' as u8
+	return libc::formatDouble(value, cstring::fromBytes(&format), &var digits)
+}
+
+/// Whether the digits `formatG` wrote read back as `value`, as an `f32`'s
+/// where `single`.
+fn readsBack(digits: &[u8; 32], value: f64, single: bool): bool = {
+	val text = cstring::fromBytes(&digits)
+	val back = if single then libc::strtof(text, null) as f64 else libc::strtod(text, null)
+	return back == value
 }

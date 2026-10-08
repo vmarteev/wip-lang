@@ -25,6 +25,31 @@ pub enum Error {
     Bug(String),
 }
 
+/// The line among a file's leading comments that leaves it as written.
+pub const OFF: &str = "// wip fmt: off";
+
+/// Whether the file asks to be left as written: one of its leading
+/// comments — the `//` lines before anything else, blank lines between
+/// them allowed — is exactly [`OFF`]. Read from the text, before it is
+/// parsed, so a file that does not parse may ask too. The same words
+/// further down are a comment like any other, and a doc comment, `///`,
+/// belongs to the item below it.
+pub fn switched_off(src: &str) -> bool {
+    for line in src.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if !line.starts_with("//") || line.starts_with("///") {
+            return false;
+        }
+        if line == OFF {
+            return true;
+        }
+    }
+    false
+}
+
 /// The file's text, laid out. `package` says the file is a `package.wip`.
 pub fn format(src: &str, style: Style, package: bool) -> Result<String, Error> {
     let first = layout(src, style, package)?;

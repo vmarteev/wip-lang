@@ -199,12 +199,11 @@ impl<'a> Lowerer<'a> {
             interface,
             args: crate::TyList::EMPTY,
         };
-        if let Some((arg, _)) = self.unmet_for(ty, constraint) {
+        let chain = self.unmet_chain(ty, constraint);
+        if let Some(&(arg, _)) = chain.last() {
             let inside = self.ty_name(arg).to_string();
-            diagnostic = diagnostic.with_help(format!(
-                "{type_name} implements `{named}` where {inside} does, and {inside} does not"
-            ));
-            if declared(arg) {
+            diagnostic = diagnostic.with_help(self.unmet_help(ty, constraint, &chain));
+            if declared(arg) && self.std_module_of(arg).is_none() {
                 diagnostic = diagnostic.with_help(format!(
                     "write `@derive({named})` on {inside} too, or an `extend` block that implements `{named}` for it"
                 ));
@@ -373,6 +372,7 @@ impl<'a> Lowerer<'a> {
             accesses: None,
             is_variadic: false,
             variadic_of: None,
+            lends_from: None,
             is_lambda: false,
             generator: None,
             is_tailrec: false,

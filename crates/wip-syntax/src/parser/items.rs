@@ -117,17 +117,19 @@ impl<'a> Parser<'a> {
                     self.skip_to_item();
                     None
                 }
-                T::Struct => self.struct_decl(is_pub, annotations).map(Item::Struct),
+                T::Struct => self
+                    .struct_decl_with(is_pub, StructKind::Plain, annotations)
+                    .map(Item::Struct),
                 // `view struct Name { … }`: a struct that borrows.
                 // `view` is a word only here, so a program
                 // may still name something `view`.
                 T::Ident(_) if self.nth_text(0) == "view" && self.nth(1) == T::Struct => {
                     let view = self.bump();
-                    self.struct_decl(is_pub, annotations).map(|mut decl| {
-                        decl.is_view = true;
-                        decl.span = view.to(decl.span);
-                        Item::Struct(decl)
-                    })
+                    self.struct_decl_with(is_pub, StructKind::View(view), annotations)
+                        .map(|mut decl| {
+                            decl.span = view.to(decl.span);
+                            Item::Struct(decl)
+                        })
                 }
                 // `view enum Name { … }`: an enum whose variants borrow.
                 T::Ident(_) if self.nth_text(0) == "view" && self.nth(1) == T::Enum => {
@@ -180,7 +182,7 @@ impl<'a> Parser<'a> {
                 // declarations.
                 T::Extern if self.nth(1) == T::Struct => {
                     self.bump();
-                    self.struct_decl_with(is_pub, true, false, annotations)
+                    self.struct_decl_with(is_pub, StructKind::Extern, annotations)
                         .map(Item::Struct)
                 }
                 // `extern union Name { … }`: every field over the same
@@ -188,7 +190,7 @@ impl<'a> Parser<'a> {
                 // program may still name something `union`.
                 T::Extern if is_ident(self.nth(1)) && self.nth_text(1) == "union" => {
                     self.bump();
-                    self.struct_decl_with(is_pub, true, true, annotations)
+                    self.struct_decl_with(is_pub, StructKind::Union, annotations)
                         .map(Item::Struct)
                 }
                 T::Extern if !is_pub => self.extern_block(annotations).map(Item::Extern),
@@ -336,6 +338,7 @@ impl<'a> Parser<'a> {
             interface_args,
             path: vec![elem],
             generics: vec![GenericParam {
+                decided: None,
                 name: elem,
                 span: elem.span.to(self.prev_span()),
                 bounds,
@@ -478,22 +481,22 @@ impl<'a> Parser<'a> {
         })
     }
 
-    pub(super) fn struct_decl(
-        &mut self,
-        is_pub: bool,
-        annotations: Vec<Annotation>,
-    ) -> Option<StructDecl> {
-        self.struct_decl_with(is_pub, false, false, annotations)
-    }
-
-    /// `extern struct Name { … }`: C's layout, and fields C can write.
+    /// A struct, `struct Name { … }`, or a `view` one, which may borrow, or
+    /// C's layout, `extern struct Name { … }` and `extern union Name { … }`.
+    /// A plain struct with no fields is its name alone, `struct Csv`: the
+    /// declaration ends at its line, as any item does.
     pub(super) fn struct_decl_with(
         &mut self,
         is_pub: bool,
-        is_extern: bool,
-        is_union: bool,
+        kind: StructKind,
         annotations: Vec<Annotation>,
     ) -> Option<StructDecl> {
+        let (is_extern, is_union) = match kind {
+            StructKind::Extern => (true, false),
+            StructKind::Union => (true, true),
+            StructKind::Plain | StructKind::View(_) => (false, false),
+        };
+        let is_view = matches!(kind, StructKind::View(_));
         let start = self.bump();
         let what = if is_union {
             "a union name"
@@ -505,6 +508,38 @@ impl<'a> Parser<'a> {
             return None;
         };
         let generics = self.generic_params();
+        if self.on_later_line() {
+            if !self.at(T::LBrace) {
+                self.no_body(kind, start);
+                return Some(StructDecl {
+                    annotations,
+                    is_extern,
+                    is_union,
+                    is_view,
+                    name,
+                    generics,
+                    fields: Vec::new(),
+                    methods: Vec::new(),
+                    is_pub,
+                    span: start.to(self.prev_span()),
+                });
+            }
+            // A body on the next line: reported, and read as the body all
+            // the same, so that what is in it is read as it was meant.
+            let brace = self.span();
+            let diagnostic = Diagnostic::error(
+                codes::STRUCT_BODY,
+                "a struct's body starts on the line of its name",
+                brace,
+                "on the next line",
+            )
+            .with_note("a struct with no fields is written without braces, so a `{` on the line after its name would begin nothing")
+            .with_fix(
+                "move the `{` up",
+                [Edit::replace(Span::new(self.prev_span().hi, brace.lo), " ")],
+            );
+            self.report(diagnostic);
+        }
         let open = self.item_body_open()?;
         let list = BraceList {
             sep: T::Comma,
@@ -549,7 +584,7 @@ impl<'a> Parser<'a> {
             annotations,
             is_extern,
             is_union,
-            is_view: false,
+            is_view,
             name,
             generics,
             fields,
@@ -557,6 +592,31 @@ impl<'a> Parser<'a> {
             is_pub,
             span: start.to(close),
         })
+    }
+
+    /// A struct written without braces that needs them: a `view` one, which
+    /// borrows through fields it would not have, or C's layout, which has
+    /// no struct without members.
+    fn no_body(&mut self, kind: StructKind, start: Span) {
+        let diagnostic = match kind {
+            StructKind::Plain => return,
+            StructKind::View(view) => Diagnostic::error(
+                codes::STRUCT_BODY,
+                "a `view struct` borrows through its fields, and this one has none",
+                view,
+                "a view of nothing",
+            )
+            .with_note("a struct with no fields borrows nothing, so it is a plain one")
+            .with_fix("remove `view`", [Edit::replace(Span::new(view.lo, start.lo), "")]),
+            StructKind::Extern | StructKind::Union => Diagnostic::error(
+                codes::STRUCT_BODY,
+                "C has no struct or union without members",
+                start,
+                "C's layout, and nothing in it",
+            )
+            .with_help("a C type whose contents Wip does not know is `type Name` in an `extern \"C\"` block"),
+        };
+        self.report(diagnostic);
     }
 
     pub(super) fn enum_decl(
@@ -824,15 +884,59 @@ impl<'a> Parser<'a> {
             }
             _ => None,
         };
-        let end = ret.map_or(close, |t| self.ast.types[t].span);
+        let mut end = ret.map_or(close, |t| self.ast.types[t].span);
+        let lends_from = match ret {
+            Some(_) => self.lends_from(),
+            None => Vec::new(),
+        };
+        if let Some(last) = lends_from.last() {
+            end = last.span;
+        }
         Some(FnSig {
             name,
             generics,
             params,
             variadic,
             ret,
+            lends_from,
             span: start.to(end),
         })
+    }
+
+    /// `from a, self.ast` after a result type: the parameters, or fields
+    /// reached from one, that the result borrows. `from` is a word here
+    /// alone.
+    fn lends_from(&mut self) -> Vec<LendPath> {
+        let mut paths = Vec::new();
+        if !matches!(self.peek(), T::Ident(sym) if sym == Symbol::from_word()) {
+            return paths;
+        }
+        self.bump();
+        loop {
+            let (root, start) = if self.at(T::SelfKw) {
+                (None, self.bump())
+            } else {
+                let Some(name) = self.name("a parameter, or `self`, that the result borrows")
+                else {
+                    break;
+                };
+                (Some(name), name.span)
+            };
+            let mut fields = Vec::new();
+            while self.at(T::Dot) {
+                self.bump();
+                let Some(field) = self.name("a field") else {
+                    break;
+                };
+                fields.push(field);
+            }
+            let span = start.to(fields.last().map_or(start, |f| f.span));
+            paths.push(LendPath { root, fields, span });
+            if !self.eat(T::Comma) {
+                break;
+            }
+        }
+        paths
     }
 
     /// The annotations before a declaration: `@name`, or `@name(a, b = 1)`.
@@ -1182,12 +1286,12 @@ impl<'a> Parser<'a> {
         // layout: the block says `extern` once.
         if self.at(T::Struct) {
             return self
-                .struct_decl_with(is_pub, true, false, annotations)
+                .struct_decl_with(is_pub, StructKind::Extern, annotations)
                 .map(ExternMember::Struct);
         }
         if is_ident(self.peek()) && self.text(self.span()) == "union" {
             return self
-                .struct_decl_with(is_pub, true, true, annotations)
+                .struct_decl_with(is_pub, StructKind::Union, annotations)
                 .map(ExternMember::Struct);
         }
         if self.at(T::Type) {
@@ -1256,4 +1360,18 @@ impl<'a> Parser<'a> {
         }
         Some(sig)
     }
+}
+
+/// What a struct declaration is, which says whether it may be written
+/// without braces.
+#[derive(Clone, Copy)]
+pub(super) enum StructKind {
+    /// `struct Name`, which may be.
+    Plain,
+    /// `view struct Name`, with where `view` was written.
+    View(Span),
+    /// `extern struct Name`, or `struct Name` in an `extern` block.
+    Extern,
+    /// `extern union Name`, or `union Name` in an `extern` block.
+    Union,
 }

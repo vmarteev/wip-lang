@@ -30,6 +30,31 @@ impl<'a> Lowerer<'a> {
         }
     }
 
+    /// Whether `place` is a value made where it is used, not a place that
+    /// holds one: a call's answer, a literal, or a part of either. A `var
+    /// fn` may be called on one, which it changes and which then ends. A
+    /// variable C owns is read as a copy, and is not one: a change to the
+    /// copy would leave C's as it was.
+    pub(super) fn made_here(&self, place: ExprId) -> bool {
+        if !matches!(self.place_root(place), PlaceRoot::NotAPlace) {
+            return false;
+        }
+        let mut e = place;
+        loop {
+            match &self.state.body.exprs[e].kind {
+                ExprKind::Field { base, .. }
+                | ExprKind::Index { base, .. }
+                | ExprKind::SubSlice { base, .. }
+                | ExprKind::Deref(base) => e = *base,
+                ExprKind::Len(_) | ExprKind::Error => return false,
+                ExprKind::Call { callee, .. } => {
+                    return !matches!(self.program.fns[*callee].accesses, Some(Access::Global(_)));
+                }
+                _ => return true,
+            }
+        }
+    }
+
     /// Whether `place` may be assigned, or borrowed as `&var`.
     pub(super) fn writable(&self, place: ExprId) -> bool {
         // A field of another module's struct is written only where it
@@ -241,6 +266,20 @@ impl<'a> Lowerer<'a> {
     pub(super) fn not_writable(&self, place: ExprId, how: Writing) -> Option<Diagnostic> {
         if let Some(diagnostic) = self.no_writing_twin(place, how) {
             return Some(diagnostic);
+        }
+        // Lent by an accessor that has a writing twin, which needs the
+        // container lent `&var`: why the container cannot be is the reason,
+        // `v[0] = 3` with `val v`.
+        if let Some(call) = self.lending_call(place)
+            && let ExprKind::Call {
+                callee, ref args, ..
+            } = self.state.body.exprs[call].kind
+            && self.writing_twin(callee).is_some()
+            && let Some(&arg) = args.first()
+            && let ExprKind::Ref(container) = self.state.body.exprs[arg].kind
+            && !self.writable(container)
+        {
+            return self.not_writable(container, Writing::Borrow);
         }
         let span = self.state.body.exprs[place].span;
         let code = match how {
@@ -792,13 +831,30 @@ impl<'a> Lowerer<'a> {
                 name.span,
                 "a method, not a field",
             )
-            .with_note("a method is not a value: it can only be called");
+            .with_note("`x.name` is not a value, since it would hold `x`");
             let diagnostic = match takes_nothing {
                 true => diagnostic.with_fix(
                     format!("call it: `{text}()`"),
                     [Edit::insert(name.span.hi, "()")],
                 ),
                 false => diagnostic.with_help(format!("to call it, write `{call}`")),
+            };
+            // Where a function is wanted, the type's is one, where it can
+            // be a value and its type has a name to write it with.
+            let def = &self.program.fns[method];
+            let a_value = !is_static
+                && def.intrinsic.is_none()
+                && !def.is_inline
+                && !matches!(self.kind(def.ret), TyKind::Ref(..))
+                && !matches!(
+                    owner,
+                    TypeDef::Builtin(BuiltinOwner::Slice | BuiltinOwner::Slots)
+                );
+            let diagnostic = match a_value {
+                true => diagnostic.with_help(format!(
+                    "where a function is wanted, `{type_name}::{text}` is one, taking the value first"
+                )),
+                false => diagnostic,
             };
             self.report(diagnostic);
             return self.error_expr(span);
@@ -1170,6 +1226,38 @@ impl<'a> Lowerer<'a> {
         }
     }
 
+    /// The slice a container lends, where a range of it is asked for: a
+    /// type whose `x[i]` is a position, a `Sequence<T>`, and which lends its
+    /// elements as one slice, an `Items<T>`, of one `T`. Otherwise what is
+    /// missing, for the message.
+    fn ranged_items(&mut self, base: ExprId, ty: Ty) -> Result<ExprId, Option<&'static str>> {
+        let known = |known| self.program.prelude_items.interface(known);
+        let implements = |interface: Option<InterfaceId>| {
+            interface.is_some_and(|interface| self.implements_any(ty, interface))
+        };
+        let sequence = known(KnownInterface::Sequence);
+        let lends = implements(known(KnownInterface::Items));
+        match (lends, implements(sequence)) {
+            (true, true) => {
+                // Of one element: the positions are those of the slice.
+                let same = self.items_element(ty).is_some_and(|elem| {
+                    sequence.is_some_and(|sequence| self.implements_args(ty, sequence, &[elem]))
+                });
+                match self.items_of(base, ty) {
+                    super::body::Walked::Items(items, _) if same => Ok(items),
+                    _ => Err(None),
+                }
+            }
+            (false, true) => Err(Some(
+                "its elements are not in one slice: it is a sequence, and lends no `Items`",
+            )),
+            (true, false) => Err(Some(
+                "it lends its elements as a slice, and has no positions for a range to count: it is no `Sequence`",
+            )),
+            (false, false) => Err(None),
+        }
+    }
+
     /// `base[lo..hi]`: a range of elements of an array or slice, which must
     /// be `borrowed` where it is written.
     pub(super) fn sub_slice(
@@ -1202,28 +1290,47 @@ impl<'a> Lowerer<'a> {
                 end_span,
             ));
         }
-        let ty = self.ty_of(b);
+        let mut b = b;
+        let mut ty = self.ty_of(b);
         // A range of a `str` is a `str`: the same bytes, seen from further in.
         // It is a value, so it needs no borrow.
         if self.kind(ty) == TyKind::Str {
             return self.alloc(ExprKind::SubSlice { base: b, lo, hi }, Types::STR, span);
         }
+        // A container whose `x[i]` is a position and which lends its
+        // elements as one slice is ranged as that slice: `v[a..b]` is
+        // `v.items()[a..b]`.
+        if !matches!(
+            self.kind(ty),
+            TyKind::Array(..) | TyKind::Slice(_) | TyKind::Slots(_)
+        ) && !self.is_poisoned(ty)
+        {
+            match self.ranged_items(b, ty) {
+                Ok(items) => {
+                    b = items;
+                    ty = self.ty_of(items);
+                }
+                Err(note) => {
+                    let mut diagnostic = Diagnostic::error(
+                        codes::INVALID_INDEX,
+                        format!(
+                            "cannot take a range of a value of type {}",
+                            self.ty_name(ty)
+                        ),
+                        self.state.body.exprs[b].span,
+                        "not an array, a slice or a sequence that lends one",
+                    );
+                    if let Some(note) = note {
+                        diagnostic = diagnostic.with_note(note);
+                    }
+                    self.report(diagnostic);
+                    return self.error_expr(span);
+                }
+            }
+        }
         let elem = match self.kind(ty) {
             TyKind::Array(elem, _) | TyKind::Slice(elem) | TyKind::Slots(elem) => elem,
-            _ if self.is_poisoned(ty) => return self.error_expr(span),
-            _ => {
-                let diagnostic = Diagnostic::error(
-                    codes::INVALID_INDEX,
-                    format!(
-                        "cannot take a range of a value of type {}",
-                        self.ty_name(ty)
-                    ),
-                    self.state.body.exprs[b].span,
-                    "not an array or slice",
-                );
-                self.report(diagnostic);
-                return self.error_expr(span);
-            }
+            _ => return self.error_expr(span),
         };
         if !borrowed {
             let diagnostic = Diagnostic::error(

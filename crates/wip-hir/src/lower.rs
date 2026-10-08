@@ -25,7 +25,7 @@ use paths::{ItemUse, PathTarget};
 use type_rules::BUILTIN_TYPES;
 #[cfg(test)]
 use wording::edit_distance;
-use wording::{left_the_prelude, plural, suggest};
+use wording::{article, left_the_prelude, plural, suggest};
 
 mod aggregates;
 mod annotations;
@@ -38,6 +38,7 @@ mod consts;
 mod derives;
 mod embed;
 mod expr;
+mod extensions;
 mod generators;
 mod generics;
 mod imports;
@@ -330,6 +331,37 @@ pub fn lower_with_threads<'a>(
         name: lowerer.interner.lambda_symbol(),
         generics: Vec::new(),
         fields: Vec::new(),
+        methods: Vec::new(),
+        is_tuple: false,
+        generator: None,
+        is_env: true,
+        is_view: false,
+        module: 0,
+        is_pub: false,
+        span: Span::at(0),
+    }));
+    // And the one a named function made an owned closure carries, which
+    // holds nothing but the function that drops it, as every owned
+    // closure's environment begins with.
+    let address = lowerer.program.types.intern_list(&[Types::PTR_U8]);
+    let drop_ty = lowerer.intern(TyKind::Fn(address, Types::UNIT));
+    lowerer.program.fn_owned_closure_env = Some(lowerer.program.structs.alloc(StructDef {
+        is_extern: false,
+        is_union: false,
+        is_opaque: false,
+        is_intrinsic: false,
+        header: None,
+        accessors: Vec::new(),
+        name: lowerer.interner.lambda_symbol(),
+        generics: Vec::new(),
+        fields: vec![FieldDef {
+            is_pub: false,
+            is_var: false,
+            name: lowerer.interner.lambda_symbol(),
+            ty: drop_ty,
+            span: Span::at(0),
+            default: None,
+        }],
         methods: Vec::new(),
         is_tuple: false,
         generator: None,
@@ -785,6 +817,11 @@ struct BodyState {
     /// set while an arm's pattern is checked, and taken by the tuple
     /// pattern at its top.
     place_binds: Option<Vec<matching::Binds>>,
+    /// The `|`s being checked, innermost last: what each alternative
+    /// binds, so that the next binds the same locals.
+    alternatives: Vec<matching::Alternatives>,
+    /// How many `|`s that bind the body has numbered.
+    binding_alternatives: u32,
     /// A `val`'s or a `var`'s whole value is the `&place` about to be
     /// checked, which gives the variable its type.
     local_reference: bool,
@@ -816,6 +853,8 @@ impl Default for BodyState {
             keeping_closure: false,
             settling: Vec::new(),
             place_binds: None,
+            alternatives: Vec::new(),
+            binding_alternatives: 0,
             local_reference: false,
             inferring_ret: false,
         }

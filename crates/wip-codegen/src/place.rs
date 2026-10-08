@@ -310,6 +310,24 @@ impl FnCodegen<'_, '_, '_> {
                     mir::Turn::Right => self.b.ins().rotr(value, amount),
                 }
             }
+            // Whether the answer would not fit: the flag of the instruction a
+            // checked `+` panics on.
+            Rvalue::Overflows(op, lhs, rhs) => {
+                let signed =
+                    matches!(self.kind(self.operand_ty(lhs)), TyKind::Int(int) if int.signed());
+                let l = self.operand(lhs);
+                let r = self.operand(rhs);
+                let (_, overflowed) = match (op, signed) {
+                    (BinaryOp::Add, true) => self.b.ins().sadd_overflow(l, r),
+                    (BinaryOp::Add, false) => self.b.ins().uadd_overflow(l, r),
+                    (BinaryOp::Sub, true) => self.b.ins().ssub_overflow(l, r),
+                    (BinaryOp::Sub, false) => self.b.ins().usub_overflow(l, r),
+                    (BinaryOp::Mul, true) => self.b.ins().smul_overflow(l, r),
+                    (BinaryOp::Mul, false) => self.b.ins().umul_overflow(l, r),
+                    (op, _) => unreachable!("{op:?} does not overflow"),
+                };
+                overflowed
+            }
             // A float's bits as the integer of its width, and back.
             Rvalue::Bits(operand) => {
                 let value = self.operand(operand);

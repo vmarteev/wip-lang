@@ -46,7 +46,7 @@ impl<'a> Lowerer<'a> {
                 self.report(diagnostic);
             }
         }
-        self.params_of(params, false)
+        self.params_of(params, false, false)
     }
 
     /// The type parameters an interface declares, which may have defaults
@@ -56,15 +56,58 @@ impl<'a> Lowerer<'a> {
         &mut self,
         params: &[ast::GenericParam],
     ) -> Vec<GenericParamDef> {
-        self.type_generic_params(params)
+        // The decided ones come last, as a constraint names a prefix of the
+        // rest, and have no default: the implementation says what they are.
+        let mut first_decided: Option<Span> = None;
+        for param in params {
+            match (param.decided, first_decided) {
+                (Some(span), None) => first_decided = Some(span.to(param.name.span)),
+                (None, Some(first)) => {
+                    let text = self.text(param.name.sym).to_string();
+                    let diagnostic = Diagnostic::error(
+                        codes::DECIDED_TYPE,
+                        format!("`{text}` follows a type each implementation decides"),
+                        param.name.span,
+                        "not decided",
+                    )
+                    .with_secondary(first, "decided")
+                    .with_note("a constraint leaves out what an implementation decides, so those come after the types it names");
+                    self.report(diagnostic);
+                }
+                _ => {}
+            }
+            if param.decided.is_some()
+                && let Some(default) = param.default
+            {
+                let text = self.text(param.name.sym).to_string();
+                let diagnostic = Diagnostic::error(
+                    codes::DECIDED_TYPE,
+                    format!("`{text}` is decided by each implementation, and has no default"),
+                    self.ast.types[default].span,
+                    "a default",
+                )
+                .with_note("an implementation says what a decided type is where it names the interface: `extend Chars: Iterator<char>`");
+                self.report(diagnostic);
+            }
+        }
+        self.type_generic_params_of(params, true)
     }
 
-    /// The type parameters a struct or an enum declares. A default is read
-    /// once every type has a name; here it is only noted,
-    /// and the ones after it must have one too.
+    /// The type parameters a struct or an enum declares.
     pub(super) fn type_generic_params(
         &mut self,
         params: &[ast::GenericParam],
+    ) -> Vec<GenericParamDef> {
+        self.type_generic_params_of(params, false)
+    }
+
+    /// The type parameters a struct, an enum or an interface declares. A
+    /// default is read once every type has a name; here it is only noted,
+    /// and the ones after it must have one too.
+    fn type_generic_params_of(
+        &mut self,
+        params: &[ast::GenericParam],
+        interface: bool,
     ) -> Vec<GenericParamDef> {
         let mut defaulted: Option<Span> = None;
         for param in params {
@@ -87,10 +130,15 @@ impl<'a> Lowerer<'a> {
                 _ => {}
             }
         }
-        self.params_of(params, true)
+        self.params_of(params, true, interface)
     }
 
-    fn params_of(&mut self, params: &[ast::GenericParam], defaults: bool) -> Vec<GenericParamDef> {
+    fn params_of(
+        &mut self,
+        params: &[ast::GenericParam],
+        defaults: bool,
+        interface: bool,
+    ) -> Vec<GenericParamDef> {
         let mut seen: FxHashMap<Symbol, Span> = FxHashMap::default();
         let mut defs = Vec::new();
         for param in params {
@@ -118,7 +166,21 @@ impl<'a> Lowerer<'a> {
                 .bounds
                 .iter()
                 .any(|bound| self.text(bound.name.sym) == "copy");
+            // A type an implementation decides is an interface's alone.
+            if let Some(span) = param.decided
+                && !interface
+            {
+                let diagnostic = Diagnostic::error(
+                    codes::DECIDED_TYPE,
+                    "only an interface's type parameter is decided by its implementations",
+                    span,
+                    "`type` here",
+                )
+                .with_note("`interface Iterator<type Item>` says each implementation decides `Item`; a struct's, an enum's and a function's parameters are given where they are used");
+                self.report(diagnostic);
+            }
             defs.push(GenericParamDef {
+                decided: interface && param.decided.is_some(),
                 name: param.name.sym,
                 written: param.name.sym,
                 interfaces: Vec::new(),
@@ -176,6 +238,8 @@ impl<'a> Lowerer<'a> {
                     }
                 }
             }
+            // Seen by the parameters after it: `J: Iterator<I::Item>`.
+            self.type_params[outer + i].interfaces = interfaces.clone();
             defs[i].interfaces = interfaces;
         }
         self.type_params.truncate(outer);
@@ -193,7 +257,9 @@ impl<'a> Lowerer<'a> {
         constrained: Ty,
     ) -> crate::TyList {
         let generics = self.program.interfaces[id].generics.clone();
-        if bound.args.len() < required_type_args(&generics) || bound.args.len() > generics.len() {
+        if bound.args.len() < required_constraint_args(&generics)
+            || bound.args.len() > generics.len()
+        {
             let name = self.program.interfaces[id].name;
             for &arg in &bound.args {
                 self.resolve_ty(arg);
@@ -225,11 +291,17 @@ impl<'a> Lowerer<'a> {
         let generics = self.program.interfaces[id].generics.clone();
         let mut args = written;
         while args.len() < generics.len() {
-            let ty = match generics[args.len()].default {
+            let index = args.len();
+            let ty = match generics[index].default {
                 ParamDefault::Ty(default) => {
                     let mut known = vec![implementing];
                     known.extend(args.iter().copied());
                     self.program.types.subst(default, &known)
+                }
+                // Left out of a constraint, a decided type is what the
+                // implementation decides: `I::Item`.
+                ParamDefault::None if generics[index].decided => {
+                    self.program.types.assoc(implementing, id, index as u32)
                 }
                 ParamDefault::Pending | ParamDefault::None => Types::ERROR,
             };
@@ -331,10 +403,18 @@ impl<'a> Lowerer<'a> {
         for (&arg, param) in args.iter().zip(&generics) {
             let ty = self.type_arg(arg);
             self.check_copy(ty, param, self.ast.types[arg].span);
-            self.check_constraints(ty, param, self.ast.types[arg].span);
             tys.push(ty);
         }
         let tys = self.with_defaults(&generics, tys, span);
+        // Each written argument's constraints, read with every argument
+        // known: `J: Iterator<I::Item>` is about the `I` given beside it.
+        for ((&arg, param), &ty) in args.iter().zip(&generics).zip(&tys) {
+            if tys.len() == generics.len() {
+                self.check_constraints_in(ty, param, self.ast.types[arg].span, &tys);
+            } else {
+                self.check_constraints(ty, param, self.ast.types[arg].span);
+            }
+        }
         if tys.iter().any(|&t| self.has_error(t)) {
             return Types::ERROR;
         }
@@ -424,6 +504,7 @@ impl<'a> Lowerer<'a> {
         self.phase = Phase::TypesResolved;
         for (ty, name, span) in std::mem::take(&mut self.pending_copy) {
             let param = GenericParamDef {
+                decided: false,
                 name,
                 written: name,
                 copy: true,
@@ -659,9 +740,11 @@ impl<'a> Lowerer<'a> {
             (TyKind::Enum(a, d), TyKind::Enum(b, f)) if a == b => {
                 self.unify_lists(d, f, solution);
             }
-            // A function value converts to a closure lent for a call, so a
-            // lent closure's types are learnt from one.
-            (TyKind::Ref(d, _), TyKind::Fn(..)) if matches!(types.kind(d), TyKind::Fn(..)) => {
+            // A function value converts to a closure, lent for a call or
+            // owned, so a closure's types are learnt from one.
+            (TyKind::Ref(d, _) | TyKind::Own(d), TyKind::Fn(..))
+                if matches!(types.kind(d), TyKind::Fn(..)) =>
+            {
                 self.unify(d, found, solution);
             }
             (TyKind::Fn(d, d_ret), TyKind::Fn(f, f_ret)) => {
@@ -1109,6 +1192,15 @@ impl<'a> Lowerer<'a> {
 /// no default. A `static fn`'s own parameters follow its type's, so a
 /// default of the type's is left out only where the function has none of
 /// its own.
+/// How many type arguments a constraint must give an interface: those
+/// before the decided ones, but for those with defaults.
+pub(super) fn required_constraint_args(generics: &[GenericParamDef]) -> usize {
+    generics
+        .iter()
+        .rposition(|p| !p.decided && p.default == ParamDefault::None)
+        .map_or(0, |last| last + 1)
+}
+
 pub(super) fn required_type_args(generics: &[GenericParamDef]) -> usize {
     generics
         .iter()

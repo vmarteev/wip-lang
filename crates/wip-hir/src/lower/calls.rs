@@ -273,26 +273,8 @@ impl<'a> Lowerer<'a> {
         let explicit =
             self.explicit_type_args(name_sym, &generics, item.type_args, item.name_segment);
         let mut inference = Inference::new(explicit);
-        // A `static fn` reached through a type alias knows what the
-        // type's own parameters are.
-        if let Some(owner_ty) = item.owner_ty
-            && let Some(owner) = self.program.owner_of_fn(callee)
-        {
-            let params: Vec<Ty> = generics
-                .iter()
-                .enumerate()
-                .map(|(index, param)| {
-                    self.intern(TyKind::Param(crate::ty::TyParam {
-                        index: index as u32,
-                        name: param.name,
-                        copy: param.copy,
-                    }))
-                })
-                .collect();
-            let list = self.program.types.intern_list(&params);
-            if let Some(declared) = self.program.type_of(owner, list) {
-                self.unify(declared, owner_ty, &mut inference.tys);
-            }
+        if let Some(owner_ty) = item.owner_ty {
+            self.owner_type_args(callee, &generics, owner_ty, &mut inference);
         }
         // A call through a constraint knows the interface's own types, which
         // the constraint carries: `C: At<i64, T>` says what `at` takes and what
@@ -341,6 +323,8 @@ impl<'a> Lowerer<'a> {
         {
             self.unify(ret, hint, &mut inference.tys);
         }
+        let params = self.program.fns[callee].params[taken..].to_vec();
+        self.swapped_arguments(&params, args, &item.arg_names(), name);
         // Defaults that are code, called with this call's type arguments
         // once they are known.
         let defaults = self.state.unsettled_defaults.len();
@@ -936,16 +920,48 @@ impl<'a> Lowerer<'a> {
         }
         match args {
             Some(_) => self.call(id, used),
-            None => self.fn_value(id, used),
+            None => self.fn_value(id, used, None),
+        }
+    }
+
+    /// A function of a type reached through an alias of the type knows
+    /// what the type's own parameters are: they are inferred from the type
+    /// the alias names.
+    pub(super) fn owner_type_args(
+        &mut self,
+        id: FnId,
+        generics: &[GenericParamDef],
+        owner_ty: Ty,
+        inference: &mut Inference,
+    ) {
+        let Some(owner) = self.program.owner_of_fn(id) else {
+            return;
+        };
+        let params: Vec<Ty> = generics
+            .iter()
+            .enumerate()
+            .map(|(index, param)| {
+                self.intern(TyKind::Param(crate::ty::TyParam {
+                    index: index as u32,
+                    name: param.name,
+                    copy: param.copy,
+                }))
+            })
+            .collect();
+        let list = self.program.types.intern_list(&params);
+        if let Some(declared) = self.program.type_of(owner, list) {
+            self.unify(declared, owner_ty, &mut inference.tys);
         }
     }
 
     /// A function named as a value: its address, of a function type.
     /// A generic function takes its type arguments from
     /// those written after its name, or from the function type expected.
-    pub(super) fn fn_value(&mut self, id: FnId, item: ItemUse<'a>) -> ExprId {
+    /// `shown` is how it was written where that is more than its name,
+    /// `Shape::area`, for what is reported.
+    pub(super) fn fn_value(&mut self, id: FnId, item: ItemUse<'a>, shown: Option<&str>) -> ExprId {
         let def = &self.program.fns[id];
-        let name = self.text(def.name);
+        let name = shown.map_or_else(|| self.text(def.name).to_string(), str::to_string);
         let (name_sym, ret, span) = (def.name, def.ret, item.span);
         // `@inline` promises that every call is spliced, and a call through
         // a value has no callee to splice.
@@ -965,6 +981,22 @@ impl<'a> Lowerer<'a> {
             self.report(diagnostic);
             return self.error_expr(span);
         }
+        // What the compiler writes where it is called has no code of its
+        // own to be the address of.
+        if def.intrinsic.is_some() {
+            let diagnostic = Diagnostic::error(
+                codes::NOT_A_VALUE,
+                format!("`{name}` is written where it is called, and is not a value"),
+                span,
+                "no code of its own",
+            )
+            .with_note(
+                "the compiler writes its body at each call, so there is no function to hand over",
+            )
+            .with_help("write a lambda that calls it");
+            self.report(diagnostic);
+            return self.error_expr(span);
+        }
         if matches!(self.kind(ret), TyKind::Ref(..)) {
             let diagnostic = Diagnostic::error(
                 codes::NOT_A_VALUE,
@@ -972,9 +1004,8 @@ impl<'a> Lowerer<'a> {
                 span,
                 "lends a place",
             )
-            .with_note(
-                "a projection lends a place to its caller; a function value returns a value",
-            );
+            .with_note("a projection lends a place to its caller; a function value returns a value")
+            .with_help("write a lambda that calls it");
             self.report(diagnostic);
             return self.error_expr(span);
         }
@@ -985,13 +1016,26 @@ impl<'a> Lowerer<'a> {
         let explicit =
             self.explicit_type_args(name_sym, &generics, item.type_args, item.name_segment);
         let mut inference = Inference::new(explicit);
+        if let Some(owner_ty) = item.owner_ty {
+            self.owner_type_args(id, &generics, owner_ty, &mut inference);
+        }
+        // Where a closure is wanted, lent or owned, the function it would be
+        // lent as is what says the types.
         if let Some(hint) = item.hint {
-            self.unify(ty, hint, &mut inference.tys);
+            let wanted = match self.kind(hint) {
+                TyKind::Ref(inner, _) | TyKind::Own(inner)
+                    if matches!(self.kind(inner), TyKind::Fn(..)) =>
+                {
+                    inner
+                }
+                _ => hint,
+            };
+            self.unify(ty, wanted, &mut inference.tys);
         }
         let mut type_args = crate::TyList::EMPTY;
         if !generics.is_empty() {
             let written = format!("{name}<{}>", vec!["…"; generics.len()].join(", "));
-            let tys = self.finish_type_args(name, &written, &generics, inference, span);
+            let tys = self.finish_type_args(&name, &written, &generics, inference, span);
             type_args = self.program.types.intern_list(&tys);
             ty = self.program.types.subst(ty, &tys);
         }

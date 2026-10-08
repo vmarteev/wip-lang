@@ -49,6 +49,10 @@ pub struct Program {
     pub enums: Arena<EnumDef>,
     /// Wip functions and extern declarations, in source order.
     pub fns: Arena<FnDef>,
+    /// The functions the program uses as values, each an instance once
+    /// the generic ones are made: any of them may be handed to C as a
+    /// function pointer, and called by it.
+    pub fn_values: FxHashSet<FnId>,
     /// Whether moves leave poison and drops check for it:
     /// a debug build does, a release build does not. The
     /// build says so before the program is compiled.
@@ -88,6 +92,10 @@ pub struct Program {
     /// The environment of a closure made from a named function: a struct
     /// with nothing in it, shared by all of them.
     pub fn_closure_env: Option<StructId>,
+    /// The environment of an owned closure made from a named function: a
+    /// struct with nothing in it but the function that drops it, which every
+    /// owned closure's environment begins with.
+    pub fn_owned_closure_env: Option<StructId>,
     /// The writing halves of `lend fn`s, whose bodies are the reading
     /// halves' checked again with `self` a `&var Self`.
     pub lent_halves: rustc_hash::FxHashSet<FnId>,
@@ -131,6 +139,13 @@ pub enum Named {
 }
 
 impl Program {
+    /// Whether `ty` is the prelude's `String`, which text patterns and `==`
+    /// treat as the text it holds.
+    pub fn is_string(&self, ty: Ty) -> bool {
+        matches!(self.types.kind(ty), TyKind::Struct(id, _)
+            if Some(id) == self.prelude_items.structure(crate::KnownStruct::String))
+    }
+
     /// The type as it is written in source, for diagnostics.
     pub fn ty_name(&self, ty: Ty, interner: &Interner) -> String {
         self.name_of(ty, interner, false)
@@ -199,6 +214,15 @@ impl Program {
             TyKind::Dyn(id, args) => {
                 let name = format!("dyn {}", interner.resolve(self.interfaces[id].name));
                 self.args_of(&name, args, interner, symbol)
+            }
+            // `I::Item`: the type, and the interface's name for its
+            // parameter.
+            TyKind::Assoc(base, id, index) => {
+                let param = self.interfaces[id]
+                    .generics
+                    .get(index as usize)
+                    .map_or("?", |p| interner.resolve(p.name));
+                format!("{}::{param}", self.name_of(base, interner, symbol))
             }
             // A tuple is the prelude's struct, and prints as the tuple it
             // was written as.
@@ -447,6 +471,9 @@ impl Program {
             match types.kind(ty) {
                 TyKind::Own(_) | TyKind::Slots(_) | TyKind::Error => false,
                 TyKind::Param(param) => param.copy,
+                // What an implementation decides is anything, as an
+                // unconstrained parameter is.
+                TyKind::Assoc(..) => false,
                 TyKind::Ref(_, crate::RefKind::Var) => false,
                 TyKind::Ref(inner, _) => !matches!(types.kind(inner), TyKind::Fn(..)),
                 TyKind::Struct(id, args) => {
@@ -584,6 +611,7 @@ impl Program {
                 // A block of slots frees itself.
                 TyKind::Own(_) | TyKind::Slots(_) => true,
                 TyKind::Param(param) => !param.copy,
+                TyKind::Assoc(..) => true,
                 TyKind::Struct(..) => {
                     seen.insert(ty)
                         && program
@@ -612,6 +640,10 @@ impl Program {
 pub struct GenericParamDef {
     /// The name the parameter was declared with, which its type carries.
     pub name: Symbol,
+    /// An interface's parameter declared `type`: each implementation
+    /// decides it, so it is not part of which implementation one is, and a
+    /// constraint may leave it out.
+    pub decided: bool,
     /// The name it is written under here: an `extend` block may rename the
     /// type's parameters, and they are the same parameters.
     pub written: Symbol,
@@ -661,6 +693,12 @@ pub struct InterfaceDef {
     /// `@oneOf(toString, appendTo)`: groups of methods with defaults, of
     /// each of which an implementation writes one at least.
     pub one_of: Vec<OneOf>,
+    /// `extend Iterator<T: Ord> { move fn max() … }`: the methods every
+    /// implementer has where the interface's types meet the block's
+    /// condition. Each is generic as a default is, in `Self` and then the
+    /// interface's types, which carry the condition as their constraints;
+    /// none is in the interface's table, and no implementation writes one.
+    pub extensions: Vec<FnId>,
     /// The module that declares it, and whether it is exported.
     pub module: u32,
     pub is_pub: bool,
@@ -738,6 +776,8 @@ pub enum BuiltinOwner {
     Slice,
     /// `Slots<T>`, the prelude's uninitialized storage.
     Slots,
+    /// `void`, whose one value compares, hashes and is written.
+    Void,
 }
 
 impl BuiltinOwner {
@@ -752,6 +792,7 @@ impl BuiltinOwner {
             TyKind::Cstring => Some(BuiltinOwner::Cstring),
             TyKind::Slice(_) => Some(BuiltinOwner::Slice),
             TyKind::Slots(_) => Some(BuiltinOwner::Slots),
+            TyKind::Unit => Some(BuiltinOwner::Void),
             _ => None,
         }
     }
@@ -768,6 +809,7 @@ impl BuiltinOwner {
             BuiltinOwner::Cstring => "cstring".to_string(),
             BuiltinOwner::Slice => "slice".to_string(),
             BuiltinOwner::Slots => "Slots".to_string(),
+            BuiltinOwner::Void => "void".to_string(),
         }
     }
 }
@@ -938,6 +980,10 @@ pub struct FnDef {
     pub intrinsic: Option<Intrinsic>,
     /// `None` for extern functions, and until the body has been checked.
     pub body: Option<Body>,
+    /// What `from` after the result type says it borrows, where it says:
+    /// the result borrows those and nothing else, and the body is held to
+    /// it.
+    pub lends_from: Option<Vec<LendFrom>>,
     /// A projection lends a place that belongs to one of its reference
     /// parameters, or to a constant table.
     /// Once the body has been checked, this says which; a projection's
@@ -981,6 +1027,13 @@ pub enum Intrinsic {
     /// `Slots::takeFrom(&var buffer)`: a buffer's block as slots, all of
     /// which hold values; the buffer is left empty.
     SlotsTakeFrom,
+    /// `Slots::over(elements)`: slots over elements they do not own, the
+    /// same pointer and count, for a `String` that is never dropped.
+    SlotsOver,
+    /// `slots.release()`: the slots are left holding no block, and the
+    /// block is not freed: what slots over elements they do not own end
+    /// with.
+    SlotsRelease,
     /// `str::fromBytes(bytes)`: the bytes, seen as text. A `str` and a
     /// `&[u8]` are the same pair — a pointer and a length — so this copies
     /// it and says nothing about what the bytes mean.
@@ -1007,6 +1060,12 @@ pub enum Intrinsic {
     /// `x.swapBytes()`, `x.reverseBits()`: an integer's bits, one
     /// instruction each.
     IntCountOnes,
+    /// `x.addOverflows(y)`, `x.subOverflows(y)`, `x.mulOverflows(y)`:
+    /// whether the answer does not fit, for the methods that answer
+    /// nothing or a limit instead of panicking.
+    IntAddOverflows,
+    IntSubOverflows,
+    IntMulOverflows,
     IntLeadingZeros,
     IntTrailingZeros,
     IntSwapBytes,
@@ -1238,6 +1297,17 @@ impl ConstValue {
             | ConstValue::Str(_) => false,
         }
     }
+}
+
+/// One thing `from` names a function's result as borrowing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LendFrom {
+    /// The parameter, by its index: the place a reference refers to, and
+    /// what it borrows.
+    Param(u32),
+    /// What the parameter borrows, and not its place: `self.ast`, a view's
+    /// `&` field, which points outside the view.
+    Borrowed(u32),
 }
 
 #[derive(Debug, Clone)]
@@ -1538,6 +1608,10 @@ pub enum ExprKind {
     Deref(ExprId),
     /// `&expr`: a reference to a place, or to a temporary.
     Ref(ExprId),
+    /// A temporary that is lent for its statement and never dropped: a
+    /// `String` over a `str`'s own bytes, `String::over(text)`, where a
+    /// `&String` is taken. Only ever what a `Ref` refers to.
+    Undropped(ExprId),
     Move(ExprId),
     /// `own expr`: a heap allocation.
     Own(ExprId),
@@ -1701,6 +1775,7 @@ impl ExprKind {
             | ExprKind::Field { base: e, .. }
             | ExprKind::Deref(e)
             | ExprKind::Ref(e)
+            | ExprKind::Undropped(e)
             | ExprKind::Move(e)
             | ExprKind::Own(e)
             | ExprKind::ArrayRepeat { elem: e, .. }
@@ -1849,8 +1924,13 @@ pub enum Pattern {
         lo: Option<u128>,
         hi: Option<u128>,
     },
-    /// `.Round(..) | .Square(..)`: any one of them.
-    Any(Vec<Pattern>),
+    /// `.Round(..) | .Square(..)`: any one of them. Where they bind, each
+    /// binds the same locals, and `binding` numbers them within the body:
+    /// which one matched is kept under that number, to bind from.
+    Any {
+        alternatives: Vec<Pattern>,
+        binding: Option<u32>,
+    },
     /// `[first, ..rest]`: the elements of an array or a slice, `prefix`
     /// from its start and `suffix` from its end. With a
     /// `rest`, it matches as many elements as these name or more, and the
@@ -1860,6 +1940,10 @@ pub enum Pattern {
         rest: Option<SliceRest>,
         suffix: Vec<Binder>,
     },
+    /// A value that is a reference, tested through it: what it refers to
+    /// matches the pattern. Its bindings alias what they name there, to
+    /// read, and take nothing.
+    Deref(Box<Pattern>),
     Error,
 }
 
@@ -1939,7 +2023,13 @@ impl Pattern {
                 suffix.iter().for_each(|b| b.locals(out));
             }
             // Any one of several.
-            Pattern::Any(alternatives) => alternatives.iter().for_each(|p| p.locals(out)),
+            // Each binds the same locals.
+            Pattern::Any { alternatives, .. } => {
+                if let Some(first) = alternatives.first() {
+                    first.locals(out);
+                }
+            }
+            Pattern::Deref(inner) => inner.locals(out),
         }
     }
 }

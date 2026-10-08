@@ -42,6 +42,7 @@ impl Lowerer<'_> {
                 accesses: None,
                 is_variadic: false,
                 variadic_of: None,
+                lends_from: None,
                 is_lambda: false,
                 generator: None,
                 is_tailrec: false,

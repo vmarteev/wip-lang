@@ -271,8 +271,21 @@ pub enum Promoted {
 
 /// Whether a struct crosses by value, in either direction.
 pub fn by_value(program: &Program, def: &FnDef) -> bool {
-    let is_struct = |ty: Ty| matches!(program.types.kind(ty), TyKind::Struct(..));
+    let is_struct = |ty: Ty| crosses_as_struct(program, ty);
     is_struct(def.ret) || def.params.iter().any(|p| is_struct(p.ty))
+}
+
+/// Whether a value of `ty` crosses to C as a struct does, from memory: a
+/// struct, and a function pointer that may be null, `Option<(…) => R>`,
+/// which Wip keeps as an enum and lays out as the pointer alone. C passes
+/// and answers that as the one word it is, which is what a struct of one
+/// pointer comes to.
+pub fn crosses_as_struct(program: &Program, ty: Ty) -> bool {
+    match program.types.kind(ty) {
+        TyKind::Struct(..) => true,
+        TyKind::Enum(..) => program.nullable_function(ty),
+        _ => false,
+    }
 }
 
 /// How `def`'s parameters and result travel on `arch`, or `None` where a
@@ -285,7 +298,7 @@ pub fn classify(
 ) -> Option<CCall> {
     let mut regs = Registers::new(arch);
     let ret = match program.types.kind(def.ret) {
-        TyKind::Struct(..) => {
+        _ if crosses_as_struct(program, def.ret) => {
             let layout = layouts.of(program, def.ret);
             let leaves = leaves_of(program, layouts, def.ret)?;
             if layout.size == 0 {
@@ -309,7 +322,7 @@ pub fn classify(
     for param in &def.params {
         let ty = param.ty;
         let pass = match program.types.kind(ty) {
-            TyKind::Struct(..) => {
+            _ if crosses_as_struct(program, ty) => {
                 let layout = layouts.of(program, ty);
                 let leaves = leaves_of(program, layouts, ty)?;
                 if layout.size == 0 {

@@ -20,7 +20,9 @@ impl Llvm<'_> {
         }
         let name = self.program.ty_name(ty, self.interner);
         let node = match self.kind(ty) {
-            TyKind::Unit | TyKind::Never | TyKind::Error | TyKind::Param(_) => None,
+            TyKind::Unit | TyKind::Never | TyKind::Error | TyKind::Param(_) | TyKind::Assoc(..) => {
+                None
+            }
             TyKind::Int(t) => {
                 let encoding = match t.signed() {
                     true => "DW_ATE_signed",

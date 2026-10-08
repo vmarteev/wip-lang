@@ -48,6 +48,28 @@ fn main() = {
 A name at the call is checked against the parameter's, so a call that names
 the wrong one is refused rather than passed along.
 
+An argument by position goes where its position says, whatever it is
+called. So `draw(height, width)`, for `draw(width: i64, height: i64)`, puts
+the height in `width`, and nothing on the line says so: it is a warning
+(E0361), wherever two arguments or more are the parameters' own names in
+each other's places. Where that is meant, the arguments are named, and
+the warning goes:
+
+```wip,run
+fn draw(width: i64, height: i64): i64 = width * 10 + height
+
+fn turned(width: i64, height: i64): i64 = draw(width: height, height: width)
+
+fn main() = {
+    assert(turned(2, 3) == 32)
+}
+```
+
+A variable named as another parameter, where that parameter is given
+something else, is not a swap, and is not reported: `binary(.Mul, rhs,
+size)`, for `binary(kind, lhs, rhs)`, puts `rhs` in `lhs` and a size in
+`rhs`.
+
 ## Methods
 
 Methods are declared in the type's own body or in an `extend` block for it;
@@ -93,6 +115,21 @@ A method is called with a dot; a `static fn` is called through the type,
 `Counter::by(3)`. A method may be `pub`, which exports it from the module
 as any other name is exported.
 
+A `var fn` changes the place it is called on, which must be one that can be
+written: a `var`, or one behind a `&var`. It may also be called on a value
+made where it is called, such as what a call answers. That value is lent
+`&var` for the call and ends with its statement, so what the method changed
+goes with it, and what it answers is what is wanted:
+
+```wip,run
+fn main() = {
+    val text = "first\nsecond"
+    // An iterator made to be asked for one value needs no name.
+    assert(text.lines().next() == .Some("first"))
+    assert(Vec::of(own [1, 2, 3]).pop() == .Some(3))
+}
+```
+
 ## Functions that yield
 
 A function that answers `Iterator<T>` and hands its values over with
@@ -131,22 +168,47 @@ fn main() = {
 }
 ```
 
-A method is not a value, and neither is a type's own function: `x.name` and
-`Type::name` are only called. Where a function is wanted, a lambda that calls
-it stands in for it:
+A type's function is a value too, written through the type, `Type::name`,
+as a function of a module is by its name. A `static fn` is the function it
+is; a method takes its receiver as its first parameter — `&Self`, `&var
+Self` or `Self`, as it declares — so the value is called as the method is
+called through its type:
 
-```wip,error=E0337
-fn applied(value: i64, f: (x: i64) => i64): i64 = f(value)
+```wip,run
+struct Shape {
+    side: i64
 
-struct Meters {
-    value: i64
-
-    static fn doubled(value: i64): i64 = value * 2
+    fn area(): i64 = self.side * self.side
 }
 
 fn main() = {
-    assert(applied(21, (x) => Meters::doubled(x)) == 42)
-    assert(applied(21, Meters::doubled) == 42)
+    val shapes = [Shape(side: 2), Shape(side: 3)]
+    assert(shapes.map(Shape::area) == Vec::of(own [4, 9]))
+    val area: (shape: &Shape) => i64 = Shape::area
+    assert(area(&shapes[1]) == 9)
+    val build: (text: str) => String = String::of
+    assert(build("bc") == "bc")
+}
+```
+
+A generic type's arguments come from the type expected, as a generic
+function's do, and where a type has one function of the name for each of
+two interfaces, `Meters::from`, the type expected says which. `x.name` is
+not a value, since it would hold `x`; and a projection, an `@inline`
+function, and one the compiler writes where it is called, as `str::len`,
+are not values either. Where one is wanted, a lambda that calls it stands
+in for it:
+
+```wip,error=E0337
+struct Grid {
+    cells: [i64; 4]
+
+    fn total(): i64 = self.cells[0] + self.cells[1]
+}
+
+fn main() = {
+    val grid = Grid(cells: [1, 2, 3, 4])
+    val bound = grid.total
 }
 ```
 
@@ -228,7 +290,22 @@ A lambda that captures where a plain function value is expected is refused,
 and says which name it captured. A closure that must outlive the call it is
 given to — one an iterator adapter keeps, or a struct holds — is written
 `own` at the call: `values.map(own (x) => x + step)`
-([page 10](10-library.md)).
+([page 10](10-library.md)). A named function goes where either kind of
+closure is expected, a module's or a type's, since it captures nothing: it
+is lent for a call, or owned with nothing to own:
+
+```wip,run
+fn double(x: i64): i64 = x * 2
+
+fn main() = {
+    val words = "a bc".split(" ").map(String::of).toVec()
+    assert(words == Vec::of(own [String::of("a"), String::of("bc")]))
+    val doubled = Vec::of(own [1, 2]).intoIterator().map(double).toVec()
+    assert(doubled == Vec::of(own [2, 4]))
+    val kept: own<(x: i64) => i64> = double
+    assert(kept(21) == 42)
+}
+```
 
 ## Generic functions
 

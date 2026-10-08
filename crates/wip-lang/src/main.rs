@@ -143,7 +143,8 @@ enum Command {
     /// Lay `.wip` files out in one way, from their syntax tree.
     /// Files named, and every `.wip` file under a
     /// directory named; with none, the current directory. `-` formats
-    /// standard input to standard output, as an editor wants.
+    /// standard input to standard output, as an editor wants. A file whose
+    /// leading comments include `// wip fmt: off` is left as written.
     Fmt {
         paths: Vec<PathBuf>,
         /// With `-`: the file standard input stands for, whose package
@@ -379,6 +380,11 @@ fn format_stdin(stdin_path: Option<&Path>, layout: &Layout, color: bool) -> Exit
         eprintln!("error: cannot read standard input: {err}");
         return ExitCode::from(1);
     }
+    // A file that asks to be left as written is given back as it came.
+    if wip_fmt::switched_off(&text) {
+        print!("{text}");
+        return ExitCode::SUCCESS;
+    }
     let file = stdin_path.map_or_else(|| PathBuf::from("<stdin>"), Path::to_path_buf);
     match format_text(&file, &text, layout, color) {
         Some(formatted) => {
@@ -390,7 +396,8 @@ fn format_stdin(stdin_path: Option<&Path>, layout: &Layout, color: bool) -> Exit
 }
 
 /// `wip fmt`: each file laid out as its package says, or
-/// as the command line does. A file that cannot be is left alone.
+/// as the command line does. A file that cannot be is left alone, and so is
+/// one that asks to be, which is said rather than passed over.
 fn format_files(paths: &[PathBuf], check: bool, layout: &Layout, color: bool) -> ExitCode {
     let roots: Vec<PathBuf> = if paths.is_empty() {
         vec![PathBuf::from(".")]
@@ -407,6 +414,7 @@ fn format_files(paths: &[PathBuf], check: bool, layout: &Layout, color: bool) ->
     }
     files.sort();
     let (mut changed, mut failed) = (0, 0);
+    let mut left = Vec::new();
     for file in &files {
         let text = match std::fs::read_to_string(file) {
             Ok(text) => text,
@@ -416,6 +424,10 @@ fn format_files(paths: &[PathBuf], check: bool, layout: &Layout, color: bool) ->
                 continue;
             }
         };
+        if wip_fmt::switched_off(&text) {
+            left.push(file);
+            continue;
+        }
         match format_text(file, &text, layout, color) {
             Some(formatted) if formatted == text => {}
             Some(formatted) => {
@@ -429,6 +441,19 @@ fn format_files(paths: &[PathBuf], check: bool, layout: &Layout, color: bool) ->
             }
             None => failed += 1,
         }
+    }
+    match left.as_slice() {
+        [] => {}
+        [one] => eprintln!(
+            "`{}` is left as written: it says `{}`",
+            one.display(),
+            wip_fmt::OFF
+        ),
+        many => eprintln!(
+            "{} files are left as written: each says `{}`",
+            many.len(),
+            wip_fmt::OFF
+        ),
     }
     if failed > 0 || (check && changed > 0) {
         ExitCode::from(1)
@@ -662,6 +687,7 @@ fn main() -> ExitCode {
                 let mut mir = wip_mir::lower_fn(program, &loaded.interner, def, body);
                 // What is compiled is what is dumped, `@inline` and all.
                 wip_mir::inline(program, &loaded.interner, &mut mir);
+                wip_mir::convert_c_bools(program, id, &mut mir);
                 wip_mir::simplify(program, &mut mir);
                 print!("{}", wip_mir::dump(program, &loaded.interner, &name, &mir));
             }

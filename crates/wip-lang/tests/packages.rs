@@ -441,6 +441,62 @@ fn standard_input_is_formatted_as_its_package_says() {
     assert!(stderr(&broken).contains("main.wip"), "{}", stderr(&broken));
 }
 
+/// A file whose leading comments say `// wip fmt: off` is left as written:
+/// a directory formatted or checked around it changes and lists nothing of
+/// it and says how many it left, a file named says so too, and standard
+/// input comes back as it went in, even where it does not parse.
+#[test]
+fn a_file_that_says_so_is_left_as_written() {
+    let dir = TempDir::new().expect("a temporary directory");
+    let root = dir.path();
+    let kept = "// Written by a tool.\n// wip fmt: off\n\nfn  kept( ) : i64 = 1\n";
+    let table = "// wip fmt: off\nval  TABLE = [1,2,  3]\n";
+    write(&root.join("kept.wip"), kept);
+    write(&root.join("table.wip"), table);
+    write(&root.join("main.wip"), "fn main() = {\nval x = 1\n}\n");
+    let read = |name: &str| std::fs::read_to_string(root.join(name)).expect("read");
+
+    let check = wip(root, &["fmt", "--check", "."]);
+    assert_eq!(check.status.code(), Some(1), "{}", stderr(&check));
+    assert_eq!(stdout(&check).trim(), "./main.wip");
+    assert!(
+        stderr(&check).contains("2 files are left as written: each says `// wip fmt: off`"),
+        "{}",
+        stderr(&check)
+    );
+
+    let formatted = wip(root, &["fmt", "."]);
+    assert!(formatted.status.success(), "{}", stderr(&formatted));
+    assert_eq!(read("main.wip"), "fn main() = {\n\tval x = 1\n}\n");
+    assert_eq!(
+        (read("kept.wip"), read("table.wip")),
+        (kept.to_string(), table.to_string())
+    );
+
+    let named = wip(root, &["fmt", "kept.wip"]);
+    assert!(named.status.success(), "{}", stderr(&named));
+    assert!(
+        stderr(&named).contains("`kept.wip` is left as written"),
+        "{}",
+        stderr(&named)
+    );
+
+    let unparsed = "// wip fmt: off\nfn main( = {\n";
+    let mut child = Command::new(env!("CARGO_BIN_EXE_wip"))
+        .current_dir(root)
+        .args(["fmt", "-", "--stdin-path", "main.wip"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("`wip` runs");
+    std::io::Write::write_all(&mut child.stdin.take().expect("stdin"), unparsed.as_bytes())
+        .expect("written");
+    let echoed = child.wait_with_output().expect("`wip` ends");
+    assert!(echoed.status.success(), "{}", stderr(&echoed));
+    assert_eq!(stdout(&echoed), unparsed);
+}
+
 #[test]
 fn a_format_wip_does_not_know_is_refused() {
     let said = refused(

@@ -189,6 +189,7 @@ impl<'a> Printer<'a> {
                         if let Some(ret) = f.sig.ret {
                             p.ty("ret", ret);
                         }
+                        p.lends_from(&f.sig.lends_from);
                         if let Some(body) = f.body {
                             p.expr("body", body);
                         }
@@ -223,6 +224,7 @@ impl<'a> Printer<'a> {
                             if let Some(ret) = method.sig.ret {
                                 p.ty("ret", ret);
                             }
+                            p.lends_from(&method.sig.lends_from);
                             if let Some(body) = method.default {
                                 p.expr("body", body);
                             }
@@ -305,6 +307,7 @@ impl<'a> Printer<'a> {
             if let Some(ret) = decl.sig.ret {
                 p.ty("ret", ret);
             }
+            p.lends_from(&decl.sig.lends_from);
             if let Some(body) = decl.body {
                 p.expr("body", body);
             }
@@ -331,13 +334,34 @@ impl<'a> Printer<'a> {
             if let Some(ret) = sig.ret {
                 p.ty("ret", ret);
             }
+            p.lends_from(&sig.lends_from);
         });
+    }
+
+    /// What `from` says the result borrows, one line each.
+    fn lends_from(&mut self, paths: &[LendPath]) {
+        for path in paths {
+            let mut text = match path.root {
+                Some(name) => self.sym(name.sym).to_string(),
+                None => "self".to_string(),
+            };
+            for field in &path.fields {
+                text.push('.');
+                text.push_str(self.sym(field.sym));
+            }
+            self.line("from", &text, path.span);
+        }
     }
 
     /// `<T, U: copy>` of a generic item.
     fn generics(&mut self, generics: &[GenericParam]) {
         for param in generics {
-            let mut text = format!("type param {}", self.sym(param.name.sym));
+            let decided = if param.decided.is_some() {
+                "decided "
+            } else {
+                ""
+            };
+            let mut text = format!("{decided}type param {}", self.sym(param.name.sym));
             if !param.bounds.is_empty() {
                 let bounds: Vec<&str> = param.bounds.iter().map(|b| self.sym(b.name.sym)).collect();
                 text.push_str(&format!(": {}", bounds.join(" + ")));

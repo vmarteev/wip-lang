@@ -137,6 +137,9 @@ struct Builder<'a> {
     /// zeroing says nothing about a type that cleans up after itself, so it
     /// says so here instead.
     temp_flags: FxHashMap<Local, Local>,
+    /// For each `|` that binds, by its number, which of its alternatives
+    /// matched: set where it is tested, read where its arm binds.
+    alternatives_matched: FxHashMap<u32, Local>,
     /// For a reference whose referent the body moves out — `move self` in
     /// a `var fn` — whether the referent holds a value: an assignment puts
     /// one back, and drops what was there only where there was one.
@@ -163,6 +166,12 @@ struct Builder<'a> {
     /// Where each scope being lowered ends, innermost last: what a
     /// variable declared now is seen until.
     seen_until: Vec<u32>,
+    /// What a place's expression computes, worked out where it is written:
+    /// each index, and what a projection is given but the place it lends
+    /// from. The place itself is found later — after the value of `=`, or
+    /// once a call's arguments are all worked out — and takes them from
+    /// here.
+    early: FxHashMap<ExprId, Value>,
 }
 
 /// Whether a build checks moves: a move leaves poison where it would leave
@@ -227,9 +236,11 @@ impl<'a> Builder<'a> {
             top: None,
             flags: ArenaMap::default(),
             temp_flags: FxHashMap::default(),
+            alternatives_matched: FxHashMap::default(),
             referent_flags: FxHashMap::default(),
             field_flags: FxHashMap::default(),
             referent_field_flags: FxHashMap::default(),
+            early: FxHashMap::default(),
             generator: None,
             check_moves: checking_moves(program),
             destroys: FxHashMap::default(),

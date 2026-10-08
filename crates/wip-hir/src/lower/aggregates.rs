@@ -243,10 +243,9 @@ impl<'a> Lowerer<'a> {
     }
 
     /// The fields a literal sets, each under its name, by a variant's rules:
-    /// with two or more fields each is named, a variable
-    /// with a field's name standing for `name: name`; a value by position
-    /// fills the field in its position, which is how a struct of one field
-    /// and a tuple are built. More of them than the struct has fields is
+    /// with two or more fields each is named; a value by position fills the
+    /// field in its position, which is how a struct of one field and a
+    /// tuple are built. More of them than the struct has fields is
     /// reported, and answers nothing.
     fn written_fields(
         &mut self,
@@ -1055,11 +1054,11 @@ impl<'a> Lowerer<'a> {
     }
 
     /// The name of the field each value of a variant or a struct is for.
-    /// With two or more fields, every value is named: a bare variable with a
-    /// field's name stands for `name: name`, as a pattern binds by name, and a
-    /// value by position is reported, with a fix that names it. It is then
-    /// taken as the field in its position, so that the rest of the literal is
-    /// still checked.
+    /// With two or more fields, every value is named, as a call's are where
+    /// they must be: a value by position is reported, with a fix that names
+    /// it — a variable with a field's name, that field; anything else, the
+    /// field in its position. It is then taken as the field in its position,
+    /// so that the rest of the literal is still checked.
     fn field_names(
         &mut self,
         path: &str,
@@ -1071,31 +1070,33 @@ impl<'a> Lowerer<'a> {
             return names;
         }
         let ast = self.ast;
-        let mut positional = Vec::new();
-        for (i, name) in names.iter_mut().enumerate() {
-            if name.is_some() {
-                continue;
-            }
-            let arg = &ast.exprs[args[i]];
-            match arg.kind {
-                ast::ExprKind::Name(sym) if fields.iter().any(|f| f.name == sym) => {
-                    *name = Some(ast::Name {
-                        sym,
-                        span: arg.span,
-                    });
-                }
-                _ => positional.push(i),
-            }
-        }
+        let positional: Vec<usize> = (0..names.len()).filter(|&i| names[i].is_none()).collect();
         if positional.is_empty() {
             return names;
         }
+        // The field each value is meant for: a variable named as one of the
+        // fields, that one; anything else, the first field nothing else
+        // names, in order.
+        let named_as = |i: usize| match ast.exprs[args[i]].kind {
+            ast::ExprKind::Name(sym) if fields.iter().any(|f| f.name == sym) => Some(sym),
+            _ => None,
+        };
+        let mut taken: Vec<Symbol> = names.iter().flatten().map(|n| n.sym).collect();
+        taken.extend(positional.iter().filter_map(|&i| named_as(i)));
+        let mut free = fields.iter().map(|f| f.name).filter(|f| !taken.contains(f));
+        let meant: FxHashMap<usize, Symbol> = positional
+            .iter()
+            .filter_map(|&i| Some((i, named_as(i).or_else(|| free.next())?)))
+            .collect();
+        let meant = |i: usize| meant.get(&i).copied();
         let edits: Vec<Edit> = positional
             .iter()
-            .filter(|&&i| i < fields.len())
-            .map(|&i| {
-                let field = self.text(fields[i].name);
-                Edit::insert(ast.exprs[args[i]].span.lo, format!("{field}: "))
+            .filter_map(|&i| {
+                let field = self.text(meant(i)?);
+                Some(Edit::insert(
+                    ast.exprs[args[i]].span.lo,
+                    format!("{field}: "),
+                ))
             })
             .collect();
         let first = ast.exprs[args[positional[0]]].span;
@@ -1105,15 +1106,15 @@ impl<'a> Lowerer<'a> {
             first,
             "a value without its field's name",
         )
-        .with_note("a variant or a struct with two or more fields names each one, and a variable with a field's name stands for `name: name`; with one field, a name is optional");
+        .with_note("a variant or a struct with two or more fields names each one, a variable of a field's name too; with one field, a name is optional");
         if edits.len() == positional.len() {
             diagnostic = diagnostic.with_fix("name the fields", edits);
         }
         self.report(diagnostic);
         for i in positional {
-            if let Some(field) = fields.get(i) {
+            if let Some(sym) = meant(i) {
                 names[i] = Some(ast::Name {
-                    sym: field.name,
+                    sym,
                     span: ast.exprs[args[i]].span,
                 });
             }

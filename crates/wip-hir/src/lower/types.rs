@@ -38,11 +38,118 @@ impl<'a> Lowerer<'a> {
         resolved
     }
 
+    /// `base::name`: the type an implementation decides under `name`, for
+    /// `base` a type parameter in scope — through its constraints, which
+    /// pin it or leave it to be decided — or a type this file names, through
+    /// its implementation. Nothing where `base` is neither, and the path is
+    /// a module's.
+    fn decided_type(&mut self, base: ast::Name, name: ast::Name) -> Option<Ty> {
+        let (base_ty, candidates) = if let Some(at) =
+            self.type_params.iter().position(|p| p.written == base.sym)
+        {
+            let ty = self.type_param(base.sym)?;
+            let mut found = Vec::new();
+            for constraint in self.type_params[at].interfaces.clone() {
+                let generics = &self.program.interfaces[constraint.interface].generics;
+                if let Some(index) = generics
+                    .iter()
+                    .position(|p| p.decided && p.name == name.sym)
+                {
+                    let arg = self.program.types.list(constraint.args).get(index).copied();
+                    found.push((constraint.interface, arg.unwrap_or(Types::ERROR)));
+                }
+            }
+            (ty, found)
+        } else {
+            let ty = match self.builtin(base.sym) {
+                Some(ty) => ty,
+                None => {
+                    let def = self
+                        .types()
+                        .get(&base.sym)
+                        .map(|&(def, _)| def)
+                        .or_else(|| self.imported_type(base))
+                        .or_else(|| self.prelude_type(base.sym))?;
+                    let generics = self.type_generics(def);
+                    if !generics.is_empty() {
+                        return None;
+                    }
+                    match def {
+                        TypeDef::Struct(id) => {
+                            self.intern(TyKind::Struct(id, crate::TyList::EMPTY))
+                        }
+                        TypeDef::Enum(id) => self.intern(TyKind::Enum(id, crate::TyList::EMPTY)),
+                        TypeDef::Builtin(_) => return None,
+                    }
+                }
+            };
+            let mut found = Vec::new();
+            let interfaces: Vec<crate::InterfaceId> =
+                self.program.interfaces.iter().map(|(id, _)| id).collect();
+            for interface in interfaces {
+                let generics = &self.program.interfaces[interface].generics;
+                if let Some(index) = generics
+                    .iter()
+                    .position(|p| p.decided && p.name == name.sym)
+                {
+                    let decided = self.program.types.assoc(ty, interface, index as u32);
+                    if !matches!(self.kind(decided), TyKind::Assoc(..)) {
+                        found.push((interface, decided));
+                    }
+                }
+            }
+            (ty, found)
+        };
+        let text = format!("{}::{}", self.text(base.sym), self.text(name.sym));
+        match found_one(&candidates) {
+            Ok(ty) => Some(ty),
+            Err(0) => {
+                let diagnostic = Diagnostic::error(
+                    codes::UNKNOWN_TYPE,
+                    format!("`{text}` is not a type"),
+                    base.span.to(name.span),
+                    format!("nothing decides `{}` for {}", self.text(name.sym), self.ty_name(base_ty)),
+                )
+                .with_note("`I::Item` is the type an implementation decides, where an interface declares it `type Item` and `I` implements it");
+                self.report(diagnostic);
+                Some(Types::ERROR)
+            }
+            Err(_) => {
+                let names: Vec<String> = candidates
+                    .iter()
+                    .map(|&(interface, _)| {
+                        format!("`{}`", self.text(self.program.interfaces[interface].name))
+                    })
+                    .collect();
+                let diagnostic = Diagnostic::error(
+                    codes::DECIDED_TYPE,
+                    format!("`{text}` is in question"),
+                    base.span.to(name.span),
+                    format!("{} each decide one", names.join(" and ")),
+                )
+                .with_help("name it a parameter of its own where the interface is written: `I: Iterator<T>`, and write `T`");
+                self.report(diagnostic);
+                Some(Types::ERROR)
+            }
+        }
+    }
+
     fn resolve_written(&mut self, id: ast::TypeId, pointee: bool) -> Ty {
         let ast = self.ast;
         let ty = &ast.types[id];
         match ty.kind {
             // A type from another module.
+            // `I::Item`: what an implementation decides, for a type
+            // parameter or a type.
+            ast::TypeKind::Path {
+                ref segments,
+                ref args,
+            } if segments.len() == 2
+                && args.is_empty()
+                && let Some(decided) = self.decided_type(segments[0], segments[1]) =>
+            {
+                decided
+            }
             ast::TypeKind::Path {
                 ref segments,
                 ref args,
@@ -592,5 +699,13 @@ impl<'a> Lowerer<'a> {
                 || (visited.insert(child)
                     && self.contains_by_value(child, target, visited, depth + 1))
         })
+    }
+}
+
+/// The one type the candidates agree on, or how many there are.
+fn found_one(candidates: &[(crate::InterfaceId, Ty)]) -> Result<Ty, usize> {
+    match candidates {
+        [(_, ty)] => Ok(*ty),
+        _ => Err(candidates.len()),
     }
 }

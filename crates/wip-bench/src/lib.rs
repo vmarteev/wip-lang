@@ -273,7 +273,7 @@ fn sum_to$k(n: i64): i64 = {
 
 fn boxed$k(seed: i64): own<Shape$k> = {
     val corner = Point$k(x: seed, y: seed + $c3)
-    own Shape$k::Square(corner, side: seed % $c4 + 1)
+    own Shape$k::Square(corner: corner, side: seed % $c4 + 1)
 }
 
 fn unit$k(seed: i64, count: &var i64): i64 = {

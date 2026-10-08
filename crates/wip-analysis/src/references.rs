@@ -16,9 +16,14 @@ fn into_payload(path: &Path, matched: &Path) -> bool {
 
 impl Checker<'_> {
     /// The arguments of a call, `params` in the order of the parameters of
-    /// `callee`, where it is known, evaluated in `order`. A reference
-    /// argument may not overlap a `&var` one (E0413), and must stay valid
-    /// while the later arguments are evaluated (E0414).
+    /// `callee`, where it is known, evaluated in `order`. A place lent to the
+    /// call is lent when the call begins, after every argument: what its
+    /// expression computes is checked where it is written, and what that
+    /// lends is held from there, so a later argument may change the place
+    /// but not its index or key (E0414). A value that borrows — a `str`, a
+    /// view, a closure — borrows where it is made, and must stay valid while
+    /// the later arguments are evaluated (E0414). No reference argument may
+    /// overlap a `&var` one (E0413).
     pub(super) fn call_args(
         &mut self,
         params: &[ExprId],
@@ -32,111 +37,114 @@ impl Checker<'_> {
         let mark = self.borrows.len();
         // The places the call may change, through its `&var` arguments.
         let mut changes: Vec<(Path, Span)> = Vec::new();
+        // The places lent when the call begins: each argument, and its place.
+        let mut lent: Vec<(ExprId, ExprId)> = Vec::new();
         for &arg in &args {
-            self.expr(arg, Ctx::Value, state);
             let body = self.body;
+            if let ExprKind::Ref(place) = body.exprs[arg].kind
+                && self.kept_reference_behind(place).is_none()
+                && self.place(place).is_none()
+            {
+                // A reference to what is no place of its own — a sub-slice,
+                // a temporary — is lent where it is made.
+                self.expr(arg, Ctx::Value, state);
+                let var = matches!(
+                    self.program.types.kind(body.exprs[arg].ty),
+                    TyKind::Ref(_, RefKind::Var)
+                );
+                let paths = self
+                    .access_path(place)
+                    .into_iter()
+                    .map(|p| (p, var))
+                    .collect();
+                self.lend_argument(arg, Some(place), paths, mark, &mut changes);
+                continue;
+            }
+            if let ExprKind::Ref(place) = body.exprs[arg].kind
+                && self.place(place).is_some()
+                && self.kept_reference_behind(place).is_none()
+            {
+                self.place_parts(place, state);
+                for (path, span, var) in self.operand_borrows(place, state) {
+                    self.borrows.push(Borrow {
+                        heap: false,
+                        path,
+                        span,
+                        var,
+                        holder: Holder::View,
+                    });
+                }
+                lent.push((arg, place));
+                continue;
+            }
+            self.expr(arg, Ctx::Value, state);
             let var = matches!(
                 self.program.types.kind(body.exprs[arg].ty),
                 TyKind::Ref(_, RefKind::Var)
             );
-            // The places the argument refers to: the one `&place` names, or
-            // those a reference chosen by an `if`, or kept in a variable,
-            // may point into; each with whether the call
-            // may write it.
-            let (place, paths): (Option<ExprId>, Vec<(Path, bool)>) = match body.exprs[arg].kind {
-                ExprKind::Ref(place) if self.kept_reference_behind(place).is_none() => (
-                    Some(place),
-                    self.access_path(place)
-                        .into_iter()
-                        .map(|p| (p, var))
-                        .collect(),
-                ),
-                _ if self.borrows_as_view(body.exprs[arg].ty)
-                    && !self.is_view(body.exprs[arg].ty) =>
-                {
-                    let roots = self.lent_roots(arg, Lends::ALL, state);
-                    (None, roots.paths.into_iter().map(|p| (p, var)).collect())
+            // The places a value argument refers to: those a reference chosen
+            // by an `if`, or kept in a variable, may point into, or a view's;
+            // each with whether the call may write it.
+            // A `str` or a view: what it borrows stays as it is until the
+            // call starts.
+            if self.is_view(body.exprs[arg].ty) {
+                let roots = self.lent_roots(arg, Lends::ALL, state);
+                for path in roots.paths {
+                    self.borrows.push(Borrow {
+                        heap: false,
+                        path,
+                        span: body.exprs[arg].span,
+                        var: false,
+                        holder: Holder::View,
+                    });
                 }
-                // A lent closure refers to what it captured, for as long as the
-                // call may call it: so it may not capture what the call is also
-                // given `&var`. A closure written here holds a `&var` to what
-                // it writes and a `&` to what it only reads, so it writes only
-                // the first.
-                _ if matches!(
-                    self.program.types.kind(body.exprs[arg].ty),
-                    TyKind::Ref(inner, _) if matches!(self.program.types.kind(inner), TyKind::Fn(..))
-                ) =>
-                {
-                    let captured = self.closure_captures(arg, state);
-                    let paths = match captured {
-                        Some(paths) => paths,
-                        None => {
-                            let roots = self.lent_roots(arg, Lends::ALL, state);
-                            roots.paths.into_iter().map(|p| (p, var)).collect()
-                        }
-                    };
-                    (None, paths)
-                }
-                _ => continue,
-            };
-            let span = body.exprs[arg].span;
-            for (path, var) in paths {
-                if var {
-                    changes.push((path.clone(), span));
-                }
-                // A `&var` argument could change what a `match` or `for`
-                // around the call refers into.
-                if var && let Some(place) = place {
-                    self.check_not_held(
-                        place,
-                        &path,
-                        ("borrow", " as `&var`"),
-                        span,
-                        "borrowed here",
-                        ..mark,
-                    );
-                }
-                let conflict = self.borrows[mark..]
-                    .iter()
-                    .find(|b| (var || b.var) && (path.within(&b.path) || b.path.within(&path)))
-                    .map(|b| (b.span, b.var));
-                if let Some((earlier, earlier_var)) = conflict {
-                    let label = |var: bool| {
-                        if var {
-                            "a `&var` reference"
-                        } else {
-                            "a `&` reference"
-                        }
-                    };
-                    let name = match place {
-                        Some(place) => self.display(place),
-                        None => self.root_name(&path),
-                    };
-                    let message = if var {
-                        format!(
-                            "`{name}` is passed as `&var` together with another reference to it"
-                        )
-                    } else {
-                        format!("`{name}` is passed together with a `&var` reference to it")
-                    };
-                    let diagnostic = Diagnostic::error(
-                        codes::CONFLICTING_REFERENCES,
-                        message,
-                        span,
-                        label(var),
-                    )
-                    .with_secondary(earlier, label(earlier_var))
-                    .with_note("while a function runs, a `&var` argument must be the only reference to its place");
-                    self.report(diagnostic);
-                }
-                self.borrows.push(Borrow {
-                    heap: false,
-                    path,
-                    span,
-                    var,
-                    holder: Holder::Argument,
-                });
+                continue;
             }
+            let paths: Vec<(Path, bool)> = if self.borrows_as_view(body.exprs[arg].ty) {
+                let roots = self.lent_roots(arg, Lends::ALL, state);
+                roots.paths.into_iter().map(|p| (p, var)).collect()
+            } else if matches!(
+                self.program.types.kind(body.exprs[arg].ty),
+                TyKind::Ref(inner, _) if matches!(self.program.types.kind(inner), TyKind::Fn(..))
+            ) {
+                // A lent closure refers to what it captured, for as long as
+                // the call may call it: so it may not capture what the call
+                // is also given `&var`. A closure written here holds a
+                // `&var` to what it writes and a `&` to what it only reads,
+                // so it writes only the first.
+                match self.closure_captures(arg, state) {
+                    Some(paths) => paths,
+                    None => {
+                        let roots = self.lent_roots(arg, Lends::ALL, state);
+                        roots.paths.into_iter().map(|p| (p, var)).collect()
+                    }
+                }
+            } else {
+                continue;
+            };
+            self.lend_argument(arg, None, paths, mark, &mut changes);
+        }
+        // The places, lent now: each must still be there, after what the
+        // arguments written after it did.
+        for (arg, place) in lent {
+            self.use_found(place, Ctx::Inspect, state);
+            // What it is found from must still be there: a later argument
+            // may have moved it.
+            if let Some(path) = self.access_path(place) {
+                let name = self.root_name(&path);
+                let span = self.body.exprs[place].span;
+                self.check_live(&path, &name, span, state);
+            }
+            let var = matches!(
+                self.program.types.kind(self.body.exprs[arg].ty),
+                TyKind::Ref(_, RefKind::Var)
+            );
+            let paths = self
+                .access_path(place)
+                .into_iter()
+                .map(|p| (p, var))
+                .collect();
+            self.lend_argument(arg, Some(place), paths, mark, &mut changes);
         }
         self.borrows.truncate(mark);
         // What the call changes, every `str` that borrows it is stale from
@@ -147,6 +155,77 @@ impl Checker<'_> {
             for (path, span) in changes {
                 self.changed(&path, span, "passed as `&var`", state);
             }
+        }
+    }
+
+    /// Holds what an argument lends for the call: `paths`, each with whether
+    /// the call may write it, are checked against what the call's other
+    /// arguments hold (E0413), and a `&var` place against a `match` or a
+    /// `for` around the call that refers into it.
+    fn lend_argument(
+        &mut self,
+        arg: ExprId,
+        place: Option<ExprId>,
+        paths: Vec<(Path, bool)>,
+        mark: usize,
+        changes: &mut Vec<(Path, Span)>,
+    ) {
+        let span = self.body.exprs[arg].span;
+        for (path, var) in paths {
+            if var {
+                changes.push((path.clone(), span));
+            }
+            // A `&var` argument could change what a `match` or `for`
+            // around the call refers into.
+            if var && let Some(place) = place {
+                self.check_not_held(
+                    place,
+                    &path,
+                    ("borrow", " as `&var`"),
+                    span,
+                    "borrowed here",
+                    ..mark,
+                );
+            }
+            let conflict = self.borrows[mark..]
+                .iter()
+                .filter(|b| b.holder != Holder::View)
+                .find(|b| (var || b.var) && (path.within(&b.path) || b.path.within(&path)))
+                .map(|b| (b.span, b.var));
+            if let Some((earlier, earlier_var)) = conflict {
+                let label = |var: bool| {
+                    if var {
+                        "a `&var` reference"
+                    } else {
+                        "a `&` reference"
+                    }
+                };
+                let name = match place {
+                    Some(place) => self.display(place),
+                    None => self.root_name(&path),
+                };
+                let message = if var {
+                    format!("`{name}` is passed as `&var` together with another reference to it")
+                } else {
+                    format!("`{name}` is passed together with a `&var` reference to it")
+                };
+                let diagnostic = Diagnostic::error(
+                    codes::CONFLICTING_REFERENCES,
+                    message,
+                    span,
+                    label(var),
+                )
+                .with_secondary(earlier, label(earlier_var))
+                .with_note("while a function runs, a `&var` argument must be the only reference to its place");
+                self.report(diagnostic);
+            }
+            self.borrows.push(Borrow {
+                heap: false,
+                path,
+                span,
+                var,
+                holder: Holder::Argument,
+            });
         }
     }
 
@@ -263,10 +342,10 @@ impl Checker<'_> {
         let Some((borrowed, holder)) = self.borrows[borrows]
             .iter()
             .find(|b| match b.holder {
-                Holder::Assign { replace: true, .. } => b.path.within(&path) && b.path != path,
-                Holder::Argument | Holder::Assign { .. } => {
-                    path.within(&b.path) || b.path.within(&path)
-                }
+                Holder::Argument
+                | Holder::View
+                | Holder::Assign { .. }
+                | Holder::Operand { .. } => path.within(&b.path) || b.path.within(&path),
                 // Bindings may write into the payload they alias.
                 Holder::Match | Holder::Test | Holder::Guard | Holder::Loop => {
                     !into_payload(&path, &b.path) && (path.within(&b.path) || b.path.within(&path))
@@ -310,31 +389,35 @@ impl Checker<'_> {
             )
             .with_secondary(borrowed, "walked here; the loop's binding refers to its elements")
             .with_note("a `for` binding refers to the element itself, so what the loop walks must not change until the loop ends"),
-            Holder::Argument => Diagnostic::error(
+            Holder::Argument | Holder::View => Diagnostic::error(
                 codes::CHANGED_WHILE_BORROWED,
                 format!("cannot {verb} `{name}`{how} while an earlier argument borrows it"),
                 span,
                 label,
             )
             .with_secondary(borrowed, "borrowed here, until the call returns")
-            .with_note("arguments are evaluated left to right, and a reference argument must still be valid when the call starts"),
-            Holder::Assign {
-                target, compound, ..
-            } => {
+            .with_note("arguments are evaluated left to right, and what an argument borrows must stay as it is until the call starts"),
+            Holder::Assign { target } => {
                 let target_name = self.display(target);
-                let note = if compound {
-                    "`op=` finds its place and reads it before it computes the value, so the value must not change the place"
-                } else {
-                    "an assignment finds its place before it computes the value, so the value must not change what the place was found in"
-                };
                 Diagnostic::error(
                     codes::CHANGED_WHILE_BORROWED,
                     format!("cannot {verb} `{name}`{how} in the value assigned to `{target_name}`"),
                     span,
                     label,
                 )
-                .with_secondary(borrowed, "the place assigned, found before the value")
-                .with_note(note)
+                .with_secondary(borrowed, "the place, read before the value")
+                .with_note("`op=` reads its place before it computes the value, so the value must not change what the place is in")
+            }
+            Holder::Operand { target } => {
+                let target_name = self.display(target);
+                Diagnostic::error(
+                    codes::CHANGED_WHILE_BORROWED,
+                    format!("cannot {verb} `{name}`{how} in the value assigned to `{target_name}`"),
+                    span,
+                    label,
+                )
+                .with_secondary(borrowed, "taken here, before the value")
+                .with_note("the place's index or key is taken before the value, so the value must not change it")
             }
         };
         self.report(diagnostic);

@@ -26,6 +26,26 @@ pub(crate) const MAX_TYPE_DEPTH: u32 = 64;
 /// module makes the instances it uses. Instances are made in the order they are
 /// found, so the result does not depend on threads.
 pub fn instantiate(program: &mut Program, interner: &Interner) -> Vec<Diagnostic> {
+    let diagnostics = make_instances(program, interner);
+    program.fn_values = fn_values(program);
+    diagnostics
+}
+
+/// The functions some body uses as a value, by the instance it names.
+fn fn_values(program: &Program) -> FxHashSet<FnId> {
+    program
+        .fns
+        .iter()
+        .filter_map(|(_, def)| def.body.as_ref())
+        .flat_map(|body| body.exprs.iter())
+        .filter_map(|(_, expr)| match expr.kind {
+            ExprKind::FnRef { id, .. } => Some(id),
+            _ => None,
+        })
+        .collect()
+}
+
+fn make_instances(program: &mut Program, interner: &Interner) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
     // Nothing to make: no generic function, and no interface to build a table
     // of methods for.
@@ -232,8 +252,11 @@ pub fn instantiate(program: &mut Program, interner: &Interner) -> Vec<Diagnostic
             }
             let mut concrete = program.types.subst_list(*type_args, &args);
             // A call of an interface's method goes to the implementation for
-            // the type `Self` turned out to be.
-            if let Some(interface) = program.fns[*callee].interface {
+            // the type `Self` turned out to be. An extension's is the same
+            // for every implementer, and is made for `Self` as it is.
+            if let Some(interface) = program.fns[*callee].interface
+                && !program.interfaces[interface].extensions.contains(callee)
+            {
                 let mut tys = program.types.list(concrete).to_vec();
                 // A `&T` is answered by `T`'s implementation, given what the
                 // references point to, and is copied as a view is.

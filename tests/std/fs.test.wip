@@ -7,6 +7,7 @@ import std::io
 import std::net::{Listener}
 import std::path
 import std::process::{Command, Exit}
+import std::process
 
 /// Where the tests write: a directory beside the program, made once.
 val SCRATCH: str = "target/fs-tests"
@@ -209,4 +210,108 @@ fn fsSaysWhatSpecialFilesAre() = {
 	}
 	fs::removeFile(pipe.toStr())
 	fs::removeFile(socketPath.toStr())
+}
+
+// Every level of a path made at once, again without error, and refused
+// where a file is in the way; a tree removed whole, an empty directory
+// alone, and one with something in it refused.
+@test
+fn fsMakesEveryLevelAndRemovesATree() = {
+	val root = "\(scratch())/tree-\(process::id())"
+	assert(fs::makeDirs("\(root)/a/b/c").isOk())
+	assert(fs::makeDirs("\(root)/a/b/c").isOk(), "what is there already is no error")
+	assert(fs::writeFile("\(root)/a/b/file", "x").isOk())
+	assert(fs::makeDirs("\(root)/a/b/file/d") == .Err(.AlreadyExists), "a file in the way")
+	assert(fs::removeDir("\(root)/a/b").isErr(), "something in it")
+	assert(fs::removeDir("\(root)/a/b/c").isOk() && !fs::exists("\(root)/a/b/c"))
+	assert(fs::removeAll(root).isOk() && !fs::exists(root))
+	assert(fs::removeAll(root) == .Err(.NotFound))
+}
+
+// A file renamed in place of what was there, and copied with its bytes and
+// its permission bits.
+@test
+fn fsRenamesAndCopiesAFile() = {
+	val from = freshFile("rename-from")
+	val to = freshFile("rename-to")
+	assert(fs::writeFile(from, "moved").isOk() && fs::writeFile(to, "old").isOk())
+	assert(fs::rename(from, to).isOk() && !fs::exists(from))
+	assert(fs::readFile(to) == .Ok("moved"))
+	var big = String()
+	for i in 0..20000 {
+		big.push("line \(i)\n")
+	}
+	val copied = freshFile("copied")
+	assert(fs::writeFile(from, big).isOk())
+	assert(fs::copy(from, copied) == .Ok(big.len()), "more than one block")
+	assert(fs::readFile(copied).unwrap() == big)
+	assert(fs::meta(copied).unwrap().mode == fs::meta(from).unwrap().mode)
+	assert(fs::copy("\(scratch())/not-there", copied) == .Err(.NotFound))
+	fs::removeFile(from)
+	fs::removeFile(to)
+	fs::removeFile(copied)
+}
+
+// When a file last changed, to the nanosecond where the filesystem keeps
+// it; and the program's own directory, file and number.
+@test
+fn fsSaysWhenToTheNanosecondAndTheProgramWhereItIs() = {
+	val .Ok(about) = fs::meta("std/fs/fs.wip") else {
+		assert(false, "the module is there")
+		return
+	}
+	assert(about.modified > 0 && about.modifiedNanos >= 0 && about.modifiedNanos < 1000000000)
+	val .Ok(here) = process::currentDir() else {
+		assert(false, "the program runs somewhere")
+		return
+	}
+	assert(here.startsWith("/") && fs::exists("\(here)/std/fs/fs.wip"))
+	val .Ok(program) = process::executable() else {
+		assert(false, "the program is a file")
+		return
+	}
+	assert(program.startsWith("/") && fs::meta(program).unwrap().kind == .File)
+	assert(process::id() > 0)
+	assert(!io::isTerminal(.Input) || io::isTerminal(.Input), "an answer either way")
+}
+
+// Messages framed as the language server's are, a header and then exactly
+// the bytes it says, read line by line and then by count, across reads
+// of the file larger than one; and fewer than asked at the end.
+@test
+fn aReaderReadsExactlyWhatAHeaderSays() = {
+	val path = freshFile("framed")
+	var text = String()
+	var bodies: Vec<String> = Vec()
+	for i in 0..300 {
+		val body = "{\"id\":\(i),\"padding\":\"\("x".repeat(i))\"}"
+		text.push("Content-Length: \(body.len())\r\n\r\n\(body)")
+		bodies.push(move body)
+	}
+	assert(fs::writeFile(path, text).isOk())
+	var file = fs::File::open(path).unwrap()
+	for expected in bodies.forwards() {
+		var header = String()
+		assert(file.readLine(&var header) == .Ok(true))
+		val length = header.toStr().
+			stripPrefix("Content-Length: ").
+			unwrap().
+			trimEnd().
+			toInt().
+			unwrap()
+		var blank = String()
+		assert(file.readLine(&var blank) == .Ok(true) && blank == "\r")
+		var body = String()
+		assert(file.readExact(length, &var body) == .Ok(length))
+		assert(body == expected)
+	}
+	var rest = String()
+	assert(file.readExact(10, &var rest) == .Ok(0), "nothing left")
+	fs::removeFile(path)
+	val short = freshFile("short")
+	assert(fs::writeFile(short, "abc").isOk())
+	var three = fs::File::open(short).unwrap()
+	var got = String()
+	assert(three.readExact(5, &var got) == .Ok(3) && got == "abc", "fewer, at the end")
+	fs::removeFile(short)
 }

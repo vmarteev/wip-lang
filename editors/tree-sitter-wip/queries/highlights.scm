@@ -186,6 +186,8 @@
 
 "fn" @keyword.function
 
+"from" @keyword
+
 [
   "import"
 ] @keyword.import

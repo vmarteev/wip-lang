@@ -359,8 +359,34 @@ impl<'a> Lowerer<'a> {
         item: ItemUse<'a>,
     ) -> Option<ExprId> {
         let ty = self.ty_of(receiver);
-        let id = match self.method_of(owner, name.sym) {
+        // A type's own method wins; otherwise what its interfaces give it,
+        // which must be one interface's.
+        let mut unmet = None;
+        let found = match self.method_of(owner, name.sym) {
+            Some(id) if !self.through_an_interface(owner, id) => Some(id),
+            found => {
+                let (offered, missed) = self.offered(owner, ty, name.sym);
+                if distinct_interfaces(&offered) > 1 {
+                    let subject = self.type_name(owner).to_string();
+                    self.ambiguous_method(&offered, &subject, name);
+                    return Some(
+                        self.give_up(item.args.unwrap_or_default().iter().copied(), item.span),
+                    );
+                }
+                unmet = missed.first().copied();
+                found.or_else(|| offered.first().map(|o| o.method))
+            }
+        };
+        let id = match found {
             Some(id) => id,
+            // An extension of that name whose condition is not met.
+            None if unmet.is_some() => {
+                let subject = self.type_name(owner).to_string();
+                self.unmet_extension(unmet.expect("just tested"), &subject, name);
+                return Some(
+                    self.give_up(item.args.unwrap_or_default().iter().copied(), item.span),
+                );
+            }
             // A field of function type can be called; any
             // other name is a method that does not exist.
             None if self.field_named(owner, name.sym) => return None,
@@ -384,6 +410,31 @@ impl<'a> Lowerer<'a> {
                 // The argument is the `String` being built, which nothing
                 // else would report on.
                 return Some(self.give_up(std::iter::empty(), item.span));
+            }
+            // A number written to a precision or in a radix, of a type that
+            // is not that number, is reported for what the option asks.
+            None if Symbol::written()[2..].contains(&name.sym) => {
+                let type_name = self.type_name(owner).to_string();
+                let precision = name.sym == Symbol::written()[2];
+                let (message, label, note) = match precision {
+                    true => (
+                        format!("a precision is a float's, and this is `{type_name}`"),
+                        "not a float",
+                        "a precision is how many digits a float is written with after its point: `\\(seconds, precision: 3)`",
+                    ),
+                    false => (
+                        format!("a radix is an integer's, and this is `{type_name}`"),
+                        "not an integer",
+                        "a radix is the base an integer is written in: `\\(byte, radix: 16)`",
+                    ),
+                };
+                let diagnostic =
+                    Diagnostic::error(codes::INTERPOLATION_OPTION, message, name.span, label)
+                        .with_note(note);
+                self.report(diagnostic);
+                return Some(
+                    self.give_up(item.args.unwrap_or_default().iter().copied(), item.span),
+                );
             }
             None => {
                 let type_name = self.type_name(owner).to_string();
@@ -650,16 +701,23 @@ impl<'a> Lowerer<'a> {
             .get(param.index as usize)
             .map(|p| p.interfaces.clone())
             .unwrap_or_default();
-        let found = constraints.iter().find_map(|&constraint| {
-            let method = self.program.interfaces[constraint.interface]
-                .methods
-                .iter()
-                .find(|m| self.program.fns[m.id].name == name.sym)?;
-            Some((constraint, *method))
-        });
-        let Some((constraint, method)) = found else {
+        let subject = self.under_refs(ty);
+        let (offered, missed) = self.offered_by_constraints(subject, &constraints, name.sym);
+        if distinct_interfaces(&offered) > 1 {
+            let param_name = self.text(param.name).to_string();
+            self.ambiguous_method(&offered, &param_name, name);
+            return Some(self.give_up(item.args.unwrap_or_default().iter().copied(), item.span));
+        }
+        let Some(&found) = offered.first() else {
             if constraints.is_empty() {
                 return None;
+            }
+            if let Some(&unmet) = missed.first() {
+                let param_name = self.text(param.name).to_string();
+                self.unmet_extension(unmet, &param_name, name);
+                return Some(
+                    self.give_up(item.args.unwrap_or_default().iter().copied(), item.span),
+                );
             }
             let names: Vec<String> = constraints
                 .iter()
@@ -680,7 +738,7 @@ impl<'a> Lowerer<'a> {
             self.report(diagnostic);
             return Some(self.give_up(item.args.unwrap_or_default().iter().copied(), item.span));
         };
-        let kind = self.program.fns[method.id]
+        let kind = self.program.fns[found.method]
             .receiver
             .expect("an interface's method has a receiver");
         let Some(receiver) = self.receiver_expr(receiver, kind, name, false) else {
@@ -689,10 +747,21 @@ impl<'a> Lowerer<'a> {
         let item = ItemUse {
             receiver: Some(receiver),
             // What the constraint says the interface's own types are.
-            interface_args: constraint.args,
+            interface_args: found.args,
             ..item
         };
-        Some(self.call(method.id, item))
+        Some(self.call(found.method, item))
+    }
+
+    /// Whether a type's method is one an interface gives it: a default, or
+    /// the method an implementation writes.
+    fn through_an_interface(&self, owner: TypeDef, id: FnId) -> bool {
+        self.program.fns[id].owner.is_none()
+            || self
+                .program
+                .impls
+                .iter()
+                .any(|i| i.ty == owner && i.methods.contains(&id))
     }
 
     /// `x.clone()` of plain data: the prelude's `Clone::clone`, which the
@@ -809,7 +878,10 @@ impl<'a> Lowerer<'a> {
                 {
                     return Some(self.autoderef_to_ref(receiver));
                 }
-                if ref_kind == crate::RefKind::Var {
+                // A value made where it is called is lent `&var` for the
+                // call, and ends with its statement: what the method
+                // changed in it goes with it.
+                if ref_kind == crate::RefKind::Var && !self.made_here(place) {
                     self.require_writable(place, Writing::Borrow);
                 }
                 let ref_ty = self.intern(TyKind::Ref(ty, ref_kind));
@@ -902,8 +974,91 @@ impl<'a> Lowerer<'a> {
         Some(self.call(method.id, item))
     }
 
-    /// `Type::name` written where it is not called: a function of a type is
-    /// not a value yet, as a method is not.
+    /// `Type::name` not called: the function's value, a method's receiver its
+    /// first parameter. Among several of the name — `Meters::from`, for two
+    /// interfaces — the expected type says which.
+    fn type_fn_value(
+        &mut self,
+        candidates: &[FnId],
+        written: &str,
+        member: ast::Name,
+        item: ItemUse<'a>,
+    ) -> ExprId {
+        // A `lend fn` is its two halves, and lends a place, which no value
+        // does: it is refused as any projection is.
+        if candidates
+            .iter()
+            .any(|&id| matches!(self.kind(self.program.fns[id].ret), TyKind::Ref(..)))
+        {
+            return self.fn_value(candidates[0], item, Some(written));
+        }
+        let id = match candidates {
+            [only] => *only,
+            _ => {
+                let fits: Vec<FnId> = candidates
+                    .iter()
+                    .copied()
+                    .filter(|&id| item.hint.is_some_and(|hint| self.value_fits(id, hint)))
+                    .collect();
+                match fits[..] {
+                    [only] => only,
+                    _ => {
+                        let interfaces: Vec<String> = candidates
+                            .iter()
+                            .map(|&id| self.implemented_name(id))
+                            .collect();
+                        let diagnostic = Diagnostic::error(
+                            codes::NOT_A_METHOD,
+                            format!("`{written}` is more than one function"),
+                            member.span,
+                            "which one is not said",
+                        )
+                        .with_note(format!(
+                            "the type has one for each of {}; the type of the value expected says which",
+                            interfaces.join(" and ")
+                        ))
+                        .with_help(format!(
+                            "give the value a type, or write a lambda that calls `{written}(…)`"
+                        ));
+                        self.report(diagnostic);
+                        return self.error_expr(item.span);
+                    }
+                }
+            }
+        };
+        if !self.method_is_visible(id) {
+            let diagnostic = Diagnostic::error(
+                codes::PRIVATE_ITEM,
+                format!("`{written}` is not exported"),
+                member.span,
+                "not `pub`",
+            )
+            .with_note("a function of a type is used outside its module only if it is `pub`");
+            self.report(diagnostic);
+        }
+        self.fn_value(id, item, Some(written))
+    }
+
+    /// Whether the function's type is the type expected of it, or the type
+    /// a closure lent or owned would be made from.
+    fn value_fits(&self, id: FnId, hint: Ty) -> bool {
+        let def = &self.program.fns[id];
+        let params: Vec<Ty> = def.params.iter().map(|p| p.ty).collect();
+        let wanted = match self.kind(hint) {
+            TyKind::Ref(inner, _) | TyKind::Own(inner) => inner,
+            _ => hint,
+        };
+        let TyKind::Fn(wanted_params, wanted_ret) = self.kind(wanted) else {
+            return false;
+        };
+        let wanted_params = self.program.types.list(wanted_params);
+        params.len() == wanted_params.len()
+            && params.iter().zip(wanted_params).all(|(&a, &b)| a == b)
+            && def.ret == wanted_ret
+    }
+
+    /// `T::name` written where it is not called: a function a type
+    /// parameter's constraint answers is not a value yet.
     fn function_not_a_value(&mut self, id: FnId, written: &str, span: Span) -> ExprId {
         // The lambda that stands in for it takes what it takes, by the
         // names it gives them.
@@ -915,11 +1070,13 @@ impl<'a> Lowerer<'a> {
         let names = names.join(", ");
         let diagnostic = Diagnostic::error(
             codes::NOT_A_METHOD,
-            format!("`{written}` is a function of a type, and is not a value"),
+            format!("`{written}` is a function of a type parameter, and is not a value"),
             span,
             "not called",
         )
-        .with_note("a function of a type is not a value yet: it can only be called")
+        .with_note(
+            "what a type parameter's constraint answers is not a value yet: it can only be called",
+        )
         .with_help(format!("to call it, write `{written}(…)`"))
         .with_help(format!(
             "where a function is wanted, a lambda can call it: `({names}) => {written}({names})`"
@@ -1007,9 +1164,11 @@ impl<'a> Lowerer<'a> {
                 .push((type_name.span, Named::Owner(owner)));
         }
         let candidates = self.methods_named(owner, member.sym);
-        if let (Some(&first), None) = (candidates.first(), item.args) {
+        // Not called, it is the function itself, a method's receiver its
+        // first parameter.
+        if !candidates.is_empty() && item.args.is_none() {
             let written = format!("{}::{}", self.text(type_name.sym), self.text(member.sym));
-            return Some(self.function_not_a_value(first, &written, item.span));
+            return Some(self.type_fn_value(&candidates, &written, member, item));
         }
         let id = match candidates.len() {
             0 => return None,
@@ -1113,4 +1272,15 @@ impl<'a> Lowerer<'a> {
             TypeDef::Builtin(builtin) => builtin.text(),
         }
     }
+}
+
+/// How many interfaces offer a call's method.
+fn distinct_interfaces(offered: &[super::extensions::Offered]) -> usize {
+    let mut seen: Vec<InterfaceId> = Vec::new();
+    for offer in offered {
+        if !seen.contains(&offer.interface) {
+            seen.push(offer.interface);
+        }
+    }
+    seen.len()
 }

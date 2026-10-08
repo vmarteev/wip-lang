@@ -76,6 +76,7 @@ fn main() = {
     var made = Vec::of(own [3, 1, 2])
     made.sort()
     assert(made == Vec::of(own [1, 2, 3]))
+    assert(made[1..] == [2, 3])
     made.insert(0, 0)
     assert(made.remove(0) == 0)
     assert(made.swapRemove(0) == 1)
@@ -91,8 +92,11 @@ fn main() = {
 ```
 
 `at(i)` is the lending pair behind `v[i]`, `items()` lends the whole as a
-slice, `truncate`, `clear` and `reserve` are there, and a `Vec` ends what it
-holds when it ends.
+slice, and `v[a..b]` is a range of that slice, as an array's is. A
+container whose `x[i]` is a position and which lends its elements as one
+slice — a `Sequence` and an `Items` — is ranged so: a `Set` by the order
+its keys went in, and a type of a program's own. `truncate`, `clear` and
+`reserve` are there, and a `Vec` ends what it holds when it ends.
 
 Elements that are plain data are copied many at once, in one copy of the
 memory: `pushAll(items)` puts them at the end of a `Vec`,
@@ -135,18 +139,24 @@ fn main() = {
     val numbers = [3, 1, 4, 1, 5, 9]
     assert(numbers.map((n) => n * 2) == Vec::of(own [6, 2, 8, 2, 10, 18]))
     assert(numbers.filter((n) => n > 3) == Vec::of(own [4, 5, 9]))
-    assert(numbers.fold(0, (sum, n) => sum + n) == 23)
+    assert(numbers.fold(0, (sum, n) => sum + n) == 23 && numbers.sum() == 23)
     assert(numbers.find((n) => n > 3) == .Some(&4))
     assert(numbers.first() == .Some(&3) && numbers.max() == .Some(9))
     assert(numbers.take(2).len() == 2 && numbers.skip(4).len() == 2)
     assert(numbers.join(" ") == "3 1 4 1 5 9")
+    val words = ["pear", "fig", "plum"]
+    assert(words.minBy((w) => w.len()) == .Some(&"fig"))
 }
 ```
 
 `map`, `flatMap`, `fold`, `indexWhere` and `lastIndexWhere`, `take` and
 `skip` work on any elements, and `take` and `skip` lend a part of the slice
 rather than copy it. `find`, `first` and `last` answer the element by
-reference, for any elements. `filter`, `partition`, `min` and `max` copy the
+reference, for any elements, and so do `minBy` and `maxBy`, the element
+whose key is least or greatest, the first of equals. `sum` and `product`
+add up and multiply elements that implement `Add` and `Zero`, or
+`Multiply` and `One`, as every number does: nothing sums to zero and
+multiplies to one. `filter`, `partition`, `min` and `max` copy the
 elements they answer, so they are there for plain data; a vector of values
 that own memory keeps what it wants with `retain`. `join` writes each
 element as text, and `joinTo(&var out, separator)` writes them onto a
@@ -206,7 +216,8 @@ fn main() = {
 }
 ```
 
-`String::of(text)` copies a `str` into a new `String`; `toStr()` lends the
+`String::of(text)` copies a `str` into a new `String`, which text where a
+`String` is expected does without the call; `toStr()` lends the
 bytes back as a `str`; `toCstring()` makes the zero-terminated kind C wants
 ([page 11](11-c.md)).
 
@@ -231,9 +242,35 @@ fn main() = {
 }
 ```
 
+The other way round, text is lent as a `String` where a `&String` is taken:
+a `String` made over the text's own bytes, which allocates nothing and
+copies nothing, and which nothing can grow or free behind a `&`. So a map
+keyed by `String` is looked up by a literal or a `str`, without a copy of
+the key for every lookup. Where a `String` is taken by value, to be kept,
+the text is copied into one; where a `&var String` is taken, it is
+neither, since what the callee wrote would be lost.
+
+```wip,run
+import std::collections::{Map}
+
+fn main() = {
+    var counts: Map<String, i64> = Map()
+    for word in "the cat and the hat".split(" ") {
+        counts.atOrPut(word, 0) += 1
+    }
+    assert(counts.at("the") == 2 && !counts.contains("dog"))
+}
+```
+
 `stripPrefix` and `stripSuffix` answer the text with a prefix or a suffix
 taken off, and `splitOnce` the text either side of its first separator —
-or nothing, where it is not there:
+or nothing, where it is not there — and `rsplitOnce` of its last.
+`trimMatches`, `trimStartMatches` and `trimEndMatches` take a pattern off
+as many times as it is there; `rsplit` answers the pieces from the last,
+`splitn(count, separator)` at most so many, the last the rest, and
+`splitWhitespace()` the words between runs of white space. `toU64`,
+`toI128` and `toU128` read the numbers `toInt` is too narrow for, with the
+same `radix:`:
 
 ```wip,run
 fn main() = {
@@ -245,6 +282,25 @@ fn main() = {
         return
     }
     assert(name == "WIDTH" && value == "32")
+    assert("==title==".trimMatches("=") == "title")
+    assert("k=v=w".splitn(2, "=").toVec() == Vec::of(own ["k", "v=w"]))
+    assert(" a  b ".splitWhitespace().count() == 2)
+    assert("18446744073709551615".toU64().isOk())
+}
+```
+
+`replace(pattern, by:)` makes a new `String` with each occurrence of the
+pattern replaced, left to right and none overlapping another, or the first
+so many where `count: .Some(n)` says; an empty pattern panics, since
+nothing says where it would be. `repeat(times)` makes the text that many
+times over:
+
+```wip,run
+fn main() = {
+    assert("a-b-c".replace("-", by: "+") == "a+b+c")
+    assert("aaa".replace("aa", by: "b") == "ba")
+    assert("a-b-c".replace("-", by: "+", count: .Some(1)) == "a+b-c")
+    assert("ab".repeat(3) == "ababab" && "ab".repeat(0) == "")
 }
 ```
 
@@ -286,6 +342,21 @@ fn main() = {
 }
 ```
 
+What a character is, is Unicode's too: `isLetter()` for a letter of any
+script, `isNumeric()` for a number of any script — a digit, `Ⅻ`, `½` —
+and `isAlphanumeric()` for either. `isDigit()` is `0` to `9` alone, which
+is what a program reading a number asks, and `isAsciiLetter()` `a` to `z`
+and `A` to `Z`; `isAsciiAlphanumeric()`, `isAsciiUppercase()`,
+`isAsciiLowercase()` and `isHexDigit()` are what a lexer asks of ASCII.
+
+```wip,run
+fn main() = {
+    assert('é'.isLetter() && '中'.isLetter() && !'_'.isLetter())
+    assert('٣'.isNumeric() && !'٣'.isDigit())
+    assert("année2".chars().all((c) => c.isAlphanumeric()))
+}
+```
+
 ## Walking: `Items`, `Iterator` and the adapters
 
 A container that can be walked as a slice implements `Items<T>`, which is
@@ -317,26 +388,94 @@ fn main() = {
     var letters = "ab".chars().peekable()
     assert(letters.peek() == .Some(&'a') && letters.next() == .Some('a'))
 
-    // A slice walks through `walk()`, and from the end through
-    // `backwards()`, which lends each element where it lies.
+    // A slice walks through `walk()`, and through `forwards()` and
+    // `backwards()`, which lend each element where it lies.
     val numbers = [1, 2, 3, 4]
     assert(numbers.walk().skip(1).take(2).toVec() == Vec::of(own [2, 3]))
     assert(numbers.countWhere((n) => n > 2) == 2)
-    val names = Vec::of(own [String::of("a"), String::of("b")])
+    val names: Vec<String> = Vec::of(own ["a", "b"])
     var seen = String()
+    for (index, name) in names.forwards().enumerate() {
+        seen.push("\(index)\(name)")
+    }
     for name in names.backwards() {
         seen.push(name)
     }
-    assert(seen == "ba")
+    assert(seen == "0a1bba")
 }
 ```
 
-`walk()` hands out copies, so its elements are plain data; `backwards()`
-lends them, `&T`, so it walks any list, from the last element to the first.
+`walk()` hands out copies, so its elements are plain data, which is what
+`sum` and arithmetic on them want; `forwards()` and `backwards()` lend
+them, `&T`, so they walk any list, from the first element or from the last.
+
+The adapters are `map`, `filter`, `filterMap` — what a closure makes of
+an element, where it makes something — `flatMap`, `flatten` where the
+elements are iterators, `enumerate`, `take`,
+`takeWhile`, `skip`, `chain`, `zip` and `peekable`. The consumers are
+`count`, `toVec`, `toSet` where the elements hash, `find`, `findMap`,
+`position`, `nth`, `last`, `any`, `all`, `fold`, `forEach`, `minBy` and
+`maxBy`. `nth` passes over the elements before the one it answers, and the
+iterator goes on after it. A map is made of pairs by `Map::fromPairs`:
+
+```wip,run
+import std::collections::{Map}
+
+fn main() = {
+    val numbers = "1 x 22 y".split(" ").
+        filterMap(own (w) => w.toInt().toOption()).
+        toVec()
+    assert(numbers == Vec::of(own [1, 22]))
+    val letters = "ab cd".split(" ").flatMap(own (w) => w.chars()).toVec()
+    assert(letters.len() == 4 && letters[2] == 'c')
+    val words = "ab cd".split(" ").map(own (w) => w.chars()).flatten()
+    assert(words.count() == 4)
+    assert("12a3".chars().takeWhile(own (c) => c.isDigit()).count() == 2)
+    assert("a b".split(" ").chain("c".split(" ")).last() == .Some("c"))
+    assert("a b c".split(" ").position((w) => w == "c") == .Some(2))
+    var total = 0
+    "1 2 3".split(" ").forEach((w) => { total += w.toInt().unwrap() })
+    assert(total == 6)
+    val years = [30, 40]
+    val ages: Map<str, i64> = Map::fromPairs(
+        "ann bo".split(" ").zip(years.walk()),
+    )
+    assert(ages.at("bo") == 40)
+}
+```
 
 A slice also answers about itself directly: `indexOf` and `lastIndexOf`,
-`contains`, `minIndex`, `maxIndex`, `countWhere`, `isSorted`, `sort` and
-`sortBy`. A sorted one is searched by halves: `binarySearch(value)` answers
+`contains`, `minIndex`, `maxIndex`, `countWhere`, `isSorted`, and sorts in
+place: `sort`, `sortBy` an order given, `sortByKey` a key made of each.
+They are stable — equals stay in the order they came, so sorting by one
+key and then another orders by the second and, among equals, the first —
+and take a buffer of half the elements; `sortUnstable` and
+`sortUnstableBy` take none, and equals may change places. A `Vec`'s
+`dedup()` keeps the first of each run of equal neighbours, and
+`dedupBy(key)` of neighbours whose keys are equal:
+
+```wip,run
+struct Person {
+    name: String
+    age: i64
+}
+
+fn main() = {
+    var people: Vec<Person> = Vec::of(own [
+        Person(name: "cy", age: 30),
+        Person(name: "ann", age: 40),
+        Person(name: "bo", age: 30),
+    ])
+    people.sortByKey((p) => p.name.toString())
+    people.sortByKey((p) => p.age)
+    assert(people[0].name == "bo" && people[1].name == "cy")
+    var ages = people.forwards().map(own (p) => p.age).toVec()
+    ages.dedup()
+    assert(ages == Vec::of(own [30, 40]))
+}
+```
+
+A sorted one is searched by halves: `binarySearch(value)` answers
 `.Ok(i)` where the value is, or `.Err(i)` where it would go, and
 `binarySearchBy` takes a closure that says how an element stands to the one
 sought:
@@ -352,7 +491,21 @@ fn main() = {
 ```
 
 `count()` is an iterator's, and counts every element; a slice's length is
-`len()`.
+`len()`. Where its element adds up, an iterator has `sum`, where it
+multiplies `product`, and where it is ordered `min` and `max`, the first
+of equals, as a slice does ([page 8](08-interfaces.md)):
+
+```wip,run
+fn main() = {
+    val text = "wide 字\nab"
+    assert(text.chars().map(own (c) => c.width()).sum() == 9)
+    assert(text.lines().map(own (line) => line.len()).max() == .Some(8))
+    assert("pear fig plum".split(" ").min() == .Some("fig"))
+    val values = [3, 9, 4]
+    assert(values.walk().product() == 108)
+    assert(values.backwards().max() == .Some(&9))
+}
+```
 
 An iterator of a program's own is most easily a generator: a loop that
 yields where a value stands, or a function that answers `Iterator<T>`
@@ -516,6 +669,40 @@ it after `error: ` and exits with 1. A subcommand is a positional argument,
 after which the same `Arguments` reads its own options. The usage message
 is the program's own, written as text and printed where it matches `-h`.
 
+## Random numbers: `std::random`
+
+`Random` is a generator of numbers for what is not cryptography — a game's
+dice, a test's input, a shuffled deck. What it answers next follows from
+what it has answered, so it is not fit to make a key or a password.
+`Random::seeded(seed)` answers the same numbers on every machine and every
+run, for a test or a game played again; `Random::fromEntropy()` is seeded
+by the system, and differs on every run:
+
+```wip,run
+import std::random::{Random}
+
+fn main() = {
+    var rng = Random::seeded(42)
+    val roll = rng.below(6) + 1
+    assert(roll >= 1 && roll <= 6)
+    val point = rng.inRange(-10, 10)
+    assert(point >= -10 && point < 10)
+    val chance = rng.float()
+    assert(chance >= 0.0 && chance < 1.0)
+    var deck = [1, 2, 3, 4, 5]
+    rng.shuffle(&var deck)
+    var again = Random::seeded(42)
+    assert(again.below(6) + 1 == roll, "the same seed, the same numbers")
+}
+```
+
+`below(count)` is a number from 0 up to the count, and `inRange(low, high)`
+one from `low` up to `high`, leaving `high` out as a range does; each
+number is as likely as any other, and an empty range panics. `next()` is
+64 random bits, `float()` is from 0.0 up to 1.0, `bool()` is either, and
+`shuffle` puts a slice's elements in any order, each as likely. The
+generator is xoshiro256\*\*, with a seed spread through SplitMix64.
+
 ## Other programs: `std::process`
 
 A `Command` names a program and its arguments, which no shell reads: each
@@ -583,6 +770,7 @@ fn main() = {
     assert(counts.keyAt(1) == "b")
     counts.at("a") += 10
     assert(counts.remove("a") == .Some(11))
+    assert(counts == Map::fromPairs([("b", 2)].walk()))
 
     var seen = Set<i64>()
     assert(seen.add(1))
@@ -594,10 +782,13 @@ fn main() = {
 ```
 
 `get` answers the value by reference, or nothing, and borrows the map and
-not the key; `at` lends it to read or write, and panics
-where there is none. `remove` keeps the order and costs the entries after
-it; `swapRemove` moves the last into the gap and costs nothing; `values()`
-lends a map's values to walk or to write.
+not the key; `at` lends it to read or write, and panics where there is
+none. `remove` keeps the order and costs the entries after it;
+`swapRemove` moves the last into the gap and costs nothing; `values()`
+lends a map's values to walk or to write. `atOrPutWith(key, make)` is
+`atOrPut` whose value is made only where there is none. Two maps are equal
+with the same keys and equal values under them, and two sets with the same
+keys, whatever order they went in.
 
 `Deque<T>` is pushed and taken at either end at the same small cost, where
 a `Vec` is quick at its back alone: a queue, a stack, or a list pushed at
@@ -805,9 +996,7 @@ fn main() = {
     val .Object(fields) = doc else {
         return
     }
-    assert(
-        fields[0].0 == "name" && fields[0].1 == .Text(text: String::of("wip")),
-    )
+    assert(fields[0].0 == "name" && fields[0].1 == .Text(String::of("wip")))
     assert(fields[1].0 == "tags" && "\(fields[1].1)" == "[1,2.5,null]")
 
     val .Err(error) = json::parse("[1,\n 2,]") else {
@@ -863,26 +1052,58 @@ fn main() = {
     assert(about.isFile())
     assert(about.size > 0)
     assert(about.modified > 0) // seconds since 1970
+    assert(about.modifiedNanos < 1000000000) // and the nanoseconds past them
     assert(about.mode > 0) // the permission bits, as `chmod` writes them
     assert(about.inode > 0) // with `device`, which file it is, whatever its name
 }
 ```
 
-A `Meta`'s and an `Entry`'s `kind` is a `File`, a `Directory`, a `Link`, or
-one of the special files — a `Pipe`, a `Socket`, a `CharDevice`, a
+A `Meta`'s and an `Entry`'s `kind` is a `File`, a `Directory`, a `Link`,
+or one of the special files — a `Pipe`, a `Socket`, a `CharDevice`, a
 `BlockDevice` — or `Other`; `kind.isSpecial()` says whether it is none of
-the first three. `meta` follows a symbolic link and `linkMeta` looks at the
-link itself; `exists` asks whether there is anything there; `removeFile`
-removes a file and refuses a directory; `makeDir` makes a directory and
-fails where one already is, and `File::createNew` makes a file the same way,
-where `File::create` would empty one that is there. An open `File` reads by
-lines or whole, and `readAt(offset, into)` reads from where it is asked
+the first three. `meta` follows a symbolic link and `linkMeta` looks at
+the link itself; `exists` asks whether there is anything there;
+`removeFile` removes a file and refuses a directory; `makeDir` makes a
+directory and fails where one already is, and `File::createNew` makes a
+file the same way, where `File::create` would empty one that is there. An
+open `File` reads by lines, whole, or exactly so many bytes,
+`readExact(count, &var into)`, which a message whose header gave its
+length is read by, and `readAt(offset, into)` reads from where it is asked
 without moving where the next read starts, as C's `pread` does; `size()`
-says how long the file is. A `Meta`'s `device` and `inode` say which file a
-path names, so a program can tell, before it acts, that a name it listed
+says how long the file is. A `Meta`'s `device` and `inode` say which file
+a path names, so a program can tell, before it acts, that a name it listed
 still means what it did. Entries come in the order the filesystem gives
-them, without `.` and `..`, and sorting is the caller's. `realPath` answers
-where a path really is: absolute, with no `.`, `..` or link on the way.
+them, without `.` and `..`, and sorting is the caller's. `realPath`
+answers where a path really is: absolute, with no `.`, `..` or link on the
+way.
+
+`makeDirs` makes a directory and every one above it that is missing, with
+none an error where it is there already; `removeDir` removes an empty
+directory, and `removeAll` a directory and everything in it, or a file;
+`rename` moves a path within its filesystem; `copy` writes a file's bytes
+and its permission bits to another, and answers how many bytes.
+`std::process` answers the program's own `currentDir()`, `executable()` —
+the absolute path of the file it was started from — and `id()`, and
+`std::io` whether a stream is a terminal, `io::isTerminal(.Output)`, which
+is what decides whether to colour what is written:
+
+```wip,run
+import std::fs
+import std::io
+import std::process
+
+fn main() = {
+    val root = "target/docs-\(process::id())"
+    assert(fs::makeDirs("\(root)/a/b").isOk())
+    assert(fs::writeFile("\(root)/a/b/note", "hi").isOk())
+    assert(fs::copy("\(root)/a/b/note", "\(root)/copy") == .Ok(2))
+    assert(fs::rename("\(root)/copy", "\(root)/moved").isOk())
+    assert(fs::removeAll(root).isOk() && !fs::exists(root))
+    assert(process::executable().isOk())
+    val colour = io::isTerminal(.Output)
+    assert(colour || !colour)
+}
+```
 
 `std::path` takes a path apart and puts one together, as text: a `str`
 of names between `/`s, which is what `std::fs` takes. Nothing in it reads
@@ -954,29 +1175,38 @@ the reason both exist.
 | Module | What is in it |
 |---|---|
 | `std::args` | `Arguments`, `Argument` and `ArgumentError`: the program's arguments, read as options |
-| `std::io` | `print`, `println`, `printInt`, `eprintln`, `flush`, `stdin`, `Reader`, `env`, `IoError` |
+| `std::io` | `print`, `println`, `printInt`, `eprintln`, `flush`, `stdin`, `Reader`, `env`, `isTerminal`, `IoError` |
 | `std::fs` | whole files, reading a directory, and what the filesystem says about a path |
 | `std::path` | a path joined, and taken apart: its name, parent, extension and stem |
+| `std::mem` | `replace`, a place's value taken out with another left in, and `swap`, two places' values exchanged |
+| `std::digest` | `sha256(bytes)`, the SHA-256 digest of bytes in hand, and `Sha256`, one written in pieces and then finished |
 | `std::c` | a value lent to C as a callback's `void *`, and had back in the callback; `Pinned`, a value C holds until it lets go; a slice's address for C to read; C's `sizeof` and `_Alignof` |
 | `std::embed` | a file's bytes or text, read when the program is compiled, as a constant |
 | `std::sync` | `Atomic<T>` and `Mutex<T>`: what several threads may change at once |
 | `std::shared` | `Shared<T>` and `Weak<T>`: a value several owners hold and read |
+| `std::random` | `Random`: numbers seeded or from the system, not for cryptography |
 | `std::net` | `Listener`, `Stream` and `Address`: TCP and Unix-domain connections |
 | `std::math` | `PI`, `TAU` and `E`; the functions are methods of `f64` and `f32`, `x.sin()`, written in Wip so that a `@comptime` constant computes the program's bits |
 | `std::text` | `ParseError`, and the `Split`, `Lines` and `Chars` types the prelude's methods answer |
-| `std::iter` | `Walk`, `Taking` (what a `Vec` gives up to `for x in move v`), and the adapter types `Mapped`, `Filtered`, `Enumerated`, `Taken`, `Skipped`, `Zipped` |
+| `std::iter` | `Walk`, `Forwards`, `Backwards`, `Taking` (what a `Vec` gives up to `for x in move v`), and the adapter types `Mapped`, `Filtered`, `FilterMapped`, `FlatMapped`, `Chained`, `Enumerated`, `Taken`, `TakenWhile`, `Skipped`, `Zipped`, `Peekable` |
 | `std::collections` | `Map`, `Set`, `MapEntry`, `Deque`, and `Arena` with its `Handle`, `ArenaEntry` and `ArenaValues` |
 | `std::time` | `Duration`, a length of time; `Instant`, a moment on a clock that only goes forward; `sleep`; `now`, the date it is, and `Utc`, a moment as a calendar has it |
-| `std::libc` | the C library as std calls it: `printf`, `fwrite`, `stdout`, `read`, `open` and its flags, `errno()` — C's, promising nothing C does not |
+| `std::libc` | the C library as std calls it: `printf`, `fwrite`, `stdout`, `read`, `open` and its flags, `getentropy`, `errno()` — C's, promising nothing C does not |
 
 ```wip,run
+import std::digest
 import std::io
 import std::math
+import std::mem
 
 fn main() = {
     io::println("a line on standard output")
     assert(math::TAU > 6.28)
     assert((2.0).sqrt() > 1.41)
+    var state = String::of("reading")
+    assert(mem::replace(&var state, "idle") == "reading" && state == "idle")
+    val text = "abc"
+    assert(digest::sha256(&text)[0] == 0xBA)
 }
 ```
 

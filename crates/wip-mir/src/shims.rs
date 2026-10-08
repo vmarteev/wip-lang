@@ -92,6 +92,28 @@ pub fn write_shims(
     if !headers.is_empty() {
         out.push('\n');
     }
+    // A C function pointer is named by a `typedef`, so that it reads as
+    // any other type where a wrapper declares, takes or answers one: the
+    // ones the layouts, the variables and the wrappers below use.
+    let mut typedefs: Vec<String> = Vec::new();
+    let layouts = program
+        .structs
+        .iter()
+        .filter(|(_, def)| def.is_extern && def.header.is_none())
+        .flat_map(|(_, def)| def.fields.iter().map(|f| f.ty));
+    let variables = program.globals.iter().map(|(_, def)| def.ty);
+    let signatures = needed
+        .iter()
+        .flat_map(|(_, def)| def.params.iter().map(|p| p.ty).chain([def.ret]));
+    for ty in layouts.chain(variables).chain(signatures) {
+        function_typedefs(program, interner, ty, &mut typedefs);
+    }
+    for typedef in &typedefs {
+        let _ = writeln!(out, "{typedef}");
+    }
+    if !typedefs.is_empty() {
+        out.push('\n');
+    }
     // Every C layout the program declares, in the order they were written,
     // since one may hold another.
     for (_, def) in program.structs.iter() {
@@ -210,15 +232,16 @@ fn write_shim(out: &mut String, program: &Program, interner: &Interner, id: FnId
         let _ = writeln!(out, "extern {ret} {name}({arguments});\n");
     }
 
-    // What Wip calls: a struct is an address, here and back.
-    let aggregate_result = matches!(program.types.kind(def.ret), TyKind::Struct(..));
+    // What Wip calls: a struct is an address, here and back, and so is a
+    // function pointer that may be null, which Wip keeps as an `Option`.
+    let aggregate_result = crate::c_abi::crosses_as_struct(program, def.ret);
     let mut taken: Vec<String> = Vec::new();
     if aggregate_result {
         taken.push(format!("{ret} *out"));
     }
     let mut passed: Vec<String> = Vec::new();
     for (i, (ty, param)) in params.iter().enumerate() {
-        let by_address = matches!(program.types.kind(def.params[i].ty), TyKind::Struct(..));
+        let by_address = crate::c_abi::crosses_as_struct(program, def.params[i].ty);
         if by_address {
             taken.push(format!("{ty} *{param}"));
             passed.push(format!("*{param}"));
@@ -311,7 +334,68 @@ fn c_type(program: &Program, interner: &Interner, ty: Ty) -> String {
             TyKind::Array(elem, _) => format!("{} *", c_type(program, interner, elem)),
             _ => format!("{} *", c_type(program, interner, inner)),
         },
+        // A C function pointer, by the `typedef` written for it; one that
+        // may be null is the same pointer.
+        TyKind::Fn(..) => function_typedef(program, interner, ty).0,
+        TyKind::Enum(_, args) if program.nullable_function(ty) => {
+            c_type(program, interner, program.types.list(args)[0])
+        }
         _ => "void".to_string(),
+    }
+}
+
+/// The name of a C function pointer type, and the `typedef` that declares
+/// it: named for what it takes and answers, so the same type has one name.
+fn function_typedef(program: &Program, interner: &Interner, ty: Ty) -> (String, String) {
+    let TyKind::Fn(params, ret) = program.types.kind(ty) else {
+        unreachable!("a function type")
+    };
+    let ret = match ret {
+        Types::UNIT => "void".to_string(),
+        ret => c_type(program, interner, ret),
+    };
+    let params: Vec<String> = program
+        .types
+        .list(params)
+        .iter()
+        .map(|&param| c_type(program, interner, param))
+        .collect();
+    let params = if params.is_empty() {
+        "void".to_string()
+    } else {
+        params.join(", ")
+    };
+    let spelled = format!("{ret}_of_{params}");
+    let name: String = std::iter::once("wip_fn_".to_string())
+        .chain(spelled.chars().map(|c| match c {
+            'a'..='z' | 'A'..='Z' | '0'..='9' => c.to_string(),
+            '*' => "p".to_string(),
+            _ => "_".to_string(),
+        }))
+        .collect();
+    let typedef = format!("typedef {ret} (*{name})({params});");
+    (name, typedef)
+}
+
+/// The `typedef`s `ty` needs, each once and after those it names.
+fn function_typedefs(program: &Program, interner: &Interner, ty: Ty, out: &mut Vec<String>) {
+    let ty = match program.types.kind(ty) {
+        TyKind::Enum(_, args) if program.nullable_function(ty) => program.types.list(args)[0],
+        TyKind::Array(elem, _) | TyKind::Ref(elem, _) | TyKind::Ptr(elem) => {
+            return function_typedefs(program, interner, elem, out);
+        }
+        _ => ty,
+    };
+    let TyKind::Fn(params, ret) = program.types.kind(ty) else {
+        return;
+    };
+    for &param in program.types.list(params) {
+        function_typedefs(program, interner, param, out);
+    }
+    function_typedefs(program, interner, ret, out);
+    let (_, typedef) = function_typedef(program, interner, ty);
+    if !out.contains(&typedef) {
+        out.push(typedef);
     }
 }
 

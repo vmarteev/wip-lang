@@ -278,6 +278,7 @@ impl Builder<'_> {
         let generics: Vec<GenericParam> = generics
             .iter()
             .map(|param| GenericParam {
+                decided: None,
                 name: self.name(param.name.sym),
                 bounds: vec![Bound {
                     name: self.name(interface),
@@ -296,6 +297,7 @@ impl Builder<'_> {
                 params,
                 variadic: None,
                 ret,
+                lends_from: Vec::new(),
                 span: self.at,
             },
             body: Some(body),

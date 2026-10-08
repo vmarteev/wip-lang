@@ -48,6 +48,13 @@ extend File {
 		&var into,
 	)
 
+	/// The next `count` bytes, appended; fewer only at the end of the file.
+	/// What comes back is how many.
+	pub var fn readExact(
+		count: i64,
+		into: &var String,
+	): Result<i64, io::IoError> = self.reader.readExact(count, &var into)
+
 	/// The rest of the file, appended. What comes back is how many bytes.
 	pub var fn readAll(into: &var String): Result<i64, io::IoError> = self.reader.readAll(&var into)
 
@@ -121,7 +128,7 @@ fn opened(path: str, how: Opening): Result<File, io::IoError> = {
 		.CreateNew => libc::open(c, libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL, MADE_MODE)
 	}
 	if fd < 0 then return .Err(io::lastError())
-	return .Ok(File(reader: io::reader(fd)))
+	return .Ok(File(io::reader(fd)))
 }
 
 /// What a path is: the three kinds a program acts on differently, and the
@@ -160,6 +167,9 @@ pub struct Meta {
 	pub size: i64
 	/// When it last changed, in seconds since 1970.
 	pub modified: i64
+	/// The nanoseconds past `modified`'s second, where the filesystem keeps
+	/// them: what tells apart two writes within one second.
+	pub modifiedNanos: i64
 	/// The permission bits, as `chmod` writes them: `0o755`.
 	pub mode: i64
 	/// The filesystem it is on, as the system numbers it.
@@ -261,6 +271,79 @@ pub fn makeDir(path: str): Result<void, io::IoError> = {
 	return .Ok()
 }
 
+/// Makes a directory and every one above it that is not there yet; one
+/// that is there already is no error: `fs::makeDirs("build/cache/objects")`.
+pub fn makeDirs(path: str): Result<void, io::IoError> = {
+	var at = 0
+	while at <= path.len() {
+		// Each prefix that ends where a `/` is, and then the whole.
+		val end = match path[at..path.len()].find("/") {
+			.Some(slash) => at + slash
+			.None => path.len()
+		}
+		if end > 0 {
+			match makeDir(path[0..end]) {
+				.Ok(..) => {}
+				// A file in the way is the error; a directory is what was
+				// asked for.
+				.Err(.AlreadyExists) => {
+					if !(meta(path[0..end]) is .Ok(about) && about.kind == .Directory) then
+						return .Err(.AlreadyExists)
+				}
+				.Err(error) => return .Err(error)
+			}
+		}
+		at = end + 1
+	}
+	return .Ok()
+}
+
+/// Removes an empty directory; one with anything in it is refused.
+pub fn removeDir(path: str): Result<void, io::IoError> = {
+	var name = String::of(path)
+	if libc::rmdir(name.toCstring()) != 0 then return .Err(io::lastError())
+	return .Ok()
+}
+
+/// Removes what is at `path`, and where it is a directory everything in it
+/// first; a link is removed, not what it names.
+pub fn removeAll(path: str): Result<void, io::IoError> = {
+	val about = linkMeta(path)?
+	if about.kind != .Directory then return removeFile(path)
+	for entry in readDir(path)? {
+		removeAll("\(path)/\(entry.name)")?
+	}
+	return removeDir(path)
+}
+
+/// Moves `from` to `to`, in place of anything there but a directory with
+/// something in it; within one filesystem, where a move is a rename.
+pub fn rename(from: str, to: str): Result<void, io::IoError> = {
+	var source = String::of(from)
+	var target = String::of(to)
+	if libc::rename(source.toCstring(), target.toCstring()) != 0 then return .Err(io::lastError())
+	return .Ok()
+}
+
+/// The bytes of the file at `from` written to `to`, made or emptied, with
+/// its permission bits; answers how many bytes.
+pub fn copy(from: str, to: str): Result<i64, io::IoError> = {
+	val about = meta(from)?
+	val source = File::open(from)?
+	var target = File::create(to)?
+	var block: Vec<u8> = Vec::filled(65536, 0)
+	var copied = 0
+	while true {
+		val got = source.readAt(copied, &var block.items())?
+		if got == 0 then break
+		target.writeBytes(&block[0..got])?
+		copied += got
+	}
+	var name = String::of(to)
+	if libc::chmod(name.toCstring(), about.mode as c_uint) != 0 then return .Err(io::lastError())
+	return .Ok(copied)
+}
+
 /// Removes a file, or a link without what it names; a directory is
 /// refused.
 pub fn removeFile(path: str): Result<void, io::IoError> = {
@@ -289,6 +372,7 @@ fn metaOf(path: str, following: bool): Result<Meta, io::IoError> = {
 		kind: kind,
 		size: stated.size,
 		modified: stated.modified,
+		modifiedNanos: stated.modifiedNanos,
 		mode: mode & 0o7777,
 		device: stated.device,
 		inode: stated.inode,
@@ -302,6 +386,7 @@ struct Stated {
 	mode: i64
 	size: i64
 	modified: i64
+	modifiedNanos: i64
 	device: i64
 	inode: i64
 }
@@ -411,6 +496,7 @@ fn statInto(call: &(info: ptr<Stat>) => c_int): Result<Stated, io::IoError> = {
 				mode: info.mode as i64,
 				size: info.size,
 				modified: info.modified[0],
+				modifiedNanos: info.modified[1],
 				device: info.device as i64,
 				inode: info.inode as i64,
 			))
@@ -502,6 +588,7 @@ fn statInto(call: &(info: ptr<Statx>) => c_int): Result<Stated, io::IoError> = {
 				mode: info.mode as i64,
 				size: info.size as i64,
 				modified: info.modified[0],
+				modifiedNanos: info.modified[1],
 				device: ((info.devMajor as i64) << 32) | (info.devMinor as i64),
 				inode: info.inode as i64,
 			))

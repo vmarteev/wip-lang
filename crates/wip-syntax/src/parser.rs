@@ -71,6 +71,7 @@ pub fn parse_package_at(src: &str, base: u32, lexed: &Lexed) -> ParsedPackage {
         region_start: 0,
         newlines: true,
         no_struct: false,
+        guard: false,
         brace_pairs: Vec::new(),
         variadic: None,
         last_error_at: None,
@@ -103,6 +104,7 @@ pub fn parse_at(src: &str, base: u32, lexed: &Lexed) -> Parsed {
         region_start: 0,
         newlines: true,
         no_struct: false,
+        guard: false,
         brace_pairs: Vec::new(),
         variadic: None,
         last_error_at: None,
@@ -347,6 +349,10 @@ struct Parser<'a> {
     /// Set while parsing a condition, where struct literals are not allowed
     /// (grammar R1). Parentheses, brackets, braces and argument lists clear it.
     no_struct: bool,
+    /// Set while parsing a match arm's guard, which the arm's `=>` follows:
+    /// `( … ) =>` at its top level is a parenthesized condition, not a
+    /// lambda, since a lambda is no condition. Cleared where `no_struct` is.
+    guard: bool,
     /// Every matched `{` … `}` so far, for guessing which brace is missing.
     brace_pairs: Vec<(Span, Span)>,
     last_error_at: Option<u32>,
@@ -515,36 +521,43 @@ impl<'a> Parser<'a> {
         self.ast.exprs[id].span
     }
 
-    /// Runs `f` with line breaks significant or not, and struct literals
-    /// allowed or not, restoring both afterwards.
+    /// Runs `f` with line breaks significant or not, struct literals
+    /// allowed or not, and in a guard or not, restoring all three
+    /// afterwards.
     fn in_context<R>(
         &mut self,
         newlines: bool,
         no_struct: bool,
+        guard: bool,
         f: impl FnOnce(&mut Self) -> R,
     ) -> R {
-        let saved = (self.newlines, self.no_struct);
-        (self.newlines, self.no_struct) = (newlines, no_struct);
+        let saved = (self.newlines, self.no_struct, self.guard);
+        (self.newlines, self.no_struct, self.guard) = (newlines, no_struct, guard);
         let result = f(self);
-        (self.newlines, self.no_struct) = saved;
+        (self.newlines, self.no_struct, self.guard) = saved;
         result
     }
 
     /// Inside `( )` and `[ ]`: line breaks are whitespace, struct literals are
     /// allowed.
     fn in_parens<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
-        self.in_context(false, false, f)
+        self.in_context(false, false, false, f)
     }
 
     /// Inside `{ }`: line breaks are significant, struct literals are allowed.
     fn in_braces<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
-        self.in_context(true, false, f)
+        self.in_context(true, false, false, f)
     }
 
     /// Parses a condition: line breaks are whitespace up to its `{`, and a
     /// struct literal may not appear at its top level.
     fn cond(&mut self) -> ExprId {
-        self.in_context(false, true, |p| p.expr())
+        self.in_context(false, true, false, |p| p.expr())
+    }
+
+    /// Parses a match arm's guard: a condition, before the arm's `=>`.
+    fn guard_cond(&mut self) -> ExprId {
+        self.in_context(false, true, true, |p| p.expr())
     }
 
     /// A parameter's name, or `_` for one that is not used.

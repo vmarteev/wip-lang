@@ -968,6 +968,42 @@ impl FnGen<'_, '_> {
     fn rvalue(&mut self, rvalue: &Rvalue, ty: Ty) -> Val {
         match rvalue {
             Rvalue::Use(operand) => self.operand(operand),
+            // Whether the answer would not fit: the flag of the intrinsic a
+            // checked `+` panics on, as a `bool`.
+            Rvalue::Overflows(op, lhs, rhs) => {
+                let signed =
+                    matches!(self.kind(self.operand_ty(lhs)), TyKind::Int(int) if int.signed());
+                let lhs = self.operand(lhs);
+                let rhs = self.operand(rhs);
+                let lt = lhs.t;
+                let rhs = Val::new(self.coerce(&rhs, lt), lt);
+                let name = match (op, signed) {
+                    (BinaryOp::Add, true) => "sadd",
+                    (BinaryOp::Add, false) => "uadd",
+                    (BinaryOp::Sub, true) => "ssub",
+                    (BinaryOp::Sub, false) => "usub",
+                    (BinaryOp::Mul, true) => "smul",
+                    (BinaryOp::Mul, false) => "umul",
+                    (op, _) => unreachable!("{op:?} does not overflow"),
+                };
+                let t = lt.text();
+                self.m.intrinsic(&format!(
+                    "declare {{ {t}, i1 }} @llvm.{name}.with.overflow.{t}({t}, {t})"
+                ));
+                let both = self.value(
+                    format!(
+                        "call {{ {t}, i1 }} @llvm.{name}.with.overflow.{t}({}, {})",
+                        lhs.typed(),
+                        rhs.typed()
+                    ),
+                    lt,
+                );
+                let over = self.value(
+                    format!("extractvalue {{ {t}, i1 }} {}, 1", both.v),
+                    Lt::I(1),
+                );
+                self.value(format!("zext i1 {} to i8", over.v), Lt::I(8))
+            }
             Rvalue::Unary(op, operand) => {
                 let value = self.operand(operand);
                 match (op, self.kind(ty)) {

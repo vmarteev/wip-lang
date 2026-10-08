@@ -19,7 +19,7 @@ or a `var`, with or without `else`, and a `for` binding.
 | `Point(x, y)`, `Point(x: across, ..)` | a struct, by field name, renamed or the rest passed over |
 | `(a, b)` | a tuple |
 | `[a, b]`, `[first, ..rest]`, `[.., last]` | an array or a slice, by its elements from either end |
-| `a \| b` | either |
+| `a \| b` | either, each binding the same names |
 | `.Some(.None)`, `(.Int(a), .Float(b))` | a pattern inside a pattern, to any depth |
 
 ```wip,run
@@ -46,6 +46,74 @@ A variant's fields are named where it declares them, so a pattern may name
 the field it takes: `.Round(radius: r)`. A variant with one field needs no
 name, and a pattern that names none of a variant's several fields is told to
 say which it means.
+
+Alternatives may bind, where each binds the same names, each name of one
+type: whichever matched gives the arm its fields. A field of another name
+is renamed to join them. Where an arm's alternatives do not fit on its
+line, `wip fmt` puts as many on each line as fit, each line after the first
+beginning with `|`:
+
+```wip,run
+enum View {
+    Text(size: i64, text: String)
+    Label(size: i64, text: String)
+    Column(size: i64)
+    Row(size: i64)
+    Over
+}
+
+fn sizeOf(view: &View): i64 = match view {
+    .Text(size, ..) | .Label(size, ..) | .Column(size) | .Row(size) => size
+    .Over => 1
+}
+
+fn textOf(view: View): String = match move view {
+    .Text(text, ..) | .Label(text, ..) => move text
+    _ => String()
+}
+
+fn main() = {
+    assert(sizeOf(View::Row(size: 3)) == 3 && sizeOf(.Over) == 1)
+    assert(textOf(View::Label(size: 1, text: "taken")) == "taken")
+    val round = Shape::Round(radius: 4)
+    assert(round is .Round(radius: n) | .Square(side: n) && n == 4)
+}
+
+enum Shape {
+    Round(radius: i64)
+    Square(side: i64)
+    Empty
+}
+```
+
+A binding is what it would be in an arm of its own: on a place it aliases
+the field that matched, and under `match move` it takes it, the rest of the
+value dropped. An `is` test and a `val … else` bind so too, and `|` binds
+inside a pattern as at its top: `.Some(.Named(name) | .Tag(name))`.
+
+Text matches a `str`, and a `String` by the text it holds, as `==` compares
+them. So a `String` is matched against the words a program takes, and a
+value that keeps what it names in a `String` of its own is tested by its
+fields. Text has no end of values, so a `match` on it ends with `_`:
+
+```wip,run
+enum Problem {
+    Unknown(word: String)
+    Empty
+}
+
+fn run(word: String): i64 = match word {
+    "add" => 1
+    "remove" => 2
+    _ => 0
+}
+
+fn main() = {
+    assert(run(String::of("remove")) == 2)
+    val problem = Problem::Unknown(String::of("frob"))
+    assert(problem is .Unknown("frob"))
+}
+```
 
 ## Ranges
 
@@ -328,7 +396,7 @@ enum Counter {
 }
 
 fn main() = {
-    var counter: Counter = .Counting(n: 1)
+    var counter: Counter = .Counting(1)
     match counter {
         .Counting(n) => n += 1
         .Stopped => {}
@@ -396,13 +464,13 @@ enum Shape {
 }
 
 fn same(a: &Shape, b: &Shape): bool = match (a, b) {
-    (.Circle(radius: x), .Circle(radius: y)) => x == y
-    (.Named(name: x), .Named(name: y)) => x == y
+    (.Circle(x), .Circle(y)) => x == y
+    (.Named(x), .Named(y)) => x == y
     _ => false
 }
 
 fn main() = {
-    val one = Shape::Named(name: String::of("one"))
+    val one = Shape::Named(String::of("one"))
     assert(same(&one, &one))
     assert(!same(&one, Shape::Circle(radius: 1)))
 }
@@ -411,6 +479,43 @@ fn main() = {
 The arms are tuple patterns, `(p, q)`, or `_`; a name for the whole —
 `pair => …` — has no tuple to bind, and is refused. A tuple held in a
 variable is a value, and is matched as one.
+
+### Through a reference
+
+A pattern that tests a value — a variant, a number, a range, text, a
+slice, a tuple or a struct taken apart — tests what a reference refers to
+wherever it meets one, at any depth, as a `match` on the reference itself
+would. A lookup answers an `Option<&T>`, and is matched as the value it
+lends:
+
+```wip,run
+enum Token {
+    Word(text: String)
+    Space
+}
+
+fn width(token: Option<&Token>): i64 = match token {
+    .Some(.Word(text)) => text.len()
+    .Some(.Space) => 1
+    .None => 0
+}
+
+fn main() = {
+    val tokens: Vec<Token> = Vec::of(own [
+        Token::Word(text: "hello"),
+        Token::Space,
+    ])
+    assert(width(tokens.first()) == 5 && width(tokens.last()) == 1)
+    assert("x7".chars().peekable().peek() is .Some('a'..='z'))
+}
+```
+
+The `match` covers every case of what the reference refers to, so it
+needs no `_`. A name at the reference binds the reference itself:
+`.Some(token)` gives `token: &Token`. A name below it aliases what it
+names there, to read: it cannot be written, `match move` takes nothing
+from behind a reference, and it borrows what the reference borrows, so it
+is not used after that changes.
 
 ## Patterns that must always match
 

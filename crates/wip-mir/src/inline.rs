@@ -414,7 +414,9 @@ fn map_rvalue(rvalue: &mut Rvalue, places: &[Place]) {
         | Rvalue::Integer(_, operand)
         | Rvalue::Bits(operand)
         | Rvalue::VTableFn { table: operand, .. } => map_operand(operand, places),
-        Rvalue::Binary(_, lhs, rhs) | Rvalue::Rotate(_, lhs, rhs) => {
+        Rvalue::Binary(_, lhs, rhs)
+        | Rvalue::Rotate(_, lhs, rhs)
+        | Rvalue::Overflows(_, lhs, rhs) => {
             map_operand(lhs, places);
             map_operand(rhs, places);
         }

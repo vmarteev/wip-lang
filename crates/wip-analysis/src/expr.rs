@@ -1,5 +1,6 @@
 //! Expressions, and how each use of a place is checked.
 
+use super::lends::Lends;
 use super::*;
 
 impl Checker<'_> {
@@ -28,6 +29,9 @@ impl Checker<'_> {
                 };
                 self.expr(*inner, ctx, state);
             }
+            // A `String` over a `str`'s bytes, made for the call it is lent
+            // to: the text is read, and the `String` is a temporary.
+            ExprKind::Undropped(inner) => self.expr(*inner, Ctx::Value, state),
             ExprKind::Assign {
                 place, op, value, ..
             } => {
@@ -61,6 +65,7 @@ impl Checker<'_> {
                 ..
             } => {
                 self.call_args(args, order, Some(*callee), state);
+                self.record_copy(id, *callee, args, state);
                 // A call that is a jump leaves this frame in place, so
                 // nothing of it may still need cleaning up.
                 if self.body.tail_calls.contains(&id) {
@@ -358,10 +363,13 @@ impl Checker<'_> {
         }
     }
 
-    /// `place = value` and `place op= value`, in the order they run: the
-    /// place is found, its old value read for `op=`, and the value computed
-    /// while the place must stay as it was found (E0414). Then the place is
-    /// written.
+    /// `place = value` and `place op= value`, in the order they run. What
+    /// the place's expression computes comes first; then, for `op=`, the
+    /// place is found and its old value read, and the value may not change
+    /// what it is in (E0414). For `=` the value comes next, and the place
+    /// is found where it is written, in what the value left: the value may
+    /// change what it is in, but not what its expression lends (E0414),
+    /// nor move what it is found from (E0408).
     fn assignment(&mut self, place: ExprId, compound: bool, value: ExprId, state: &mut State) {
         let body = self.body;
         self.place_parts(place, state);
@@ -371,26 +379,41 @@ impl Checker<'_> {
         if compound && let Place::Path(path) = &found {
             let name = self.display(place);
             self.check_live(path, &name, body.exprs[place].span, state);
+            self.read_after_copy(path.local, false, state);
         }
         let mark = self.borrows.len();
-        if let Some(path) = self.access_path(place) {
-            // A variable, or a field of one, is found where it is, so `=`
-            // may still take or replace it: `acc = push(move acc, x)`.
-            let replace = !compound && matches!(found, Place::Path(_));
-            self.borrows.push(Borrow {
-                heap: false,
-                path,
-                span: body.exprs[place].span,
-                var: true,
-                holder: Holder::Assign {
-                    target: place,
-                    replace,
-                    compound,
-                },
-            });
+        if compound {
+            if let Some(path) = self.access_path(place) {
+                self.borrows.push(Borrow {
+                    heap: false,
+                    path,
+                    span: body.exprs[place].span,
+                    var: true,
+                    holder: Holder::Assign { target: place },
+                });
+            }
+        } else {
+            for (path, span, var) in self.operand_borrows(place, state) {
+                self.borrows.push(Borrow {
+                    heap: false,
+                    path,
+                    span,
+                    var,
+                    holder: Holder::Operand { target: place },
+                });
+            }
         }
         self.expr(value, Ctx::Value, state);
         self.borrows.truncate(mark);
+        // The place is found now: what it is found from must still be
+        // there. A variable's own fields are checked as it is assigned.
+        if !compound
+            && !matches!(found, Place::Path(_))
+            && let Some(path) = self.access_path(place)
+        {
+            let name = self.root_name(&path);
+            self.check_live(&path, &name, body.exprs[place].span, state);
+        }
         self.use_place(place, Ctx::Assign, state);
         // A `str` variable borrows what its new value borrows, and so does
         // one holding a `&` reference; one assigned through a
@@ -470,7 +493,7 @@ impl Checker<'_> {
 
     /// Evaluates the parts of a place that are not a path: the reference it
     /// is behind, an array and its index, or a temporary.
-    fn place_parts(&mut self, id: ExprId, state: &mut State) {
+    pub(super) fn place_parts(&mut self, id: ExprId, state: &mut State) {
         match self.place(id).expect("place_parts is called on places") {
             Place::Path(_) => {}
             Place::ThroughRef { reference } => self.expr(reference, Ctx::Inspect, state),
@@ -482,19 +505,81 @@ impl Checker<'_> {
         }
     }
 
+    /// What a place's expression lends, held from where it is written to
+    /// where the place is used: each `&` argument of a projection the place
+    /// is found through, and what a view argument borrows, but the place
+    /// the projection lends from, which is lent where the place is used.
+    /// Each with whether it is lent `&var`.
+    pub(super) fn operand_borrows(&mut self, id: ExprId, state: &State) -> Vec<(Path, Span, bool)> {
+        let body = self.body;
+        let mut held = Vec::new();
+        match body.exprs[id].kind {
+            ExprKind::Field { base, .. }
+            | ExprKind::Index { base, .. }
+            | ExprKind::SubSlice { base, .. } => held.extend(self.operand_borrows(base, state)),
+            ExprKind::Deref(pointer) => match body.exprs[pointer].kind {
+                ExprKind::Call {
+                    callee, ref args, ..
+                } => {
+                    let from = match self.program.fns[callee].projects {
+                        Some(wip_hir::Lent::Param(from)) => Some(from as usize),
+                        _ => None,
+                    };
+                    for (i, &arg) in args.iter().enumerate() {
+                        let kind = self.program.types.kind(body.exprs[arg].ty);
+                        let var = matches!(kind, TyKind::Ref(_, RefKind::Var));
+                        match body.exprs[arg].kind {
+                            ExprKind::Ref(inner) if Some(i) == from => {
+                                held.extend(self.operand_borrows(inner, state))
+                            }
+                            ExprKind::Ref(inner) => {
+                                if let Some(path) = self.access_path(inner) {
+                                    held.push((path, body.exprs[arg].span, var));
+                                }
+                            }
+                            _ if self.borrows_as_view(body.exprs[arg].ty) => {
+                                let roots = self.lent_roots(arg, Lends::ALL, state);
+                                held.extend(
+                                    roots
+                                        .paths
+                                        .into_iter()
+                                        .map(|path| (path, body.exprs[arg].span, false)),
+                                );
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                _ => held.extend(self.operand_borrows(pointer, state)),
+            },
+            _ => {}
+        }
+        held
+    }
+
     /// Checks a use of a place. The parts of an assignment's target were
     /// evaluated before its value, so they are not evaluated again.
     pub(super) fn use_place(&mut self, id: ExprId, ctx: Ctx, state: &mut State) {
-        let body = self.body;
-        let (span, ty) = (body.exprs[id].span, body.exprs[id].ty);
-        let name = self.display(id);
         if matches!(ctx, Ctx::Move(_) | Ctx::Assign) {
             self.check_not_borrowed(id, ctx);
         }
         if ctx != Ctx::Assign {
             self.place_parts(id, state);
         }
+        self.use_found(id, ctx, state);
+    }
+
+    /// Checks a use of a place whose parts are checked already: where it is
+    /// lent to a call, after the arguments its expression was written
+    /// before.
+    pub(super) fn use_found(&mut self, id: ExprId, ctx: Ctx, state: &mut State) {
+        let body = self.body;
+        let (span, ty) = (body.exprs[id].span, body.exprs[id].ty);
+        let name = self.display(id);
         let found = self.place(id).expect("use_place is called on places");
+        if let Place::Path(path) = &found {
+            self.read_after_copy(path.local, ctx == Ctx::Assign, state);
+        }
         // A `str` is read wherever it is used, and so is
         // the reference a place lies behind, where it is kept.
         if ctx != Ctx::Assign {
@@ -575,9 +660,16 @@ impl Checker<'_> {
                         body.exprs[reference].kind,
                         ExprKind::Local(l) if self.aliases.get(&l).is_some_and(|path| {
                             path.projs.iter().any(|p| matches!(p, Proj::Element))
-                        })
+                        }) || self.kept_elements.contains(&l)
                     );
                     let lent = matches!(body.exprs[reference].kind, ExprKind::Call { .. });
+                    // A binding behind a reference the pattern tested
+                    // through, or the matched value was behind: `match
+                    // move` takes nothing from there either.
+                    let kept = matches!(
+                        body.exprs[reference].kind,
+                        ExprKind::Local(l) if binding && self.kept_bindings.contains(&l)
+                    );
                     // What a closure captured: its own, and kept, since it
                     // may be called again.
                     if self.is_capture(id) {
@@ -614,7 +706,11 @@ impl Checker<'_> {
                         },
                     )
                     .with_note("a reference can read a value but cannot take ownership of it");
-                    if element {
+                    if kept {
+                        diagnostic = diagnostic.with_help(
+                            "it lies behind a reference, which neither `move` nor `match move` takes from; copy it with `clone()`",
+                        );
+                    } else if element {
                         diagnostic = diagnostic.with_help(
                             "elements stay where they are while a loop walks them; to take one out, move the whole array",
                         );
@@ -682,6 +778,15 @@ impl Checker<'_> {
         // Each binding, and the place it refers into, at any depth.
         let mut binders: Vec<(LocalId, Option<Path>)> = Vec::new();
         crate::bindings_of(pattern, scrut_path.cloned(), &mut binders);
+        // An alias behind a reference the pattern tests through is a kept
+        // reference, which borrows what the value tested does.
+        let mut behind = Vec::new();
+        crate::behind_references(pattern, &mut behind);
+        for local in behind {
+            if body.alias_bindings.contains(&local) {
+                self.kept_bindings.insert(local);
+            }
+        }
         if let Some(reference) = self.kept_reference_behind(scrutinee) {
             let roots = self.str_roots(reference, state).paths;
             for (local, _) in binders {

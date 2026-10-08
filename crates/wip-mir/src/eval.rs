@@ -1172,6 +1172,13 @@ impl<'a> Machine<'a> {
                     left => ((value << left) | (value >> (bits - left))) & mask(bits),
                 }
             }
+            // Whether the answer would not fit: what a checked `+` panics
+            // on.
+            Rvalue::Overflows(op, lhs, rhs) => {
+                let operand = operand_ty(program, &frame.body, lhs);
+                let (l, r) = (self.scalar(frame, lhs)?, self.scalar(frame, rhs)?);
+                u128::from(checked(program, operand, *op, l, r).is_none())
+            }
             Rvalue::VTableFn { table, index, .. } => {
                 let table = self.scalar(frame, table)? as u64;
                 u128::from(self.read_word(table + u64::from(*index) * 8)?)

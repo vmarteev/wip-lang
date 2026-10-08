@@ -178,6 +178,24 @@ impl Checker<'_> {
                     Ctx::Value
                 };
                 self.expr(*elements, ctx, state);
+                // A list behind a reference a view keeps lies in what that
+                // reference borrows, which nothing here can change: its
+                // bindings borrow that, and nothing of what holds it is held.
+                if let Some(reference) = self.kept_reference_behind(*elements) {
+                    let roots = self.str_roots(reference, state).paths;
+                    let mut locals = Vec::new();
+                    binding.locals(&mut locals);
+                    for local in locals {
+                        if self.body.alias_bindings.contains(&local) {
+                            self.kept_bindings.insert(local);
+                            self.kept_elements.insert(local);
+                            state.roots.insert(local, roots.clone());
+                            state.stale.remove(&local);
+                        }
+                    }
+                    self.loop_stmt(None, body, None, None, state);
+                    return false;
+                }
                 // The binding refers to each element, so what is walked must
                 // stay put while the loop runs.
                 let walked = self.access_path(*elements);

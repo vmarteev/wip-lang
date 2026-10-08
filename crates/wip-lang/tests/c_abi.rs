@@ -521,6 +521,64 @@ fn structs_cross_by_value_the_way_c_passes_them() {
 /// but an export that takes a struct by value cannot also be a Wip
 /// function value: C passes it in registers and Wip passes its address.
 /// Whichever backend builds it.
+/// A C function pointer that may be null is an `Option` to Wip, laid out as
+/// the pointer: C passes and answers it as the one word it is, in a
+/// register, which Wip's own calls would pass by its address.
+#[test]
+fn nullable_function_pointers_cross_as_c_passes_them() {
+    let dir = TempDir::new().expect("a temporary directory");
+    std::fs::write(
+        dir.path().join("pointers.c"),
+        "#include <stdint.h>\n\
+         typedef int32_t (*int_fn)(void);\n\
+         static int32_t seven(void) { return 7; }\n\
+         int_fn c_seven(int32_t give) { return give ? seven : 0; }\n\
+         int32_t c_call(int_fn f) { return f ? f() + 1 : -1; }\n\
+         int_fn wip_pick(int_fn f);\n\
+         int32_t c_through_export(void) {\n    \
+             int_fn kept = wip_pick(seven);\n    \
+             int_fn none = wip_pick(0);\n    \
+             return kept() * 100 + (none ? 1 : 0);\n\
+         }\n\
+         typedef struct { int_fn f; int32_t n; } Holder;\n\
+         int32_t c_holder(Holder h) { return h.f ? h.f() + h.n : h.n; }\n\
+         Holder c_made(void) { Holder h = { seven, 3 }; return h; }\n",
+    )
+    .expect("written");
+    std::fs::write(
+        dir.path().join("main.wip"),
+        "import std::io\n\n\
+         extern struct Holder {\n    f: Option<() => i32>\n    n: i32\n}\n\n\
+         extern \"C\" {\n    \
+             fn c_seven(give: i32): Option<() => i32>\n    \
+             fn c_call(f: Option<() => i32>): i32\n    \
+             fn c_through_export(): i32\n    \
+             fn c_holder(h: Holder): i32\n    \
+             fn c_made(): Holder\n\
+         }\n\n\
+         @export(\"C\")\nfn wip_pick(f: Option<() => i32>): Option<() => i32> = f\n\n\
+         fn five(): i32 = 5\n\n\
+         fn called(f: Option<() => i32>): i32 = if f is .Some(g) then g() else 0\n\n\
+         fn main() = {\n    \
+             io::println(\"\\(called(c_seven(1))) \\(called(c_seven(0)))\")\n    \
+             io::println(\"\\(c_call(.Some(five))) \\(c_call(.None))\")\n    \
+             io::println(\"\\(c_through_export())\")\n    \
+             io::println(\"\\(c_holder(Holder(f: .Some(five), n: 2))) \\(c_holder(Holder(f: .None, n: 2)))\")\n    \
+             val made = c_made()\n    \
+             io::println(\"\\(called(made.f) + made.n)\")\n\
+         }\n",
+    )
+    .expect("written");
+    for way in WAYS {
+        let (code, stdout, stderr) = run(dir.path(), way);
+        assert_eq!(
+            (code, stdout.as_str()),
+            (Some(0), "7 0\n6 -1\n700\n7 2\n10\n"),
+            "{way:?}:\n{stdout}{stderr}"
+        );
+    }
+}
+
 #[test]
 fn an_export_taken_as_a_value_is_refused() {
     let dir = TempDir::new().expect("a temporary directory");

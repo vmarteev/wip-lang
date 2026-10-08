@@ -158,6 +158,56 @@ for byte in "wip".items() {
 assert(hash == 0x25F7F447)
 ```
 
+### The order of an assignment
+
+`place = value` works out what the place's expression computes first — an
+index, or what a projection is given — then the value, and finds the place
+last, where it is written. So the value may change what the place is in,
+and the write goes where the place is then: a list filled in with what is
+made next is written as it reads, though making it moves the list.
+
+```wip,run
+struct Node {
+    value: i64
+    next: i64 = -1
+}
+
+fn main() = {
+    var nodes: Vec<Node> = Vec()
+    nodes.push(Node(value: 1))
+    nodes[0].next = {
+        nodes.push(Node(value: 2))
+        nodes.len() - 1
+    }
+    assert(nodes[0].next == 1 && nodes[1].value == 2)
+}
+```
+
+The index was read before the value, so a value that changes it changes
+nothing already read; a check that the index is in bounds is made where
+the place is found, after the value:
+
+```wip,run
+var xs = [0, 0, 0]
+var i = 0
+xs[i] = {
+    i = 2
+    7
+}
+assert(xs[0] == 7 && xs[2] == 0)
+```
+
+`a op= b` reads `a` before it works out `b`, so it finds its place first,
+and `b` may not change what `a` is in:
+
+```wip,error=E0414
+var n = 1
+n += {
+    n = 10
+    1
+}
+```
+
 A shift's amount may be an integer of any type, and the answer is of the
 type shifted. It takes the amount modulo the width of what
 it shifts, so `x >> 8` of a `u8` is `x` itself, and
@@ -259,6 +309,25 @@ assert("\(-5, width: 4, fill: '0')" == "-005")
 assert("[\("mid", width: 7, align: .Center)]" == "[  mid  ]")
 ```
 
+A number may say how it is written. `precision:` is how many digits a float
+has after its point: its exact value rounded once to the nearest, a tie to
+the even digit, as C's `%.3f` writes it, and no point for `0`. `radix:`
+writes an integer in a base from 2 to 36, in lower case, after a `-` where
+it is negative, as `toInt(radix:)` reads it back, and with `upper: true` its
+digits above 9 in upper case. Either goes with a width, and `withPrecision`
+and `inRadix` make the same value for a program to keep:
+
+```wip,run
+val seconds = 0.0567
+assert("\(seconds, precision: 3) s" == "0.057 s")
+assert("\(2.5, precision: 0) \(3.5, precision: 0)" == "2 4")
+val byte: u8 = 15
+assert("\(byte, radix: 16, width: 2, fill: '0')" == "0f")
+assert("\(-255, radix: 16)" == "-ff")
+assert("\(byte, radix: 16, upper: true)" == "F")
+assert(1.5.withPrecision(2).toString() == "1.50")
+```
+
 A type of a program's own is written by implementing `Text`, with one of
 two methods. `toString` is the text as a `String` of its
 own, which is simplest where a value has one thing to say; `appendTo`
@@ -281,7 +350,7 @@ extend Failure: Text {
 }
 
 fn main() = {
-    val failure = Failure::NotFound(path: String::of("a.txt"))
+    val failure = Failure::NotFound(String::of("a.txt"))
     assert("error: \(failure)" == "error: no such file: a.txt")
     assert(Failure::Denied.toString() == "permission denied")
     assert(42.toString() == "42")

@@ -74,6 +74,11 @@ const STD: &[(&str, &str, &str)] = &[
     ),
     (
         "std::prelude",
+        "std/prelude/overflow.wip",
+        include_str!("../../../std/prelude/overflow.wip"),
+    ),
+    (
+        "std::prelude",
         "std/prelude/str.wip",
         include_str!("../../../std/prelude/str.wip"),
     ),
@@ -97,11 +102,23 @@ const STD: &[(&str, &str, &str)] = &[
         "std/prelude/char.wip",
         include_str!("../../../std/prelude/char.wip"),
     ),
+    // Whether a character is a letter or a number.
+    (
+        "std::prelude",
+        "std/prelude/category.wip",
+        include_str!("../../../std/prelude/category.wip"),
+    ),
     // How many columns a character takes.
     (
         "std::prelude",
         "std/prelude/width.wip",
         include_str!("../../../std/prelude/width.wip"),
+    ),
+    // A float to a precision, an integer in a radix.
+    (
+        "std::prelude",
+        "std/prelude/written.wip",
+        include_str!("../../../std/prelude/written.wip"),
     ),
     // A copy of a value.
     (
@@ -250,6 +267,11 @@ const STD: &[(&str, &str, &str)] = &[
     ),
     (
         "std::iter",
+        "std/iter/forwards.wip",
+        include_str!("../../../std/iter/forwards.wip"),
+    ),
+    (
+        "std::iter",
         "std/iter/backwards.wip",
         include_str!("../../../std/iter/backwards.wip"),
     ),
@@ -348,6 +370,12 @@ const STD: &[(&str, &str, &str)] = &[
         "std/args/args.wip",
         include_str!("../../../std/args/args.wip"),
     ),
+    // Random numbers, for what is not cryptography.
+    (
+        "std::random",
+        "std/random/random.wip",
+        include_str!("../../../std/random/random.wip"),
+    ),
     // Starting another program.
     (
         "std::process",
@@ -371,6 +399,16 @@ const STD: &[(&str, &str, &str)] = &[
         "std::path",
         "std/path/path.wip",
         include_str!("../../../std/path/path.wip"),
+    ),
+    (
+        "std::mem",
+        "std/mem/mem.wip",
+        include_str!("../../../std/mem/mem.wip"),
+    ),
+    (
+        "std::digest",
+        "std/digest/digest.wip",
+        include_str!("../../../std/digest/digest.wip"),
     ),
     (
         "std::c",
