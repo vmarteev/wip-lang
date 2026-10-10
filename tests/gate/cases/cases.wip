@@ -1,0 +1,145 @@
+// The language's own cases, `tests/cases`: each a directory and a program,
+// which can be run as it is, `wip run tests/cases/ok/1_hello/main.wip`.
+//
+// - `ok/<case>`: the program must compile. Its syntax tree, every file of
+//   its own module under the file's name, is `syntax.snap`, and what running
+//   it prints is `run.snap`. A release build must print what the debug
+//   build prints.
+// - `err/<case>`: the program must be refused, and what `wip check` reports
+//   is `diagnostics.snap`.
+//
+// Every command runs in `tests/cases`, so that what a snapshot names, a
+// file in a diagnostic or a call in a panic's trace, does not depend on
+// where the gate was started. A program built runs with its standard input
+// reading nothing, so that a case that reads does not wait on a terminal,
+// and reports any `own` value it never freed.
+
+import std::process::{Command}
+import check::{Checked, Gate, across, indented, listed, report, run}
+import snapshot
+
+val CASES = "tests/cases"
+
+pub fn check(gate: &Gate): Checked = {
+	var names: Vec<String> = Vec()
+	for kind in ["ok", "err"] {
+		for name in listed("\(CASES)/\(kind)") {
+			val case = "\(kind)/\(name)"
+			if gate.takes(case.toStr()) then names.push(move case)
+		}
+	}
+	val failed = across(
+		names.len(),
+		(index) => {
+			val name = names[index].toStr()
+			return if name.startsWith("ok/") then ok(&gate, name) else err(&gate, name)
+		},
+	)
+	return Checked::of(names.len(), move failed)
+}
+
+/// A case that must compile: its syntax, and what it prints, built both
+/// ways.
+fn ok(gate: &Gate, name: str): Option<String> = {
+	val dir = "\(CASES)/\(name)"
+	var found: Vec<String> = Vec()
+
+	var tree = String()
+	for file in moduleFiles(dir.toStr()) {
+		val path = "\(name)/\(file)"
+		val parsed = gate.wip(CASES, ["parse", path.toStr()])
+		if !parsed.exit.success() then
+			return .Some("\(name): `wip parse \(file)` failed\(indented(parsed.stderr.toStr()))")
+		tree.push("=== \(file) ===\n")
+		tree.push(parsed.stdout.toStr())
+	}
+	if snapshot::compare("\(dir)/syntax.snap", tree.toStr(), gate.writes) is .Some(why) then
+		found.push("syntax.snap\n\(why)")
+
+	val program = gate.work.join(name.replace("/", "-").toStr())
+	var printed = String()
+	for build in [Build::Debug, Build::Release] {
+		val exe = if build == .Release then "\(program)-release" else program.clone()
+		val main = "\(name)/main.wip"
+		val built = match build {
+			.Debug => gate.wip(CASES, ["build", main.toStr(), "-o", exe.toStr()])
+			.Release => gate.wip(CASES, ["build", "--release", main.toStr(), "-o", exe.toStr()])
+		}
+		if !built.exit.success() {
+			found.push("`wip build\(build.flag())` failed\(indented(built.stderr.toStr()))")
+			break
+		}
+		val output = run(Command::of(exe.toStr()).env("WIP_CHECK_LEAKS", "1").directory(CASES))
+		val ran = report(&output)
+		if build == .Debug {
+			if snapshot::compare("\(dir)/run.snap", ran.toStr(), gate.writes) is .Some(why) then
+				found.push("run.snap\n\(why)")
+			printed = move ran
+		} else if ran != printed {
+			found.push("the release build prints something else\n\(snapshot::difference(printed.toStr(), ran.toStr()))")
+		}
+	}
+	return failure(name, &found)
+}
+
+/// A case that must be refused: what `wip check` reports, but for the count
+/// of errors it ends with.
+fn err(gate: &Gate, name: str): Option<String> = {
+	val main = "\(name)/main.wip"
+	val checked = gate.wip(CASES, ["check", "--color", "never", main.toStr()])
+	val reported = withoutCount(checked.stderr.toStr())
+	val rendered = if reported.isEmpty() then "(no diagnostics)\n" else reported
+	var found: Vec<String> = Vec()
+	if snapshot::compare("\(CASES)/\(name)/diagnostics.snap", rendered, gate.writes) is .Some(why) {
+		found.push("diagnostics.snap\n\(why)")
+	}
+	return failure(name, &found)
+}
+
+/// How a case is built: the debug build a snapshot records, and the release
+/// build that must do what it does.
+@derive(Eq)
+enum Build {
+	Debug
+	Release
+}
+
+extend Build {
+	fn flag(): str = if self == .Release then " --release" else ""
+}
+
+/// What `wip check` wrote, but for its last line where that counts the
+/// errors, `1 error` or `3 errors`, which is the command's and not the
+/// diagnostics'.
+fn withoutCount(text: str): str = {
+	val body = text.trimEnd()
+	val start = match body.findLast("\n") {
+		.Some(at) => at + 1
+		.None => 0
+	}
+	val last = body[start..]
+	val count = last.stripSuffix(" errors").or(last.stripSuffix(" error"))
+	if count is .Some(digits) && !digits.isEmpty() && digits.chars().all((c) => c.isDigit()) then
+		return text[0..start]
+	return text
+}
+
+/// The files of the case's own module, in name order, as the compiler reads
+/// them: its `.wip` files, but for a package's file and the tests.
+fn moduleFiles(dir: str): Vec<String> = {
+	var files: Vec<String> = Vec()
+	for name in listed(dir) {
+		if name.endsWith(".wip") && name != "package.wip" && !name.endsWith(".test.wip") then
+			files.push(move name)
+	}
+	return move files
+}
+
+fn failure(name: str, found: &Vec<String>): Option<String> = {
+	if found.isEmpty() then return .None
+	var out = String::of(name)
+	for why in found {
+		out.push("\n  \(why)")
+	}
+	return .Some(move out)
+}

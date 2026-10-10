@@ -1,0 +1,218 @@
+// A function C calls with a struct by value, or that answers C one: C's side
+// is a function of its own with the signature C's ABI gives it, which puts the
+// structs back together from what C passed, calls the function as Wip calls
+// it, and answers as C's ABI says. LLVM inlines the one into the other.
+
+import hir::{FnId, Ty}
+import mir::{Answer, CCall, Part, Pass, Reg}
+
+/// The temporaries C's side makes, `%w1` on, and C's arguments in order,
+/// `%p0` on.
+struct Names {
+	temps: u32
+	incoming: u32
+}
+
+extend Names {
+	var fn temp(): Value = {
+		self.temps += 1
+		return .Wrapper(self.temps)
+	}
+
+	var fn take(): Value = {
+		self.incoming += 1
+		return .Param(self.incoming - 1)
+	}
+}
+
+extend Llvm {
+	/// C's side of `id`, whose structs travel as `cCall` says, named `symbol`
+	/// and calling `body`, the function as Wip calls it.
+	var fn defineExport(id: FnId, symbol: u32, body: u32, cCall: &CCall): Function = {
+		val program = self.program
+		val def = &program.fns[id]
+		var params: Vec<Ty> = Vec()
+		for p in def.params {
+			params.push(p.ty)
+		}
+		val ret = def.ret
+		val cSig = self.cSignature(id, &cCall)
+		val wipSig = self.signatureWith(&params, ret, true)
+		val name = program.fnName(id, self.interner)
+		val subprogram = self.debug.subprogram(name.toStr(), .None)
+		val place = self.debug.noLine(subprogram.clone())
+
+		var code: Vec<Instruction> = Vec()
+		val at = (result: Option<Value>, op: Op) => Instruction(
+			result: move result,
+			op: move op,
+			at: .Some(place),
+		)
+		var names = Names(temps: 0, incoming: 0)
+		var args: Vec<Value> = Vec()
+		// Where the struct the function answers is written: C's address, or a
+		// slot its pieces are read from.
+		var result: Option<Value> = .None
+		match cCall.ret {
+			.Hidden => args.push(names.take())
+			.Parts(parts) => {
+				val slot = names.temp()
+				val size = reach(self.layout(ret).size, &parts)
+				code.push(at(.Some(slot.clone()), .Alloca(t: byteArray(size), align: 8)))
+				args.push(slot.clone())
+				result = .Some(move slot)
+			}
+			.Plain => {}
+		}
+		for (i, pass) in cCall.params.forwards().enumerate() {
+			val ty = params[i]
+			match pass {
+				.Plain => {
+					if self.isCPair(ty) {
+						args.push(names.take())
+						args.push(names.take())
+					} else {
+						args.push(names.take())
+					}
+				}
+				// A struct in pieces: stored to a slot as large as all of them,
+				// whose address the function takes.
+				.Parts(parts) | .Spilled(parts, ..) => {
+					if pass is .Spilled(pad, ..) {
+						for _ in 0..(pad.ints + pad.floats) {
+							names.take()
+						}
+					}
+					val slot = names.temp()
+					val size = reach(self.layout(ty).size, &parts)
+					code.push(at(.Some(slot.clone()), .Alloca(t: byteArray(size), align: 8)))
+					for part in parts {
+						val piece = names.take()
+						val address = names.temp()
+						code.push(
+							at(
+								.Some(address.clone()),
+								.Offset(base: slot.clone(), offset: .Int(part.offset as i64)),
+							),
+						)
+						code.push(
+							at(.None, .Store(
+								value: Val::of(move piece, regType(part.reg.clone())),
+								address: move address,
+								align: 1,
+							)),
+						)
+					}
+					args.push(move slot)
+				}
+				// C's copy, or the bytes C put on the stack: the struct's own
+				// address, which the function takes as Wip passes a struct.
+				.Copy | .Stack(..) => args.push(names.take())
+			}
+		}
+		// As the function takes them, which says what C's ABI asks of each.
+		var typed: Vec<Arg> = Vec()
+		for (i, value) in args.forwards().enumerate() {
+			if i < wipSig.params.len() {
+				val slot = &wipSig.params[i]
+				typed.push(Arg(
+					value: Val::of(value.clone(), slot.t.clone()),
+					attrs: slot.attrs.clone(),
+				))
+			}
+		}
+		val call = Call(
+			ret: wipSig.retType(),
+			retAttrs: wipSig.retAttrs(),
+			variadic: .None,
+			callee: .Global(body),
+			args: move typed,
+		)
+		match cCall.ret {
+			.Plain => match wipSig.ret {
+				.Some(slot) => {
+					val answer = names.temp()
+					code.push(at(.Some(answer.clone()), .Call(own move call)))
+					code.push(at(.None, .Ret(.Some(Val::of(move answer, slot.t.clone())))))
+				}
+				.None => {
+					code.push(at(.None, .Call(own move call)))
+					code.push(at(.None, .Ret(.None)))
+				}
+			}
+			.Hidden => {
+				code.push(at(.None, .Call(own move call)))
+				code.push(at(.None, .Ret(.None)))
+			}
+			// The pieces, read from where the function wrote the struct.
+			.Parts(parts) => {
+				code.push(at(.None, .Call(own move call)))
+				val .Some(slot) = result else {
+					panic("a slot for the struct answered")
+				}
+				val ty = partsType(&parts)
+				var both = Value::Undef
+				for (i, part) in parts.forwards().enumerate() {
+					val address = names.temp()
+					code.push(
+						at(
+							.Some(address.clone()),
+							.Offset(base: slot.clone(), offset: .Int(part.offset as i64)),
+						),
+					)
+					val piece = names.temp()
+					val t = regType(part.reg.clone())
+					code.push(
+						at(
+							.Some(piece.clone()),
+							.Load(t: t.clone(), address: move address, align: 1, assumes: .Nothing),
+						),
+					)
+					val next = names.temp()
+					code.push(
+						at(
+							.Some(next.clone()),
+							.InsertValue(own InsertValue(
+								aggregate: Val::of(move both, ty.clone()),
+								value: Val::of(move piece, move t),
+								index: i as u32,
+							)),
+						),
+					)
+					both = move next
+				}
+				code.push(at(.None, .Ret(.Some(Val::of(move both, move ty)))))
+			}
+		}
+
+		var cParams: Vec<Param> = Vec()
+		for (i, slot) in cSig.params.forwards().enumerate() {
+			cParams.push(Param(
+				t: slot.t.clone(),
+				attrs: slot.attrs.clone(),
+				name: .Some(.Param(i as u32)),
+			))
+		}
+		return Function(
+			symbol: symbol,
+			linkage: .External,
+			ret: cSig.retType(),
+			retAttrs: cSig.retAttrs(),
+			params: move cParams,
+			returns: true,
+			subprogram: subprogram.node,
+			blocks: Vec::of(own [Block(label: .Start, instructions: move code)]),
+		)
+	}
+}
+
+/// The bytes a struct's slot takes: the struct's, or as far as its pieces
+/// reach, which may be past them.
+fn reach(size: u32, parts: &[Part]): u32 = {
+	var end: u32 = 0
+	for part in parts {
+		val reaches = part.offset + if part.reg == Reg::F32 then 4 else 8
+		if reaches > end then end = reaches
+	}
+	return size.max(end).max(1)
+}

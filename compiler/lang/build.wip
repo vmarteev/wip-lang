@@ -1,0 +1,640 @@
+// Building: checking a loaded program, generating its code, compiling the C
+// it carries and linking the executable or library.
+
+import std::fs
+import std::io
+import std::path
+import std::process::{Command}
+import std::time::{Instant}
+import hir::{CLanguage, FnId, Program, checkMain}
+import llvm
+import mir
+import syntax::{Diagnostic, Interner}
+
+/// What `wip build` writes.
+@derive(Eq, Clone)
+pub enum Emit {
+	/// An executable, with the C entry point.
+	Program
+	/// An archive C links against: the objects, the runtime, and the C files
+	/// the modules carry.
+	Static
+	/// A shared library: `.dylib` on macOS, `.so` elsewhere.
+	Dynamic
+	/// The program's LLVM IR, as text, which `clang` is not run on: a release
+	/// build's one module, and a debug build's parts, the first where the
+	/// output says and the rest beside it, numbered.
+	LlvmIr
+	/// The same, as LLVM's bitcode.
+	LlvmBc
+}
+
+extend Emit {
+	/// Whether what is written needs a `main` — a library does not.
+	pub fn isProgram(): bool = self is .Program | .LlvmIr | .LlvmBc
+
+	/// What the flag's value is written as, for a message.
+	pub fn text(): str = match self {
+		.Program => "program"
+		.Static => "static"
+		.Dynamic => "dynamic"
+		.LlvmIr => "llvm-ir"
+		.LlvmBc => "llvm-bc"
+	}
+
+	/// The flag's value, read.
+	pub static fn parse(text: str): Option<Emit> = match text {
+		"program" => .Some(.Program)
+		"static" => .Some(.Static)
+		"dynamic" => .Some(.Dynamic)
+		"llvm-ir" => .Some(.LlvmIr)
+		"llvm-bc" => .Some(.LlvmBc)
+		_ => .None
+	}
+}
+
+/// Whether a build is for debugging or for use: the program does the same
+/// either way, and a release build is faster.
+@derive(Eq, Clone)
+pub enum Profile {
+	/// Not optimised, with the move checks; the default.
+	Debug
+	/// Optimised, without the move checks, and with the debug information in
+	/// a file beside the program.
+	Release
+}
+
+extend Profile {
+	pub fn optimizes(): bool = self == Profile::Release
+}
+
+/// Where to look for the C a program binds: the directories a command line
+/// added with `-I` and `-L`. What a module needs is in the module; where it
+/// is on this machine is not.
+@derive(Clone)
+pub struct Search {
+	pub var includes: Vec<String> = Vec()
+	pub var libraryPaths: Vec<String> = Vec()
+}
+
+/// How a program is built, beyond what and where: where the C it binds is on
+/// this machine, what is written, and whether for debugging or for use.
+/// `BuildOptions()` is a debug build of an executable, looking for C where
+/// the compiler looks by itself.
+@derive(Clone)
+pub struct BuildOptions {
+	/// The directories `-I` and `-L` added.
+	pub var search: Search = Search()
+	/// A program, a library C links against, or the program's IR.
+	pub var emit: Emit = .Program
+	/// Where to write the C declarations of what a library exports, if
+	/// anywhere.
+	pub var header: Option<String> = .None
+	/// Debug or release.
+	pub var profile: Profile = .Debug
+	/// The processor the program is built for.
+	pub var cpu: Cpu = .Baseline
+	/// Whether it carries debug information: the lines a panic lists, and
+	/// what a debugger reads.
+	pub var debugInfo: bool = true
+}
+
+/// Why a build did not finish: what is wrong in the program, or what went
+/// wrong after it was checked.
+pub enum BuildError {
+	Diagnostics(diagnostics: Vec<Diagnostic>)
+	Link(message: String)
+}
+
+/// Compiles a loaded program as `options` say, to `output`, and answers the
+/// warnings. What the build writes on the way is named by `unique`, which
+/// the process shares with whatever else names a file.
+pub fn buildLoaded(
+	loaded: &var Loaded,
+	output: str,
+	options: &BuildOptions,
+	unique: &Unique,
+	timings: &var Timings,
+): Result<Vec<Diagnostic>, BuildError> = {
+	val checked = checkLoaded(&var loaded, &var timings)
+	var program = move checked.program
+	val diagnostics = move checked.diagnostics
+	if anyError(&diagnostics) then return .Err(.Diagnostics(move diagnostics))
+	program.checkMoves = options.profile == Profile::Debug
+	program.dropsByCall = options.profile == Profile::Debug
+	// A program has an entry point; a library is called from one.
+	var main: Option<llvm::Entry> = .None
+	if options.emit.isProgram() {
+		match checkMain(&program, &loaded.interner) {
+			.Ok(entry) => main = .Some(.Main(entry.main))
+			.Err(diagnostic) => return .Err(.Diagnostics(Vec::of(own [move diagnostic])))
+		}
+	}
+	match writeBinary(&loaded, &program, move main, output, &options, &unique, &var timings) {
+		.Ok(..) => {}
+		.Err(error) => return .Err(move error)
+	}
+	return .Ok(move diagnostics)
+}
+
+/// Compiles a checked program that starts at `entry` and links it, writing
+/// the declarations of what a library exports where one was asked for.
+fn writeBinary(
+	loaded: &Loaded,
+	program: &Program,
+	entry: Option<llvm::Entry>,
+	output: str,
+	options: &BuildOptions,
+	unique: &Unique,
+	timings: &var Timings,
+): Result<void, BuildError> = {
+	// What C cannot be given to call.
+	val refused = mir::refusedExports(&program, &loaded.interner, mir::Arch::host())
+	if !refused.isEmpty() then return .Err(.Diagnostics(move refused))
+	val optimize = options.profile.optimizes()
+	val sources = &loaded.sources
+	var started = Instant::now()
+	var ir = llvm::compile(
+		&program,
+		&loaded.interner,
+		move entry,
+		(span) => sources.locate(span),
+		optimize,
+	)
+	if !options.debugInfo then ir.dropDebugInfo()
+	timings.record("codegen", started)
+	if options.emit is .LlvmIr | .LlvmBc {
+		for (index, module) in ir.modules.forwards().enumerate() {
+			val path = partPath(output, index)
+			// Bitcode is bytes, which a `str` holds as any others.
+			val written = if options.emit == Emit::LlvmBc {
+				val bytes = llvm::bitcode(&module)
+				fs::writeFile(path.toStr(), str::fromBytes(&bytes.items()))
+			} else {
+				fs::writeFile(path.toStr(), module.text().toStr())
+			}
+			if written is .Err(error) then return .Err(.Link("cannot write `\(path)`: \(error)"))
+		}
+		return .Ok()
+	}
+	started = Instant::now()
+	val compiled = llvmObjects(&ir, &options.cpu, optimize, &unique)
+	timings.record("codegen", started)
+	val objects = compiled?
+	started = Instant::now()
+	val linked = linkProgram(&loaded, &program, &objects, output, &options, &unique)
+	timings.record("link", started)
+	linked?
+	if options.header is .Some(header) {
+		val guard = headerGuard(header.toStr())
+		val text = mir::writeHeader(&program, &loaded.interner, guard.toStr())
+		if fs::writeFile(header.toStr(), text.toStr()) is .Err(error) then
+			return .Err(.Link("cannot write `\(header)`: \(error)"))
+	}
+	return .Ok()
+}
+
+/// Links what was compiled with the C the program carries, which is known
+/// only once it is checked.
+fn linkProgram(
+	loaded: &Loaded,
+	program: &Program,
+	objects: &[Vec<u8>],
+	output: str,
+	options: &BuildOptions,
+	unique: &Unique,
+): Result<void, BuildError> = {
+	val shims = shims(&program, &loaded.interner)
+	var dirs: Vec<String> = Vec()
+	for module in loaded.modules {
+		dirs.push(module.dir.clone())
+	}
+	val includeDirs = cIncludeDirs(&program, &dirs, &loaded.includeDirs)?
+	// The C a module names with `@source`, and the header it puts before
+	// its own C with `@prefix`, and what it defines for it with
+	// `@define`. All are known only once the program is checked, which
+	// is why they join the files here rather than where the modules were
+	// read.
+	val cFiles = cSources(&program, &dirs, &loaded.cFiles)?
+	val linking = Linking(
+		cFiles: &cFiles,
+		shims: match shims {
+			.Some(text) => .Some(text.toStr())
+			.None => .None
+		},
+		includeDirs: &includeDirs,
+		search: &options.search,
+		libraries: &program.libraries,
+		frameworks: &program.frameworks,
+		emit: options.emit.clone(),
+		profile: options.profile.clone(),
+		cpu: &options.cpu,
+	)
+	return link(&objects, &linking, output, &unique)
+}
+
+/// Compiles a loaded program's tests to a runner at `output`: it calls each
+/// test the program declares, in declaration order, and `filter` keeps the
+/// ones whose name, as the runner prints it — `board::placesABall` — holds
+/// it. The count is how many tests the runner holds. What `options` say of
+/// what is written and where its declarations go is not asked: tests are a
+/// program of their own, with no header to write.
+pub fn buildTests(
+	loaded: &var Loaded,
+	output: str,
+	options: &BuildOptions,
+	filter: Option<str>,
+	unique: &Unique,
+	timings: &var Timings,
+): Result<(Vec<Diagnostic>, i64), BuildError> = {
+	val profile = options.profile.clone()
+	val checked = checkLoaded(&var loaded, &var timings)
+	var program = move checked.program
+	val diagnostics = move checked.diagnostics
+	if anyError(&diagnostics) then return .Err(.Diagnostics(move diagnostics))
+	program.checkMoves = profile == Profile::Debug
+	program.dropsByCall = profile == Profile::Debug
+	var tests: Vec<FnId> = Vec()
+	for id in program.fns.ids() {
+		if !program.fns[id].isTest then continue
+		if filter is .Some(text) && !program.testName(id, &loaded.interner).contains(text) then
+			continue
+		tests.push(id)
+	}
+	val count = tests.len()
+	val written = BuildOptions(
+		search: options.search.clone(),
+		emit: .Program,
+		header: .None,
+		profile: move profile,
+		cpu: options.cpu.clone(),
+	)
+	writeBinary(
+		&loaded,
+		&program,
+		.Some(.Tests(move tests)),
+		output,
+		&written,
+		&unique,
+		&var timings,
+	)?
+	return .Ok((move diagnostics, count))
+}
+
+/// Where the part `index` of a debug build's IR is written: the first at
+/// `output`, and each after it beside it, its number before the extension —
+/// `main.ll`, `main.1.ll`, `main.2.ll`.
+fn partPath(output: str, index: i64): String = {
+	if index == 0 then return String::of(output)
+	var slash: Option<i64> = .None
+	for i in 0..output.len() {
+		if output[i] == b'/' then slash = .Some(i)
+	}
+	val (dir, name) = match slash {
+		.Some(at) => (output[0..at + 1], output[at + 1..output.len()])
+		.None => ("", output)
+	}
+	var dot: Option<i64> = .None
+	for i in 1..name.len() {
+		if name[i] == b'.' then dot = .Some(i)
+	}
+	return match dot {
+		.Some(at) => "\(dir)\(name[0..at]).\(index).\(name[at + 1..name.len()])"
+		.None => "\(dir)\(name).\(index)"
+	}
+}
+
+/// `BOARD_H` for `board.h`: what keeps a header from being read twice.
+fn headerGuard(header: str): String = {
+	val name = path::name(header)
+	val given = if name.isEmpty() then "wip" else name
+	var guard = String::of("WIP_")
+	for byte in given {
+		// One `_` for each character that is not a letter or a digit, however
+		// many bytes it takes.
+		if byte is 0x80..=0xBF then continue
+		if byte is b'a'..=b'z' then guard.pushByte(byte - 32)
+		else if byte is b'A'..=b'Z' | b'0'..=b'9' then guard.pushByte(byte)
+		else guard.pushByte(b'_')
+	}
+	return move guard
+}
+
+/// Every C file compiled with the program: the ones found beside a module's
+/// Wip files, and the ones a module names with `@source`, each carrying the
+/// `@prefix` header of the module it belongs to.
+fn cSources(
+	program: &Program,
+	dirs: &[String],
+	found: &[String],
+): Result<Vec<CFile>, BuildError> = {
+	var files: Vec<CFile> = Vec()
+	for file in found {
+		var c = CFile::of(file.clone())
+		if ownerOf(file.toStr(), &dirs) is .Some(owner) {
+			c.prefix = prefixOf(&program, &dirs, owner)
+			c.defines = definesOf(&program, owner)
+		}
+		files.push(move c)
+	}
+	for (module, relative, language) in program.cSources {
+		val path = path::join(dirs[module].toStr(), relative.toStr())
+		if !(fs::meta(path.toStr()) is .Ok(meta) && meta.isFile()) {
+			val name =
+				if program.modules[module].isEmpty() then String::of("the root module")
+				else "module `\(program.modules[module])`"
+			return .Err(.Link("`@source(\"\(relative)\")` in \(name): `\(path)` is not a file"))
+		}
+		var c = CFile::of(move path)
+		// What `@source` said it is written in.
+		match language {
+			.Some(.C) => c.language = .C
+			.Some(.ObjectiveC) => c.language = .ObjectiveC
+			.None => {}
+		}
+		// Objective-C is Apple's, as it is for a file found beside the
+		// module's own.
+		if c.language == Language::ObjectiveC && TARGET_VENDOR != "apple" then continue
+		c.prefix = prefixOf(&program, &dirs, module)
+		c.defines = definesOf(&program, module)
+		files.push(move c)
+	}
+	return .Ok(move files)
+}
+
+/// A module's prefix header, as a path.
+fn prefixOf(program: &Program, dirs: &[String], module: i64): Option<String> = {
+	for (owner, relative) in program.cPrefix {
+		if owner == module then return .Some(path::join(dirs[module].toStr(), relative.toStr()))
+	}
+	return .None
+}
+
+/// What a module's C is compiled with defined.
+fn definesOf(program: &Program, module: i64): Vec<String> = {
+	var defines: Vec<String> = Vec()
+	for (owner, define) in program.cDefines {
+		if owner == module then defines.push(define.clone())
+	}
+	return move defines
+}
+
+/// Which module a file found on disk belongs to: the deepest module
+/// directory it is under, or else a module in the current directory, as
+/// `wip run main.wip` has.
+fn ownerOf(file: str, dirs: &[String]): Option<i64> = {
+	var deepest: Option<(i64, i64)> = .None
+	for (module, dir) in dirs.forwards().enumerate() {
+		if dir.isEmpty() || !path::isWithin(file, dir.toStr()) then continue
+		val depth = components(dir.toStr())
+		if !(deepest is .Some((_, deeper)) && deeper > depth) then deepest = .Some((module, depth))
+	}
+	if deepest is .Some((module, _)) then return .Some(module)
+	for (module, dir) in dirs.forwards().enumerate() {
+		if dir.isEmpty() then return .Some(module)
+	}
+	return .None
+}
+
+/// How many names a path is made of: `/` and `.` count as one each, as
+/// Rust's components do.
+fn components(dir: str): i64 = {
+	var count = if dir.startsWith("/") then 1 else 0
+	for name in dir.split("/") {
+		if !name.isEmpty() && !(name == "." && count > 0) then count += 1
+	}
+	return count
+}
+
+/// Where the program's C looks for headers: the modules' directories, and
+/// then the directories they name with `@include`, each inside its module.
+/// One that is not there is an error, since a header the C cannot find would
+/// be reported by the C compiler, far from the cause.
+fn cIncludeDirs(
+	program: &Program,
+	moduleDirs: &[String],
+	modules: &[String],
+): Result<Vec<String>, BuildError> = {
+	var dirs: Vec<String> = Vec()
+	for dir in modules {
+		dirs.push(dir.clone())
+	}
+	for (module, relative) in program.cIncludes {
+		val path = &program.modules[module]
+		val dir = path::join(moduleDirs[module].toStr(), relative.toStr())
+		if !(fs::meta(dir.toStr()) is .Ok(meta) && meta.isDirectory()) {
+			val name = if path.isEmpty() then String::of("the root module") else "module `\(path)`"
+			return .Err(
+				.Link("`@include(\"\(relative)\")` in \(name): `\(dir)` is not a directory"),
+			)
+		}
+		if !dirs.contains(&dir) then dirs.push(move dir)
+	}
+	return .Ok(move dirs)
+}
+
+/// What the linker is given besides the objects: where to look for
+/// libraries, the libraries the extern blocks name, and on an Apple target
+/// the frameworks.
+fn linkArgs(libraryPaths: &[String], libraries: &[String], frameworks: &[String]): Vec<String> = {
+	var args: Vec<String> = Vec()
+	for dir in libraryPaths {
+		args.push("-L\(dir)")
+	}
+	for name in libraries {
+		args.push("-l\(name)")
+	}
+	// The runtime starts threads: a Linux whose C library does not have them
+	// in it has them in a library of their own. A Mac has them in libSystem.
+	if TARGET_OS == "linux" then args.push(String::of("-lpthread"))
+	// No other system has frameworks, so elsewhere they are not asked for.
+	if TARGET_VENDOR == "apple" {
+		for name in frameworks {
+			args.push(String::of("-framework"))
+			args.push(name.clone())
+		}
+	}
+	return move args
+}
+
+/// Everything the C toolchain is given besides the object files: what to
+/// compile beside them, where to look, and what to write.
+view struct Linking {
+	/// The modules' own C: the files found beside their Wip ones and those
+	/// they name with `@source`, each with the `@prefix` header of its
+	/// module.
+	cFiles: &[CFile]
+	shims: Option<str>
+	/// Where the program's C looks for headers: the modules' directories,
+	/// and those they name with `@include`.
+	includeDirs: &[String]
+	search: &Search
+	libraries: &[String]
+	frameworks: &[String]
+	emit: Emit
+	profile: Profile
+	cpu: &Cpu
+}
+
+/// The C the compiler writes for the calls it cannot make itself: the ones
+/// `c_abi` leaves to a wrapper on this target.
+fn shims(program: &Program, interner: &Interner): Option<String> = {
+	val shimmed = mir::shimmed(&program, mir::Arch::host())
+	return mir::writeShims(&program, &interner, &shimmed)
+}
+
+/// Compiles the program's C, each file once, and links it with the modules'
+/// object files, using `$CC` or `cc`.
+fn link(
+	objects: &[Vec<u8>],
+	linking: &Linking,
+	output: str,
+	unique: &Unique,
+): Result<void, BuildError> = {
+	val dir = match TempDir::new(&unique) {
+		.Ok(dir) => move dir
+		.Err(message) => return .Err(.Link(move message))
+	}
+	var members: Vec<String> = Vec()
+	for (i, object) in objects.forwards().enumerate() {
+		val path = dir.join("module\(i).o")
+		if writeBytes(path.toStr(), &object) is .Err(error) then
+			return .Err(.Link("cannot write temporary files: \(error)"))
+		members.push(move path)
+	}
+
+	// The C the compiler wrote for the calls C has to make is kept where its
+	// path depends only on what it says, so it compiles once. A person can
+	// read it there if a call ever goes wrong. The runtime is Wip, in the
+	// prelude: a program that brings no C and needs no wrapper compiles no C.
+	val cache = cacheDir()
+	var files: Vec<CFile> = Vec()
+	for file in linking.cFiles {
+		files.push(file.clone())
+	}
+	if linking.shims is .Some(source) {
+		val generated = match generated(cache.toStr(), [("wip_shims.c", source)], &unique) {
+			.Ok(generated) => move generated
+			.Err(message) => return .Err(.Link(move message))
+		}
+		files.push(CFile::c(path::join(generated.toStr(), "wip_shims.c")))
+	}
+
+	// The modules' directories first, then the command line's, so a module's
+	// header wins over one of the same name elsewhere. Each as the file
+	// system names it, so that the same directory is the same flag wherever
+	// the build was started. An empty path is the current directory, as a
+	// bare file name's parent is: written as it is, it would be a `-I` that
+	// takes the next argument.
+	var includes: Vec<String> = Vec()
+	for dir in linking.includeDirs {
+		addInclude(&var includes, dir.toStr())
+	}
+	for dir in linking.search.includes {
+		addInclude(&var includes, dir.toStr())
+	}
+	// Code in a shared library is placed wherever the library is loaded;
+	// Apple's compilers make all code so.
+	val positionIndependent = linking.emit == Emit::Dynamic && TARGET_VENDOR != "apple"
+	val compiled = match compile(
+		&files,
+		&includes,
+		cache.toStr(),
+		positionIndependent,
+		linking.profile.optimizes(),
+		linking.cpu,
+		&unique,
+	) {
+		.Ok(compiled) => move compiled
+		.Err(message) => return .Err(.Link(move message))
+	}
+	for object in compiled.objects {
+		members.push(object.clone())
+	}
+
+	// An archive is made of objects, and `ar` collects them.
+	if linking.emit == Emit::Static {
+		var args: Vec<String> = Vec()
+		args.push(String::of("rcs"))
+		args.push(String::of(output))
+		for member in members {
+			args.push(member.clone())
+		}
+		val ar = match io::env("AR") {
+			.Some(ar) => move ar
+			.None => String::of("ar")
+		}
+		return run(ar.toStr(), strs(&args))
+	}
+	var args: Vec<String> = Vec()
+	// A shared library has no entry point, and each platform spells it
+	// differently.
+	if linking.emit == Emit::Dynamic then
+		args.push(String::of(if TARGET_OS == "macos" then "-dynamiclib" else "-shared"))
+	args.push(String::of("-o"))
+	args.push(String::of(output))
+	for member in members {
+		args.push(member.clone())
+	}
+	for arg in linkArgs(&linking.search.libraryPaths, linking.libraries, linking.frameworks) {
+		args.push(move arg)
+	}
+	val cc = compiler()
+	run(cc.toStr(), strs(&args))?
+	// Apple's linker leaves the debug information in the objects and names
+	// them in the program; the program's objects go when this returns, so it
+	// is gathered beside it first, as `clang -g` does. What the linker left
+	// in the program, naming the objects, is then of no use, and is taken
+	// out, as Xcode does for a release: the debugger finds the `.dSYM` by the
+	// program's UUID.
+	if TARGET_VENDOR == "apple" {
+		val symbols = "\(output).dSYM"
+		run("dsymutil", [output, "-o", symbols.toStr()])?
+		return run("strip", ["-S", output])
+	}
+	// Elsewhere the linker puts it in the program. A release build moves it
+	// into a file beside the program, which the program names, as Linux
+	// distributions ship theirs: the program stays small, and gdb and
+	// profilers find the file where it is kept.
+	if linking.profile == Profile::Release {
+		val objcopy = match io::env("OBJCOPY") {
+			.Some(objcopy) => move objcopy
+			.None => String::of("objcopy")
+		}
+		val debug = "\(output).debug"
+		run(objcopy.toStr(), ["--only-keep-debug", output, debug.toStr()])?
+		val named = "--add-gnu-debuglink=\(debug)"
+		run(objcopy.toStr(), ["--strip-debug", named.toStr(), output])?
+	}
+	return .Ok()
+}
+
+/// A directory the program's C looks in, as the file system names it, where
+/// it is not there already.
+fn addInclude(includes: &var Vec<String>, given: str) = {
+	val dir = if given.isEmpty() then "." else given
+	val real = match fs::realPath(dir) {
+		.Ok(real) => move real
+		.Err(..) => String::of(dir)
+	}
+	if !includes.contains(&real) then includes.push(move real)
+}
+
+/// Each of `texts`, lent.
+fn strs(texts: &[String]): Vec<str> = {
+	var out: Vec<str> = Vec()
+	for text in texts {
+		out.push(text.toStr())
+	}
+	return move out
+}
+
+/// Runs a tool of the toolchain, saying what it said when it fails.
+fn run(tool: str, args: &[str]): Result<void, BuildError> = {
+	val result = match Command::of(tool).args(&args).output() {
+		.Ok(result) => move result
+		.Err(error) => return .Err(.Link("cannot run `\(tool)`: \(error)"))
+	}
+	if !result.exit.success() then return .Err(.Link("`\(tool)` failed:\n\(result.stderr)"))
+	return .Ok()
+}

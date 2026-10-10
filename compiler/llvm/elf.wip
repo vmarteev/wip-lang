@@ -1,0 +1,345 @@
+// An ELF object, read as far as adding to it needs, and added to: a section
+// of data, the relocations of the addresses in it, and the symbols they name.
+//
+// The object is kept as `clang` wrote it, and what is added comes after it:
+// the section's bytes and its relocations, the symbol table again with the
+// new symbols at its end, the strings again with their names, and a header
+// for each section, which names them all. A new symbol is global, and global
+// symbols come last, so none `clang` wrote moves and none of its relocations
+// changes. What the object held where the moved tables were is left, read by
+// nothing.
+
+import std::collections::{Map}
+
+/// The sizes of a section's header, a symbol and a relocation, in an ELF
+/// object of 64 bits.
+val HEADER: i64 = 64
+val SYMBOL: i64 = 24
+val RELA: i64 = 24
+
+val SHT_PROGBITS: u32 = 1
+val SHT_SYMTAB: u32 = 2
+val SHT_RELA: u32 = 4
+val SHF_WRITE: u64 = 1
+val SHF_ALLOC: u64 = 2
+val SHF_INFO_LINK: u64 = 0x40
+val STB_GLOBAL: u8 = 1
+val STT_NOTYPE: u8 = 0
+val STT_OBJECT: u8 = 1
+val STV_HIDDEN: u8 = 2
+val EM_X86_64: u16 = 62
+val EM_AARCH64: u16 = 183
+val R_X86_64_64: u32 = 1
+val R_AARCH64_ABS64: u32 = 257
+
+/// A section of data to add: its name, its bytes, the hidden symbol at its
+/// start, and where in it an address goes, and of what.
+struct Data {
+	name: String
+	bytes: Vec<u8>
+	symbol: String
+	addresses: Vec<(u64, Address)>
+}
+
+/// What an address in the data is of.
+enum Address {
+	/// A symbol, the object's or one another object holds, which the linker
+	/// finds.
+	Symbol(name: String)
+	/// A place in the data itself, by its distance from the start.
+	Here(at: u64)
+}
+
+/// A section, as its header says.
+struct Section {
+	kind: u32
+	link: u32
+	offset: i64
+	size: i64
+}
+
+/// An object of 64 bits, its words little-endian: the machine, the sections'
+/// headers, and which section holds their names.
+struct Elf {
+	machine: u16
+	headers: Vec<u8>
+	sections: Vec<Section>
+	names: i64
+}
+
+extend Elf {
+	static fn read(bytes: &[u8]): Result<Elf, String> = {
+		if bytes.len() < HEADER ||
+			bytes[0] != 0x7f ||
+			bytes[1] != b'E' ||
+			bytes[2] != b'L' ||
+			bytes[3] != b'F' {
+			return .Err(String::of("not an ELF object"))
+		}
+		if bytes[4] != 2 || bytes[5] != 1 then
+			return .Err(String::of("not an ELF object of 64 bits, little-endian"))
+		val at = u64At(&bytes, 0x28) as i64
+		val size = u16At(&bytes, 0x3a) as i64
+		val count = u16At(&bytes, 0x3c) as i64
+		val names = u16At(&bytes, 0x3e) as i64
+		// A count of 0 with headers, or a names' index past 0xff00, is kept in
+		// the first header, which an object of this size has no need of.
+		if size != HEADER || count == 0 || names >= 0xff00 then
+			return .Err(String::of("an ELF object whose sections are counted elsewhere"))
+		if at + count * HEADER > bytes.len() then
+			return .Err(String::of("the sections' headers are past the end of the object"))
+		val headers = bytes[at..(at + count * HEADER)].toVec()
+		var sections: Vec<Section> = Vec()
+		for index in 0..count {
+			val h = index * HEADER
+			sections.push(Section(
+				kind: u32At(&headers, h + 4),
+				link: u32At(&headers, h + 40),
+				offset: u64At(&headers, h + 24) as i64,
+				size: u64At(&headers, h + 32) as i64,
+			))
+		}
+		return .Ok(Elf(
+			machine: u16At(&bytes, 0x12),
+			headers: move headers,
+			sections: move sections,
+			names: names,
+		))
+	}
+
+	/// The bytes a section holds.
+	fn data(bytes: &[u8], index: i64): Result<Vec<u8>, String> = {
+		val section = &self.sections[index]
+		if section.offset + section.size > bytes.len() then
+			return .Err("section \(index) is past the end of the object")
+		return .Ok(bytes[section.offset..(section.offset + section.size)].toVec())
+	}
+}
+
+/// `object`, an ELF object, with `data` added as a section of its own.
+fn withData(object: &[u8], data: &Data): Result<Vec<u8>, String> = {
+	val elf = Elf::read(&object)?
+	val absolute =
+		if elf.machine == EM_AARCH64 then R_AARCH64_ABS64
+		else if elf.machine == EM_X86_64 then R_X86_64_64
+		else return .Err("no relocation for an address on machine \(elf.machine)")
+	var symtab: Option<i64> = .None
+	for (i, section) in elf.sections.forwards().enumerate() {
+		if section.kind == SHT_SYMTAB {
+			symtab = .Some(i)
+			break
+		}
+	}
+	val .Some(table) = symtab else {
+		return .Err(String::of("an object with no symbol table"))
+	}
+	val strtab = elf.sections[table].link as i64
+	if strtab >= elf.sections.len() then
+		return .Err(String::of("the symbol table's strings are no section"))
+	// LLVM keeps the sections' names with the symbols' strings, and where they
+	// are one table, it is written once.
+	val shared = elf.names == strtab
+	var strings = elf.data(&object, strtab)?
+	var names: Vec<u8> = if shared then Vec() else elf.data(&object, elf.names)?
+	val dataName =
+		if shared then addName(&var strings, data.name.toStr())
+		else addName(&var names, data.name.toStr())
+	val rela = ".rela\(data.name)"
+	val relaName =
+		if shared then addName(&var strings, rela.toStr()) else addName(&var names, rela.toStr())
+
+	// The symbols by name, the last of a name standing for it; and those
+	// added at the end.
+	var symbols = elf.data(&object, table)?
+	var byName: Map<String, u32> = Map()
+	for index in 0..(symbols.len() / SYMBOL) {
+		val name = u32At(&symbols, index * SYMBOL) as i64
+		byName.put(nameAt(&strings, name)?, index as u32)
+	}
+	// A symbol another object holds, named for the linker to find.
+	for (_, address) in data.addresses {
+		if address is .Symbol(name) && !byName.contains(&name) {
+			val index = addSymbol(
+				&var symbols,
+				&var strings,
+				name.toStr(),
+				(STB_GLOBAL << 4) | STT_NOTYPE,
+				0,
+				0,
+				0,
+			)
+			byName.put(name.clone(), index)
+		}
+	}
+	val dataIndex = elf.sections.len()
+	val start = addSymbol(
+		&var symbols,
+		&var strings,
+		data.symbol.toStr(),
+		(STB_GLOBAL << 4) | STT_OBJECT,
+		STV_HIDDEN,
+		dataIndex as u16,
+		data.bytes.len() as u64,
+	)
+	var relocations: Vec<u8> = Vec()
+	for (offset, address) in data.addresses {
+		val (symbol, addend) = match address {
+			.Symbol(name) => match byName.get(&name) {
+				.Some(index) => (index, 0 as i64)
+				.None => return .Err("no symbol `\(name)` in the object")
+			}
+			.Here(at) => (start, at as i64)
+		}
+		pushWord(&var relocations, offset)
+		pushWord(&var relocations, (symbol as u64) << 32 | absolute as u64)
+		pushWord(&var relocations, addend as u64)
+	}
+
+	// The object, then what is added, each where its alignment says.
+	var out = object.toVec()
+	val dataAt = place(&var out, &data.bytes, 8)
+	val relaAt = place(&var out, &relocations, 8)
+	val stringsAt = place(&var out, &strings, 1)
+	val namesAt = if shared then stringsAt else place(&var out, &names, 1)
+	val symbolsAt = place(&var out, &symbols, 8)
+
+	var headers = elf.headers.clone()
+	moved(&var headers, table, symbolsAt, symbols.len())
+	moved(&var headers, strtab, stringsAt, strings.len())
+	if !shared then moved(&var headers, elf.names, namesAt, names.len())
+	header(
+		&var headers,
+		dataName,
+		SHT_PROGBITS,
+		SHF_ALLOC | SHF_WRITE,
+		dataAt,
+		data.bytes.len(),
+		0,
+		0,
+		0,
+	)
+	header(
+		&var headers,
+		relaName,
+		SHT_RELA,
+		SHF_INFO_LINK,
+		relaAt,
+		relocations.len(),
+		table as u32,
+		dataIndex as u32,
+		RELA as u64,
+	)
+	val headersAt = place(&var out, &headers, 8)
+	for i in 0..8 {
+		out[0x28 + i] = (headersAt >> (8 * i as u64)) as u8
+	}
+	val count = (dataIndex + 2) as u16
+	out[0x3c] = count as u8
+	out[0x3d] = (count >> 8) as u8
+	return .Ok(move out)
+}
+
+/// `name` at the end of a table of names, and where it is.
+fn addName(table: &var Vec<u8>, name: str): u32 = {
+	val at = table.len() as u32
+	for i in 0..name.len() {
+		table.push(name[i])
+	}
+	table.push(0)
+	return at
+}
+
+/// A symbol at the end of the table, its name at the end of the strings, and
+/// its index.
+fn addSymbol(
+	symbols: &var Vec<u8>,
+	strings: &var Vec<u8>,
+	name: str,
+	info: u8,
+	other: u8,
+	section: u16,
+	size: u64,
+): u32 = {
+	val index = (symbols.len() / SYMBOL) as u32
+	val at = addName(&var strings, name)
+	for i in 0..4 {
+		symbols.push((at >> (8 * i as u32)) as u8)
+	}
+	symbols.push(info)
+	symbols.push(other)
+	symbols.push(section as u8)
+	symbols.push((section >> 8) as u8)
+	pushWord(&var symbols, 0)
+	pushWord(&var symbols, size)
+	return index
+}
+
+/// `data` at the end of `out`, after the zeros its alignment asks for, and
+/// where it is.
+fn place(out: &var Vec<u8>, data: &[u8], align: i64): u64 = {
+	while out.len() % align != 0 {
+		out.push(0)
+	}
+	val at = out.len() as u64
+	for b in data {
+		out.push(b)
+	}
+	return at
+}
+
+/// The header of section `index`, made to say its bytes are at `offset`.
+fn moved(headers: &var Vec<u8>, index: i64, offset: u64, size: i64) = {
+	val at = index * HEADER
+	for i in 0..8 {
+		headers[at + 24 + i] = (offset >> (8 * i as u64)) as u8
+		headers[at + 32 + i] = ((size as u64) >> (8 * i as u64)) as u8
+	}
+}
+
+/// A section's header, as the object holds it, aligned to 8, at the end of
+/// `headers`.
+fn header(
+	headers: &var Vec<u8>,
+	name: u32,
+	kind: u32,
+	flags: u64,
+	offset: u64,
+	size: i64,
+	link: u32,
+	info: u32,
+	entry: u64,
+) = {
+	pushHalfWord(&var headers, name)
+	pushHalfWord(&var headers, kind)
+	pushWord(&var headers, flags)
+	pushWord(&var headers, 0)
+	pushWord(&var headers, offset)
+	pushWord(&var headers, size as u64)
+	pushHalfWord(&var headers, link)
+	pushHalfWord(&var headers, info)
+	pushWord(&var headers, 8)
+	pushWord(&var headers, entry)
+}
+
+fn pushHalfWord(out: &var Vec<u8>, value: u32) = {
+	for i in 0..4 {
+		out.push((value >> (8 * i as u32)) as u8)
+	}
+}
+
+fn pushWord(out: &var Vec<u8>, value: u64) = {
+	for i in 0..8 {
+		out.push((value >> (8 * i as u64)) as u8)
+	}
+}
+
+/// The NUL-terminated name at `at` of a table of strings.
+fn nameAt(table: &[u8], at: i64): Result<String, String> = {
+	if at > table.len() then return .Err(String::of("a name past the end of its table"))
+	var end = at
+	while end < table.len() && table[end] != 0 {
+		end += 1
+	}
+	if end == table.len() then return .Err(String::of("a name with no end"))
+	return .Ok(String::of(str::fromBytes(&table[at..end])))
+}

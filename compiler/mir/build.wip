@@ -1,0 +1,623 @@
+// Lowering a type-checked function body to MIR.
+//
+// The builder walks the typed IR once, in evaluation order. It keeps what
+// the old code generator kept: a stack of scopes whose cleanups run at each
+// exit, and the temporaries of the statements being lowered, which are
+// dropped where their statements end.
+
+import std::collections::{Map}
+import std::io
+import hir as hir
+import hir::{BOOL, ExprId, FnDef, FnId, I64, LocalId, Program, Ty, TyKind, UNIT}
+import syntax::{Interner, Span}
+
+/// Lowers the body of `def`. A generator's `next` keeps its locals in the
+/// generator.
+pub fn lowerFn(program: &Program, interner: &Interner, def: &FnDef, body: &hir::Body): Body = {
+	var builder = Builder::new(&program, &interner, &body)
+	val .Some(id) = def.generator else {
+		builder.function(&def)
+		return builder.finish()
+	}
+	// Its locals are its frame, laid out while the program was checked,
+	// before the build said how it drops: so it drops as then, field by
+	// field.
+	builder.dropsByCall = false
+	builder.generator(&def)
+	var lowered = builder.finish()
+	keepInFrame(&var lowered, program.structs[id].fields.len() as u32)
+	return move lowered
+}
+
+/// The frame of every generator the program has: what its `next` keeps in it
+/// between calls, after its declared fields. Each is the locals of the `next`
+/// of that type, so it is known once the monomorphizer has made them, and
+/// before anything is laid out.
+pub fn generatorFrames(program: &var Program, interner: &Interner) = {
+	// Each frame is its own, so the order they are worked out in does not
+	// matter.
+	var generators: Vec<(Ty, FnId)> = Vec()
+	for entry in program.generatorNext {
+		generators.push((entry.key, entry.value))
+	}
+	var frames: Vec<(Ty, Vec<Ty>)> = Vec()
+	for (ty, next) in generators {
+		val def = &program.fns[next]
+		val .Some(body) = def.body else {
+			continue
+		}
+		var builder = Builder::new(&program, &interner, &body)
+		builder.generator(&def)
+		val lowered = builder.finish()
+		frames.push((ty, frameTys(&lowered)))
+	}
+	for (ty, frame) in move frames {
+		program.frames.put(ty, move frame)
+	}
+}
+
+/// `count` for an enum whose variants carry nothing: how many there are.
+pub fn lowerCountFn(program: &Program, interner: &Interner, count: u64): Body = {
+	val empty = hir::Body()
+	var builder = Builder::new(&program, &interner, &empty)
+	builder.countFn(count)
+	return builder.finish()
+}
+
+/// `fromIndex` for one: the variant with that number, or nothing.
+pub fn lowerFromIndexFn(program: &Program, interner: &Interner, ty: Ty, option: Ty): Body = {
+	val empty = hir::Body()
+	var builder = Builder::new(&program, &interner, &empty)
+	builder.indexToVariantFn(ty, option)
+	return builder.finish()
+}
+
+/// `all` for one: every variant, in order, as an array.
+pub fn lowerAllVariantsFn(program: &Program, interner: &Interner, ty: Ty, array: Ty): Body = {
+	val empty = hir::Body()
+	var builder = Builder::new(&program, &interner, &empty)
+	builder.allVariantsFn(ty, array)
+	return builder.finish()
+}
+
+/// The drop function of an `own<ty>`: given a pointer, which may be null, it
+/// drops the value the pointer points to and frees it. A chain of `own`
+/// values of the same type is followed in a loop, not by recursion.
+pub fn lowerDropFn(program: &Program, interner: &Interner, ty: Ty): Body = {
+	val empty = hir::Body()
+	var builder = Builder::new(&program, &interner, &empty)
+	builder.dropFn(ty)
+	return builder.finish()
+}
+
+/// The function that drops a value of `ty` where it lies: given its address,
+/// it drops what the value holds and frees nothing. A buffer's elements are
+/// dropped by it, one call each, so that an element holding a buffer of its
+/// own type is a call, not a drop written inside itself without end.
+pub fn lowerDropInPlaceFn(program: &Program, interner: &Interner, ty: Ty): Body = {
+	val empty = hir::Body()
+	var builder = Builder::new(&program, &interner, &empty)
+	builder.dropInPlaceFn(ty)
+	return builder.finish()
+}
+
+view struct Builder {
+	program: &Program
+	interner: &Interner
+	hir: &hir::Body
+	locals: Vec<LocalDecl>
+	params: Vec<Local>
+	ret: Option<Local>
+	/// Statements, and the terminator once there is one.
+	blocks: Vec<(Vec<Statement>, Option<Terminator>)>
+	current: BlockId
+	/// Control cannot reach what follows: a `return` has ended the path.
+	dead: bool
+	vars: Map<LocalId, Local>
+	/// What each enclosing block does at its exits, innermost last.
+	scopes: Vec<Vec<Cleanup>>
+	/// Temporaries of the statements being lowered that own memory, dropped
+	/// when their statements end.
+	temps: Vec<(Place, Ty)>
+	/// Whether values of a type own memory.
+	owns: Map<Ty, bool>
+	/// The loops around the statement being lowered, innermost last.
+	loops: Vec<LoopFrame>
+	/// The top of a `@tailrec` function's body, where its calls to itself
+	/// jump back to.
+	top: Option<BlockId>
+	/// For a local that may have been moved away by the time its scope ends,
+	/// a `bool` that says whether it still holds a value.
+	flags: Map<LocalId, Local>
+	/// The same, for a temporary a `match` or a `?` takes a payload out of:
+	/// zeroing says nothing about a type that cleans up after itself, so it
+	/// says so here instead.
+	tempFlags: Map<Local, Local>
+	/// For each `|` that binds, by its number, which of its alternatives
+	/// matched: set where it is tested, read where its arm binds.
+	alternativesMatched: Map<u32, Local>
+	/// For a reference whose referent the body moves out — `move self` in a
+	/// `var fn` — whether the referent holds a value: an assignment puts one
+	/// back, and drops what was there only where there was one.
+	referentFlags: Map<LocalId, Local>
+	/// For a field the body moves out of a local — `going.work.get()`, or one
+	/// inside another, `all.row.entries` — whether it still holds a value, so
+	/// that dropping the local drops only what is left of it. The field is
+	/// its path of field indices from the local.
+	fieldFlags: Map<(LocalId, Vec<u32>), Local>
+	/// The same for a field the body moves out of what a reference parameter
+	/// refers to — `move self.dialog` in a `var fn` — so that putting one back
+	/// drops what was there only where there was one.
+	referentFieldFlags: Map<(LocalId, u32), Local>
+	/// While a generator's `next` is lowered: where it stops and goes on.
+	generatorState: Option<Generator>
+	/// Whether moves leave poison and drops check for it.
+	checkMoves: bool
+	/// Whether a struct, an enum or an array is dropped by a call to its
+	/// type's drop function, as a debug build drops one.
+	dropsByCall: bool
+	/// The value a drop function drops where it lies is written out, not a
+	/// call to itself: true until its drop is begun.
+	droppingInPlace: bool
+	/// Whether a type holds a `destroy` of its own, which would run on the
+	/// zeros a move leaves.
+	destroys: Map<Ty, bool>
+	/// Where a drop being lowered is, for the check's message: the local's
+	/// declaration, or the assignment that replaces a value.
+	dropAt: Span
+	/// Where each scope being lowered ends, innermost last: what a variable
+	/// declared now is seen until.
+	seenUntil: Vec<u32>
+	/// What a place's expression computes, worked out where it is written:
+	/// each index, and what a projection is given but the place it lends
+	/// from. The place itself is found later — after the value of `=`, or
+	/// once a call's arguments are all worked out — and takes them from here.
+	early: Map<ExprId, Value>
+}
+
+/// Whether a build checks moves: a move leaves poison where it would leave
+/// zeros, and each drop that would run a `destroy` on zeros panics where it
+/// finds poison. `WIP_CHECK_MOVES` says so, `1` or `0`; where it is not set,
+/// the build does: a debug build checks, a release build does not.
+fn checkingMoves(program: &Program): bool = match io::env("WIP_CHECK_MOVES") {
+	.Some(value) => !value.isEmpty() && value != "0"
+	.None => program.checkMoves
+}
+
+/// A loop being lowered: where `break` and `continue` go, how many scopes and
+/// temporaries were open when it started, and whether a `break` leaves it.
+@derive(Clone)
+struct LoopFrame {
+	exit: BlockId
+	next: BlockId
+	scopes: i64
+	temps: i64
+	breaks: bool
+}
+
+/// One entry of a block's cleanups, run newest first.
+@derive(Clone)
+enum Cleanup {
+	Drop(local: LocalId)
+	/// Lower a deferred expression, whole, at this exit.
+	Defer(expr: ExprId)
+}
+
+/// A lowered expression.
+@derive(Clone)
+enum Value {
+	/// No value: `void`, or a path that has ended.
+	Unit
+	/// A scalar: a constant, or a temporary that nothing changes later.
+	Scalar(operand: Operand)
+	/// An aggregate, where it is.
+	Place(place: Place)
+}
+
+extend Builder {
+	static fn new(program: &Program, interner: &Interner, body: &hir::Body): Builder = Builder(
+		program: &program,
+		interner: &interner,
+		hir: &body,
+		locals: Vec(),
+		params: Vec(),
+		ret: .None,
+		blocks: Vec::of(own [(Vec(), Option::None)]),
+		current: BlockId(0),
+		dead: false,
+		vars: Map(),
+		scopes: Vec(),
+		temps: Vec(),
+		owns: Map(),
+		loops: Vec(),
+		top: .None,
+		flags: Map(),
+		tempFlags: Map(),
+		alternativesMatched: Map(),
+		referentFlags: Map(),
+		fieldFlags: Map(),
+		referentFieldFlags: Map(),
+		generatorState: .None,
+		checkMoves: checkingMoves(&program),
+		dropsByCall: program.dropsByCall,
+		droppingInPlace: false,
+		destroys: Map(),
+		// A drop function's body has no value of its own to point at.
+		dropAt: match body.value {
+			.Some(value) => body.exprs[value].span
+			.None => Span::at(0)
+		},
+		seenUntil: Vec(),
+		early: Map(),
+	)
+
+	/// What a move leaves where the value was: zeros, or, in a build that
+	/// checks moves, poison where zeros would let a `destroy` run on nothing.
+	var fn vacate(place: Place, ty: Ty) = {
+		if self.checkMoves && self.poisons(ty) then self.push(.Poison(move place))
+		else self.push(.Zero(move place))
+	}
+
+	/// Whether a moved-out value of this type is poisoned in a build that
+	/// checks moves: it holds a `destroy` of its own, and does not say it was
+	/// moved by its own zeros, as an `own` does.
+	var fn poisons(ty: Ty): bool = !self.zeroesItself(ty) && self.holdsDestroy(ty)
+
+	/// Whether a value of this type holds, in place, one with a `destroy` of
+	/// its own. What an `own` points to is not in place.
+	var fn holdsDestroy(ty: Ty): bool = {
+		if self.destroys.get(&ty) is .Some(known) then return known
+		// A type that holds itself is answered for while it is asked.
+		self.destroys.put(ty, false)
+		val program = self.program
+		var holds = program.dropFns.contains(&ty)
+		if !holds then
+			holds = match self.kind(ty) {
+				.Struct(..) => {
+					var any = false
+					for field in program.fieldTys(ty) {
+						if self.holdsDestroy(field) {
+							any = true
+							break
+						}
+					}
+					any
+				}
+				.Enum(..) => {
+					var any = false
+					for fields in program.variantFieldTys(ty) {
+						for field in fields {
+							if self.holdsDestroy(field) {
+								any = true
+								break
+							}
+						}
+						if any then break
+					}
+					any
+				}
+				.Array(elem, len) => len > 0 && self.holdsDestroy(elem)
+				_ => false
+			}
+		self.destroys.put(ty, holds)
+		return holds
+	}
+
+	move fn finish(): Body = {
+		var blocks: Vec<Block> = Vec()
+		for (statements, terminator) in move self.blocks {
+			blocks.push(Block(
+				statements: move statements,
+				terminator: match move terminator {
+					.Some(t) => move t
+					.None => Terminator::Unreachable
+				},
+			))
+		}
+		return Body(
+			locals: move self.locals,
+			params: move self.params,
+			ret: self.ret,
+			blocks: move blocks,
+		)
+	}
+
+	/// A function: its parameters, its body's value, and the cleanups of its
+	/// outermost scope, which drop the parameters it owns.
+	var fn function(def: &FnDef) = {
+		val hir = self.hir
+		// A parameter is seen by the whole body.
+		self.seenUntil.push(hir.exprs[hir.valueId()].span.hi)
+		for param in hir.params {
+			val local = self.sourceLocal(param, .Param)
+			self.params.push(local)
+			self.vars.put(param, local)
+		}
+		if def.ret != UNIT then self.ret = .Some(self.newLocal(def.ret, .Return))
+		// A parameter holds a value from the start; a flag only says when it
+		// stops.
+		for param in hir.params {
+			self.setFlag(param, true)
+			if self.needsReferentFlag(param) {
+				val flag = self.newLocal(BOOL, .Var)
+				self.referentFlags.put(param, flag)
+				self.assign(Place::of(flag), .Use(.Const(.Bool(true))))
+			}
+			for index in self.movedReferentFields(param) {
+				val flag = self.newLocal(BOOL, .Var)
+				self.referentFieldFlags.put((param, index), flag)
+				self.assign(Place::of(flag), .Use(.Const(.Bool(true))))
+			}
+		}
+		var outermost: Vec<Cleanup> = Vec()
+		for p in hir.params {
+			outermost.push(.Drop(p))
+		}
+		self.scopes.push(move outermost)
+		// A `@tailrec` function's calls to itself set the parameters and jump
+		// here.
+		if !hir.tailCalls.isEmpty() {
+			val top = self.newBlock()
+			self.terminate(.Goto(top))
+			self.switchTo(top)
+			self.top = .Some(top)
+		}
+		val value = hir.valueId()
+		// A block marks its own statements; a body that is one expression is
+		// written at that expression.
+		if !(hir.exprs[value].kind is .Block(..)) then self.at(hir.exprs[value].span)
+		val result = match self.ret {
+			.Some(ret) if self.isAggregate(def.ret) => {
+				self.storeExpr(value, Place::of(ret))
+				Value::Unit
+			}
+			_ => self.expr(value)
+		}
+		if self.dead then return
+		self.dropTemps(0)
+		self.dropScope()
+		match (move result, self.ret) {
+			(.Scalar(operand), .Some(ret)) => {
+				self.assign(Place::of(ret), .Use(move operand))
+				self.terminate(.Return)
+			}
+			_ if def.ret == UNIT || self.isAggregate(def.ret) => self.terminate(.Return)
+			// The type checker guarantees a value on every path.
+			_ => self.terminate(.Unreachable)
+		}
+	}
+
+	/// Records whether a local holds a value, where it needs a flag. The flag
+	/// is made on first use, false until then.
+	var fn setFlag(local: LocalId, live: bool) = {
+		// A whole value put in holds every field again.
+		if live {
+			for path in self.movedFields(local) {
+				self.setFieldFlag(local, &path, true)
+			}
+		}
+		val flag = match self.flags.get(&local) {
+			.Some(flag) => flag
+			.None => {
+				if !self.needsFlag(local) then return
+				val flag = self.newLocal(BOOL, .Var)
+				self.flags.put(local, flag)
+				flag
+			}
+		}
+		self.assign(Place::of(flag), .Use(.Const(.Bool(live))))
+	}
+
+	/// A whole local was moved away, so its flag says it holds nothing.
+	var fn movedFrom(id: ExprId) = {
+		if self.hir.exprs[id].kind is .Local(local) then self.setFlag(local, false)
+		self.setReferentFlag(id, false)
+		if self.fieldOfLocal(id) is .Some((local, path)) then self.setFieldFlag(local, &path, false)
+		self.setReferentFieldFlag(id, false)
+	}
+
+	/// A whole local was assigned, so it holds a value again.
+	var fn assignedTo(id: ExprId) = {
+		if self.hir.exprs[id].kind is .Local(local) then self.setFlag(local, true)
+		self.setReferentFlag(id, true)
+		// A field put in holds it again, and every field inside it.
+		match self.fieldOfLocal(id) {
+			.Some((local, path)) => {
+				for moved in self.movedFields(local) {
+					if startsWith(&moved, &path) then self.setFieldFlag(local, &moved, true)
+				}
+			}
+			.None => {}
+		}
+		self.setReferentFieldFlag(id, true)
+	}
+
+	/// The reference and the field `id` is, where it is a field of what a
+	/// local reference refers to: `self.dialog` in a `var fn`.
+	fn fieldOfReferent(id: ExprId): Option<(LocalId, u32)> = match self.hir.exprs[id].kind {
+		.Field(base, index) => match self.referentOf(base) {
+			.Some(reference) => .Some((reference, index))
+			.None => .None
+		}
+		_ => .None
+	}
+
+	/// Records whether a field of a referent holds a value, where it has a
+	/// flag.
+	var fn setReferentFieldFlag(id: ExprId, live: bool) = {
+		val .Some(field) = self.fieldOfReferent(id) else {
+			return
+		}
+		if self.referentFieldFlags.get(&field) is .Some(flag) then
+			self.assign(Place::of(flag), .Use(.Const(.Bool(live))))
+	}
+
+	/// The local and the field `id` is, where it is a field of a local or a
+	/// field of one of its fields: the path of field indices from it.
+	fn fieldOfLocal(id: ExprId): Option<(LocalId, Vec<u32>)> = {
+		var path: Vec<u32> = Vec()
+		var at = id
+		while true {
+			match self.hir.exprs[at].kind {
+				.Field(base, index) => {
+					path.push(index)
+					at = base
+				}
+				.Local(local) if !path.isEmpty() => {
+					path.reverse()
+					return .Some((local, move path))
+				}
+				_ => return .None
+			}
+		}
+		return .None
+	}
+
+	/// Records whether a field of a local holds a value, where the body moves
+	/// it out; the flag is made on first use.
+	var fn setFieldFlag(local: LocalId, path: &[u32], live: bool) = {
+		var moved = false
+		for m in self.movedFields(local) {
+			if m.items() == path {
+				moved = true
+				break
+			}
+		}
+		if !moved then return
+		val key = (local, path.toVec())
+		val flag = match self.fieldFlags.get(&key) {
+			.Some(flag) => flag
+			.None => {
+				val flag = self.newLocal(BOOL, .Var)
+				self.fieldFlags.put(key.clone(), flag)
+				flag
+			}
+		}
+		self.assign(Place::of(flag), .Use(.Const(.Bool(live))))
+	}
+
+	/// The reference whose referent `id` is, where `id` is `*r` for a local
+	/// `r`: `self` in a `var fn`.
+	fn referentOf(id: ExprId): Option<LocalId> = match self.hir.exprs[id].kind {
+		.Deref(inner) => match self.hir.exprs[inner].kind {
+			.Local(local) => .Some(local)
+			_ => .None
+		}
+		_ => .None
+	}
+
+	/// Records whether `id`'s referent holds a value, where it has a flag.
+	var fn setReferentFlag(id: ExprId, live: bool) = {
+		val .Some(reference) = self.referentOf(id) else {
+			return
+		}
+		if self.referentFlags.get(&reference) is .Some(flag) then
+			self.assign(Place::of(flag), .Use(.Const(.Bool(live))))
+	}
+
+	fn kind(ty: Ty): TyKind = self.program.types.kind(ty)
+
+	fn ty(id: ExprId): Ty = self.hir.exprs[id].ty
+
+	fn isAggregate(ty: Ty): bool = isAggregate(self.program, ty)
+
+	fn isScalar(ty: Ty): bool = isScalar(self.program, ty)
+
+	/// Where an expression was written, for a check's message.
+	fn span(id: ExprId): Span = self.hir.exprs[id].span
+
+	/// Whether a function of this result does not return.
+	fn tyIsNever(ty: Ty): bool = self.program.types.kind(ty) is .Never
+
+	var fn needsDrop(ty: Ty): bool = {
+		if self.owns.get(&ty) is .Some(known) then return known
+		val owns = self.program.ownsMemory(ty)
+		self.owns.put(ty, owns)
+		return owns
+	}
+
+	var fn newLocal(ty: Ty, kind: LocalKind): Local = {
+		self.locals.push(LocalDecl::unnamed(ty, kind))
+		return Local((self.locals.len() - 1) as u32)
+	}
+
+	/// The local of a variable or parameter of the source, named as it is
+	/// there, and seen until the end of the scope being lowered. One the
+	/// compiler named has no name a debugger shows.
+	var fn sourceLocal(id: LocalId, kind: LocalKind): Local = {
+		val local = &self.hir.locals[id]
+		if self.interner.isHidden(local.name) then return self.newLocal(local.ty, kind)
+		val source = Source(
+			name: local.name,
+			at: local.span,
+			seenUntil: match self.seenUntil.last() {
+				.Some(end) => end
+				.None => local.span.hi
+			},
+			byAddress: self.hir.aliasBindings.contains(&id),
+		)
+		self.locals.push(LocalDecl(ty: local.ty, kind: kind, source: .Some(source)))
+		return Local((self.locals.len() - 1) as u32)
+	}
+
+	var fn temp(ty: Ty): Local = self.newLocal(ty, .Temp)
+
+	var fn newBlock(): BlockId = {
+		self.blocks.push((Vec(), Option::None))
+		return BlockId((self.blocks.len() - 1) as u32)
+	}
+
+	var fn switchTo(block: BlockId) = self.current = block
+
+	var fn push(statement: Statement) = {
+		val at = self.current.index as i64
+		if self.blocks[at].1.isSome() then panic("a statement after the end of block \(at)")
+		self.blocks[at].0.push(move statement)
+	}
+
+	var fn terminate(terminator: Terminator) = {
+		val at = self.current.index as i64
+		if self.blocks[at].1.isSome() then panic("block \(at) is terminated twice")
+		self.blocks[at].1 = .Some(move terminator)
+	}
+
+	var fn assign(place: Place, rvalue: Rvalue) = self.push(.Assign(
+		place: move place,
+		rvalue: move rvalue,
+	))
+
+	/// A new temporary holding `rvalue`, as an operand.
+	var fn value(ty: Ty, rvalue: Rvalue): Operand = {
+		val temp = Place::of(self.temp(ty))
+		self.assign(temp.clone(), move rvalue)
+		return .Copy(move temp)
+	}
+
+	/// The local an operand is in, putting a constant in a temporary first.
+	var fn localOf(operand: Operand, ty: Ty): Local = {
+		if operand is .Copy(place) && place.projections.isEmpty() then return place.local
+		val temp = self.temp(ty)
+		self.assign(Place::of(temp), .Use(move operand))
+		return temp
+	}
+
+	static fn int(bits: u128, ty: Ty): Operand = .Const(.Int(bits: bits, ty: ty))
+
+	/// Starts a block that nothing reaches, if the path has ended.
+	var fn revive() = {
+		if self.dead {
+			val block = self.newBlock()
+			self.switchTo(block)
+			self.dead = false
+		}
+	}
+}
+
+/// Whether `path` begins with `prefix`.
+fn startsWith(path: &[u32], prefix: &[u32]): bool = {
+	if path.len() < prefix.len() then return false
+	for i in 0..prefix.len() {
+		if path[i] != prefix[i] then return false
+	}
+	return true
+}

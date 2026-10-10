@@ -1,0 +1,651 @@
+// Top-level `val`s: constants.
+//
+// A constant's value is worked out where it is written, so nothing runs
+// before `main` and there is no order of initialisation to get wrong. A use
+// of one is the value itself, put in place by the checker, which is why a
+// constant may be a `str` as easily as an integer.
+//
+// What is written with literals, `-` and the arithmetic and bitwise
+// operators, comparisons, `as`, and other constants is folded here. What
+// else is written — a call, a loop, a block — becomes the body of a function
+// of its own, which the compiler runs once the program is checked; a use of
+// such a constant reads where it is kept.
+
+import std::collections::{Map}
+import std::mem
+import syntax as ast
+import syntax::{BinaryOp, COMPTIME_MARK, Diagnostic, Edit, NOT_A_CONSTANT, Span}
+
+/// Where a constant was written, so that a use of it can work it out even
+/// where the pass over its own file has not reached it yet.
+@derive(Clone)
+view struct ConstSource {
+	decl: &ast::ValDecl
+	/// Where `@comptime` was written on it, if it was.
+	comptime: Option<Span>
+	ast: &ast::Ast
+	module: i64
+	imports: FileImports
+	/// The lambdas and generators of its file, which its value may hold.
+	lambdas: Map<ast::ExprId, FnId>
+	lambdaEnvs: Map<FnId, StructId>
+	generators: Map<ast::ExprId, StructId>
+}
+
+extend Lowerer {
+	/// Declares the file's constants, before any body is checked. Their
+	/// values come later, once every type is known, and a constant that uses
+	/// another is worked out through it, whatever order they are written in.
+	var fn declareConsts() = {
+		val file = self.ast
+		for item in file.items {
+			val .Val(decl) = item else {
+				continue
+			}
+			val annotations = self.annotations(&decl.annotations, .Val)
+			val id = self.program.consts.add(ConstDef(
+				name: decl.name.sym,
+				ty: ERROR,
+				value: .None,
+				code: .None,
+				module: self.current as u32,
+				isPub: decl.isPub,
+				span: decl.name.span,
+			))
+			// Reported where it is; it keeps its place in this module's scope.
+			self.preludeName(decl.name, "a constant named")
+			match self.consts().get(&decl.name.sym) {
+				.Some(first) => {
+					val previous = self.program.consts[first].span
+					self.duplicate(decl.name, previous)
+				}
+				.None => self.modules[self.current].consts.put(decl.name.sym, id)
+			}
+			// Where it was written, so that a use can work it out before the
+			// pass over its own file reaches it.
+			val source = ConstSource(
+				decl: &decl,
+				comptime: annotations.comptime,
+				ast: &file,
+				module: self.current,
+				imports: self.imports.clone(),
+				lambdas: self.lambdas.clone(),
+				lambdaEnvs: self.lambdaEnvs.clone(),
+				generators: self.generators.clone(),
+			)
+			self.constSources.put(id, move source)
+		}
+	}
+
+	/// Works out the values of the file's constants, once every type is
+	/// known.
+	var fn checkConsts() = {
+		// In the order they were declared, not the order a map holds them:
+		// two constants defined in terms of each other are reported from the
+		// first of them, whatever else a program happens to name.
+		var ids: Vec<ConstId> = Vec()
+		val scope = &self.consts()
+		for i in 0..scope.len() {
+			ids.push(scope.valueAt(i).clone())
+		}
+		ids.sortBy((a, b) => a.index() < b.index())
+		for id in ids {
+			self.constValue(id)
+		}
+	}
+
+	/// Works out one constant's value, if it has not been worked out
+	/// already. Its initializer is checked as any expression is, with the
+	/// written type expected, in the file that wrote it.
+	var fn constValue(id: ConstId) = {
+		if self.constsDone.contains(&id) then return
+		// Taken out while it is worked out, which changes `self`, and put back.
+		val .Some(found) = self.constSources.remove(&id) else {
+			return
+		}
+		// Its file's lambdas and generators are wanted once, now; the rest of
+		// where it was written is read again while it is worked out.
+		var source = move found
+		val codeLambdas = mem::replace(&var source.lambdas, Map())
+		val codeEnvs = mem::replace(&var source.lambdaEnvs, Map())
+		val codeGenerators = mem::replace(&var source.generators, Map())
+		self.constSources.put(id, source.clone())
+		self.constsDone.add(id)
+		self.constStack.push(id)
+		// A constant is checked in the file that wrote it, in a body of its
+		// own that nothing keeps: only the value it works out to is.
+		val hereAst = self.ast
+		val hereModule = self.current
+		val hereImports = self.imports.clone()
+		val lambdas = mem::replace(&var self.lambdas, move codeLambdas)
+		val lambdaEnvs = mem::replace(&var self.lambdaEnvs, move codeEnvs)
+		val generators = mem::replace(&var self.generators, move codeGenerators)
+		self.enter(source.module, source.ast, source.imports.clone())
+		self.outer.push(mem::replace(&var self.state, BodyState()))
+		self.state.scopes = Vec::of(own [Map()])
+		val decl = source.decl
+		val (value, ty) = match decl.ty {
+			.Some(t) => {
+				var ty = self.resolveTy(t)
+				// A file's bytes, embedded, are the one reference a constant
+				// holds, alone or in an array.
+				if (!self.bytesRefsOnly(ty) &&
+					self.noRef(ty, t, "a constant cannot hold a reference", .None)) ||
+					self.noNever(ty, t, "a constant") ||
+					self.bareSlice(ty, t, false) {
+					ty = ERROR
+				}
+				val context = (self.ast.types[t].span, "expected because of this type")
+				(self.checkIn(decl.value, ty, .Some(context)), ty)
+			}
+			.None => {
+				val value = self.infer(decl.value, .None)
+				(value, self.tyOf(value))
+			}
+		}
+		var folded: Result<ConstValue, Unfolded> = if self.hasError(ty) {
+			.Err(.Failed)
+		} else if self.owns(ty) {
+			// A use is a copy of the value, so what would be freed at each use
+			// cannot be one.
+			val span = self.state.body.exprs[value].span
+			self.report(
+				Diagnostic::error(NOT_A_CONSTANT, "a top-level `val` cannot hold what owns memory", span, "\(self.tyName(ty)) owns memory").withNote(
+					"each use of a constant is its value, made there; a value that owns memory would be made and freed at every use",
+				),
+			)
+			Result::Err(.Failed)
+		} else {
+			self.fold(value)
+		}
+		// What folding cannot work out is run: the initializer is the body of
+		// a function of its own, which the compiler runs once the program is
+		// checked, where the constant says so with `@comptime`.
+		folded = self.comptimeMark(&decl, source.comptime, move folded, value)
+		var code: Option<FnId> = .None
+		if folded is .Err(.Runs) {
+			var body = mem::replace(&var self.state.body, Body())
+			body.value = .Some(value)
+			code = .Some(self.constantCode(&decl, ty, move body))
+		}
+		self.state = self.outer.pop().unwrap()
+		self.enter(hereModule, hereAst, move hereImports)
+		self.lambdas = move lambdas
+		self.lambdaEnvs = move lambdaEnvs
+		self.generators = move generators
+		self.constStack.pop()
+		self.program.consts[id].ty = ty
+		self.program.consts[id].value = match move folded {
+			.Ok(v) => .Some(move v)
+			.Err(_) => .None
+		}
+		self.program.consts[id].code = code
+	}
+
+	/// The value of a checked expression, where folding can work it out; or
+	/// that it is to be run, or that it failed, which is reported.
+	var fn fold(id: ExprId): Result<ConstValue, Unfolded> = {
+		val kind = self.state.body.exprs[id].kind.clone()
+		val ty = self.state.body.exprs[id].ty
+		val span = self.state.body.exprs[id].span
+		return match kind {
+			.Int(value) => .Ok(.Int(value))
+			.Float(value) => .Ok(.Float(value))
+			.Bool(value) => .Ok(.Bool(value))
+			.Str(symbol) => .Ok(.Str(symbol))
+			.Error => .Err(.Failed)
+			// A table's value, where it is known and holds a file's bytes, which
+			// is read where it is kept rather than made again.
+			.Deref(address) => match self.state.body.exprs[address].kind {
+				.Table(table) => match self.program.consts[table].value {
+					.Some(value) if value.holdsBytes() => .Ok(value.clone())
+					_ => .Err(.Runs)
+				}
+				_ => .Err(.Runs)
+			}
+			// A table: an array, a struct or tuple, or a variant, of constants.
+			.Array(elems) => .Ok(.Array(self.foldAll(&elems)?))
+			.ArrayRepeat(elem, count) => {
+				val value = self.fold(elem)?
+				var values: Vec<ConstValue> = Vec()
+				for _ in 0..count as i64 {
+					values.push(value.clone())
+				}
+				.Ok(.Array(move values))
+			}
+			.Struct(fields, ..) => .Ok(.Struct(self.foldAll(&fields)?))
+			.Variant(variant, args, ..) => .Ok(.Variant(
+				variant: variant,
+				fields: self.foldAll(&args)?,
+			))
+			.Unary(op, operand) => {
+				val value = self.fold(operand)?
+				self.foldUnary(op, move value, ty)
+			}
+			.Binary(op, lhs, rhs, ..) => {
+				val lhsTy = self.tyOf(lhs)
+				val left = self.fold(lhs)?
+				val right = self.fold(rhs)?
+				self.foldBinary(op, move left, move right, lhsTy, span)
+			}
+			// `as` between numbers: the checker has already agreed to it.
+			.Cast(inner) => {
+				val value = self.fold(inner)?
+				.Ok(self.foldCast(move value, ty))
+			}
+			// A call, a block, a constant that is run itself: what folding does
+			// not do is run.
+			_ => .Err(.Runs)
+		}
+	}
+
+	/// Every part of a table, where folding works each out.
+	var fn foldAll(parts: &[ExprId]): Result<Vec<ConstValue>, Unfolded> = {
+		var values: Vec<ConstValue> = Vec()
+		for part in parts {
+			values.push(self.fold(part)?)
+		}
+		return .Ok(move values)
+	}
+
+	fn foldUnary(op: UnaryOp, value: ConstValue, ty: Ty): Result<ConstValue, Unfolded> = match op {
+		.Neg => match value {
+			.Int(v) => .Ok(.Int(truncate(0 -% v, self.intBits(ty))))
+			.Float(v) => .Ok(.Float(-v))
+			_ => .Err(.Runs)
+		}
+		.Not => match value {
+			.Bool(v) => .Ok(.Bool(!v))
+			.Int(v) => .Ok(.Int(truncate(!v, self.intBits(ty))))
+			_ => .Err(.Runs)
+		}
+	}
+
+	var fn foldBinary(
+		op: BinaryOp,
+		lhs: ConstValue,
+		rhs: ConstValue,
+		operandTy: Ty,
+		span: Span,
+	): Result<ConstValue, Unfolded> = {
+		val signed = self.kind(operandTy) is .Int(int: t) && t.signed()
+		val bits = self.intBits(operandTy)
+		if lhs is .Int(a) && rhs is .Int(b) {
+			// Arithmetic wraps; a division by zero is the one thing a constant
+			// cannot do.
+			if op is .Div | .Rem && b == 0 {
+				self.report(
+					Diagnostic::error(
+						NOT_A_CONSTANT,
+						"this constant divides by zero",
+						span,
+						"a division by zero",
+					).withNote(
+						"a constant is worked out where it is written, so this would never be a value at all",
+					),
+				)
+				return .Err(.Failed)
+			}
+			val value: ConstValue = match op {
+				.Add => .Int(truncate(a +% b, bits))
+				.Sub => .Int(truncate(a -% b, bits))
+				.Mul => .Int(truncate(a *% b, bits))
+				.Div if signed => .Int(
+					truncate(signedDiv(asSigned(a, bits), asSigned(b, bits)) as u128, bits),
+				)
+				.Div => .Int(truncate(a / b, bits))
+				.Rem if signed => .Int(
+					truncate(signedRem(asSigned(a, bits), asSigned(b, bits)) as u128, bits),
+				)
+				.Rem => .Int(truncate(a % b, bits))
+				.BitAnd => .Int(truncate(a & b, bits))
+				.BitOr => .Int(truncate(a | b, bits))
+				.BitXor => .Int(truncate(a ^ b, bits))
+				.Shl => .Int(truncate(a << (b % 128), bits))
+				.Shr if signed => .Int(
+					truncate((asSigned(a, bits) >> (b % 128) as i128) as u128, bits),
+				)
+				.Shr => .Int(truncate(a >> (b % 128), bits))
+				.Eq => .Bool(a == b)
+				.Ne => .Bool(a != b)
+				.Lt | .Le | .Gt | .Ge => {
+					val right = asSigned(b, bits)
+					val ordering =
+						if signed then asSigned(a, bits).compare(&right) else a.compare(&b)
+					.Bool(
+						match op {
+							.Lt => ordering == .Less
+							.Le => ordering != .More
+							.Gt => ordering == .More
+							_ => ordering != .Less
+						},
+					)
+				}
+				.And | .Or => return .Err(.Runs)
+			}
+			return .Ok(move value)
+		}
+		if lhs is .Float(a) && rhs is .Float(b) then
+			return .Ok(
+				match op {
+					.Add => .Float(a + b)
+					.Sub => .Float(a - b)
+					.Mul => .Float(a * b)
+					.Div => .Float(a / b)
+					.Rem => .Float(a % b)
+					.Eq => .Bool(a == b)
+					.Ne => .Bool(a != b)
+					.Lt => .Bool(a < b)
+					.Le => .Bool(a <= b)
+					.Gt => .Bool(a > b)
+					.Ge => .Bool(a >= b)
+					_ => return .Err(.Runs)
+				},
+			)
+		if lhs is .Bool(a) && rhs is .Bool(b) then
+			return .Ok(
+				match op {
+					.And => .Bool(a && b)
+					.Or => .Bool(a || b)
+					.Eq => .Bool(a == b)
+					.Ne => .Bool(a != b)
+					.BitAnd => .Bool(a && b)
+					.BitOr => .Bool(a || b)
+					.BitXor => .Bool(a != b)
+					_ => return .Err(.Runs)
+				},
+			)
+		return .Err(.Runs)
+	}
+
+	/// `as`, which the checker has already agreed to: between numbers, and
+	/// between an integer and a `bool`.
+	fn foldCast(value: ConstValue, ty: Ty): ConstValue = match self.kind(ty) {
+		.Int(_) => match value {
+			.Int(v) => .Int(truncate(v, self.intBits(ty)))
+			.Float(v) => .Int(truncate(saturatingI128(v) as u128, self.intBits(ty)))
+			.Bool(v) => .Int(if v then 1 else 0)
+			_ => move value
+		}
+		.Float(_) => match value {
+			.Int(v) => .Float(v as f64)
+			_ => move value
+		}
+		_ => move value
+	}
+
+	/// The function that computes a constant folding cannot work out: its
+	/// initializer, checked, as the body, and the constant's own name, which
+	/// is how a failure while it runs names it.
+	var fn constantCode(decl: &ast::ValDecl, ty: Ty, body: Body): FnId = self.program.fns.add(FnDef(
+		name: decl.name.sym,
+		nameSpan: decl.name.span,
+		symbol: .None,
+		receiver: .None,
+		owner: .None,
+		interfaceId: .None,
+		generics: Vec(),
+		instanceOf: .None,
+		params: Vec(),
+		ret: ty,
+		retSpan: .None,
+		isExtern: false,
+		exportsC: false,
+		header: .None,
+		accesses: .None,
+		isVariadic: false,
+		variadicOf: .None,
+		lendsFrom: .None,
+		keeps: Vec(),
+		keepsAt: .None,
+		isLambda: false,
+		generator: .None,
+		isTailrec: false,
+		isTest: false,
+		isInline: false,
+		generated: .None,
+		intrinsic: .None,
+		body: .Some(move body),
+		projects: .None,
+		compileTime: true,
+		module: self.current as u32,
+		isPub: false,
+		span: decl.name.span,
+	))
+
+	/// Holds a constant to its mark: one that runs code says so with
+	/// `@comptime`, and one folding works out does not, since a mark that
+	/// does nothing is worse than none. A constant that runs without the mark
+	/// fails.
+	var fn comptimeMark(
+		decl: &ast::ValDecl,
+		comptime: Option<Span>,
+		folded: Result<ConstValue, Unfolded>,
+		value: ExprId,
+	): Result<ConstValue, Unfolded> = {
+		val name = String::of(self.text(decl.name.sym))
+		if folded is .Err(.Runs) && comptime.isNone() {
+			val span = self.state.body.exprs[value].span
+			val at =
+				if decl.annotations.isEmpty() then decl.span.lo else decl.annotations[0].span.lo
+			self.report(
+				Diagnostic::error(
+					COMPTIME_MARK,
+					"`\(name)` runs code while the program is compiled, and does not say so",
+					span,
+					"runs while the program is compiled",
+				).withFix("mark it `@comptime`", own [Edit::insert(at, "@comptime\n")]).withNote(
+					"a constant written with a call, a loop or a block is worked out by running it, which `@comptime` says where it is declared",
+				),
+			)
+			return .Err(.Failed)
+		}
+		if folded is .Ok(_) && comptime is .Some(mark) then
+			self.report(
+				Diagnostic::error(
+					COMPTIME_MARK,
+					"`\(name)` runs nothing, so `@comptime` says nothing",
+					mark,
+					"on a constant known where it is written",
+				).withFix("remove `@comptime`", own [Edit::replace(mark, String())]).withNote(
+					"`@comptime` marks a constant worked out by running code; one written with literals, operators and other such constants is known without it",
+				),
+			)
+		return move folded
+	}
+
+	/// `&[u8]`, what a file embedded as bytes is, or an array of them, which
+	/// are the references a constant holds.
+	fn bytesRefsOnly(ty: Ty): bool = match self.kind(ty) {
+		.Ref(inner, kind: .Shared) => self.kind(inner) is .Slice(elem) && elem == U8
+		.Array(elem, ..) => self.bytesRefsOnly(elem)
+		_ => false
+	}
+
+	/// Whether a constant's value is known while types are checked, as an
+	/// array's length and a pattern need it; one the compiler runs is known
+	/// only after, which is reported.
+	var fn knownNow(id: ConstId, span: Span, need: str): bool = {
+		if self.program.consts[id].code.isNone() then return true
+		val name = String::of(self.text(self.program.consts[id].name))
+		self.report(
+			Diagnostic::error(
+				NOT_A_CONSTANT,
+				"`\(name)` is not known until the program is checked",
+				span,
+				"\(need) must be known while types are checked",
+			).withNote(
+				"a constant written with a call, a loop or a block is run once the program is checked; one written with literals, operators and other such constants is known before",
+			),
+		)
+		return false
+	}
+
+	fn intBits(ty: Ty): u32 = match self.kind(ty) {
+		.Int(int: t) => t.bits()
+		_ => 128
+	}
+
+	/// A use of a constant: the value itself, where it was worked out. One
+	/// that has not been worked out yet is worked out here, so that a
+	/// constant may use one written after it; one that is being worked out
+	/// already is a cycle.
+	var fn constUse(id: ConstId, span: Span): ExprId = {
+		if !self.derived then self.program.names.push((span, .Const(id)))
+		var at: Option<i64> = .None
+		for (i, on) in self.constStack.forwards().enumerate() {
+			if at.isNone() && on == id then at = .Some(i)
+		}
+		if at is .Some(at) {
+			var cycle: Vec<String> = Vec()
+			for i in at..self.constStack.len() {
+				cycle.push("`\(self.text(self.program.consts[self.constStack[i]].name))`")
+			}
+			val message = match cycle.len() {
+				1 => "\(cycle[0]) is defined in terms of itself"
+				2 => "\(cycle[0]) and \(cycle[1]) are defined in terms of each other"
+				_ => {
+					var rest: Vec<String> = Vec()
+					for i in 1..cycle.len() {
+						rest.push(cycle[i].clone())
+					}
+					"\(cycle[0]) is defined in terms of itself, through \(rest.join(", "))"
+				}
+			}
+			self.report(
+				Diagnostic::error(
+					NOT_A_CONSTANT,
+					move message,
+					span,
+					"used while it is being worked out",
+				).withNote(
+					"a constant's value is worked out where it is written, so it cannot depend on itself",
+				),
+			)
+			return self.errorExpr(span)
+		}
+		self.constValue(id)
+		val def = self.program.consts[id].clone()
+		// A constant the compiler runs is known only once the program is
+		// checked, so a use reads where it is kept, as a table's does, and
+		// another constant that uses it is run too.
+		if def.code.isSome() {
+			val reference = self.intern(.Ref(inner: def.ty, kind: .Shared))
+			val address = self.alloc(.Table(id), reference, span)
+			return self.alloc(.Deref(address), def.ty, span)
+		}
+		val .Some(value) = def.value else {
+			// Its own error was reported where it was written.
+			return self.errorExpr(span)
+		}
+		// A table is kept once, and a use of it is the place it is kept in; in
+		// another constant it is its value, which that constant folds, unless
+		// that constant runs code, which reads the table where it lies as a
+		// function does.
+		val running = match self.constStack.last() {
+			.None => true
+			.Some(on) => match self.constSources.get(&on) {
+				.Some(s) => s.comptime.isSome()
+				.None => false
+			}
+		}
+		// A file's bytes are never made again where they are used, even in a
+		// constant being folded: that one reads them, and folds the read.
+		if value.isTable() && (running || value.holdsBytes()) {
+			val reference = self.intern(.Ref(inner: def.ty, kind: .Shared))
+			val address = self.alloc(.Table(id), reference, span)
+			return self.alloc(.Deref(address), def.ty, span)
+		}
+		return self.constExpr(value.clone(), def.ty, span)
+	}
+
+	/// A constant's value, made where it is used, as a number is, and as a
+	/// table is in another constant: of its parts, each of its own type.
+	var fn constExpr(value: ConstValue, ty: Ty, span: Span): ExprId = {
+		val kind: ExprKind = match move value {
+			// A file's bytes are read where they are kept, and never made again
+			// here.
+			.Bytes(..) => panic("a use of a file's bytes reads its table")
+			.Int(v) => .Int(v)
+			.Float(v) => .Float(v)
+			.Bool(v) => .Bool(v)
+			.Str(symbol) => .Str(symbol)
+			.Array(values) => {
+				val .Array(elem, ..) = self.kind(ty) else {
+					return self.errorExpr(span)
+				}
+				var parts: Vec<ExprId> = Vec()
+				for v in move values {
+					parts.push(self.constExpr(move v, elem, span))
+				}
+				.Array(move parts)
+			}
+			.Struct(values) => {
+				val .Struct(id, ..) = self.kind(ty) else {
+					return self.errorExpr(span)
+				}
+				var fields: Vec<ExprId> = Vec()
+				var i = 0
+				for v in move values {
+					val fieldTy = self.structFieldTy(ty, i)
+					fields.push(self.constExpr(move v, fieldTy, span))
+					i += 1
+				}
+				.Struct(id: id, fields: move fields, order: Vec())
+			}
+			.Variant(variant, fields) => {
+				val .Enum(id, ..) = self.kind(ty) else {
+					return self.errorExpr(span)
+				}
+				var args: Vec<ExprId> = Vec()
+				var i = 0
+				for v in move fields {
+					val fieldTy = self.variantFieldTy(ty, variant as i64, i)
+					args.push(self.constExpr(move v, fieldTy, span))
+					i += 1
+				}
+				.Variant(id: id, variant: variant, args: move args, order: Vec())
+			}
+		}
+		return self.alloc(move kind, ty, span)
+	}
+}
+
+/// The low `bits` of a value, which is what an integer type holds.
+fn truncate(value: u128, bits: u32): u128 =
+	if bits >= 128 then value else value & ((1 << bits as u128) - 1)
+
+/// The value as the signed integer of that width, for the operators that
+/// treat it as one.
+fn asSigned(value: u128, bits: u32): i128 = {
+	if bits >= 128 then return value as i128
+	val shift = (128 - bits) as i128
+	return (value << shift as u128) as i128 >> shift
+}
+
+/// A division that wraps where the answer does not fit, as the one quotient
+/// that cannot does: the least value over -1 is itself.
+fn signedDiv(a: i128, b: i128): i128 = if b == -1 then 0 -% a else a / b
+
+/// The remainder of that division, which is 0 where it wraps.
+fn signedRem(a: i128, b: i128): i128 = if b == -1 then 0 else a % b
+
+/// A float as the nearest `i128`: the least or the greatest where it is
+/// beyond them, and 0 for a NaN.
+fn saturatingI128(v: f64): i128 = {
+	if v.isNaN() then return 0
+	if v >= 170141183460469231731687303715884105728.0 then
+		return 0x7FFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF
+	if v <= -170141183460469231731687303715884105728.0 then
+		return 0 - 0x7FFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF - 1
+	return v as i128
+}
+
+/// Why folding did not work a constant out.
+@derive(Eq, Clone)
+enum Unfolded {
+	/// It is to be run, once the program is checked.
+	Runs
+	/// It went wrong, and that was reported.
+	Failed
+}

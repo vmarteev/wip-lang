@@ -1,0 +1,129 @@
+// `std::process`: what a program started is given — its standard streams,
+// the environment its command says, and none of the files, sockets and
+// pipes this program has open — and a program talked to as it runs.
+
+import std::fs
+import std::net::{Listener}
+import std::io
+import std::process::{Command}
+import std::time::{Duration, Instant, sleep}
+
+/// The descriptors past the standard streams that a program started now
+/// is given, as a shell finds them: each it can read from, by number.
+fn given(): String = {
+	val listed = Command::of("sh").arg("-c").arg(LIST).output().unwrap()
+	return listed.stdout.clone()
+}
+
+val LIST =
+	"n=3; while [ $n -lt 64 ]; do (: <&$n) 2>/dev/null && printf '%s ' $n; n=$((n + 1)); done"
+
+@test
+fn processGivesAProgramNothingThisOneOpened() = {
+	val before = given()
+	val file = fs::File::open("tests/std/main.wip").unwrap()
+	val listener = Listener::tcp(.Some("127.0.0.1"), 0).unwrap()
+	val after = given()
+	assert(after == before, "given \(after)where it was given \(before)before they were open")
+}
+
+/// What a shell started by `command` says `$name` is, or `-` where it has
+/// no such variable.
+fn variable(command: Command, name: str): String = {
+	val said = command.arg("-c").arg("echo \"${\(name)-unset}\"").output().unwrap()
+	return String::of(said.stdout.trim())
+}
+
+@test
+fn processSetsAndLeavesOutWhatTheCommandSays() = {
+	assert(variable(Command::of("sh").env("WIP_PROBE", "one"), "WIP_PROBE") == "one")
+	assert(
+		variable(Command::of("sh").env("WIP_PROBE", "one").unset("WIP_PROBE"), "WIP_PROBE") ==
+			"unset",
+	)
+	// Each change in turn: set again after it is left out.
+	val again = Command::of("sh").env("WIP_PROBE", "one").unset("WIP_PROBE").env("WIP_PROBE", "two")
+	assert(variable(move again, "WIP_PROBE") == "two")
+	// One this program has, and what comes after it in the list.
+	assert(variable(Command::of("sh").unset("HOME"), "HOME") == "unset")
+	assert(variable(Command::of("sh").unset("HOME"), "PATH") != "unset")
+	// One that is not there is nothing to leave out.
+	assert(variable(Command::of("sh").unset("WIP_NOT_SET_ANYWHERE"), "HOME") != "unset")
+}
+
+/// A conversation: each line written is read back before the next is
+/// written, and the next is made from what came back.
+@test
+fn processTalksToAProgramAsItRuns() = {
+	var echo = Command::of("sh").args(["-c", "while read line; do echo \"got $line\"; done"]).
+		connect().
+		unwrap()
+	var answer = String()
+	echo.writeText("one\n").unwrap()
+	assert(echo.output().readLine(&var answer).unwrap())
+	assert(answer == "got one", answer.toStr())
+	echo.writeText("\(answer), again\n").unwrap()
+	answer.clear()
+	assert(echo.output().readLine(&var answer).unwrap())
+	assert(answer == "got got one, again", answer.toStr())
+	echo.closeInput()
+	answer.clear()
+	assert(!echo.output().readLine(&var answer).unwrap(), "its output ends with it")
+	assert(echo.wait().success())
+}
+
+/// What a command says of the environment holds for a program talked to,
+/// and its output is read as any `Reader`'s is: by length too.
+@test
+fn processTalksWithTheEnvironmentItsCommandSays() = {
+	var shell = Command::of("sh").env("WIP_PROBE", "here").connect().unwrap()
+	shell.writeText("printf '%s' \"$WIP_PROBE\"\n").unwrap()
+	var said = String()
+	assert(shell.output().readExact(4, &var said).unwrap() == 4)
+	assert(said == "here", said.toStr())
+	assert(shell.wait().success())
+}
+
+/// A read waits no longer than its timeout, answering `.WouldBlock`, and
+/// reads on afterwards; what a program writes before it ends is read to
+/// its end.
+@test
+fn processGivesUpOnAnAnswerThatDoesNotCome() = {
+	var quiet = Command::of("cat").connect().unwrap()
+	quiet.output().setTimeout(.Some(Duration::millis(100)))
+	val started = Instant::now()
+	var line = String()
+	assert(quiet.output().readLine(&var line) == .Err(io::IoError::WouldBlock))
+	assert(started.elapsed().asMillis() < 2000)
+	quiet.writeText("late\n").unwrap()
+	quiet.output().setTimeout(.None)
+	assert(quiet.output().readLine(&var line).unwrap())
+	assert(line == "late", line.toStr())
+}
+
+/// A program that has ended reads nothing more: writing to it answers
+/// `.BrokenPipe`, and does not end this program. It has ended once it is
+/// waited for, not once its output ends: a program may close its output
+/// before it ends, and its input with it.
+@test
+fn processSaysAProgramThatEndedReadsNoMore() = {
+	var ended = Command::of("true").connect().unwrap()
+	while ended.tryWait().isNone() {
+		sleep(Duration::millis(1))
+	}
+	assert(ended.writeText("anyone?\n") == .Err(io::IoError::BrokenPipe))
+	ended.closeInput()
+	assert(ended.writeText("now?\n") == .Err(io::IoError::BrokenPipe))
+}
+
+/// A program talked to that is dropped while it reads has its input
+/// closed, which ends it, and is waited for.
+@test
+fn processEndsAProgramTalkedToWhereItIsDropped() = {
+	val started = Instant::now()
+	{
+		val reading = Command::of("cat").connect().unwrap()
+		reading.writeText("left unread\n").unwrap()
+	}
+	assert(started.elapsed().asMillis() < 5000)
+}

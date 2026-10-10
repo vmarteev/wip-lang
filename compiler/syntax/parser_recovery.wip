@@ -1,0 +1,212 @@
+// Reporting errors and recovering from them: expected tokens, skipping to
+// a synchronization point, unclosed braces, and misplaced operators.
+
+extend Parser {
+	var fn beginRegion() = {
+		self.regionStart = self.prevSpan().hi
+	}
+
+	var fn report(diagnostic: Diagnostic) = {
+		// The first gap at or after where the region began.
+		var lo = 0
+		var hi = self.gaps.len()
+		while lo < hi {
+			val middle = (lo + hi) / 2
+			if self.gaps[middle].lo < self.regionStart then lo = middle + 1 else hi = middle
+		}
+		if lo < self.gaps.len() && self.gaps[lo].lo <= self.span().hi then return
+		val at = diagnostic.primary.span.lo
+		if self.lastErrorAt == .Some(at) then return
+		self.lastErrorAt = .Some(at)
+		self.diagnostics.push(move diagnostic)
+	}
+
+	/// Builds "expected X, found Y". When the unexpected token is on a later
+	/// line, the error points just after the previous token — where the
+	/// missing piece belongs — rather than at the start of the next line.
+	var fn expected(what: str): Diagnostic = {
+		val span =
+			if self.pos > 0 && self.onLaterLine() then Span::at(self.prevSpan().hi) else self.span()
+		val message = "expected \(what), found \(self.found())"
+		val diagnostic = Diagnostic::error(EXPECTED, move message, span, "expected \(what)")
+		// An annotation belongs before a declaration, and nowhere else.
+		if self.peek() == .At then
+			return diagnostic.withNote(
+				"an annotation is written before a function, a struct, an enum, an interface or an `extend` block",
+			)
+		return move diagnostic
+	}
+
+	var fn expect(kind: TokenKind): bool = {
+		if self.eat(kind) then return true
+		val .Some(text) = kind.text() else {
+			panic("expect() takes a fixed token")
+		}
+		val diagnostic = self.expected("`\(text)`")
+		self.report(move diagnostic)
+		return false
+	}
+
+	/// Expects the delimiter that closes `open`, pointing back at `open` if
+	/// it is missing.
+	var fn expectClosing(close: TokenKind, open: Span): bool = {
+		if self.eat(close) then return true
+		val .Some(text) = close.text() else {
+			panic("closing delimiters are fixed tokens")
+		}
+		val diagnostic = self.expected("`\(text)`").
+			withSecondary(open, "to close this `\(self.text(open))`").
+			withFix("add `\(text)`", own [Edit::insert(self.prevSpan().hi, text)])
+		self.report(move diagnostic)
+		return false
+	}
+
+	/// Skips tokens, keeping `(`/`[`/`{` balanced, until `stop` accepts one
+	/// outside any nested group; `stop` also learns whether a significant line
+	/// break comes before it. Never skips an item keyword, the end of file,
+	/// or a closing delimiter that belongs to an enclosing group.
+	var fn skipUntil(stop: &(kind: TokenKind, lineBreak: bool) => bool) = {
+		var depth = 0
+		while true {
+			val kind = self.peek()
+			if kind == .Eof || isItemStart(kind) || (depth == 0 && stop(kind, self.lineBreak())) {
+				return
+			}
+			match kind {
+				.LParen | .LBracket | .LBrace => depth += 1
+				.RParen | .RBracket | .RBrace => {
+					if depth == 0 then return
+					depth -= 1
+				}
+				_ => {}
+			}
+			self.bump()
+		}
+	}
+
+	/// Skips the rest of a statement: up to the next `;`, line break or
+	/// statement keyword.
+	var fn skipStmt() = self.skipUntil((kind, lineBreak) =>
+		kind == .Semi || lineBreak || isStmtKeyword(kind))
+
+	/// Past a block whose head was rejected: the rest of the head, and then
+	/// the braces with what is inside them, so that its methods are not read
+	/// as items of the file.
+	var fn skipBraced() = {
+		while !(self.peek() is .LBrace | .RBrace | .Eof) {
+			self.bump()
+		}
+		if !self.at(.LBrace) then return
+		var depth = 0
+		while true {
+			match self.peek() {
+				.Eof => return
+				.LBrace => depth += 1
+				.RBrace => {
+					self.bump()
+					depth -= 1
+					if depth == 0 then return
+					continue
+				}
+				_ => {}
+			}
+			self.bump()
+		}
+	}
+
+	var fn skipToItem() = {
+		while !(self.at(.Eof) || isItemStart(self.peek())) {
+			self.bump()
+		}
+	}
+
+	fn lineOf(pos: u32): i64 = {
+		var lines = 1
+		for b in self.src[0..self.local(pos)] {
+			if b == b'\n' then lines += 1
+		}
+		return lines
+	}
+
+	fn lineStartOf(pos: u32): i64 = match self.src[0..self.local(pos)].findLast("\n") {
+		.Some(at) => at + 1
+		.None => 0
+	}
+
+	fn indentOf(pos: u32): i64 = {
+		val start = self.lineStartOf(pos)
+		var count = 0
+		while start + count < self.src.len() && self.src[start + count] is b' ' | b'\t' {
+			count += 1
+		}
+		return count
+	}
+
+	fn firstOnLine(pos: u32): bool = {
+		for b in self.src[self.lineStartOf(pos)..self.local(pos)] {
+			if !(b is b' ' | b'\t') then return false
+		}
+		return true
+	}
+
+	var fn unclosedBrace(open: Span) = {
+		var diagnostic = Diagnostic::error(
+			UNCLOSED_BRACE,
+			"unclosed `{`",
+			open,
+			"this `{` is never closed",
+		)
+		// Guess which brace is really missing: a later `}` that is indented
+		// like `open`'s line, but closes a `{` opened on a line with different
+		// indentation. That `}` was probably meant for `open`.
+		val indent = self.indentOf(open.lo)
+		var suspect: Option<(Span, Span)> = .None
+		for (o, c) in self.bracePairs {
+			if o.lo > open.lo &&
+				self.firstOnLine(c.lo) &&
+				self.indentOf(c.lo) == indent &&
+				self.indentOf(o.lo) != indent {
+				suspect = .Some((o, c))
+				break
+			}
+		}
+		if suspect is .Some((innerOpen, innerClose)) {
+			val line = self.lineOf(innerOpen.lo)
+			diagnostic = diagnostic.withSecondary(innerClose, "this `}` is indented to close the block above, but it closes the `{` on line \(line)").withSecondary(
+				innerOpen,
+				"this `{` may be the one missing its `}`",
+			)
+		}
+		self.report(move diagnostic)
+	}
+
+	/// A line that begins with a binary operator was meant to continue the
+	/// line above, but a line break ends a complete expression (E0113).
+	/// Reports it with a fix that joins the lines and skips the rest of the
+	/// line. Returns whether there was one.
+	var fn leadingOperator(): bool = {
+		if !(self.pos > 0 && isBinaryOnly(self.peek()) && self.lineBreak()) then return false
+		val op = self.span()
+		val text = self.text(op)
+		val (gapLo, gapHi) = (self.prevSpan().hi, op.lo)
+		val between = Span::new(gapLo, gapHi)
+		var diagnostic = Diagnostic::error(
+			LEADING_OPERATOR,
+			"a line cannot start with `\(text)`",
+			op,
+			"this line starts with an operator",
+		).withNote(
+			"a line break ends an expression that is complete, so an operator at the start of the next line does not continue it",
+		)
+		// Joining the lines would delete a comment at the end of the line.
+		if !self.text(between).contains("//") then
+			diagnostic = diagnostic.withFix(
+				"move `\(text)` to the end of the previous line",
+				own [Edit::replace(between, " ")],
+			)
+		self.report(move diagnostic)
+		self.bump()
+		self.skipUntil((kind, lineBreak) => lineBreak || kind == .Semi || kind == .Comma)
+		return true
+	}
+}

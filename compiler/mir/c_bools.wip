@@ -1,0 +1,291 @@
+// A `bool` that C hands over, read as C reads one.
+//
+// Wip writes a `bool` as 0 or 1, and its `!` and `==` count on that. A byte C
+// wrote may be anything: a struct filled by `fread`, a field C left unset, a
+// `uint8_t` flag declared as `bool`. Read as it is, a 2 would be true, and its
+// `!` true too, and an `Option<bool>` holding it would be empty. So where a
+// `bool` comes from C, it is compared with zero, as C converts a byte to
+// `_Bool`: zero is false and anything else is true.
+//
+// A `bool` comes from C where a declaration of C's says so:
+//
+// - a field of an `extern struct` or an `extern union`, or an element of a
+//   `bool` array in one, wherever the value lies: it is converted where it is
+//   read, and lent converted;
+// - what a C function answers, and what a C variable's getter answers,
+//   converted after the call; and what a function value answers, since the
+//   function may be C's;
+// - a parameter of a function C may call: one exported to C, and one the
+//   program uses as a value, which may be handed to C as a function pointer,
+//   converted where the function begins.
+//
+// What a `ptr<bool>` points at is not converted: a pointer reaches what the
+// program says it does, a `Vec<bool>`'s elements among them.
+
+import std::mem
+import hir::{BOOL, FnId, Program, RefKind}
+
+/// Converts every `bool` of `body` that comes from C, `id` being the function
+/// it is the body of.
+pub fn convertCBools(program: &Program, id: FnId, body: &var Body) = {
+	val def = &program.fns[id]
+	val enteredByC = def.exportsC || program.fnValues.contains(&id)
+	var c = Converter(
+		program: &program,
+		body: mem::replace(&var body, Body(
+			locals: Vec(),
+			params: Vec(),
+			ret: .None,
+			blocks: Vec(),
+		)),
+	)
+	if enteredByC then c.parameters()
+	for index in 0..c.body.blocks.len() {
+		c.block(index)
+	}
+	body = move c.body
+}
+
+view struct Converter {
+	program: &Program
+	body: Body
+}
+
+extend Converter {
+	/// Each `bool` parameter, compared with zero before anything reads it.
+	var fn parameters() = {
+		var statements: Vec<Statement> = Vec()
+		for param in self.body.params {
+			if self.body.local(param).ty == BOOL then statements.push(inPlace(Place::of(param)))
+		}
+		for statement in self.body.blocks[0].statements {
+			statements.push(statement.clone())
+		}
+		self.body.blocks[0].statements = move statements
+	}
+
+	var fn block(index: i64) = {
+		val statements = mem::replace(&var self.body.blocks[index].statements, Vec())
+		var out: Vec<Statement> = Vec()
+		for statement in move statements {
+			val converted = self.statement(move statement, &var out)
+			val after = self.afterCall(&converted)
+			out.push(move converted)
+			if after is .Some(s) then out.push(s.clone())
+		}
+		val terminator: Terminator = match mem::replace(
+			&var self.body.blocks[index].terminator,
+			.Unreachable,
+		) {
+			.Branch(cond, thenBlock, otherwise) => .Branch(
+				cond: self.operand(move cond, &var out),
+				thenBlock: thenBlock,
+				otherwise: otherwise,
+			)
+			.Switch(value, cases, otherwise) => .Switch(
+				value: self.operand(move value, &var out),
+				cases: move cases,
+				otherwise: otherwise,
+			)
+			.Panic(note: .Some(note), message, at) => .Panic(
+				note: .Some(self.operand(move note, &var out)),
+				message: message,
+				at: at,
+			)
+			other => move other
+		}
+		self.body.blocks[index].statements = move out
+		self.body.blocks[index].terminator = move terminator
+	}
+
+	/// The reads of C's `bool`s in `statement`, each made a read of a
+	/// temporary converted before it, in `out`.
+	var fn statement(statement: Statement, out: &var Vec<Statement>): Statement = {
+		if statement is .Assign(place: dest, rvalue: .AddressOf(place)) && self.isCBool(&place) {
+			val destTy = placeTy(self.program, &self.body, &dest)
+			return match self.program.types.kind(destTy) {
+				// Lent to be written: converted where it lies, so that what reads
+				// it through the reference reads 0 or 1.
+				.Ref(kind: .Var, ..) | .Ptr(..) => {
+					out.push(inPlace(place.clone()))
+					Statement::Assign(place: dest.clone(), rvalue: .AddressOf(place.clone()))
+				}
+				// Lent to be read: a converted copy is lent, and C's memory, which
+				// may be read-only, is left alone.
+				_ => {
+					val copy = self.converted(place.clone(), &var out)
+					.Assign(place: dest.clone(), rvalue: .AddressOf(move copy))
+				}
+			}
+		}
+		return self.operands(move statement, &var out)
+	}
+
+	/// `statement`, with each operand it reads converted where it is C's.
+	var fn operands(
+		statement: Statement,
+		out: &var Vec<Statement>,
+	): Statement = match move statement {
+		.Assign(place, rvalue) => .Assign(
+			place: move place,
+			rvalue: self.rvalue(move rvalue, &var out),
+		)
+		.Arith(dest, op, lhs, rhs, at) => {
+			val left = self.operand(move lhs, &var out)
+			.Arith(
+				dest: move dest,
+				op: op,
+				lhs: move left,
+				rhs: self.operand(move rhs, &var out),
+				at: at,
+			)
+		}
+		.Call(callee, args, dest) => {
+			val called = match move callee {
+				.Value(operand: o) => Callee::Value(self.operand(move o, &var out))
+				other => move other
+			}
+			var converted: Vec<Operand> = Vec()
+			for arg in move args {
+				converted.push(self.operand(move arg, &var out))
+			}
+			.Call(callee: move called, args: move converted, dest: move dest)
+		}
+		.AllocBuffer(dest, elem, count) => .AllocBuffer(
+			dest: move dest,
+			elem: elem,
+			count: self.operand(move count, &var out),
+		)
+		.Atomic(op, ty, address, value, expected, dest) => {
+			val at = self.operand(move address, &var out)
+			val given = self.optional(move value, &var out)
+			val wanted = self.optional(move expected, &var out)
+			.Atomic(
+				op: op,
+				ty: ty,
+				address: move at,
+				value: move given,
+				expected: move wanted,
+				dest: move dest,
+			)
+		}
+		.Free(operand: o) => .Free(self.operand(move o, &var out))
+		.DropFn(ty, ptr) => .DropFn(ty: ty, ptr: self.operand(move ptr, &var out))
+		.Check(fails, kind, at) => {
+			val failing = self.operand(move fails, &var out)
+			val reported: CheckKind = match move kind {
+				.Bounds(index, length) => {
+					val i = self.operand(move index, &var out)
+					.Bounds(index: move i, length: self.operand(move length, &var out))
+				}
+				.Length(length) => .Length(self.operand(move length, &var out))
+				other => move other
+			}
+			.Check(fails: move failing, kind: move reported, at: at)
+		}
+		other => move other
+	}
+
+	var fn rvalue(rvalue: Rvalue, out: &var Vec<Statement>): Rvalue = match move rvalue {
+		.Use(operand: o) => .Use(self.operand(move o, &var out))
+		.Unary(op, operand: o) => .Unary(op: op, operand: self.operand(move o, &var out))
+		.Cast(operand: o, ty) => .Cast(operand: self.operand(move o, &var out), ty: ty)
+		.CstrLen(operand: o) => .CstrLen(self.operand(move o, &var out))
+		.Float(op, operand: o) => .Float(op: op, operand: self.operand(move o, &var out))
+		.Integer(op, operand: o) => .Integer(op: op, operand: self.operand(move o, &var out))
+		.Bits(operand: o) => .Bits(self.operand(move o, &var out))
+		.VTableFn(table, index, methods) => .VTableFn(
+			table: self.operand(move table, &var out),
+			index: index,
+			methods: methods,
+		)
+		.Binary(op, lhs, rhs) => {
+			val left = self.operand(move lhs, &var out)
+			.Binary(op: op, lhs: move left, rhs: self.operand(move rhs, &var out))
+		}
+		.Rotate(turn, lhs, rhs) => {
+			val left = self.operand(move lhs, &var out)
+			.Rotate(turn: turn, lhs: move left, rhs: self.operand(move rhs, &var out))
+		}
+		.Overflows(op, lhs, rhs) => {
+			val left = self.operand(move lhs, &var out)
+			.Overflows(op: op, lhs: move left, rhs: self.operand(move rhs, &var out))
+		}
+		.MulAdd(first, second, third) => {
+			val a = self.operand(move first, &var out)
+			val b = self.operand(move second, &var out)
+			.MulAdd(first: move a, second: move b, third: self.operand(move third, &var out))
+		}
+		// A `bool` is lent by the statement, above; an enum's variant is not a
+		// `bool`.
+		other => move other
+	}
+
+	var fn optional(
+		operand: Option<Operand>,
+		out: &var Vec<Statement>,
+	): Option<Operand> = match move operand {
+		.Some(o) => .Some(self.operand(move o, &var out))
+		.None => .None
+	}
+
+	/// A read of C's `bool`, made a read of the converted value.
+	var fn operand(operand: Operand, out: &var Vec<Statement>): Operand = {
+		if operand is .Copy(place) && self.isCBool(&place) then
+			return .Copy(self.converted(place.clone(), &var out))
+		return move operand
+	}
+
+	/// A temporary holding `place` compared with zero, assigned in `out`.
+	var fn converted(place: Place, out: &var Vec<Statement>): Place = {
+		val temp = Local(self.body.locals.len() as u32)
+		self.body.locals.push(LocalDecl(ty: BOOL, kind: .Temp, source: .None))
+		out.push(.Assign(place: Place::of(temp), rvalue: nonzero(move place)))
+		return Place::of(temp)
+	}
+
+	/// What a call answers, converted where C may have answered it.
+	fn afterCall(statement: &Statement): Option<Statement> = {
+		val .Call(callee, dest: .Some(dest), ..) = statement else {
+			return .None
+		}
+		val fromC = match callee {
+			.Fn(id) => {
+				val def = &self.program.fns[id]
+				def.isExtern || def.accesses.isSome()
+			}
+			.Value(..) => true
+			.StrCmp => false
+		}
+		return if fromC && placeTy(self.program, &self.body, &dest) == BOOL then
+			.Some(inPlace(dest.clone()))
+		else .None
+	}
+
+	/// Whether `place` is a `bool` C declares: a field of an `extern struct`
+	/// or an `extern union`, or an element of a `bool` array that is one.
+	fn isCBool(place: &Place): bool = {
+		if placeTy(self.program, &self.body, &place) != BOOL then return false
+		var end = place.projections.len()
+		while end > 0 && place.projections[end - 1] is .Index(..) | .ConstIndex(..) {
+			end -= 1
+		}
+		if end == 0 then return false
+		end -= 1
+		if !(place.projections[end] is .Field(..)) then return false
+		val owner = Place(local: place.local, projections: place.projections[0..end].toVec())
+		val ownerTy = placeTy(self.program, &self.body, &owner)
+		return self.program.types.kind(ownerTy) is .Struct(id, ..) &&
+			self.program.structs[id].isExtern
+	}
+}
+
+/// `place != false`: zero is false, and any other byte true.
+fn nonzero(place: Place): Rvalue = .Binary(
+	op: .Ne,
+	lhs: .Copy(move place),
+	rhs: .Const(.Bool(false)),
+)
+
+/// `place = place != false`.
+fn inPlace(place: Place): Statement = .Assign(place: place.clone(), rvalue: nonzero(move place))

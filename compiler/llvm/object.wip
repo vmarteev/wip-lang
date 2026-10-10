@@ -1,0 +1,398 @@
+// An object `clang` wrote, read as far as the table a panic reads needs: its
+// sections and their bytes, its symbols, and the relocations of its sections,
+// in ELF and in Mach-O, of 64 bits, little-endian.
+//
+// What is read is what a reader of every object would answer for these: an
+// ELF section is numbered as its header is, a Mach-O section from 1 across the
+// segments, and a symbol by its place in the symbol table; a Mach-O section
+// is named `__debug_info` where ELF names it `.debug_info`.
+
+/// Which of the two formats an object is.
+@derive(Eq, Clone)
+enum Format {
+	Elf
+	Macho
+}
+
+/// A section: its name, which Mach-O keeps to sixteen bytes, where its bytes
+/// are, and whether it is code.
+struct ObjectSection {
+	name: String
+	/// Its number, as the object numbers it.
+	index: i64
+	address: u64
+	offset: i64
+	size: i64
+	text: bool
+	/// What its relocations are, in the order the object lists them.
+	relocations: Vec<Relocation>
+}
+
+/// A symbol: its name, the section it is in, if any, and its value.
+struct ObjectSymbol {
+	name: String
+	section: Option<i64>
+	address: u64
+	/// Whether it names code, as a function of the program does.
+	text: bool
+	undefined: bool
+	/// Mach-O's symbol of a section, which LLVM names `ltmp` and a number.
+	sectionSymbol: bool
+}
+
+/// A relocation: where in its section it is, whether it is an address put
+/// there as it is, what it is relative to, and what it adds.
+struct Relocation {
+	offset: u64
+	absolute: bool
+	/// What it is, where it is not an address: for a message.
+	kind: String
+	target: RelocationTarget
+	addend: i64
+	/// Whether what is at the place is added too, as in Mach-O, where the
+	/// addend is kept in the bytes.
+	implicit: bool
+}
+
+/// What a relocation is relative to.
+enum RelocationTarget {
+	Symbol(index: i64)
+	Section(index: i64)
+	Nothing
+}
+
+/// An ELF section's header, as the object holds it.
+struct ElfHeader {
+	name: u32
+	kind: u32
+	flags: u64
+	address: u64
+	offset: u64
+	size: u64
+	link: u32
+	info: u32
+}
+
+/// An object, read.
+struct Object {
+	format: Format
+	bytes: Vec<u8>
+	sections: Vec<ObjectSection>
+	/// Each symbol at its index; `none` where the index names none, as a
+	/// Mach-O debugging symbol does.
+	symbols: Vec<Option<ObjectSymbol>>
+}
+
+extend Object {
+	/// The section of `name`, as ELF names it.
+	fn section(name: str): Option<&ObjectSection> = {
+		for section in self.sections {
+			if self.format == Format::Elf {
+				if section.name == name then return .Some(&section)
+			} else if name.startsWith(".") {
+				// `.debug_info` is `__debug_info`, cut to the sixteen bytes a
+				// Mach-O name holds.
+				val rest = name[1..name.len()]
+				val kept = if rest.len() > 14 then rest[0..14] else rest
+				if section.name == "__\(kept)" then return .Some(&section)
+			}
+		}
+		return .None
+	}
+
+	/// The section numbered `index`, as the object numbers its sections.
+	fn sectionAt(index: i64): Option<&ObjectSection> = {
+		for section in self.sections {
+			if section.index == index then return .Some(&section)
+		}
+		return .None
+	}
+
+	/// What a section holds.
+	fn data(section: &ObjectSection): &[u8] =
+		lend self.bytes[section.offset..(section.offset + section.size)]
+}
+
+/// The object `bytes` are.
+fn readObject(bytes: &[u8]): Result<Object, String> = {
+	if bytes.len() >= 4 &&
+		bytes[0] == 0x7f &&
+		bytes[1] == b'E' &&
+		bytes[2] == b'L' &&
+		bytes[3] == b'F' {
+		return readElf(&bytes)
+	}
+	if bytes.len() >= 4 && u32At(&bytes, 0) == 0xfeedfacf then return readMacho(&bytes)
+	return .Err(String::of("not an object of ELF or of Mach-O, of 64 bits"))
+}
+
+fn readElf(bytes: &[u8]): Result<Object, String> = {
+	if bytes.len() < 64 || bytes[4] != 2 || bytes[5] != 1 then
+		return .Err(String::of("not an ELF object of 64 bits, little-endian"))
+	val machine = u16At(&bytes, 0x12)
+	val at = u64At(&bytes, 0x28) as i64
+	val count = u16At(&bytes, 0x3c) as i64
+	val namesIndex = u16At(&bytes, 0x3e) as i64
+	if at + count * 64 > bytes.len() then
+		return .Err(String::of("the sections' headers are past the end of the object"))
+	var headers: Vec<ElfHeader> = Vec()
+	for i in 0..count {
+		val h = at + i * 64
+		headers.push(ElfHeader(
+			name: u32At(&bytes, h),
+			kind: u32At(&bytes, h + 4),
+			flags: u64At(&bytes, h + 8),
+			address: u64At(&bytes, h + 16),
+			offset: u64At(&bytes, h + 24),
+			size: u64At(&bytes, h + 32),
+			link: u32At(&bytes, h + 40),
+			info: u32At(&bytes, h + 44),
+		))
+	}
+	val names = if namesIndex < count then headers[namesIndex].offset as i64 else 0
+	var sections: Vec<ObjectSection> = Vec()
+	var symtab: Option<i64> = .None
+	for (i, h) in headers.forwards().enumerate() {
+		// `SHT_PROGBITS` with `SHF_EXECINSTR`: code.
+		val text = h.kind == 1 && h.flags & 4 != 0
+		// `SHT_NOBITS` has no bytes in the file.
+		val held = if h.kind == 8 then 0 else h.size as i64
+		sections.push(ObjectSection(
+			name: cString(&bytes, names + h.name as i64),
+			index: i,
+			address: h.address,
+			offset: h.offset as i64,
+			size: held,
+			text: text,
+			relocations: Vec(),
+		))
+		if h.kind == 2 then symtab = .Some(i)
+	}
+	// Each section's relocations, from the `SHT_RELA` section that says it is
+	// theirs.
+	for h in headers {
+		val offset = h.offset
+		val size = h.size
+		val info = h.info
+		if h.kind != 4 || info as i64 >= sections.len() then continue
+		var relocations: Vec<Relocation> = Vec()
+		var r = offset as i64
+		while r + 24 <= (offset + size) as i64 {
+			val rInfo = u64At(&bytes, r + 8)
+			val symbol = (rInfo >> 32) as i64
+			val rType = (rInfo & 0xffffffff) as u32
+			val absolute =
+				if machine == 183 then rType == 257 || rType == 258 || rType == 259
+				else if machine == 62 then rType == 1 || rType == 10 || rType == 11 || rType == 12
+				else false
+			relocations.push(Relocation(
+				offset: u64At(&bytes, r),
+				absolute: absolute,
+				kind: if absolute then String::of("Absolute")
+				else "an ELF relocation of type \(rType)",
+				target: if symbol == 0 then RelocationTarget::Nothing
+				else RelocationTarget::Symbol(symbol),
+				addend: u64At(&bytes, r + 16) as i64,
+				implicit: false,
+			))
+			r += 24
+		}
+		sections[info as i64].relocations = move relocations
+	}
+	// The symbols, by their place in the table.
+	var symbols: Vec<Option<ObjectSymbol>> = Vec()
+	if symtab is .Some(index) {
+		val offset = headers[index].offset
+		val size = headers[index].size
+		val strings = headers[headers[index].link as i64].offset as i64
+		var s = offset as i64
+		while s + 24 <= (offset + size) as i64 {
+			val info = bytes[s + 4]
+			val shndx = u16At(&bytes, s + 6) as i64
+			val section: Option<i64> = if shndx != 0 && shndx < 0xff00 then .Some(shndx) else .None
+			symbols.push(
+				.Some(ObjectSymbol(
+					name: cString(&bytes, strings + u32At(&bytes, s) as i64),
+					section: section,
+					address: u64At(&bytes, s + 8),
+					text: info & 15 == 2 || info & 15 == 10,
+					undefined: shndx == 0,
+					sectionSymbol: false,
+				)),
+			)
+			s += 24
+		}
+	}
+	return .Ok(Object(
+		format: .Elf,
+		bytes: bytes.toVec(),
+		sections: move sections,
+		symbols: move symbols,
+	))
+}
+
+fn readMacho(bytes: &[u8]): Result<Object, String> = {
+	val cpu = u32At(&bytes, 4)
+	val arm64 = cpu == 0x0100000c
+	val commands = u32At(&bytes, 16) as i64
+	var at = 32
+	var sections: Vec<ObjectSection> = Vec()
+	var symtab: Option<(i64, i64, i64)> = .None
+	for _ in 0..commands {
+		val command = u32At(&bytes, at)
+		val size = u32At(&bytes, at + 4) as i64
+		if command == 0x19 {
+			// `LC_SEGMENT_64`, and its sections after it.
+			val count = u32At(&bytes, at + 64) as i64
+			for i in 0..count {
+				val s = at + 72 + i * 80
+				val sectname = fixedName(&bytes, s)
+				val segname = fixedName(&bytes, s + 16)
+				val offset = u32At(&bytes, s + 48) as i64
+				val reloff = u32At(&bytes, s + 56) as i64
+				val nreloc = u32At(&bytes, s + 60) as i64
+				val flags = u32At(&bytes, s + 64)
+				// Zero filled: no bytes in the file.
+				val zerofill = flags & 0xff == 1 || flags & 0xff == 12
+				var relocations: Vec<Relocation> = Vec()
+				var paired: i64 = 0
+				for r in 0..nreloc {
+					val place = reloff + r * 8
+					val address = u32At(&bytes, place)
+					val info = u32At(&bytes, place + 4)
+					val symbolnum = (info & 0xffffff) as i64
+					val pcrel = (info >> 24) & 1 == 1
+					val external = (info >> 27) & 1 == 1
+					val rType = info >> 28
+					// `ARM64_RELOC_ADDEND`: the addend of the one after it.
+					if arm64 && rType == 10 {
+						paired = ((symbolnum << 40) as i64) >> 40
+						continue
+					}
+					// A subtractor: the one after it says what it is.
+					if arm64 && rType == 1 || !arm64 && rType == 5 then continue
+					val absolute = rType == 0 && !pcrel
+					relocations.push(Relocation(
+						offset: address as u64,
+						absolute: absolute,
+						kind: if absolute then String::of("Absolute")
+						else "a Mach-O relocation of type \(rType)",
+						target: if external then RelocationTarget::Symbol(symbolnum)
+						else RelocationTarget::Section(symbolnum),
+						addend: paired,
+						implicit: paired == 0,
+					))
+					paired = 0
+				}
+				val text = sectname == "__text" && segname == "__TEXT"
+				sections.push(ObjectSection(
+					name: move sectname,
+					index: sections.len() + 1,
+					address: u64At(&bytes, s + 32),
+					offset: offset,
+					size: if zerofill then 0 else u64At(&bytes, s + 40) as i64,
+					text: text,
+					relocations: move relocations,
+				))
+			}
+		} else if command == 0x2 {
+			symtab = .Some(
+				(
+					u32At(&bytes, at + 8) as i64,
+					u32At(&bytes, at + 12) as i64,
+					u32At(&bytes, at + 16) as i64,
+				),
+			)
+		}
+		at += size
+	}
+	var symbols: Vec<Option<ObjectSymbol>> = Vec()
+	if symtab is .Some((symoff, count, stroff)) {
+		for i in 0..count {
+			val n = symoff + i * 16
+			val nType = bytes[n + 4]
+			// A debugging symbol is none of the object's.
+			if nType & 0xe0 != 0 {
+				symbols.push(.None)
+				continue
+			}
+			val nSect = bytes[n + 5] as i64
+			val defined = nType & 0x0e == 0x0e
+			val section: Option<i64> = if defined then .Some(nSect) else .None
+			val name = cString(&bytes, stroff + u32At(&bytes, n) as i64)
+			val address = u64At(&bytes, n + 8)
+			var text = false
+			var sectionSymbol = false
+			for s in sections {
+				if defined && s.index == nSect {
+					val local = nType & 0x01 == 0
+					sectionSymbol = local && isLtmp(name.toStr()) && address == s.address
+					text = s.text && !sectionSymbol
+				}
+			}
+			symbols.push(
+				.Some(ObjectSymbol(
+					name: move name,
+					section: section,
+					address: address,
+					text: text,
+					undefined: nType & 0x0e == 0,
+					sectionSymbol: sectionSymbol,
+				)),
+			)
+		}
+	}
+	return .Ok(Object(
+		format: .Macho,
+		bytes: bytes.toVec(),
+		sections: move sections,
+		symbols: move symbols,
+	))
+}
+
+/// Whether a name is LLVM's for the symbol of a section: `ltmp` and digits.
+fn isLtmp(name: str): bool = {
+	if name.len() <= 4 || !name.startsWith("ltmp") then return false
+	for i in 4..name.len() {
+		if name[i] < b'0' || name[i] > b'9' then return false
+	}
+	return true
+}
+
+/// The name in the sixteen bytes at `at`, which end at a NUL or at the
+/// sixteenth.
+fn fixedName(bytes: &[u8], at: i64): String = {
+	var end = at
+	while end < at + 16 && bytes[end] != 0 {
+		end += 1
+	}
+	return String::of(str::fromBytes(&bytes[at..end]))
+}
+
+/// The NUL-terminated name at `at`.
+fn cString(bytes: &[u8], at: i64): String = {
+	if at >= bytes.len() then return String()
+	var end = at
+	while end < bytes.len() && bytes[end] != 0 {
+		end += 1
+	}
+	return String::of(str::fromBytes(&bytes[at..end]))
+}
+
+fn u16At(bytes: &[u8], at: i64): u16 = bytes[at] as u16 | (bytes[at + 1] as u16) << 8
+
+fn u32At(bytes: &[u8], at: i64): u32 = {
+	var value: u32 = 0
+	for i in 0..4 {
+		value = value | (bytes[at + i] as u32) << (8 * i as u32)
+	}
+	return value
+}
+
+fn u64At(bytes: &[u8], at: i64): u64 = {
+	var value: u64 = 0
+	for i in 0..8 {
+		value = value | (bytes[at + i] as u64) << (8 * i as u64)
+	}
+	return value
+}

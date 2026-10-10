@@ -1,8 +1,11 @@
 #!/bin/bash
 # Checks the LLVM backend against every major `clang` it says it builds with
 # — 15 and newer — on Linux, where Debian packages them side by side: for
-# each, the case suite, whose release builds are LLVM's and are compared
-# with its debug builds, and `c_abi`, whose third way is a release build.
+# each, the cases, each case's release build compared with its debug
+# build; the calls across the C boundary, whose third way is a release
+# build; and the bitcode of every case, which each must read to the module
+# it reads the text to. The compiler is built from this checkout as
+# `scripts/verify.sh` builds its stage 1.
 # Run before a release, and whenever the IR the backend writes changes; each
 # `clang` is a build of every case, minutes in the guest, which is why the
 # gate leaves it to this.
@@ -28,13 +31,15 @@ say() { printf '%-34s %s\n' "$1" "$2"; }
 export WIP_CACHE_DIR="${WIP_CACHE_DIR:-$PWD/target/wip-cache}"
 export WIP_CHECK_MOVES="${WIP_CHECK_MOVES:-1}"
 
-if ! cargo test -q -p wip-lang --test cases --test c_abi --no-run >"$out/build" 2>&1; then
+# The compiler, and the gate's checks, which run with each `clang`.
+stage1="${WIP_TARGET_DIR:-target}/stages/1"
+wip="$stage1/bin/wip"
+if ! { scripts/build.sh --release --out "$stage1" &&
+    "$wip" build --release tests/gate/main.wip -o "$out/gate"; } >"$out/build" 2>&1; then
     say "building" "FAILED"
     cat "$out/build"
     exit 1
 fi
-# The compiler the tests run.
-wip=${CARGO_TARGET_DIR:-target}/debug/wip
 printf 'fn main() = {}\n' >"$out/main.wip"
 
 for version in $versions; do
@@ -51,23 +56,21 @@ for version in $versions; do
         continue
     fi
     export WIP_CLANG=$clang
-    # The release builds below fall back to Cranelift, saying so, where
-    # the `clang` does not read the IR; insisting on LLVM first makes that
-    # a failure here.
-    if ! "$wip" build --release --backend llvm "$out/main.wip" -o "$out/main" >"$out/probe" 2>&1; then
+    # A `clang` that does not read the IR builds nothing: a release build
+    # first says so here.
+    if ! "$wip" build --release "$out/main.wip" -o "$out/main" >"$out/probe" 2>&1; then
         say "$clang" "FAILED: does not build with it"
         cat "$out/probe"
         failed=1
         continue
     fi
-    if cargo test -q -p wip-lang --test cases --test c_abi >"$out/tests" 2>&1; then
+    if "$out/gate" "$wip" cases abi bitcode --read-only >"$out/tests" 2>&1; then
         say "$clang" "ok"
     else
         say "$clang" "FAILED"
-        grep -E "^test .* FAILED|^---- |test result" "$out/tests"
+        grep -v -E " ok$" "$out/tests" | head -40
         failed=1
     fi
-    find tests -name '*.snap.new' -delete
 done
 
 [ $failed -eq 0 ] && echo "ALL OK"

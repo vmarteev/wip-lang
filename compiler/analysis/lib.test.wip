@@ -1,0 +1,112 @@
+// What the analysis reports of whole programs, and how often.
+
+import hir::{ModuleAst, PRELUDE, lower, lowerFile}
+import syntax::{
+	Code,
+	Diagnostic,
+	Interner,
+	MOVED_IN_PREVIOUS_ITERATION,
+	USE_OF_MOVED_VALUE,
+	USE_OF_POSSIBLY_MOVED_VALUE,
+	lex,
+	parse
+}
+
+/// What the analysis reports of the program `text`, which must check.
+fn analysed(text: str): Vec<Diagnostic> = {
+	var interner = Interner::new()
+	val lexed = lex(text, &var interner)
+	val parsed = parse(text, &lexed)
+	val lowered = lowerFile(&parsed.ast, &interner)
+	assert(lowered.diagnostics.isEmpty())
+	return check(&lowered.program, &interner, 3)
+}
+
+/// The codes of `diagnostics`, in order.
+fn codes(diagnostics: &[Diagnostic]): Vec<Code> = {
+	var found: Vec<Code> = Vec()
+	for d in diagnostics {
+		found.push(d.code.clone())
+	}
+	return move found
+}
+
+/// A struct that owns memory, and a function that takes one.
+val BOX: str = "struct Box {\n\tvalue: own<i64>\n}\n\nfn take(b: Box) = {}\n\n"
+
+@test
+fn aValueMovedTwiceIsReportedOnce() = {
+	val found = analysed("\(BOX)fn main() = {\n\tval b = Box(value: own 1)\n\ttake(move b)\n\ttake(move b)\n\ttake(move b)\n}\n")
+	assert(codes(&found).items() == [USE_OF_MOVED_VALUE])
+}
+
+@test
+fn aValueMovedOnOnePathIsPossiblyMoved() = {
+	val found = analysed("\(BOX)fn main(go: bool) = {\n\tval b = Box(value: own 1)\n\tif go {\n\t\ttake(move b)\n\t}\n\ttake(move b)\n}\n")
+	assert(codes(&found).items() == [USE_OF_POSSIBLY_MOVED_VALUE])
+}
+
+@test
+fn aMoveInALoopIsSeenByTheNextIteration() = {
+	val found = analysed("\(BOX)fn main(n: i64) = {\n\tval b = Box(value: own 1)\n\tfor _ in 0..n {\n\t\ttake(move b)\n\t}\n}\n")
+	assert(codes(&found).items() == [MOVED_IN_PREVIOUS_ITERATION])
+}
+
+@test
+fn aValueAssignedAgainHoldsOne() = {
+	val found = analysed("\(BOX)fn main() = {\n\tvar b = Box(value: own 1)\n\ttake(move b)\n\tb = Box(value: own 2)\n\ttake(move b)\n}\n")
+	assert(found.isEmpty())
+}
+
+/// What the analysis reports of the program `root`, with `prelude` as the
+/// prelude; both must check.
+fn analysedWithPrelude(prelude: str, root: str): Vec<Diagnostic> = {
+	var interner = Interner::new()
+	val preludeLexed = lex(prelude, &var interner)
+	val preludeParsed = parse(prelude, &preludeLexed)
+	val preludeAst = move preludeParsed.ast
+	val rootLexed = lex(root, &var interner)
+	val rootParsed = parse(root, &rootLexed)
+	val rootAst = move rootParsed.ast
+	val modules = [
+		ModuleAst(
+			path: String::of(PRELUDE),
+			files: Vec::of(own [&preludeAst]),
+			prefix: String(),
+			depends: Vec(),
+			dir: .None,
+			root: .None,
+		),
+		ModuleAst(
+			path: String(),
+			files: Vec::of(own [&rootAst]),
+			prefix: String(),
+			depends: Vec(),
+			dir: .None,
+			root: .None,
+		),
+	]
+	val lowered = lower(&modules, &interner, 3)
+	assert(lowered.diagnostics.isEmpty())
+	return check(&lowered.program, &interner, 3)
+}
+
+/// A `for` over a value, whose body moves a variable out and returns: the
+/// next element never comes, so nothing is moved by the next iteration.
+@test
+fn aReturnFromALoopIsNotAMoveOfTheNextIteration() = {
+	val prelude =
+		"pub enum Option<T> {\n\tSome(value: T)\n\tNone\n}\n\npub interface Iterator<type Item> {\n\tvar fn next(): Option<Item>\n}\n"
+	val root = "\(BOX)struct Count {\n\tleft: i64\n}\n\nextend Count: Iterator<i64> {\n\tvar fn next(): Option<i64> = {\n\t\tif self.left == 0 then return .None\n\t\tself.left -= 1\n\t\treturn .Some(self.left)\n\t}\n}\n\nfn first(): Box = {\n\tval kept = Box(value: own 1)\n\tfor n in Count(left: 2) {\n\t\treturn move kept\n\t}\n\treturn Box(value: own 2)\n}\n"
+	val found = analysedWithPrelude(prelude, root.toStr())
+	assert(found.isEmpty())
+}
+
+/// An `is` test after `&&`, in a loop, whose binding is moved out: each pass
+/// binds it afresh where the test runs, and nothing names it where it does
+/// not.
+@test
+fn anIsBindingAfterAndIsBoundOnEachPass() = {
+	val found = analysed("\(BOX)enum Maybe {\n\tSome(held: Box)\n\tNone\n}\n\nfn made(n: i64): Maybe = if n > 0 then .Some(Box(value: own n)) else .None\n\nfn main() = {\n\tfor n in 0..3 {\n\t\tif n > 1 && made(n) is .Some(b) {\n\t\t\ttake(move b)\n\t\t}\n\t}\n}\n")
+	assert(found.isEmpty())
+}

@@ -1,0 +1,212 @@
+// MIR as text, one statement per line, for `wip mir` and for tests. A
+// number, a text and the name of an operation are written in words of the
+// dump's own, as the syntax tree's dump writes them.
+
+import hir::{Program, Ty}
+import syntax::{Interner, quoted}
+
+/// The text of a body named `name`.
+pub fn dump(program: &Program, interner: &Interner, name: str, body: &Body): String = {
+	var out = String()
+	var params: Vec<String> = Vec()
+	for p in body.params {
+		params.push("_\(p.index): \(program.tyName(body.local(p).ty, &interner))")
+	}
+	val ret = match body.ret {
+		.Some(r) => " -> _\(r.index): \(program.tyName(body.local(r).ty, &interner))"
+		.None => String()
+	}
+	out.push("fn \(name)(\(params.join(", ")))\(ret) {\n")
+	for (i, decl) in body.locals.forwards().enumerate() {
+		if decl.kind is .Var | .Temp {
+			val kind = if decl.kind == .Var then "var" else "temp"
+			out.push("    \(kind) _\(i): \(program.tyName(decl.ty, &interner))\n")
+		}
+	}
+	for (i, block) in body.blocks.forwards().enumerate() {
+		out.push("  bb\(i):\n")
+		// Where code was written is for debug information, and would bury
+		// what the code does.
+		for statement in block.statements {
+			if statement is .At(..) then continue
+			out.push("    \(statementText(&program, &interner, &statement))\n")
+		}
+		out.push("    \(terminatorText(&program, &interner, &block.terminator))\n")
+	}
+	out.push("}\n")
+	return move out
+}
+
+fn placeText(place: &Place): String = {
+	var text = "_\(place.local.index)"
+	for projection in place.projections {
+		text = match projection {
+			.Deref => "(*\(text))"
+			.Field(index) => "\(text).\(index)"
+			.VariantField(variant, field) => "(\(text) as \(variant)).\(field)"
+			.Index(local) => "\(text)[_\(local.index)]"
+			.ConstIndex(index) => "\(text)[\(index)]"
+		}
+	}
+	return move text
+}
+
+fn operandText(program: &Program, interner: &Interner, operand: &Operand): String = match operand {
+	.Copy(place) => placeText(&place)
+	.Const(.Int(bits, ty)) => "\(bits)_\(program.tyName(ty, &interner))"
+	.Const(.Float(value, ty)) => "\(value)_\(program.tyName(ty, &interner))"
+	.Const(.Bool(value)) => "\(value)"
+	.Const(.CStr(symbol)) => "c\(quoted(interner.resolve(symbol), '"'))"
+	.Const(.Fn(id, ..)) => "fn \(program.fnName(id, &interner))"
+	.Const(.VTable(interfaceId, ty)) =>
+		"vtable \(interner.resolve(program.interfaces[interfaceId].name)) for \(program.tyName(ty, &interner))"
+	.Const(.DropFn(ty)) => "drop_fn \(program.tyName(ty, &interner))"
+	.Const(.RuntimeWords) => String::of("runtime_words")
+	.Const(.FrameTables) => String::of("frame_tables")
+	.Const(.SizeOf(of, ..)) => "size_of \(program.tyName(of, &interner))"
+	.Const(.AlignOf(of, ..)) => "align_of \(program.tyName(of, &interner))"
+	.Const(.Table(id, ..)) => "table \(interner.resolve(program.consts[id].name))"
+}
+
+fn statementText(
+	program: &Program,
+	interner: &Interner,
+	statement: &Statement,
+): String = match statement {
+	.Assign(place: dest, rvalue) => {
+		val value = match rvalue {
+			.Use(o) => operandText(&program, &interner, &o)
+			.Unary(op, operand: o) => {
+				val sign = match op {
+					.Neg => "-"
+					.Not => "!"
+				}
+				"\(sign)\(operandText(&program, &interner, &o))"
+			}
+			.Binary(op, lhs, rhs) =>
+				"\(operandText(&program, &interner, &lhs)) \(op.text()) \(operandText(&program, &interner, &rhs))"
+			.Cast(operand: o, ty) =>
+				"\(operandText(&program, &interner, &o)) as \(program.tyName(ty, &interner))"
+			.AddressOf(p) => "&\(placeText(&p))"
+			.Variant(p) => "variant(\(placeText(&p)))"
+			.CstrLen(o) => "cstr_len(\(operandText(&program, &interner, &o)))"
+			.Float(op, operand: o) => "\(floatOpName(op))(\(operandText(&program, &interner, &o)))"
+			.MulAdd(first, second, third) =>
+				"muladd(\(operandText(&program, &interner, &first)), \(operandText(&program, &interner, &second)), \(operandText(&program, &interner, &third)))"
+			.Integer(op, operand: o) =>
+				"\(integerOpName(op))(\(operandText(&program, &interner, &o)))"
+			.Rotate(turn, lhs, rhs) => {
+				val way = match turn {
+					.Left => "left"
+					.Right => "right"
+				}
+				"rotate\(way)(\(operandText(&program, &interner, &lhs)), \(operandText(&program, &interner, &rhs)))"
+			}
+			.Overflows(op, lhs, rhs) =>
+				"overflows(\(operandText(&program, &interner, &lhs)) \(op.text()) \(operandText(&program, &interner, &rhs)))"
+			.Bits(o) => "bits(\(operandText(&program, &interner, &o)))"
+			.VTableFn(table, index, ..) =>
+				"method \(index) of \(operandText(&program, &interner, &table))"
+		}
+		"\(placeText(&dest)) = \(value)"
+	}
+	.SetVariant(place, variant) => "set_variant(\(placeText(&place)), \(variant))"
+	.Zero(place) => "zero(\(placeText(&place)))"
+	.Poison(place) => "poison(\(placeText(&place)))"
+	.CheckMoved(place, ..) => "check_moved(\(placeText(&place)))"
+	.At(span) => "at \(span.lo)"
+	.Call(callee, args, dest) => {
+		var texts: Vec<String> = Vec()
+		for arg in args {
+			texts.push(operandText(&program, &interner, &arg))
+		}
+		val name = match callee {
+			.Fn(id) => program.fnName(id, &interner)
+			.Value(operand) => "(\(operandText(&program, &interner, &operand)))"
+			.StrCmp => String::of("str_cmp")
+		}
+		val call = "call \(name)(\(texts.join(", ")))"
+		match dest {
+			.Some(place) => "\(placeText(&place)) = \(call)"
+			.None => move call
+		}
+	}
+	.Alloc(dest, ty) => "\(placeText(&dest)) = alloc \(program.tyName(ty, &interner))"
+	.AllocBuffer(dest, elem, count) =>
+		"\(placeText(&dest)) = alloc_buffer \(program.tyName(elem, &interner))[\(operandText(&program, &interner, &count))]"
+	// `+`, `-` and `*` on integers, which panic if the answer does not fit.
+	.Arith(dest, op, lhs, rhs, ..) =>
+		"\(placeText(&dest)) = \(operandText(&program, &interner, &lhs)) \(op.text())? \(operandText(&program, &interner, &rhs))"
+	.Free(o) => "free(\(operandText(&program, &interner, &o)))"
+	.Atomic(op, ty, address, value, expected, dest) => {
+		var texts = Vec::of(own [operandText(&program, &interner, &address)])
+		if expected is .Some(e) then texts.push(operandText(&program, &interner, &e))
+		if value is .Some(v) then texts.push(operandText(&program, &interner, &v))
+		val call = "atomic_\(atomicOpName(op))<\(program.tyName(ty, &interner))>(\(texts.join(", ")))"
+		match dest {
+			.Some(place) => "\(placeText(&place)) = \(call)"
+			.None => move call
+		}
+	}
+	.DropFn(ty, ptr) =>
+		"drop_fn<\(program.tyName(ty, &interner))>(\(operandText(&program, &interner, &ptr)))"
+	.DropInPlace(ty, place) =>
+		"drop_in_place<\(program.tyName(ty, &interner))>(\(placeText(&place)))"
+	.Check(fails, kind, ..) => {
+		val what = match kind {
+			.Bounds(..) => "Bounds"
+			.Length(..) => "Length"
+			.Division => "Division"
+			.Overflow(..) => "Overflow"
+		}
+		"check \(operandText(&program, &interner, &fails)) (\(what))"
+	}
+}
+
+/// What a float operation is called in the dump.
+fn floatOpName(op: FloatOp): str = match op {
+	.Sqrt => "sqrt"
+	.Floor => "floor"
+	.Ceil => "ceil"
+	.Trunc => "trunc"
+}
+
+/// What an operation on an integer's bits is called in the dump.
+fn integerOpName(op: IntegerOp): str = match op {
+	.CountOnes => "countones"
+	.LeadingZeros => "leadingzeros"
+	.TrailingZeros => "trailingzeros"
+	.SwapBytes => "swapbytes"
+	.ReverseBits => "reversebits"
+}
+
+/// What an atomic operation is called in the dump.
+fn atomicOpName(op: AtomicOp): str = match op {
+	.Add => "add"
+	.Subtract => "subtract"
+	.Swap => "swap"
+	.CompareSwap => "compare_swap"
+	.Load => "load"
+	.Store => "store"
+}
+
+fn terminatorText(
+	program: &Program,
+	interner: &Interner,
+	terminator: &Terminator,
+): String = match terminator {
+	.Goto(target) => "goto bb\(target.index)"
+	.Panic(note: .None, ..) => String::of("panic")
+	.Panic(note: .Some(note), ..) => "panic \(operandText(&program, &interner, &note))"
+	.Branch(cond, thenBlock, otherwise) =>
+		"branch \(operandText(&program, &interner, &cond)) ? bb\(thenBlock.index) : bb\(otherwise.index)"
+	.Switch(value, cases, otherwise) => {
+		var texts: Vec<String> = Vec()
+		for (case, block) in cases {
+			texts.push("\(case): bb\(block.index)")
+		}
+		"switch \(operandText(&program, &interner, &value)) [\(texts.join(", "))] else bb\(otherwise.index)"
+	}
+	.Return => String::of("return")
+	.Unreachable => String::of("unreachable")
+}

@@ -2,6 +2,60 @@
 
 Each version published, newest first.
 
+## 0.3.0 — 2026-10-10
+
+Programs written for 0.2 may need changes where marked **breaking**.
+
+- **The compiler is written in Wip.** It is built from its source with a
+  `clang` 15 or newer and nothing else: the repository keeps it for each
+  system as LLVM's bitcode, which `clang` compiles into a first `wip`, and
+  that one builds the compiler, which builds itself again
+  (`scripts/bootstrap.sh`). No Rust is needed to build or to work on Wip.
+- **`wip` is a directory:** `bin/wip`, and beside it the standard library,
+  `std/`, and the tools, `tools/`, which it reads from where it is
+  installed rather than carrying them inside. Each system's is published
+  as an archive, `wip-0.3.0-<system>.tar.gz`; `WIP_HOME` names another
+  home.
+- **Every build is LLVM's.** **Breaking:** a `clang` 15 or newer is
+  needed for a debug build too, and `--backend` is gone. A debug build is
+  compiled in parts at `-O0`, at once and kept in the cache, so that a
+  build after an edit compiles only what the edit changed.
+- **What a call keeps:** a call keeps nothing of its arguments unless its
+  signature says `keeps`, `var fn add(word: str) keeps word`, and a body
+  is held to it. **Breaking:** a function that stores a parameter in a
+  `&var` one says so; the library's methods that store, `Vec`'s `push`
+  among them, do.
+- **Another module's interface,** imported or named by its path: `T:
+  shapes::Area`, `&dyn shapes::Area`, `extend Rect: shapes::Area`.
+- **A line that begins with `|` continues a pattern's alternatives.**
+- **A `str` field of a view lends as a `&` field does,** so a method may
+  answer the text it reads `from self.source`.
+- **A variable holding a function value is captured** by a closure as any
+  variable is; `&` of a function value is refused, since a closure is
+  expected there.
+- **Programs talked to:** `Command::connect()` starts a program with its
+  input and output piped, written and read as it runs; `Command.unset`
+  leaves a variable out of its environment; `io::Reader.setTimeout` says
+  how long a read waits. A program started is given none of the files,
+  sockets and pipes this one has open.
+- **`embed::textOr(path, otherwise)`,** a file's text where it is there;
+  **`future::cores()`,** how many processors the work is spread over.
+- **The tools:** `wip build --emit llvm-ir` and `--emit llvm-bc` write the
+  program's LLVM IR, as text or as bitcode; `--no-debug-info` writes no
+  debug information; `wip cache clean` empties the cache; `wip check
+  --dump-diagnostics` and `--dump-hir` write what was found and what was
+  checked for a tool; `wip mir` prints what a build compiles, `--release`
+  as a release build does.
+- **Fixes:** what a match guard makes is dropped where the guard ran; a
+  reference loaded from memory is no longer promised to LLVM as one it may
+  read early; an `i128` product's overflow is checked without a helper
+  GCC's runtime lacks; a generic function given `void` for a type
+  compiles, where the backend panicked; an `is` binding after `&&` in a
+  loop is bound afresh on each pass, not moved on the pass before; a
+  `return move` in a `for` body is not a move on the next turn;
+  alternatives on a tuple matched in place are each tried; a `String`
+  lent through a reference lends what it refers to.
+
 ## 0.2.0 — 2026-10-07
 
 Programs written for 0.1 may need changes where marked **breaking**.

@@ -1,0 +1,897 @@
+// A readable, deterministic rendering of the syntax tree, for `wip parse` and
+// snapshot tests. One node per line, children indented under their parent,
+// and each line ends with the node's span as `@line:col..line:col`. A
+// `role:` prefix says which child of the parent a node is where the order
+// alone would not.
+
+pub fn dumpAst(ast: &Ast, src: str, interner: &Interner): String = dumpAstAt(
+	&ast,
+	src,
+	0,
+	&interner,
+)
+
+/// Dumps a file whose spans start at `base`.
+pub fn dumpAstAt(ast: &Ast, src: str, base: u32, interner: &Interner): String = {
+	var printer = Printer(
+		ast: &ast,
+		src: src,
+		interner: &interner,
+		base: base,
+		lines: LineIndex::new(src),
+		out: String(),
+		depth: 0,
+	)
+	for item in ast.items {
+		printer.item(&item)
+	}
+	return move printer.out
+}
+
+view struct Printer {
+	ast: &Ast
+	src: str
+	interner: &Interner
+	base: u32
+	lines: LineIndex
+	out: String
+	depth: i64
+}
+
+extend Printer {
+	var fn line(role: str, text: str, span: Span) = {
+		val (l1, c1) = self.lines.lineCol(self.src, span.lo - self.base)
+		val (l2, c2) = self.lines.lineCol(self.src, span.hi - self.base)
+		for _ in 0..self.depth {
+			self.out.push("  ")
+		}
+		if !role.isEmpty() {
+			self.out.push(role)
+			self.out.push(": ")
+		}
+		self.out.push("\(text)  @\(l1):\(c1)..\(l2):\(c2)\n")
+	}
+
+	fn sym(symbol: Symbol): str from self.interner = self.interner.resolve(symbol)
+
+	/// An interface as it was named: `Area`, or `shapes::Area`.
+	fn interfacePath(module: &[Name], name: Name): String = {
+		var path = String()
+		for m in module {
+			path.push(self.sym(m.sym))
+			path.push("::")
+		}
+		path.push(self.sym(name.sym))
+		return move path
+	}
+
+	/// The names of a path, joined by `::`.
+	fn path(names: &[Name]): String = {
+		var out = String()
+		for (i, name) in names.forwards().enumerate() {
+			if i > 0 then out.push("::")
+			out.push(self.sym(name.sym))
+		}
+		return move out
+	}
+
+	/// The annotations before a declaration, each on a line of its own.
+	var fn annotations(annotations: &[Annotation]) = {
+		for annotation in annotations {
+			var text = String::of("@\(self.sym(annotation.name.sym))")
+			if annotation.parens.isSome() {
+				text.push("(")
+				for (i, arg) in annotation.args.forwards().enumerate() {
+					if i > 0 then text.push(", ")
+					if arg.name is .Some(name) then text.push("\(self.sym(name.sym)) = ")
+					match arg.value {
+						.Int(value) => text.push("\(value)")
+						.Str(symbol) => text.push(quoted(self.sym(symbol), '"'))
+						.Bool(value) => text.push("\(value)")
+						.Name(symbol) => text.push(self.sym(symbol))
+						.Error => text.push("?")
+					}
+				}
+				text.push(")")
+			}
+			self.line("", text.toStr(), annotation.span)
+		}
+	}
+
+	var fn item(item: &Item) = match item {
+		.Import(decl) => {
+			var text = String::of("import \(self.path(&decl.path))")
+			if decl.items is .Some(items) {
+				text.push("::{")
+				for (i, imported) in items.forwards().enumerate() {
+					if i > 0 then text.push(", ")
+					// `self` in the list is the module itself.
+					match imported.name {
+						.Some(name) => text.push(self.sym(name.sym))
+						.None => text.push("self")
+					}
+					if imported.alias is .Some(alias) then text.push(" as \(self.sym(alias.sym))")
+				}
+				text.push("}")
+			}
+			if decl.alias is .Some(alias) then text.push(" as \(self.sym(alias.sym))")
+			self.line("", text.toStr(), decl.span)
+		}
+		// `type Id = i64`.
+		.Type(alias) => {
+			self.line("", "\(exported(alias.isPub))type \(self.sym(alias.name.sym))", alias.span)
+			self.depth += 1
+			self.generics(&alias.generics)
+			self.ty("", alias.ty)
+			self.depth -= 1
+		}
+		.Struct(decl) => {
+			self.annotations(&decl.annotations)
+			// `extern struct` is C's layout, and `extern union` is C's
+			// one-of.
+			val kind =
+				if decl.isExtern && decl.isUnion then "extern union"
+				else if decl.isExtern then "extern struct"
+				else if decl.isView then "view struct"
+				else "struct"
+			self.line("", "\(exported(decl.isPub))\(kind) \(self.sym(decl.name.sym))", decl.span)
+			self.depth += 1
+			self.generics(&decl.generics)
+			for field in decl.fields {
+				self.field("field", &field)
+			}
+			for method in decl.methods {
+				self.method(&method)
+			}
+			self.depth -= 1
+		}
+		.Enum(decl) => {
+			self.annotations(&decl.annotations)
+			val kind = if decl.isView then "view enum" else "enum"
+			self.line("", "\(exported(decl.isPub))\(kind) \(self.sym(decl.name.sym))", decl.span)
+			self.depth += 1
+			self.generics(&decl.generics)
+			for variant in decl.variants {
+				self.line("", "variant \(self.sym(variant.name.sym))", variant.span)
+				self.depth += 1
+				for field in variant.fields {
+					self.field("field", &field)
+				}
+				self.depth -= 1
+			}
+			for method in decl.methods {
+				self.method(&method)
+			}
+			self.depth -= 1
+		}
+		.Assert(decl) => {
+			self.annotations(&decl.annotations)
+			self.line("", "assert", decl.span)
+			self.depth += 1
+			self.expr("assert", decl.assertion)
+			self.depth -= 1
+		}
+		.Val(decl) => {
+			self.annotations(&decl.annotations)
+			self.line("", "\(exported(decl.isPub))val \(self.sym(decl.name.sym))", decl.span)
+			self.depth += 1
+			if decl.ty is .Some(ty) then self.ty("type", ty)
+			self.expr("value", decl.value)
+			self.depth -= 1
+		}
+		.Fn(decl) => {
+			self.annotations(&decl.annotations)
+			if decl.isPub {
+				self.line("", "pub fn \(self.sym(decl.sig.name.sym))", decl.span)
+				self.depth += 1
+				self.generics(&decl.sig.generics)
+				for param in decl.sig.params {
+					self.field("param", &param)
+				}
+				if decl.sig.ret is .Some(ret) then self.ty("ret", ret)
+				self.lendsFrom(&decl.sig.lendsFrom)
+				self.keeps(&decl.sig.keeps)
+				if decl.body is .Some(body) then self.expr("body", body)
+				self.depth -= 1
+				return
+			}
+			self.sigWith("", &decl.sig, decl.span)
+			self.depth += 1
+			if decl.body is .Some(body) then self.expr("body", body)
+			self.depth -= 1
+		}
+		.Interface(decl) => {
+			self.annotations(&decl.annotations)
+			self.line("", "\(exported(decl.isPub))interface \(self.sym(decl.name.sym))", decl.span)
+			self.depth += 1
+			for method in decl.methods {
+				val (receiver, _) = method.receiver
+				val default = if method.default.isSome() then " with default" else ""
+				self.line(
+					"",
+					"\(receiver.text()) \(self.sym(method.sig.name.sym))\(default)",
+					method.span,
+				)
+				self.depth += 1
+				self.generics(&method.sig.generics)
+				for param in method.sig.params {
+					self.field("param", &param)
+				}
+				if method.sig.ret is .Some(ret) then self.ty("ret", ret)
+				self.lendsFrom(&method.sig.lendsFrom)
+				self.keeps(&method.sig.keeps)
+				if method.default is .Some(body) then self.expr("body", body)
+				self.depth -= 1
+			}
+			self.depth -= 1
+		}
+		.Extend(block) => {
+			self.annotations(&block.annotations)
+			var text = match block.sliceOf {
+				.Some(elem) => String::of("extend [\(self.sym(elem.sym))]")
+				.None => String::of("extend \(self.path(&block.path))")
+			}
+			if !block.generics.isEmpty() {
+				text.push("<")
+				for (i, param) in block.generics.forwards().enumerate() {
+					if i > 0 then text.push(", ")
+					text.push(self.sym(param.name.sym))
+				}
+				text.push(">")
+			}
+			if block.interfaceName is .Some(name) then
+				text.push(": \(self.interfacePath(&block.interfaceModule, name))")
+			self.line("", text.toStr(), block.span)
+			self.depth += 1
+			if block.interfaceArgs is .Some(args) {
+				for arg in args.args {
+					self.ty("interface arg", arg)
+				}
+			}
+			for method in block.methods {
+				self.method(&method)
+			}
+			self.depth -= 1
+		}
+		.Extern(block) => {
+			self.annotations(&block.annotations)
+			val abi = self.src[(block.abi.lo - self.base) as i64..(block.abi.hi - self.base) as i64]
+			self.line("", "extern \(abi)".trimEnd(), block.span)
+			self.depth += 1
+			for declared in block.types {
+				self.line(
+					"",
+					"\(exported(declared.isPub))type \(self.sym(declared.name.sym))",
+					declared.name.span,
+				)
+			}
+			for declared in block.globals {
+				val keyword = if declared.isMut then "var" else "val"
+				self.line(
+					"",
+					"\(exported(declared.isPub))\(keyword) \(self.sym(declared.name.sym))",
+					declared.span,
+				)
+				self.depth += 1
+				self.ty("type", declared.ty)
+				self.depth -= 1
+			}
+			for declared in block.fns {
+				self.sigWith(exported(declared.isPub), &declared.sig, declared.sig.span)
+			}
+			self.depth -= 1
+		}
+	}
+
+	/// A method of a struct or an enum, with the word that declares how it
+	/// takes its receiver.
+	var fn method(decl: &FnDecl) = {
+		self.annotations(&decl.annotations)
+		val .Some((receiver, _)) = decl.receiver else {
+			panic("a method has a receiver")
+		}
+		self.line(
+			"",
+			"\(exported(decl.isPub))\(receiver.text()) \(self.sym(decl.sig.name.sym))",
+			decl.span,
+		)
+		self.depth += 1
+		self.generics(&decl.sig.generics)
+		for param in decl.sig.params {
+			self.field("param", &param)
+		}
+		if decl.sig.ret is .Some(ret) then self.ty("ret", ret)
+		self.lendsFrom(&decl.sig.lendsFrom)
+		self.keeps(&decl.sig.keeps)
+		if decl.body is .Some(body) then self.expr("body", body)
+		self.depth -= 1
+	}
+
+	/// `fn name`, with what goes before it — `pub` on an exported C
+	/// declaration — and its parameters and return type nested under it.
+	/// The caller prints the body, if there is one, at the same depth.
+	var fn sigWith(before: str, sig: &FnSig, span: Span) = {
+		self.line("", "\(before)fn \(self.sym(sig.name.sym))", span)
+		self.depth += 1
+		self.generics(&sig.generics)
+		for param in sig.params {
+			self.field("param", &param)
+		}
+		// `...`: it takes more than it declares.
+		if sig.variadic is .Some(variadic) then self.line("", "more arguments", variadic)
+		if sig.ret is .Some(ret) then self.ty("ret", ret)
+		self.lendsFrom(&sig.lendsFrom)
+		self.keeps(&sig.keeps)
+		self.depth -= 1
+	}
+
+	/// What `from` says the result borrows, one line each.
+	var fn lendsFrom(paths: &[LendPath]) = {
+		for path in paths {
+			var text = match path.root {
+				.Some(name) => String::of(self.sym(name.sym))
+				.None => String::of("self")
+			}
+			for field in path.fields {
+				text.push(".")
+				text.push(self.sym(field.sym))
+			}
+			self.line("from", text.toStr(), path.span)
+		}
+	}
+
+	/// What `keeps` says a call may keep, one line each.
+	var fn keeps(names: &[Name]) = {
+		for name in names {
+			self.line("keeps", self.sym(name.sym), name.span)
+		}
+	}
+
+	/// `<T, U: copy>` of a generic item.
+	var fn generics(generics: &[GenericParam]) = {
+		for param in generics {
+			val decided = if param.decided.isSome() then "decided " else ""
+			var text = String::of("\(decided)type param \(self.sym(param.name.sym))")
+			if !param.bounds.isEmpty() {
+				text.push(": ")
+				for (i, bound) in param.bounds.forwards().enumerate() {
+					if i > 0 then text.push(" + ")
+					text.push(self.interfacePath(&bound.module, bound.name))
+				}
+			}
+			self.line("", text.toStr(), param.span)
+			// The types a constraint's interface takes.
+			self.depth += 1
+			for bound in param.bounds {
+				for arg in bound.args {
+					self.ty("constraint arg", arg)
+				}
+			}
+			// What a use that leaves it out means.
+			if param.default is .Some(default) then self.ty("default", default)
+			self.depth -= 1
+		}
+	}
+
+	/// `<A, B>` in an expression, with the segment it follows.
+	var fn typeArgs(typeArgs: &Option<TypeArgs>) = {
+		val .Some(typeArgs) = typeArgs else {
+			return
+		}
+		self.line("", "type args after segment \(typeArgs.after + 1)", typeArgs.span)
+		self.depth += 1
+		for arg in typeArgs.args {
+			self.ty("", arg)
+		}
+		self.depth -= 1
+	}
+
+	/// `while outer`, `break outer`: the word and the loop's name where
+	/// one was written.
+	fn labelled(word: str, label: Option<Name>): String = match label {
+		.Some(label) => "\(word) \(self.sym(label.sym))"
+		.None => String::of(word)
+	}
+
+	var fn field(what: str, field: &Field) = {
+		self.line("", "\(what) \(self.sym(field.name.sym))", field.span)
+		self.depth += 1
+		self.ty("", field.ty)
+		if field.default is .Some(default) then self.expr("default", default)
+		self.depth -= 1
+	}
+
+	var fn ty(role: str, id: TypeId) = {
+		val ty = &self.ast.types[id]
+		match ty.kind {
+			.Named(name, args) => {
+				self.line(role, self.sym(name), ty.span)
+				self.depth += 1
+				for arg in args {
+					self.ty("arg", arg)
+				}
+				self.depth -= 1
+			}
+			.Path(segments, args) => {
+				self.line(role, self.path(&segments).toStr(), ty.span)
+				self.depth += 1
+				for arg in args {
+					self.ty("arg", arg)
+				}
+				self.depth -= 1
+			}
+			.Own(inner) => {
+				self.line(role, "own", ty.span)
+				self.depth += 1
+				self.ty("", inner)
+				self.depth -= 1
+			}
+			.Ref(isVar, inner) => {
+				self.line(role, if isVar then "ref var" else "ref", ty.span)
+				self.depth += 1
+				self.ty("", inner)
+				self.depth -= 1
+			}
+			.Array(elem, len) => {
+				val length = match len {
+					.Int(value) => "\(value)"
+					.Name(name) => String::of(self.sym(name.sym))
+				}
+				self.line(role, "array \(length)", ty.span)
+				self.depth += 1
+				self.ty("", elem)
+				self.depth -= 1
+			}
+			.Slice(elem) => {
+				self.line(role, "slice", ty.span)
+				self.depth += 1
+				self.ty("", elem)
+				self.depth -= 1
+			}
+			.Dyn(module, name, args) => {
+				self.line(role, "dyn \(self.interfacePath(&module, name))", ty.span)
+				self.depth += 1
+				for arg in args {
+					self.ty("arg", arg)
+				}
+				self.depth -= 1
+			}
+			.Fn(params, ret) => {
+				self.line(role, "fn type", ty.span)
+				self.depth += 1
+				for param in params {
+					self.field("param", &param)
+				}
+				self.ty("ret", ret)
+				self.depth -= 1
+			}
+			.Error => self.line(role, "error", ty.span)
+		}
+	}
+
+	var fn block(role: str, block: &Block) = {
+		self.line(role, "block", block.span)
+		self.depth += 1
+		for stmt in block.stmts {
+			self.stmt("", stmt)
+		}
+		self.depth -= 1
+	}
+
+	/// What a `for` walks: its elements, or a range of numbers.
+	var fn forSource(source: &ForSource) = match source {
+		.Elements(elements) => self.expr("elements", elements)
+		.Range(lo, hi, inclusive) => {
+			self.expr("from", lo)
+			self.expr(if inclusive then "through" else "to", hi)
+		}
+	}
+
+	var fn stmt(role: str, id: StmtId) = {
+		val stmt = &self.ast.stmts[id]
+		match stmt.kind {
+			.Let(mutable, name, ty, init) => {
+				val keyword = if mutable then "var" else "val"
+				self.line(role, "\(keyword) \(self.sym(name.sym))", stmt.span)
+				self.depth += 1
+				if ty is .Some(ty) then self.ty("type", ty)
+				self.expr("init", init)
+				self.depth -= 1
+			}
+			.Guard(mutable, pattern, value, elseBlock) => {
+				self.line(role, if mutable then "var else" else "val else", stmt.span)
+				self.depth += 1
+				self.pattern(&pattern)
+				self.expr("value", value)
+				if elseBlock is .Some(elseBlock) then self.block("else", &elseBlock)
+				self.depth -= 1
+			}
+			.Defer(value) => {
+				self.line(role, "defer", stmt.span)
+				self.depth += 1
+				self.expr("", value)
+				self.depth -= 1
+			}
+			.Return(value) => {
+				self.line(role, "return", stmt.span)
+				self.depth += 1
+				if value is .Some(value) then self.expr("", value)
+				self.depth -= 1
+			}
+			.Yield(value) => {
+				self.line(role, "yield", stmt.span)
+				self.depth += 1
+				self.expr("", value)
+				self.depth -= 1
+			}
+			.While(label, cond, body) => {
+				self.line(role, self.labelled("while", label).toStr(), stmt.span)
+				self.depth += 1
+				self.expr("cond", cond)
+				self.block("body", &body)
+				self.depth -= 1
+			}
+			.For(label, binding, source, body) => {
+				self.line(role, self.labelled("for", label).toStr(), stmt.span)
+				self.depth += 1
+				self.pattern(&binding)
+				self.forSource(&source)
+				self.block("body", &body)
+				self.depth -= 1
+			}
+			.Break(label) => self.line(role, self.labelled("break", label).toStr(), stmt.span)
+			.Continue(label) => self.line(role, self.labelled("continue", label).toStr(), stmt.span)
+			.Expr(value) => {
+				self.line(role, "expr", stmt.span)
+				self.depth += 1
+				self.expr("", value)
+				self.depth -= 1
+			}
+		}
+	}
+
+	var fn expr(role: str, id: ExprId) = {
+		val expr = &self.ast.exprs[id]
+		val span = expr.span
+		match expr.kind {
+			.Int(value) => self.line(role, "int \(value)", span)
+			.Float(value) => self.line(role, "float \(value)", span)
+			.Str(symbol) => self.line(role, "str \(quoted(self.sym(symbol), '"'))", span)
+			.Char(value) => self.line(role, "char \(showChar(value))", span)
+			.Byte(value) => self.line(role, "byte \(showByte(value))", span)
+			.Bool(value) => self.line(role, "bool \(value)", span)
+			.Null => self.line(role, "null", span)
+			.Name(symbol) => self.line(role, "name \(self.sym(symbol))", span)
+			.SelfRef => self.line(role, "self", span)
+			.Paren(inner) => {
+				self.line(role, "paren", span)
+				self.depth += 1
+				self.expr("", inner)
+				self.depth -= 1
+			}
+			.Block(block) => self.block(role, &block)
+			.If(cond, thenBlock, elseBranch) => {
+				self.line(role, "if", span)
+				self.depth += 1
+				self.expr("cond", cond)
+				self.block("then", &thenBlock)
+				if elseBranch is .Some(elseBranch) then self.expr("else", elseBranch)
+				self.depth -= 1
+			}
+			.Assert(cond, note, message) => {
+				val text = match message {
+					.Some(message) => "assert \(quoted(self.sym(message), '"'))"
+					.None => String::of("assert")
+				}
+				self.line(role, text.toStr(), span)
+				self.depth += 1
+				self.expr("cond", cond)
+				if note is .Some(note) then self.expr("note", note)
+				self.depth -= 1
+			}
+			.Path(leadingDot, segments, typeArgs) => {
+				val dot = if leadingDot then "." else ""
+				self.line(role, "path \(dot)\(self.path(&segments))", span)
+				self.depth += 1
+				self.typeArgs(&typeArgs)
+				self.depth -= 1
+			}
+			.Lend(value) => {
+				self.line(role, "lend", span)
+				self.depth += 1
+				self.expr("", value)
+				self.depth -= 1
+			}
+			.Array(elems) => {
+				self.line(role, "array", span)
+				self.depth += 1
+				for elem in elems {
+					self.expr("", elem)
+				}
+				self.depth -= 1
+			}
+			.ForElement(binding, source, body) => {
+				self.line(role, "for element", span)
+				self.depth += 1
+				self.pattern(&binding)
+				self.forSource(&source)
+				self.block("body", &body)
+				self.depth -= 1
+			}
+			.ArrayRepeat(elem, count) => match count {
+				.Literal(count) => {
+					self.line(role, "array repeat \(count)", span)
+					self.depth += 1
+					self.expr("", elem)
+					self.depth -= 1
+				}
+				.Expr(count) => {
+					self.line(role, "array repeat", span)
+					self.depth += 1
+					self.expr("", elem)
+					self.expr("count", count)
+					self.depth -= 1
+				}
+			}
+			.Match(scrutinee, arms) => {
+				self.line(role, "match", span)
+				self.depth += 1
+				self.expr("scrutinee", scrutinee)
+				for arm in arms {
+					self.line("", "arm", arm.span)
+					self.depth += 1
+					self.pattern(&arm.pattern)
+					self.expr("body", arm.body)
+					self.depth -= 1
+				}
+				self.depth -= 1
+			}
+			.Unary(op, operand, ..) => {
+				self.line(role, "unary \(op.text())", span)
+				self.depth += 1
+				self.expr("", operand)
+				self.depth -= 1
+			}
+			.Binary(op, lhs, rhs, wrapping, ..) => {
+				// `+%` is `+` that wraps, and the dump says which was
+				// written.
+				val wraps = if wrapping then "%" else ""
+				self.line(role, "binary \(op.text())\(wraps)", span)
+				self.depth += 1
+				self.expr("", lhs)
+				self.expr("", rhs)
+				self.depth -= 1
+			}
+			.Lambda(params, ret, body) => {
+				self.line(role, "lambda", span)
+				self.depth += 1
+				for param in params {
+					self.line("", "param \(self.sym(param.name.sym))", param.span)
+					if param.ty is .Some(ty) {
+						self.depth += 1
+						self.ty("", ty)
+						self.depth -= 1
+					}
+				}
+				if ret is .Some(ret) then self.ty("ret", ret)
+				self.expr("body", body)
+				self.depth -= 1
+			}
+			.Try(inner) => {
+				self.line(role, "try", span)
+				self.depth += 1
+				self.expr("", inner)
+				self.depth -= 1
+			}
+			.Cast(expr: value, ty) => {
+				self.line(role, "cast", span)
+				self.depth += 1
+				self.expr("", value)
+				self.ty("to", ty)
+				self.depth -= 1
+			}
+			.Assign(target, op, wrapping, value) => {
+				val wraps = if wrapping then "%" else ""
+				match op {
+					.Some((op, _)) => self.line(role, "assign \(op.text())\(wraps)=", span)
+					.None => self.line(role, "assign", span)
+				}
+				self.depth += 1
+				self.expr("target", target)
+				self.expr("value", value)
+				self.depth -= 1
+			}
+			.Field(base, name) => {
+				self.line(role, "field \(self.sym(name.sym))", span)
+				self.depth += 1
+				self.expr("", base)
+				self.depth -= 1
+			}
+			.Call(callee, args, names, rest) => {
+				self.line(role, "call", span)
+				self.depth += 1
+				self.expr("callee", callee)
+				for (i, arg) in args.forwards().enumerate() {
+					match names[i] {
+						.Some(name) => self.expr("arg \(self.sym(name.sym))", arg)
+						.None => self.expr("arg", arg)
+					}
+				}
+				if rest is .Some(rest) then self.expr("rest", rest)
+				self.depth -= 1
+			}
+			.Is(scrutinee, pattern, negated) => {
+				self.line(role, if negated then "!is" else "is", span)
+				self.depth += 1
+				self.expr("scrutinee", scrutinee)
+				self.pattern(&pattern)
+				self.depth -= 1
+			}
+			.Index(base, index) => {
+				self.line(role, "index", span)
+				self.depth += 1
+				self.expr("base", base)
+				self.expr("index", index)
+				self.depth -= 1
+			}
+			.SubSlice(base, lo, hi, inclusive) => {
+				self.line(role, if inclusive then "slice through" else "slice", span)
+				self.depth += 1
+				self.expr("base", base)
+				if lo is .Some(lo) then self.expr("lo", lo)
+				if hi is .Some(hi) then self.expr("hi", hi)
+				self.depth -= 1
+			}
+			.Error => self.line(role, "error", span)
+		}
+	}
+
+	var fn pattern(pattern: &Pattern) = {
+		val text = self.patternText(&pattern, true)
+		self.line("pattern", text.toStr(), pattern.span)
+	}
+
+	/// A pattern as one line, which a binder's own pattern is part of.
+	/// Only the outermost says what kind it is; nested,
+	/// it reads as it was written.
+	fn patternText(pattern: &Pattern, top: bool): String = match pattern.kind {
+		.Wildcard => String::of("_")
+		.Binding(symbol) =>
+			if top then "binding \(self.sym(symbol))" else String::of(self.sym(symbol))
+		.Variant(leadingDot, segments, binders, rest) => {
+			var text = String()
+			if top then text.push("variant ")
+			if leadingDot then text.push(".")
+			text.push(self.path(&segments))
+			if binders is .Some(binders) {
+				text.push("(")
+				for (i, binder) in binders.forwards().enumerate() {
+					if i > 0 then text.push(", ")
+					text.push(self.sym(binder.field.sym))
+					// A binder takes a pattern, and a name is
+					// one of those, which reads as the rename
+					// it has always been.
+					if binder.pattern is .Some(inner) then
+						text.push(": \(self.patternText(&inner, false))")
+				}
+				if rest {
+					if !binders.isEmpty() then text.push(", ")
+					text.push("..")
+				}
+				text.push(")")
+			}
+			return move text
+		}
+		// A number, a `bool` or text the value must equal, and `|`
+		// for any one of several.
+		.Int(negative, magnitude) => if negative then "int -\(magnitude)" else "int \(magnitude)"
+		.Bool(value) => "bool \(value)"
+		.Str(symbol) => "str \"\(self.sym(symbol))\""
+		.Char(value) => "char \(showChar(value))"
+		.Byte(value) => "byte \(showByte(value))"
+		// `lo..hi`, `lo..=hi`, an end left off.
+		.Range(lo, hi, inclusive) => {
+			val dots = if inclusive then "..=" else ".."
+			return "range \(self.bound(&lo))\(dots)\(self.bound(&hi))"
+		}
+		.Any(alternatives) => {
+			var text = String()
+			for (i, alternative) in alternatives.forwards().enumerate() {
+				if i > 0 then text.push(" | ")
+				text.push(self.patternText(&alternative, top))
+			}
+			return move text
+		}
+		// `[first, ..rest]`.
+		.Slice(elements) => {
+			var text = String::of("slice [")
+			for (i, element) in elements.forwards().enumerate() {
+				if i > 0 then text.push(", ")
+				match element {
+					.Pattern(inner) => text.push(self.patternText(&inner, false))
+					.Rest(name, ..) => {
+						text.push("..")
+						if name is .Some(name) then text.push(self.sym(name.sym))
+					}
+				}
+			}
+			text.push("]")
+			return move text
+		}
+		.Error => String::of("error")
+	}
+
+	/// An end of a range pattern, or nothing where it was left off.
+	fn bound(bound: &Option<RangeBound>): String = match bound {
+		.None => String()
+		.Some(bound) => match bound.kind {
+			.Int(negative, magnitude) => if negative then "-\(magnitude)" else "\(magnitude)"
+			.Char(value) => showChar(value)
+			.Byte(value) => showByte(value)
+			.Const(path) => self.path(&path)
+		}
+	}
+}
+
+/// `pub ` where a declaration is exported, and nothing where it is not.
+fn exported(isPub: bool): str = if isPub then "pub " else ""
+
+/// A byte as a dump shows it: `b'x'`, escaped as a character is.
+fn showByte(value: u8): String = "b\(showChar(value as u32))"
+
+/// A character as a dump shows it: `'x'`, escaped where it is not
+/// printable, and its number where it is no character.
+fn showChar(value: u32): String = match char::fromInt(value as i64) {
+	.Some(c) => {
+		var text = String()
+		text.pushChar(c)
+		return quoted(text.toStr(), '\'')
+	}
+	.None => "'\\u{\(value, radix: 16)}'"
+}
+
+/// `text` between `quote`s, as a dump shows text: a backslash, the quote,
+/// and the characters a line would not show written as escapes — `\0`,
+/// `\t`, `\r` and `\n`, and `\u{…}` for any other control, for white space
+/// other than the space, for a character that takes no columns, a mark or
+/// a format character, and for one of private use or no character at all.
+pub fn quoted(text: str, quote: char): String = {
+	var out = String::withCapacity(text.len() + 2)
+	out.pushChar(quote)
+	for c in text.chars() {
+		if c == '\\' {
+			out.push("\\\\")
+		} else if c == '\0' {
+			out.push("\\0")
+		} else if c == '\t' {
+			out.push("\\t")
+		} else if c == '\r' {
+			out.push("\\r")
+		} else if c == '\n' {
+			out.push("\\n")
+		} else if c == quote {
+			out.pushChar('\\')
+			out.pushChar(c)
+		} else if unseen(c) {
+			out.push("\\u{\(c as u32, radix: 16)}")
+		} else {
+			out.pushChar(c)
+		}
+	}
+	out.pushChar(quote)
+	return move out
+}
+
+/// Whether `c` is one a line of text would not show: a control, white
+/// space other than the space, a character that takes no columns, one of
+/// private use, or a noncharacter.
+fn unseen(c: char): bool = {
+	val code = c as u32
+	val private = code is 0xE000..=0xF8FF | 0xF0000..
+	val noncharacter = code is 0xFDD0..=0xFDEF || (code & 0xFFFE) == 0xFFFE
+	return isControl(c) ||
+		(c.isWhitespace() && c != ' ') ||
+		c.width() == 0 ||
+		private ||
+		noncharacter
+}

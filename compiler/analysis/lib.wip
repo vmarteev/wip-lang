@@ -1,0 +1,633 @@
+// Move checking: the static half of destructive moves.
+//
+// At every program point the checker knows which *places* have been moved
+// out of: a local, or a path of fields into it (`car.engine`), looking
+// through `own` and `&var` parameters but not through `&` parameters or
+// array elements. Using a place that overlaps a moved one is an error;
+// assigning to a place makes it whole again. Branches are merged, so a place
+// moved on only some paths is "possibly moved", and each loop is iterated to
+// a fixed point so that a move late in its body is seen by uses early in the
+// next iteration.
+//
+// The rules:
+// - A value whose type contains `own` is never copied implicitly. Using such
+//   a place as a value needs `move` (E0404).
+// - After `move p`, `p` and everything inside it hold no value until assigned
+//   again (E0401, E0402, E0403). Moving a field leaves the other fields
+//   usable, but not the struct as a whole.
+// - Nothing is moved out of a `&` reference (E0405), an array element
+//   (E0406) or a temporary (E0409), and a value containing `own` cannot be
+//   repeated with `[x; n]` (E0407). A `&var` parameter can be moved out of,
+//   but must hold a value again at every exit (E0415).
+// - In one call, a `&var` argument cannot overlap another reference
+//   argument (E0413), and a later argument cannot move or assign what an
+//   earlier one borrowed (E0414).
+//
+// The code generator zeroes every place it moves out of, and drops skip null
+// pointers, so a place the checker accepts is never freed twice.
+
+import std::collections::{Map, Set}
+import std::future
+import hir::{
+	Binder,
+	Body,
+	ExprId,
+	ExprKind,
+	FnDef,
+	FnId,
+	LocalId,
+	LocalKind,
+	NEVER,
+	Pattern,
+	Program,
+	RefKind,
+	SliceRest,
+	Ty,
+	TyKind
+}
+import syntax::{Code, Diagnostic, Interner, Span, split}
+
+/// Checks every function body. Each body is checked on its own, and what
+/// they report is sorted by where it is.
+pub fn check(program: &Program, interner: &Interner, threads: i64): Vec<Diagnostic> = {
+	val implemented = implementedMethods(&program)
+	// What each function's parameters lend its result, by its signature:
+	// worked out once, for its own body and every call of it.
+	var signatures: Vec<Vec<Lends>> = Vec()
+	for def in program.fns {
+		signatures.push(signatureLends(&program, &def))
+	}
+	// The bodies split by how many expressions they hold, each range checked
+	// on a thread of its own: each body is checked apart, so the result is
+	// the same at any number of threads.
+	var bodies: Vec<FnId> = Vec()
+	var weights: Vec<i64> = Vec()
+	for id in program.fns.ids() {
+		if program.fns[id].body is .Some(body) {
+			bodies.push(id)
+			weights.push(body.exprs.len())
+		}
+	}
+	val ranges = split(&weights.items(), threads)
+	val found = future::map(&ranges.items(), (range) => {
+		var said: Vec<Diagnostic> = Vec()
+		for i in range.0..range.1 {
+			val id = bodies[i]
+			val .Some(body) = program.fns[id].body else {
+				continue
+			}
+			val implements = match implemented.get(&id) {
+				.Some(declared) => Option::Some(declared.clone())
+				.None => Option::None
+			}
+			for d in checkBody(&program, &interner, &signatures, id, &body, implements) {
+				said.push(move d)
+			}
+		}
+		return move said
+	})
+	var diagnostics: Vec<Diagnostic> = Vec()
+	for part in move found {
+		for d in move part {
+			diagnostics.push(move d)
+		}
+	}
+	diagnostics.sortByKey((d) => d.primary.span.lo)
+	return move diagnostics
+}
+
+/// Each method of an implementation, and the interface's method it
+/// implements.
+fn implementedMethods(program: &Program): Map<FnId, FnId> = {
+	var implemented: Map<FnId, FnId> = Map()
+	for imp in program.impls {
+		val declaring = &program.interfaces[imp.interfaceId]
+		for method in imp.methods {
+			val name = program.fns[method].name
+			for m in declaring.methods {
+				if program.fns[m.id].name == name {
+					implemented.put(method, m.id)
+					break
+				}
+			}
+		}
+	}
+	return move implemented
+}
+
+/// Checks one body. `implements` is the interface's method it implements,
+/// whose signature its result is held to as well as its own.
+fn checkBody(
+	program: &Program,
+	interner: &Interner,
+	signatures: &[Vec<Lends>],
+	id: FnId,
+	body: &Body,
+	implements: Option<FnId>,
+): Vec<Diagnostic> = {
+	val def = &program.fns[id]
+	var lends = signatures[id.index()].clone()
+	if implements is .Some(declared) {
+		val declaredLends = &signatures[declared.index()]
+		for i in 0..lends.len() {
+			if i >= declaredLends.len() then break
+			lends[i].place = lends[i].place && declaredLends[i].place
+			lends[i].borrows = lends[i].borrows && declaredLends[i].borrows
+		}
+	}
+	var varParams: Vec<LocalId> = Vec()
+	for p in body.params {
+		if program.types.kind(body.locals[p].ty) is .Ref(kind: .Var, ..) then varParams.push(p)
+	}
+	var keeps: Vec<LocalId> = Vec()
+	for index in def.keeps {
+		keeps.push(body.params[index as i64])
+	}
+	var checker = Checker(
+		program: &program,
+		interner: &interner,
+		body: &body,
+		signatures: &signatures,
+		diagnostics: Vec(),
+		quiet: 0,
+		loops: Vec(),
+		reported: Set(),
+		staleReported: Set(),
+		deferred: Vec(),
+		exit: .None,
+		seen: Set(),
+		borrows: Vec(),
+		varParams: move varParams,
+		fnName: String::of(interner.resolve(def.name)),
+		generator: def.generator.isSome(),
+		aliases: Map(),
+		scopes: Vec(),
+		loopExits: Vec(),
+		lends: move lends,
+		implements: implements,
+		keptBindings: Set(),
+		saysFrom: def.lendsFrom.isSome(),
+		keeps: move keeps,
+		keepsAt: def.keepsAt,
+		keptElements: Set(),
+		copies: Vec(),
+		copiesRead: Set(),
+	)
+	var state = State()
+	// Where `from` says what the result borrows, what each parameter
+	// borrows is a root of its own, so the body is held to it.
+	if def.lendsFrom.isSome() {
+		for param in body.params {
+			if program.holdsView(body.locals[param].ty) {
+				var lent: SortedSet<Path> = SortedSet()
+				lent.add(Path(local: param, projs: Vec::of(own [Proj::Lent])))
+				state.roots.put(param, move lent)
+			}
+		}
+	}
+	val value = body.valueId()
+	checker.expr(value, .Value, &var state)
+	if body.exprs[value].ty != NEVER && checker.isView(def.ret) then
+		checker.checkLeaving(bodyResult(&body, value), .Result, &state)
+	if body.exprs[value].ty != NEVER {
+		val span = body.exprs[value].span
+		val end = Span::new(lo: span.hi.saturatingSub(1), hi: span.hi)
+		checker.checkVarParams(end, &state)
+	}
+	checker.checkGenericKeeps()
+	checker.reportCopies()
+	return move checker.diagnostics
+}
+
+/// The expression that answers a function's result: the value of its
+/// block, where it is one.
+fn bodyResult(body: &Body, value: ExprId): ExprId = match body.exprs[value].kind {
+	.Block(block) => match block.value {
+		.Some(v) => v
+		.None => value
+	}
+	_ => value
+}
+
+// ---- places and move state ----
+
+/// `base`, one projection further in.
+fn deeper(base: &Option<Path>, proj: Proj): Option<Path> = match base {
+	.Some(path) => {
+		var further = path.clone()
+		further.projs.push(proj)
+		Option::Some(move further)
+	}
+	.None => .None
+}
+
+/// Every name a pattern binds, with the place it refers into at whatever
+/// depth: a binder may be a pattern of its own.
+fn bindingsOf(pattern: &Pattern, base: Option<Path>, out: &var Vec<(LocalId, Option<Path>)>) = {
+	match pattern {
+		.Binding(local) => out.push((local, move base))
+		.Variant(binders, ..) => {
+			for (i, binder) in binders.forwards().enumerate() {
+				binderBindings(&binder, deeper(&base, .Payload(i as u32)), &var out)
+			}
+		}
+		.Fields(binders) => {
+			for (i, binder) in binders.forwards().enumerate() {
+				binderBindings(&binder, deeper(&base, .Field(i as u32)), &var out)
+			}
+		}
+		// An element, and the slice of those between, refer to the
+		// elements.
+		.Slice(prefix, rest, suffix) => {
+			for binder in prefix {
+				binderBindings(&binder, deeper(&base, .Elements), &var out)
+			}
+			for binder in suffix {
+				binderBindings(&binder, deeper(&base, .Elements), &var out)
+			}
+			if rest is .Some(.Bind(local)) then out.push((local, deeper(&base, .Elements)))
+		}
+		// A value the scrutinee must equal binds nothing.
+		.Wildcard | .Error | .Int(..) | .Range(..) | .Bool(..) | .Str(..) => {}
+		// Each binds the same names, each to its own field: the binding's
+		// place is what their places share, which is no stricter than a
+		// binding of the whole.
+		.Any(alternatives, ..) => {
+			var merged: Vec<(LocalId, Option<Path>)> = Vec()
+			for alternative in alternatives {
+				var found: Vec<(LocalId, Option<Path>)> = Vec()
+				bindingsOf(&alternative, base.clone(), &var found)
+				for (local, path) in move found {
+					var seen = false
+					for i in 0..merged.len() {
+						if merged[i].0 == local {
+							val shared = merged[i].1.clone()
+							merged[i].1 = commonPath(move shared, path.clone())
+							seen = true
+							break
+						}
+					}
+					if !seen then merged.push((local, move path))
+				}
+			}
+			for binding in move merged {
+				out.push(move binding)
+			}
+		}
+		// What lies behind a reference is not part of the place: its
+		// bindings are kept references, which borrow what the reference
+		// does (`behindReferences`).
+		.Deref(inner) => bindingsOf(&inner, .None, &var out)
+	}
+}
+
+/// The place two paths share: the longest path both lie within, or
+/// nothing where either is not a place.
+fn commonPath(a: Option<Path>, b: Option<Path>): Option<Path> = {
+	val .Some(second) = b else {
+		return .None
+	}
+	var path = match move a {
+		.Some(first) => move first
+		.None => return .None
+	}
+	if path.local != second.local then return .None
+	var shared = 0
+	while shared < path.projs.len() &&
+		shared < second.projs.len() &&
+		path.projs[shared] == second.projs[shared] {
+		shared += 1
+	}
+	path.projs.truncate(shared)
+	return .Some(move path)
+}
+
+/// The names a pattern binds behind a reference it tests through, at any
+/// depth.
+fn behindReferences(pattern: &Pattern, out: &var Vec<LocalId>) = match pattern {
+	.Deref(inner) => inner.locals(&var out)
+	.Variant(binders, ..) | .Fields(binders) => nestedBehindReferences(&binders, &var out)
+	.Slice(prefix, suffix, ..) => {
+		nestedBehindReferences(&prefix, &var out)
+		nestedBehindReferences(&suffix, &var out)
+	}
+	.Any(alternatives, ..) => {
+		for alternative in alternatives {
+			behindReferences(&alternative, &var out)
+		}
+	}
+	_ => {}
+}
+
+fn nestedBehindReferences(binders: &[Binder], out: &var Vec<LocalId>) = {
+	for binder in binders {
+		if binder is .Nested(pattern) then behindReferences(&pattern, &var out)
+	}
+}
+
+fn binderBindings(
+	binder: &Binder,
+	base: Option<Path>,
+	out: &var Vec<(LocalId, Option<Path>)>,
+) = match binder {
+	.Ignored => {}
+	.Bind(local) => out.push((local, move base))
+	.Nested(pattern) => bindingsOf(&pattern, move base, &var out)
+}
+
+@derive(Eq, Ord, Hash, Clone)
+enum Proj {
+	/// Through an `own`, or a reference parameter.
+	Deref
+	Field(index: u32)
+	/// A field of the variant that a `match` arm matched. Only the arm's
+	/// bindings reach it.
+	Payload(index: u32)
+	/// The element a `for` binding refers to. Only the binding reaches it.
+	Element
+	/// The elements a slice pattern's bindings refer to: one, or the slice
+	/// of those between. Only the bindings reach them.
+	Elements
+	/// What a parameter borrows, as a root of its own where the function
+	/// says with `from` what its result borrows: nothing the call does
+	/// changes it, so it is never stale, and a result may hold it only where
+	/// `from` names the parameter.
+	Lent
+}
+
+/// A tracked place: a local and a path of projections into it.
+@derive(Eq, Ord, Hash, Clone)
+struct Path {
+	local: LocalId
+	projs: Vec<Proj>
+}
+
+@derive(Eq, Clone)
+struct Moved {
+	/// Moved on every path to this point, rather than only on some.
+	definite: bool
+	/// Where it was moved, sorted.
+	spans: Vec<Span>
+	/// The place as written, for messages: `car.engine`.
+	name: String
+	/// Moved by a deferred expression, where its block exited.
+	byDefer: bool
+}
+
+/// Every place moved out of at a program point. Places not listed, and not
+/// inside a listed one, hold values.
+@derive(Eq, Clone)
+struct State {
+	moved: SortedMap<Path, Moved> = SortedMap()
+	/// What each `str` variable borrows.
+	roots: SortedMap<LocalId, SortedSet<Path>> = SortedMap()
+	/// The `str` variables whose roots changed since they were given their
+	/// value.
+	stale: SortedMap<LocalId, Stale> = SortedMap()
+	/// The `String` variables whose text was copied whole, with where, and
+	/// not read since: a copy that nothing reads the variable after could
+	/// have been a move.
+	copied: SortedMap<LocalId, Vec<Span>> = SortedMap()
+}
+
+/// What a place expression refers to, as far as ownership is concerned.
+enum Place {
+	Path(path: Path)
+	/// Behind a `&` reference, or a `match` binding of either kind, which
+	/// cannot be moved out of; `reference` is the expression of reference
+	/// type.
+	ThroughRef(reference: ExprId)
+	/// Inside an array element.
+	Element(array: ExprId, index: ExprId)
+	/// Inside a temporary, such as the result of a call.
+	Temporary(base: ExprId)
+}
+
+/// How an expression is used.
+@derive(Eq, Clone)
+enum Ctx {
+	/// Its value is taken: read if it is plain data, which needs `move` if it
+	/// owns memory.
+	Value
+	/// Looked at without taking ownership: borrowed, or the base of a field
+	/// access or index, or matched on.
+	Inspect
+	/// `move place`; the span is the whole `move` expression.
+	Move(span: Span)
+	/// The target of `place = value`.
+	Assign
+}
+
+view struct Checker {
+	program: &Program
+	interner: &Interner
+	body: &Body
+	/// What each function's parameters lend its result, by its number.
+	signatures: &[Vec<Lends>]
+	diagnostics: Vec<Diagnostic>
+	/// Nonzero while a loop is being iterated to its fixed point; diagnostics
+	/// are reported only in the final pass over it.
+	quiet: u32
+	/// Bodies of the loops around the current point, innermost last.
+	loops: Vec<Span>
+	/// Moves already reported, so that one mistake produces one error.
+	reported: Set<Span>
+	/// Stale `str`s already reported, by the change that made them stale.
+	staleReported: Set<(LocalId, Span)>
+	/// For each enclosing block, innermost last: the expressions of its
+	/// `defer`s so far, which run where the block exits.
+	deferred: Vec<Vec<ExprId>>
+	/// While deferred expressions are checked as they run: the exit that
+	/// runs them, and a label for it.
+	exit: Option<(Span, str)>
+	/// Diagnostics already reported: a deferred expression is checked at
+	/// every exit that runs it, but each mistake is reported once.
+	seen: Set<(Code, Span)>
+	/// The reference arguments of the calls whose arguments are being
+	/// evaluated, outermost first. Each must stay valid until its call.
+	borrows: Vec<Borrow>
+	/// The `&var` parameters, which must hold values at every exit.
+	varParams: Vec<LocalId>
+	/// The function's name, for messages.
+	fnName: String
+	/// Whether the body is a generator's `next`, which stops at each `yield`
+	/// and may be moved before it goes on.
+	generator: bool
+	/// Alias bindings of `match`es on places, and the place each refers into.
+	aliases: Map<LocalId, Path>
+	/// The loops around the current point, innermost last.
+	loopExits: Vec<LoopExits>
+	/// The locals declared in each enclosing block, innermost last: what a
+	/// `@tailrec` function's jump would leave undropped.
+	scopes: Vec<Vec<LocalId>>
+	/// What each parameter may lend the function's result, by its signature
+	/// and the interface's it implements.
+	lends: Vec<Lends>
+	/// The interface's method this body implements, for messages.
+	implements: Option<FnId>
+	/// The parameters `keeps` names, which the body may store in its `&var`
+	/// parameters; and where the fix that names another goes.
+	keeps: Vec<LocalId>
+	keepsAt: Option<(u32, bool)>
+	/// The alias bindings of a place behind a kept `&` reference, which are
+	/// kept references themselves.
+	keptBindings: Set<LocalId>
+	/// The function says with `from` what its result borrows.
+	saysFrom: bool
+	/// The bindings of a `for` over a list behind a kept reference, which are
+	/// kept references to its elements.
+	keptElements: Set<LocalId>
+	/// Each copy of a `String` variable's whole text, and its variable.
+	copies: Vec<(Span, LocalId)>
+	/// The copies after which the variable was read again.
+	copiesRead: Set<Span>
+}
+
+/// A place that must stay as it is for a while: borrowed by a reference
+/// argument of a call whose arguments are being evaluated, or referred to by
+/// bindings.
+@derive(Clone)
+struct Borrow {
+	path: Path
+	span: Span
+	/// It is borrowed `&var`, to write.
+	writes: bool
+	holder: Holder
+	/// What is borrowed lies on the heap, where the place's own `own` or
+	/// block of slots points: a loop over a `Vec` borrows its elements, not
+	/// the `Vec`. A generator that holds the place may be moved, and the
+	/// elements stay where they are.
+	heap: bool
+}
+
+/// What holds a `Borrow`.
+@derive(Eq, Clone)
+enum Holder {
+	/// A reference argument, until the call starts.
+	Argument
+	/// What an argument borrows from where it is written until the call
+	/// starts — a `str` or a view it makes, or what the expression of a
+	/// place it lends lends: `&k` in `&var m.at(&k)` — so a later argument
+	/// may not change it. It is not one of the call's references: the call
+	/// is checked against what it is given where it begins.
+	View
+	/// The bindings of a `match` arm.
+	Match
+	/// The bindings of an `is` test, for its block.
+	Test
+	/// The bindings of a guard, for the rest of the block.
+	Guard
+	/// The binding of a `for` loop.
+	Loop
+	/// The target of `op=`, found and read before its value is computed.
+	Assign(target: ExprId)
+	/// What an assignment's target lends from its expression — a
+	/// projection's `&` argument, `&k` in `m.at(&k) = …` — taken before the
+	/// value. The target itself is found after the value, where it is used.
+	Operand(target: ExprId)
+}
+
+/// The states with which the `break`s and `continue`s of a loop leave its
+/// body.
+struct LoopExits {
+	/// How many blocks were open when the loop started: a jump runs the
+	/// `defer`s of the blocks inside it.
+	deferred: i64
+	breaks: Option<State>
+	continues: Option<State>
+}
+
+extend Checker {
+	var fn report(diagnostic: Diagnostic) = {
+		if self.quiet == 0 && self.seen.add((diagnostic.code.clone(), diagnostic.primary.span)) then
+			self.diagnostics.push(move diagnostic)
+	}
+
+	fn ty(id: ExprId): Ty = self.body.exprs[id].ty
+
+	fn owns(ty: Ty): bool = self.program.ownsMemory(ty)
+
+	fn tyName(ty: Ty): String = self.program.tyName(ty, self.interner)
+
+	/// The expression as the programmer wrote it, for messages: `car.engine`.
+	fn display(id: ExprId): String = match self.body.exprs[id].kind {
+		.Local(local) => String::of(self.interner.resolve(self.body.locals[local].name))
+		.Field(base, index) => {
+			val .Struct(id: s, ..) = self.program.types.kind(self.ty(base)) else {
+				return self.display(base)
+			}
+			val def = &self.program.structs[s]
+			val field = def.fields[index as i64].name
+			// A capture is written as the name the lambda used, not as a
+			// field of the environment the compiler built for it.
+			if def.isEnv then return String::of(self.interner.resolve(field))
+			"\(self.display(base)).\(self.interner.resolve(field))"
+		}
+		.Deref(inner) | .Ref(inner) | .Move(inner) => self.display(inner)
+		.Index(base, ..) | .SubSlice(base, ..) => "\(self.display(base))[…]"
+		.Call(callee, ..) => "\(self.interner.resolve(self.program.fns[callee].name))(…)"
+		.Table(id: c) => String::of(self.interner.resolve(self.program.consts[c].name))
+		_ => String::of("this value")
+	}
+
+	/// Whether the place is a field of a closure's environment: what it
+	/// captured.
+	fn isCapture(id: ExprId): bool = {
+		val .Field(base, ..) = self.body.exprs[id].kind else {
+			return false
+		}
+		val .Struct(id: s, ..) = self.program.types.kind(self.ty(base)) else {
+			return false
+		}
+		return self.program.structs[s].isEnv
+	}
+
+	/// Classifies a place expression; nothing for anything else.
+	fn place(id: ExprId): Option<Place> = match self.body.exprs[id].kind {
+		.Local(local) => .Some(.Path(Path(local: local, projs: Vec())))
+		.Field(base, index) => .Some(
+			match self.place(base) {
+				.Some(.Path(path)) => {
+					var further = move path
+					further.projs.push(.Field(index))
+					Place::Path(move further)
+				}
+				.Some(other) => move other
+				.None => Place::Temporary(base)
+			},
+		)
+		// Moves through `&var` are tracked like moves through `own`: the
+		// parameter must hold a value again at every exit (E0415).
+		.Deref(inner) => .Some(
+			match self.program.types.kind(self.ty(inner)) {
+				.Ref(kind: .Shared, ..) => Place::ThroughRef(inner)
+				// A writable binding cannot be moved out of either: nothing
+				// checks that it holds a value again when its arm ends, as
+				// E0415 does for a `&var` parameter.
+				.Ref(kind: .Var, ..) if self.isBindingLocal(inner) => Place::ThroughRef(inner)
+				// What a projection lends cannot be moved out of either: it
+				// belongs to the caller.
+				.Ref(kind: .Var, ..) if self.body.exprs[inner].kind is .Call(
+					..,
+				) => Place::ThroughRef(inner)
+				_ => match self.place(inner) {
+					.Some(.Path(path)) => {
+						var further = move path
+						further.projs.push(.Deref)
+						Place::Path(move further)
+					}
+					.Some(other) => move other
+					.None => Place::Temporary(inner)
+				}
+			},
+		)
+		.Index(base, index) => .Some(.Element(array: base, index: index))
+		_ => .None
+	}
+
+	/// Whether the expression is a local a pattern bound.
+	fn isBindingLocal(id: ExprId): bool = match self.body.exprs[id].kind {
+		.Local(local) => self.body.locals[local].kind == .Binding
+		_ => false
+	}
+}

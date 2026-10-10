@@ -1,0 +1,270 @@
+// Rules about where types may appear, and the built-in type names.
+
+import syntax as ast
+import syntax::{
+	Diagnostic,
+	Edit,
+	NEVER_VALUE,
+	REF_OUTSIDE_PARAMETER,
+	STORED_STR,
+	Span,
+	Symbol,
+	UNSIZED_DYN,
+	UNSIZED_SLICE
+}
+
+/// C's `long` is 64 bits where Unix's LP64 says so, and 32 bits on Windows,
+/// which is why bindings must not write `i64` for it.
+@comptime
+val C_LONG: Ty = if TARGET_OS == "windows" then I32 else I64
+@comptime
+val C_ULONG: Ty = if TARGET_OS == "windows" then U32 else U64
+
+/// C's `char` is signed or unsigned by target, not by the standard: Apple
+/// and Windows make it signed everywhere, and ARM's own ABI makes it
+/// unsigned, which is what Linux on ARM follows.
+@comptime
+val C_CHAR: Ty =
+	if TARGET_ARCH == "arm64" && TARGET_OS != "macos" && TARGET_OS != "windows" then U8 else I8
+
+@comptime
+val BUILTIN_TYPES: [(str, Ty); 37] = [
+	// What does not return: a `panic`, a `return`, a loop that never ends.
+	("never", NEVER),
+	("i8", I8),
+	("i16", I16),
+	("i32", I32),
+	("i64", I64),
+	("i128", I128),
+	("isize", ISIZE),
+	("u8", U8),
+	("u16", U16),
+	("u32", U32),
+	("u64", U64),
+	("u128", U128),
+	("usize", USIZE),
+	("f32", F32),
+	("f64", F64),
+	("bool", BOOL),
+	("str", STR),
+	// A Unicode scalar value.
+	("char", CHAR),
+	("cstring", CSTRING),
+	("void", UNIT),
+	// C's own names, fixed per target, so that bindings never write `i64` for
+	// `long`. They are built in rather than declared in `std`, which has no
+	// way to differ per target. Only 64-bit targets are supported, so
+	// `size_t` is `u64` — Wip's `usize` stays its own, and does not cross
+	// into C.
+	("c_char", C_CHAR),
+	("c_schar", I8),
+	("c_uchar", U8),
+	("c_short", I16),
+	("c_ushort", U16),
+	("c_int", I32),
+	("c_uint", U32),
+	("c_long", C_LONG),
+	("c_ulong", C_ULONG),
+	("c_longlong", I64),
+	("c_ulonglong", U64),
+	("c_float", F32),
+	("c_double", F64),
+	("size_t", U64),
+	("ssize_t", I64),
+	("intptr_t", I64),
+	("uintptr_t", U64),
+]
+
+extend Lowerer {
+	fn hasError(ty: Ty): bool = self.program.types.hasError(ty)
+
+	fn containsRef(ty: Ty): bool = self.program.types.containsRef(ty)
+
+	/// Whether `ty` has a slice anywhere but directly behind a reference.
+	fn hasBareSlice(ty: Ty): bool = match self.kind(ty) {
+		.Slice(..) => true
+		// A buffer owns its elements.
+		.Ref(inner, ..) | .Own(inner) => match self.kind(inner) {
+			.Slice(elem) => self.hasBareSlice(elem)
+			_ => self.hasBareSlice(inner)
+		}
+		.Array(elem, ..) => self.hasBareSlice(elem)
+		_ => false
+	}
+
+	/// Reports `never` where a value would have to exist. Returns whether it
+	/// did.
+	var fn noNever(ty: Ty, typeId: ast::TypeId, what: str): bool = {
+		if ty != NEVER then return false
+		val span = self.ast.types[typeId].span
+		self.report(
+			Diagnostic::error(
+				NEVER_VALUE,
+				"\(what) cannot have type `never`",
+				span,
+				String::of("no value has this type"),
+			).withNote(
+				String::of(
+					"`never` is what does not return: a `panic`, a `return`, a loop that never ends",
+				),
+			),
+		)
+		return true
+	}
+
+	/// Whether a `dyn` type is anywhere but directly behind `&` or `&var`.
+	fn hasBareDyn(ty: Ty): bool = match self.kind(ty) {
+		.Dyn(..) => true
+		.Ref(inner, ..) if self.kind(inner) is .Dyn(..) => false
+		.Ref(inner, ..) | .Own(inner) | .Array(elem: inner, ..) => self.hasBareDyn(inner)
+		.Slice(elem) => self.hasBareDyn(elem)
+		_ => false
+	}
+
+	/// Reports a `dyn` type anywhere but behind `&`. Returns whether it did.
+	var fn bareDyn(ty: Ty, typeId: ast::TypeId): bool = {
+		if !self.hasBareDyn(ty) then return false
+		val span = self.ast.types[typeId].span
+		self.report(
+			Diagnostic::error(
+				UNSIZED_DYN,
+				String::of("a `dyn` type must be borrowed"),
+				span,
+				String::of("a value of unknown type has no size of its own"),
+			).withNote(
+				String::of(
+					"a `dyn` value lives somewhere else, and is known by a pointer and a table of methods, so it exists only behind `&` or `&var`",
+				),
+			).withFix(String::of("borrow it"), own [Edit::insert(span.lo, String::of("&"))]),
+		)
+		return true
+	}
+
+	/// Reports a slice type that is not behind `&`, with a fix that adds the
+	/// `&` when `fixable`. Returns whether it did.
+	var fn bareSlice(ty: Ty, typeId: ast::TypeId, fixable: bool): bool = {
+		if !self.hasBareSlice(ty) then return false
+		val span = self.ast.types[typeId].span
+		var diagnostic = Diagnostic::error(
+			UNSIZED_SLICE,
+			String::of("a slice type must be borrowed"),
+			span,
+			String::of("a slice has no size of its own"),
+		).withNote(
+			String::of(
+				"a slice's elements live somewhere else, so a slice exists only behind `&`, `&var` or `own`",
+			),
+		)
+		if fixable && self.kind(ty) is .Slice(..) then
+			diagnostic = diagnostic.withFix(
+				String::of("borrow it"),
+				own [Edit::insert(span.lo, String::of("&"))],
+			)
+		self.report(move diagnostic)
+		return true
+	}
+
+	/// Reports a type that borrows — a `str`, a view, or what holds one —
+	/// where it would be stored: a field that is not a view's, or a variant's
+	/// payload that is not a view enum's. It borrows bytes that live
+	/// somewhere else, so it keeps to where the checker can see it. Returns
+	/// whether it did, with a help of the caller's where it has a better one.
+	var fn storedViewAt(ty: Ty, span: Span, what: str, help: Option<String>): bool = {
+		// A `&` reference is a view, and is refused where one is.
+		if !self.program.holdsView(ty) then return false
+		val (message, label) =
+			if ty == STR then
+				(
+					"\(what) cannot hold a `str`",
+					String::of("a `str` borrows bytes that live somewhere else"),
+				)
+			else (
+				"\(what) cannot hold \(self.tyName(ty))",
+				"\(self.tyName(ty)) borrows, as a `str` does",
+			)
+		val helped = match move help {
+			.Some(help) => move help
+			.None => String::of("`String` owns its bytes, and hands out a `str` with `toStr()`")
+		}
+		self.report(
+			Diagnostic::error(STORED_STR, move message, span, move label).withNote(
+				String::of(
+					"a `str`, a `&` reference, a `view struct` and what holds one borrow what lives somewhere else, so they stand in a parameter, a local, a result and a view's field, and not where they would outlive it",
+				),
+			).withHelp(move helped),
+		)
+		return true
+	}
+
+	/// Whether a `&var` stands inside `ty`: anywhere but a function type's
+	/// parameters, which may be one.
+	fn holdsVarRef(ty: Ty): bool = match self.kind(ty) {
+		.Ref(inner, kind) => kind == .Var || self.holdsVarRef(inner)
+		.Own(inner) | .Array(elem: inner, ..) | .Slice(elem: inner) | .Ptr(inner) | .Slots(inner) => self.holdsVarRef(
+			inner,
+		)
+		.Struct(args, ..) | .Enum(args, ..) => {
+			for arg in self.program.types.list(args).toVec() {
+				if self.holdsVarRef(arg) then return true
+			}
+			false
+		}
+		.Fn(ret, ..) => self.holdsVarRef(ret)
+		_ => false
+	}
+
+	/// Reports a `&var` inside a type, where `what` would keep it: only a
+	/// parameter's whole type may be one. Returns whether it did.
+	var fn noVarRef(ty: Ty, typeId: ast::TypeId, what: str): bool = {
+		if !self.holdsVarRef(ty) then return false
+		val span = self.ast.types[typeId].span
+		self.report(
+			Diagnostic::error(
+				REF_OUTSIDE_PARAMETER,
+				"\(what) cannot hold a `&var` reference",
+				span,
+				String::of("a `&var` reference"),
+			).withNote(
+				String::of(
+					"a `&` reference is kept where a view is, but a `&var` is a parameter's alone: a view may be copied, and two copies of a `&var` would each write one place",
+				),
+			).withHelp(
+				String::of("hold `&`, and take `&var` as a parameter where the change is made"),
+			),
+		)
+		return true
+	}
+
+	/// Reports a reference where none may stand: a constant, what a C pointer
+	/// points at, a function value's whole result. Returns whether it did, so
+	/// that the caller can use the error type instead and avoid follow-on
+	/// errors.
+	var fn noRef(ty: Ty, typeId: ast::TypeId, message: str, help: Option<str>): bool = {
+		if !self.containsRef(ty) then return false
+		val span = self.ast.types[typeId].span
+		var diagnostic = Diagnostic::error(
+			REF_OUTSIDE_PARAMETER,
+			String::of(message),
+			span,
+			String::of("a reference type"),
+		).withNote(
+			String::of(
+				"a `&` reference stands where a view does — a parameter, a local, a view's field, a type argument — and a `&var` only as a parameter's whole type",
+			),
+		)
+		if help is .Some(help) then diagnostic = diagnostic.withHelp(String::of(help))
+		self.report(move diagnostic)
+		return true
+	}
+
+	/// Types for which no further errors should be reported.
+	fn isPoisoned(ty: Ty): bool = ty == NEVER || self.hasError(ty)
+
+	fn builtin(sym: Symbol): Option<Ty> = {
+		val text = self.text(sym)
+		for (name, ty) in BUILTIN_TYPES {
+			if name == text then return .Some(ty)
+		}
+		return .None
+	}
+}

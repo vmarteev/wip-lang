@@ -1,0 +1,303 @@
+// A list built as it runs: `own [ … ]` whose elements include statements
+// that `yield`, and `own for`, whose loop does. A `yield` hands its value to
+// the innermost list being built. The list is written into what the rest of
+// the compiler already knows, a vector that is filled and then handed over
+// as a buffer:
+//
+//     own [a, if c { yield b }, for x in xs { yield f(x) }]
+//         ⇒ { var list# = Vec<T>::withCapacity(1)
+//             list#.push(a)
+//             if c { list#.push(b) }
+//             for x in xs { list#.push(f(x)) }
+//             list#.intoBuffer() }
+//
+// `if`, `for` and the rest are the statements they always are; only `yield`
+// is new. `T` is what is expected of the list, or else the type of the first
+// value that goes into it.
+
+import syntax as ast
+import syntax::{
+	CANNOT_INFER,
+	Diagnostic,
+	ELEMENT_ADDS_NOTHING,
+	Edit,
+	LIST_NEEDS_OWN,
+	Span,
+	Symbol,
+	YIELD_OUTSIDE_LIST
+}
+
+/// A list being built: its variable, and its element's type once known.
+@derive(Clone)
+struct ListBuild {
+	local: LocalId
+	elem: Option<Ty>
+}
+
+/// Whether an element is a statement that gives the list its elements by
+/// `yield` — a `for`, or an `if`, a `match` or a block with a `yield` inside
+/// — rather than a value that is one element.
+fn yields(file: &ast::Ast, e: ast::ExprId): bool = match file.exprs[e].kind {
+	.ForElement(..) => true
+	.If(thenBlock, elseBranch, ..) =>
+		blockYields(&file, &thenBlock) || (elseBranch is .Some(next) && yields(&file, next))
+	.Block(block) => blockYields(&file, &block)
+	.Match(arms, ..) => {
+		for arm in arms {
+			if yields(&file, arm.body) then return true
+		}
+		false
+	}
+	_ => false
+}
+
+/// Whether a block has a `yield` in it, not counting one inside a list of
+/// its own or a lambda, which yield elsewhere.
+fn blockYields(file: &ast::Ast, block: &ast::Block): bool = {
+	for stmt in block.stmts {
+		val found = match file.stmts[stmt].kind {
+			.Yield(_) => true
+			.For(body, ..) | .While(body, ..) => blockYields(&file, &body)
+			.Expr(e) => yields(&file, e)
+			_ => false
+		}
+		if found then return true
+	}
+	return false
+}
+
+extend Lowerer {
+	/// `own [ … ]` with an element that yields, or `own for`: an `own<[T]>`,
+	/// built as above.
+	var fn builtList(elems: &[ast::ExprId], hint: Option<Ty>, span: Span): ExprId = {
+		var elemHint: Option<Ty> = .None
+		if hint is .Some(h) &&
+			self.kind(h) is .Own(inner) &&
+			self.kind(inner) is .Slice(elem: t) | .Array(elem: t, ..) {
+			elemHint = .Some(t)
+		}
+		val .Some(.Struct(vec)) = self.preludeType(Symbol::vecType()) else {
+			// The prelude builds nothing with this; it is not for it.
+			self.report(
+				Diagnostic::error(
+					CANNOT_INFER,
+					"a list built as it runs needs the prelude's `Vec`",
+					span,
+					"not here",
+				),
+			)
+			return self.errorExpr(span)
+		}
+		val local = self.state.body.locals.add(Local(
+			name: Symbol::list(),
+			ty: ERROR,
+			kind: .Var,
+			span: span,
+		))
+		self.state.lists.push(ListBuild(local: local, elem: elemHint))
+		var stmts: Vec<StmtId> = Vec()
+		for e in elems {
+			stmts.push(self.element(e))
+		}
+		val build = self.state.lists.pop().unwrap()
+		val .Some(elem) = build.elem else {
+			// Nothing went in to go by, and nothing is expected.
+			self.report(
+				Diagnostic::error(
+					CANNOT_INFER,
+					"cannot infer the element type of this list",
+					span,
+					"type unknown",
+				).withHelp("say what it holds: `val rows: own<[Row]> = own [ … ]`"),
+			)
+			return self.errorExpr(span)
+		}
+		if self.isPoisoned(elem) then return self.errorExpr(span)
+		val args = self.program.types.internList([elem])
+		val vecTy = self.intern(.Struct(id: vec, args: args))
+		self.state.body.locals[local].ty = vecTy
+		val .Some(withCapacity) = self.vecMethod(vec, Symbol::withCapacity()) else {
+			return self.errorExpr(span)
+		}
+		val .Some(intoBuffer) = self.vecMethod(vec, Symbol::intoBuffer()) else {
+			return self.errorExpr(span)
+		}
+		// `var list# = Vec<T>::withCapacity(n)`, room for the elements that are
+		// one each.
+		var plain = 0
+		for e in elems {
+			if !yields(self.ast, e) then plain += 1
+		}
+		val count = self.alloc(.Int(plain as u128), I64, span)
+		val init = self.alloc(
+			.Call(
+				callee: withCapacity,
+				args: Vec::of(own [count]),
+				typeArgs: args,
+				order: Vec::of(own [0]),
+			),
+			vecTy,
+			span,
+		)
+		val declare = self.state.body.stmts.add(Stmt(
+			kind: .Let(local: local, init: init),
+			span: span,
+		))
+		stmts.insert(0, declare)
+		// `list#.intoBuffer()`, which takes the vector.
+		val taken = self.alloc(.Local(local), vecTy, span)
+		val moved = self.alloc(.Move(taken), vecTy, span)
+		val slice = self.intern(.Slice(elem))
+		val ty = self.intern(.Own(slice))
+		val value = self.alloc(
+			.Call(
+				callee: intoBuffer,
+				args: Vec::of(own [moved]),
+				typeArgs: args,
+				order: Vec::of(own [0]),
+			),
+			ty,
+			span,
+		)
+		return self.alloc(
+			.Block(Block(stmts: move stmts, value: .Some(value), span: span)),
+			ty,
+			span,
+		)
+	}
+
+	/// One of the prelude `Vec`'s functions, by name.
+	fn vecMethod(vec: StructId, name: Symbol): Option<FnId> = {
+		val found = self.methodsNamed(.Struct(vec), name)
+		return if found.isEmpty() then .None else .Some(found[0])
+	}
+
+	/// The statement an element is: a loop or a branch whose `yield`s put
+	/// elements in, or `list#.push(value)` for a value.
+	var fn element(e: ast::ExprId): StmtId = {
+		val file = self.ast
+		val span = file.exprs[e].span
+		if file.exprs[e].kind is .ForElement(binding, source, body) {
+			val kind = self.forStmt(.None, &binding, source, &body)
+			return self.state.body.stmts.add(Stmt(kind: move kind, span: span))
+		}
+		if yields(&file, e) {
+			val id = self.discarded(e, .None)
+			return self.state.body.stmts.add(Stmt(kind: .Expr(id), span: span))
+		}
+		if file.exprs[e].kind is .If(..) && lacksElse(&file, e) {
+			self.addsNothing(span)
+			val id = self.discarded(e, .None)
+			return self.state.body.stmts.add(Stmt(kind: .Expr(id), span: span))
+		}
+		val value = self.listValue(e)
+		return self.pushed(value, span)
+	}
+
+	/// `if c { x }` among a list's elements, as it might be read: an `if`
+	/// without `else` has no value, and hands none over.
+	var fn addsNothing(span: Span) = {
+		self.report(
+			Diagnostic::error(
+				ELEMENT_ADDS_NOTHING,
+				"an `if` without `else` adds nothing to a list",
+				span,
+				"no value, and no `yield`",
+			).withHelp(
+				"hand the value to a list built as it runs, `own [if c { yield x }]`, or give the `if` an `else`",
+			).withNote(
+				"an `if` without `else` is a statement; among a list's elements, what it yields is what it adds",
+			),
+		)
+	}
+
+	/// `yield value`: to the innermost list being built.
+	var fn yieldStmt(value: ast::ExprId, span: Span): StmtKind = {
+		// A list built inside a generator takes its own `yield`s; the rest are
+		// the generator's.
+		if self.state.lists.isEmpty() && self.state.generator.isSome() then
+			return self.generatorYield(value, span)
+		if self.state.lists.isEmpty() {
+			self.report(
+				Diagnostic::error(
+					YIELD_OUTSIDE_LIST,
+					"`yield` with no list being built, and no generator",
+					span,
+					"nothing to hand the value to",
+				).withNote(
+					"`yield` hands a value to the list being built around it, `own [ … ]` or `own for`, or to whoever asks a generator for its next one: a loop where a value stands, or a function that answers `Iterator<T>`",
+				),
+			)
+			// Checked for what else is wrong with it, and nothing more said.
+			val id = self.infer(value, .None)
+			return .Expr(self.wrapDiscarded(id))
+		}
+		val checked = self.listValue(value)
+		return .Expr(self.pushCall(checked, span))
+	}
+
+	/// A value that goes into the list, checked against its element type,
+	/// which the first one sets where nothing is expected.
+	var fn listValue(e: ast::ExprId): ExprId = {
+		val last = self.state.lists.len() - 1
+		if self.state.lists[last].elem is .Some(t) then return self.check(e, t)
+		val value = self.infer(e, .None)
+		val ty = self.tyOf(value)
+		val top = self.state.lists.len() - 1
+		self.state.lists[top].elem = .Some(ty)
+		return value
+	}
+
+	/// `list#.push(value);`, as a statement.
+	var fn pushed(value: ExprId, span: Span): StmtId = {
+		val expr = self.pushCall(value, span)
+		return self.state.body.stmts.add(Stmt(kind: .Expr(expr), span: span))
+	}
+
+	/// `list#.push(value)`.
+	var fn pushCall(value: ExprId, span: Span): ExprId = {
+		val build = self.state.lists[self.state.lists.len() - 1].clone()
+		val local = build.local
+		val elem = build.elem.unwrapOr(ERROR)
+		val .Some(.Struct(vec)) = self.preludeType(Symbol::vecType()) else {
+			return value
+		}
+		val .Some(push) = self.vecMethod(vec, Symbol::push()) else {
+			return value
+		}
+		if self.isPoisoned(elem) then return value
+		val args = self.program.types.internList([elem])
+		val vecTy = self.intern(.Struct(id: vec, args: args))
+		val list = self.alloc(.Local(local), vecTy, span)
+		val lentTy = self.intern(.Ref(inner: vecTy, kind: .Var))
+		val lent = self.alloc(.Ref(list), lentTy, span)
+		return self.alloc(
+			.Call(
+				callee: push,
+				args: Vec::of(own [lent, value]),
+				typeArgs: args,
+				order: Vec::of(own [0, 1]),
+			),
+			UNIT,
+			span,
+		)
+	}
+
+	/// A list whose length its `yield`s decide, where no `own` builds it: an
+	/// array literal, or a loop standing for a value.
+	var fn needsOwn(at: Span, whole: Span, what: str): ExprId = {
+		self.report(
+			Diagnostic::error(
+				LIST_NEEDS_OWN,
+				"\(what) is built with `own`",
+				at,
+				"its `yield`s decide how long it is",
+			).withFix("build it on the heap, with `own`", own [
+				Edit::insert(whole.lo, "own "),
+			]).withNote(
+				"a list whose `yield`s decide its length is an `own<[T]>`, built as it runs, and `own` says where it goes; a loop standing alone for a value is a generator, which yields one value at a time as it is asked",
+			),
+		)
+		return self.errorExpr(whole)
+	}
+}

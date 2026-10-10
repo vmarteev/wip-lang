@@ -1,0 +1,362 @@
+// Blocks, statements, `if`, loops, and the `defer`s that run at each exit.
+
+import hir::{Block, ExprId, LocalId, NEVER, StmtId}
+import syntax::{Span}
+
+extend Checker {
+	/// Checks a block's statements, then its value, then the `defer`s that
+	/// run where it ends. Returns whether the block always returns.
+	var fn block(block: &Block, state: &var State): bool = {
+		// The borrows of guards in the block last until it ends.
+		val borrows = self.borrows.len()
+		self.deferred.push(Vec())
+		self.scopes.push(Vec())
+		// Statements after one that returns are unreachable and not checked.
+		var returns = false
+		for stmt in block.stmts {
+			if self.stmt(stmt, &var state) {
+				returns = true
+				break
+			}
+		}
+		if !returns {
+			if block.value is .Some(value) {
+				self.expr(value, .Value, &var state)
+				returns = self.ty(value) == NEVER
+			}
+		}
+		val deferred = match self.deferred.pop() {
+			.Some(defers) => move defers
+			.None => panic("pushed above")
+		}
+		self.scopes.pop()
+		if !returns {
+			val end = Span::new(lo: block.span.hi.saturatingSub(1), hi: block.span.hi)
+			self.runDeferred(&deferred, end, "the block ends here, running the `defer`", &var state)
+			self.blockEnds(&block, end, &var state)
+		}
+		self.borrows.truncate(borrows)
+		return returns
+	}
+
+	/// Checks deferred expressions where an exit runs them, newest first,
+	/// with the state there.
+	var fn runDeferred(defers: &[ExprId], exit: Span, label: str, state: &var State) keeps label = {
+		val outer = self.exit
+		self.exit = .Some((exit, label))
+		for e in defers.backwards() {
+			self.expr(e, .Value, &var state)
+		}
+		self.exit = outer
+	}
+
+	/// An `if`: each branch starts from the state before it, and the states
+	/// of the branches that fall through are merged.
+	var fn ifExpr(cond: ExprId, thenBlock: &Block, elseBlock: &Option<Block>, state: &var State) = {
+		// The borrows of `is` tests in the condition last through the `then`
+		// block.
+		val mark = self.borrows.len()
+		self.expr(cond, .Value, &var state)
+		var thenState = state.clone()
+		val thenReturns = self.block(&thenBlock, &var thenState)
+		self.borrows.truncate(mark)
+		var elseState = state.clone()
+		val elseReturns = match elseBlock {
+			.Some(b) => self.block(&b, &var elseState)
+			.None => false
+		}
+		state = if thenReturns && !elseReturns then move elseState
+		else if elseReturns then move thenState
+		else thenState.merge(&elseState)
+	}
+
+	/// Returns whether the statement always returns.
+	var fn stmt(id: StmtId, state: &var State): bool = {
+		val body = self.body
+		// What the block declares, for a `@tailrec` jump.
+		val declared = body.stmts[id].kind.declares()
+		if !declared.isEmpty() && !self.scopes.isEmpty() {
+			val last = self.scopes.len() - 1
+			for local in declared {
+				self.scopes[last].push(local)
+			}
+		}
+		return match body.stmts[id].kind {
+			.Let(local, init) => {
+				self.expr(init, .Value, &var state)
+				// In a loop, a `let` makes its variable whole again on every
+				// iteration.
+				val whole = Path(local: local, projs: Vec())
+				state.reinit(&whole)
+				if self.isView(body.locals[local].ty) || self.isKeptRef(local) then
+					self.bindStr(local, init, &var state)
+				if self.isKeptClosure(body.locals[local].ty) then
+					self.bindClosure(local, init, &var state)
+				false
+			}
+			.Expr(e) => {
+				self.expr(e, .Value, &var state)
+				self.ty(e) == NEVER
+			}
+			// `yield value` hands `.Some(value)` over, as a result, and the
+			// generator waits.
+			.Yield(value) => {
+				self.expr(value, .Value, &var state)
+				val handed = match body.exprs[value].kind {
+					.Variant(args, ..) if args.len() == 1 => args[0]
+					_ => value
+				}
+				if self.borrowsAsView(self.ty(handed)) then
+					self.checkLeaving(handed, .Yield, &state)
+				self.yielded(body.stmts[id].span, &var state)
+				false
+			}
+			// `val pattern = value else { … }`: the `else` path leaves, and
+			// the bindings hold for the rest of the block.
+			.Guard(scrutinee, pattern, elseBlock) => {
+				val ctx = if self.place(scrutinee).isSome() then Ctx::Inspect else Ctx::Value
+				self.expr(scrutinee, ctx, &var state)
+				var elseState = state.clone()
+				if elseBlock is .Some(b) then self.block(&b, &var elseState)
+				self.bindPattern(&pattern, scrutinee, .Guard, &var state)
+				self.bindViews(&pattern, scrutinee, &var state)
+				false
+			}
+			.Defer(e) => {
+				// Nothing happens here: the expression is checked at each exit
+				// that runs it.
+				val last = self.deferred.len() - 1
+				self.deferred[last].push(e)
+				false
+			}
+			.Return(value) => {
+				if value is .Some(v) {
+					self.expr(v, .Value, &var state)
+					if self.isView(self.ty(v)) then self.checkLeaving(v, .Result, &state)
+				}
+				// A `return` unwinds every enclosing block, innermost first.
+				val blocks = self.deferred.clone()
+				val span = body.stmts[id].span
+				var s = state.clone()
+				for defers in blocks.backwards() {
+					self.runDeferred(&defers, span, "this `return` runs the `defer`", &var s)
+				}
+				self.checkVarParams(span, &s)
+				true
+			}
+			.While(cond, body: loopBody) => {
+				self.loopStmt(.Some(cond), &loopBody, .None, .None, &var state)
+				false
+			}
+			.ForElements(binding, elements, body: loopBody) => {
+				val ctx = if self.place(elements).isSome() then Ctx::Inspect else Ctx::Value
+				self.expr(elements, ctx, &var state)
+				// A list behind a reference a view keeps lies in what that
+				// reference borrows, which nothing here can change: its
+				// bindings borrow that, and nothing of what holds it is held.
+				if self.keptReferenceBehind(elements) is .Some(reference) {
+					val found = self.strRoots(reference, &state)
+					var locals: Vec<LocalId> = Vec()
+					binding.locals(&var locals)
+					for local in locals {
+						if body.aliasBindings.contains(&local) {
+							self.keptBindings.add(local)
+							self.keptElements.add(local)
+							state.roots.put(local, found.paths.clone())
+							state.stale.remove(&local)
+						}
+					}
+					self.loopStmt(.None, &loopBody, .None, .None, &var state)
+					return false
+				}
+				// The binding refers to each element, so what is walked must
+				// stay put while the loop runs.
+				val walked = self.accessPath(elements)
+				// Each binding refers into the element: the name a `for`
+				// binds, or a struct's fields.
+				if walked is .Some(path) {
+					var element = path.clone()
+					element.projs.push(.Element)
+					var binders: Vec<(LocalId, Option<Path>)> = Vec()
+					bindingsOf(&binding, .Some(move element), &var binders)
+					for (local, place) in move binders {
+						match move place {
+							.Some(found) => self.aliases.put(local, move found)
+							.None => {}
+						}
+					}
+				}
+				val span = body.exprs[elements].span
+				val heap = self.onHeap(elements)
+				val borrow = match move walked {
+					.Some(path) => Option::Some(Borrow(
+						path: move path,
+						span: span,
+						writes: false,
+						holder: .Loop,
+						heap: heap,
+					))
+					.None => Option::None
+				}
+				self.loopStmt(.None, &loopBody, .None, move borrow, &var state)
+				false
+			}
+			.ForRange(binding, lo, hi, body: loopBody, ..) => {
+				self.expr(lo, .Value, &var state)
+				self.expr(hi, .Value, &var state)
+				self.loopStmt(.None, &loopBody, binding, .None, &var state)
+				false
+			}
+			.Break(depth) | .Continue(depth) => {
+				val isBreak = body.stmts[id].kind is .Break(..)
+				val span = body.stmts[id].span
+				// Which loop it leaves: the innermost, or one further out
+				// where it named a loop.
+				val target = (self.loopExits.len() - 1 - depth as i64).max(0)
+				val open =
+					if target < self.loopExits.len() then self.loopExits[target].deferred
+					else self.deferred.len()
+				// The jump unwinds the blocks inside the loop, innermost first.
+				var blocks: Vec<Vec<ExprId>> = Vec()
+				for i in open..self.deferred.len() {
+					blocks.push(self.deferred[i].clone())
+				}
+				val label =
+					if isBreak then "this `break` runs the `defer`"
+					else "this `continue` runs the `defer`"
+				var s = state.clone()
+				for defers in blocks.backwards() {
+					self.runDeferred(&defers, span, label, &var s)
+				}
+				if target < self.loopExits.len() {
+					if isBreak then
+						self.loopExits[target].breaks = .Some(
+							joinStates(&self.loopExits[target].breaks, move s),
+						)
+					else self.loopExits[target].continues = .Some(
+						joinStates(&self.loopExits[target].continues, move s),
+					)
+				}
+				true
+			}
+		}
+	}
+
+	/// What the block declared is dropped where it ends: its value may not
+	/// borrow it, and a `str` that does is stale from here.
+	var fn blockEnds(block: &Block, end: Span, state: &var State) = {
+		val body = self.body
+		var dying: Vec<LocalId> = Vec()
+		for s in block.stmts {
+			match body.stmts[s].kind {
+				.Guard(pattern, ..) => pattern.locals(&var dying)
+				_ => {
+					for local in body.stmts[s].kind.declares() {
+						dying.push(local)
+					}
+				}
+			}
+		}
+		// The function's own block answers its result, which is checked as
+		// one.
+		val isBody = body.exprs[body.valueId()].span == block.span
+		if !isBody {
+			if block.value is .Some(value) then self.checkBlockValue(value, &dying, "block", &state)
+		}
+		for local in dying {
+			val whole = Path(local: local, projs: Vec())
+			self.changed(&whole, end, .Dropped, &var state)
+		}
+	}
+
+	/// A loop's body, with the states its `break`s and `continue`s leave
+	/// with. Returns whether the body always returns.
+	var fn loopBody(body: &Block, state: &var State, fresh: Option<LocalId>): (bool, LoopExits) = {
+		// A range's binding holds a new number on every pass.
+		if fresh is .Some(local) {
+			val whole = Path(local: local, projs: Vec())
+			state.reinit(&whole)
+		}
+		self.loopExits.push(LoopExits(
+			deferred: self.deferred.len(),
+			breaks: .None,
+			continues: .None,
+		))
+		val returns = self.block(&body, &var state)
+		val exits = match self.loopExits.pop() {
+			.Some(exits) => move exits
+			.None => panic("pushed above")
+		}
+		return (returns, move exits)
+	}
+
+	/// The state at the top of a loop after one more pass: the entry state,
+	/// merged with the state at the end of the body and at each `continue`.
+	var fn nextHead(
+		entry: &State,
+		body: &Block,
+		state: &var State,
+		fresh: Option<LocalId>,
+	): State = {
+		val (returns, exits) = self.loopBody(&body, &var state, fresh)
+		var next = if returns then entry.clone() else entry.merge(&state)
+		if exits.continues is .Some(continues) then next = next.merge(&continues)
+		return move next
+	}
+
+	/// A loop: `cond`, if it is a `while`, and then `body`, on each pass. The
+	/// state at the top of the loop is iterated until it stops changing; then
+	/// a final pass reports what is wrong. The loop may run no times, so the
+	/// state after it includes the state before.
+	///
+	/// `fresh` is a range's binding, which holds a new number on every pass,
+	/// and `borrow` keeps what a `for` walks in place while it runs.
+	var fn loopStmt(
+		cond: Option<ExprId>,
+		body: &Block,
+		fresh: Option<LocalId>,
+		borrow: Option<Borrow>,
+		state: &var State,
+	) = {
+		val mark = self.borrows.len()
+		match move borrow {
+			.Some(b) => self.borrows.push(move b)
+			.None => {}
+		}
+		val entry = state.clone()
+		var head = entry.clone()
+		self.quiet += 1
+		while true {
+			var s = head.clone()
+			// The borrows of `is` tests in a `while`'s condition last through
+			// its body.
+			val pass = self.borrows.len()
+			if cond is .Some(c) then self.expr(c, .Value, &var s)
+			val next = self.nextHead(&entry, &body, &var s, fresh)
+			self.borrows.truncate(pass)
+			if next == head then break
+			head = move next
+		}
+		self.quiet -= 1
+		// The final pass reports, starting from the fixed point. The loop
+		// ends where its condition is false, or at a `break`.
+		self.loops.push(body.span)
+		var s = move head
+		val pass = self.borrows.len()
+		if cond is .Some(c) then self.expr(c, .Value, &var s)
+		var exit = s.clone()
+		val (_, exits) = self.loopBody(&body, &var s, fresh)
+		self.borrows.truncate(pass)
+		self.loops.pop()
+		if exits.breaks is .Some(breaks) then exit = exit.merge(&breaks)
+		self.borrows.truncate(mark)
+		state = move exit
+	}
+}
+
+/// The state a loop is left with by its jumps: where an earlier jump left
+/// it, joined with this one's.
+fn joinStates(earlier: &Option<State>, state: State): State = match earlier {
+	.Some(e) => e.merge(&state)
+	.None => move state
+}

@@ -1,0 +1,1559 @@
+// Running a program's own code while it is compiled: the functions that
+// compute the constants folding could not work out.
+//
+// What runs is the MIR every backend compiles, statement by statement, on a
+// memory laid out as the target's is — the same layouts, the same widths, a
+// pointer being an address — so that `offsetBytes`, a `Vec`'s slots and a
+// table read as they do in the program. The heap is the interpreter's own, and
+// so are the few functions of C the standard library is written over
+// (`memcpy`, `malloc` and the like); any other call into C is refused, since C
+// cannot be run here and need not answer the same twice. A panic, a call that
+// cannot be made, and a computation past its budget are errors at the
+// constant, with the calls that led to them.
+
+import std::collections::{Map, Set}
+import std::shared::{Shared}
+import hir::{ConstId, ConstValue, FnId, InterfaceId, Program, Ty, UnaryOp}
+import syntax::{
+	ASSERTION_FAILED,
+	BinaryOp,
+	CONSTANT_PANICKED,
+	Diagnostic,
+	EVALUATION_TOO_LONG,
+	Interner,
+	NOT_RUN_AT_COMPILE_TIME,
+	Span,
+	Symbol
+}
+
+/// How many statements a constant may run, the constants it reads included:
+/// about two seconds.
+val STEPS: u64 = 100000000
+/// How many bytes of memory it may use.
+val BYTES: u64 = 512 << 20
+/// The first address of memory: below it, as at run time, is no value's.
+val BASE: u64 = 0x10000
+/// Where the addresses of functions begin: never memory, only a number a call
+/// through a function value is taken back from.
+val CODE: u64 = 0x7F00000000000000
+/// What a move leaves in a build that checks moves, as the code generator
+/// writes it.
+val POISON: u64 = 0xA5A5A5A5A5A5A5A5
+/// The words the runtime keeps its counters in.
+val RUNTIME_WORDS: u64 = 8
+
+/// Works out every constant that is to be run, and sets its value, then checks
+/// every top-level `assert`; answers what went wrong, each at the constant or
+/// the assert it went wrong in. `locate` names the file, line and column of a
+/// place in the source.
+pub fn evaluateConstants(
+	program: &var Program,
+	interner: &var Interner,
+	locate: &(at: Span) => (String, u32, u32),
+): Vec<Diagnostic> = evaluateWithin(&var program, &var interner, locate, STEPS)
+
+/// The same, with a budget of `steps` for each constant.
+pub fn evaluateWithin(
+	program: &var Program,
+	interner: &var Interner,
+	locate: &(at: Span) => (String, u32, u32),
+	steps: u64,
+): Vec<Diagnostic> = {
+	var ids: Vec<ConstId> = Vec()
+	for id in program.consts.ids() {
+		val def = &program.consts[id]
+		if def.code.isSome() && def.value.isNone() then ids.push(id)
+	}
+	if ids.isEmpty() && program.asserts.isEmpty() then return Vec()
+	var diagnostics: Vec<Diagnostic> = Vec()
+	var values: Vec<(ConstId, Built)> = Vec()
+	{
+		var machine = Machine::new(&program, &interner, steps)
+		for id in ids {
+			// Each constant has a budget of its own.
+			machine.steps = 0
+			match machine.constant(id) {
+				.Ok(address) => {
+					val ty = program.consts[id].ty
+					match machine.built(address, ty) {
+						.Ok(built) => values.push((id, move built))
+						.Err(stop) => {
+							val failure = Failure(stop: move stop, calls: Vec())
+							if machine.report(.Constant(id), move failure, locate) is .Some(d) then
+								diagnostics.push(d.clone())
+						}
+					}
+				}
+				.Err(failure) => {
+					if machine.report(.Constant(id), move failure, locate) is .Some(d) then
+						diagnostics.push(d.clone())
+				}
+			}
+		}
+		// Each top-level assert, once every constant it may read is known.
+		val asserts = program.asserts.clone()
+		for id in asserts {
+			machine.steps = 0
+			if machine.call(.Fn(id), Vec(), .None) is .Err(stop) {
+				val failure = Failure(stop: stop.clone(), calls: machine.stack())
+				machine.calls.clear()
+				if machine.report(.Assert(id), move failure, locate) is .Some(d) then
+					diagnostics.push(d.clone())
+			}
+		}
+	}
+	for (id, built) in move values {
+		program.consts[id].value = .Some(built.intoValue(&var interner))
+	}
+	return move diagnostics
+}
+
+/// A constant's value as the machine read it back, its strings not yet
+/// interned.
+@derive(Clone)
+enum Built {
+	Int(bits: u128)
+	Float(value: f64)
+	Bool(value: bool)
+	Str(text: String)
+	Array(parts: Vec<Built>)
+	Struct(parts: Vec<Built>)
+	Variant(variant: u32, fields: Vec<Built>)
+}
+
+extend Built {
+	fn intoValue(interner: &var Interner): ConstValue = match self {
+		.Int(bits) => .Int(bits)
+		.Float(value) => .Float(value)
+		.Bool(value) => .Bool(value)
+		.Str(text) => .Str(interner.intern(text.toStr()))
+		.Array(parts) => .Array(allValues(&parts, &var interner))
+		.Struct(parts) => .Struct(allValues(&parts, &var interner))
+		.Variant(variant, fields) => .Variant(
+			variant: variant,
+			fields: allValues(&fields, &var interner),
+		)
+	}
+}
+
+fn allValues(parts: &[Built], interner: &var Interner): Vec<ConstValue> = {
+	var values: Vec<ConstValue> = Vec()
+	for part in parts {
+		values.push(part.intoValue(&var interner))
+	}
+	return move values
+}
+
+/// What was being run when something went wrong.
+@derive(Clone)
+enum Subject {
+	Constant(id: ConstId)
+	/// A top-level `assert`'s function.
+	Assert(id: FnId)
+}
+
+/// Why running stopped.
+@derive(Clone)
+enum Stop {
+	/// A panic, with its message and where it was written.
+	Panic(message: String, at: Span)
+	/// Something that cannot be done while the program is compiled.
+	Cannot(why: String)
+	/// The budget of steps or of memory ran out.
+	Budget(what: String)
+	/// A constant it needed had failed, which was reported there.
+	Quiet
+}
+
+/// A stop, and the calls it happened in, innermost first: each function's name
+/// and the place it had reached.
+struct Failure {
+	stop: Stop
+	calls: Vec<(String, Span)>
+}
+
+/// What can be called through an address: a function, or the drop function of
+/// an `own` of a type.
+@derive(Eq, Hash, Clone)
+enum Callable {
+	Fn(id: FnId)
+	Drop(ty: Ty)
+	DropInPlace(ty: Ty)
+}
+
+/// An argument: a scalar's bits, or an aggregate's address.
+@derive(Clone)
+enum Arg {
+	Scalar(bits: u128)
+	Address(address: u64)
+}
+
+/// One call being run: its body, and the address of each local.
+struct Frame {
+	body: Shared<Body>
+	locals: Vec<u64>
+	/// The locals whose memory the frame took, freed when it returns.
+	owned: Vec<(u64, u64)>
+}
+
+view struct Machine {
+	program: &Program
+	interner: &Interner
+	layouts: Layouts
+	memory: Vec<u8>
+	free: Map<u64, Vec<u64>>
+	bodies: Map<Callable, Shared<Body>>
+	code: Vec<Callable>
+	codeOf: Map<Callable, u64>
+	strings: Map<Symbol, u64>
+	tables: Map<ConstId, u64>
+	vtables: Map<(InterfaceId, Ty), u64>
+	words: Option<u64>
+	steps: u64
+	/// How many steps a constant may take.
+	budget: u64
+	/// The calls being run, outermost first, each with the place it has
+	/// reached.
+	calls: Vec<(String, Span)>
+	evaluating: Vec<ConstId>
+	failed: Set<ConstId>
+}
+
+extend Machine {
+	static fn new(program: &Program, interner: &Interner, budget: u64): Machine = {
+		return Machine(
+			program: &program,
+			interner: &interner,
+			layouts: Layouts::new(),
+			memory: Vec::filled(BASE as i64, 0),
+			free: Map(),
+			bodies: Map(),
+			code: Vec(),
+			codeOf: Map(),
+			strings: Map(),
+			tables: Map(),
+			vtables: Map(),
+			words: .None,
+			steps: 0,
+			budget: budget,
+			calls: Vec(),
+			evaluating: Vec(),
+			failed: Set(),
+		)
+	}
+
+	// --- Constants -------------------------------------------------------
+
+	/// The address of a constant's value: run once, where it is to be run, and
+	/// laid out as a table otherwise.
+	var fn constant(id: ConstId): Result<u64, Failure> = {
+		if self.tables.get(&id) is .Some(address) then return .Ok(address)
+		if self.failed.contains(&id) then return .Err(Failure(stop: .Quiet, calls: Vec()))
+		val def = &self.program.consts[id]
+		val ty = def.ty
+		val .Some(code) = def.code else {
+			return match self.table(id) {
+				.Ok(address) => .Ok(address)
+				.Err(stop) => .Err(Failure(stop: move stop, calls: Vec()))
+			}
+		}
+		if self.evaluating.contains(&id) {
+			val name = self.interner.resolve(def.name)
+			return .Err(Failure(
+				stop: .Cannot("`\(name)` is defined in terms of itself, through what it runs"),
+				calls: self.stack(),
+			))
+		}
+		self.evaluating.push(id)
+		val depth = self.calls.len()
+		val size = self.size(ty).max(1)
+		val result = self.runConstant(code, ty, size)
+		self.evaluating.pop()
+		return match move result {
+			.Ok(address) => {
+				self.calls.truncate(depth)
+				self.tables.put(id, address)
+				Result::Ok(address)
+			}
+			.Err(stop) => {
+				val calls = self.stack()
+				self.calls.truncate(depth)
+				self.failed.add(id)
+				Result::Err(Failure(stop: move stop, calls: move calls))
+			}
+		}
+	}
+
+	/// Runs a constant's code into memory of its own, and answers where.
+	var fn runConstant(code: FnId, ty: Ty, size: u64): Result<u64, Stop> = {
+		val address = self.alloc(size)?
+		if self.call(.Fn(code), Vec(), .Some(address))? is .Some(bits) then
+			self.store(address, ty, bits)?
+		return .Ok(address)
+	}
+
+	/// A constant folding worked out, laid out in memory as the program keeps
+	/// it, with its strings where the pool has them.
+	var fn table(id: ConstId): Result<u64, Stop> = {
+		val def = &self.program.consts[id]
+		val .Some(value) = def.value else {
+			return .Err(.Quiet)
+		}
+		val table = tableBytes(self.program, self.interner, &var self.layouts, &value, def.ty, true)
+		val address = self.alloc(table.bytes.len().max(1) as u64)?
+		self.writeBytes(address, &table.bytes)?
+		for (offset, sym) in table.strings {
+			val text = self.string(sym)?
+			self.writeWord(address + offset as u64, text)?
+		}
+		// A file's bytes, embedded.
+		for (offset, bytes, _) in table.blobs {
+			val blob = self.alloc(bytes.len().max(1) as u64)?
+			self.writeBytes(blob, &bytes)?
+			self.writeWord(address + offset as u64, blob)?
+		}
+		self.tables.put(id, address)
+		return .Ok(address)
+	}
+
+	/// The error a failure is, at the constant or the assert it happened in;
+	/// none where the failure was another constant's, already reported.
+	fn report(
+		subject: Subject,
+		failure: Failure,
+		locate: &(at: Span) => (String, u32, u32),
+	): Option<Diagnostic> = {
+		val (span, working, cannot) = match subject {
+			.Constant(id) => {
+				val def = &self.program.consts[id]
+				val name = self.interner.resolve(def.name)
+				(
+					def.span,
+					"working out `\(name)`",
+					"`\(name)` cannot be worked out while the program is compiled",
+				)
+			}
+			.Assert(id) => (
+				self.program.fns[id].span,
+				String::of("checking this assert"),
+				String::of("this assert cannot be checked while the program is compiled"),
+			)
+		}
+		val diagnostic = match failure.stop {
+			.Quiet => return .None
+			// The assert's own condition, not a panic in what it calls: the
+			// message it would print at run time.
+			.Panic(message, ..) if subject is .Assert(..) &&
+				failure.calls.len() == 1 => return .Some(
+				Diagnostic::error(
+					ASSERTION_FAILED,
+					message.clone(),
+					span,
+					String::of("does not hold while the program is compiled"),
+				).withNote(
+					String::of(
+						"a top-level assert is checked while the program is compiled, for the target it is compiled for",
+					),
+				),
+			)
+			.Panic(message, at) => {
+				val (file, line, column) = locate(at)
+				Diagnostic::error(
+					CONSTANT_PANICKED,
+					"\(working) panicked: \(message)",
+					span,
+					String::of("panicked while the program was compiled"),
+				).withNote("at \(file):\(line):\(column)")
+			}
+			.Cannot(why) => Diagnostic::error(
+				NOT_RUN_AT_COMPILE_TIME,
+				cannot.clone(),
+				span,
+				why.clone(),
+			).withNote(
+				String::of(
+					"what runs while the program is compiled is the program's own code; C, the time, files and threads are not there until the program runs",
+				),
+			)
+			.Budget(what) => Diagnostic::error(
+				EVALUATION_TOO_LONG,
+				"\(working) took too \(what)",
+				span,
+				String::of("stopped while the program was compiled"),
+			).withNote("a constant or an assert may run \(self.budget) steps and use \(BYTES >> 20) MiB")
+		}
+		var noted = move diagnostic
+		for (function, at) in failure.calls {
+			val (file, line, _) = locate(at)
+			noted = noted.withNote("in \(function) (\(file):\(line))")
+		}
+		return .Some(move noted)
+	}
+
+	/// The calls being run, innermost first.
+	fn stack(): Vec<(String, Span)> = {
+		var calls: Vec<(String, Span)> = Vec()
+		for call in self.calls.backwards() {
+			calls.push(call.clone())
+		}
+		return move calls
+	}
+
+	// --- Reading a value back --------------------------------------------
+
+	/// The value of type `ty` at `address`, as a constant holds it.
+	var fn built(address: u64, ty: Ty): Result<Built, Stop> = {
+		val program = self.program
+		return .Ok(
+			match program.types.kind(ty) {
+				.Int(..) | .Char => .Int(self.load(address, ty)?)
+				.Float(float: .F32) => .Float(f32::fromBits(self.load(address, ty)? as u32) as f64)
+				.Float(..) => .Float(f64::fromBits(self.load(address, ty)? as u64))
+				.Bool => .Bool(self.load(address, ty)? != 0)
+				.Str => {
+					val pointer = self.readWord(address)?
+					val length = self.readWord(address + 8)?
+					.Str(self.text(pointer, length)?)
+				}
+				.Cstring => {
+					val pointer = self.readWord(address)?
+					val length = self.strlen(pointer)?
+					.Str(self.text(pointer, length)?)
+				}
+				.Array(elem, len: count) => {
+					val stride = self.layouts.of(program, elem).stride() as u64
+					var parts: Vec<Built> = Vec()
+					for i in 0..count {
+						parts.push(self.built(address + i * stride, elem)?)
+					}
+					.Array(move parts)
+				}
+				.Struct(..) => {
+					val fields = program.fieldTys(ty)
+					var parts: Vec<Built> = Vec()
+					for (i, field) in fields.forwards().enumerate() {
+						val offset = self.layouts.fieldOffset(program, ty, i as u32)
+						parts.push(self.built(address + offset as u64, field)?)
+					}
+					.Struct(move parts)
+				}
+				.Enum(..) => {
+					val variant = self.variant(address, ty)?
+					val tys = program.variantFieldTys(ty)
+					var fields: Vec<Built> = Vec()
+					for (i, field) in tys[variant as i64].forwards().enumerate() {
+						val offset = self.layouts.variantOffset(program, ty, variant, i as u32)
+						fields.push(self.built(address + offset as u64, field)?)
+					}
+					.Variant(variant: variant, fields: move fields)
+				}
+				.Ptr(..) if self.readWord(address)? == 0 => .Int(0)
+				_ => return .Err(
+					.Cannot("a constant cannot hold \(program.tyName(ty, self.interner)), which points into memory that is gone once the program is compiled"),
+				)
+			},
+		)
+	}
+
+	// --- Calls -----------------------------------------------------------
+
+	var fn body(callable: Callable): Result<Shared<Body>, Stop> = {
+		if self.bodies.get(&callable) is .Some(body) then return .Ok(body.share())
+		val body = match callable {
+			.Fn(id) => match functionBody(self.program, self.interner, id) {
+				.Some(found) => move found
+				.None => return .Err(
+					.Cannot("calls `\(self.program.fnName(id, self.interner))`, which has no body to run"),
+				)
+			}
+			.Drop(ty) => lowerDropFn(self.program, self.interner, ty)
+			.DropInPlace(ty) => lowerDropInPlaceFn(self.program, self.interner, ty)
+		}
+		val shared = Shared::of(move body)
+		self.bodies.put(callable.clone(), shared.share())
+		return .Ok(move shared)
+	}
+
+	fn nameOf(callable: &Callable): String = match callable {
+		.Fn(id) => self.program.fnName(id, self.interner)
+		.Drop(ty) | .DropInPlace(ty) => "drop<\(self.program.tyName(ty, self.interner))>"
+	}
+
+	/// Runs a call: its arguments, and where an aggregate result goes. Answers
+	/// a scalar result's bits.
+	var fn call(
+		callable: Callable,
+		args: Vec<Arg>,
+		ret: Option<u64>,
+	): Result<Option<u128>, Stop> = {
+		if callable is .Fn(id) {
+			val def = &self.program.fns[id]
+			if def.isExtern || def.accesses.isSome() || def.variadicOf.isSome() then
+				return self.cCall(id, &args)
+		}
+		val body = self.body(callable.clone())?
+		val name = self.nameOf(&callable)
+		val at = match callable {
+			.Fn(id) => self.program.fns[id].span
+			_ => Span::at(0)
+		}
+		self.calls.push((move name, at))
+		var frame = Frame(body: body.share(), locals: Vec(), owned: Vec())
+		var next = 0
+		for decl in body.value().locals {
+			val aggregate = isAggregate(self.program, decl.ty)
+			val address = if decl.kind == .Param && aggregate {
+				val .Address(given) = args[next] else {
+					panic("an aggregate argument is passed by address")
+				}
+				next += 1
+				given
+			} else if decl.kind == .Return && aggregate && ret.isSome() {
+				ret.unwrap()
+			} else {
+				val size = self.size(decl.ty).max(1)
+				val made = self.alloc(size)?
+				frame.owned.push((made, size))
+				made
+			}
+			frame.locals.push(address)
+			if decl.kind == .Param && !aggregate {
+				val .Scalar(bits) = args[next] else {
+					panic("a scalar argument is passed by value")
+				}
+				next += 1
+				self.store(address, decl.ty, bits)?
+			}
+		}
+		val answer = self.run(&frame)?
+		for (address, size) in frame.owned {
+			self.release(address, size)
+		}
+		self.calls.pop()
+		return .Ok(answer)
+	}
+
+	/// Runs a body from its first block to a `return`.
+	var fn run(frame: &Frame): Result<Option<u128>, Stop> = {
+		val body: &Body = &frame.body.value()
+		var block = BlockId(0)
+		while true {
+			val this: &Block = &body.block(block)
+			for statement in this.statements {
+				self.step()?
+				self.statement(&frame, &statement)?
+			}
+			self.step()?
+			match this.terminator {
+				.Goto(target) => block = target
+				.Branch(cond, thenBlock, otherwise) =>
+					block = if self.scalar(&frame, &cond)? != 0 then thenBlock else otherwise
+				.Switch(value, cases, otherwise) => {
+					// Compared whole: a number past what a case holds is no case,
+					// rather than the case its low bits are.
+					val bits = self.scalar(&frame, &value)?
+					block = otherwise
+					for (case, target) in cases {
+						if case as u128 == bits {
+							block = target
+							break
+						}
+					}
+				}
+				.Return => {
+					if body.ret is .Some(ret) && !isAggregate(self.program, body.local(ret).ty) {
+						val ty = body.local(ret).ty
+						return .Ok(.Some(self.load(frame.locals[ret.index as i64], ty)?))
+					}
+					return .Ok(.None)
+				}
+				.Panic(note, message, at) => {
+					var text = String()
+					if note is .Some(.Copy(place)) {
+						val address = self.place(&frame, &place)?
+						val pointer = self.readWord(address)?
+						val length = self.readWord(address + 8)?
+						text.push(self.text(pointer, length)?.toStr())
+					}
+					if message is .Some(m) then text.push(self.interner.resolve(m))
+					return .Err(.Panic(message: move text, at: at))
+				}
+				.Unreachable => return .Err(
+					.Cannot(String::of("reached code that no path was to reach")),
+				)
+			}
+		}
+		return .Ok(.None)
+	}
+
+	var fn step(): Result<void, Stop> = {
+		self.steps += 1
+		return if self.steps > self.budget then .Err(.Budget(String::of("long"))) else .Ok()
+	}
+
+	var fn statement(frame: &Frame, statement: &Statement): Result<void, Stop> = {
+		val program = self.program
+		val body: &Body = &frame.body.value()
+		match statement {
+			.At(span) => {
+				if !self.calls.isEmpty() {
+					val last = self.calls.len() - 1
+					self.calls[last].1 = span
+				}
+			}
+			.Assign(place, rvalue) => {
+				val ty = placeTy(program, &body, &place)
+				if isAggregate(program, ty) {
+					val .Use(.Copy(source)) = rvalue else {
+						panic("an aggregate is assigned by copying a place")
+					}
+					val dest = self.place(&frame, &place)?
+					val from = self.place(&frame, &source)?
+					val size = self.size(ty)
+					self.copy(dest, from, size)?
+					return .Ok()
+				}
+				if self.size(ty) == 0 then return .Ok()
+				val value = self.rvalue(&frame, &rvalue, ty)?
+				val address = self.place(&frame, &place)?
+				self.store(address, ty, value)?
+			}
+			.SetVariant(place, variant) => {
+				val ty = placeTy(program, &body, &place)
+				val address = self.place(&frame, &place)?
+				match self.layouts.enumTag(program, ty) {
+					.Byte(size) => self.writeInt(address, size as u64, variant as u128)?
+					.Niche(empty, offset, ..) if variant == empty =>
+						self.writeWord(address + offset as u64, 0)?
+					.Niche(..) => {}
+				}
+			}
+			.Zero(place) => {
+				val ty = placeTy(program, &body, &place)
+				val size = self.size(ty)
+				if size > 0 {
+					val address = self.place(&frame, &place)?
+					self.fill(address, size, 0)?
+				}
+			}
+			.Poison(place) => {
+				val ty = placeTy(program, &body, &place)
+				val size = self.size(ty)
+				val address = self.place(&frame, &place)?
+				var offset: u64 = 0
+				while offset + 8 <= size {
+					self.writeWord(address + offset, POISON)?
+					offset += 8
+				}
+				self.fill(address + offset, size - offset, POISON as u8)?
+			}
+			.CheckMoved(place, at) => {
+				val ty = placeTy(program, &body, &place)
+				val size = self.size(ty).min(8)
+				if size > 0 {
+					val address = self.place(&frame, &place)?
+					val first = self.readInt(address, size)?
+					val pattern = POISON as u128 & mask(size as u32 * 8)
+					if first == pattern then
+						return .Err(.Panic(
+							message: String::of("a value was dropped after it was moved away"),
+							at: at,
+						))
+				}
+			}
+			.Call(callee, args, dest) => {
+				var values: Vec<Arg> = Vec()
+				for arg in args {
+					values.push(self.arg(&frame, &arg)?)
+				}
+				val retTy: Option<Ty> = match dest {
+					.Some(d) => .Some(placeTy(program, &body, &d))
+					.None => .None
+				}
+				val aggregate = retTy is .Some(t) && isAggregate(program, t)
+				val destAddress: Option<u64> = match dest {
+					.Some(d) => .Some(self.place(&frame, &d)?)
+					.None => .None
+				}
+				val ret = if aggregate then destAddress else .None
+				val answer = match callee {
+					.StrCmp => Option::Some(self.strCmp(&values)?)
+					.Fn(id) => self.call(.Fn(id), move values, ret)?
+					.Value(value) => {
+						val address = self.scalar(&frame, &value)? as u64
+						val callable = self.callable(address)?
+						self.call(move callable, move values, ret)?
+					}
+				}
+				if !aggregate &&
+					answer is .Some(bits) &&
+					destAddress is .Some(address) &&
+					retTy is .Some(ty) {
+					self.store(address, ty, bits)?
+				}
+			}
+			.Alloc(dest, ty) => {
+				val size = self.size(ty).max(1)
+				val pointer = self.alloc(size)?
+				val address = self.place(&frame, &dest)?
+				self.writeWord(address, pointer)?
+			}
+			.AllocBuffer(dest, elem, count) => {
+				val n = self.scalar(&frame, &count)? as u64 as i64
+				val stride = self.layouts.of(program, elem).stride() as i64
+				val .Some(size) = n.checkedMul(stride) else {
+					return .Err(.Budget(String::of("much memory")))
+				}
+				val pointer = self.alloc((size as u64).max(1))?
+				val address = self.place(&frame, &dest)?
+				self.writeWord(address, pointer)?
+				self.writeWord(address + 8, n as u64)?
+			}
+			.Free(pointer) => { self.scalar(&frame, &pointer)? }
+			.DropFn(ty, ptr) => {
+				val pointer = self.scalar(&frame, &ptr)?
+				self.call(.Drop(ty), Vec::of(own [Arg::Scalar(pointer)]), .None)?
+			}
+			.DropInPlace(ty, place) => {
+				val pointer = self.place(&frame, &place)? as u128
+				self.call(.DropInPlace(ty), Vec::of(own [Arg::Scalar(pointer)]), .None)?
+			}
+			.Arith(dest, op, lhs, rhs, at) => {
+				val ty = placeTy(program, &body, &dest)
+				val l = self.scalar(&frame, &lhs)?
+				val r = self.scalar(&frame, &rhs)?
+				val .Some(value) = checked(program, ty, op, l, r) else {
+					return .Err(.Panic(message: String::of(overflowMessage(op)), at: at))
+				}
+				val address = self.place(&frame, &dest)?
+				self.store(address, ty, value)?
+			}
+			// One thread computes a constant, so each is a plain step.
+			.Atomic(op, ty, address, value, expected, dest) => {
+				val at = self.scalar(&frame, &address)? as u64
+				val (bits, _) = intOf(program, ty)
+				val before = self.load(at, ty)?
+				val answer: Option<u128> = match op {
+					.Add => {
+						val amount = self.atomicOperand(&frame, &value)?
+						self.store(at, ty, (before +% amount) & mask(bits))?
+						Option::Some(before)
+					}
+					.Subtract => {
+						val amount = self.atomicOperand(&frame, &value)?
+						self.store(at, ty, (before -% amount) & mask(bits))?
+						Option::Some(before)
+					}
+					.Swap => {
+						val stored = self.atomicOperand(&frame, &value)?
+						self.store(at, ty, stored & mask(bits))?
+						Option::Some(before)
+					}
+					.CompareSwap => {
+						val wanted = self.atomicOperand(&frame, &expected)?
+						val stored = self.atomicOperand(&frame, &value)?
+						if before == wanted & mask(bits) then
+							self.store(at, ty, stored & mask(bits))?
+						.Some(before)
+					}
+					.Load => .Some(before)
+					.Store => {
+						val stored = self.atomicOperand(&frame, &value)?
+						self.store(at, ty, stored & mask(bits))?
+						Option::None
+					}
+				}
+				if dest is .Some(d) && answer is .Some(bits) {
+					val address = self.place(&frame, &d)?
+					self.store(address, ty, bits)?
+				}
+			}
+			.Check(fails, kind, at) => {
+				if self.scalar(&frame, &fails)? == 0 then return .Ok()
+				val message: String = match kind {
+					.Bounds(index, length) => {
+						val i = self.scalar(&frame, &index)? as u64 as i64
+						val n = self.scalar(&frame, &length)? as u64 as i64
+						"index \(i) is out of bounds for length \(n)"
+					}
+					.Length(length) => {
+						val n = self.scalar(&frame, &length)? as u64 as i64
+						"a buffer cannot have length \(n)"
+					}
+					.Division => String::of("divided by zero")
+					.Overflow(op) => String::of(overflowMessage(op))
+				}
+				return .Err(.Panic(message: move message, at: at))
+			}
+		}
+		return .Ok()
+	}
+
+	/// The value an atomic operation is given, or expects.
+	var fn atomicOperand(
+		frame: &Frame,
+		operand: &Option<Operand>,
+	): Result<u128, Stop> = match operand {
+		.Some(o) => self.scalar(&frame, &o)
+		.None => panic("an atomic's value")
+	}
+
+	/// An argument: a scalar's bits, or an aggregate's address.
+	var fn arg(frame: &Frame, operand: &Operand): Result<Arg, Stop> = {
+		val body: &Body = &frame.body.value()
+		val ty = operandTy(self.program, &body, &operand)
+		if isAggregate(self.program, ty) {
+			val .Copy(place) = operand else {
+				panic("an aggregate operand is a place")
+			}
+			return .Ok(.Address(self.place(&frame, &place)?))
+		}
+		return .Ok(.Scalar(self.scalar(&frame, &operand)?))
+	}
+
+	/// What a function of C does, where it is one of those the standard library
+	/// is written over; any other is refused.
+	var fn cCall(id: FnId, args: &[Arg]): Result<Option<u128>, Stop> = {
+		val def = &self.program.fns[id]
+		val name = self.interner.resolve(def.symbol.unwrapOr(def.name))
+		// What the program calls it, which C may call otherwise.
+		val written = self.interner.resolve(def.name)
+		val answer: u128 = match name {
+			"memcpy" | "memmove" => {
+				self.copy(word(&args, 0), word(&args, 1), word(&args, 2))?
+				word(&args, 0) as u128
+			}
+			"memset" => {
+				self.fill(word(&args, 0), word(&args, 2), word(&args, 1) as u8)?
+				word(&args, 0) as u128
+			}
+			"memcmp" => {
+				val count = word(&args, 2)
+				val a = self.readBytes(word(&args, 0), count)?
+				val b = self.readBytes(word(&args, 1), count)?
+				val order = a.items().compare(&b.items())
+				val signed: i32 = if order.isLess() then -1 else if order.isSame() then 0 else 1
+				signed as u32 as u128
+			}
+			"strlen" => self.strlen(word(&args, 0))? as u128
+			"malloc" => self.alloc(word(&args, 0).max(1))? as u128
+			"calloc" => {
+				val size = word(&args, 0).saturatingMul(word(&args, 1)).max(1)
+				val pointer = self.alloc(size)?
+				self.fill(pointer, size, 0)?
+				pointer as u128
+			}
+			"realloc" => {
+				val old = word(&args, 0)
+				val size = word(&args, 1).max(1)
+				val pointer = self.alloc(size)?
+				if old != 0 {
+					val kept = size.min(self.memory.len() as u64 - old)
+					self.copy(pointer, old, kept)?
+				}
+				pointer as u128
+			}
+			"free" if def.accesses.isNone() => 0
+			_ if def.accesses.isSome() => return .Err(
+				.Cannot("reads `\(written)`, which is C's, and C is not there while the program is compiled"),
+			)
+			_ => return .Err(
+				.Cannot("calls `\(written)`, which is C's, and C does not run while the program is compiled"),
+			)
+		}
+		return .Ok(.Some(answer))
+	}
+
+	/// The runtime's comparison of two strings' bytes: the order of their
+	/// shared bytes, then of their lengths.
+	fn strCmp(args: &[Arg]): Result<u128, Stop> = {
+		val a = self.readBytes(word(&args, 0), word(&args, 1))?
+		val b = self.readBytes(word(&args, 2), word(&args, 3))?
+		val order = a.items().compare(&b.items())
+		val signed: i64 = if order.isLess() then -1 else if order.isSame() then 0 else 1
+		return .Ok(signed as u64 as u128)
+	}
+
+	// --- Places and values -----------------------------------------------
+
+	/// The address of a place.
+	var fn place(frame: &Frame, place: &Place): Result<u64, Stop> = {
+		val program = self.program
+		val body: &Body = &frame.body.value()
+		var address = frame.locals[place.local.index as i64]
+		var ty = body.local(place.local).ty
+		for projection in place.projections {
+			address = match projection {
+				.Deref => self.readWord(address)?
+				.Field(index) => {
+					val offset = if program.types.kind(ty) is .Struct(..) {
+						self.layouts.fieldOffset(program, ty, index)
+					} else {
+						// A `str`'s or a slice's pointer, then its length.
+						index * 8
+					}
+					address + offset as u64
+				}
+				.VariantField(variant, field) =>
+					address + self.layouts.variantOffset(program, ty, variant, field) as u64
+				.Index(..) | .ConstIndex(..) => {
+					val .Some(elem) = elementTy(program, ty) else {
+						panic("elements")
+					}
+					// An array's elements are where the array is; any other's are
+					// where its pointer points.
+					val first =
+						if program.types.kind(ty) is .Array(..) then address
+						else self.readWord(address)?
+					val stride = self.layouts.of(program, elem).stride() as i128
+					val index: i128 = match projection {
+						.Index(local) => {
+							val localTy = body.local(local).ty
+							val bits = self.load(frame.locals[local.index as i64], localTy)?
+							signed(program, localTy, bits)
+						}
+						.ConstIndex(index) => index as i128
+						_ => panic("an index")
+					}
+					(first as i128 +% index *% stride) as u64
+				}
+			}
+			ty = projectTy(program, ty, projection.clone())
+		}
+		return .Ok(address)
+	}
+
+	/// The bits of a scalar operand.
+	var fn scalar(frame: &Frame, operand: &Operand): Result<u128, Stop> = match operand {
+		.Copy(place) => {
+			val body: &Body = &frame.body.value()
+			val ty = placeTy(self.program, &body, &place)
+			if self.size(ty) == 0 then return .Ok(0)
+			val address = self.place(&frame, &place)?
+			self.load(address, ty)
+		}
+		.Const(constant) => self.constantBits(&constant)
+	}
+
+	var fn constantBits(constant: &Const): Result<u128, Stop> = .Ok(
+		match constant {
+			.Int(bits, ..) => bits
+			.Float(value, ty) => match self.program.types.kind(ty) {
+				.Float(float: .F32) => (value as f32).toBits() as u128
+				_ => value.toBits() as u128
+			}
+			.Bool(value) => if value then 1 else 0
+			.CStr(sym) => self.string(sym)? as u128
+			.Table(id, ..) => match self.constant(id) {
+				.Ok(address) => address as u128
+				.Err(failure) => return .Err(failure.stop.clone())
+			}
+			.Fn(id, ..) => self.codeAddress(.Fn(id)) as u128
+			.DropFn(ty) => self.codeAddress(.Drop(ty)) as u128
+			.VTable(interfaceId, ty) => self.vtable(interfaceId, ty)? as u128
+			.RuntimeWords => self.runtimeWords()? as u128
+			.FrameTables => return .Err(
+				.Cannot(
+					String::of(
+						"reads the tables a panic walks, which the program has only once it runs",
+					),
+				),
+			)
+			.SizeOf(of, ..) => self.layouts.of(self.program, of).stride() as u128
+			.AlignOf(of, ..) => self.layouts.of(self.program, of).align as u128
+		},
+	)
+
+	var fn rvalue(frame: &Frame, rvalue: &Rvalue, ty: Ty): Result<u128, Stop> = {
+		val program = self.program
+		val body: &Body = &frame.body.value()
+		return .Ok(
+			match rvalue {
+				.Use(operand) => self.scalar(&frame, &operand)?
+				.Unary(op, operand) => {
+					val value = self.scalar(&frame, &operand)?
+					val bits = (self.size(ty) * 8) as u32
+					match op {
+						.Neg => match program.types.kind(ty) {
+							.Float(float: .F32) => value ^ (1 << 31)
+							.Float(..) => value ^ (1 << 63)
+							_ => (0 -% value) & mask(bits)
+						}
+						.Not =>
+							if program.types.kind(ty) is .Bool then value ^ 1
+							else !value & mask(bits)
+					}
+				}
+				.Binary(op, lhs, rhs) => {
+					val operandType = operandTy(program, &body, &lhs)
+					val l = self.scalar(&frame, &lhs)?
+					val r = self.scalar(&frame, &rhs)?
+					match binary(program, operandType, op, l, r) {
+						.Some(value) => value
+						.None => return .Err(
+							.Cannot(
+								String::of(
+									"divides by zero, or overflows a division, where no check stood before it",
+								),
+							),
+						)
+					}
+				}
+				.Cast(operand, ty: to) => {
+					val from = operandTy(program, &body, &operand)
+					val value = self.scalar(&frame, &operand)?
+					cast(program, value, from, to)
+				}
+				.AddressOf(place) => self.place(&frame, &place)? as u128
+				.Variant(place) => {
+					val placeType = placeTy(program, &body, &place)
+					val address = self.place(&frame, &place)?
+					self.variant(address, placeType)? as u128
+				}
+				.CstrLen(operand) => {
+					val pointer = self.scalar(&frame, &operand)? as u64
+					self.strlen(pointer)? as u128
+				}
+				// Exact on every machine, so exactly what the program's instruction
+				// gives.
+				.Float(op, operand) => {
+					val bits = self.scalar(&frame, &operand)?
+					if program.types.kind(ty) is .Float(float: .F32) {
+						val value = f32::fromBits(bits as u32)
+						val answer = match op {
+							.Sqrt => value.sqrt()
+							.Floor => value.floor()
+							.Ceil => value.ceil()
+							.Trunc => value.trunc()
+						}
+						answer.toBits() as u128
+					} else {
+						val value = f64::fromBits(bits as u64)
+						val answer = match op {
+							.Sqrt => value.sqrt()
+							.Floor => value.floor()
+							.Ceil => value.ceil()
+							.Trunc => value.trunc()
+						}
+						answer.toBits() as u128
+					}
+				}
+				// The same bits, of the same width, read as the other type.
+				.Bits(operand) => self.scalar(&frame, &operand)?
+				// One rounding, which IEEE 754 defines.
+				.MulAdd(first, second, third) => {
+					val a = self.scalar(&frame, &first)?
+					val b = self.scalar(&frame, &second)?
+					val c = self.scalar(&frame, &third)?
+					if program.types.kind(ty) is .Float(float: .F32) then
+						f32::fromBits(a as u32).mulAdd(
+							f32::fromBits(b as u32),
+							f32::fromBits(c as u32),
+						).toBits() as u128
+					else f64::fromBits(a as u64).mulAdd(
+						f64::fromBits(b as u64),
+						f64::fromBits(c as u64),
+					).toBits() as u128
+				}
+				// An integer's bits, within its width.
+				.Integer(op, operand) => {
+					val (bits, _) = intOf(program, ty)
+					val value = self.scalar(&frame, &operand)? & mask(bits)
+					match op {
+						.CountOnes => value.countOnes()
+						.LeadingZeros => value.leadingZeros() - (128 - bits) as u128
+						.TrailingZeros => value.trailingZeros().min(bits as u128)
+						.SwapBytes => value.swapBytes() >> (128 - bits)
+						.ReverseBits => value.reverseBits() >> (128 - bits)
+					}
+				}
+				.Rotate(turn, lhs: value, rhs: amount) => {
+					val (bits, _) = intOf(program, ty)
+					val v = self.scalar(&frame, &value)? & mask(bits)
+					// Modulo the width, as a shift's amount is.
+					val turned = (self.scalar(&frame, &amount)? as u32) % bits
+					val left = match turn {
+						.Left => turned
+						.Right => (bits - turned) % bits
+					}
+					if left == 0 then v else ((v << left) | (v >> (bits - left))) & mask(bits)
+				}
+				// Whether the answer would not fit: what a checked `+` panics on.
+				.Overflows(op, lhs, rhs) => {
+					val operandType = operandTy(program, &body, &lhs)
+					val l = self.scalar(&frame, &lhs)?
+					val r = self.scalar(&frame, &rhs)?
+					if checked(program, operandType, op, l, r).isNone() then 1 else 0
+				}
+				.VTableFn(table, index, ..) => {
+					val at = self.scalar(&frame, &table)? as u64
+					self.readWord(at + index as u64 * 8)? as u128
+				}
+			},
+		)
+	}
+
+	/// Which variant the enum at `address` holds.
+	var fn variant(address: u64, ty: Ty): Result<u32, Stop> = .Ok(
+		match self.layouts.enumTag(self.program, ty) {
+			.Byte(size) => self.readInt(address, size as u64)? as u32
+			.Niche(payload, empty, offset) =>
+				if self.readWord(address + offset as u64)? == 0 then empty else payload
+		},
+	)
+
+	// --- Addresses that are not memory ------------------------------------
+
+	var fn codeAddress(callable: Callable): u64 = {
+		if self.codeOf.get(&callable) is .Some(address) then return address
+		val address = CODE + self.code.len() as u64 * 16
+		self.code.push(callable.clone())
+		self.codeOf.put(move callable, address)
+		return address
+	}
+
+	fn callable(address: u64): Result<Callable, Stop> = {
+		val index = (address -% CODE) / 16
+		if address >= CODE && (address -% CODE) % 16 == 0 && index < self.code.len() as u64 then
+			return .Ok(self.code[index as i64].clone())
+		return .Err(.Cannot(String::of("calls through an address that is no function's")))
+	}
+
+	/// A type's table of methods for an interface.
+	var fn vtable(interfaceId: InterfaceId, ty: Ty): Result<u64, Stop> = {
+		val key = (interfaceId, ty)
+		if self.vtables.get(&key) is .Some(address) then return .Ok(address)
+		var methods: Option<Vec<FnId>> = .None
+		for table in self.program.vtables {
+			if table.interfaceId == interfaceId && table.ty == ty {
+				methods = .Some(table.methods.clone())
+				break
+			}
+		}
+		val .Some(found) = methods else {
+			panic("every table a program needs was made with its instances")
+		}
+		val address = self.alloc((found.len() as u64 * 8).max(8))?
+		for (slot, method) in found.forwards().enumerate() {
+			val code = self.codeAddress(.Fn(method))
+			self.writeWord(address + slot as u64 * 8, code)?
+		}
+		self.vtables.put(key, address)
+		return .Ok(address)
+	}
+
+	var fn runtimeWords(): Result<u64, Stop> = {
+		if self.words is .Some(address) then return .Ok(address)
+		val address = self.alloc(RUNTIME_WORDS * 8)?
+		self.words = .Some(address)
+		return .Ok(address)
+	}
+
+	/// A string's bytes, with a NUL after them, kept once.
+	var fn string(sym: Symbol): Result<u64, Stop> = {
+		if self.strings.get(&sym) is .Some(address) then return .Ok(address)
+		val text = self.interner.resolve(sym)
+		val address = self.alloc(text.len() as u64 + 1)?
+		self.writeBytes(address, &text)?
+		self.strings.put(sym, address)
+		return .Ok(address)
+	}
+
+	// --- Memory ------------------------------------------------------------
+
+	var fn size(ty: Ty): u64 = self.layouts.of(self.program, ty).size as u64
+
+	/// Memory for `size` bytes, zeroed, aligned for anything.
+	var fn alloc(size: u64): Result<u64, Stop> = {
+		val rounded = roundUp(size)
+		if self.free.contains(&rounded) {
+			if self.free.at(&rounded).pop() is .Some(address) {
+				self.fill(address, rounded, 0)?
+				return .Ok(address)
+			}
+		}
+		val address = self.memory.len() as u64
+		if address + rounded > BYTES then return .Err(.Budget(String::of("much memory")))
+		self.memory.reserve((address + rounded) as i64)
+		while self.memory.len() < (address + rounded) as i64 {
+			self.memory.push(0)
+		}
+		return .Ok(address)
+	}
+
+	var fn release(address: u64, size: u64) = {
+		self.free.atOrPut(roundUp(size), Vec()).push(address)
+	}
+
+	/// Where `len` bytes at `address` are in memory: `start` and `end`, or a
+	/// stop where they are not all memory.
+	fn range(address: u64, len: u64): Result<(i64, i64), Stop> = {
+		val end = address.checkedAdd(len)
+		if end is .Some(e) && address >= BASE && e <= self.memory.len() as u64 then
+			return .Ok((address as i64, e as i64))
+		if len == 0 then return .Ok((0, 0))
+		return .Err(.Cannot("reads or writes memory at \(hex(address)), which is no value's"))
+	}
+
+	fn readBytes(address: u64, len: u64): Result<Vec<u8>, Stop> = {
+		val (start, end) = self.range(address, len)?
+		return .Ok(self.memory[start..end].toVec())
+	}
+
+	var fn writeBytes(address: u64, bytes: &[u8]): Result<void, Stop> = {
+		val (start, end) = self.range(address, bytes.len() as u64)?
+		self.memory[start..end].copyFrom(bytes)
+		return .Ok()
+	}
+
+	var fn copy(dest: u64, source: u64, len: u64): Result<void, Stop> = {
+		val (from, fromEnd) = self.range(source, len)?
+		val (to, _) = self.range(dest, len)?
+		val bytes = self.memory[from..fromEnd].toVec()
+		self.memory[to..(to + bytes.len())].copyFrom(&bytes)
+		return .Ok()
+	}
+
+	var fn fill(address: u64, len: u64, byte: u8): Result<void, Stop> = {
+		val (start, end) = self.range(address, len)?
+		for i in start..end {
+			self.memory[i] = byte
+		}
+		return .Ok()
+	}
+
+	fn readInt(address: u64, size: u64): Result<u128, Stop> = {
+		val (start, end) = self.range(address, size)?
+		var bits: u128 = 0
+		var i = end
+		while i > start {
+			i -= 1
+			bits = (bits << 8) | self.memory[i] as u128
+		}
+		return .Ok(bits)
+	}
+
+	var fn writeInt(address: u64, size: u64, bits: u128): Result<void, Stop> = {
+		val (start, end) = self.range(address, size)?
+		var rest = bits
+		for i in start..end {
+			self.memory[i] = rest as u8
+			rest = rest >> 8
+		}
+		return .Ok()
+	}
+
+	fn readWord(address: u64): Result<u64, Stop> = .Ok(self.readInt(address, 8)? as u64)
+
+	var fn writeWord(address: u64, value: u64): Result<void, Stop> = self.writeInt(
+		address,
+		8,
+		value as u128,
+	)
+
+	/// A scalar of type `ty` at `address`.
+	var fn load(address: u64, ty: Ty): Result<u128, Stop> = {
+		val size = self.size(ty)
+		return self.readInt(address, size)
+	}
+
+	var fn store(address: u64, ty: Ty, bits: u128): Result<void, Stop> = {
+		val size = self.size(ty)
+		return self.writeInt(address, size, bits)
+	}
+
+	fn strlen(pointer: u64): Result<u64, Stop> = {
+		val (start, _) = self.range(pointer, 1)?
+		for i in start..self.memory.len() {
+			if self.memory[i] == 0 then return .Ok((i - start) as u64)
+		}
+		return .Err(.Cannot(String::of("reads a C string that has no end")))
+	}
+
+	fn text(pointer: u64, length: u64): Result<String, Stop> = {
+		val bytes = self.readBytes(pointer, length)?
+		return .Ok(lossy(&bytes))
+	}
+}
+
+/// The word an argument is: a scalar's low bits, or an aggregate's address; 0
+/// past the last.
+fn word(args: &[Arg], i: i64): u64 = {
+	if i >= args.len() then return 0
+	return match args[i] {
+		.Scalar(bits) => bits as u64
+		.Address(address) => address
+	}
+}
+
+/// `size`, rounded up to a multiple of 16.
+fn roundUp(size: u64): u64 = (size + 15) / 16 * 16
+
+/// An address as Rust's `{:#x}` writes it.
+fn hex(value: u64): String = {
+	var reversed: Vec<u8> = Vec()
+	var rest = value
+	while true {
+		val digit = (rest % 16) as u8
+		reversed.push(if digit < 10 then b'0' + digit else b'a' + digit - 10)
+		rest = rest / 16
+		if rest == 0 then break
+	}
+	var text = String::of("0x")
+	var i = reversed.len()
+	while i > 0 {
+		i -= 1
+		text.pushByte(reversed[i])
+	}
+	return move text
+}
+
+/// Bytes as text, each run of them that is not UTF-8 read as one U+FFFD: the
+/// longest start of a sequence that could still have been one, or a byte that
+/// begins none.
+fn lossy(bytes: &[u8]): String = {
+	var text = String()
+	var i = 0
+	while i < bytes.len() {
+		val lead = bytes[i]
+		if lead < 0x80 {
+			text.pushByte(lead)
+			i += 1
+			continue
+		}
+		// How many bytes follow the lead, and the range the first of them must
+		// be in; the rest are each 0x80 to 0xBF.
+		val (follow, low, high) = match lead {
+			0xC2..=0xDF => (1, 0x80, 0xBF)
+			0xE0 => (2, 0xA0, 0xBF)
+			0xE1..=0xEC | 0xEE..=0xEF => (2, 0x80, 0xBF)
+			0xED => (2, 0x80, 0x9F)
+			0xF0 => (3, 0x90, 0xBF)
+			0xF1..=0xF3 => (3, 0x80, 0xBF)
+			0xF4 => (3, 0x80, 0x8F)
+			_ => (0, 0, 0)
+		}
+		var taken = 1
+		var valid = follow > 0
+		while valid && taken <= follow {
+			if i + taken >= bytes.len() {
+				valid = false
+				break
+			}
+			val next = bytes[i + taken] as i64
+			val least = if taken == 1 then low else 0x80
+			val most = if taken == 1 then high else 0xBF
+			if next < least || next > most {
+				valid = false
+				break
+			}
+			taken += 1
+		}
+		if valid then text.pushBytes(&bytes[i..(i + taken)]) else text.pushChar('\u{FFFD}')
+		i += taken
+	}
+	return move text
+}
+
+// --- Arithmetic, as the code generator does it -----------------------------
+
+/// The low `bits` bits.
+fn mask(bits: u32): u128 = if bits >= 128 then !(0 as u128) else ((1 as u128) << bits) - 1
+
+/// A scalar type's width and whether it is signed: an integer's own, and every
+/// other scalar's as the unsigned number it is held in.
+fn intOf(program: &Program, ty: Ty): (u32, bool) = match program.types.kind(ty) {
+	.Int(int) => (int.bits(), int.signed())
+	.Char => (32, false)
+	.Bool => (8, false)
+	_ => (64, false)
+}
+
+/// The bits of a value of type `ty`, as the signed number they are.
+fn signed(program: &Program, ty: Ty, bits: u128): i128 = {
+	val (width, isSigned) = intOf(program, ty)
+	if !isSigned || width >= 128 then return bits as i128
+	val shift = 128 - width
+	return ((bits << shift) as i128) >> shift
+}
+
+fn overflowMessage(op: BinaryOp): str = match op {
+	.Add => "the sum does not fit"
+	.Sub => "the difference does not fit"
+	.Mul => "the product does not fit"
+	_ => "the answer does not fit"
+}
+
+/// `+`, `-` or `*` that panics where the answer does not fit: `None` then.
+fn checked(program: &Program, ty: Ty, op: BinaryOp, l: u128, r: u128): Option<u128> = {
+	val (bits, isSigned) = intOf(program, ty)
+	if isSigned {
+		val a = signed(program, ty, l)
+		val b = signed(program, ty, r)
+		val .Some(answer) = match op {
+			.Add => a.checkedAdd(b)
+			.Sub => a.checkedSub(b)
+			.Mul => a.checkedMul(b)
+			_ => panic("only `+`, `-` and `*` are checked this way")
+		} else {
+			return .None
+		}
+		if bits < 128 {
+			val low = -((1 as i128) << (bits - 1))
+			val high = ((1 as i128) << (bits - 1)) - 1
+			if answer < low || answer > high then return .None
+		}
+		return .Some(answer as u128 & mask(bits))
+	}
+	val .Some(answer) = match op {
+		.Add => l.checkedAdd(r)
+		.Sub => l.checkedSub(r)
+		.Mul => l.checkedMul(r)
+		_ => panic("only `+`, `-` and `*` are checked this way")
+	} else {
+		return .None
+	}
+	return if answer <= mask(bits) then .Some(answer) else .None
+}
+
+fn boolBits(b: bool): u128 = if b then 1 else 0
+
+/// A binary operator on operands of type `operand`; `None` for a division the
+/// machine traps on.
+fn binary(program: &Program, operand: Ty, op: BinaryOp, l: u128, r: u128): Option<u128> = {
+	match program.types.kind(operand) {
+		.Float(float: .F32) => {
+			val a = f32::fromBits(l as u32)
+			val b = f32::fromBits(r as u32)
+			return .Some(
+				match op {
+					.Add => (a + b).toBits() as u128
+					.Sub => (a - b).toBits() as u128
+					.Mul => (a * b).toBits() as u128
+					.Div => (a / b).toBits() as u128
+					.Eq => boolBits(a == b)
+					.Ne => boolBits(a != b)
+					.Lt => boolBits(a < b)
+					.Le => boolBits(a <= b)
+					.Gt => boolBits(a > b)
+					.Ge => boolBits(a >= b)
+					_ => panic("the type checker rejects this operator on floats")
+				},
+			)
+		}
+		.Float(..) => {
+			val a = f64::fromBits(l as u64)
+			val b = f64::fromBits(r as u64)
+			return .Some(
+				match op {
+					.Add => (a + b).toBits() as u128
+					.Sub => (a - b).toBits() as u128
+					.Mul => (a * b).toBits() as u128
+					.Div => (a / b).toBits() as u128
+					.Eq => boolBits(a == b)
+					.Ne => boolBits(a != b)
+					.Lt => boolBits(a < b)
+					.Le => boolBits(a <= b)
+					.Gt => boolBits(a > b)
+					.Ge => boolBits(a >= b)
+					_ => panic("the type checker rejects this operator on floats")
+				},
+			)
+		}
+		_ => {}
+	}
+	val (bits, isSigned) = intOf(program, operand)
+	val m = mask(bits)
+	val a = signed(program, operand, l)
+	val b = signed(program, operand, r)
+	return .Some(
+		match op {
+			.Add => (l +% r) & m
+			.Sub => (l -% r) & m
+			.Mul => (l *% r) & m
+			.Div | .Rem if r & m == 0 => return .None
+			.Div if isSigned => match a.checkedDiv(b) {
+				.Some(q) => q as u128 & m
+				.None => return .None
+			}
+			.Div => (l & m) / (r & m)
+			.Rem if isSigned => match a.checkedRem(b) {
+				.Some(q) => q as u128 & m
+				.None => return .None
+			}
+			.Rem => (l & m) % (r & m)
+			.BitAnd => l & r & m
+			.BitOr => (l | r) & m
+			.BitXor => (l ^ r) & m
+			// The amount is taken modulo the width.
+			.Shl => (l << ((r as u32) % bits)) & m
+			.Shr if isSigned => (a >> ((r as u32) % bits)) as u128 & m
+			.Shr => (l & m) >> ((r as u32) % bits)
+			.Eq => boolBits(l & m == r & m)
+			.Ne => boolBits(l & m != r & m)
+			.Lt | .Le | .Gt | .Ge => {
+				val left = l & m
+				val right = r & m
+				val order = if isSigned then a.compare(&b) else left.compare(&right)
+				boolBits(
+					match op {
+						.Lt => order.isLess()
+						.Le => !order.isMore()
+						.Gt => order.isMore()
+						_ => !order.isLess()
+					},
+				)
+			}
+			.And | .Or => panic("`&&` and `||` are branches in MIR")
+		},
+	)
+}
+
+/// A float as an integer of `bits` bits, toward zero, the least or the greatest
+/// value where it is past them, and 0 for NaN.
+fn saturated(v: f64, bits: u32, isSigned: bool): u128 = {
+	if v != v then return 0
+	if isSigned {
+		val limit = ((1 as u128) << (bits - 1)) as f64
+		if v >= limit then return (((1 as u128) << (bits - 1)) - 1) & mask(bits)
+		if v < -limit then return ((1 as u128) << (bits - 1)) & mask(bits)
+		val whole = if bits <= 64 then v as i64 as i128 else v as i128
+		return whole as u128 & mask(bits)
+	}
+	if v <= -1.0 then return 0
+	val limit =
+		if bits >= 128 then ((1 as u128) << 127) as f64 * 2.0 else ((1 as u128) << bits) as f64
+	if v >= limit then return mask(bits)
+	if v < 0.0 then return 0
+	return if bits <= 64 then v as u64 as u128 else v as u128
+}
+
+/// `value as to`: widening by the source's sign, narrowing to the low bits,
+/// floats toward zero and saturating.
+fn cast(program: &Program, value: u128, from: Ty, to: Ty): u128 = {
+	val fromKind = program.types.kind(from)
+	val toKind = program.types.kind(to)
+	if fromKind is .Float(float: .F32) && toKind is .Float(float: .F64) then
+		return (f32::fromBits(value as u32) as f64).toBits() as u128
+	if fromKind is .Float(float: .F64) && toKind is .Float(float: .F32) then
+		return (f64::fromBits(value as u64) as f32).toBits() as u128
+	if fromKind is .Float(..) && toKind is .Float(..) then return value
+	if fromKind is .Float(float: f) {
+		val v =
+			if f == .F32 then f32::fromBits(value as u32) as f64 else f64::fromBits(value as u64)
+		val (bits, isSigned) = intOf(program, to)
+		return saturated(v, bits, isSigned) & mask(bits)
+	}
+	if toKind is .Float(float: f) {
+		val (_, isSigned) = intOf(program, from)
+		val v = signed(program, from, value)
+		return match f {
+			.F32 =>
+				if isSigned then (v as f32).toBits() as u128 else (value as f32).toBits() as u128
+			.F64 =>
+				if isSigned then (v as f64).toBits() as u128 else (value as f64).toBits() as u128
+		}
+	}
+	val (toBits, _) = intOf(program, to)
+	return signed(program, from, value) as u128 & mask(toBits)
+}

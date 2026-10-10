@@ -1,0 +1,1069 @@
+// Name resolution and type checking: syntax tree to `Program`.
+//
+// Checking is bidirectional. An expected type flows down where the context
+// knows it (annotated `let`, arguments, `return`, field initializers) and is
+// checked with `Lowerer.check`; everywhere else the type is synthesized
+// bottom-up by `Lowerer.infer`. There is no inference beyond that.
+//
+// The bodies are checked on several threads, each on a copy of the
+// declarations, and what each found is merged in order: the types each
+// interned are absorbed, and its bodies renumbered, so the program is the
+// same at any number of threads.
+
+import std::collections::{Map, Set}
+import std::future
+import std::mem
+import syntax as ast
+import syntax::{DUPLICATE_DEFINITION, Diagnostic, Interner, Span, Symbol, split}
+
+pub struct Lowered {
+	pub var program: Program
+	pub var diagnostics: Vec<Diagnostic>
+}
+
+/// One module's files, as the driver found them.
+pub view struct ModuleAst {
+	/// `a::b::c`, and empty for the root module. A module of a dependency is
+	/// named with the dependency's name first, `engine::render`, which is how
+	/// every other package writes it.
+	pub var path: String
+	pub var files: Vec<&ast::Ast>
+	/// What the module's own paths are written from: empty for the program's
+	/// package and the standard library, and the package's name for a
+	/// dependency, so that `render` written in `engine` is `engine::render`.
+	pub var prefix: String
+	/// The names of the packages the module's package depends on, which its
+	/// paths may begin with as they may begin with `std`.
+	pub var depends: Vec<String>
+	/// Where its files are, which the files it embeds are read relative to,
+	/// and its package's root, which they may not leave. Nothing for the
+	/// standard library, which is in the compiler, and for a file checked on
+	/// its own.
+	pub var dir: Option<String>
+	pub var root: Option<String>
+}
+
+/// What one file's imports bind.
+@derive(Clone)
+struct FileImports {
+	/// Modules, by the name the file gave them.
+	modules: Map<Symbol, i64> = Map()
+	/// Items of other modules, by the name the file gave them.
+	items: Map<Symbol, ImportedItem> = Map()
+}
+
+@derive(Clone)
+enum ImportedItem {
+	/// The item's module, and its name there.
+	Item(module: i64, name: ast::Name)
+	/// An import already reported as wrong: its uses stay quiet.
+	Broken
+}
+
+/// `type Id = i64`: another name for a type. The body is resolved once,
+/// with the alias's own parameters standing in it, and each use substitutes
+/// the arguments it was given.
+@derive(Clone)
+struct AliasDef {
+	/// Nothing until something asks for it, and its body is resolved.
+	ty: Option<Ty>
+	generics: Vec<GenericParamDef>
+	isPub: bool
+	span: Span
+}
+
+/// How far the checker has come through a program, in order: what it learns
+/// in one phase it knows in every later one, and a check that needs what it
+/// does not know yet waits for the phase that tells it.
+@derive(Eq, Ord, Clone)
+enum Phase {
+	/// Names are declared and types resolved: whether a type owns memory is
+	/// not known yet.
+	Declaring
+	/// Every type's body is resolved; what implements what is not known yet.
+	TypesResolved
+	/// Every `extend` block is declared, and bodies are checked.
+	ImplsDeclared
+}
+
+/// Where an alias is written, to resolve its body there.
+@derive(Clone)
+view struct AliasSource {
+	decl: &ast::TypeAlias
+	ast: &ast::Ast
+	imports: FileImports
+}
+
+/// Where a type whose fields have defaults is declared, with what its file
+/// sees: its defaults are checked there, when a literal first needs them or
+/// in their turn, whichever comes first.
+@derive(Clone)
+view struct DefaultSource {
+	item: Declared
+	module: i64
+	ast: &ast::Ast
+	imports: FileImports
+	lambdas: Map<ast::ExprId, FnId>
+	lambdaEnvs: Map<FnId, StructId>
+	generators: Map<ast::ExprId, StructId>
+}
+
+/// The names one module declares, and what it exports.
+@derive(Clone)
+struct ModuleScope {
+	path: String
+	/// The module's package, as `ModuleAst` says.
+	prefix: String
+	depends: Vec<String>
+	/// Where its files are, and its package's root.
+	dir: Option<String>
+	root: Option<String>
+	types: Map<Symbol, (TypeDef, Span)> = Map()
+	/// The type aliases the module declares.
+	aliases: Map<Symbol, AliasDef> = Map()
+	/// The opaque C types the module declares.
+	opaques: Map<Symbol, OpaqueId> = Map()
+	/// The interfaces the module declares.
+	interfaces: Map<Symbol, (InterfaceId, Span)> = Map()
+	fns: Map<Symbol, FnId> = Map()
+	/// The constants the module declares.
+	consts: Map<Symbol, ConstId> = Map()
+	/// The variables C owns that the module declares.
+	globals: Map<Symbol, GlobalId> = Map()
+}
+
+/// Lowers a program of one file, in the root module.
+pub fn lowerFile(file: &ast::Ast, interner: &Interner): Lowered = lower(
+	[
+		ModuleAst(
+			path: String(),
+			files: Vec::of(own [&file]),
+			prefix: String(),
+			depends: Vec(),
+			dir: .None,
+			root: .None,
+		),
+	],
+	&interner,
+	future::cores(),
+)
+
+/// Lowers a program, checking its bodies on up to `threads` threads.
+pub fn lower(modules: &[ModuleAst], interner: &Interner, threads: i64): Lowered = {
+	// Every file, with the module it belongs to.
+	var files: Vec<(i64, &ast::Ast)> = Vec()
+	for index in 0..modules.len() {
+		for file in modules[index].files {
+			files.push((index, file))
+		}
+	}
+	var paths: Vec<String> = Vec()
+	for module in modules {
+		paths.push(module.path.clone())
+	}
+	val program = Program::new(move paths)
+	if files.isEmpty() then return Lowered(program: move program, diagnostics: Vec())
+	var scopes: Vec<ModuleScope> = Vec()
+	for module in modules {
+		scopes.push(ModuleScope(
+			path: module.path.clone(),
+			prefix: module.prefix.clone(),
+			depends: module.depends.clone(),
+			dir: module.dir.clone(),
+			root: module.root.clone(),
+		))
+	}
+	var lowerer = Lowerer::new(files[0].1, &interner, move program, move scopes)
+	// The prelude is declared before anything else, so that a module that
+	// declares one of its names is reported.
+	var prelude: Option<i64> = .None
+	for (i, module) in modules.forwards().enumerate() {
+		if prelude.isNone() && module.path == PRELUDE then prelude = .Some(i)
+	}
+	var declarationOrder: Vec<i64> = Vec()
+	for i in 0..files.len() {
+		if prelude == .Some(files[i].0) then declarationOrder.push(i)
+	}
+	for i in 0..files.len() {
+		if prelude != .Some(files[i].0) then declarationOrder.push(i)
+	}
+	// Imports are resolved once, so their errors are reported once.
+	var imports: Vec<FileImports> = Vec()
+	for (module, file) in files {
+		lowerer.enter(module, file, FileImports())
+		imports.push(lowerer.resolveImports())
+	}
+
+	// Names first, so that a type may be used before it is declared and by
+	// any module that imports it. Interfaces come before types, since a
+	// type's parameters may be constrained by one.
+	var interfaces: Vec<Vec<(&ast::InterfaceDecl, InterfaceId)>> = Vec()
+	var types: Vec<Vec<(Declared, TypeDef)>> = Vec()
+	for _ in files {
+		interfaces.push(Vec())
+		types.push(Vec())
+	}
+	for i in declarationOrder {
+		lowerer.enter(files[i].0, files[i].1, FileImports())
+		interfaces[i] = lowerer.collectInterfaces()
+	}
+	for i in declarationOrder {
+		lowerer.enter(files[i].0, files[i].1, FileImports())
+		types[i] = lowerer.collectTypes()
+	}
+	// The type aliases' names, before any body names one.
+	for i in declarationOrder {
+		lowerer.enter(files[i].0, files[i].1, FileImports())
+		lowerer.collectAliases()
+	}
+	// With every type named, the items a file imports can be checked before
+	// anything uses them.
+	var checkedImports: Vec<FileImports> = Vec()
+	for _ in files {
+		checkedImports.push(FileImports())
+	}
+	for i in declarationOrder {
+		lowerer.enter(files[i].0, files[i].1, mem::replace(&var imports[i], FileImports()))
+		checkedImports[i] = lowerer.checkImportedItems(&modules)
+	}
+	imports = move checkedImports
+	// A function for every lambda, before the bodies are checked, and before
+	// the constants, whose values may hold one too.
+	var lambdas: Vec<Map<ast::ExprId, FnId>> = Vec()
+	var envs: Vec<Map<FnId, StructId>> = Vec()
+	// And a struct and its `next` for every loop that is a generator.
+	var generators: Vec<Map<ast::ExprId, StructId>> = Vec()
+	for _ in files {
+		lambdas.push(Map())
+		envs.push(Map())
+		generators.push(Map())
+	}
+	for i in declarationOrder {
+		lowerer.enter(files[i].0, files[i].1, imports[i].clone())
+		val (fileLambdas, fileEnvs) = lowerer.collectLambdas()
+		lambdas[i] = move fileLambdas
+		envs[i] = move fileEnvs
+		generators[i] = lowerer.collectGenerators()
+	}
+	val files = move files
+	val lambdas = move lambdas
+	val envs = move envs
+	val generators = move generators
+	// Constants are declared before type bodies, since an array's length may
+	// be one; each is worked out where it is first needed, with its file's
+	// lambdas and generators.
+	for i in declarationOrder {
+		lowerer.enterFile(i, &files, &imports, &lambdas, &envs, &generators)
+		lowerer.declareConsts()
+	}
+	// The environment a named function lent as a closure carries, which holds
+	// nothing.
+	lowerer.program.fnClosureEnv = .Some(
+		lowerer.program.structs.add(StructDef(
+			isExtern: false,
+			isUnion: false,
+			isOpaque: false,
+			isIntrinsic: false,
+			header: .None,
+			accessors: Vec(),
+			name: interner.lambdaSymbol(),
+			generics: Vec(),
+			fields: Vec(),
+			methods: Vec(),
+			isTuple: false,
+			generator: .None,
+			isEnv: true,
+			isView: false,
+			module: 0,
+			isPub: false,
+			span: Span::at(0),
+		)),
+	)
+	// And the one a named function made an owned closure carries, which holds
+	// nothing but the function that drops it, as every owned closure's
+	// environment begins with.
+	val address = lowerer.program.types.internList([PTR_U8])
+	val dropTy = lowerer.intern(.Fn(params: address, ret: UNIT))
+	lowerer.program.fnOwnedClosureEnv = .Some(
+		lowerer.program.structs.add(StructDef(
+			isExtern: false,
+			isUnion: false,
+			isOpaque: false,
+			isIntrinsic: false,
+			header: .None,
+			accessors: Vec(),
+			name: interner.lambdaSymbol(),
+			generics: Vec(),
+			fields: Vec::of(own [
+				FieldDef(
+					isPub: false,
+					isVar: false,
+					name: interner.lambdaSymbol(),
+					ty: dropTy,
+					span: Span::at(0),
+					default: .None,
+				),
+			]),
+			methods: Vec(),
+			isTuple: false,
+			generator: .None,
+			isEnv: true,
+			isView: false,
+			module: 0,
+			isPub: false,
+			span: Span::at(0),
+		)),
+	)
+	// An alias's body, once the imports are known: each where it is written,
+	// and one another names when that one is resolved, which says where an
+	// alias names itself.
+	for i in declarationOrder {
+		lowerer.enterFile(i, &files, &imports, &lambdas, &envs, &generators)
+		lowerer.recordAliasSources()
+	}
+	// The defaults of type parameters, before any alias or type body leaves
+	// an argument out. One may leave out another's, so they are read in
+	// rounds until a round reads none; what is left rests on itself.
+	while true {
+		var read = false
+		for i in declarationOrder {
+			lowerer.enterFile(i, &files, &imports, &lambdas, &envs, &generators)
+			if lowerer.resolveDefaults(&types[i], false) then read = true
+		}
+		if !read then break
+	}
+	for i in declarationOrder {
+		lowerer.enterFile(i, &files, &imports, &lambdas, &envs, &generators)
+		lowerer.resolveDefaults(&types[i], true)
+	}
+	// An interface's defaults may name a type whose own were read above, and
+	// `Self`.
+	for i in declarationOrder {
+		lowerer.enterFile(i, &files, &imports, &lambdas, &envs, &generators)
+		lowerer.resolveInterfaceDefaults(&interfaces[i])
+	}
+	for i in declarationOrder {
+		lowerer.enterFile(i, &files, &imports, &lambdas, &envs, &generators)
+		lowerer.resolveAliases()
+	}
+	for i in 0..files.len() {
+		lowerer.enterFile(i, &files, &imports, &lambdas, &envs, &generators)
+		lowerer.resolveTypeBodies(&types[i])
+	}
+	lowerer.checkRecursiveTypes()
+	lowerer.flushCopyChecks()
+	// An interface's methods before anything implements it.
+	var fns: Vec<Vec<BodyWork>> = Vec()
+	// The parameters with defaults, by file, which are checked once every
+	// function is declared.
+	var paramDefaults: Vec<Vec<(FnId, i64, ast::ExprId)>> = Vec()
+	for _ in files {
+		fns.push(Vec())
+		paramDefaults.push(Vec())
+	}
+	for i in declarationOrder {
+		lowerer.enter(files[i].0, files[i].1, imports[i].clone())
+		lowerer.declareInterfaceMethods(&interfaces[i], &var fns[i])
+		for d in mem::replace(&var lowerer.paramDefaults, Vec()) {
+			paramDefaults[i].push(d)
+		}
+	}
+	// What every type asks `@derive` for, before any is declared: a field of
+	// a type declared in a later file is counted too, and what `@derive`
+	// wrote is for the type that asked.
+	for i in declarationOrder {
+		lowerer.noteDerives(&types[i])
+	}
+	for i in declarationOrder {
+		lowerer.enter(files[i].0, files[i].1, imports[i].clone())
+		for work in lowerer.collectFns() {
+			fns[i].push(work)
+		}
+		for d in mem::replace(&var lowerer.paramDefaults, Vec()) {
+			paramDefaults[i].push(d)
+		}
+	}
+	// Every generator is an `Iterator`, with the interface's other methods.
+	for i in declarationOrder {
+		lowerer.enterFile(i, &files, &imports, &lambdas, &envs, &generators)
+		lowerer.declareGeneratorImpls()
+	}
+	// An enum whose variants carry nothing gets `count` and `fromIndex`,
+	// unless the program declared methods of those names.
+	for i in 0..files.len() {
+		lowerer.enterFile(i, &files, &imports, &lambdas, &envs, &generators)
+		lowerer.declareEnumNumbers(&types[i])
+	}
+	// With every implementation declared, the types that asked for
+	// `@derive(Eq)` get the comparison the compiler writes.
+	for i in declarationOrder {
+		lowerer.enter(files[i].0, files[i].1, imports[i].clone())
+		lowerer.declareEquality(&types[i])
+	}
+	// With every implementation declared, the constraints on the types
+	// written before them can be checked.
+	lowerer.flushConstraintChecks()
+	// Defaults, once every function is declared, since one may be code that
+	// calls one; a field's first, since a parameter's may be a literal that
+	// leaves one out.
+	for i in 0..files.len() {
+		for (item, def) in types[i] {
+			if item.hasFieldDefaults() then
+				lowerer.defaultSources.put(def, DefaultSource(
+					item: item,
+					module: files[i].0,
+					ast: files[i].1,
+					imports: imports[i].clone(),
+					lambdas: lambdas[i].clone(),
+					lambdaEnvs: envs[i].clone(),
+					generators: generators[i].clone(),
+				))
+		}
+	}
+	for declared in types {
+		for (_, def) in declared {
+			lowerer.ensureDefaults(def)
+		}
+	}
+	for i in 0..files.len() {
+		lowerer.enterFile(i, &files, &imports, &lambdas, &envs, &generators)
+		lowerer.checkParamDefaults(&paramDefaults[i])
+	}
+	// Every constant that was not needed by a type is worked out here, and
+	// each top-level `assert` checked, to be run once the program is.
+	for i in declarationOrder {
+		lowerer.enter(files[i].0, files[i].1, imports[i].clone())
+		lowerer.checkConsts()
+		lowerer.checkAsserts()
+	}
+
+	// Bodies last. Every signature is known by now, so no body waits for
+	// another. They are split by the size of what was written, each range
+	// checked by a worker of its own where there is more than one.
+	var work: Vec<(i64, BodyWork)> = Vec()
+	var weights: Vec<i64> = Vec()
+	for i in 0..fns.len() {
+		for one in fns[i] {
+			if lowerer.withheld.contains(&one.id) then continue
+			work.push((i, one.clone()))
+			weights.push((one.span.hi - one.span.lo) as i64)
+		}
+	}
+	val ranges = split(&weights.items(), threads)
+	if ranges.len() == 1 {
+		lowerer.checkBodies(
+			&work.items(),
+			&files.items(),
+			&imports.items(),
+			&lambdas.items(),
+			&envs.items(),
+			&generators.items(),
+		)
+	} else {
+		val mark = lowerer.program.types.mark()
+		// What each worker starts from: the declarations as they are now, and
+		// how far the checker has come, taken before the threads begin, so
+		// that the workers borrow these and not the lowerer, which takes back
+		// what they checked.
+		val declared = lowerer.program.clone()
+		val scopes = lowerer.modules.clone()
+		val phase = lowerer.phase.clone()
+		val workers = future::map(
+			&ranges.items(),
+			(range) => {
+				// A lowerer that checks bodies on another thread, from a copy of the
+				// declarations, interning types of its own, which `intoChecked`
+				// hands back. It checks a constraint where it is written rather than
+				// putting it off, the implementations being all declared, and what
+				// it records is its own, joining the lowerer's afterwards.
+				var worker = Lowerer::new(files[0].1, &interner, declared.clone(), scopes.clone())
+				worker.phase = phase.clone()
+				worker.program.names.clear()
+				worker.checkBodies(
+					&work[range.0..range.1],
+					&files.items(),
+					&imports.items(),
+					&lambdas.items(),
+					&envs.items(),
+					&generators.items(),
+				)
+				return move worker
+			},
+		)
+		// The types each worker added, numbered in order, as one lowerer would
+		// have numbered them. There are few, so this is quick.
+		var taken: Vec<Taken> = Vec()
+		var at = 0
+		for worker in move workers {
+			val map = lowerer.program.types.absorb(&worker.program.types, &mark)
+			taken.push(Taken(
+				worker: .Some(move worker),
+				map: move map,
+				start: ranges[at].0,
+				end: ranges[at].1,
+				checked: .None,
+			))
+			at += 1
+		}
+		// Renumbering the bodies, and freeing each worker's copy of the
+		// declarations, is not: that happens on threads again.
+		future::each(&var taken, (piece) => {
+			var done = match piece.worker.take() {
+				.Some(worker) => move worker
+				.None => return
+			}
+			piece.checked = .Some(done.intoChecked(&work[piece.start..piece.end], &piece.map))
+		})
+		for piece in move taken {
+			if move piece.checked is .Some(checked) then lowerer.takeChecked(move checked)
+		}
+	}
+	// A projection that forwards to another lends what that one lends, which
+	// is known only now that every body is checked.
+	lowerer.resolveForwarded()
+	// The code of the closures made from named functions.
+	lowerer.makeFnClosures()
+	// A generator that holds itself would be endlessly large.
+	lowerer.checkGeneratorCycles()
+	// An `@inline` function that reaches itself could never be spliced.
+	lowerer.checkInlineCycles()
+	// With every body checked, each call to a C function that takes more
+	// than it declares is pointed at a declaration of what it passes.
+	resolveVariadicCalls(&var lowerer.program)
+	// Later phases share the types read-only, so the field types of every
+	// instance are interned now. A program with errors goes no further, and
+	// its types may be the endless ones reported.
+	var errors = false
+	for d in lowerer.diagnostics {
+		if d.isError() then errors = true
+	}
+	if !errors then lowerer.completeTypes(0)
+	return Lowered(program: move lowerer.program, diagnostics: move lowerer.diagnostics)
+}
+
+/// What a worker did, taken back in the order of the ranges: the worker,
+/// until its bodies are taken out of it; where its types are in the
+/// lowerer's; the range it checked; and what it checked, renumbered.
+view struct Taken {
+	worker: Option<Lowerer>
+	map: TyMap
+	start: i64
+	end: i64
+	checked: Option<CheckedBodies>
+}
+
+/// The bodies one worker checked, with what their projections lend, and
+/// what it reported.
+struct CheckedBodies {
+	bodies: Vec<(FnId, Option<Body>, Option<Lent>)>
+	/// The functions of the lambdas this worker checked: their signatures are
+	/// known only once their bodies are.
+	lambdas: Vec<(FnId, FnDef)>
+	/// What each closure it checked captured.
+	envStructs: Vec<(StructId, StructDef)>
+	/// The generators it checked: each one's `next`, its struct, and what its
+	/// implementation of `Iterator` yields and when it holds.
+	generators: Vec<GeneratorChecked>
+	/// The names it read that left no expression.
+	names: Vec<(Span, Named)>
+	diagnostics: Vec<Diagnostic>
+}
+
+/// A generator a worker checked: its `next`, its struct, and the index of its
+/// implementation of `Iterator` with what that yields and when it holds.
+struct GeneratorChecked {
+	next: FnId
+	def: FnDef
+	id: StructId
+	strukt: StructDef
+	implementation: Option<(i64, TyList, Vec<GenericParamDef>)>
+}
+
+/// A body to check: the expression, the function it belongs to, and the span
+/// of what was written.
+@derive(Clone)
+struct BodyWork {
+	body: ast::ExprId
+	id: FnId
+	span: Span
+}
+
+/// A method being declared: how it takes its receiver, the span of the word
+/// that says so, the type it belongs to, and that type's parameters as this
+/// declaration names them.
+@derive(Clone)
+struct Member {
+	receiver: ast::Receiver
+	keyword: Span
+	owner: MemberOwner
+	typeParams: Vec<GenericParamDef>
+	/// Written in an `extend` of an interface that takes types: `From<i64>`
+	/// and `From<Feet>` both declare `from`, and which is meant is decided by
+	/// what is passed.
+	overloaded: bool
+	/// The writing half of a `lend fn`, whose `&T` result it lends as
+	/// `&var T`.
+	lent: bool
+}
+
+/// What a method belongs to: a type, or an interface, whose methods are
+/// checked with `Self` as their type parameter.
+@derive(Eq, Clone)
+enum MemberOwner {
+	Type(def: TypeDef)
+	Interface(id: InterfaceId)
+}
+
+/// What an assignment target ultimately writes to.
+@derive(Eq, Clone)
+enum PlaceRoot {
+	Local(local: LocalId)
+	/// Behind a `&` parameter, which only reads.
+	ThroughRef
+	/// Through a `ptr<T>`: C's memory, which Wip writes whatever the pointer
+	/// was declared.
+	ThroughPointer
+	/// Behind a `&var` parameter, which writes the caller's variable.
+	ThroughVarRef
+	/// In a constant table, which nothing writes.
+	Table(id: ConstId)
+	NotAPlace
+}
+
+/// A constraint check that waits for the implementations: the type given,
+/// what it must implement, the parameter's name and where it was declared,
+/// and where the type was written.
+@derive(Clone)
+struct PendingConstraint {
+	ty: Ty
+	constraint: Constraint
+	written: Symbol
+	declared: Span
+	span: Span
+}
+
+/// Why a place must be writable.
+@derive(Eq, Clone)
+enum Writing {
+	/// `place = value`.
+	Assign
+	/// `&var place`.
+	Borrow
+}
+
+view struct Lowerer {
+	ast: &ast::Ast
+	interner: &Interner
+	program: Program
+	diagnostics: Vec<Diagnostic>
+	/// Every module, in the order the driver found them; 0 is the root.
+	modules: Vec<ModuleScope>
+	/// The module whose file is being lowered.
+	current: i64
+	/// What the current file's imports bind: names for modules, and for items
+	/// of other modules. Imports are file-scoped, as they are in Go and Odin.
+	imports: FileImports
+	/// The body being checked, with everything that belongs to it.
+	state: BodyState
+	/// How far the checker has come, which says what it can know yet.
+	phase: Phase
+	/// The bodies being checked around it, outermost first: a lambda's body
+	/// is checked in the middle of the body that writes it, and a name it
+	/// does not declare is looked for in these.
+	outer: Vec<BodyState>
+	/// Where each alias is written, by its module and name.
+	aliasSources: Map<(i64, Symbol), AliasSource>
+	/// The aliases being resolved, innermost last: one asked for again names
+	/// itself.
+	aliasStack: Vec<(i64, Symbol)>
+	/// Set where a type leaves out an argument whose default is not read yet,
+	/// while the defaults are read.
+	defaultWaits: bool
+	/// The types whose field defaults are not checked yet. One is taken out
+	/// as its defaults are checked, so a default that needs its own type's
+	/// finds none.
+	defaultSources: Map<TypeDef, DefaultSource>
+	/// The constraint checks that are waiting: the type given, what it must
+	/// implement, the parameter's name and where it was declared, and where
+	/// the type was written.
+	pendingConstraints: Vec<PendingConstraint>
+	/// The function of each lambda of the current file, and the struct its
+	/// captures go in.
+	lambdas: Map<ast::ExprId, FnId>
+	lambdaEnvs: Map<FnId, StructId>
+	/// The struct of each loop of the current file that is a generator.
+	generators: Map<ast::ExprId, StructId>
+	/// Whether what is being lowered is what `@derive` wrote. It is placed at
+	/// the annotation, so it names nothing for an editor.
+	derived: bool
+	/// The parameters with a default, as `declareFn` finds them: checked once
+	/// every function is declared.
+	paramDefaults: Vec<(FnId, i64, ast::ExprId)>
+	/// The bodies `@derive` wrote for a type with a field that keeps it from
+	/// applying, which is reported where the field is written: they are not
+	/// checked, and say nothing more.
+	withheld: Set<FnId>
+	/// The type each `@derive` argument was written on, which what it wrote
+	/// is for.
+	deriveOwners: Map<Span, TypeDef>
+	/// Where each constant was written, which constant it is being worked
+	/// out, and which have been worked out already.
+	constSources: Map<ConstId, ConstSource>
+	constStack: Vec<ConstId>
+	constsDone: Set<ConstId>
+	/// Whether a top-level `assert` is being checked, where a file may be
+	/// embedded as in a constant.
+	checkingAssert: bool
+	/// The files embedded so far, each kept once: by where it is and whether
+	/// it is text.
+	embedded: Map<(String, bool), ConstId>
+	/// The type parameters of the item being lowered.
+	typeParams: Vec<GenericParamDef>
+	/// The type whose method is being lowered, which `Self` names.
+	selfTy: Option<Ty>
+	/// The module whose `pub` items every file sees without an import.
+	prelude: Option<i64>
+	pendingCopy: Vec<(Ty, Symbol, Span)>
+}
+
+/// Everything about one body being checked. A lambda's body is checked in the
+/// middle of the body around it, so the whole of this is put aside and taken
+/// up again as one value: a field that belonged to the body and was left
+/// behind would be a body checked against another one's locals.
+struct BodyState {
+	body: Body = Body()
+	/// The names in scope, innermost last.
+	scopes: Vec<Map<Symbol, LocalId>> = Vec()
+	/// The result type, and where it was written.
+	ret: Ty = UNIT
+	retSpan: Option<Span> = .None
+	/// The keywords of the `defer`s being checked, innermost last.
+	defers: Vec<(Span, i64)> = Vec()
+	/// The loops around the statement being lowered, innermost last: the name
+	/// each was given, if any, and whether it has a `break`. A `defer`
+	/// records how many there were, since a jump may not leave it.
+	loops: Vec<(Option<Symbol>, bool)> = Vec()
+	/// While a projection is checked: how often its body lends, and the
+	/// parameter the yielded place belongs to.
+	lends: u32 = 0
+	lentParam: Option<u32> = .None
+	/// A `lend` in the projection lends a constant table.
+	lentTable: bool = false
+	/// Checking the writing half of a `lend fn`.
+	lentHalf: bool = false
+	/// While a lambda's body is checked: what it has captured so far, and how
+	/// a closure holds it — nothing for a plain function value, which may
+	/// capture nothing.
+	captures: Vec<Capture> = Vec()
+	captureKind: Option<CaptureKind> = .None
+	/// The lists being built, innermost last, which `yield` hands its value
+	/// to.
+	lists: Vec<ListBuild> = Vec()
+	/// While a generator's body is checked: what it yields.
+	generator: Option<GeneratorBuild> = .None
+	/// Arguments written `name = value` where `name: value` was meant,
+	/// reported, and checked as their values.
+	namedByEquals: Set<ast::ExprId> = Set()
+	/// An index handed to a type's `at` as its argument: an integer of any
+	/// type there, as anywhere a position is.
+	indexOperands: Set<ast::ExprId> = Set()
+	/// Calls of generic defaults waiting for the type arguments of the
+	/// literal or the call that uses them.
+	unsettledDefaults: Vec<ExprId> = Vec()
+	/// The lambda about to be checked is a `val`'s whole value, which may
+	/// keep what it captures by `&` for as long as the `val` is used.
+	keepingClosure: bool = false
+	/// The bindings of plain data that are aliases while the body is lowered,
+	/// and copies after it where nothing writes through them.
+	settling: Vec<LocalId> = Vec()
+	/// How each element of a tuple matched in place binds: set while an arm's
+	/// pattern is checked, and taken by the tuple pattern at its top.
+	placeBinds: Option<Vec<Binds>> = .None
+	/// The `|`s being checked, innermost last: what each alternative binds,
+	/// so that the next binds the same locals.
+	alternatives: Vec<Alternatives> = Vec()
+	/// How many `|`s that bind the body has numbered.
+	bindingAlternatives: u32 = 0
+	/// A `val`'s or a `var`'s whole value is the `&place` about to be
+	/// checked, which gives the variable its type.
+	localReference: bool = false
+	/// A lambda whose result nothing expected, and no `return` has said yet:
+	/// the first `return value` says it.
+	inferringRet: bool = false
+}
+
+extend Lowerer {
+	static fn new(
+		file: &ast::Ast,
+		interner: &Interner,
+		program: Program,
+		modules: Vec<ModuleScope>,
+	): Lowerer = {
+		var prelude: Option<i64> = .None
+		for (i, module) in modules.forwards().enumerate() {
+			if prelude.isNone() && module.path == PRELUDE then prelude = .Some(i)
+		}
+		return Lowerer(
+			ast: &file,
+			interner: &interner,
+			program: move program,
+			diagnostics: Vec(),
+			modules: move modules,
+			current: 0,
+			imports: FileImports(),
+			state: BodyState(),
+			phase: .Declaring,
+			outer: Vec(),
+			aliasSources: Map(),
+			aliasStack: Vec(),
+			defaultWaits: false,
+			defaultSources: Map(),
+			pendingConstraints: Vec(),
+			lambdas: Map(),
+			lambdaEnvs: Map(),
+			generators: Map(),
+			derived: false,
+			paramDefaults: Vec(),
+			withheld: Set(),
+			deriveOwners: Map(),
+			constSources: Map(),
+			constStack: Vec(),
+			constsDone: Set(),
+			checkingAssert: false,
+			embedded: Map(),
+			typeParams: Vec(),
+			selfTy: .None,
+			prelude: prelude,
+			pendingCopy: Vec(),
+		)
+	}
+
+	// ---- helpers ----
+
+	fn text(sym: Symbol): str from self.interner = self.interner.resolve(sym)
+
+	fn kind(ty: Ty): TyKind = self.program.types.kind(ty)
+
+	var fn intern(kind: TyKind): Ty = self.program.types.intern(kind)
+
+	/// The type in backticks, for messages.
+	fn tyName(ty: Ty): String = "`\(self.program.tyName(ty, self.interner))`"
+
+	var fn report(diagnostic: Diagnostic) = self.diagnostics.push(move diagnostic)
+
+	/// The names the module being lowered declares.
+	fn types(): &Map<Symbol, (TypeDef, Span)> = lend self.modules[self.current].types
+
+	/// The type aliases of this module.
+	fn aliases(): &Map<Symbol, AliasDef> = lend self.modules[self.current].aliases
+
+	fn interfaces(): &Map<Symbol, (InterfaceId, Span)> = lend self.modules[self.current].interfaces
+
+	fn fns(): &Map<Symbol, FnId> = lend self.modules[self.current].fns
+
+	fn opaques(): &Map<Symbol, OpaqueId> = lend self.modules[self.current].opaques
+
+	fn consts(): &Map<Symbol, ConstId> = lend self.modules[self.current].consts
+
+	fn globals(): &Map<Symbol, GlobalId> = lend self.modules[self.current].globals
+
+	/// Whether the module being lowered is the standard library's, which
+	/// alone may name what holds memory that holds nothing, or turn an `own`
+	/// into an address.
+	fn inStd(): bool = {
+		val path = &self.modules[self.current].path
+		return path == "std" || path.startsWith("std::")
+	}
+
+	/// Moves to a file of `module`, with the imports that file wrote.
+	var fn enter(module: i64, file: &ast::Ast, imports: FileImports) keeps file = {
+		self.current = module
+		self.ast = &file
+		self.imports = move imports
+	}
+
+	/// Moves to the `i`th file, with its imports, lambdas and generators.
+	/// Checks the bodies of `work`, each in its file.
+	var fn checkBodies(
+		work: &[(i64, BodyWork)],
+		files: &[(i64, &ast::Ast)],
+		imports: &[FileImports],
+		lambdas: &[Map<ast::ExprId, FnId>],
+		envs: &[Map<FnId, StructId>],
+		generators: &[Map<ast::ExprId, StructId>],
+	) keeps files = {
+		var file: Option<i64> = .None
+		for (i, one) in work {
+			if file != .Some(i) {
+				self.enterFile(i, &files, &imports, &lambdas, &envs, &generators)
+				file = .Some(i)
+			}
+			self.checkFn(one.body, one.id)
+		}
+	}
+
+	/// What a worker checked: the bodies of `fns`, with its types renumbered
+	/// through `map`, and its diagnostics.
+	var fn intoChecked(fns: &[(i64, BodyWork)], map: &TyMap): CheckedBodies = {
+		val renumber = !map.isIdentity()
+		var bodies: Vec<(FnId, Option<Body>, Option<Lent>)> = Vec()
+		for (_, one) in fns {
+			var body = self.program.fns[one.id].body.take()
+			if renumber && body is .Some(checked) then
+				checked.mapTypes((ty) => map.get(ty), (list) => map.getList(list))
+			bodies.push((one.id, move body, self.program.fns[one.id].projects.clone()))
+		}
+		// A closure's environment is a struct the worker filled in: what it
+		// captured, or the type parameters of the generic function it was
+		// written in, which a worker gives it too.
+		var envStructs: Vec<(StructId, StructDef)> = Vec()
+		for id in self.program.structs.ids() {
+			val def = &self.program.structs[id]
+			if !def.isEnv || (def.fields.isEmpty() && def.generics.isEmpty()) then continue
+			var copy = def.clone()
+			if renumber {
+				for field in copy.fields {
+					field.ty = map.get(field.ty)
+				}
+			}
+			envStructs.push((id, move copy))
+		}
+		// A lambda's function was declared before the bodies were checked, and
+		// filled in by the worker that checked the body around it.
+		var lambdas: Vec<(FnId, FnDef)> = Vec()
+		for id in self.program.fns.ids() {
+			val def = &self.program.fns[id]
+			if !def.isLambda || def.body.isNone() then continue
+			var copy = def.clone()
+			if renumber {
+				for param in copy.params {
+					param.ty = map.get(param.ty)
+				}
+				copy.ret = map.get(copy.ret)
+				if copy.body is .Some(body) then
+					body.mapTypes((ty) => map.get(ty), (list) => map.getList(list))
+			}
+			lambdas.push((id, move copy))
+		}
+		// A generator's `next`, struct and implementation were declared empty,
+		// and filled in by the worker that checked its loop.
+		var generators: Vec<GeneratorChecked> = Vec()
+		for next in self.program.fns.ids() {
+			val def = &self.program.fns[next]
+			val .Some(id) = def.generator else {
+				continue
+			}
+			if def.body.isNone() then continue
+			var copy = def.clone()
+			var strukt = self.program.structs[id].clone()
+			val owner = TypeDef::Struct(id)
+			var implementation: Option<(i64, TyList, Vec<GenericParamDef>)> = .None
+			for (index, i) in self.program.impls.forwards().enumerate() {
+				if implementation.isNone() && i.ty == owner then
+					implementation = .Some(
+						(
+							index,
+							if renumber then map.getList(i.args) else i.args,
+							i.conditions.clone(),
+						),
+					)
+			}
+			if renumber {
+				for param in copy.params {
+					param.ty = map.get(param.ty)
+				}
+				copy.ret = map.get(copy.ret)
+				if copy.body is .Some(body) then
+					body.mapTypes((ty) => map.get(ty), (list) => map.getList(list))
+				for field in strukt.fields {
+					field.ty = map.get(field.ty)
+				}
+				if strukt.generator is .Some(generator) then
+					generator.elem = map.get(generator.elem)
+			}
+			generators.push(GeneratorChecked(
+				next: next,
+				def: move copy,
+				id: id,
+				strukt: move strukt,
+				implementation: move implementation,
+			))
+		}
+		var names: Vec<(Span, Named)> = Vec()
+		for (span, named) in mem::replace(&var self.program.names, Vec()) {
+			names.push(
+				(
+					span,
+					match named {
+						.Type(ty) if renumber => Named::Type(map.get(ty))
+						other => move other
+					},
+				),
+			)
+		}
+		return CheckedBodies(
+			bodies: move bodies,
+			lambdas: move lambdas,
+			envStructs: move envStructs,
+			generators: move generators,
+			names: move names,
+			diagnostics: mem::replace(&var self.diagnostics, Vec()),
+		)
+	}
+
+	/// What a worker checked, put in its place.
+	var fn takeChecked(checked: CheckedBodies) = {
+		for (id, body, projects) in move checked.bodies {
+			self.program.fns[id].body = move body
+			self.program.fns[id].projects = move projects
+		}
+		for (id, def) in move checked.lambdas {
+			self.program.fns[id] = move def
+		}
+		for (id, def) in move checked.envStructs {
+			self.program.structs[id] = move def
+		}
+		for generator in move checked.generators {
+			self.program.fns[generator.next] = move generator.def
+			self.program.structs[generator.id] = move generator.strukt
+			if generator.implementation is .Some((index, args, conditions)) {
+				self.program.impls[index].args = args
+				self.program.impls[index].conditions = conditions.clone()
+			}
+		}
+		for name in move checked.names {
+			self.program.names.push(move name)
+		}
+		for d in move checked.diagnostics {
+			self.diagnostics.push(move d)
+		}
+	}
+
+	var fn enterFile(
+		i: i64,
+		files: &[(i64, &ast::Ast)],
+		imports: &[FileImports],
+		lambdas: &[Map<ast::ExprId, FnId>],
+		envs: &[Map<FnId, StructId>],
+		generators: &[Map<ast::ExprId, StructId>],
+	) keeps files = {
+		self.enter(files[i].0, files[i].1, imports[i].clone())
+		self.lambdas = lambdas[i].clone()
+		self.lambdaEnvs = envs[i].clone()
+		self.generators = generators[i].clone()
+	}
+
+	var fn duplicate(name: ast::Name, first: Span) = {
+		// Parameters written `_` are as many as are written, and none is
+		// named.
+		if name.sym == Symbol::ignored() then return
+		self.report(
+			Diagnostic::error(
+				DUPLICATE_DEFINITION,
+				"`\(self.text(name.sym))` is defined more than once",
+				name.span,
+				String::of("defined again here"),
+			).withSecondary(first, String::of("first defined here")),
+		)
+	}
+}

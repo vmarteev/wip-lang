@@ -1,0 +1,407 @@
+// What a call's result may borrow, read from the callee's signature.
+//
+// An argument is among a result's roots only where its type can hold what
+// the result refers to: a `&T` in the result refers to `T`, and a `str` to a
+// text's bytes, `u8`. A reference argument whose pointee holds that as its
+// own — through fields, variants, elements, `own` and owned buffers — lends
+// its place; an argument that reaches it through a borrow lends what it
+// borrows. A type parameter holds itself, and what the results of its
+// interfaces' methods hold: code generic over `K: Hash + Eq` cannot make a
+// `&V` out of a `K`. The signature is read as written, so every call of a
+// function lends the same, and its body can be held to it.
+
+import std::collections::{Set}
+import hir::{FnDef, GenericParamDef, LendFrom, Program, Ty, TyList, U8}
+
+/// What one parameter lends to what a call answers.
+@derive(Eq, Clone)
+struct Lends {
+	/// The place a reference argument refers to.
+	place: bool = false
+	/// What the argument borrows: a `str`'s bytes, a view's roots.
+	borrows: bool = false
+}
+
+extend Lends {
+	/// Both: what an argument lends whose parameter is not known, a function
+	/// value's, or one past a variadic function's parameters.
+	static fn all(): Lends = Lends(place: true, borrows: true)
+
+	/// Whether it lends nothing.
+	fn isNothing(): bool = !self.place && !self.borrows
+}
+
+/// What a value refers to: the types of the places its references and `str`s
+/// point into, and the type parameters it holds values of, which may borrow
+/// in turn.
+struct Refers {
+	places: Set<Ty> = Set()
+	values: Set<Ty> = Set()
+	/// It may point anywhere: a closure it holds lends what it captured.
+	any: bool = false
+}
+
+extend Refers {
+	fn isEmpty(): bool = self.places.isEmpty() && self.values.isEmpty() && !self.any
+}
+
+/// What a value can hold: the types reached from its own as its own, and
+/// those reached through a borrow.
+struct Holds {
+	owned: Set<Ty> = Set()
+	borrowed: Set<Ty> = Set()
+	/// It reaches something whose contents are not known where the function
+	/// is written: a `dyn`, a closure.
+	any: bool = false
+}
+
+/// The type parameters a signature is written with, whose interfaces say
+/// what each may hold.
+view struct Signature {
+	program: &Program
+	generics: &[GenericParamDef]
+}
+
+/// Where a type is read from an interface's method, how the method's type
+/// parameters map to the signature's; nothing where it is read from the
+/// signature itself.
+type Env = Option<Vec<Ty>>
+
+extend Signature {
+	/// What `ty` refers to, added to `refers`. `env` maps the type parameters
+	/// of an interface's method to the signature's, where the type is read
+	/// from one; a parameter it does not map is the method's own, which the
+	/// caller supplies.
+	fn refers(ty: Ty, env: &Env, refers: &var Refers, seen: &var Set<(Ty, Env)>) = {
+		val noEnv: Env = .None
+		val types = &self.program.types
+		if !seen.add((ty, env.clone())) then return
+		match types.kind(ty) {
+			.Str => { refers.places.add(U8) }
+			.Ref(inner, ..) => {
+				val pointee = match types.kind(inner) {
+					// A lent closure refers to what it captured, and a `dyn` to
+					// a value of any type.
+					.Fn(..) | .Dyn(..) => {
+						refers.any = true
+						return
+					}
+					// A slice is a run of elements, wherever they are held: in
+					// an array, a `Vec`'s buffer, one on its own.
+					.Slice(elem) => elem
+					_ => inner
+				}
+				match env {
+					// A type read from an interface's method means the same in
+					// the signature only where it has no parameters, or is one
+					// that maps.
+					.Some(mapping) if types.isGeneric(pointee) => match types.kind(pointee) {
+						.Param(param) => {
+							if (param.index as i64) < mapping.len() then
+								refers.places.add(mapping[param.index as i64])
+						}
+						_ => refers.any = true
+					}
+					_ => { refers.places.add(pointee) }
+				}
+				self.refers(pointee, &env, &var refers, &var seen)
+			}
+			.Struct(..) => {
+				for field in self.program.fieldTys(ty) {
+					self.refers(field, &env, &var refers, &var seen)
+				}
+			}
+			.Enum(..) => {
+				for fields in self.program.variantFieldTys(ty) {
+					for field in fields {
+						self.refers(field, &env, &var refers, &var seen)
+					}
+				}
+			}
+			.Array(elem: e, ..) | .Slice(elem: e) | .Own(inner: e) | .Slots(inner: e) => self.refers(
+				e,
+				&env,
+				&var refers,
+				&var seen,
+			)
+			.Param(param) => match env {
+				.Some(mapping) => {
+					if (param.index as i64) < mapping.len() then
+						self.refers(mapping[param.index as i64], &noEnv, &var refers, &var seen)
+				}
+				.None => { refers.values.add(ty) }
+			}
+			// What an implementation decides may be a reference, as a
+			// parameter may.
+			.Assoc(..) => match env {
+				.Some(_) => refers.any = true
+				.None => { refers.values.add(ty) }
+			}
+			_ => {}
+		}
+	}
+
+	/// What `ty` can hold, added to `holds`: as its own, or through a borrow
+	/// where `borrowed`. `env` maps the type parameters of an interface's
+	/// method to the signature's, where the type is read from one; a
+	/// parameter it does not map is the method's own, which the caller
+	/// supplies.
+	fn holds(
+		ty: Ty,
+		borrowed: bool,
+		env: &Env,
+		holds: &var Holds,
+		seen: &var Set<(Ty, bool, Env)>,
+	) = {
+		val noEnv: Env = .None
+		val types = &self.program.types
+		if !seen.add((ty, borrowed, env.clone())) then return
+		if types.kind(ty) is .Param(param) {
+			match env {
+				.Some(mapping) => {
+					if (param.index as i64) < mapping.len() then
+						self.holds(
+							mapping[param.index as i64],
+							borrowed,
+							&noEnv,
+							&var holds,
+							&var seen,
+						)
+				}
+				.None => {
+					if borrowed then holds.borrowed.add(ty) else holds.owned.add(ty)
+					self.paramHolds(ty, param.index as i64, borrowed, &var holds, &var seen)
+				}
+			}
+			return
+		}
+		// A type read from an interface's method is recorded where it means
+		// the same in the signature: where it has no type parameters.
+		if env.isNone() || !types.isGeneric(ty) {
+			if borrowed then holds.borrowed.add(ty) else holds.owned.add(ty)
+		}
+		match types.kind(ty) {
+			// A `str`'s bytes are borrowed, and so is what a reference refers
+			// to.
+			.Str => self.holds(U8, true, &noEnv, &var holds, &var seen)
+			// A C string's bytes are C's, and no owner of theirs is known, so
+			// what `toStr()` reads of one is taken to lie where the C string
+			// does: what is read from `main`'s `args: &[cstring]` borrows
+			// `args`, which a caller keeps while it is used.
+			.Cstring => self.holds(U8, borrowed, &noEnv, &var holds, &var seen)
+			.Ref(inner, ..) => self.holds(inner, true, &env, &var holds, &var seen)
+			.Struct(..) => {
+				for field in self.program.fieldTys(ty) {
+					self.holds(field, borrowed, &env, &var holds, &var seen)
+				}
+			}
+			.Enum(..) => {
+				for fields in self.program.variantFieldTys(ty) {
+					for field in fields {
+						self.holds(field, borrowed, &env, &var holds, &var seen)
+					}
+				}
+			}
+			.Array(elem: e, ..) | .Slice(elem: e) | .Own(inner: e) | .Slots(inner: e) => self.holds(
+				e,
+				borrowed,
+				&env,
+				&var holds,
+				&var seen,
+			)
+			// What C points at is C's to keep.
+			.Ptr(inner) => self.holds(inner, true, &env, &var holds, &var seen)
+			// A closure may hold anything it captured, and a `dyn` is a value
+			// of any type.
+			.Fn(..) | .Dyn(..) => holds.any = true
+			_ => {}
+		}
+	}
+
+	/// What type parameter `index` holds besides itself: what the results of
+	/// its interfaces' methods hold and refer to, with `Self` read as the
+	/// parameter.
+	fn paramHolds(
+		param: Ty,
+		index: i64,
+		borrowed: bool,
+		holds: &var Holds,
+		seen: &var Set<(Ty, bool, Env)>,
+	) = {
+		if index >= self.generics.len() {
+			// A parameter the signature does not declare: nothing is known of
+			// it.
+			holds.any = true
+			return
+		}
+		for constraint in self.generics[index].interfaces {
+			val env: Env = .Some(self.methodEnv(param, constraint.args))
+			val declaring = &self.program.interfaces[constraint.interfaceId]
+			for method in declaring.methods {
+				val ret = self.program.fns[method.id].ret
+				self.holds(ret, borrowed, &env, &var holds, &var seen)
+				// What the answer refers to may lie in the parameter's own
+				// place, or where it borrows: `name(): str` may answer the
+				// bytes of a `String` inside it.
+				var refers = Refers()
+				var fresh: Set<(Ty, Env)> = Set()
+				self.refers(ret, &env, &var refers, &var fresh)
+				if refers.any then holds.any = true
+				for ty in refers.places {
+					holds.owned.add(ty)
+					holds.borrowed.add(ty)
+				}
+				for ty in refers.values {
+					holds.owned.add(ty)
+					holds.borrowed.add(ty)
+				}
+			}
+		}
+	}
+
+	/// How an interface's method names the types a constraint gives it:
+	/// `Self` first, then the interface's own parameters.
+	fn methodEnv(param: Ty, args: TyList): Vec<Ty> = {
+		var env = Vec::of(own [param])
+		for ty in self.program.types.list(args) {
+			env.push(ty)
+		}
+		return move env
+	}
+
+	/// What a parameter of type `param` lends to a value that refers to
+	/// `refers`.
+	fn lends(refers: &Refers, param: Ty): Lends = {
+		val noEnv: Env = .None
+		if refers.isEmpty() then return Lends()
+		val (isRef, content) = match self.program.types.kind(param) {
+			.Ref(inner, ..) => (true, inner)
+			_ => (false, param)
+		}
+		var holds = Holds()
+		var seen: Set<(Ty, bool, Env)> = Set()
+		self.holds(content, false, &noEnv, &var holds, &var seen)
+		if holds.any then return Lends(place: isRef, borrows: true)
+		val place = isRef && (refers.any || meets(&refers.places, &holds.owned))
+		val borrows =
+			(refers.any && !holds.borrowed.isEmpty()) ||
+			meets(&refers.places, &holds.borrowed) ||
+			meets(&refers.values, &holds.owned) ||
+			meets(&refers.values, &holds.borrowed)
+		return Lends(place: place, borrows: borrows)
+	}
+}
+
+/// Whether any of `targets` is among `held`.
+fn meets(targets: &Set<Ty>, held: &Set<Ty>): bool = {
+	for target in targets {
+		if held.contains(&target) then return true
+	}
+	return false
+}
+
+/// What each of `params` lends to a value of type `to`, in a signature
+/// written with `generics`.
+fn lendsTo(program: &Program, generics: &[GenericParamDef], params: &[Ty], to: Ty): Vec<Lends> = {
+	val noEnv: Env = .None
+	val signature = Signature(program: &program, generics: &generics)
+	var refers = Refers()
+	var seen: Set<(Ty, Env)> = Set()
+	signature.refers(to, &noEnv, &var refers, &var seen)
+	signature.throughFunctions(&params, &var refers)
+	var lends: Vec<Lends> = Vec()
+	for param in params {
+		lends.push(signature.lends(&refers, param))
+	}
+	return move lends
+}
+
+extend Signature {
+	/// What a function the call is given may make of what it is passed:
+	/// where its result may refer to what the call's result refers to, so may
+	/// what its parameters refer to, and the call's arguments of those types
+	/// lend to the call's result. `map(f)` on an `Option<&String>` makes
+	/// `f`'s `str` out of the `&String` it is passed, so the result borrows
+	/// what the option borrows.
+	fn throughFunctions(params: &[Ty], refers: &var Refers) = {
+		val noEnv: Env = .None
+		var functions: Vec<(TyList, Ty)> = Vec()
+		for param in params {
+			var seen: Set<Ty> = Set()
+			self.functionsIn(param, &var functions, &var seen)
+		}
+		while true {
+			var grew = false
+			for (fnParams, ret) in functions {
+				var made = Refers()
+				var seen: Set<(Ty, Env)> = Set()
+				self.refers(ret, &noEnv, &var made, &var seen)
+				val reaches =
+					made.any ||
+					made.places.items().any((t) => refers.places.contains(&t)) ||
+					made.values.items().any((t) => refers.values.contains(&t)) ||
+					(refers.any && !made.isEmpty())
+				if !reaches then continue
+				for input in self.program.types.list(fnParams) {
+					var passed = Refers()
+					var passedSeen: Set<(Ty, Env)> = Set()
+					self.refers(input, &noEnv, &var passed, &var passedSeen)
+					// What the function is passed by value may be borrowed as
+					// it is: a type parameter's value is itself.
+					self.valuesIn(input, &var passed.values)
+					for ty in passed.places {
+						if refers.places.add(ty) then grew = true
+					}
+					for ty in passed.values {
+						if refers.values.add(ty) then grew = true
+					}
+					if passed.any && !refers.any {
+						refers.any = true
+						grew = true
+					}
+				}
+			}
+			if !grew then return
+		}
+	}
+
+	/// The function types `ty` holds or is: a function value, a closure lent
+	/// or owned, as the parameters and the result each is written with.
+	fn functionsIn(ty: Ty, out: &var Vec<(TyList, Ty)>, seen: &var Set<Ty>) = {
+		if !seen.add(ty) then return
+		match self.program.types.kind(ty) {
+			.Fn(params, ret) => out.push((params, ret))
+			.Ref(inner: e, ..) | .Own(inner: e) => self.functionsIn(e, &var out, &var seen)
+			_ => {}
+		}
+	}
+
+	/// The type parameters `ty` holds values of directly, as itself.
+	fn valuesIn(ty: Ty, values: &var Set<Ty>) = match self.program.types.kind(ty) {
+		.Param(..) | .Assoc(..) => { values.add(ty) }
+		.Ref(inner, ..) => self.valuesIn(inner, &var values)
+		_ => {}
+	}
+}
+
+/// What each parameter of `def` lends to its result.
+fn signatureLends(program: &Program, def: &FnDef): Vec<Lends> = {
+	var params: Vec<Ty> = Vec()
+	for p in def.params {
+		params.push(p.ty)
+	}
+	var lends = lendsTo(&program, &def.generics, &params, def.ret)
+	// `from` narrows it to what it names: a parameter named alone lends its
+	// place and what it borrows, one whose field is named what it borrows
+	// alone, and the others nothing.
+	if def.lendsFrom is .Some(named) {
+		for i in 0..lends.len() {
+			val param = LendFrom::Param(i as u32)
+			val borrowed = LendFrom::Borrowed(i as u32)
+			val whole = named.contains(&param)
+			lends[i].place = lends[i].place && whole
+			lends[i].borrows = lends[i].borrows && (whole || named.contains(&borrowed))
+		}
+	}
+	return move lends
+}

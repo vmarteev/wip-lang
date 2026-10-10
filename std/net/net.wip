@@ -1,7 +1,8 @@
 // Network sockets: a `Listener`, which accepts connections,
 // a `Stream`, one connection, and an `Address`, where one is — over TCP,
-// IPv4 or IPv6, or a Unix-domain socket. Each owns its descriptor and closes
-// it where it ends; reads and writes answer `io::IoError`, as a file's do.
+// IPv4 or IPv6, or a Unix-domain socket. Each owns its descriptor, closes
+// it where it ends and gives it to no program this one starts; reads and
+// writes answer `io::IoError`, as a file's do.
 //
 // Calls block until they can answer, unless `setBlocking(false)` says not
 // to, when they answer `.WouldBlock` instead and an event queue says when
@@ -68,7 +69,7 @@ extend Listener {
 	pub static fn unix(path: str): Result<Listener, io::IoError> = {
 		var address = SockAddr()
 		val length = unixAddress(path, &var address)?
-		val fd = socket(AF_UNIX, SOCK_STREAM, 0)
+		val fd = openSocket(AF_UNIX, SOCK_STREAM, 0)
 		if fd < 0 then return .Err(io::lastError())
 		if bindLocal(fd, &address, length) < 0 || listen(fd, SOMAXCONN) < 0 {
 			val error = io::lastError()
@@ -83,7 +84,7 @@ extend Listener {
 	pub fn accept(): Result<(Stream, Address), io::IoError> = {
 		var address = SockAddr()
 		var length = SOCKADDR_ROOM
-		val fd = accept(self.fd, &var address, &var length)
+		val fd = accepted(self.fd, &var address, &var length)
 		if fd < 0 then return .Err(io::lastError())
 		quiet(fd)
 		return .Ok((Stream(fd), addressOf(&address, length)))
@@ -117,7 +118,7 @@ extend Stream {
 	pub static fn unix(path: str): Result<Stream, io::IoError> = {
 		var address = SockAddr()
 		val length = unixAddress(path, &var address)?
-		val fd = socket(AF_UNIX, SOCK_STREAM, 0)
+		val fd = openSocket(AF_UNIX, SOCK_STREAM, 0)
 		if fd < 0 then return .Err(io::lastError())
 		if connectLocal(fd, &address, length) < 0 {
 			val error = io::lastError()
@@ -315,6 +316,50 @@ extern struct AddrInfo {
 	next: ptr<AddrInfo>
 }
 
+// A socket and a connection accepted are closed in a program started,
+// from the moment they are made: Linux marks them so as it makes them; a
+// Mac marks them once made, and starts a program with every descriptor
+// closed but those it is given, so no program another thread starts in
+// between is given them.
+
+@target(os = "linux")
+extern "C" {
+	fn accept4(fd: c_int, address: &var SockAddr, length: &var u32, flags: c_int): c_int
+}
+
+/// `socket` and `accept4`: made closed in a program started.
+@target(os = "linux")
+val SOCK_CLOEXEC: c_int = 524288
+
+@target(os = "linux")
+fn openSocket(family: c_int, kind: c_int, protocol: c_int): c_int = socket(
+	family,
+	kind | SOCK_CLOEXEC,
+	protocol,
+)
+
+@target(vendor = "apple")
+fn openSocket(family: c_int, kind: c_int, protocol: c_int): c_int = {
+	val fd = socket(family, kind, protocol)
+	if fd >= 0 then libc::closeOnExec(fd)
+	return fd
+}
+
+@target(os = "linux")
+fn accepted(fd: c_int, address: &var SockAddr, length: &var u32): c_int = accept4(
+	fd,
+	&var address,
+	&var length,
+	SOCK_CLOEXEC,
+)
+
+@target(vendor = "apple")
+fn accepted(fd: c_int, address: &var SockAddr, length: &var u32): c_int = {
+	val got = accept(fd, &var address, &var length)
+	if got >= 0 then libc::closeOnExec(got)
+	return got
+}
+
 extern "C" {
 	fn socket(family: c_int, kind: c_int, protocol: c_int): c_int
 	@symbol("bind")
@@ -436,7 +481,7 @@ fn resolved(
 	var error: io::IoError = .NotFound
 	var at = answers
 	while !at.isNull {
-		val fd = socket(at.family, at.socktype, at.protocol)
+		val fd = openSocket(at.family, at.socktype, at.protocol)
 		if fd >= 0 {
 			setOption(fd, SO_REUSEADDR)
 			if use(fd, at.address, at.addressLength) {

@@ -1,0 +1,280 @@
+// `expr?`: the value, or an early return of the other variant.
+//
+// It lowers to what a reader would write: a `match` whose first arm takes the
+// value and whose second returns, so the move checker, the MIR and code
+// generation see nothing new.
+
+import std::collections::{Map}
+import syntax as ast
+import syntax::{CANNOT_PROPAGATE, Diagnostic, Span}
+
+/// The `expr?` being lowered: the enum it is of, its value, and how the arms
+/// bind that value's fields.
+@derive(Clone)
+struct Tried {
+	id: EnumId
+	ty: Ty
+	/// Where the value is a place, the kind of reference its bindings are:
+	/// aliases for its fields.
+	alias: Option<RefKind>
+	scrutinee: ExprId
+	span: Span
+}
+
+/// The two types `?` knows.
+@derive(Eq, Clone)
+enum Propagated {
+	Option
+	Result
+}
+
+extend Lowerer {
+	var fn tryExpr(value: ast::ExprId, span: Span): ExprId = {
+		val inferred = self.infer(value, .None)
+		val ty = self.tyOf(inferred)
+		if self.isPoisoned(ty) then return self.errorExpr(span)
+		val .Enum(id, args) = self.kind(ty) else {
+			val diagnostic = self.notPropagatable(ty, span)
+			self.report(move diagnostic)
+			return self.errorExpr(span)
+		}
+		val .Some(kind) = self.propagatedEnum(id) else {
+			val diagnostic = self.notPropagatable(ty, span)
+			self.report(move diagnostic)
+			return self.errorExpr(span)
+		}
+		// The function must return the same one, with the same error type.
+		val ret = self.state.ret
+		val matchesResult = match self.kind(ret) {
+			.Enum(id: retId, args: retArgs) if retId == id => match kind {
+				.Option => true
+				.Result =>
+					secondArg(&self.program.types, args) == secondArg(&self.program.types, retArgs)
+			}
+			_ => false
+		}
+		// Where the error types differ, the function's error type may say how
+		// it is made from this one.
+		val conversion: Option<FnId> =
+			if !matchesResult && kind == .Result then self.errorConversion(ty, ret, id) else .None
+		if !matchesResult && conversion.isNone() {
+			val diagnostic = self.wrongResult(ty, ret, kind, span)
+			self.report(move diagnostic)
+			return self.errorExpr(span)
+		}
+		// `.Some` is the first variant, `.None` the second; `.Ok` and `.Err`
+		// likewise.
+		val taken: u32 = 0
+		val other: u32 = 1
+		// A value that owns memory is taken; plain data is read where it is, as
+		// a `match` on a place does.
+		val scrutinee = if self.state.body.isPlace(inferred) && self.owns(ty) {
+			val at = self.state.body.exprs[inferred].span
+			self.alloc(.Move(inferred), ty, at)
+		} else {
+			inferred
+		}
+		val tried = Tried(
+			id: id,
+			ty: ty,
+			alias: self.aliasKind(scrutinee),
+			scrutinee: scrutinee,
+			span: span,
+		)
+		// The arm that takes the value.
+		val valueTy = self.program.variantFieldTy(ty, taken, 0)
+		// The arms' bindings are named as the variants' fields are — `value`,
+		// `error` — in a scope of their own, so that they do not hide a
+		// program's own `value` after the `?`.
+		self.state.scopes.push(Map())
+		val (local, body) = self.fieldBinding(&tried, taken)
+		val takenArm = Arm(
+			pattern: .Variant(variant: taken, binders: Vec::of(own [Binder::Bind(local)])),
+			guard: .None,
+			body: body,
+			span: span,
+		)
+		// The arm that returns what was not taken.
+		val otherArm = self.returningArm(&tried, other, ret, conversion)
+		self.state.scopes.pop()
+		return self.alloc(
+			.Match(scrutinee: scrutinee, arms: Vec::of(own [move takenArm, move otherArm])),
+			valueTy,
+			span,
+		)
+	}
+
+	/// The arm that returns: `.None` as it is, and `.Err(error)` with the
+	/// error it was given.
+	var fn returningArm(tried: &Tried, variant: u32, ret: Ty, conversion: Option<FnId>): Arm = {
+		val id = tried.id
+		val span = tried.span
+		val fields = self.program.enums[id].variants[variant as i64].fields.len()
+		var binders: Vec<Binder> = Vec()
+		var args: Vec<ExprId> = Vec()
+		if fields != 0 {
+			val (local, read) = self.fieldBinding(&tried, variant)
+			var error = read
+			// `extend TheirError: From<ThisError>`: the error is made into the one
+			// the function returns.
+			if conversion is .Some(from) {
+				val made = self.program.fns[from].ret
+				error = self.alloc(
+					.Call(
+						callee: from,
+						args: Vec::of(own [error]),
+						typeArgs: TyList::empty(),
+						order: Vec(),
+					),
+					made,
+					span,
+				)
+			}
+			binders.push(.Bind(local))
+			args.push(error)
+		}
+		val returned = self.alloc(
+			.Variant(id: id, variant: variant, args: move args, order: Vec()),
+			ret,
+			span,
+		)
+		// `return` is a statement, so the arm is a block of one.
+		val stmt = self.state.body.stmts.add(Stmt(kind: .Return(.Some(returned)), span: span))
+		val body = self.alloc(
+			.Block(Block(stmts: Vec::of(own [stmt]), value: .None, span: span)),
+			NEVER,
+			span,
+		)
+		return Arm(
+			pattern: .Variant(variant: variant, binders: move binders),
+			guard: .None,
+			body: body,
+			span: span,
+		)
+	}
+
+	/// The binding of a variant's one field, `value` or `error`, and the value
+	/// read from it.
+	var fn fieldBinding(tried: &Tried, variant: u32): (LocalId, ExprId) = {
+		val span = tried.span
+		val fieldTy = self.program.variantFieldTy(tried.ty, variant, 0)
+		val boundTy = match tried.alias {
+			.Some(kind) => self.intern(.Ref(inner: fieldTy, kind: kind))
+			.None => fieldTy
+		}
+		val name = self.program.enums[tried.id].variants[variant as i64].fields[0].name
+		val local = self.declare(name, boundTy, .Binding, span)
+		if tried.alias.isSome() {
+			self.state.body.aliases.put(local, tried.scrutinee)
+			self.state.body.aliasBindings.add(local)
+		}
+		var value = self.alloc(.Local(local), boundTy, span)
+		// An alias is read through, as a `match` binding is; a field that is
+		// itself a reference, `Option<&Json>`'s, is the value, and copied as a
+		// view is.
+		if tried.alias.isSome() {
+			value = self.alloc(.Deref(value), fieldTy, span)
+		} else if self.owns(boundTy) {
+			// The binding owns its field, which is taken from it.
+			value = self.alloc(.Move(value), boundTy, span)
+		}
+		return (local, value)
+	}
+
+	/// The error type of a `Result`, which is its second type argument.
+	fn errorOf(ty: Ty): Option<Ty> = {
+		val .Enum(id, args) = self.kind(ty) else {
+			return .None
+		}
+		if self.propagatedEnum(id) != .Some(.Result) then return .None
+		return secondArg(&self.program.types, args)
+	}
+
+	/// The `from` of `extend TheirError: From<ThisError>`, where the function
+	/// returns a `Result` whose error type says how it is made from this one.
+	var fn errorConversion(ty: Ty, ret: Ty, result: EnumId): Option<FnId> = {
+		val interfaceId = self.program.preludeItems.interfaceOf(.From)?
+		val .Enum(id: retId, args: retArgs) = self.kind(ret) else {
+			return .None
+		}
+		if retId != result then return .None
+		val .Enum(args, ..) = self.kind(ty) else {
+			return .None
+		}
+		val source = secondArg(&self.program.types, args)?
+		val target = secondArg(&self.program.types, retArgs)?
+		val owner = self.ownerOf(target)?
+		val wanted = self.program.types.internList([source])
+		var method: Option<FnId> = .None
+		for i in self.program.impls {
+			if i.interfaceId == interfaceId && i.ty == owner && i.args == wanted {
+				if i.methods.isEmpty() then return .None
+				method = .Some(i.methods[0])
+				break
+			}
+		}
+		val found = method?
+		// The conversion is the interface's one method, and an implementation
+		// that only has the interface's default would convert nothing.
+		return if self.program.fns[found].body.isSome() then .Some(found) else .None
+	}
+
+	/// Which of the prelude's two types an enum is, if it is one.
+	fn propagatedEnum(id: EnumId): Option<Propagated> = {
+		val prelude = self.prelude?
+		val name = self.program.enums[id].name
+		val declared = match self.modules[prelude].types.get(&name) {
+			.Some((def, _)) => def == .Enum(id)
+			.None => false
+		}
+		if !declared then return .None
+		if self.text(name) == "Option" then return .Some(.Option)
+		if self.text(name) == "Result" then return .Some(.Result)
+		return .None
+	}
+
+	fn notPropagatable(ty: Ty, span: Span): Diagnostic = Diagnostic::error(
+		CANNOT_PROPAGATE,
+		"`?` needs an `Option` or a `Result`, and this is \(self.tyName(ty))",
+		span,
+		"not an `Option` or a `Result`",
+	).withNote("`?` takes the value, or returns the other variant to the caller")
+
+	fn wrongResult(ty: Ty, ret: Ty, kind: Propagated, span: Span): Diagnostic = {
+		val value = self.tyName(ty)
+		val result = self.tyName(ret)
+		val diagnostic = Diagnostic::error(
+			CANNOT_PROPAGATE,
+			"`?` on \(value) needs the function to return one too",
+			span,
+			"this function returns \(result)",
+		)
+		return match kind {
+			.Result => {
+				// Where the two error types are known, the help names the
+				// implementation that would bridge them. The names go inside an
+				// `extend` the help writes out, so they are written plainly.
+				val help = match (self.errorOf(ty), self.errorOf(ret)) {
+					(.Some(source), .Some(target)) => {
+						val sourceName = self.tyName(source)
+						val targetName = self.tyName(target)
+						"write `extend \(targetName.toStr().trimMatches("`")): From<\(sourceName.toStr().trimMatches("`"))>`, and `?` will use it; or convert it here with `mapErr`"
+					}
+					_ => String::of("convert it first, with `mapErr`")
+				}
+				diagnostic.withNote(
+					"`?` returns the error as it is, unless the function's error type says how it is made from this one",
+				).withHelp(move help)
+			}
+			.Option => diagnostic.withNote(
+				"`?` on an `Option` returns `.None`, so the function must return an `Option`",
+			)
+		}
+	}
+}
+
+/// The second of a list of types, where it has one.
+fn secondArg(types: &Types, args: TyList): Option<Ty> = {
+	val list = types.list(args)
+	return if list.len() > 1 then .Some(list[1]) else .None
+}

@@ -1,0 +1,212 @@
+// Files embedded in the program: `embed::bytes(path)` and
+// `embed::text(path)`, read when the program is compiled, and
+// `embed::textOr(path, otherwise)`, which is `otherwise` where there is no
+// such file. The file is read
+// here, relative to the module that names it and inside its package, and
+// kept as a constant table of its own, which the call reads where the
+// program keeps it. It is written where a constant's value is worked out — a
+// top-level `val`, a top-level `assert` — since its contents are a constant
+// of the program.
+
+import std::fs
+import std::path
+import syntax::{Diagnostic, EMBED, Span, Symbol}
+
+extend Lowerer {
+	/// A call of `embed::bytes`, `embed::text` or `embed::textOr`: a read of
+	/// the constant that holds the file, or the text given where there is
+	/// none.
+	var fn embed(which: Intrinsic, item: ItemUse): ExprId = {
+		val span = item.span
+		val text = which != Intrinsic::EmbedBytes
+		val what = match which {
+			.EmbedBytes => "embed::bytes"
+			.EmbedText => "embed::text"
+			_ => "embed::textOr"
+		}
+		// Where a constant's value is worked out, and nowhere else.
+		if self.constStack.isEmpty() && !self.checkingAssert {
+			self.embedError(
+				"`\(what)` reads a file while the program is compiled, so it belongs in a constant",
+				span,
+				"not in a constant",
+				.Some(
+					"write it as a constant's value, `val DATA = embed::bytes(\"file\")`, and use the constant here",
+				),
+			)
+			return self.errorExpr(span)
+		}
+		val wanted = if which == Intrinsic::EmbedTextOr then 2 else 1
+		var path: Option<Symbol> = .None
+		var otherwise: Option<Symbol> = .None
+		if item.args is .Some(args) && args.len() == wanted {
+			if self.ast.exprs[args[0]].kind is .Str(symbol) then path = .Some(symbol)
+			if wanted == 2 && self.ast.exprs[args[1]].kind is .Str(symbol) then
+				otherwise = .Some(symbol)
+		}
+		if path.isNone() || wanted == 2 && otherwise.isNone() {
+			if path.isSome() then
+				self.embedError(
+					"`\(what)` takes the text where there is no file as a string literal",
+					span,
+					"not two string literals",
+					.None,
+				)
+			else if wanted == 2 then
+				self.embedError(
+					"`\(what)` takes the file's path and the text where there is none, each written as a string literal",
+					span,
+					"not two string literals",
+					.None,
+				)
+			else self.embedError(
+				"`\(what)` takes the file's path, written as a string literal",
+				span,
+				"not one string literal",
+				.None,
+			)
+			return self.errorExpr(span)
+		}
+		val name = path.unwrap()
+		val written = String::of(self.text(name))
+		val module = &self.modules[self.current]
+		val .Some(dir) = module.dir.clone() else {
+			self.embedError(
+				"`\(what)` has no directory to read from here",
+				span,
+				"a module of the standard library, or a file checked on its own",
+				.None,
+			)
+			return self.errorExpr(span)
+		}
+		val .Some(root) = module.root.clone() else {
+			self.embedError(
+				"`\(what)` has no directory to read from here",
+				span,
+				"a module of the standard library, or a file checked on its own",
+				.None,
+			)
+			return self.errorExpr(span)
+		}
+		// A file that is not there is the text given, for `textOr`; one that
+		// is there is read as `text` reads it.
+		if otherwise is .Some(given) &&
+			!written.startsWith("/") &&
+			!fs::exists(path::join(dir.toStr(), written.toStr()).toStr()) {
+			return self.alloc(.Str(given), STR, span)
+		}
+		val file = match embeddedFile(&written, &dir, &root) {
+			.Ok(file) => move file
+			.Err((message, label)) => {
+				self.embedError(move message, span, &label, .None)
+				return self.errorExpr(span)
+			}
+		}
+		val ty = if text {
+			STR
+		} else {
+			val bytes = self.intern(.Slice(U8))
+			self.intern(.Ref(inner: bytes, kind: .Shared))
+		}
+		val key = (file.clone(), text)
+		val id = match self.embedded.get(&key) {
+			.Some(id) => id
+			.None => {
+				val bytes = match fs::readFile(&file) {
+					.Ok(bytes) => move bytes
+					.Err(err) => {
+						self.embedError("cannot read `\(file)`: \(err)", span, "not read", .None)
+						return self.errorExpr(span)
+					}
+				}
+				if text && validUpTo(&bytes) is .Some(at) {
+					self.embedError(
+						"`\(written)` is not UTF-8 text: byte \(at) begins no character",
+						span,
+						"not text",
+						.Some("read it with `embed::bytes`, which takes any bytes"),
+					)
+					return self.errorExpr(span)
+				}
+				var kept: Vec<u8> = Vec()
+				for b in bytes.items() {
+					kept.push(b)
+				}
+				val made = self.program.consts.add(ConstDef(
+					name: name,
+					ty: ty,
+					value: .None,
+					code: .None,
+					module: self.current as u32,
+					isPub: false,
+					span: span,
+				))
+				self.program.consts[made].value = .Some(.Bytes(bytes: move kept, origin: made))
+				self.embedded.put(move key, made)
+				made
+			}
+		}
+		val reference = self.intern(.Ref(inner: ty, kind: .Shared))
+		val address = self.alloc(.Table(id), reference, span)
+		return self.alloc(.Deref(address), ty, span)
+	}
+
+	var fn embedError(message: String, span: Span, label: str, help: Option<str>) = {
+		var diagnostic = Diagnostic::error(EMBED, move message, span, String::of(label)).withNote(
+			"a file embedded is read when the program is compiled, from beside the module that names it, and is a constant of the program",
+		)
+		if help is .Some(help) then diagnostic = diagnostic.withHelp(String::of(help))
+		self.report(move diagnostic)
+	}
+}
+
+/// Where a path a module wrote leads: a file below the module's directory,
+/// or beside it, that does not leave the package's root.
+fn embeddedFile(written: str, dir: str, root: str): Result<String, (String, String)> = {
+	if written.startsWith("/") then
+		return .Err(
+			(
+				"`\(written)` is a whole path; a file embedded is named from the module's directory",
+				"not relative to the module",
+			),
+		)
+	val joined = path::join(dir, written)
+	val .Ok(file) = fs::realPath(&joined) else {
+		return .Err(("there is no file `\(written)` beside the module", "looked for `\(joined)`"))
+	}
+	// An empty root is the current directory, as a bare file name's parent
+	// is; one that cannot be found holds nothing, rather than everything, as
+	// the empty path would.
+	val writtenRoot = if root.isEmpty() then "." else root
+	val .Ok(found) = fs::realPath(writtenRoot) else {
+		return .Err(
+			("the package's root, `\(root)`, cannot be found", "nothing is embedded outside it"),
+		)
+	}
+	if !path::isWithin(&file, &found) then
+		return .Err(
+			(
+				"`\(written)` is outside the package, which a file embedded may not leave",
+				"outside `\(writtenRoot)`",
+			),
+		)
+	val isFile = match fs::meta(&file) {
+		.Ok(meta) => meta.isFile()
+		.Err(_) => false
+	}
+	if !isFile then return .Err(("`\(written)` is not a file", "a directory, or something else"))
+	return .Ok(move file)
+}
+
+/// Where bytes stop being UTF-8: the first byte that begins no character, or
+/// nothing where they are UTF-8 throughout.
+fn validUpTo(text: str): Option<i64> = {
+	var at = 0
+	while at < text.len() {
+		val (c, width) = text.charAt(at)
+		// A U+FFFD that is really there takes three bytes.
+		if c == '\u{FFFD}' && width == 1 then return .Some(at)
+		at += width
+	}
+	return .None
+}

@@ -1,0 +1,247 @@
+// Sizes, alignments and field offsets, computed once per program and shared
+// by every backend. Struct layouts are C-like.
+
+import std::collections::{Map}
+import hir::{Program, Ty}
+
+/// The size and alignment of a type, in bytes.
+@derive(Eq, Clone)
+pub struct Layout {
+	pub size: u32
+	pub align: u32
+}
+
+struct StructLayout {
+	layout: Layout
+	offsets: Vec<u32>
+}
+
+/// Struct layouts are C-like: fields in declaration order, each at the next
+/// offset that satisfies its alignment. Each instance of a generic struct or
+/// enum has a layout of its own, so layouts are kept by type, and computed
+/// when first asked for.
+pub struct Layouts {
+	structs: Map<Ty, StructLayout> = Map()
+	enums: Map<Ty, EnumLayout> = Map()
+}
+
+/// Where an enum records which variant it holds.
+@derive(Eq, Clone)
+pub enum Tag {
+	/// The variant's index, in the first `size` bytes.
+	Byte(size: u32)
+	/// No tag: the variant `payload` holds an `own` at `offset`, and a null
+	/// pointer there means the variant `empty` instead. Nothing else in
+	/// `payload` owns memory, since taking the `own` out leaves a null.
+	Niche(payload: u32, empty: u32, offset: u32)
+}
+
+/// An enum's layout: its tag, and the offsets of each variant's fields from
+/// the start of the value.
+struct EnumLayout {
+	layout: Layout
+	tag: Tag
+	offsets: Vec<Vec<u32>>
+}
+
+extend Layout {
+	/// Distance between consecutive array elements.
+	pub fn stride(): u32 = nextMultiple(self.size, self.align)
+}
+
+extend Layouts {
+	pub static fn new(): Layouts = Layouts()
+
+	pub var fn structLayout(program: &Program, ty: Ty): Layout = {
+		if self.structs.get(&ty) is .Some(s) then return s.layout.clone()
+		// A union's fields are all at 0, over the same bytes, and it is as
+		// large as the largest of them.
+		val union = match program.types.kind(ty) {
+			.Struct(id, ..) => program.structs[id].isUnion
+			_ => false
+		}
+		var size: u32 = 0
+		var align: u32 = 1
+		var offsets: Vec<u32> = Vec()
+		for fieldTy in program.fieldTys(ty) {
+			val field = self.of(&program, fieldTy)
+			if union {
+				offsets.push(0)
+				size = size.max(field.size)
+			} else {
+				size = nextMultiple(size, field.align)
+				offsets.push(size)
+				size += field.size
+			}
+			align = align.max(field.align)
+		}
+		val layout = Layout(size: nextMultiple(size, align), align: align)
+		self.structs.put(ty, StructLayout(layout: layout.clone(), offsets: move offsets))
+		return layout
+	}
+
+	pub var fn of(program: &Program, ty: Ty): Layout = match program.types.kind(ty) {
+		.Unit | .Never | .Error => Layout(size: 0, align: 1)
+		// Integers are aligned to their size: `i128` to 16 bytes, as C
+		// compilers align `__int128`.
+		.Int(int) => {
+			val size = int.bits() / 8
+			Layout(size: size, align: size)
+		}
+		.Float(float: .F32) => Layout(size: 4, align: 4)
+		// A slice is known by a pointer and a length, and so are a reference
+		// to one and a buffer. A `&dyn` is a pointer and a table of methods.
+		.Slice(..) | .Dyn(..) => Layout(size: 16, align: 8)
+		// A closure lent for one call is what it captured and its code.
+		.Ref(inner: e, ..) | .Own(inner: e) if program.types.kind(e) is .Slice(..) | .Dyn(..)
+		| .Fn(..) => Layout(size: 16, align: 8)
+		// A C pointer is one word, like every other pointer.
+		.Float(float: .F64) | .Cstring | .Fn(..) | .Own(..) | .Ptr(..) | .Ref(..) => Layout(
+			size: 8,
+			align: 8,
+		)
+		// No value of an opaque C type exists; only `ptr<T>` of one.
+		.Opaque(..) => Layout(size: 0, align: 1)
+		// A block of slots is a pointer and how many there are.
+		.Slots(..) => Layout(size: 16, align: 8)
+		// A pointer and a length.
+		.Str => Layout(size: 16, align: 8)
+		.Bool => Layout(size: 1, align: 1)
+		// A Unicode scalar value, in 32 bits.
+		.Char => Layout(size: 4, align: 4)
+		.Struct(..) => self.structLayout(&program, ty)
+		.Array(elem, len) => {
+			val element = self.of(&program, elem)
+			val size = (element.stride() as u64) * len
+			if size > 0xFFFF_FFFF then panic("arrays larger than 4 GiB are not supported")
+			Layout(size: size as u32, align: element.align)
+		}
+		.Enum(..) => self.enumLayout(&program, ty)
+		.Param(..) | .Assoc(..) => panic("only instances of generic items are laid out")
+	}
+
+	pub var fn fieldOffset(program: &Program, ty: Ty, index: u32): u32 = {
+		self.structLayout(&program, ty)
+		return match self.structs.get(&ty) {
+			.Some(s) => s.offsets[index as i64]
+			.None => panic("laid out above")
+		}
+	}
+
+	/// An enum's layout: a tag and then each variant's fields over the same
+	/// bytes, or no tag at all when a null `own`, or a null function, can
+	/// stand for the only variant without fields.
+	pub var fn enumLayout(program: &Program, ty: Ty): Layout = {
+		if self.enums.get(&ty) is .Some(e) then return e.layout.clone()
+		val variants = program.variantFieldTys(ty)
+		var fields: Vec<Vec<Layout>> = Vec()
+		for variant in variants {
+			var layouts: Vec<Layout> = Vec()
+			for f in variant {
+				layouts.push(self.of(&program, f))
+			}
+			fields.push(move layouts)
+		}
+		val niche = if variants.len() == 2 then nicheOf(&program, &variants) else Option::None
+		val enumLayout = match niche {
+			.Some((payload, empty, field)) => {
+				val (offsets, end) = sequential(&fields[payload], 0)
+				var align: u32 = 1
+				for f in fields[payload] {
+					align = align.max(f.align)
+				}
+				val offset = offsets[field]
+				var all: Vec<Vec<u32>> = Vec::of(own [Vec(), Vec()])
+				all[payload] = move offsets
+				EnumLayout(
+					layout: Layout(size: nextMultiple(end, align), align: align),
+					tag: .Niche(payload: payload as u32, empty: empty as u32, offset: offset),
+					offsets: move all,
+				)
+			}
+			.None => {
+				val tagSize: u32 = if variants.len() <= 256 then 1 else 4
+				var payloadAlign: u32 = 1
+				for variant in fields {
+					for f in variant {
+						payloadAlign = payloadAlign.max(f.align)
+					}
+				}
+				val start = nextMultiple(tagSize, payloadAlign)
+				var size = tagSize
+				var offsets: Vec<Vec<u32>> = Vec()
+				for variant in fields {
+					val (variantOffsets, end) = sequential(&variant, start)
+					size = size.max(end)
+					offsets.push(move variantOffsets)
+				}
+				val align = tagSize.max(payloadAlign)
+				EnumLayout(
+					layout: Layout(size: nextMultiple(size, align), align: align),
+					tag: .Byte(tagSize),
+					offsets: move offsets,
+				)
+			}
+		}
+		val layout = enumLayout.layout.clone()
+		self.enums.put(ty, move enumLayout)
+		return layout
+	}
+
+	pub var fn enumTag(program: &Program, ty: Ty): Tag = {
+		self.enumLayout(&program, ty)
+		return match self.enums.get(&ty) {
+			.Some(e) => e.tag.clone()
+			.None => panic("laid out above")
+		}
+	}
+
+	pub var fn variantOffset(program: &Program, ty: Ty, variant: u32, field: u32): u32 = {
+		self.enumLayout(&program, ty)
+		return match self.enums.get(&ty) {
+			.Some(e) => e.offsets[variant as i64][field as i64]
+			.None => panic("laid out above")
+		}
+	}
+}
+
+/// Of an enum of two variants, the one whose `own` or function can be null
+/// for the other, which has no fields: the variant, the empty one, and the
+/// field. Taking the `own` out leaves a null, which reads as the empty
+/// variant, so nothing else in the variant may still need dropping then.
+fn nicheOf(program: &Program, variants: &[Vec<Ty>]): Option<(i64, i64, i64)> = {
+	val empty =
+		if variants[0].isEmpty() then 0 else if variants[1].isEmpty() then 1 else return .None
+	val payload = 1 - empty
+	val fields = &variants[payload]
+	var found: Option<i64> = .None
+	for (i, f) in fields.forwards().enumerate() {
+		if program.types.kind(f) is .Own(..) | .Fn(..) {
+			found = .Some(i)
+			break
+		}
+	}
+	val .Some(field) = found else {
+		return .None
+	}
+	for (i, f) in fields.forwards().enumerate() {
+		if i != field && program.ownsMemory(f) then return .None
+	}
+	return .Some((payload, empty, field))
+}
+
+/// Offsets for fields laid out one after another from `start`, each at the
+/// next multiple of its alignment, and where the last one ends.
+fn sequential(fields: &[Layout], start: u32): (Vec<u32>, u32) = {
+	var end = start
+	var offsets: Vec<u32> = Vec()
+	for f in fields {
+		val offset = nextMultiple(end, f.align)
+		end = offset + f.size
+		offsets.push(offset)
+	}
+	return (move offsets, end)
+}
+
+/// The smallest multiple of `align` that is `n` or more.
+fn nextMultiple(n: u32, align: u32): u32 = if n % align == 0 then n else n + (align - n % align)

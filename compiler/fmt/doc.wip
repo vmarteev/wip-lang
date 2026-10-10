@@ -1,0 +1,403 @@
+// The document a file is printed from, and the printer that fits it to a
+// width. It is Wadler's "prettier printer" as Prettier
+// uses it: text, groups, indentation, and line breaks that are spaces
+// while the group they are in fits.
+
+/// A document.
+pub enum Doc {
+	/// Text with no line break in it.
+	Text(text: String)
+	/// A space while its group fits, and a line break where it does not.
+	Line
+	/// Nothing while its group fits, and a line break where it does not.
+	Soft
+	/// A line break always; the groups around it cannot be flat.
+	Hard
+	/// A line with nothing on it: a blank line between two things.
+	Blank
+	Concat(parts: Vec<Doc>)
+	/// Laid out flat if it fits in what is left of the line, and broken
+	/// otherwise.
+	Group(inner: own<Doc>)
+	/// One indentation deeper, from the next line break on.
+	Indent(inner: own<Doc>)
+	/// The first where its group is broken, the second where it is flat.
+	IfBreak(broken: own<Doc>, flat: own<Doc>)
+	/// Text put at the end of the line it is on, before its line break: a
+	/// comment that ended a line. Its group cannot be flat, or the comment
+	/// would swallow what follows it.
+	LineEnd(text: String)
+	/// Words with a space between them, as many on a line as fit where its
+	/// group is broken: a table of numbers, filled as a paragraph is.
+	Fill(words: Vec<String>)
+	/// Always flat, and where it ends past the width, the `Choice` it is
+	/// in takes its second layout: an `if`'s condition and its `then`.
+	Rigid(inner: own<Doc>)
+	/// Where a `Rigid` ends: the printer checks it ended within the width.
+	RigidEnd
+	/// The first layout where its rigid parts each fit on their line, and
+	/// the second where one does not.
+	Choice(first: own<Doc>, second: own<Doc>)
+}
+
+pub fn text(s: str): Doc = .Text(text: String::of(s))
+
+pub fn concat(parts: Vec<Doc>): Doc = .Concat(parts: move parts)
+
+pub fn group(doc: Doc): Doc = .Group(inner: own move doc)
+
+pub fn indent(doc: Doc): Doc = .Indent(inner: own move doc)
+
+pub fn ifBreak(broken: Doc, flat: Doc): Doc = .IfBreak(broken: own move broken, flat: own move flat)
+
+pub fn rigid(doc: Doc): Doc = .Rigid(inner: own move doc)
+
+pub fn choice(first: Doc, second: Doc): Doc = .Choice(
+	first: own move first,
+	second: own move second,
+)
+
+/// The document laid out on one line, where it can be: nothing in it
+/// breaks a line whatever the width, a comment that ends one included.
+pub fn flat(doc: &Doc): Option<String> = {
+	var out = String()
+	var stack: Vec<&Doc> = Vec::of(own [doc])
+	while stack.pop() is .Some(doc) {
+		match doc {
+			.Text(text) => out.push(text.toStr())
+			.Line => out.push(" ")
+			.Soft | .RigidEnd => {}
+			.Hard | .Blank | .LineEnd(..) => return .None
+			.Concat(parts) => {
+				var i = parts.len()
+				while i > 0 {
+					i -= 1
+					stack.push(&parts[i])
+				}
+			}
+			.Group(inner) | .Indent(inner) | .Rigid(inner) => stack.push(&inner)
+			.IfBreak(flat: inner, ..) => stack.push(&inner)
+			.Choice(first, ..) => stack.push(&first)
+			.Fill(words) => out.push(words.join(" "))
+		}
+	}
+	return .Some(move out)
+}
+
+/// `parts` with `sep` between them.
+pub fn join(parts: Vec<Doc>, sep: Doc): Doc = {
+	var out: Vec<Doc> = Vec::withCapacity(parts.len() * 2)
+	var i = 0
+	for part in move parts {
+		if i > 0 then out.push(sep.clone())
+		out.push(move part)
+		i += 1
+	}
+	return .Concat(parts: move out)
+}
+
+extend Doc: Clone {
+	fn clone(): Doc = match self {
+		.Text(text) => .Text(text: text.clone())
+		.Line => .Line
+		.Soft => .Soft
+		.Hard => .Hard
+		.Blank => .Blank
+		.Concat(parts) => {
+			var copied: Vec<Doc> = Vec::withCapacity(parts.len())
+			for part in parts {
+				copied.push(part.clone())
+			}
+			return .Concat(parts: move copied)
+		}
+		.Group(inner) => group(inner.clone())
+		.Indent(inner) => indent(inner.clone())
+		.IfBreak(broken, flat) => ifBreak(broken.clone(), flat.clone())
+		.LineEnd(text) => .LineEnd(text: text.clone())
+		.Fill(words) => .Fill(words: words.clone())
+		.Rigid(inner) => rigid(inner.clone())
+		.RigidEnd => .RigidEnd
+		.Choice(first, second) => choice(first.clone(), second.clone())
+	}
+}
+
+/// How a line is indented, and how wide it may be.
+@derive(Eq, Clone)
+pub struct Style {
+	pub var width: i64 = 100
+	pub var tabs: bool = true
+	/// Spaces per indentation, or the columns a tab counts as.
+	pub var size: i64 = 4
+}
+
+@derive(Eq, Clone)
+enum Mode {
+	Flat
+	Break
+}
+
+/// Whether a document holds something that no group around it can be
+/// flat with: a line break that always breaks, or a comment that ends a
+/// line.
+fn forcesBreak(doc: &Doc): bool = match doc {
+	.Hard | .Blank | .LineEnd(..) => true
+	.Concat(parts) => {
+		for part in parts {
+			if forcesBreak(&part) then return true
+		}
+		return false
+	}
+	.Group(inner) | .Indent(inner) => forcesBreak(&inner)
+	.IfBreak(broken, flat) => forcesBreak(&broken) || forcesBreak(&flat)
+	.Rigid(inner) => forcesBreak(&inner)
+	.Choice(first, ..) => forcesBreak(&first)
+	.Text(..) | .Line | .Soft | .Fill(..) | .RigidEnd => false
+}
+
+/// Prints a document to `style`'s width.
+pub fn print(doc: &Doc, style: Style): String = {
+	var layout = Layout(
+		out: String(),
+		column: 0,
+		fresh: true,
+		lineEnd: Vec(),
+		overran: false,
+		style: style,
+	)
+	// Where a `Rigid` ends, pushed after it on the stack.
+	val rigidEnd: Doc = .RigidEnd
+	var stack: Vec<(i64, Mode, &Doc)> = Vec::of(own [(0, Mode::Break, doc)])
+	layout.run(&var stack, 0, &rigidEnd)
+	var out = move layout.out
+	for s in layout.lineEnd {
+		out.push(s.toStr())
+	}
+	trimEnd(&var out)
+	out.push("\n")
+	return move out
+}
+
+/// What is printed so far, and where.
+struct Layout {
+	out: String
+	column: i64
+	/// Nothing but indentation is on the current line yet.
+	fresh: bool
+	/// What is waiting for the end of the line: comments that ended one.
+	lineEnd: Vec<String>
+	/// Whether a rigid part ended past the width.
+	overran: bool
+	style: Style
+}
+
+extend Layout {
+	/// Prints what is on `stack` above its first `bottom` entries, which
+	/// are what follows, seen only to decide whether a group fits.
+	/// `rigidEnd` is a `RigidEnd`, pushed after each rigid part.
+	var fn run(stack: &var Vec<(i64, Mode, &Doc)>, bottom: i64, rigidEnd: &Doc) keeps rigidEnd = {
+		val style = self.style
+		while stack.len() > bottom {
+			val .Some((level, mode, doc)) = stack.pop() else {
+				break
+			}
+			match doc {
+				.Text(text) => {
+					self.out.push(text.toStr())
+					self.column += charCount(text.toStr())
+					self.fresh = self.fresh && text.isEmpty()
+				}
+				// Flat, all on this line; broken, a word goes on the next
+				// line where it would not fit on this one.
+				.Fill(words) => {
+					for (i, word) in words.forwards().enumerate() {
+						val width = charCount(word.toStr())
+						if i > 0 {
+							if mode == .Flat || self.column + 1 + width <= style.width {
+								self.out.push(" ")
+								self.column += 1
+							} else {
+								trimEnd(&var self.out)
+								self.out.push("\n")
+								self.column = indentation(&var self.out, level, style)
+							}
+						}
+						self.out.push(word.toStr())
+						self.column += width
+						self.fresh = false
+					}
+				}
+				.Concat(parts) => {
+					var i = parts.len()
+					while i > 0 {
+						i -= 1
+						stack.push((level, mode, &parts[i]))
+					}
+				}
+				.Indent(inner) => stack.push((level + 1, mode, &inner))
+				// Inside what is flat, flat too: inside a group that fits,
+				// it fits, and inside a rigid part it must.
+				.Group(inner) => {
+					val left = if style.width > self.column then style.width - self.column else 0
+					val isFlat = mode == .Flat || !forcesBreak(&inner) && fits(&inner, &stack, left)
+					stack.push((level, if isFlat then Mode::Flat else Mode::Break, &inner))
+				}
+				.IfBreak(broken, flat) => stack.push(
+					(level, mode, if mode == .Break then &broken else &flat),
+				)
+				// One with a line break that cannot be flat does not fit.
+				.Rigid(inner) => {
+					self.overran = self.overran || forcesBreak(&inner)
+					stack.push((level, mode, rigidEnd))
+					stack.push((level, Mode::Flat, &inner))
+				}
+				.RigidEnd => self.overran = self.overran || self.column > style.width
+				// Where the group around it is flat, it fits as the first
+				// already. Otherwise the first is tried, on a copy of what
+				// is printed, with what follows it to decide its groups.
+				.Choice(first, second) => {
+					if mode == .Flat {
+						stack.push((level, mode, &first))
+						continue
+					}
+					var trial = Layout(
+						out: String(),
+						column: self.column,
+						fresh: self.fresh,
+						lineEnd: Vec(),
+						overran: false,
+						style: style,
+					)
+					var tried = stack.clone()
+					val below = tried.len()
+					tried.push((level, mode, &first))
+					trial.run(&var tried, below, rigidEnd)
+					stack.push((level, mode, if trial.overran then &second else &first))
+				}
+				// A comment that ended a line, met only once the next line
+				// has begun: it goes back to the end of the line it ended.
+				.LineEnd(text) if self.fresh => {
+					val end = trimEndSpace(self.out.toStr()).len()
+					val before = String::of(self.out.toStr()[0..end])
+					val after = String::of(self.out.toStr()[end..self.out.len()])
+					self.out = "\(before)\(text)\(after)"
+				}
+				.LineEnd(text) => self.lineEnd.push(text.clone())
+				.Line | .Soft if mode == .Flat => {
+					if doc is .Line {
+						self.out.push(" ")
+						self.column += 1
+						self.fresh = false
+					}
+				}
+				.Line | .Soft | .Hard | .Blank => {
+					for s in self.lineEnd {
+						self.out.push(s.toStr())
+					}
+					self.lineEnd.clear()
+					trimEnd(&var self.out)
+					self.out.push("\n")
+					if doc is .Blank then self.out.push("\n")
+					self.column = indentation(&var self.out, level, style)
+					self.fresh = true
+				}
+			}
+		}
+	}
+}
+
+/// Takes the spaces and tabs off the end of what is written, so that no
+/// line ends in them.
+fn trimEnd(out: &var String) = {
+	while !out.isEmpty() && out.toStr()[out.len() - 1] is b' ' | b'\t' {
+		out.popChar()
+	}
+}
+
+/// `text` without the white space it ends with, as Unicode counts it.
+fn trimEndSpace(text: str): str = {
+	var end = text.len()
+	while end > 0 {
+		var start = end - 1
+		while start > 0 && (text[start] & 0xC0) == 0x80 {
+			start -= 1
+		}
+		if !text.charAt(start).0.isWhitespace() then break
+		end = start
+	}
+	return text[0..end]
+}
+
+/// How many characters `text` holds.
+fn charCount(text: str): i64 = {
+	var count = 0
+	for b in text {
+		if (b & 0xC0) != 0x80 then count += 1
+	}
+	return count
+}
+
+/// Writes one line's indentation, and answers the column it reaches.
+fn indentation(out: &var String, level: i64, style: Style): i64 = {
+	if style.tabs {
+		for _ in 0..level {
+			out.push("\t")
+		}
+	} else {
+		for _ in 0..level * style.size {
+			out.push(" ")
+		}
+	}
+	return level * style.size
+}
+
+/// Whether `first`, flat, and then what follows it up to its next line
+/// break, fit in `width` columns.
+fn fits(first: &Doc, rest: &[(i64, Mode, &Doc)], width: i64): bool = {
+	var left = width
+	var stack: Vec<(Mode, &Doc)> = Vec::of(own [(Mode::Flat, first)])
+	var next = rest.len()
+	while true {
+		if stack.isEmpty() {
+			if next == 0 then return true
+			next -= 1
+			val (_, m, d) = rest[next]
+			stack.push((m, d))
+		}
+		val .Some((mode, doc)) = stack.pop() else {
+			return true
+		}
+		match doc {
+			.Text(text) => {
+				left -= charCount(text.toStr())
+				if left < 0 then return false
+			}
+			// Flat, every word and the spaces; broken, the first word, and
+			// then a line break.
+			.Fill(words) => {
+				for (i, word) in words.forwards().enumerate() {
+					if i > 0 && mode != .Flat then return true
+					left -= charCount(word.toStr()) + (if i > 0 then 1 else 0)
+					if left < 0 then return false
+				}
+			}
+			.Concat(parts) => {
+				var i = parts.len()
+				while i > 0 {
+					i -= 1
+					stack.push((mode, &parts[i]))
+				}
+			}
+			.Indent(inner) => stack.push((mode, &inner))
+			.Group(inner) => stack.push((mode, &inner))
+			.IfBreak(broken, flat) => stack.push((mode, if mode == .Break then &broken else &flat))
+			.Rigid(inner) => stack.push((Mode::Flat, &inner))
+			.Choice(first, ..) => stack.push((mode, &first))
+			.LineEnd(..) | .RigidEnd => {}
+			.Line | .Soft if mode == .Flat => if doc is .Line then left -= 1
+			// A line break of what follows, where it is broken: the line
+			// ends there, and everything before it fitted.
+			.Line | .Soft | .Hard | .Blank => return true
+		}
+	}
+	return true
+}

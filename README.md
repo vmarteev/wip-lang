@@ -1,6 +1,6 @@
 # Wip
 
-A systems language, and the prototype compiler for it. Wip is an experiment
+A systems language, and its compiler, written in itself. Wip is an experiment
 in how much of what a borrow checker buys can be had without lifetimes:
 writing is second-class — a `&var` exists only while a call runs — and
 reading borrows are tracked without being written down, so ownership is
@@ -46,9 +46,9 @@ fn main() = {
 
 It is a prototype, and it is finished enough to write programs in: the
 compiler type-checks, move-checks and borrow-checks, generates native code
-through Cranelift, links C, and compiles a program in a fraction of a
-second; a release build is optimised by LLVM, where there is a `clang` 15
-or newer to compile with. It has been tried on real programs by porting
+through LLVM, with a `clang` 15 or newer, links C, and compiles a program
+in a fraction of a second; a release build is optimised across the whole
+program. It has been tried on real programs by porting
 them: a C++23 game — raylib built from source with it, a frame identical
 to the C++ build's, pixel for pixel, compiled in **0.19 s** — a file
 manager, a web server, a Lox interpreter, and miniz's compressor, whose
@@ -79,18 +79,28 @@ fn main() = {
 ```
 
 ```sh
-cargo build --release                  # build the compiler
-./target/release/wip run hello.wip     # compile a program and run it
-./target/release/wip build hello.wip   # write an executable
-./target/release/wip test hello.wip    # run the program's tests
-./target/release/wip check hello.wip   # report everything wrong, write nothing
-./target/release/wip fmt hello.wip     # lay the file out in the one way Wip is written
+scripts/bootstrap.sh --out ~/wip   # build the compiler, with clang alone
+export PATH="$HOME/wip/bin:$PATH"
+wip run hello.wip                  # compile a program and run it
+wip build hello.wip                # write an executable
+wip test hello.wip                 # run the program's tests
+wip check hello.wip                # report everything wrong, write nothing
+wip fmt hello.wip                  # lay the file out in the one way Wip is written
 ```
+
+Building it needs a `clang` 15 or newer and nothing of Wip's: the compiler
+is written in Wip, and `bootstrap/` holds it for each system as LLVM's
+bitcode, which `clang` compiles into the first `wip`; that one builds the
+compiler from its source, and the compiler built builds itself again. What
+it leaves is a directory, as an installed compiler is: `bin/wip`, and
+beside it the standard library, `std/`, and the tools, `tools/`, which
+are this checkout's own, so a change to the library is seen by the next
+build of a program.
 
 The entry file's directory is the program's module, and every directory it
 imports is another: there is no build file, no manifest and no module
-manager. The standard library is inside the compiler, so nothing is
-installed and nothing is fetched.
+manager. The standard library is read from beside the compiler, so
+nothing is fetched.
 
 For Zed and Neovim — highlighting, and a language server with errors as
 you type, hover, definitions, completion and rename — see
@@ -100,12 +110,14 @@ you type, hover, definitions, completion and rename — see
 
 | Directory | What is in it |
 |---|---|
-| `crates/` | the compiler, in Rust, in nine crates — `wip-syntax`, `wip-hir`, `wip-analysis`, `wip-mir`, `wip-codegen` (Cranelift), `wip-llvm`, `wip-fmt`, `wip-lang` (the driver and CLI), `wip-bench` |
-| `std/` | the standard library, in Wip, compiled into the compiler |
+| `compiler/` | the compiler, in Wip, a module a phase — `syntax`, `hir` (checking), `analysis` (moves and borrows), `mir`, `llvm` (LLVM's IR and bitcode, through `clang`), `fmt` — and `lang`, the driver and the language server; `main.wip` is the `wip` command |
+| `bootstrap/` | the compiler as LLVM's bitcode, for each system: what builds the first `wip` with `clang` |
+| `std/` | the standard library, in Wip, which the compiler reads from beside it |
 | `tools/` | tools written in Wip that `wip` carries and builds when first asked: `wip bindgen`, a Wip module from a C header |
 | `editors/` | Zed and Neovim: a Tree-sitter grammar, and the language server `wip lsp` |
 | `tests/cases/` | the language's own test programs, each with its output or its diagnostics as a snapshot |
 | `tests/std/` | the standard library's own tests, written in Wip |
+| `tests/gate/` | checks of the `wip` command, written in Wip: given a `wip`, it runs it as a reader does: the cases against their snapshots, every example in the documents, calls across the C boundary, packages, the driver and the debugger |
 | `docs/language/` | the language reference, by topic |
 | `docs/grammar.md` | the syntax specification the parser must agree with |
 | `examples/` | small, complete programs, each in a directory of its own, from `hello` to a web server and a C library |
@@ -148,8 +160,9 @@ Everything you can do with the language is `wip --help`; everything you can
 do to the repository is a script in `scripts/`:
 
 ```sh
-cargo build --release          # build the compiler
-scripts/verify.sh              # the gate: formatting, every test, clippy
+scripts/bootstrap.sh           # build the compiler from the seed, with clang
+scripts/build.sh [--release]   # build it from its source, into target/wip
+scripts/verify.sh              # the gate: the compiler built twice, formatting, every check
 scripts/verify.sh --fast       # just the language's own cases, in a second
 scripts/snapshots.sh [filter]  # regenerate what the cases expect, then read the diff
 scripts/linux.sh [--fast]      # the same verification on Linux, in a container
@@ -158,16 +171,18 @@ scripts/tree-sitter.sh         # the editors' grammar: regenerate, test, parse e
 ```
 
 `scripts/verify.sh` is the definition of green: it must print `ALL OK`
-before a commit. It runs every test binary — the case programs and their
-snapshots, the standard library's own tests written in Wip, the driver's
-tests, a robustness pass over mutilated input, and every example in this
-file and in the language reference, each of which must compile and be laid
-out as `wip fmt` lays it out. A `run` example must run to a successful end
+before a commit. It builds the compiler from its source with the `wip` the
+seed builds, has the compiler built build itself, the two writing the same
+bitcode for it, and runs `tests/gate` with the second, a program in Wip
+that checks `wip` by running it: the case programs and their snapshots, the standard library's
+own tests, the driver, the compiler's own tests — among them a robustness
+pass over mutilated input — and every example in this file and in the
+language reference, each of which must compile and be laid out as `wip
+fmt` lays it out. A `run` example must run to a successful end
 and an `error=` example must be refused with the code it names, so a
 document that stops being true fails the build.
 
-The scripts are the interface, not `cargo`: the compiler is Rust today and
-means to be Wip tomorrow, and a script that says what it does outlives
+The scripts are the interface: a script that says what it does outlives
 whichever tool is underneath it.
 
 Apple arm64 is what this is developed on, and Linux is tested beside it:

@@ -1,0 +1,281 @@
+// `wip test`, and what `wip mir` and `wip check` write of a program for
+// people and for tools.
+
+import check::{Gate, wrong, write}
+
+/// `wip test` compiles the `.test.wip` files of every module with the
+/// program, runs each `@test` function, and says so; a test sees the names
+/// its module keeps to itself, wherever the module is. A filter keeps the
+/// tests whose name holds it. `wip run` compiles the program without its
+/// tests: a test file that does not compile is no business of a build.
+fn testsEveryModule(gate: &Gate, root: str): Option<String> = {
+	write(
+		root,
+		"main.wip",
+		"import std::io\nimport board\n\nfn main() = io::println(\"the program\")\n",
+	)
+	write(root, "board/board.wip", "pub fn width(): i64 = 9\n\nfn hidden(): i64 = 4\n")
+	write(
+		root,
+		"board/board.test.wip",
+		"@test\nfn theBoardIsNine() = assert(width() == 9)\n\n@test\nfn testsSeeWhatTheModuleKeeps() = assert(hidden() == 4)\n",
+	)
+	write(root, "main.test.wip", "@test\nfn theWidthIsShared() = assert(board::width() == 9)\n")
+	val tested = gate.wip(root, ["test", "main.wip"])
+	if !tested.exit.success() ||
+		tested.stdout !=
+			"running 3 tests\ntest theWidthIsShared ... ok\ntest board::theBoardIsNine ... ok\ntest board::testsSeeWhatTheModuleKeeps ... ok\n\n3 tests passed\n" {
+		return wrong("`wip test main.wip`", &tested)
+	}
+	val filtered = gate.wip(root, ["test", "main.wip", "Nine"])
+	if !filtered.exit.success() ||
+		filtered.stdout != "running 1 test\ntest board::theBoardIsNine ... ok\n\n1 test passed\n" {
+		return wrong("`wip test main.wip Nine`", &filtered)
+	}
+	write(root, "board/board.test.wip", "@test\nfn broken() = assert(nothingIsCalledThis())\n")
+	val ran = gate.wip(root, ["run", "main.wip"])
+	if !ran.exit.success() || ran.stdout != "the program\n" then
+		return wrong("`wip run main.wip`, a test broken", &ran)
+	val broken = gate.wip(root, ["test", "main.wip"])
+	if broken.exit.success() || !broken.stderr.contains("nothingIsCalledThis") then
+		return wrong("`wip test main.wip`, a test broken", &broken)
+	return .None
+}
+
+/// A test that fails ends the run where it is: the line that names it is
+/// unfinished, and the panic says what was asserted and where.
+fn failingTest(gate: &Gate, root: str): Option<String> = {
+	write(root, "main.wip", "fn main() = {}\n")
+	write(
+		root,
+		"main.test.wip",
+		"@test\nfn theSumIsRight() = {\n    var total = 0\n    total += 3\n    assert(total == 7, \"three and four\")\n}\n\n@test\nfn neverReached() = assert(true)\n",
+	)
+	val tested = gate.wip(root, ["test", "main.wip"])
+	if tested.exit != .Code(101) ||
+		tested.stdout != "running 2 tests\ntest theSumIsRight ... " ||
+		!tested.stderr.startsWith("panicked: three and four: total == 7\n  at ") {
+		return wrong("`wip test main.wip`", &tested)
+	}
+	return .None
+}
+
+/// A program with no tests is not a failure: `wip test` says there are none.
+fn noTests(gate: &Gate, root: str): Option<String> = {
+	write(root, "main.wip", "fn main() = {}\n")
+	val tested = gate.wip(root, ["test", "main.wip"])
+	if !tested.exit.success() || tested.stdout != "running 0 tests\n" then
+		return wrong("`wip test main.wip`", &tested)
+	return .None
+}
+
+/// `wip mir` prints the mid-level IR of every function of the program,
+/// whether `main` reaches it or not.
+fn mirEveryFunction(gate: &Gate, root: str): Option<String> = {
+	write(
+		root,
+		"main.wip",
+		"fn twice(x: i64): i64 = x * 2\n\nfn unused(): i64 = 1\n\nfn main(): i64 = twice(21)\n",
+	)
+	val printed = gate.wip(root, ["mir", "main.wip"])
+	if !printed.exit.success() then return wrong("`wip mir main.wip`", &printed)
+	for text in [
+		"fn twice(_0: i64) -> _1: i64 {",
+		"fn main() -> _0: i64 {",
+		"call twice(21_i64)",
+		"fn unused() -> _0: i64 {",
+	] {
+		if !printed.stdout.contains(text) then
+			return wrong("`wip mir` does not print `\(text)`", &printed)
+	}
+	return .None
+}
+
+/// `wip mir` prints the program as a build compiles it: its constants as
+/// they were worked out, its own functions and the instances it made, and
+/// the drop functions they name, but not the library's own functions, which
+/// are the same in every program, unless `--library` asks. A debug build
+/// drops a struct by a call; with `--release`, a release build drops each
+/// field where it is.
+fn mirWhatABuildCompiles(gate: &Gate, root: str): Option<String> = {
+	write(
+		root,
+		"main.wip",
+		"struct Pair {\n\ta: own<i64>\n\tb: own<i64>\n}\n\n@comptime\nval SQUARES: [i64; 3] = squares()\n\nfn squares(): [i64; 3] = {\n\tvar table = [0; 3]\n\tfor i in 0..3 {\n\t\ttable[i] = i * i\n\t}\n\treturn table\n}\n\nfn take(pair: Pair) = {}\n\nfn main() = {\n\ttake(Pair(a: own 1, b: own 2))\n\tassert(SQUARES[2] == 4)\n}\n",
+	)
+	val debug = gate.wip(root, ["mir", "main.wip"])
+	if !debug.exit.success() || !debug.stdout.startsWith("val SQUARES: [i64; 3] = [0, 1, 4]") then
+		return wrong("`wip mir main.wip`", &debug)
+	for text in [
+		"fn squares() -> _0: [i64; 3] {",
+		"drop_in_place<Pair>(_0)",
+		"fn drop_in_place<Pair>(",
+		// An instance the program made.
+		"fn std::prelude::Vec.push<u8>(",
+	] {
+		if !debug.stdout.contains(text) then
+			return wrong("`wip mir` does not print `\(text)`", &debug)
+	}
+	if debug.stdout.contains("fn std::prelude::i8.add(") then
+		return wrong("`wip mir` prints the library's own", &debug)
+	val library = gate.wip(root, ["mir", "--library", "main.wip"])
+	if !library.stdout.contains("fn std::prelude::i8.add(") then
+		return wrong("`wip mir --library main.wip`", &library)
+	val release = gate.wip(root, ["mir", "--release", "main.wip"])
+	val .Some(take) = release.stdout.split("\nfn ").find((f) => f.startsWith("take(")) else {
+		return wrong("`wip mir --release` does not print `take`", &release)
+	}
+	if take.contains("drop_in_place") || countOf(take, "free(") != 2 then
+		return .Some("a release build drops a struct otherwise than field by field:\n\(take)")
+	return .None
+}
+
+/// `wip check --dump-diagnostics` writes each diagnostic plainly, one fact a
+/// line, on standard output, after the files they are in: what it is, then
+/// its labels by place — `file:line:column-line:column`, the end just past
+/// what it covers, a tab one column — and its fix with each edit. It fails
+/// as `wip check` does.
+fn diagnosticsDumped(gate: &Gate, root: str): Option<String> = {
+	write(
+		root,
+		"main.wip",
+		"fn twice() = {}\n\nfn twice() = {}\n\nfn main() = {\n\tval big = 1__000\n}\n",
+	)
+	val dumped = gate.wip(root, ["check", "--dump-diagnostics", "main.wip"])
+	if dumped.exit != .Code(1) ||
+		dumped.stdout !=
+			"file main.wip\nerror E0201 `twice` is defined more than once\n  primary main.wip:3:4-3:9 defined again here\n  secondary main.wip:1:4-1:9 first defined here\nerror E0010 digits are separated by one `_`\n  primary main.wip:6:13-6:15 more than one `_`\n  fix keep one `_`\n  edit main.wip:6:13-6:15 _\n" {
+		return wrong("`wip check --dump-diagnostics main.wip`", &dumped)
+	}
+	return .None
+}
+
+/// The `|`s that bind are numbered in each body from 0, so that the checked
+/// program is the same however many threads checked its bodies: the count
+/// once went on from one body to the next on a thread, and began again
+/// where a thread began.
+fn alternativesNumbered(gate: &Gate, root: str): Option<String> = {
+	write(
+		root,
+		"main.wip",
+		"enum Shape {\n\tRound(size: i64)\n\tSquare(size: i64)\n\tDot\n}\n\nfn size(s: Shape): i64 = match s {\n\t.Round(size) | .Square(size) => size\n\t.Dot => 0\n}\n\nfn twice(s: Shape): i64 = match s {\n\t.Round(size) | .Square(size) => size * 2\n\t.Dot => 0\n}\n\nfn main() = {\n\tval n = size(.Dot) + twice(.Round(1))\n}\n",
+	)
+	val one = gate.wip(root, ["check", "--threads", "1", "--dump-hir", "main.wip"])
+	if !one.exit.success() then return wrong("`wip check --threads 1 --dump-hir`", &one)
+	var numbered: Vec<String> = Vec()
+	for line in one.stdout.lines() {
+		if line.contains("pattern any binding") then numbered.push(String::of(line.trim()))
+	}
+	if numbered.len() != 2 ||
+		numbered[0] != "pattern any binding 0" ||
+		numbered[1] != "pattern any binding 0" {
+		return .Some("the alternatives are numbered \(numbered.join(", "))")
+	}
+	val four = gate.wip(root, ["check", "--threads", "4", "--dump-hir", "main.wip"])
+	if four.stdout != one.stdout then
+		return .Some("the dump on four threads is not the dump on one")
+	return .None
+}
+
+/// `wip check --dump-hir --library` writes the library's items whole too,
+/// which no file of the prelude can be checked alone to write; `--library`
+/// is only for the dump.
+fn libraryDumped(gate: &Gate, root: str): Option<String> = {
+	write(root, "main.wip", "fn main() = {}\n")
+	val dumped = gate.wip(root, ["check", "--dump-hir", "--library", "main.wip"])
+	if !dumped.exit.success() ||
+		!dumped.stdout.contains("pub enum Option<T>  @std/prelude/option.wip:") {
+		return wrong("`wip check --dump-hir --library`", &dumped)
+	}
+	val plain = gate.wip(root, ["check", "--dump-hir", "main.wip"])
+	if plain.stdout.contains("enum Option") then
+		return wrong("`wip check --dump-hir` writes the library", &plain)
+	val alone = gate.wip(root, ["check", "--library", "main.wip"])
+	if alone.exit != .Code(2) then return wrong("`wip check --library` without a dump", &alone)
+	return .None
+}
+
+/// `wip check --dump-hir` writes the checked program, one fact a line: the
+/// program's own items with their bodies, each expression with its type and
+/// where it is, and of the library only the instances the program made,
+/// which change with the library and are checked by what they hold. It is
+/// the same on any number of threads, and a program with errors is written
+/// as far as it was checked, the errors shown as `check` shows them.
+fn programDumped(gate: &Gate, root: str): Option<String> = {
+	write(
+		root,
+		"main.wip",
+		"struct Point {\n\tx: i64\n}\n\nfn norm(p: &Point): i64 = if p.x < 0 then -p.x else p.x\n\nfn main() = {\n\tval p = Point(x: -3)\n\tval n = norm(&p)\n}\n",
+	)
+	val dumped = gate.wip(root, ["check", "--dump-hir", "main.wip"])
+	if !dumped.exit.success() then return wrong("`wip check --dump-hir main.wip`", &dumped)
+	var mine = String()
+	var library: Vec<String> = Vec()
+	for line in dumped.stdout.lines() {
+		if line.startsWith("instance ") || line.startsWith("drop ") || line.startsWith("next ") {
+			library.push(String::of(line))
+		} else {
+			mine.push(line)
+			mine.push("\n")
+		}
+	}
+	if mine.trimEnd() != PROGRAM_DUMPED.trimEnd() then
+		return .Some("the program's own part is\n\(mine)")
+	if !library.contains(String::of("drop Vec<u8> = std::prelude::Vec.destroy<u8>")) then
+		return .Some("the library's part has no drop of `Vec<u8>`")
+	for line in library {
+		if !line.contains(" std::") then return .Some("the library's part has `\(line)`")
+	}
+	val oneThread = gate.wip(root, ["--threads", "1", "check", "--dump-hir", "main.wip"])
+	if oneThread.stdout != dumped.stdout then
+		return .Some("the dump on one thread is not the dump on many")
+	write(root, "main.wip", "fn main() = {\n\tval n: i64 = true\n}\n")
+	val wrongly = gate.wip(root, ["check", "--dump-hir", "main.wip"])
+	if wrongly.exit != .Code(1) ||
+		!wrongly.stderr.contains("E0") ||
+		!wrongly.stdout.contains("fn main(): void  @main.wip:1:1..1:10") {
+		return wrong("`wip check --dump-hir` of a program with an error", &wrongly)
+	}
+	return .None
+}
+
+val PROGRAM_DUMPED = """
+	module ""
+	struct Point  @main.wip:1:8..1:13
+	  field x: i64  @2:2..2:8
+	struct lambda env  @main.wip:1:1..1:1
+	struct lambda env  @main.wip:1:1..1:1
+	  field lambda: (ptr<u8>) => void  @1:1..1:1
+	fn norm(p: &Point): i64  @main.wip:5:1..5:24
+	  param p#0: &Point  @5:9..5:10
+	  value
+	    if: i64  @5:27..5:56
+	      binary <: bool  @5:30..5:37
+	        field 0 x: i64  @5:30..5:33
+	          deref: Point  @5:30..5:31
+	            local p#0: &Point  @5:30..5:31
+	        int 0: i64  @5:36..5:37
+	      then block  @5:43..5:47
+	        value
+	          unary -: i64  @5:43..5:47
+	            field 0 x: i64  @5:44..5:47
+	              deref: Point  @5:44..5:45
+	                local p#0: &Point  @5:44..5:45
+	      else block  @5:53..5:56
+	        value
+	          field 0 x: i64  @5:53..5:56
+	            deref: Point  @5:53..5:54
+	              local p#0: &Point  @5:53..5:54
+	fn main(): void  @main.wip:7:1..7:10
+	  val p#0: Point  @8:6..8:7
+	  val n#1: i64  @9:6..9:7
+	  value
+	    block: void  @7:13..10:2
+	      let p#0  @8:2..8:22
+	        struct Point: Point  @8:10..8:22
+	          int -3: i64  @8:19..8:21
+	      let n#1  @9:2..9:18
+	        call norm: i64  @9:10..9:18
+	          ref: &Point  @9:15..9:17
+	            local p#0: Point  @9:16..9:17
+	"""

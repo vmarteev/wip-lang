@@ -1,0 +1,416 @@
+// Imports and visibility: what a file's `import`s bind, and which items of
+// other modules it may name.
+
+import std::collections::{Map}
+import std::mem
+import syntax as ast
+import syntax::{
+	DUPLICATE_DEFINITION,
+	Diagnostic,
+	Edit,
+	PRIVATE_ITEM,
+	Span,
+	Symbol,
+	UNKNOWN_MODULE,
+	UNKNOWN_NAME
+}
+
+/// A function that `files` declare under `sym`: its name, whether it is
+/// exported, and whether it is a C function. A C declaration is exported
+/// when it says `pub`, so that bindings are a module people share.
+fn declaredFn(files: &[&ast::Ast], sym: Symbol): Option<(ast::Name, bool, bool)> = {
+	for file in files {
+		for item in file.items {
+			match item {
+				.Fn(f) if f.sig.name.sym == sym => return .Some((f.sig.name, f.isPub, false))
+				.Extern(e) => {
+					for declared in e.fns {
+						if declared.sig.name.sym == sym then
+							return .Some((declared.sig.name, declared.isPub, true))
+					}
+				}
+				_ => {}
+			}
+		}
+	}
+	return .None
+}
+
+/// A top-level `val` of these files, and whether it is exported: read from
+/// the files, since a module's constants are declared after the imports that
+/// name them are checked.
+fn declaredVal(files: &[&ast::Ast], sym: Symbol): Option<(ast::Name, bool)> = {
+	for file in files {
+		for item in file.items {
+			if item is .Val(v) && v.name.sym == sym then return .Some((v.name, v.isPub))
+		}
+	}
+	return .None
+}
+
+/// A variable C owns, declared in an `extern "C"` block of these files, and
+/// whether it is exported: a `pub val` or `pub var` is imported by name as a
+/// function or a constant is.
+fn declaredGlobal(files: &[&ast::Ast], sym: Symbol): Option<(ast::Name, bool)> = {
+	for file in files {
+		for item in file.items {
+			val .Extern(e) = item else {
+				continue
+			}
+			for declared in e.globals {
+				if declared.name.sym == sym then return .Some((declared.name, declared.isPub))
+			}
+		}
+	}
+	return .None
+}
+
+extend Lowerer {
+	/// The module a path written in the current module means: one of `std`'s,
+	/// one of a dependency's — whose name begins the path — or one of this
+	/// package's own, named from the package's root.
+	fn moduleMeant(written: str): String = {
+		val scope = &self.modules[self.current]
+		val first = match written.splitOnce("::") {
+			.Some((first, _)) => first
+			.None => written
+		}
+		var depended = false
+		for d in scope.depends {
+			if d == first then depended = true
+		}
+		if scope.prefix.isEmpty() || first == "std" || depended then return String::of(written)
+		if written.isEmpty() then return scope.prefix.clone()
+		return "\(scope.prefix)::\(written)"
+	}
+
+	/// The index of the module whose path is `path`, if the program has one.
+	fn moduleIndex(path: str): Option<i64> = {
+		for (index, module) in self.modules.forwards().enumerate() {
+			if module.path == path then return .Some(index)
+		}
+		return .None
+	}
+
+	/// What the current file's `import` declarations bind: modules, and the
+	/// items named in braces. The items are checked by `checkImportedItems`,
+	/// once every type is named.
+	var fn resolveImports(): FileImports = {
+		val file = self.ast
+		var imports = FileImports()
+		var firstSeen: Map<Symbol, Span> = Map()
+		for item in file.items {
+			val .Import(decl) = item else {
+				continue
+			}
+			var written = String()
+			for (i, n) in decl.path.forwards().enumerate() {
+				if i > 0 then written.push("::")
+				written.push(self.text(n.sym))
+			}
+			val meant = self.moduleMeant(written.toStr())
+			val found = self.moduleIndex(meant.toStr())
+			match found {
+				.None => {
+					self.report(
+						Diagnostic::error(
+							UNKNOWN_MODULE,
+							"cannot find module `\(written)`",
+							decl.span,
+							String::of("unknown module"),
+						).withNote(
+							String::of(
+								"a module is a directory below the one the program starts in, named by its path",
+							),
+						),
+					)
+				}
+				.Some(index) if index == self.current => {
+					self.report(
+						Diagnostic::error(
+							UNKNOWN_MODULE,
+							String::of("a module cannot import itself"),
+							decl.span,
+							String::of("this is the module being compiled"),
+						).withNote(String::of("the files of one module share a namespace already")),
+					)
+				}
+				.Some(_) => {}
+			}
+			val index: Option<i64> = match found {
+				.Some(index) if index != self.current => .Some(index)
+				_ => .None
+			}
+			val last = decl.path[decl.path.len() - 1]
+			// What the import binds, and to what: the module, or the names in
+			// its braces, where `self` is the module.
+			var bindings: Vec<(ast::Name, Option<ast::Name>)> = Vec()
+			match decl.items {
+				.None => bindings.push((decl.alias.unwrapOr(last), .None))
+				.Some(items) => {
+					for imported in items {
+						match imported.name {
+							// `self` binds the module under its last segment.
+							.None => bindings.push(
+								(
+									imported.alias.unwrapOr(ast::Name(
+										sym: last.sym,
+										span: imported.span,
+									)),
+									.None,
+								),
+							)
+							.Some(name) => bindings.push(
+								(imported.alias.unwrapOr(name), .Some(name)),
+							)
+						}
+					}
+				}
+			}
+			for (bound, named) in bindings {
+				if firstSeen.get(&bound.sym) is .Some(first) {
+					val name = String::of(self.text(bound.sym))
+					self.report(
+						Diagnostic::error(
+							DUPLICATE_DEFINITION,
+							"`\(name)` is imported twice",
+							bound.span,
+							String::of("already bound by another import"),
+						).withSecondary(first, String::of("the first import")).withHelp(
+							String::of("give one of them another name with `as`"),
+						),
+					)
+					continue
+				}
+				firstSeen.put(bound.sym, bound.span)
+				match (index, named) {
+					(.Some(index), .None) => imports.modules.put(bound.sym, index)
+					(.Some(index), .Some(named)) => imports.items.put(bound.sym, .Item(
+						module: index,
+						name: named,
+					))
+					// The module was reported; uses of its items stay quiet.
+					(.None, .Some(_)) => imports.items.put(bound.sym, .Broken)
+					(.None, .None) => {}
+				}
+			}
+		}
+		return move imports
+	}
+
+	/// Checks the items the current file imports by name. Each must be
+	/// declared and exported by its module, and must not share a name with
+	/// something the importing module declares. Returns the file's imports
+	/// with every item reported here marked broken, so that its uses stay
+	/// quiet.
+	var fn checkImportedItems(modules: &[ModuleAst]): FileImports = {
+		var imports = mem::replace(&var self.imports, FileImports())
+		val file = self.ast
+		for item in file.items {
+			val .Import(decl) = item else {
+				continue
+			}
+			// A name of the prelude is in scope already. The module's own name
+			// is bound where the import has no list.
+			val moduleName: Option<ast::Name> = match decl.alias {
+				.Some(alias) => .Some(alias)
+				.None =>
+					if decl.items.isNone() then .Some(decl.path[decl.path.len() - 1]) else .None
+			}
+			if moduleName is .Some(bound) && self.preludeName(bound, "an import named") then
+				imports.modules.remove(&bound.sym)
+			val .Some(listed) = decl.items else {
+				continue
+			}
+			for imported in listed {
+				val .Some(name) = imported.name else {
+					continue
+				}
+				val bound = imported.alias.unwrapOr(name)
+				if self.preludeName(bound, "an import named") {
+					imports.items.put(bound.sym, .Broken)
+					continue
+				}
+				// A name imported twice was reported, and keeps its first
+				// import.
+				val .Some(.Item(module, name: named)) = imports.items.get(&bound.sym) else {
+					continue
+				}
+				if named.span != imported.span then continue
+				if !self.checkImportedItem(&modules, module, named, bound) then
+					imports.items.put(bound.sym, .Broken)
+			}
+		}
+		return move imports
+	}
+
+	/// Reports what is wrong with importing `name` from `module` under the
+	/// name `bound`, and returns whether nothing is.
+	var fn checkImportedItem(
+		modules: &[ModuleAst],
+		module: i64,
+		name: ast::Name,
+		bound: ast::Name,
+	): bool = {
+		val text = String::of(self.text(name.sym))
+		val path = self.modules[module].path.clone()
+		var ty: Option<(str, bool)> = match self.modules[module].types.get(&name.sym) {
+			.Some((def, _)) => match def {
+				.Struct(id) => .Some(("struct", self.program.structs[id].isPub))
+				.Enum(id) => .Some(("enum", self.program.enums[id].isPub))
+				.Builtin(..) => .Some(("type", false))
+			}
+			.None => .None
+		}
+		// A type alias, which `pub` exports as any item, a C type, seen only
+		// through `ptr`, and an interface.
+		if ty.isNone() && self.modules[module].interfaces.get(&name.sym) is .Some((id, _)) then
+			ty = .Some(("interface", self.program.interfaces[id].isPub))
+		if ty.isNone() && self.modules[module].aliases.get(&name.sym) is .Some(alias) then
+			ty = .Some(("type alias", alias.isPub))
+		if ty.isNone() && self.modules[module].opaques.get(&name.sym) is .Some(id) then
+			ty = .Some(("C type", self.program.opaques[id].isPub))
+		val func = declaredFn(&modules[module].files, name.sym)
+		// A top-level `val` is an item too.
+		val konst: Option<bool> = match declaredVal(&modules[module].files, name.sym) {
+			.Some((_, isPub)) => .Some(isPub)
+			.None => .None
+		}
+		val global: Option<bool> = match declaredGlobal(&modules[module].files, name.sym) {
+			.Some((_, isPub)) => .Some(isPub)
+			.None => .None
+		}
+		val exported =
+			(ty is .Some((_, true))) ||
+			(func is .Some((_, true, _))) ||
+			konst == .Some(true) ||
+			global == .Some(true)
+		if !exported {
+			match (ty, func) {
+				(.None, .None) if konst == .Some(false) => self.privateItem(module, "val", name)
+				(.None, .None) if global == .Some(false) => self.privateItem(module, "var", name)
+				(.Some((what, _)), _) => self.privateItem(module, what, name)
+				(.None, .Some((_, _, false))) => self.privateItem(module, "fn", name)
+				(.None, .Some((_, _, true))) => {
+					self.report(
+						Diagnostic::error(
+							PRIVATE_ITEM,
+							"`\(text)` is a C function that module `\(path)` declares",
+							name.span,
+							String::of("an extern declaration"),
+						).withHelp("declare `fn \(text)` in an `extern \"C\"` block of this module").withNote(
+							String::of("extern declarations are never exported"),
+						),
+					)
+				}
+				(.None, .None) => {
+					var candidates: Vec<str> = Vec()
+					val types = &self.modules[module].types
+					for i in 0..types.len() {
+						val exportedType = match types.valueAt(i).0 {
+							.Struct(id) => self.program.structs[id].isPub
+							.Enum(id) => self.program.enums[id].isPub
+							.Builtin(..) => false
+						}
+						if exportedType then candidates.push(self.text(types.keyAt(i).clone()))
+					}
+					val interfaces = &self.modules[module].interfaces
+					for i in 0..interfaces.len() {
+						if self.program.interfaces[interfaces.valueAt(i).0].isPub then
+							candidates.push(self.text(interfaces.keyAt(i).clone()))
+					}
+					for file in modules[module].files {
+						for item in file.items {
+							match item {
+								.Fn(f) if f.isPub => candidates.push(self.text(f.sig.name.sym))
+								.Val(v) if v.isPub => candidates.push(self.text(v.name.sym))
+								_ => {}
+							}
+						}
+					}
+					var diagnostic = Diagnostic::error(
+						UNKNOWN_NAME,
+						"cannot find `\(text)` in module `\(path)`",
+						name.span,
+						String::of("not declared there"),
+					)
+					if suggest(text.toStr(), &candidates) is .Some(similar) then
+						diagnostic = diagnostic.withFix(
+							"did you mean `\(similar)`?",
+							own [Edit::replace(name.span, String::of(similar))],
+						)
+					self.report(move diagnostic)
+				}
+			}
+			return false
+		}
+		// The module's own names come first, so the import would never be
+		// used: a type or an interface, a function, a constant.
+		var declared = self.declaredAt(bound.sym)
+		if declared.isNone() &&
+			declaredFn(&modules[self.current].files, bound.sym) is .Some((found, _, _)) {
+			declared = .Some(found.span)
+		}
+		if declared.isNone() &&
+			declaredVal(&modules[self.current].files, bound.sym) is .Some((found, _)) {
+			declared = .Some(found.span)
+		}
+		if declared is .Some(declared) {
+			val boundText = String::of(self.text(bound.sym))
+			self.report(
+				Diagnostic::error(
+					DUPLICATE_DEFINITION,
+					"`\(boundText)` is imported, and declared in this module too",
+					bound.span,
+					String::of("imported here"),
+				).withSecondary(
+					declared,
+					String::of("declared here"),
+				).withHelp("import it under another name: `\(text) as …`"),
+			)
+			return false
+		}
+		return true
+	}
+
+	/// What `name` stands for if the current file imported it from another
+	/// module: the module, and the item's name there, spanned where it is
+	/// used. Nothing if nothing was imported under the name, or the current
+	/// module declares the name itself.
+	fn imported(name: ast::Name): Option<ImportedItem> = {
+		if self.types().contains(&name.sym) ||
+			self.fns().contains(&name.sym) ||
+			self.consts().contains(&name.sym) {
+			return .None
+		}
+		return match self.imports.items.get(&name.sym) {
+			.Some(.Item(module, name: item)) => .Some(.Item(module: module, name: ast::Name(
+				sym: item.sym,
+				span: name.span,
+			)))
+			.Some(.Broken) => .Some(.Broken)
+			.None => .None
+		}
+	}
+
+	/// Whether an item of `module` may be named here: a module sees all of
+	/// its own declarations, and only what other modules export.
+	fn visible(module: i64, isPub: bool): bool = module == self.current || isPub
+
+	/// Reports an item that another module keeps to itself.
+	var fn privateItem(module: i64, what: str, name: ast::Name) = {
+		val text = String::of(self.text(name.sym))
+		val path = self.modules[module].path.clone()
+		// A C type is declared `type name` inside an extern block, and an
+		// alias `type name = …`, so that is what the help says to write.
+		val declared = if what is "C type" | "type alias" then "type" else what
+		self.report(
+			Diagnostic::error(
+				PRIVATE_ITEM,
+				"`\(text)` is private to module `\(path)`",
+				name.span,
+				"a private \(what)",
+			).withHelp("declare it `pub \(declared) \(text)` to export it"),
+		)
+	}
+}

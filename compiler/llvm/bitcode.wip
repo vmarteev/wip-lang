@@ -1,0 +1,1904 @@
+// The module as LLVM's bitcode, as LLVM 15 writes it, which every later LLVM
+// reads: `--emit llvm-bc` writes it.
+//
+// A bitcode file is an identification block, saying who wrote it, then the
+// module's block, then the table of the names it gives its globals and
+// functions. The module's block holds, in order: the table of types; the
+// attribute groups and the attribute lists made of them; a record for each
+// global, then for each function; the constants the globals hold; the kinds
+// of metadata it attaches, and its metadata; and a block for each function
+// defined. Everything is numbered by the order it is written in, and a record
+// names what it refers to by its number: types and attribute lists, values —
+// the globals and functions, the constants after them, and in a function its
+// parameters, its constants and its instructions after those — and metadata,
+// its strings first. An instruction names a value by how far back it is from
+// itself, which keeps the numbers small.
+//
+// Every record is written as it is, with no abbreviation but those a blob
+// needs: valid bitcode, larger than LLVM's own.
+
+import std::collections::{Map}
+import std::mem
+
+/// The module as bitcode.
+pub fn bitcode(module: &Module): Vec<u8> = {
+	var writer = Writer::new(&module)
+	writer.number()
+	return writer.write()
+}
+
+// The blocks, by their numbers.
+val IDENTIFICATION_BLOCK: u32 = 13
+val MODULE_BLOCK: u32 = 8
+val PARAMATTR_BLOCK: u32 = 9
+val PARAMATTR_GROUP_BLOCK: u32 = 10
+val CONSTANTS_BLOCK: u32 = 11
+val FUNCTION_BLOCK: u32 = 12
+val VALUE_SYMTAB_BLOCK: u32 = 14
+val METADATA_BLOCK: u32 = 15
+val METADATA_ATTACHMENT_BLOCK: u32 = 16
+val TYPE_BLOCK: u32 = 17
+val METADATA_KIND_BLOCK: u32 = 22
+val STRTAB_BLOCK: u32 = 23
+
+/// The attribute index that says a group is the function's own.
+val FUNCTION_INDEX: u64 = 0xFFFFFFFF
+
+/// A call's flags: its type is written in it.
+val CALL_EXPLICIT_TYPE: u64 = 1 << 15
+
+/// Sequentially consistent, the ordering of every atomic the backend writes,
+/// and the scope of the whole system.
+val SEQ_CST: u64 = 6
+val SYSTEM_SCOPE: u64 = 1
+
+// The kinds of metadata a function or an instruction carries, as LLVM
+// numbers them.
+val KIND_DBG: u64 = 0
+val KIND_PROF: u64 = 2
+val KIND_INVARIANT_LOAD: u64 = 6
+val KIND_NONNULL: u64 = 11
+val KIND_ALIGN: u64 = 17
+
+/// One attribute of a group: one that is there, one with a number, one with
+/// a type, or a key and its value.
+enum AttrEntry {
+	Plain(kind: u64)
+	Number(kind: u64, value: u64)
+	Typed(kind: u64, t: u32)
+	Text(key: String, value: String)
+}
+
+extend AttrEntry {
+	/// The attribute as a group's record holds it.
+	fn push(values: &var Vec<u64>) = match self {
+		.Plain(kind) => {
+			values.push(0)
+			values.push(kind)
+		}
+		.Number(kind, value) => {
+			values.push(1)
+			values.push(kind)
+			values.push(value)
+		}
+		.Typed(kind, t) => {
+			values.push(6)
+			values.push(kind)
+			values.push(t as u64)
+		}
+		.Text(key, value) => {
+			values.push(4)
+			for byte in key {
+				values.push(byte as u64)
+			}
+			values.push(0)
+			for byte in value {
+				values.push(byte as u64)
+			}
+			values.push(0)
+		}
+	}
+}
+
+/// A constant before it is numbered: what it is, its operands by their
+/// numbers.
+enum ConstRecord {
+	Null
+	Undef
+	Int(value: i64)
+	Wide(value: i128)
+	Float(bits: u64)
+	/// Bytes ending in a NUL and holding no other, written without it.
+	CString(bytes: Vec<u8>)
+	Data(bytes: Vec<u8>)
+	/// A struct's or an array's elements.
+	Aggregate(elements: Vec<u32>)
+	/// `inttoptr` of the `i64` numbered so, `i64` being the type numbered
+	/// `word`.
+	IntToPtr(int: u32, word: u32)
+}
+
+/// A function's values and constants, as its block numbers them.
+view struct FnValues {
+	/// Each value it names, by what kind it is and its number, with its own.
+	values: Map<(u8, u32), u32>
+	/// Its constants, numbered after its parameters, and each by its type
+	/// and what it is.
+	constants: Vec<(u32, ConstRecord)>
+	scalars: Map<(u32, u8, i64), u32>
+	/// The first number after its parameters.
+	first: u32
+	/// Each block's number, by its label.
+	labels: Map<(u8, u32), u32>
+	/// The addresses `llvm.dbg.declare` names as metadata, each with its
+	/// metadata number.
+	declared: Map<u32, u32>
+	declaredOrder: Vec<u32>
+}
+
+/// A local value's key: what it is and its number.
+fn localKey(value: &Value): Option<(u8, u32)> = match value {
+	.Temp(n) => .Some((0, n))
+	.Slot(local) => .Some((1, local))
+	.AddressSlot(local) => .Some((2, local))
+	.Param(index) => .Some((3, index))
+	.Main(name) => .Some((4, mainNumber(&name)))
+	.Wrapper(n) => .Some((5, n))
+	_ => .None
+}
+
+fn mainNumber(name: &MainValue): u32 = match name {
+	.Argc => 0
+	.Argv => 1
+	.Args => 2
+	.Count => 3
+	.Length => 4
+	.Result => 5
+	.Code64 => 6
+	.Code => 7
+}
+
+fn labelKey(label: &Label): (u8, u32) = match label {
+	.Start => (0, 0)
+	.Block(index) => (1, index)
+	.Failed(n) => (2, n)
+	.Fine(n) => (3, n)
+}
+
+/// The writer, and what it has numbered.
+view struct Writer {
+	module: &Module
+	bits: Bitstream
+	/// The types, by their numbers, and each type's number by its text.
+	types: Vec<Type>
+	typeIds: Map<String, u32>
+	/// The attribute groups, each its index and attributes, numbered from 1.
+	groups: Vec<(u64, Vec<AttrEntry>)>
+	groupIds: Map<String, u32>
+	/// The attribute lists, each its groups, numbered from 1.
+	lists: Vec<Vec<u32>>
+	listIds: Map<String, u32>
+	/// Each global and function's value number, by its name's number.
+	globalIds: Map<u32, u32>
+	/// The globals and functions in the order their records are written.
+	globalOrder: Vec<u32>
+	/// The module's constants, numbered after its globals and functions.
+	constants: Vec<(u32, ConstRecord)>
+	/// Each global's initializer's number, by its name's number.
+	initIds: Map<u32, u32>
+	/// The metadata strings, and each one's number.
+	strings: Vec<String>
+	stringIds: Map<String, u32>
+	/// The constants metadata names, each its type and value number,
+	/// numbered after the strings, and each one's number by its width and
+	/// value.
+	mdValues: Vec<(u32, u32)>
+	mdValueIds: Map<(u32, i64), u32>
+	/// The number of the module's first node.
+	firstNode: u32
+	/// The nodes the text writes inline, numbered after the module's: the
+	/// empty tuple, and each expression `llvm.dbg.declare` names.
+	emptyTuple: u32
+	expressions: (u32, u32, u32)
+	/// How many metadata numbers the module uses: a function's own follow.
+	mdCount: u32
+	/// Each function defined: its attribute list.
+	fnLists: Vec<u32>
+	/// `llvm.dbg.declare`'s value number, where the module declares it.
+	declareFn: u32
+	/// The name table: each global's name, after the one before.
+	strtab: Vec<u8>
+}
+
+extend Writer {
+	static fn new(module: &Module): Writer = Writer(
+		module: &module,
+		bits: Bitstream::new(),
+		types: Vec(),
+		typeIds: Map(),
+		groups: Vec(),
+		groupIds: Map(),
+		lists: Vec(),
+		listIds: Map(),
+		globalIds: Map(),
+		globalOrder: Vec(),
+		constants: Vec(),
+		initIds: Map(),
+		strings: Vec(),
+		stringIds: Map(),
+		mdValues: Vec(),
+		mdValueIds: Map(),
+		firstNode: 0,
+		emptyTuple: 0,
+		expressions: (0, 0, 0),
+		mdCount: 0,
+		fnLists: Vec(),
+		declareFn: 0,
+		strtab: Vec(),
+	)
+
+	// Numbering.
+
+	/// Numbers what the blocks before the functions write, and every type
+	/// and attribute list a function names.
+	var fn number() = {
+		val module = self.module
+		// The globals, then the functions: declared, then defined.
+		for global in module.data {
+			self.global(global.name)
+		}
+		for global in module.globals {
+			self.global(global.name)
+		}
+		for declared in module.declared {
+			if declared is .Global(global) then self.global(global.name)
+		}
+		for declared in module.declared {
+			if declared is .Function(declaration) {
+				self.global(declaration.symbol)
+				if module.names[declaration.symbol as i64] == "@llvm.dbg.declare" then
+					self.declareFn = self.globalIds.at(&declaration.symbol)
+			}
+		}
+		for function in module.functions {
+			self.global(function.symbol)
+		}
+		self.typeOf(.Ptr)
+		self.typeOf(Type::I(32))
+		self.typeOf(Type::I(8))
+		for global in module.data {
+			self.typeId(&global.t)
+		}
+		for global in module.globals {
+			self.typeId(&global.t)
+		}
+		for declared in module.declared {
+			match declared {
+				.Global(global) => self.typeId(&global.t)
+				.Function(declaration) => {
+					self.typeOf(declarationType(&declaration))
+					self.declarationList(&declaration)
+				}
+			}
+		}
+		for function in module.functions {
+			self.typeOf(functionType(&function))
+			val list = self.functionList(&function)
+			self.fnLists.push(list)
+			for block in function.blocks {
+				for instruction in block.instructions {
+					self.opTypes(&instruction.op)
+				}
+			}
+		}
+		// The constants the globals hold.
+		for global in module.data {
+			if global.init is .Some(init) {
+				val id = self.constant(&init, &global.t)
+				self.initIds.put(global.name, id)
+			}
+		}
+		for global in module.globals {
+			if global.init is .Some(init) {
+				val id = self.constant(&init, &global.t)
+				self.initIds.put(global.name, id)
+			}
+		}
+		self.numberMetadata()
+	}
+
+	var fn global(name: u32) = {
+		if self.globalIds.contains(&name) then return
+		self.globalIds.put(name, self.globalOrder.len() as u32)
+		self.globalOrder.push(name)
+	}
+
+	/// The number of a type made where it is asked for.
+	var fn typeOf(t: Type): u32 = self.typeId(&t)
+
+	/// A type's number, numbered the first time, after what it is made of.
+	var fn typeId(t: &Type): u32 = {
+		val key = t.text()
+		if self.typeIds.get(&key) is .Some(id) then return id
+		match t {
+			.Array(array) => self.typeId(&array.element)
+			.Struct(layout) => {
+				for field in layout.fields {
+					self.typeId(&field)
+				}
+			}
+			.Fn(signature) => {
+				self.typeId(&signature.ret)
+				for param in signature.params {
+					self.typeId(&param)
+				}
+			}
+			_ => {}
+		}
+		val id = self.types.len() as u32
+		self.types.push(t.clone())
+		self.typeIds.put(move key, id)
+		return id
+	}
+
+	/// Every type an instruction names, and the attribute list of a call.
+	var fn opTypes(op: &Op) = match op {
+		.Alloca(t, ..) => self.typeId(&t)
+		.Load(t, ..) | .LoadAtomic(t, ..) => self.typeId(&t)
+		.Store(value, ..) | .StoreAtomic(value, ..) => self.typeId(&value.t)
+		.Arithmetic(left, ..) => self.typeId(&left.t)
+		.FNeg(value) => self.typeId(&value.t)
+		.IntCompare(left, ..) | .FloatCompare(left, ..) => self.typeId(&left.t)
+		.Cast(value, to, ..) => {
+			self.typeId(&value.t)
+			self.typeId(&to)
+		}
+		.Select(select) => self.typeId(&select.ifTrue.t)
+		.ExtractValue(aggregate, ..) => self.typeId(&aggregate.t)
+		.InsertValue(insert) => {
+			self.typeId(&insert.aggregate.t)
+			self.typeId(&insert.value.t)
+		}
+		.Call(call) => {
+			for arg in call.args {
+				self.typeId(&arg.value.t)
+			}
+			self.typeOf(callType(&call))
+			self.callList(&call)
+		}
+		.AtomicRmw(value, ..) => self.typeId(&value.t)
+		.CmpXchg(swap) => self.typeId(&swap.expected.t)
+		.Declare(..) => self.typeOf(declareType())
+		.Switch(value, ..) | .Ret(.Some(value)) => self.typeId(&value.t)
+		_ => {}
+	}
+
+	/// A group of attributes for `index`, numbered the first time.
+	var fn groupId(index: u64, entries: Vec<AttrEntry>): u32 = {
+		var values: Vec<u64> = Vec::of(own [index])
+		for entry in entries {
+			entry.push(&var values)
+		}
+		var keyParts: Vec<String> = Vec()
+		for value in values {
+			keyParts.push("\(value)")
+		}
+		val key = keyParts.join(",")
+		if self.groupIds.get(&key) is .Some(id) then return id
+		self.groups.push((index, move entries))
+		val id = self.groups.len() as u32
+		self.groupIds.put(move key, id)
+		return id
+	}
+
+	/// An attribute list of `groups`, numbered from 1 the first time; 0
+	/// where it is empty.
+	var fn listId(groups: Vec<u32>): u32 = {
+		if groups.isEmpty() then return 0
+		var keyParts: Vec<String> = Vec()
+		for group in groups {
+			keyParts.push("\(group)")
+		}
+		val key = keyParts.join(",")
+		if self.listIds.get(&key) is .Some(id) then return id
+		self.lists.push(move groups)
+		val id = self.lists.len() as u32
+		self.listIds.put(move key, id)
+		return id
+	}
+
+	/// The list of a function's attributes, its result's and its
+	/// parameters'.
+	var fn attrList(fnAttrs: &[FnAttr], ret: &[Attr], params: &[Vec<Attr>]): u32 = {
+		var groups: Vec<u32> = Vec()
+		if !fnAttrs.isEmpty() {
+			var entries: Vec<AttrEntry> = Vec()
+			for attr in fnAttrs {
+				entries.push(fnAttrEntry(&attr))
+			}
+			groups.push(self.groupId(FUNCTION_INDEX, move entries))
+		}
+		if !ret.isEmpty() then groups.push(self.attrGroup(0, &ret))
+		for (i, attrs) in params.forwards().enumerate() {
+			if !attrs.isEmpty() then groups.push(self.attrGroup((i + 1) as u64, &attrs))
+		}
+		return self.listId(move groups)
+	}
+
+	var fn attrGroup(index: u64, attrs: &[Attr]): u32 = {
+		var entries: Vec<AttrEntry> = Vec()
+		for attr in attrs {
+			entries.push(
+				match attr {
+					.ZeroExt => AttrEntry::Plain(34)
+					.SignExt => AttrEntry::Plain(24)
+					.NoAlias => AttrEntry::Plain(9)
+					.ReadOnly => AttrEntry::Plain(21)
+					.NonNull => AttrEntry::Plain(39)
+					.Dereferenceable(bytes) => AttrEntry::Number(kind: 41, value: bytes as u64)
+					.Align(bytes) => AttrEntry::Number(kind: 1, value: bytes as u64)
+					.Sret(bytes) => AttrEntry::Typed(kind: 29, t: self.typeOf(byteArray(bytes)))
+					.ByVal(bytes) => AttrEntry::Typed(kind: 3, t: self.typeOf(byteArray(bytes)))
+				},
+			)
+		}
+		return self.groupId(index, move entries)
+	}
+
+	var fn functionList(function: &Function): u32 = {
+		var params: Vec<Vec<Attr>> = Vec()
+		for param in function.params {
+			params.push(param.attrs.clone())
+		}
+		val groups = &self.module.groups
+		return self.attrList(&groups[function.group()], &function.retAttrs, &params)
+	}
+
+	var fn declarationList(declaration: &Declaration): u32 = {
+		var params: Vec<Vec<Attr>> = Vec()
+		for param in declaration.params {
+			params.push(param.attrs.clone())
+		}
+		val fnAttrs = match declaration.group {
+			.Some(group) => self.module.groups[group].clone()
+			.None => declaration.attrs.clone()
+		}
+		return self.attrList(&fnAttrs, &declaration.retAttrs, &params)
+	}
+
+	var fn callList(call: &Call): u32 = {
+		var params: Vec<Vec<Attr>> = Vec()
+		for arg in call.args {
+			params.push(arg.attrs.clone())
+		}
+		val none: Vec<FnAttr> = Vec()
+		return self.attrList(&none, &call.retAttrs, &params)
+	}
+
+	/// A constant of the module's, of type `t`: its value number. A global's
+	/// address is the global's own.
+	var fn constant(init: &Constant, t: &Type): u32 = match init {
+		.Address(global) => self.globalIds.at(&global)
+		.Zero => self.moduleConst(t, .Null)
+		.Bytes(bytes) => {
+			val zeros = bytes.items().countWhere((byte) => byte == 0)
+			// All zeros is the zero of its type, as LLVM reads it.
+			if zeros == bytes.len() then self.moduleConst(t, .Null)
+			else if zeros == 1 && bytes[bytes.len() - 1] == 0 then
+				self.moduleConst(t, .CString(bytes[0..bytes.len() - 1].toVec()))
+			else self.moduleConst(t, .Data(bytes.clone()))
+		}
+		.Packed(fields) => {
+			val .Struct(layout) = t else {
+				panic("a packed constant is a struct's")
+			}
+			var elements: Vec<u32> = Vec()
+			for (i, field) in fields.forwards().enumerate() {
+				elements.push(self.constant(&field, &layout.fields[i]))
+			}
+			self.moduleConst(t, .Aggregate(move elements))
+		}
+		.Array(items) => {
+			val .Array(array) = t else {
+				panic("an array constant is an array's")
+			}
+			var elements: Vec<u32> = Vec()
+			for item in items {
+				elements.push(self.constant(&item, &array.element))
+			}
+			self.moduleConst(t, .Aggregate(move elements))
+		}
+	}
+
+	var fn moduleConst(t: &Type, value: ConstRecord): u32 = {
+		val typeId = self.typeId(&t)
+		val id = (self.globalOrder.len() + self.constants.len()) as u32
+		self.constants.push((typeId, move value))
+		return id
+	}
+
+	// Metadata.
+
+	/// Numbers the metadata: its strings, the constants it names, the
+	/// module's nodes, and the nodes the text writes inline.
+	var fn numberMetadata() = {
+		val module = self.module
+		for node in module.nodes {
+			for text in nodeStrings(&node) {
+				self.string(text)
+			}
+		}
+		self.string("wip")
+		for node in module.nodes {
+			match node {
+				.Tuple(items) => {
+					for item in items {
+						if item is .Int(bits, value) then self.mdValue(bits, value)
+					}
+				}
+				.Subrange(count) => self.mdValue(64, count as i64)
+				_ => {}
+			}
+		}
+		self.firstNode = (self.strings.len() + self.mdValues.len()) as u32
+		val after = self.firstNode + module.nodes.len() as u32
+		self.emptyTuple = after
+		self.expressions = (after + 1, after + 2, after + 3)
+		self.mdCount = after + 4
+	}
+
+	var fn string(text: str): u32 = {
+		val key = String::of(text)
+		if self.stringIds.get(&key) is .Some(id) then return id
+		val id = self.strings.len() as u32
+		self.strings.push(key.clone())
+		self.stringIds.put(move key, id)
+		return id
+	}
+
+	/// A string's metadata number, plus one: what a record names it by.
+	fn stringRef(text: str): u64 = {
+		val key = String::of(text)
+		return self.stringIds.at(&key) as u64 + 1
+	}
+
+	var fn mdValue(bits: u32, value: i64): u32 = {
+		val key = (bits, value)
+		if self.mdValueIds.get(&key) is .Some(id) then return id
+		val t = Type::I(bits)
+		val typeId = self.typeId(&t)
+		val constant = self.moduleConst(&t, .Int(value))
+		val id = (self.strings.len() + self.mdValues.len()) as u32
+		self.mdValues.push((typeId, constant))
+		self.mdValueIds.put((bits, value), id)
+		return id
+	}
+
+	/// A node's metadata number.
+	fn nodeId(node: i64): u64 = (self.firstNode as i64 + node) as u64
+
+	/// A node's metadata number plus one, or 0 for none: what most fields
+	/// name a node by.
+	fn nodeRef(node: Option<i64>): u64 = match node {
+		.Some(n) => self.nodeId(n) + 1
+		.None => 0
+	}
+
+	// Writing.
+
+	var fn write(): Vec<u8> = {
+		val module = self.module
+		self.bits.bytes(&Vec::of(own [b'B', b'C', 0xC0 as u8, 0xDE as u8]).items())
+		self.identification()
+		self.bits.enter(MODULE_BLOCK, 3)
+		self.bits.record(1, &Vec::of(own [2 as u64]).items())
+		self.typeTable()
+		self.attributes()
+		self.globalRecords()
+		self.moduleConstants()
+		self.metadataKinds()
+		self.metadata()
+		for (i, function) in module.functions.forwards().enumerate() {
+			self.function(&function, i)
+		}
+		self.bits.exit()
+		self.bits.enter(STRTAB_BLOCK, 3)
+		val blob = self.bits.define(Vec::of(own [Field::Literal(1), Field::Blob]))
+		self.bits.abbreviated(&blob, &Vec::of(own [1 as u64]).items(), &self.strtab.items())
+		self.bits.exit()
+		return mem::replace(&var self.bits, Bitstream::new()).finish()
+	}
+
+	var fn identification() = {
+		self.bits.enter(IDENTIFICATION_BLOCK, 5)
+		var producer: Vec<u64> = Vec()
+		for byte in "wip" {
+			producer.push(byte as u64)
+		}
+		self.bits.record(1, &producer.items())
+		self.bits.record(2, &Vec::of(own [0 as u64]).items())
+		self.bits.exit()
+	}
+
+	var fn typeTable() = {
+		self.bits.enter(TYPE_BLOCK, 4)
+		self.bits.record(1, &Vec::of(own [self.types.len() as u64]).items())
+		for t in self.types.clone() {
+			match t {
+				.Void => self.bits.bare(2)
+				.F32 => self.bits.bare(3)
+				.F64 => self.bits.bare(4)
+				.I(bits) => self.bits.record(7, &Vec::of(own [bits as u64]).items())
+				.Ptr => self.bits.record(25, &Vec::of(own [0 as u64]).items())
+				.Metadata => self.bits.bare(16)
+				.Array(array) => {
+					val element = self.typeId(&array.element) as u64
+					self.bits.record(11, &Vec::of(own [array.count, element]).items())
+				}
+				.Struct(layout) => {
+					var values: Vec<u64> = Vec::of(own [if layout.packed then 1 as u64 else 0])
+					for field in layout.fields {
+						values.push(self.typeId(&field) as u64)
+					}
+					self.bits.record(18, &values.items())
+				}
+				.Fn(signature) => {
+					var values: Vec<u64> = Vec::of(own [
+						if signature.variadic then 1 as u64 else 0,
+						self.typeId(&signature.ret) as u64,
+					])
+					for param in signature.params {
+						values.push(self.typeId(&param) as u64)
+					}
+					self.bits.record(21, &values.items())
+				}
+			}
+		}
+		self.bits.exit()
+	}
+
+	var fn attributes() = {
+		if self.groups.isEmpty() then return
+		self.bits.enter(PARAMATTR_GROUP_BLOCK, 3)
+		for (i, (index, entries)) in self.groups.forwards().enumerate() {
+			var values: Vec<u64> = Vec::of(own [(i + 1) as u64, index])
+			for entry in entries {
+				entry.push(&var values)
+			}
+			self.bits.record(3, &values.items())
+		}
+		self.bits.exit()
+		self.bits.enter(PARAMATTR_BLOCK, 3)
+		for list in self.lists {
+			var values: Vec<u64> = Vec()
+			for group in list {
+				values.push(group as u64)
+			}
+			self.bits.record(2, &values.items())
+		}
+		self.bits.exit()
+	}
+
+	/// A global's name in the table of names: where it starts, and how long
+	/// it is.
+	var fn named(name: u32): (u64, u64) = {
+		val raw = rawName(self.module.names[name as i64].toStr())
+		val at = self.strtab.len() as u64
+		for byte in raw {
+			self.strtab.push(byte)
+		}
+		return (at, raw.len() as u64)
+	}
+
+	var fn globalRecords() = {
+		val module = self.module
+		var globals: Vec<&Global> = Vec()
+		for global in module.data {
+			globals.push(&global)
+		}
+		for global in module.globals {
+			globals.push(&global)
+		}
+		for declared in module.declared {
+			if declared is .Global(global) then globals.push(&global)
+		}
+		for global in globals {
+			val (at, length) = self.named(global.name)
+			val init = match self.initIds.get(&global.name) {
+				.Some(id) => id as u64 + 1
+				.None => 0
+			}
+			val values = Vec::of(own [
+				at,
+				length,
+				self.typeId(&global.t) as u64,
+				(if global.constant then 1 as u64 else 0) | 2,
+				init,
+				linkageCode(&global.linkage),
+				match global.align {
+					.Some(align) => alignCode(align)
+					.None => 0
+				},
+				0,
+				visibility(&global.linkage),
+				0,
+				if global.unnamedAddr then 1 as u64 else 0,
+				0,
+				0,
+				0,
+				0,
+				dsoLocal(&global.linkage),
+			])
+			self.bits.record(7, &values.items())
+		}
+		for declared in module.declared {
+			if declared is .Function(declaration) {
+				val (at, length) = self.named(declaration.symbol)
+				val t = self.typeOf(declarationType(&declaration)) as u64
+				val list = self.declarationList(&declaration) as u64
+				self.functionRecord(at, length, t, true, &declaration.linkage, list)
+			}
+		}
+		for (i, function) in module.functions.forwards().enumerate() {
+			val (at, length) = self.named(function.symbol)
+			val t = self.typeOf(functionType(&function)) as u64
+			self.functionRecord(at, length, t, false, &function.linkage, self.fnLists[i] as u64)
+		}
+	}
+
+	var fn functionRecord(
+		at: u64,
+		length: u64,
+		t: u64,
+		proto: bool,
+		linkage: &Linkage,
+		list: u64,
+	) = {
+		val values = Vec::of(own [
+			at,
+			length,
+			t,
+			0,
+			if proto then 1 as u64 else 0,
+			linkageCode(&linkage),
+			list,
+			0,
+			0,
+			visibility(&linkage),
+			0,
+			0,
+			0,
+			0,
+			0,
+			0,
+			0,
+			dsoLocal(&linkage),
+		])
+		self.bits.record(8, &values.items())
+	}
+
+	var fn moduleConstants() = {
+		if self.constants.isEmpty() then return
+		self.bits.enter(CONSTANTS_BLOCK, 4)
+		var current: Option<u32> = .None
+		for (t, value) in self.constants {
+			if current != Option::Some(t) {
+				self.bits.record(1, &Vec::of(own [t as u64]).items())
+				current = .Some(t)
+			}
+			constantRecord(&var self.bits, &value, self.types[t as i64] == Type::F32)
+		}
+		self.bits.exit()
+	}
+}
+
+/// The function type of a declaration.
+fn declarationType(declaration: &Declaration): Type = {
+	var params: Vec<Type> = Vec()
+	for param in declaration.params {
+		params.push(param.t.clone())
+	}
+	return fnOf(declaration.ret.clone(), move params, declaration.variadic)
+}
+
+/// The function type of a function defined.
+fn functionType(function: &Function): Type = {
+	var params: Vec<Type> = Vec()
+	for param in function.params {
+		params.push(param.t.clone())
+	}
+	return fnOf(function.ret.clone(), move params, false)
+}
+
+/// The function type a call is made by: its callee's, or what it passes.
+fn callType(call: &Call): Type = match call.variadic {
+	.Some(named) => fnOf(call.ret.clone(), named.clone(), true)
+	.None => {
+		var params: Vec<Type> = Vec()
+		for arg in call.args {
+			params.push(arg.value.t.clone())
+		}
+		fnOf(call.ret.clone(), move params, false)
+	}
+}
+
+/// `llvm.dbg.declare`'s type.
+fn declareType(): Type = fnOf(
+	.Void,
+	Vec::of(own [Type::Metadata, Type::Metadata, Type::Metadata]),
+	false,
+)
+
+fn fnAttrEntry(attr: &FnAttr): AttrEntry = match attr {
+	.NoUnwind => .Plain(18)
+	.UwTable => .Number(kind: 33, value: 2)
+	.FramePointer => .Text(key: String::of("frame-pointer"), value: String::of("all"))
+	.DisableTailCalls => .Text(key: String::of("disable-tail-calls"), value: String::of("true"))
+	.NoReturn => .Plain(17)
+	.NoMerge => .Plain(66)
+}
+
+/// What a global or a function's record says it is seen by.
+fn linkageCode(linkage: &Linkage): u64 = match linkage {
+	.External | .Hidden => 0
+	.Internal => 3
+	.Private => 9
+}
+
+fn visibility(linkage: &Linkage): u64 = if linkage == Linkage::Hidden then 1 else 0
+
+/// Whether it is in the program's own objects: what is kept to the module,
+/// or hidden.
+fn dsoLocal(linkage: &Linkage): u64 = if linkage == Linkage::External then 0 else 1
+
+/// An alignment as bitcode writes it: its logarithm, plus one.
+fn alignCode(align: u32): u64 = {
+	var log: u64 = 0
+	while ((1 as u64) << log) < align as u64 {
+		log += 1
+	}
+	return log + 1
+}
+
+/// A name as the table of names holds it: what `@"…"` or `@…` writes, its
+/// escapes undone.
+fn rawName(written: str): Vec<u8> = {
+	var out: Vec<u8> = Vec()
+	if written.len() > 1 && written[1] == b'"' {
+		var i = 2
+		while i < written.len() - 1 {
+			val byte = written[i]
+			if byte == b'\\' {
+				out.push(hexDigit(written[i + 1]) * 16 + hexDigit(written[i + 2]))
+				i += 3
+			} else {
+				out.push(byte)
+				i += 1
+			}
+		}
+	} else {
+		for i in 1..written.len() {
+			out.push(written[i])
+		}
+	}
+	return move out
+}
+
+fn hexDigit(byte: u8): u8 =
+	if byte >= b'a' then byte - b'a' + 10
+	else if byte >= b'A' then byte - b'A' + 10
+	else byte - b'0'
+
+/// The strings a node names, in the order it names them.
+fn nodeStrings(node: &Node): Vec<str> = match node {
+	.File(filename, directory) => Vec::of(own [filename.toStr(), directory.toStr()])
+	.Subprogram(name, ..) | .LocalVariable(name, ..) | .BasicType(name, ..) | .Typedef(name, ..)
+	| .Member(name, ..) | .Declared(name, ..) | .Structure(name, ..) | .Enumerator(name, ..) => Vec::of(own [
+		name.toStr(),
+	])
+	.Enumeration(name: .Some(named), ..) => Vec::of(own [named.toStr()])
+	.Tuple(items) => {
+		var texts: Vec<str> = Vec()
+		for item in items {
+			if item is .Text(text) then texts.push(text.toStr())
+		}
+		move texts
+	}
+	_ => Vec()
+}
+
+extend Writer {
+	/// The kinds of metadata the module's instructions carry, by LLVM's
+	/// numbers, and the names a reader knows them by.
+	var fn metadataKinds() = {
+		self.bits.enter(METADATA_KIND_BLOCK, 3)
+		for (kind, name) in Vec::of(own [
+			(KIND_DBG, "dbg"),
+			(KIND_PROF, "prof"),
+			(KIND_INVARIANT_LOAD, "invariant.load"),
+			(KIND_NONNULL, "nonnull"),
+			(KIND_ALIGN, "align"),
+		]) {
+			var values = Vec::of(own [kind])
+			for byte in name {
+				values.push(byte as u64)
+			}
+			self.bits.record(6, &values.items())
+		}
+		self.bits.exit()
+	}
+
+	var fn metadata() = {
+		val module = self.module
+		self.bits.enter(METADATA_BLOCK, 4)
+		if !self.strings.isEmpty() {
+			// The strings' lengths, from a word, then their bytes.
+			var lengths = Bitstream::new()
+			var chars: Vec<u8> = Vec()
+			for text in self.strings {
+				lengths.vbr(text.len() as u64, 6)
+				for byte in text {
+					chars.push(byte)
+				}
+			}
+			var blob = lengths.finish()
+			val offset = blob.len() as u64
+			for byte in chars {
+				blob.push(byte)
+			}
+			val abbrev = self.bits.define(
+				Vec::of(own [Field::Literal(35), Field::Vbr(6), Field::Vbr(6), Field::Blob]),
+			)
+			val values = Vec::of(own [35 as u64, self.strings.len() as u64, offset])
+			self.bits.abbreviated(&abbrev, &values.items(), &blob.items())
+		}
+		for (t, constant) in self.mdValues {
+			self.bits.record(2, &Vec::of(own [t as u64, constant as u64]).items())
+		}
+		for node in module.nodes {
+			self.node(&node)
+		}
+		self.bits.bare(3)
+		for count in 0..3 {
+			var values = Vec::of(own [6 as u64])
+			for _ in 0..count {
+				values.push(6)
+			}
+			self.bits.record(29, &values.items())
+		}
+		if module.unit >= 0 {
+			self.namedNode("llvm.dbg.cu", Vec::of(own [self.nodeId(module.unit)]))
+			self.namedNode(
+				"llvm.module.flags",
+				Vec::of(own [self.nodeId(module.flags.0), self.nodeId(module.flags.1)]),
+			)
+		}
+		self.bits.exit()
+	}
+
+	var fn namedNode(name: str, nodes: Vec<u64>) = {
+		var values: Vec<u64> = Vec()
+		for byte in name {
+			values.push(byte as u64)
+		}
+		self.bits.record(4, &values.items())
+		self.bits.record(10, &nodes.items())
+	}
+
+	/// A node's record: what LLVM 15 writes for its kind.
+	var fn node(node: &Node) = {
+		val coded: (u32, Vec<u64>) = match node {
+			.Unfilled => (3, Vec())
+			.CompileUnit(file, optimized) => (
+				20,
+				Vec::of(own [
+					1,
+					12,
+					self.nodeRef(.Some(file)),
+					self.stringRef("wip"),
+					if optimized then 1 as u64 else 0,
+					0,
+					0,
+					0,
+					1,
+					0,
+					0,
+					0,
+					0,
+					0,
+					0,
+					0,
+					1,
+					0,
+					0,
+					0,
+					0,
+					0,
+				]),
+			)
+			.File(filename, directory) => (
+				16,
+				Vec::of(own [
+					0,
+					self.stringRef(filename.toStr()),
+					self.stringRef(directory.toStr()),
+					0,
+					0,
+				]),
+			)
+			.SubroutineType => (19, Vec::of(own [2, 0, self.emptyTuple as u64 + 1, 0]))
+			.Subprogram(name, file, line, typeNode, artificial, optimized, unit) => (
+				21,
+				Vec::of(own [
+					7,
+					self.nodeRef(.Some(file)),
+					self.stringRef(name.toStr()),
+					0,
+					self.nodeRef(.Some(file)),
+					line as u64,
+					self.nodeRef(.Some(typeNode)),
+					line as u64,
+					0,
+					if optimized then 24 as u64 else 8,
+					0,
+					if artificial then 64 as u64 else 0,
+					self.nodeRef(.Some(unit)),
+					0,
+					0,
+					0,
+					0,
+					0,
+					0,
+					0,
+				]),
+			)
+			.LexicalBlock(scope, file, line, column) => (
+				22,
+				Vec::of(own [
+					1,
+					self.nodeRef(.Some(scope)),
+					self.nodeRef(.Some(file)),
+					line as u64,
+					column as u64,
+				]),
+			)
+			.LexicalBlockFile(scope, file) => (
+				23,
+				Vec::of(own [0, self.nodeRef(.Some(scope)), self.nodeRef(.Some(file)), 0]),
+			)
+			.Location(line, column, scope) => (
+				7,
+				Vec::of(own [0, line as u64, column as u64, self.nodeId(scope), 0, 0]),
+			)
+			.LocalVariable(name, arg, scope, file, line, typeNode) => (
+				28,
+				Vec::of(own [
+					2,
+					self.nodeRef(.Some(scope)),
+					self.stringRef(name.toStr()),
+					self.nodeRef(.Some(file)),
+					line as u64,
+					self.nodeRef(.Some(typeNode)),
+					match arg {
+						.Some(n) => n as u64
+						.None => 0
+					},
+					0,
+					0,
+					0,
+				]),
+			)
+			.BasicType(name, size, encoding) => (
+				15,
+				Vec::of(own [
+					0,
+					0x24,
+					self.stringRef(name.toStr()),
+					size as u64,
+					0,
+					encodingCode(&encoding),
+					0,
+				]),
+			)
+			.PointerType(base, size) => (
+				17,
+				derived(0x0f, 0, 0, self.nodeRef(base), size as u64, 0),
+			)
+			.Typedef(name, base) => (
+				17,
+				derived(0x16, self.stringRef(name.toStr()), 0, self.nodeRef(.Some(base)), 0, 0),
+			)
+			.Member(name, scope, base, size, offset) => (
+				17,
+				derived(
+					0x0d,
+					self.stringRef(name.toStr()),
+					self.nodeRef(.Some(scope)),
+					self.nodeRef(.Some(base)),
+					size as u64,
+					offset as u64,
+				),
+			)
+			.Declared(tag, name) => (
+				18,
+				composite(2, tagCode(&tag), self.stringRef(name.toStr()), 0, 0, 4, 0),
+			)
+			.Structure(tag, name, size, elements) => (
+				18,
+				composite(
+					3,
+					tagCode(&tag),
+					self.stringRef(name.toStr()),
+					0,
+					size as u64,
+					0,
+					self.nodeRef(.Some(elements)),
+				),
+			)
+			.ArrayType(base, size, elements) => (
+				18,
+				composite(
+					3,
+					1,
+					0,
+					self.nodeRef(base),
+					size as u64,
+					0,
+					self.nodeRef(.Some(elements)),
+				),
+			)
+			.Enumeration(name, base, size, elements) => (
+				18,
+				composite(
+					3,
+					4,
+					match name {
+						.Some(named) => self.stringRef(named.toStr())
+						.None => 0
+					},
+					self.nodeRef(.Some(base)),
+					size as u64,
+					0,
+					self.nodeRef(.Some(elements)),
+				),
+			)
+			.Subrange(count) => {
+				val key = (64 as u32, count as i64)
+				val counted = self.mdValueIds.at(&key) as u64 + 1
+				(13, Vec::of(own [4, counted, 0, 0, 0]))
+			}
+			.Enumerator(name, value) => (
+				14,
+				Vec::of(own [6, 64, self.stringRef(name.toStr()), signedVbr(value)]),
+			)
+			.Tuple(items) => {
+				var values: Vec<u64> = Vec()
+				for item in items {
+					values.push(
+						match item {
+							.Node(node) => self.nodeId(node) + 1
+							.Int(bits, value) => {
+								val key = (bits, value)
+								self.mdValueIds.at(&key) as u64 + 1
+							}
+							.Text(text) => self.stringRef(text.toStr())
+						},
+					)
+				}
+				(3, move values)
+			}
+		}
+		self.bits.record(coded.0, &coded.1.items())
+	}
+}
+
+/// A derived type's record: its tag, name, scope, base type, size and
+/// offset, and nothing else.
+fn derived(
+	tag: u64,
+	name: u64,
+	scope: u64,
+	base: u64,
+	size: u64,
+	offset: u64,
+): Vec<u64> = Vec::of(own [0, tag, name, 0, 0, scope, base, size, 0, offset, 0, 0, 0, 0])
+
+/// A composite type's record.
+fn composite(
+	flags: u64,
+	tag: u64,
+	name: u64,
+	base: u64,
+	size: u64,
+	diFlags: u64,
+	elements: u64,
+): Vec<u64> = Vec::of(own [
+	flags,
+	tag,
+	name,
+	0,
+	0,
+	0,
+	base,
+	size,
+	0,
+	0,
+	diFlags,
+	elements,
+	0,
+	0,
+	0,
+	0,
+	0,
+	0,
+	0,
+	0,
+	0,
+	0,
+])
+
+fn tagCode(tag: &DiTag): u64 = match tag {
+	.Structure => 0x13
+	.Union => 0x17
+}
+
+fn encodingCode(encoding: &Encoding): u64 = match encoding {
+	.Boolean => 2
+	.Float => 4
+	.Signed => 5
+	.SignedChar => 6
+	.Unsigned => 7
+	.UnsignedChar => 8
+	.Utf => 0x10
+}
+
+/// Bytes as a record's numbers.
+fn widened(bytes: &[u8]): Vec<u64> = {
+	var values: Vec<u64> = Vec()
+	for byte in bytes {
+		values.push(byte as u64)
+	}
+	return move values
+}
+
+extend Writer {
+	/// A function defined: its block.
+	var fn function(function: &Function, index: i64) = {
+		val module = self.module
+		val ptr = Type::Ptr
+		self.bits.enter(FUNCTION_BLOCK, 4)
+		self.bits.record(1, &Vec::of(own [function.blocks.len() as u64]).items())
+		var local = FnValues(
+			values: Map(),
+			constants: Vec(),
+			scalars: Map(),
+			first: 0,
+			labels: Map(),
+			declared: Map(),
+			declaredOrder: Vec(),
+		)
+		val base = (self.globalOrder.len() + self.constants.len()) as u32
+		for (i, param) in function.params.forwards().enumerate() {
+			if param.name is .Some(name) && localKey(&name) is .Some(key) then
+				local.values.put(key, base + i as u32)
+		}
+		local.first = base + function.params.len() as u32
+		for (i, block) in function.blocks.forwards().enumerate() {
+			local.labels.put(labelKey(&block.label), i as u32)
+		}
+		for block in function.blocks {
+			for instruction in block.instructions {
+				self.opConstants(&var local, &instruction.op)
+			}
+		}
+		var next = local.first + local.constants.len() as u32
+		for block in function.blocks {
+			for instruction in block.instructions {
+				if instruction.result is .Some(result) && localKey(&result) is .Some(key) {
+					local.values.put(key, next)
+					next += 1
+				}
+			}
+		}
+		// The addresses `llvm.dbg.declare` names, numbered after the module's
+		// metadata.
+		for block in function.blocks {
+			for instruction in block.instructions {
+				if instruction.op is .Declare(address, ..) {
+					val id = self.valueId(&local, &address, &ptr)
+					if !local.declared.contains(&id) {
+						local.declared.put(id, self.mdCount + local.declaredOrder.len() as u32)
+						local.declaredOrder.push(id)
+					}
+				}
+			}
+		}
+		if !local.constants.isEmpty() {
+			self.bits.enter(CONSTANTS_BLOCK, 4)
+			var current: Option<u32> = .None
+			for (t, value) in local.constants {
+				if current != Option::Some(t) {
+					self.bits.record(1, &Vec::of(own [t as u64]).items())
+					current = .Some(t)
+				}
+				constantRecord(&var self.bits, &value, self.types[t as i64] == Type::F32)
+			}
+			self.bits.exit()
+		}
+		if !local.declaredOrder.isEmpty() {
+			self.bits.enter(METADATA_BLOCK, 3)
+			val ptrType = self.typeId(&ptr) as u64
+			for id in local.declaredOrder {
+				self.bits.record(2, &Vec::of(own [ptrType, id as u64]).items())
+			}
+			self.bits.exit()
+		}
+		var instId = local.first + local.constants.len() as u32
+		var lastAt: Option<i64> = .None
+		var attachments: Vec<Vec<u64>> = Vec()
+		var number: u64 = 0
+		for block in function.blocks {
+			for instruction in block.instructions {
+				self.instruction(&local, &instruction.op, instId, number, &var attachments)
+				if instruction.result.isSome() then instId += 1
+				if instruction.at is .Some(at) {
+					if lastAt == Option::Some(at) {
+						self.bits.bare(33)
+					} else {
+						val .Location(line, column, scope) = module.nodes[at] else {
+							panic("an instruction is at a location")
+						}
+						val values = Vec::of(own [
+							line as u64,
+							column as u64,
+							self.nodeId(scope) + 1,
+							0,
+							0,
+						])
+						self.bits.record(35, &values.items())
+						lastAt = .Some(at)
+					}
+				}
+				number += 1
+			}
+		}
+		// The function's own: its subprogram, where it has one, in a record
+		// that names no instruction.
+		self.bits.enter(METADATA_ATTACHMENT_BLOCK, 3)
+		if function.subprogram >= 0 then
+			self.bits.record(11, &Vec::of(own [KIND_DBG, self.nodeId(function.subprogram)]).items())
+		if !attachments.isEmpty() {
+			for values in attachments {
+				self.bits.record(11, &values.items())
+			}
+		}
+		self.bits.exit()
+		self.names(&function, &local)
+		self.bits.exit()
+	}
+
+	/// The names of a function's values and blocks, as the text gives them.
+	var fn names(function: &Function, local: &FnValues) = {
+		val ptr = Type::Ptr
+		val names = &self.module.names
+		self.bits.enter(VALUE_SYMTAB_BLOCK, 4)
+		val entry = (id: u32, name: String) => {
+			var values = Vec::of(own [id as u64])
+			for i in 1..name.len() {
+				values.push(name[i] as u64)
+			}
+			move values
+		}
+		for param in function.params {
+			if param.name is .Some(name) {
+				val id = self.valueId(&local, &name, &param.t)
+				self.bits.record(1, &entry(id, name.text(&ptr, &names)).items())
+			}
+		}
+		for block in function.blocks {
+			for instruction in block.instructions {
+				if instruction.result is .Some(result) {
+					val id = self.valueId(&local, &result, &ptr)
+					self.bits.record(1, &entry(id, result.text(&ptr, &names)).items())
+				}
+			}
+		}
+		for (i, block) in function.blocks.forwards().enumerate() {
+			var values = Vec::of(own [i as u64])
+			for byte in block.label.text() {
+				values.push(byte as u64)
+			}
+			self.bits.record(2, &values.items())
+		}
+		self.bits.exit()
+	}
+
+	/// Numbers the constants an instruction names, in its function.
+	var fn opConstants(local: &var FnValues, op: &Op) = {
+		val ptr = Type::Ptr
+		val word = Type::I(64)
+		val flag = Type::I(1)
+		match op {
+			.Alloca(..) => {
+				val one = Value::Int(1)
+				val size = Type::I(32)
+				self.localConst(&var local, &one, &size)
+			}
+			.Load(address, ..) | .LoadAtomic(address, ..) => self.localConst(
+				&var local,
+				&address,
+				&ptr,
+			)
+			.Store(value, address, ..) | .StoreAtomic(value, address, ..) => {
+				self.localVal(&var local, &value)
+				self.localConst(&var local, &address, &ptr)
+			}
+			.Offset(base, offset) => {
+				self.localConst(&var local, &base, &ptr)
+				self.localConst(&var local, &offset, &word)
+			}
+			.Arithmetic(left, right, ..) | .IntCompare(left, right, ..)
+			| .FloatCompare(left, right, ..) => {
+				self.localVal(&var local, &left)
+				self.localConst(&var local, &right, &left.t)
+			}
+			.FNeg(value) | .Cast(value, ..) => self.localVal(&var local, &value)
+			.Select(select) => {
+				self.localConst(&var local, &select.condition, &flag)
+				self.localVal(&var local, &select.ifTrue)
+				self.localVal(&var local, &select.ifFalse)
+			}
+			.ExtractValue(aggregate, ..) => self.localVal(&var local, &aggregate)
+			.InsertValue(insert) => {
+				self.localVal(&var local, &insert.aggregate)
+				self.localVal(&var local, &insert.value)
+			}
+			.Call(call) => {
+				self.localConst(&var local, &call.callee, &ptr)
+				for arg in call.args {
+					self.localVal(&var local, &arg.value)
+				}
+			}
+			.AtomicRmw(address, value, ..) => {
+				self.localConst(&var local, &address, &ptr)
+				self.localVal(&var local, &value)
+			}
+			.CmpXchg(swap) => {
+				self.localConst(&var local, &swap.address, &ptr)
+				self.localVal(&var local, &swap.expected)
+				self.localVal(&var local, &swap.replacement)
+			}
+			.CondBr(condition, ..) => self.localConst(&var local, &condition, &flag)
+			.Switch(value, cases, ..) => {
+				self.localVal(&var local, &value)
+				for (case, _) in cases {
+					val number = Value::Int(case)
+					self.localConst(&var local, &number, &value.t)
+				}
+			}
+			.Ret(.Some(value)) => self.localVal(&var local, &value)
+			_ => {}
+		}
+	}
+
+	var fn localVal(local: &var FnValues, value: &Val) = self.localConst(
+		&var local,
+		&value.v,
+		&value.t,
+	)
+
+	/// Numbers `value`, of type `t`, among its function's constants, where it
+	/// is one.
+	var fn localConst(local: &var FnValues, value: &Value, t: &Type) = {
+		val typeId = self.typeId(&t)
+		val wide = t is .I(bits) && bits > 64
+		val keyed: (u8, i64, ConstRecord) = match value {
+			// Past 64 bits a number is written whole, since a reader extends
+			// a narrower one without its sign.
+			.Int(v) if wide => (0, v, ConstRecord::Wide(v as i128))
+			.Int(v) => (0, v, ConstRecord::Int(v))
+			.Float(bits) => (1, bits as i64, ConstRecord::Float(bits))
+			.Zero => (2, 0, ConstRecord::Null)
+			.Undef => (3, 0, ConstRecord::Undef)
+			.Address(v) => {
+				val word = Type::I(64)
+				val number = Value::Int(v)
+				self.localConst(&var local, &number, &word)
+				val key = (self.typeId(&word), 0 as u8, v)
+				val int = local.scalars.at(&key)
+				(4, v, ConstRecord::IntToPtr(int: int, word: key.0))
+			}
+			.Wide(wide) => {
+				for (i, (at, known)) in local.constants.forwards().enumerate() {
+					if at == typeId && known is .Wide(other) && other == wide.value then return
+				}
+				local.constants.push((typeId, .Wide(wide.value)))
+				return
+			}
+			_ => return
+		}
+		val (tag, payload, constant) = move keyed
+		val key = (typeId, tag, payload)
+		if local.scalars.contains(&key) then return
+		val id = local.first + local.constants.len() as u32
+		local.constants.push((typeId, move constant))
+		local.scalars.put(key, id)
+	}
+
+	/// A value's number in its function: a global's, a constant's, or one of
+	/// the function's own.
+	fn valueId(local: &FnValues, value: &Value, t: &Type): u32 = {
+		if value is .Global(index) then return self.globalIds.at(&index)
+		if localKey(&value) is .Some(key) then return local.values.at(&key)
+		val typeKey = t.text()
+		val typeId = self.typeIds.at(&typeKey)
+		val keyed: (u8, i64) = match value {
+			.Int(v) => (0, v)
+			.Float(bits) => (1, bits as i64)
+			.Zero => (2, 0)
+			.Undef => (3, 0)
+			.Address(v) => (4, v)
+			.Wide(wide) => {
+				for (i, (at, known)) in local.constants.forwards().enumerate() {
+					if at == typeId && known is .Wide(other) && other == wide.value then
+						return local.first + i as u32
+				}
+				panic("a wide constant is numbered")
+			}
+			_ => panic("a value is numbered")
+		}
+		val key = (typeId, keyed.0, keyed.1)
+		return local.scalars.at(&key)
+	}
+
+	/// How far back from instruction `inst` a value is.
+	fn rel(local: &FnValues, inst: u32, value: &Value, t: &Type): u64 =
+		((inst as u64) -% (self.valueId(&local, &value, &t) as u64)) & 0xFFFFFFFF
+
+	fn relVal(local: &FnValues, inst: u32, value: &Val): u64 = self.rel(
+		&local,
+		inst,
+		&value.v,
+		&value.t,
+	)
+
+	fn label(local: &FnValues, label: &Label): u64 = {
+		val key = labelKey(&label)
+		return local.labels.at(&key) as u64
+	}
+
+	/// An instruction's record, and its metadata among `attachments`.
+	var fn instruction(
+		local: &FnValues,
+		op: &Op,
+		inst: u32,
+		number: u64,
+		attachments: &var Vec<Vec<u64>>,
+	) = {
+		val ptr = Type::Ptr
+		val word = Type::I(64)
+		val flag = Type::I(1)
+		val coded: (u32, Vec<u64>) = match op {
+			.Alloca(t, align) => {
+				val one = Value::Int(1)
+				val i32 = Type::I(32)
+				val size = self.valueId(&local, &one, &i32) as u64
+				(
+					19,
+					Vec::of(own [
+						self.typeId(&t) as u64,
+						self.typeId(&i32) as u64,
+						size,
+						alignCode(align) | 64,
+					]),
+				)
+			}
+			.Load(t, address, align, assumes) => {
+				match assumes {
+					.Nothing => {}
+					.Reference(nonnull, align: aligned) => attachments.push(
+						Vec::of(own [
+							number,
+							KIND_NONNULL,
+							self.nodeId(nonnull),
+							KIND_ALIGN,
+							self.nodeId(aligned),
+						]),
+					)
+					.Invariant(node) => attachments.push(
+						Vec::of(own [number, KIND_INVARIANT_LOAD, self.nodeId(node)]),
+					)
+				}
+				(
+					20,
+					Vec::of(own [
+						self.rel(&local, inst, &address, &ptr),
+						self.typeId(&t) as u64,
+						alignCode(align),
+						0,
+					]),
+				)
+			}
+			.LoadAtomic(t, address, align) => (
+				41,
+				Vec::of(own [
+					self.rel(&local, inst, &address, &ptr),
+					self.typeId(&t) as u64,
+					alignCode(align),
+					0,
+					SEQ_CST,
+					SYSTEM_SCOPE,
+				]),
+			)
+			.Store(value, address, align) => (
+				44,
+				Vec::of(own [
+					self.rel(&local, inst, &address, &ptr),
+					self.relVal(&local, inst, &value),
+					alignCode(align),
+					0,
+				]),
+			)
+			.StoreAtomic(value, address, align) => (
+				45,
+				Vec::of(own [
+					self.rel(&local, inst, &address, &ptr),
+					self.relVal(&local, inst, &value),
+					alignCode(align),
+					0,
+					SEQ_CST,
+					SYSTEM_SCOPE,
+				]),
+			)
+			.Offset(base, offset) => (
+				43,
+				Vec::of(own [
+					1,
+					self.typeOf(.I(8)) as u64,
+					self.rel(&local, inst, &base, &ptr),
+					self.rel(&local, inst, &offset, &word),
+				]),
+			)
+			.Arithmetic(op, wrap, left, right) => {
+				var values = Vec::of(own [
+					self.relVal(&local, inst, &left),
+					self.rel(&local, inst, &right, &left.t),
+					arithmeticCode(&op),
+				])
+				match wrap {
+					.Some(.NoUnsigned) => values.push(1)
+					.Some(.NoSigned) => values.push(2)
+					.None => {}
+				}
+				(2, move values)
+			}
+			.FNeg(value) => (56, Vec::of(own [self.relVal(&local, inst, &value), 0]))
+			.IntCompare(cond, left, right) => (
+				28,
+				Vec::of(own [
+					self.relVal(&local, inst, &left),
+					self.rel(&local, inst, &right, &left.t),
+					intPredicate(&cond),
+				]),
+			)
+			.FloatCompare(cond, left, right) => (
+				28,
+				Vec::of(own [
+					self.relVal(&local, inst, &left),
+					self.rel(&local, inst, &right, &left.t),
+					floatPredicate(&cond),
+				]),
+			)
+			.Cast(cast, value, to) => (
+				3,
+				Vec::of(own [
+					self.relVal(&local, inst, &value),
+					self.typeId(&to) as u64,
+					castCode(&cast),
+				]),
+			)
+			.Select(select) => (
+				29,
+				Vec::of(own [
+					self.relVal(&local, inst, &select.ifTrue),
+					self.relVal(&local, inst, &select.ifFalse),
+					self.rel(&local, inst, &select.condition, &flag),
+				]),
+			)
+			.ExtractValue(aggregate, index) => (
+				26,
+				Vec::of(own [self.relVal(&local, inst, &aggregate), index as u64]),
+			)
+			.InsertValue(insert) => (
+				27,
+				Vec::of(own [
+					self.relVal(&local, inst, &insert.aggregate),
+					self.relVal(&local, inst, &insert.value),
+					insert.index as u64,
+				]),
+			)
+			.Call(call) => {
+				var values = Vec::of(own [
+					self.callList(&call) as u64,
+					CALL_EXPLICIT_TYPE,
+					self.typeOf(callType(&call)) as u64,
+					self.rel(&local, inst, &call.callee, &ptr),
+				])
+				for arg in call.args {
+					values.push(self.relVal(&local, inst, &arg.value))
+				}
+				(34, move values)
+			}
+			.AtomicRmw(op, address, value, align) => (
+				59,
+				Vec::of(own [
+					self.rel(&local, inst, &address, &ptr),
+					self.relVal(&local, inst, &value),
+					rmwCode(&op),
+					0,
+					SEQ_CST,
+					SYSTEM_SCOPE,
+					alignCode(align),
+				]),
+			)
+			.CmpXchg(swap) => (
+				46,
+				Vec::of(own [
+					self.rel(&local, inst, &swap.address, &ptr),
+					self.relVal(&local, inst, &swap.expected),
+					self.relVal(&local, inst, &swap.replacement),
+					0,
+					SEQ_CST,
+					SYSTEM_SCOPE,
+					SEQ_CST,
+					0,
+					alignCode(swap.align),
+				]),
+			)
+			.Declare(address, variable, expression) => {
+				val callee = self.declareFn
+				val address = self.valueId(&local, &address, &ptr)
+				val held = local.declared.at(&address)
+				val described = match expression {
+					.Plain => self.expressions.0
+					.Deref => self.expressions.1
+					.DerefTwice => self.expressions.2
+				}
+				// A metadata number may be past the instruction's: the distance
+				// wraps, in 32 bits, as LLVM's reader takes it back.
+				val back = (id: u64) => ((inst as u64) -% id) & 0xFFFFFFFF
+				(
+					34,
+					Vec::of(own [
+						0,
+						CALL_EXPLICIT_TYPE,
+						self.typeOf(declareType()) as u64,
+						back(callee as u64),
+						back(held as u64),
+						back(self.nodeId(variable)),
+						back(described as u64),
+					]),
+				)
+			}
+			.Br(target) => (11, Vec::of(own [self.label(&local, &target)]))
+			.CondBr(condition, ifTrue, ifFalse, weights) => {
+				if weights is .Some(node) then
+					attachments.push(Vec::of(own [number, KIND_PROF, self.nodeId(node)]))
+				(
+					11,
+					Vec::of(own [
+						self.label(&local, &ifTrue),
+						self.label(&local, &ifFalse),
+						self.rel(&local, inst, &condition, &flag),
+					]),
+				)
+			}
+			.Switch(value, otherwise, cases) => {
+				var values = Vec::of(own [
+					self.typeId(&value.t) as u64,
+					self.relVal(&local, inst, &value),
+					self.label(&local, &otherwise),
+				])
+				for (case, target) in cases {
+					val number = Value::Int(case)
+					values.push(self.valueId(&local, &number, &value.t) as u64)
+					values.push(self.label(&local, &target))
+				}
+				(12, move values)
+			}
+			.Ret(value) => match value {
+				.Some(given) => (10, Vec::of(own [self.relVal(&local, inst, &given)]))
+				.None => (10, Vec())
+			}
+			.Unreachable => (15, Vec())
+		}
+		self.bits.record(coded.0, &coded.1.items())
+	}
+}
+
+fn arithmeticCode(op: &Arithmetic): u64 = match op {
+	.Add | .FAdd => 0
+	.Sub | .FSub => 1
+	.Mul | .FMul => 2
+	.UDiv => 3
+	.SDiv | .FDiv => 4
+	.URem => 5
+	.SRem | .FRem => 6
+	.Shl => 7
+	.LShr => 8
+	.AShr => 9
+	.And => 10
+	.Or => 11
+	.Xor => 12
+}
+
+fn intPredicate(cond: &IntCompare): u64 = match cond {
+	.Eq => 32
+	.Ne => 33
+	.Ugt => 34
+	.Uge => 35
+	.Ult => 36
+	.Ule => 37
+	.Sgt => 38
+	.Sge => 39
+	.Slt => 40
+	.Sle => 41
+}
+
+fn floatPredicate(cond: &FloatCompare): u64 = match cond {
+	.Oeq => 1
+	.Ogt => 2
+	.Oge => 3
+	.Olt => 4
+	.Ole => 5
+	.Une => 14
+}
+
+fn castCode(cast: &Cast): u64 = match cast {
+	.Trunc => 0
+	.ZExt => 1
+	.SExt => 2
+	.UiToFp => 5
+	.SiToFp => 6
+	.FpTrunc => 7
+	.FpExt => 8
+	.PtrToInt => 9
+	.IntToPtr => 10
+	.Bitcast => 11
+}
+
+fn rmwCode(op: &Rmw): u64 = match op {
+	.Xchg => 0
+	.Add => 1
+	.Sub => 2
+}
+
+/// A constant's record: a `float`'s where `float32` says so.
+fn constantRecord(bits: &var Bitstream, value: &ConstRecord, float32: bool) = match value {
+	.Null => bits.bare(2)
+	.Undef => bits.bare(3)
+	.Int(v) => bits.record(4, &Vec::of(own [signedVbr(v)]).items())
+	.Wide(v) => {
+		val low = (v as u128 & 0xFFFFFFFFFFFFFFFF) as u64
+		val high = ((v as u128) >> 64) as u64
+		bits.record(5, &Vec::of(own [signedVbr(low as i64), signedVbr(high as i64)]).items())
+	}
+	.Float(double) => {
+		// A `float` holds its own 32 bits; the module holds a double's.
+		val written = if float32 then (f64::fromBits(double) as f32).toBits() as u64 else double
+		bits.record(6, &Vec::of(own [written]).items())
+	}
+	.CString(bytes) => bits.record(9, &widened(&bytes).items())
+	.Data(bytes) => bits.record(8, &widened(&bytes).items())
+	.Aggregate(elements) => {
+		var values: Vec<u64> = Vec()
+		for element in elements {
+			values.push(element as u64)
+		}
+		bits.record(7, &values.items())
+	}
+	.IntToPtr(int, word) => bits.record(
+		11,
+		&Vec::of(own [10 as u64, word as u64, int as u64]).items(),
+	)
+}

@@ -1,0 +1,777 @@
+// The syntax tree.
+//
+// Expressions, statements and types live in arenas owned by `Ast` and refer
+// to each other by `ExprId`, `StmtId` and `TypeId`. Every node carries its
+// source span. A parse error leaves an `Error` node where the malformed
+// construct was, so later phases can keep going.
+
+import std::collections::{Arena, Handle}
+
+pub type ExprId = Handle<Expr>
+pub type StmtId = Handle<Stmt>
+pub type TypeId = Handle<Type>
+
+pub struct Ast {
+	/// Top-level items in source order.
+	pub var items: Vec<Item> = Vec()
+	pub exprs: Arena<Expr> = Arena()
+	pub stmts: Arena<Stmt> = Arena()
+	pub types: Arena<Type> = Arena()
+}
+
+/// An identifier together with where it was written.
+@derive(Eq, Clone)
+pub struct Name {
+	pub var sym: Symbol
+	pub var span: Span
+}
+
+// ---- items ----
+
+/// `@name` or `@name(a, b = 1)` before a declaration. The
+/// set of names is closed and the checker knows it; the parser only reads
+/// the form.
+@derive(Eq, Clone)
+pub struct Annotation {
+	pub name: Name
+	pub args: Vec<AnnotationArg>
+	/// The `(` and `)`, where they were written: an annotation given an
+	/// empty list is not the same as one given none.
+	pub parens: Option<Span>
+	pub span: Span
+}
+
+/// One argument of an annotation: a literal or a name, or `name = literal`.
+@derive(Eq, Clone)
+pub struct AnnotationArg {
+	pub name: Option<Name>
+	pub value: AnnotationValue
+	pub span: Span
+}
+
+@derive(Eq, Clone)
+pub enum AnnotationValue {
+	Int(value: u128)
+	Str(symbol: Symbol)
+	Bool(value: bool)
+	/// A name: the interfaces `@derive(Eq, Hash)` asks the compiler to
+	/// write.
+	Name(symbol: Symbol)
+	/// A token that is none of those: reported, and kept so that the rest of
+	/// the declaration is still parsed.
+	Error
+}
+
+@derive(Eq, Clone)
+pub enum Item {
+	Import(decl: ImportDecl)
+	/// `val NAME: T = value` at the top level: a constant, whose value is
+	/// known where it is written.
+	Val(decl: ValDecl)
+	Struct(decl: StructDecl)
+	Enum(decl: EnumDecl)
+	Fn(decl: FnDecl)
+	Extern(block: ExternBlock)
+	/// `extend Type { … }`: methods of a type, outside its declaration.
+	Extend(block: ExtendBlock)
+	/// `interface Name { … }`.
+	Interface(decl: InterfaceDecl)
+	/// `type Name<T> = …`: another name for a type.
+	Type(alias: TypeAlias)
+	/// `assert(condition, "note")` at the top level: checked while the
+	/// program is compiled.
+	Assert(decl: AssertDecl)
+}
+
+/// A top-level `assert`.
+@derive(Eq, Clone)
+pub struct AssertDecl {
+	/// The annotations written before it: `@target` alone.
+	pub annotations: Vec<Annotation>
+	/// The `assert(…)` itself, an `ExprKind::Assert`.
+	pub assertion: ExprId
+	pub span: Span
+}
+
+/// `type Id = i64`, `type Pairs<T> = Vec<(T, T)>`.
+@derive(Eq, Clone)
+pub struct TypeAlias {
+	pub isPub: bool
+	pub name: Name
+	pub generics: Vec<GenericParam>
+	pub ty: TypeId
+	pub span: Span
+}
+
+/// `val NAME: T = value` at the top level. Its value is
+/// worked out where it is written, so nothing runs before `main`.
+@derive(Eq, Clone)
+pub struct ValDecl {
+	/// The annotations written before it.
+	pub annotations: Vec<Annotation>
+	pub name: Name
+	pub ty: Option<TypeId>
+	pub value: ExprId
+	/// Exported from its module.
+	pub isPub: bool
+	pub span: Span
+}
+
+/// `interface Name { … }`: a set of methods a type may implement.
+@derive(Eq, Clone)
+pub struct InterfaceDecl {
+	/// The annotations written before it.
+	pub annotations: Vec<Annotation>
+	pub name: Name
+	/// `interface From<T>`: the types it is about, which its methods may
+	/// use.
+	pub generics: Vec<GenericParam>
+	pub methods: Vec<InterfaceMethod>
+	/// Exported from its module.
+	pub isPub: bool
+	pub span: Span
+}
+
+/// A method of an interface: a signature, with a default body where one is
+/// written.
+@derive(Eq, Clone)
+pub struct InterfaceMethod {
+	pub sig: FnSig
+	/// How it takes its receiver, and the span of the word that says so.
+	pub receiver: (Receiver, Span)
+	/// The expression after `=`, where the method has a default.
+	pub default: Option<ExprId>
+	pub span: Span
+}
+
+/// `extend Type { … }`, or `extend Type<T> { … }`, whose type arguments bind
+/// the type's parameters under the names written.
+@derive(Eq, Clone)
+pub struct ExtendBlock {
+	/// The annotations written before it.
+	pub annotations: Vec<Annotation>
+	/// `extend [T]`: methods of a slice, with the element's name here.
+	/// `path` then holds that name, so spans still work.
+	pub sliceOf: Option<Name>
+	/// The interface implemented: `extend Rect: Shape`.
+	pub interfaceName: Option<Name>
+	/// The modules written before the interface, where a path names it:
+	/// `shapes` in `extend Rect: shapes::Area`.
+	pub interfaceModule: Vec<Name>
+	/// `extend ConfigError: From<io::IoError>`: what the interface's own
+	/// type parameters are here.
+	pub interfaceArgs: Option<TypeArgs>
+	/// The type: one name, or a path when another module's type was named,
+	/// which the type checker reports.
+	pub path: Vec<Name>
+	pub generics: Vec<GenericParam>
+	pub methods: Vec<FnDecl>
+	/// Written by `@derive`, not by the programmer: the argument that asked
+	/// for it, which every node of the block is placed at.
+	pub derived: Option<Span>
+	pub span: Span
+}
+
+/// `import a::b::c`, `import a::b::c as name`, or
+/// `import a::b::{self, Item, other as name}`.
+@derive(Eq, Clone)
+pub struct ImportDecl {
+	/// The module.
+	pub path: Vec<Name>
+	/// `as name` after the path: the name the module is bound to.
+	pub alias: Option<Name>
+	/// The names in braces after the path, if there are braces. Only these
+	/// are bound, and `self` among them binds the module.
+	pub items: Option<Vec<ImportItem>>
+	pub span: Span
+}
+
+/// One name in the braces of an import.
+@derive(Eq, Clone)
+pub struct ImportItem {
+	/// An item of the module; `None` for `self`, the module itself.
+	pub name: Option<Name>
+	/// The name as written, `self` included.
+	pub span: Span
+	/// `as name`: the name it is bound to instead.
+	pub alias: Option<Name>
+}
+
+/// A type parameter, `T` or `T: copy`, of a generic item.
+@derive(Eq, Clone)
+pub struct GenericParam {
+	/// `type` before it, in an interface's header: a type each
+	/// implementation decides, where the word was written.
+	pub var decided: Option<Span>
+	pub var name: Name
+	/// The constraints after `:`, separated by `+`: `copy`, and the
+	/// interfaces the type must implement.
+	pub var bounds: Vec<Bound>
+	/// `K = T`: the type it is where a use leaves it out, which a struct's
+	/// or an enum's parameter may have.
+	pub var default: Option<TypeId>
+	pub var span: Span
+}
+
+/// One constraint: `copy`, or an interface with the types it takes where it
+/// takes any — `T: From<i64>`, `C: Items<T>`.
+@derive(Eq, Clone)
+pub struct Bound {
+	/// The modules written before the name, where a path names the
+	/// interface: `shapes` in `T: shapes::Area`.
+	pub module: Vec<Name>
+	pub name: Name
+	pub args: Vec<TypeId>
+	pub span: Span
+}
+
+/// One parameter of a lambda: a name, and a type where one is written.
+@derive(Eq, Clone)
+pub struct LambdaParam {
+	pub name: Name
+	pub ty: Option<TypeId>
+	pub span: Span
+}
+
+/// `<A, B>` in an expression, written after the segment `after` of its
+/// path.
+@derive(Eq, Clone)
+pub struct TypeArgs {
+	pub after: i64
+	pub args: Vec<TypeId>
+	pub span: Span
+}
+
+@derive(Eq, Clone)
+pub struct StructDecl {
+	/// The annotations written before it.
+	pub annotations: Vec<Annotation>
+	/// `extern struct`: C's layout, promised now and later.
+	pub isExtern: bool
+	/// `extern union`: every field over the same bytes.
+	pub isUnion: bool
+	/// `view struct`: may hold a `str` or a `&` reference, and is kept
+	/// where a `str` is.
+	pub isView: bool
+	pub name: Name
+	pub generics: Vec<GenericParam>
+	pub fields: Vec<Field>
+	/// Methods and static functions, in the order they are written among the
+	/// fields.
+	pub methods: Vec<FnDecl>
+	/// Exported from its module.
+	pub isPub: bool
+	pub span: Span
+}
+
+/// `name: type` — a struct field, a variant field or a parameter.
+@derive(Eq, Clone)
+pub struct Field {
+	/// `pub` on a struct's field, which exports it from the module.
+	/// A parameter never has one.
+	pub isPub: bool
+	/// `pub var`: another module may write it too, not only read it.
+	pub isVar: bool
+	pub name: Name
+	pub ty: TypeId
+	/// `= value` after a parameter's type: its default.
+	pub default: Option<ExprId>
+	pub span: Span
+}
+
+pub type Param = Field
+
+@derive(Eq, Clone)
+pub struct EnumDecl {
+	/// The annotations written before it.
+	pub annotations: Vec<Annotation>
+	pub name: Name
+	pub generics: Vec<GenericParam>
+	pub variants: Vec<Variant>
+	/// Methods and static functions, in the order they are written among the
+	/// variants.
+	pub methods: Vec<FnDecl>
+	/// Exported from its module.
+	pub isPub: bool
+	/// `view enum`: its variants may borrow, as a `view struct`'s fields
+	/// may.
+	pub isView: bool
+	pub span: Span
+}
+
+@derive(Eq, Clone)
+pub struct Variant {
+	pub name: Name
+	/// Empty for a unit variant.
+	pub fields: Vec<Field>
+	pub span: Span
+}
+
+/// Everything in a function declaration before its body.
+@derive(Eq, Clone)
+pub struct FnSig {
+	pub name: Name
+	pub generics: Vec<GenericParam>
+	pub params: Vec<Param>
+	/// `...` after the parameters: a C function that takes more, where it
+	/// was written.
+	pub variadic: Option<Span>
+	/// `None` means the function returns nothing.
+	pub ret: Option<TypeId>
+	/// `from a, self.ast` after the result type: what the result borrows,
+	/// each a parameter or a path of fields from one. Empty where nothing is
+	/// written.
+	pub lendsFrom: Vec<LendPath>
+	/// `keeps value, key` after the parameters, the result type and
+	/// `from`: the parameters whose values, or what they borrow, the call
+	/// may keep in its `&var` arguments. Empty where nothing is written,
+	/// and then the call keeps nothing of its arguments.
+	pub keeps: Vec<Name>
+	pub span: Span
+}
+
+/// One name after `from`: a parameter, `self`, or a field reached from one,
+/// `self.ast`.
+@derive(Eq, Clone)
+pub struct LendPath {
+	/// The parameter, or `None` for `self`.
+	pub root: Option<Name>
+	/// The fields reached from it, in order.
+	pub fields: Vec<Name>
+	pub span: Span
+}
+
+@derive(Eq, Clone)
+pub struct FnDecl {
+	/// The annotations written before it.
+	pub annotations: Vec<Annotation>
+	pub sig: FnSig
+	/// The expression after `=`. An `@intrinsic` declaration has none: the
+	/// compiler writes its body.
+	pub body: Option<ExprId>
+	/// Exported from its module, and where the word was
+	/// written, so that one that says nothing can be reported with a fix.
+	pub isPub: bool
+	pub pubSpan: Option<Span>
+	/// How a method takes its receiver, and the span of the word that says
+	/// so. `None` for a function that is not declared in a type.
+	pub receiver: Option<(Receiver, Span)>
+	pub span: Span
+}
+
+/// What a method does with the value it is called on.
+@derive(Eq, Clone)
+pub enum Receiver {
+	/// `fn`: `self` is `&Self`.
+	Read
+	/// `var fn`: `self` is `&var Self`.
+	Var
+	/// `move fn`: `self` is `Self`, by value.
+	Move
+	/// `static fn`: no receiver.
+	Static
+	/// `lend fn`: a lending pair declared once, a reading half with `self`
+	/// a `&Self` and a writing half with `self` a `&var Self`, from one body.
+	Lend
+}
+
+extend Receiver {
+	pub fn text(): str = match self {
+		.Read => "fn"
+		.Var => "var fn"
+		.Move => "move fn"
+		.Static => "static fn"
+		.Lend => "lend fn"
+	}
+}
+
+/// A C function a module declares. `pub` exports it, so that a module of
+/// bindings is the unit people share.
+@derive(Eq, Clone)
+pub struct ExternFn {
+	pub sig: FnSig
+	/// `@symbol("sqlite3_open")`: what C calls it.
+	pub annotations: Vec<Annotation>
+	pub isPub: bool
+}
+
+/// `val optind: c_int` or `var optind: c_int` in an extern block: a
+/// variable C owns.
+@derive(Eq, Clone)
+pub struct ExternGlobal {
+	pub name: Name
+	/// `@symbol("__stderrp")`: what C calls it.
+	pub annotations: Vec<Annotation>
+	pub ty: TypeId
+	/// `var`: Wip may write it too. A `val` is read-only.
+	pub isMut: bool
+	pub isPub: bool
+	pub span: Span
+}
+
+/// `type name` in an extern block, and whether it is exported.
+@derive(Eq, Clone)
+pub struct ExternType {
+	pub name: Name
+	pub annotations: Vec<Annotation>
+	pub isPub: bool
+}
+
+@derive(Eq, Clone)
+pub struct ExternBlock {
+	/// The annotations written before it: `@link("sqlite3")` names the
+	/// library its declarations come from.
+	pub annotations: Vec<Annotation>
+	/// The ABI string, quotes included. Empty if it was missing.
+	pub abi: Span
+	pub var fns: Vec<ExternFn>
+	/// `type name`: C types whose contents Wip does not know.
+	pub var types: Vec<ExternType>
+	/// `val` and `var`: the variables C owns.
+	pub var globals: Vec<ExternGlobal>
+	/// `struct` and `union` written inside the block: C's layout, and the
+	/// block's `@header`. They are the same declarations
+	/// as `extern struct` at the top level.
+	pub structs: Vec<StructDecl>
+	pub span: Span
+}
+
+// ---- types ----
+
+@derive(Eq, Clone)
+pub struct Type {
+	pub kind: TypeKind
+	pub span: Span
+}
+
+/// An array's length: a literal, or a top-level `val`.
+@derive(Eq, Clone)
+pub enum ArrayLen {
+	Int(value: u64)
+	Name(name: Name)
+}
+
+@derive(Eq, Clone)
+pub enum TypeKind {
+	/// A type name, including built-ins such as `i64`, with its type
+	/// arguments, if any: `Pair<i64, bool>`.
+	Named(name: Symbol, args: Vec<TypeId>)
+	/// A type from another module, `a::b::Point`.
+	Path(segments: Vec<Name>, args: Vec<TypeId>)
+	Own(inner: TypeId)
+	/// `&T`, or `&var T` when `isVar` is set.
+	Ref(isVar: bool, inner: TypeId)
+	Array(elem: TypeId, len: ArrayLen)
+	/// `[T]`, a slice: only behind `&`.
+	Slice(elem: TypeId)
+	/// `dyn Name`, and `dyn Name<A>` where the interface takes types: some
+	/// type that implements it, only behind `&`.
+	/// `module` holds the modules written before the interface, where a
+	/// path names it: `shapes` in `dyn shapes::Area`.
+	Dyn(module: Vec<Name>, name: Name, args: Vec<TypeId>)
+	/// `(a: A, b: B) => R`, a function type. The parameters'
+	/// names are required, and only document the type.
+	Fn(params: Vec<Field>, ret: TypeId)
+	Error
+}
+
+// ---- statements ----
+
+/// `{ … }`. Its value is its last statement, if that is an expression.
+@derive(Eq, Clone)
+pub struct Block {
+	pub stmts: Vec<StmtId>
+	pub span: Span
+}
+
+@derive(Eq, Clone)
+pub struct Stmt {
+	pub kind: StmtKind
+	pub span: Span
+}
+
+@derive(Eq, Clone)
+pub enum StmtKind {
+	/// `val` (immutable) or `var` (mutable).
+	Let(mutable: bool, name: Name, ty: Option<TypeId>, init: ExprId)
+	/// `val pattern = value else { … }`: the pattern's
+	/// bindings for the rest of the block, or the `else` block, which leaves.
+	/// `mutable` is `var`: each name is a variable of its own, holding its
+	/// part. `elseBlock` is `else { … }`, which a refutable pattern needs
+	/// and an irrefutable one has no use for.
+	Guard(mutable: bool, pattern: Pattern, value: ExprId, elseBlock: Option<Block>)
+	Defer(value: ExprId)
+	Return(value: Option<ExprId>)
+	/// `yield value`: hands the value to the list being built, `own [ … ]`
+	/// or `own for`.
+	Yield(value: ExprId)
+	/// `label` is `outer: while …`, which `break outer` leaves.
+	While(label: Option<Name>, cond: ExprId, body: Block)
+	/// `for name in source { … }`. `label` is `outer: for …`, which
+	/// `break outer` leaves; `binding` is what each element is bound to: a
+	/// name, `_`, or a struct taken apart.
+	For(label: Option<Name>, binding: Pattern, source: ForSource, body: Block)
+	/// `break`, or `break outer`: which loop it leaves.
+	Break(label: Option<Name>)
+	Continue(label: Option<Name>)
+	Expr(value: ExprId)
+}
+
+/// What a `for` walks.
+@derive(Eq, Clone)
+pub enum ForSource {
+	/// The elements of an array, a slice or a buffer.
+	Elements(source: ExprId)
+	/// The integers from `lo` up to `hi`: not including it, or, written
+	/// `..=`, including it.
+	Range(lo: ExprId, hi: ExprId, inclusive: bool)
+}
+
+// ---- expressions ----
+
+@derive(Clone)
+pub struct Expr {
+	pub kind: ExprKind
+	pub span: Span
+}
+
+@derive(Clone)
+pub enum ExprKind {
+	/// The literal's magnitude. A leading `-` is a separate `UnaryOp::Neg`,
+	/// so the range check belongs to the type checker.
+	Int(value: u128)
+	Float(value: f64)
+	/// The contents, with escapes applied.
+	Str(symbol: Symbol)
+	/// `'x'`: a Unicode scalar value.
+	Char(value: u32)
+	/// `b'x'`: the byte of an ASCII character.
+	Byte(value: u8)
+	Bool(value: bool)
+	/// `null`: a C pointer that points at nothing.
+	Null
+	Name(symbol: Symbol)
+	/// `self`: a method's receiver.
+	SelfRef
+	Paren(inner: ExprId)
+	Block(block: Block)
+	/// `else if` is an `else` whose expression is another `If`.
+	If(cond: ExprId, thenBlock: Block, elseBranch: Option<ExprId>)
+	/// A qualified name: `Enum::Variant`, `pkg::item`, `a::b::c::item`, or
+	/// `.Variant` with a leading dot, which takes the expected enum.
+	/// What it names is decided when it is resolved; the arguments, if any,
+	/// belong to the `Call` around it.
+	Path(leadingDot: bool, segments: Vec<Name>, typeArgs: Option<TypeArgs>)
+	/// `assert(condition)` and `assert(condition, "note")`: the condition
+	/// holds, or the program says so and ends. `note` is the note the call
+	/// gives, if any: any text, built when the assert fails. `message` is
+	/// what a failure prints, which the lexer makes from the condition's own
+	/// text; `None` where the lexer could not read the call, which the
+	/// parser reports.
+	Assert(cond: ExprId, note: Option<ExprId>, message: Option<Symbol>)
+	/// `lend place`, in a projection.
+	Lend(value: ExprId)
+	Array(elems: Vec<ExprId>)
+	/// `for x in xs { … }` where a value stands: among a list's elements,
+	/// or after `own`, a loop whose `yield`s the list collects.
+	/// Anywhere else it is refused.
+	ForElement(binding: Pattern, source: ForSource, body: Block)
+	ArrayRepeat(elem: ExprId, count: RepeatCount)
+	Match(scrutinee: ExprId, arms: Vec<Arm>)
+	Unary(op: UnaryOp, opSpan: Span, operand: ExprId)
+	/// `wrapping` is for `+%`, `-%` or `*%`: the answer wraps rather than
+	/// the program panicking.
+	Binary(op: BinaryOp, opSpan: Span, lhs: ExprId, rhs: ExprId, wrapping: bool)
+	/// `value is pattern`: whether the value is the pattern's variant;
+	/// `value !is pattern` where `negated`, which binds
+	/// nothing.
+	Is(scrutinee: ExprId, pattern: Pattern, negated: bool)
+	/// `expr?`: the value of `.Ok` or `.Some`, or an early return of the
+	/// other variant.
+	Try(inner: ExprId)
+	/// `(a, b: B): R => body`: a lambda. A parameter's type
+	/// may be left out where the expected type gives it, and so may the
+	/// result's.
+	Lambda(params: Vec<LambdaParam>, ret: Option<TypeId>, body: ExprId)
+	/// `expr as T`.
+	Cast(expr: ExprId, ty: TypeId)
+	/// `target = value`, or `target op= value` with `op`,
+	/// which with `wrapping` is `+%=`, `-%=` or `*%=`.
+	Assign(target: ExprId, op: Option<(BinaryOp, Span)>, wrapping: bool, value: ExprId)
+	Field(base: ExprId, name: Name)
+	/// A call. `names[i]` is the name `args[i]` was given, if any:
+	/// `f(x, width: 2)`. `rest` is a last argument
+	/// `..base`, which a call that builds a struct takes: the fields it
+	/// does not name are `base`'s.
+	Call(callee: ExprId, args: Vec<ExprId>, names: Vec<Option<Name>>, rest: Option<ExprId>)
+	Index(base: ExprId, index: ExprId)
+	/// `base[lo..hi]`, either bound optional, or
+	/// `base[lo..=hi]`, which takes `hi` too.
+	SubSlice(base: ExprId, lo: Option<ExprId>, hi: Option<ExprId>, inclusive: bool)
+	Error
+}
+
+/// `pattern => body`. A block arm is a `ExprKind::Block` body.
+@derive(Eq, Clone)
+pub struct Arm {
+	pub pattern: Pattern
+	/// `if …` between the pattern and `=>`: the arm matches only where it
+	/// is true.
+	pub guard: Option<ExprId>
+	pub body: ExprId
+	pub span: Span
+}
+
+@derive(Eq, Clone)
+pub struct Pattern {
+	pub kind: PatternKind
+	pub span: Span
+}
+
+@derive(Eq, Clone)
+pub enum PatternKind {
+	Wildcard
+	/// A bare name. Always a new binding, never a variant.
+	Binding(symbol: Symbol)
+	/// A number the value must equal: `0 => …`. `negative` is for the `-`
+	/// before it.
+	Int(negative: bool, magnitude: u128)
+	/// `true` or `false`.
+	Bool(value: bool)
+	/// Text the value must equal, by its bytes.
+	Str(symbol: Symbol)
+	/// A character the value must equal.
+	Char(value: u32)
+	/// A byte the value must equal: `b'/'`.
+	Byte(value: u8)
+	/// `.Round(..) | .Square(..)`: any one of them.
+	Any(alternatives: Vec<Pattern>)
+	/// `'a'..='z'`, `0..10`, `..0`, `10..`: the values from `lo` to `hi`,
+	/// `hi` included where the range is written `..=`; an end left off
+	/// is the type's least or greatest value.
+	Range(lo: Option<RangeBound>, hi: Option<RangeBound>, inclusive: bool)
+	/// `leadingDot` where it was written with a leading `.`, so the enum is
+	/// the one being matched; `segments` is the path, whose last segment is
+	/// the variant's name; `rest` where the pattern ended with `..`, so
+	/// fields it does not name are ignored.
+	Variant(leadingDot: bool, segments: Vec<Name>, binders: Option<Vec<Binder>>, rest: bool)
+	/// `[first, ..rest]`, `[a, b]`, `[.., last]`: the elements of an array
+	/// or a slice, from either end. Which `..` is the rest
+	/// is the checker's to say, since `..MAX` is an element below a
+	/// constant.
+	Slice(elements: Vec<SliceElement>)
+	Error
+}
+
+/// One element of a slice pattern, in the order written.
+@derive(Eq, Clone)
+pub enum SliceElement {
+	Pattern(pattern: Pattern)
+	/// `..`, with the name the elements between bind, where it has one.
+	Rest(name: Option<Name>, span: Span)
+}
+
+/// An end of a range pattern.
+@derive(Eq, Clone)
+pub struct RangeBound {
+	pub var kind: RangeBoundKind
+	pub var span: Span
+}
+
+@derive(Eq, Clone)
+pub enum RangeBoundKind {
+	/// A number, with the `-` before it where it has one.
+	Int(negative: bool, magnitude: u128)
+	Char(value: u32)
+	Byte(value: u8)
+	/// A constant, by its name or its path: `MIN`, `limits::MAX`.
+	Const(path: Vec<Name>)
+}
+
+/// One binder of a pattern: the field it takes, and what to do with it — bind
+/// it under another name, or take it apart in turn. `None` binds it under the
+/// field's own name.
+@derive(Eq, Clone)
+pub struct Binder {
+	pub field: Name
+	pub pattern: Option<Pattern>
+	pub span: Span
+}
+
+@derive(Eq, Clone)
+pub enum UnaryOp {
+	Neg
+	Not
+	Ref
+	/// `&var`.
+	RefVar
+	Move
+	Own
+}
+
+extend UnaryOp {
+	pub fn text(): str = match self {
+		.Neg => "-"
+		.Not => "!"
+		.Ref => "&"
+		.RefVar => "&var"
+		.Move => "move"
+		.Own => "own"
+	}
+}
+
+@derive(Eq, Clone)
+pub enum BinaryOp {
+	Or
+	And
+	Eq
+	Ne
+	Lt
+	Le
+	Gt
+	Ge
+	Add
+	Sub
+	Mul
+	Div
+	Rem
+	/// `&`, `|`, `^`, `<<` and `>>` on integers.
+	BitAnd
+	BitOr
+	BitXor
+	Shl
+	Shr
+}
+
+extend BinaryOp {
+	pub fn text(): str = match self {
+		.Or => "||"
+		.And => "&&"
+		.Eq => "=="
+		.Ne => "!="
+		.Lt => "<"
+		.Le => "<="
+		.Gt => ">"
+		.Ge => ">="
+		.Add => "+"
+		.Sub => "-"
+		.Mul => "*"
+		.Div => "/"
+		.Rem => "%"
+		.BitAnd => "&"
+		.BitOr => "|"
+		.BitXor => "^"
+		.Shl => "<<"
+		.Shr => ">>"
+	}
+}
+
+/// The length of `[x; n]`.
+@derive(Eq, Clone)
+pub enum RepeatCount {
+	/// An integer literal, which is part of the array's type.
+	Literal(count: u64)
+	/// Any other expression: a length known only when the program runs,
+	/// which only a buffer on the heap can have.
+	Expr(count: ExprId)
+}

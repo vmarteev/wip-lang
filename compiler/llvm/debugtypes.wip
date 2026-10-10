@@ -1,0 +1,366 @@
+// The types of the variables a debugger is told of, as LLVM's metadata, in
+// the shapes and names the debugger's scripts read (`wip debug`): a struct is
+// a structure, a pointer a pointer, an array an array; a slice and a `str`
+// are a pointer and a length, a `dyn` and a closure their two words, and an
+// enum a structure of its tag, an enumeration of the variants' names, and a
+// member for each variant that carries something. Sizes and offsets are in
+// bits, as LLVM counts them.
+
+import hir::{I64, Ty, U32, U8}
+
+extend Llvm {
+	/// The node of `ty`, written the first time it is asked for; nothing for
+	/// a type with no value, which C calls `void`.
+	var fn diType(ty: Ty): Option<i64> = {
+		if self.diTypes.get(&ty) is .Some(node) then return node.clone()
+		val name = self.program.tyName(ty, self.interner)
+		val node: Option<i64> = match self.kind(ty) {
+			.Unit | .Never | .Error | .Param(..) | .Assoc(..) => .None
+			.Int(int) => .Some(
+				self.diBase(
+					int.name(),
+					if int.signed() then Encoding::Signed else Encoding::Unsigned,
+					int.bits(),
+				),
+			)
+			.Float(float: .F32) => .Some(self.diBase("f32", .Float, 32))
+			.Float(..) => .Some(self.diBase("f64", .Float, 64))
+			.Bool => .Some(self.diBase("bool", .Boolean, 8))
+			.Char => .Some(self.diBase("char", .Utf, 32))
+			// C's `char *`, which a debugger prints as the text it is.
+			.Cstring => {
+				val char = self.diBase("char", .SignedChar, 8)
+				.Some(self.diPointer(.Some(char)))
+			}
+			.Str => {
+				val byte = self.diBase("u8", .UnsignedChar, 8)
+				val bytes = self.diPointer(.Some(byte))
+				.Some(self.diPair(name.toStr(), "ptr", bytes))
+			}
+			// Only a declaration: what is in it is C's to know.
+			.Opaque(..) => .Some(self.debug.add(.Declared(tag: .Structure, name: name.clone())))
+			// A function's address, as C's `void *`.
+			.Fn(..) => {
+				val pointer = self.diPointer(.None)
+				.Some(self.debug.add(.Typedef(name: name.clone(), base: pointer)))
+			}
+			.Ref(inner, ..) | .Own(inner) | .Ptr(inner) => .Some(
+				self.diPointerTo(ty, inner, name.toStr()),
+			)
+			.Slice(elem) | .Slots(inner: elem) => {
+				val elemNode = self.diType(elem)
+				val items = self.diPointer(elemNode)
+				.Some(self.diPair(name.toStr(), "ptr", items))
+			}
+			.Dyn(..) => .Some(self.diDyn(name.toStr()))
+			.Array(elem, len: count) => {
+				// Numbered before its element, which may be itself behind a
+				// pointer.
+				val node = self.debug.reserve()
+				self.diTypes.put(ty, .Some(node))
+				val base = self.diType(elem)
+				val size = self.layout(ty).size * 8
+				val range = self.debug.add(.Subrange(count))
+				val elements = self.debug.add(.Tuple(Vec::of(own [MetaItem::Node(range)])))
+				self.debug.fill(node, .ArrayType(base: base, size: size, elements: elements))
+				Option::Some(node)
+			}
+			.Struct(..) => .Some(self.diStructure(ty, name.toStr()))
+			.Enum(..) => .Some(self.diEnumeration(ty, name.toStr()))
+		}
+		self.diTypes.put(ty, node.clone())
+		return node
+	}
+
+	/// A pointer to `inner`; a reference to a slice, a `dyn` or a closure is a
+	/// pair, as it is laid out.
+	var fn diPointerTo(ty: Ty, inner: Ty, name: str): i64 = match self.kind(inner) {
+		.Slice(elem) => {
+			val elemNode = self.diType(elem)
+			val items = self.diPointer(elemNode)
+			self.diPair(name, "ptr", items)
+		}
+		.Dyn(..) => self.diDyn(name)
+		.Fn(..) if !(self.kind(ty) is .Ptr(..)) => {
+			val data = self.diPointer(.None)
+			val members = [
+				Member(name: String::of("env"), ty: data, size: 64, offset: 0),
+				Member(name: String::of("code"), ty: data, size: 64, offset: 64),
+			]
+			self.diStruct(name, 128, &members)
+		}
+		_ => {
+			// Numbered before what it points to, which may point back.
+			val node = self.debug.reserve()
+			self.diTypes.put(ty, .Some(node))
+			val base = self.diType(inner)
+			self.debug.fill(node, .PointerType(base: base, size: 64))
+			node
+		}
+	}
+
+	/// A pointer and a length: a slice, a `str`, a block of slots.
+	var fn diPair(name: str, first: str, items: i64): i64 = {
+		val .Some(length) = self.diType(I64) else {
+			panic("an integer has a type")
+		}
+		val members = [
+			Member(name: String::of(first), ty: items, size: 64, offset: 0),
+			Member(name: String::of("len"), ty: length, size: 64, offset: 64),
+		]
+		return self.diStruct(name, 128, &members)
+	}
+
+	/// A `dyn`: the value's address, and the table of its methods.
+	var fn diDyn(name: str): i64 = {
+		val data = self.diPointer(.None)
+		val members = [
+			Member(name: String::of("data"), ty: data, size: 64, offset: 0),
+			Member(name: String::of("vtable"), ty: data, size: 64, offset: 64),
+		]
+		return self.diStruct(name, 128, &members)
+	}
+
+	var fn diStructure(ty: Ty, name: str): i64 = {
+		val .Struct(id, ..) = self.kind(ty) else {
+			panic("a structure of what is not a struct")
+		}
+		val program = self.program
+		val def = &program.structs[id]
+		val tag = if def.isUnion then DiTag::Union else DiTag::Structure
+		// Where C alone knows the fields, only the name is told.
+		if def.isOpaque then return self.debug.add(.Declared(tag: tag, name: String::of(name)))
+		val size = self.layout(ty).size * 8
+		// Numbered before its fields, which may point back to it.
+		val node = self.debug.reserve()
+		self.diTypes.put(ty, .Some(node))
+		var members: Vec<i64> = Vec()
+		val fields = program.fieldTys(ty)
+		for (index, field) in fields.forwards().enumerate() {
+			val fieldName = if index < def.fields.len() {
+				String::of(self.interner.resolve(def.fields[index].name))
+			} else {
+				// A generator's frame, after its fields.
+				"frame.\(index - def.fields.len())"
+			}
+			val offset = self.layouts.fieldOffset(program, ty, index as u32) * 8
+			if self.diType(field) is .Some(fieldType) {
+				val fieldSize = self.layout(field).size * 8
+				members.push(self.diMember(node, fieldName.toStr(), fieldType, fieldSize, offset))
+			}
+		}
+		val elements = self.diList(&members)
+		self.debug.fill(node, .Structure(
+			tag: tag,
+			name: String::of(name),
+			size: size,
+			elements: elements,
+		))
+		return node
+	}
+
+	/// An enum: its tag and its variants, as they are laid out in memory.
+	var fn diEnumeration(ty: Ty, name: str): i64 = {
+		val .Enum(id: enumId, ..) = self.kind(ty) else {
+			panic("an enumeration of what is not an enum")
+		}
+		val program = self.program
+		val def = &program.enums[enumId]
+		val size = self.layout(ty).size * 8
+		val tag = self.layouts.enumTag(program, ty)
+		val variants = program.variantFieldTys(ty)
+		var names: Vec<String> = Vec()
+		for variant in def.variants {
+			names.push(String::of(self.interner.resolve(variant.name)))
+		}
+		return match tag {
+			// The one variant that carries something, where a null in its
+			// `own` is the one that does not: the variant that carries is a
+			// member, and the other an empty structure where the null would
+			// be, so that both keep their names.
+			.Niche(payload, empty, offset) => {
+				val node = self.debug.reserve()
+				self.diTypes.put(ty, .Some(node))
+				val carried = self.diVariant(
+					node,
+					ty,
+					payload,
+					names[payload as i64].toStr(),
+					&variants[payload as i64],
+				)
+				val emptyName = names[empty as i64].toStr()
+				val nothingName = "\(name)::\(emptyName)"
+				val none: Vec<Member> = Vec()
+				val nothing = self.diStruct(nothingName.toStr(), 0, &none)
+				val other = self.diMember(node, emptyName, nothing, 0, offset * 8)
+				val elements = self.diList([carried, other])
+				self.debug.fill(node, .Structure(
+					tag: .Structure,
+					name: String::of(name),
+					size: size,
+					elements: elements,
+				))
+				node
+			}
+			.Byte(size: tagSize) => {
+				var enumerators: Vec<i64> = Vec()
+				for (value, variant) in names.forwards().enumerate() {
+					enumerators.push(
+						self.debug.add(.Enumerator(name: variant.clone(), value: value)),
+					)
+				}
+				val enumeratorList = self.diList(&enumerators)
+				// The tag is unsigned, which LLVM learns from the enumeration's
+				// base type: without one, it writes each value signed, in as few
+				// bits as it needs, and 1 is -1.
+				val tagType = if tagSize == 1 then U8 else U32
+				val .Some(base) = self.diType(tagType) else {
+					panic("an integer has a type")
+				}
+				// Variants that carry nothing are the names alone.
+				var nothing = true
+				for fields in variants {
+					if !fields.isEmpty() then nothing = false
+				}
+				if nothing then
+					return self.debug.add(.Enumeration(
+						name: .Some(String::of(name)),
+						base: base,
+						size: tagSize * 8,
+						elements: enumeratorList,
+					))
+				val namesOf = self.debug.add(.Enumeration(
+					name: .None,
+					base: base,
+					size: tagSize * 8,
+					elements: enumeratorList,
+				))
+				val node = self.debug.reserve()
+				self.diTypes.put(ty, .Some(node))
+				var members: Vec<i64> = Vec::of(own [
+					self.diMember(node, "variant", namesOf, tagSize * 8, 0),
+				])
+				for (index, fields) in variants.forwards().enumerate() {
+					if !fields.isEmpty() then
+						members.push(
+							self.diVariant(node, ty, index as u32, names[index].toStr(), &fields),
+						)
+				}
+				val elements = self.diList(&members)
+				self.debug.fill(node, .Structure(
+					tag: .Structure,
+					name: String::of(name),
+					size: size,
+					elements: elements,
+				))
+				node
+			}
+		}
+	}
+
+	/// The member of an enum's structure for one variant: a structure of its
+	/// fields, placed where the first of them is.
+	var fn diVariant(parent: i64, ty: Ty, index: u32, name: str, fields: &[Ty]): i64 = {
+		val program = self.program
+		var offsets: Vec<u32> = Vec()
+		for field in 0..(fields.len() as u32) {
+			offsets.push(self.layouts.variantOffset(program, ty, index, field))
+		}
+		var start: u32 = 0
+		for (i, offset) in offsets.forwards().enumerate() {
+			if i == 0 || offset < start then start = offset
+		}
+		var end = start
+		for (i, field) in fields.forwards().enumerate() {
+			val reach = offsets[i] + self.layout(field).size
+			if i == 0 || reach > end then end = reach
+		}
+		val .Enum(id: enumId, ..) = self.kind(ty) else {
+			panic("a variant of what is not an enum")
+		}
+		val declared = &program.enums[enumId].variants[index as i64].fields
+		val full = "\(program.tyName(ty, self.interner))::\(name)"
+		val node = self.debug.reserve()
+		var members: Vec<i64> = Vec()
+		for (i, field) in fields.forwards().enumerate() {
+			if i >= declared.len() then break
+			if self.diType(field) is .Some(fieldType) {
+				val fieldName = self.interner.resolve(declared[i].name)
+				val fieldSize = self.layout(field).size * 8
+				members.push(
+					self.diMember(node, fieldName, fieldType, fieldSize, (offsets[i] - start) * 8),
+				)
+			}
+		}
+		val elements = self.diList(&members)
+		self.debug.fill(node, .Structure(
+			tag: .Structure,
+			name: move full,
+			size: (end - start) * 8,
+			elements: elements,
+		))
+		return self.diMember(parent, name, node, (end - start) * 8, start * 8)
+	}
+
+	/// A structure of the members given, each a name, a type, its size and its
+	/// offset, in bits.
+	var fn diStruct(name: str, size: u32, members: &[Member]): i64 = {
+		val node = self.debug.reserve()
+		var nodes: Vec<i64> = Vec()
+		for m in members {
+			nodes.push(self.diMember(node, m.name.toStr(), m.ty, m.size, m.offset))
+		}
+		val elements = self.diList(&nodes)
+		self.debug.fill(node, .Structure(
+			tag: .Structure,
+			name: String::of(name),
+			size: size,
+			elements: elements,
+		))
+		return node
+	}
+
+	var fn diMember(
+		scope: i64,
+		name: str,
+		ty: i64,
+		size: u32,
+		offset: u32,
+	): i64 = self.debug.add(.Member(
+		name: String::of(name),
+		scope: scope,
+		base: ty,
+		size: size,
+		offset: offset,
+	))
+
+	var fn diList(nodes: &[i64]): i64 = {
+		var items: Vec<MetaItem> = Vec()
+		for node in nodes {
+			items.push(.Node(node))
+		}
+		return self.debug.add(.Tuple(move items))
+	}
+
+	/// A pointer to `target`, or C's `void *` where there is none.
+	var fn diPointer(target: Option<i64>): i64 = self.debug.constant(.PointerType(
+		base: target,
+		size: 64,
+	))
+
+	/// A base type, once.
+	var fn diBase(name: str, encoding: Encoding, size: u32): i64 = self.debug.constant(.BasicType(
+		name: String::of(name),
+		size: size,
+		encoding: encoding,
+	))
+}
+
+/// A member of a structure the compiler describes: its name, its type's
+/// node, its size and its offset, in bits.
+struct Member {
+	name: String
+	ty: i64
+	size: u32
+	offset: u32
+}

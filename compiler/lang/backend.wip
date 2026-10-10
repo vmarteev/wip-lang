@@ -1,0 +1,419 @@
+// Building with LLVM through `clang`, which compiles every build: a debug
+// build at `-O0`, in parts compiled at once, and a release build at `-O2`, as
+// one module. `clang` is handed each module as bitcode, which a later `clang`
+// reads as the one it was written for, where its text it may not. The
+// `clang` is version 15 or newer, found by asking it to compile a module of
+// one function.
+//
+// What `clang` makes of a program is kept in the cache, as the C a module
+// carries is, under the hash of everything it depends on: this compiler, the
+// `clang`, the flags and the bitcode.
+
+import std::collections::{Map}
+import std::digest::{Sha256}
+import std::fs
+import std::future
+import std::io
+import std::path
+import std::process
+import std::process::{Command}
+import llvm::{Ir, frameTableAssembly, withFrameTables}
+import llvm
+
+/// A `clang` that compiles the LLVM backend's IR, and who it is: its name
+/// and what it says its version is.
+pub struct FoundClang {
+	pub path: String
+	pub identity: Vec<u8>
+}
+
+/// The `clang` that compiles the LLVM backend's IR: the one `WIP_CLANG`
+/// names, or `clang`, if it reads the IR; what is wrong where there is
+/// none. The answer is kept in the cache, so that a `clang` is asked once.
+pub fn findClang(unique: &Unique): Result<FoundClang, String> = {
+	val clang = match io::env("WIP_CLANG") {
+		.Some(clang) => move clang
+		.None => String::of("clang")
+	}
+	val identity = toolIdentity(clang.toStr())
+	if !readsTheIr(clang.toStr(), &identity, &unique) then
+		return .Err("wip builds with a clang 15 or newer: \(missing())")
+	return .Ok(FoundClang(path: move clang, identity: move identity))
+}
+
+/// Why there is no `clang` for LLVM, and what to do.
+fn missing(): String = match io::env("WIP_CLANG") {
+	.Some(clang) => "`\(clang)`, which WIP_CLANG names, is not a clang 15 or newer, or is not there"
+	.None => String::of("`clang` is not a clang 15 or newer, or is not there; WIP_CLANG names one")
+}
+
+/// Whether `clang` compiles a module with pointers that name no type, which
+/// `clang` 15 reads by default and 14 does not: 15 is the version whose
+/// bitcode the backend writes. Apple counts its versions as LLVM does not, so
+/// the module answers rather than the number.
+fn readsTheIr(clang: str, identity: &[u8], unique: &Unique): bool = {
+	var key = Sha256()
+	val asked = "reads the LLVM backend's IR"
+	field(&var key, &asked)
+	field(&var key, &identity)
+	val answer = path::join(cache().toStr(), hex(key.finish()).toStr())
+	if fs::readFile(answer.toStr()) is .Ok(known) then return known.toStr() == "yes"
+	val .Ok(dir) = TempDir::new(&unique) else {
+		return false
+	}
+	val module = dir.join("probe.ll")
+	val object = dir.join("probe.o")
+	val probe = "define ptr @probe(ptr %p) {\n  ret ptr %p\n}\n"
+	val compiles = Command::of(clang).args([
+		"-c",
+		"-x",
+		"ir",
+		"-Wno-override-module",
+		module.toStr(),
+		"-o",
+		object.toStr(),
+	])
+	val reads =
+		fs::writeFile(module.toStr(), probe).isOk() &&
+		compiles.output() is .Ok(output) &&
+		output.exit.success()
+	// Only an answer from a `clang` that was there, and said its version, is
+	// kept: one installed later is asked again.
+	val there = identity.len() > clang.len()
+	if there {
+		fs::makeDirs(cache().toStr())
+		fs::writeFile(answer.toStr(), if reads then "yes" else "no")
+	}
+	return reads
+}
+
+/// Whether the `clang` that said `identity` is Apple's.
+fn isAppleClang(identity: &[u8]): bool = {
+	val text = str::fromBytes(&identity)
+	for line in text.lines() {
+		if line.contains("Apple clang") then return true
+	}
+	return false
+}
+
+/// The objects `clang` makes of the LLVM backend's IR, with the table a
+/// panic reads its calls from, which the program's DWARF says the contents
+/// of. A release build is one module, its table in its object; a debug build
+/// is parts compiled at once, its table an object of its own on a Mac and in
+/// the first part's object on ELF. `optimize` says which: `-O2` or `-O0`,
+/// unless `WIP_LLVM_OPT` says another level. Kept in the cache under what
+/// they depend on, a debug build's part by part, and taken from there when
+/// nothing has changed.
+pub fn llvmObjects(
+	ir: &Ir,
+	cpu: &Cpu,
+	optimize: bool,
+	unique: &Unique,
+): Result<Vec<Vec<u8>>, BuildError> = {
+	val found = match findClang(&unique) {
+		.Ok(found) => move found
+		.Err(message) => return .Err(.Link(move message))
+	}
+	val llvm = Clang::new(&found, &cpu, optimize, &unique)
+	if !optimize then return llvm.parts(&ir.modules, &ir.files)
+	val module: Vec<u8> = if ir.modules.isEmpty() then Vec() else llvm::bitcode(&ir.modules[0])
+	val object = llvm.whole(&module, &ir.files)?
+	return .Ok(Vec::of(own [move object]))
+}
+
+/// `clang`, and how it is asked to compile the LLVM backend's IR.
+view struct Clang {
+	found: &FoundClang
+	/// Code for where a position-independent program is loaded, for the
+	/// processor the program's C is built for.
+	target: Vec<String>
+	/// What compiles a module, before what it compiles.
+	compile: Vec<String>
+	/// This compiler, as far as an object depends on it.
+	compiler: Vec<u8>
+	unique: &Unique
+}
+
+extend Clang {
+	static fn new(found: &FoundClang, cpu: &Cpu, optimize: bool, unique: &Unique): Clang = {
+		var target: Vec<String> = Vec()
+		if TARGET_VENDOR != "apple" then target.push(String::of("-fPIC"))
+		target.push(cpuFlag(&cpu))
+		// `WIP_LLVM_OPT` sets the level, to tell what optimising does from
+		// what the IR says.
+		val level = match io::env("WIP_LLVM_OPT") {
+			.Some(level) => move level
+			.None => String::of(if optimize then "2" else "0")
+		}
+		var compile: Vec<String> = Vec()
+		compile.push("-O\(level)")
+		compile.push(String::of("-x"))
+		compile.push(String::of("ir"))
+		compile.push(String::of("-Wno-override-module"))
+		// A function's cold code stays in the function: moved to one of its
+		// own, it would be a call a panic's calls show, of a function the
+		// program does not have. Apple's clang moves it unless told not to;
+		// LLVM's own does not unless told to, and knows no such flag.
+		if isAppleClang(&found.identity) {
+			compile.push(String::of("-Xclang"))
+			compile.push(String::of("-fno-split-cold-code"))
+		}
+		// An ELF object is written again with the table in it, by a writer
+		// that knows no table of the functions whose addresses are taken,
+		// which only a linker folding identical code reads.
+		if TARGET_VENDOR != "apple" then compile.push(String::of("-fno-addrsig"))
+		for arg in target {
+			compile.push(arg.clone())
+		}
+		return Clang(
+			found: &found,
+			target: move target,
+			compile: move compile,
+			compiler: thisCompiler(),
+			unique: &unique,
+		)
+	}
+
+	/// Where the cache keeps what is made of `parts`: what compiles them, and
+	/// each part's bitcode, or each part's key.
+	fn key(what: str, parts: &[&[u8]]): String = {
+		var key = Sha256()
+		field(&var key, &what)
+		field(&var key, &self.compiler)
+		field(&var key, &self.found.identity)
+		for arg in self.compile {
+			field(&var key, arg.toStr())
+		}
+		for part in parts {
+			field(&var key, &part)
+		}
+		return hex(key.finish())
+	}
+
+	/// `clang` with what compiles a module, and then `args`.
+	fn invoke(before: &[String], args: &[str]): Result<void, BuildError> = {
+		var all: Vec<str> = Vec()
+		for arg in before {
+			all.push(arg.toStr())
+		}
+		for arg in args {
+			all.push(arg)
+		}
+		return run(self.found.path.toStr(), &all)
+	}
+
+	fn assemble(assembly: str, output: str): Result<void, BuildError> = {
+		var args: Vec<String> = Vec()
+		args.push(String::of("-c"))
+		args.push(String::of("-x"))
+		args.push(String::of("assembler"))
+		for arg in self.target {
+			args.push(arg.clone())
+		}
+		return self.invoke(&args, [assembly, "-o", output])
+	}
+
+	/// `module`'s bitcode compiled straight to an object, in `dir`.
+	fn object(module: &[u8], dir: &TempDir): Result<Vec<u8>, BuildError> = {
+		val source = dir.join("program.bc")
+		val object = dir.join("program.o")
+		if writeBytes(source.toStr(), module) is .Err(error) then
+			return .Err(.Link("cannot write the bitcode: \(error)"))
+		self.invoke(&self.compile, ["-c", source.toStr(), "-o", object.toStr()])?
+		return readObject(object.toStr())
+	}
+
+	/// A release build's one module, its bitcode compiled with its table.
+	fn whole(module: &[u8], files: &Map<String, String>): Result<Vec<u8>, BuildError> = {
+		val name = "\(self.key("an LLVM object", [module])).o"
+		val kept = path::join(cache().toStr(), name.toStr())
+		if readBytes(kept.toStr()) is .Ok(object) then return .Ok(move object)
+		val dir = temporaryDir(self.unique)?
+		val object = dir.join("program.o")
+		var built: Vec<u8> = Vec()
+		if TARGET_VENDOR == "apple" {
+			// Mach-O, which the compiler does not write back, and a release
+			// build, whose functions only its own object may name: the table
+			// follows the program's assembly.
+			val source = dir.join("program.bc")
+			val assembly = dir.join("program.s")
+			val first = dir.join("first.o")
+			if writeBytes(source.toStr(), module) is .Err(error) then
+				return .Err(.Link("cannot write the bitcode: \(error)"))
+			self.invoke(&self.compile, ["-S", source.toStr(), "-o", assembly.toStr()])?
+			self.assemble(assembly.toStr(), first.toStr())?
+			val firstObject = readObject(first.toStr())?
+			val tables = match frameTableAssembly([move firstObject], &files) {
+				.Ok(tables) => move tables
+				.Err(error) => return .Err(dwarf(error.toStr()))
+			}
+			// Bytes, not text: what the program's strings and names hold is
+			// written as it is.
+			var text = match fs::readFile(assembly.toStr()) {
+				.Ok(text) => move text
+				.Err(error) => return .Err(.Link("cannot read the assembly clang wrote: \(error)"))
+			}
+			text.push(tables.toStr())
+			if fs::writeFile(assembly.toStr(), text.toStr()) is .Err(error) then
+				return .Err(.Link("cannot write the assembly: \(error)"))
+			self.assemble(assembly.toStr(), object.toStr())?
+			built = readObject(object.toStr())?
+		} else {
+			// ELF: the object, written again with the table in it, with no
+			// assembly between, whose names an assembler may read as
+			// registers.
+			val compiled = self.object(module, &dir)?
+			built = match withFrameTables([move compiled], &files) {
+				.Ok(built) => move built
+				.Err(error) => return .Err(dwarf(error.toStr()))
+			}
+			if writeBytes(object.toStr(), &built) is .Err(error) then
+				return .Err(.Link("cannot write the object: \(error)"))
+		}
+		keepObject(kept.toStr(), object.toStr(), self.unique)
+		return .Ok(move built)
+	}
+
+	/// A debug build's parts, each compiled straight to an object at once
+	/// with the others and kept on its own, and the table of them all.
+	fn parts(
+		modules: &[llvm::Module],
+		files: &Map<String, String>,
+	): Result<Vec<Vec<u8>>, BuildError> = {
+		val built = future::map(&modules, (module) => self.part(&module))
+		var keys: Vec<String> = Vec()
+		var objects: Vec<Vec<u8>> = Vec()
+		for result in move built {
+			val (key, object) = result?
+			keys.push(move key)
+			objects.push(move object)
+		}
+
+		// The table, made of every part, kept under all their keys.
+		var all: Vec<&[u8]> = Vec()
+		for key in keys {
+			all.push(key.toStr())
+		}
+		val name = "\(self.key("an LLVM table", &all)).table.o"
+		val kept = path::join(cache().toStr(), name.toStr())
+		val table = match readBytes(kept.toStr()) {
+			.Ok(table) => move table
+			.Err(..) => self.table(&objects, &files, kept.toStr())?
+		}
+		// On ELF the table is the first part, written again with it.
+		if TARGET_VENDOR == "apple" then objects.push(move table) else objects[0] = move table
+		return .Ok(move objects)
+	}
+
+	/// The table of a debug build's parts, made and kept at `kept`.
+	fn table(
+		objects: &[Vec<u8>],
+		files: &Map<String, String>,
+		kept: str,
+	): Result<Vec<u8>, BuildError> = {
+		val dir = temporaryDir(self.unique)?
+		val table = dir.join("table.o")
+		if TARGET_VENDOR == "apple" {
+			val tables = match frameTableAssembly(&objects, &files) {
+				.Ok(tables) => move tables
+				.Err(error) => return .Err(dwarf(error.toStr()))
+			}
+			val assembly = dir.join("table.s")
+			if fs::writeFile(assembly.toStr(), tables.toStr()) is .Err(error) then
+				return .Err(.Link("cannot write the assembly: \(error)"))
+			self.assemble(assembly.toStr(), table.toStr())?
+		} else {
+			val first = match withFrameTables(&objects, &files) {
+				.Ok(first) => move first
+				.Err(error) => return .Err(dwarf(error.toStr()))
+			}
+			if writeBytes(table.toStr(), &first) is .Err(error) then
+				return .Err(.Link("cannot write the object: \(error)"))
+		}
+		keepObject(kept, table.toStr(), self.unique)
+		return readObject(table.toStr())
+	}
+
+	/// One part of a debug build, from the cache or compiled there, with the
+	/// key the cache keeps it under: its bitcode, written on the thread that
+	/// compiles it.
+	fn part(part: &llvm::Module): Result<(String, Vec<u8>), BuildError> = {
+		val module = llvm::bitcode(&part)
+		val key = self.key("an LLVM part", [module.items()])
+		val name = "\(key).o"
+		val kept = path::join(cache().toStr(), name.toStr())
+		if readBytes(kept.toStr()) is .Ok(object) then return .Ok((move key, move object))
+		val dir = temporaryDir(self.unique)?
+		val object = self.object(&module.items(), &dir)?
+		val made = dir.join("program.o")
+		keepObject(kept.toStr(), made.toStr(), self.unique)
+		return .Ok((move key, move object))
+	}
+}
+
+/// Where the cache keeps what LLVM made.
+fn cache(): String = path::join(cacheDir().toStr(), "llvm")
+
+fn temporaryDir(unique: &Unique): Result<TempDir, BuildError> = match TempDir::new(&unique) {
+	.Ok(dir) => .Ok(move dir)
+	.Err(message) => .Err(.Link(move message))
+}
+
+fn readObject(path: str): Result<Vec<u8>, BuildError> = match readBytes(path) {
+	.Ok(object) => .Ok(move object)
+	.Err(error) => .Err(.Link("cannot read the object clang wrote: \(error)"))
+}
+
+fn dwarf(error: str): BuildError = .Link("cannot read the DWARF clang wrote: \(error)")
+
+/// The bytes of a file.
+fn readBytes(path: str): Result<Vec<u8>, io::IoError> = {
+	val text = fs::readFile(path)?
+	var bytes: Vec<u8> = Vec::withCapacity(text.len())
+	bytes.pushAll(text.toStr())
+	return .Ok(move bytes)
+}
+
+/// Bytes, as the whole of a file that is made or emptied first.
+fn writeBytes(path: str, bytes: &[u8]): Result<void, io::IoError> = {
+	var file = fs::File::create(path)?
+	file.writeBytes(bytes)?
+	return .Ok()
+}
+
+/// Puts an object in the cache, whole or not at all: written beside where it
+/// goes under a name no other writer uses — the parts of a build are kept at
+/// once, on threads — then renamed there. A cache that cannot be written is a
+/// build that is not kept, and nothing worse.
+fn keepObject(kept: str, object: str, unique: &Unique) = {
+	val dir = path::parent(kept)
+	if fs::makeDirs(dir).isErr() then return
+	val partial = "\(kept).\(unique.next()).partial"
+	if fs::copy(object, partial.toStr()).isOk() && fs::rename(partial.toStr(), kept).isErr() then
+		fs::removeFile(partial.toStr())
+}
+
+/// This compiler, as far as an object it made depends on it: the table of
+/// calls is written by its code, which the IR does not say. Its path, size
+/// and time, which a new build of it changes.
+fn thisCompiler(): Vec<u8> = {
+	var id: Vec<u8> = Vec()
+	val .Ok(exe) = process::executable() else {
+		return move id
+	}
+	id.pushAll(exe.toStr())
+	if fs::meta(exe.toStr()) is .Ok(meta) {
+		pushLittle(&var id, meta.size as u64, 8)
+		val nanos = meta.modified * 1_000_000_000 + meta.modifiedNanos
+		pushLittle(&var id, nanos as u64, 16)
+	}
+	return move id
+}
+
+/// `value`'s bytes, least first, in `width` bytes: those past eight are
+/// zeros.
+fn pushLittle(out: &var Vec<u8>, value: u64, width: i64) = {
+	for i in 0..width {
+		out.push(if i < 8 then (value >> (8 * i) as u64) as u8 else 0)
+	}
+}

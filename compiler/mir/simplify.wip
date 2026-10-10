@@ -1,0 +1,250 @@
+// What a place really names.
+//
+// MIR is written the way a body reads: a value is copied to a temporary, an
+// address is taken and then followed, a field is loaded and then read
+// through. Nothing folds any of that, so an inlined closure reads what it
+// captured through the environment the caller built rather than reading the
+// caller's own local.
+//
+// This pass follows two kinds of fact through a whole body:
+//
+// - `p = &x` makes `(*p)` mean `x`, and an address does not change while the
+//   pointer holds it.
+// - `a = b` makes a read of `a` a read of `b`, but only while `b` is what it
+//   was.
+//
+// Both are kept only for places written **once** in the body, so there is no
+// question of which write a read sees; a copy is kept only when what it copied
+// is written once too and its address is never taken, since a call may write
+// through an address it was given.
+
+import std::collections::{Map, Set}
+import std::mem
+import hir::{Program}
+
+/// Rewrites the places of `body` to the ones they stand for.
+pub fn simplify(program: &Program, body: &var Body) = {
+	var facts = Facts(known: facts(&program, &body))
+	if facts.known.isEmpty() then return
+	for b in 0..body.blocks.len() {
+		val statements = mem::replace(&var body.blocks[b].statements, Vec())
+		var rewritten: Vec<Statement> = Vec()
+		for statement in move statements {
+			rewritten.push(rewriteStatement(move statement, &var facts))
+		}
+		body.blocks[b].statements = move rewritten
+		val terminator = mem::replace(&var body.blocks[b].terminator, .Unreachable)
+		body.blocks[b].terminator = rewriteTerminator(move terminator, &var facts)
+	}
+}
+
+/// What a place was given, where it was given it once.
+@derive(Clone)
+enum Fact {
+	Copied(source: Place)
+	Address(target: Place)
+}
+
+/// A place a fact can be about: one reached by naming fields, with no `*` and
+/// no index in it. An index names a local whose value may change, and a `*`
+/// may be anywhere.
+fn factKey(place: &Place): Option<(Local, Vec<Projection>)> = {
+	for p in place.projections {
+		if !(p is .Field(..) | .VariantField(..)) then return .None
+	}
+	return .Some((place.local, place.projections.clone()))
+}
+
+/// Whether one path passes through the other: writing `p.0` writes part of
+/// `p`, and writing `p` writes all of `p.0`.
+fn overlaps(a: &[Projection], b: &[Projection]): bool = {
+	for i in 0..a.len().min(b.len()) {
+		if a[i] != b[i] then return false
+	}
+	return true
+}
+
+/// Whether the place a fact is about is written once, by the paths each local
+/// is written at.
+fn writtenOnce(writes: &Map<Local, Vec<Vec<Projection>>>, place: &Place): bool = {
+	val .Some((local, projections)) = factKey(&place) else {
+		return false
+	}
+	val .Some(paths) = writes.get(&local) else {
+		return true
+	}
+	var count = 0
+	for p in paths {
+		if overlaps(&p, &projections) then count += 1
+	}
+	return count <= 1
+}
+
+/// The facts a body makes, which is everything this pass knows.
+fn facts(program: &Program, body: &Body): Map<(Local, Vec<Projection>), Fact> = {
+	// Every write, so that a fact is kept only about a place written once. A
+	// parameter arrives with a value, so a write to one is its second:
+	// `x = p; zero(p)` is a move, and `x` is not another name for `p`. Each
+	// local's writes, by the path written.
+	var writes: Map<Local, Vec<Vec<Projection>>> = Map()
+	for param in body.params {
+		writes.put(param, Vec::of(own [Vec()]))
+	}
+	// A local nothing can be known about: written through a pointer or an
+	// index, or the target of an address the body then passes around.
+	var unknown: Set<Local> = Set()
+	// Whether any of the locals whose address is taken may have been written
+	// through it: all of them are unknown then, which is found once, at the
+	// end, not at each write and each call.
+	var throughAddresses = false
+	var candidates: Vec<((Local, Vec<Projection>), Fact)> = Vec()
+	for block in body.blocks {
+		for statement in block.statements {
+			if writtenPlace(&statement) is .Some(dest) {
+				match factKey(&dest) {
+					.Some((local, path)) => writes.atOrPut(local, Vec()).push(move path)
+					// A write through a pointer or into an element: what it
+					// reached is not known.
+					.None => {
+						unknown.add(dest.local)
+						// It may have been any place whose address was taken.
+						val deref = Projection::Deref
+						if dest.projections.contains(&deref) then throughAddresses = true
+					}
+				}
+			}
+			// A call may write through any address it was given.
+			if statement is .Call(..) | .DropFn(..) | .DropInPlace(..) then throughAddresses = true
+			if statement is .Assign(place: dest, rvalue) && factKey(&dest) is .Some(key) {
+				val fact: Fact = match rvalue {
+					// A copy names what it copied only where the two are of one
+					// type: a slice's pointer is a word, and the `ptr<T>` it is
+					// copied into is indexed as the elements.
+					.Use(.Copy(source)) if placeTy(&program, &body, &source) ==
+						placeTy(&program, &body, &dest) => .Copied(source.clone())
+					.AddressOf(target) => .Address(target.clone())
+					_ => continue
+				}
+				candidates.push((move key, move fact))
+			}
+		}
+	}
+	if throughAddresses {
+		for local in addressed(&body) {
+			unknown.add(local)
+		}
+	}
+	var facts: Map<(Local, Vec<Projection>), Fact> = Map()
+	for (dest, fact) in move candidates {
+		val named = Place(local: dest.0, projections: dest.1.clone())
+		if !writtenOnce(&writes, &named) || unknown.contains(&dest.0) then continue
+		// An address stays what it is; a copy is only a name for what it copied
+		// while that is what it was.
+		val keep = match fact {
+			.Address(..) => true
+			// Only a scalar is a value a name can stand for. An aggregate is an
+			// address, and a callee handed that address may write through it —
+			// so a copy of an aggregate is a copy, not a second name for what it
+			// copied.
+			.Copied(source) =>
+				writtenOnce(&writes, &source) &&
+					!unknown.contains(&source.local) &&
+					!isAggregate(&program, placeTy(&program, &body, &named))
+		}
+		if keep then facts.put(move dest, move fact)
+	}
+	return move facts
+}
+
+/// The locals whose address the body takes, which is what a write through a
+/// pointer may have reached.
+fn addressed(body: &Body): Vec<Local> = {
+	var locals: Vec<Local> = Vec()
+	for block in body.blocks {
+		for statement in block.statements {
+			if statement is .Assign(rvalue: .AddressOf(target), ..) then locals.push(target.local)
+		}
+	}
+	return move locals
+}
+
+/// The place a statement writes, if it writes one.
+fn writtenPlace(statement: &Statement): Option<Place> = match statement {
+	.Assign(place: dest, ..) | .SetVariant(place: dest, ..) | .Zero(place: dest)
+	| .Poison(place: dest) | .DropInPlace(place: dest, ..) | .Arith(dest, ..) | .Alloc(dest, ..)
+	| .AllocBuffer(dest, ..) => .Some(dest.clone())
+	.Call(dest, ..) | .Atomic(dest, ..) => dest.clone()
+	_ => .None
+}
+
+/// What the pass knows, as it rewrites.
+struct Facts {
+	known: Map<(Local, Vec<Projection>), Fact>
+}
+
+extend Facts {
+	/// Follows what is known about `place` until nothing more is known.
+	fn follow(place: Place): Place = {
+		var at = move place
+		for _ in 0..8 {
+			// The longest part of the place a fact is about, with whatever it is
+			// read through left on the end: a fact about `p.0` says what `p.0.1`
+			// reads too.
+			if self.copied(&at) is .Some(folded) && folded != at {
+				at = folded.clone()
+				continue
+			}
+			// `(*p).f`, where `p` holds `&x`, is `x.f`.
+			val whole: (Local, Vec<Projection>) = (at.local, Vec())
+			if !at.projections.isEmpty() &&
+				at.projections[0] == Projection::Deref &&
+				self.known.get(&whole) is .Some(.Address(target)) {
+				var folded = target.clone()
+				folded.projections.pushAll(&at.projections[1..])
+				if folded != at {
+					at = move folded
+					continue
+				}
+			}
+			break
+		}
+		return move at
+	}
+
+	/// What a place stands for, when a fact is about it or about a part of it.
+	fn copied(place: &Place): Option<Place> = {
+		var deref = place.projections.len()
+		for (i, p) in place.projections.forwards().enumerate() {
+			if p == Projection::Deref {
+				deref = i
+				break
+			}
+		}
+		var taken = deref + 1
+		while taken > 0 {
+			taken -= 1
+			val key = (place.local, place.projections[0..taken].toVec())
+			if self.known.get(&key) is .Some(.Copied(source)) {
+				var folded = source.clone()
+				folded.projections.pushAll(&place.projections[taken..])
+				return .Some(move folded)
+			}
+		}
+		return .None
+	}
+}
+
+extend Facts: Rewrite {
+	var fn read(place: Place): Place = self.follow(move place)
+
+	/// A place that is written stays where it is; only the pointer it is
+	/// reached through is followed.
+	var fn written(place: Place): Place =
+		if !place.projections.isEmpty() && place.projections[0] == Projection::Deref then
+			self.follow(move place)
+		else move place
+
+	/// What is called is left alone: a closure's code address is read from the
+	/// pair, and the pair is what says its type.
+	fn rewritesCallee(): bool = false
+}

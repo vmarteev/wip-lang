@@ -1,0 +1,232 @@
+// What the interfaces a type implements give it by a name: each one's
+// method, as the implementation has it, and the methods of each one's
+// extensions whose condition the implementation's types meet.
+// `extend Iterator<T: Ord> { move fn max() … }` gives `max` to every
+// iterator of an ordered element, and to no other.
+
+import syntax as ast
+import syntax::{AMBIGUOUS_METHOD, Diagnostic, NOT_A_METHOD, Symbol}
+
+/// A method a call may mean, and the interface it comes from.
+@derive(Clone)
+struct Offered {
+	interfaceId: InterfaceId
+	method: FnId
+	/// The interface's types for the value it is called on, which the call
+	/// is given as a default's call is.
+	args: TyList
+}
+
+/// An extension the value's types do not meet the condition of: which
+/// parameter, and what it does not implement.
+@derive(Clone)
+struct Unmet {
+	method: FnId
+	interfaceId: InterfaceId
+	args: TyList
+	param: i64
+	missing: Constraint
+}
+
+extend Lowerer {
+	/// What a call of `name` on a value of `ty`, whose type is `owner`, may
+	/// mean through the interfaces `owner` implements, and the extensions of
+	/// that name it does not meet the condition of.
+	var fn offered(owner: TypeDef, ty: Ty, name: Symbol): (Vec<Offered>, Vec<Unmet>) = {
+		val value = self.underRefs(ty)
+		val ownArgs = self.ownerArgs(value)
+		var offered: Vec<Offered> = Vec()
+		var unmet: Vec<Unmet> = Vec()
+		var implementations: Vec<ImplDef> = Vec()
+		for i in self.program.impls {
+			if i.ty == owner then implementations.push(i.clone())
+		}
+		for implementation in implementations {
+			// The implementation's types, read in the value's own.
+			val written = self.program.types.list(implementation.args).toVec()
+			var args: Vec<Ty> = Vec()
+			for arg in written {
+				args.push(self.program.types.subst(arg, &ownArgs))
+			}
+			val list = self.program.types.internList(&args)
+			val def = self.program.interfaces[implementation.interfaceId].clone()
+			for (at, method) in def.methods.forwards().enumerate() {
+				if self.program.fns[method.id].name != name then continue
+				if at < implementation.methods.len() then
+					offered.push(Offered(
+						interfaceId: implementation.interfaceId,
+						method: implementation.methods[at],
+						args: list,
+					))
+			}
+			for method in def.extensions {
+				if self.program.fns[method].name != name then continue
+				match self.extensionUnmet(method, value, &args) {
+					.None => offered.push(Offered(
+						interfaceId: implementation.interfaceId,
+						method: method,
+						args: list,
+					))
+					.Some((param, missing)) => unmet.push(Unmet(
+						method: method,
+						interfaceId: implementation.interfaceId,
+						args: list,
+						param: param,
+						missing: missing,
+					))
+				}
+			}
+		}
+		return (move offered, move unmet)
+	}
+
+	/// The same for a type parameter, through what its constraints say.
+	var fn offeredByConstraints(
+		param: Ty,
+		constraints: &[Constraint],
+		name: Symbol,
+	): (Vec<Offered>, Vec<Unmet>) = {
+		var offered: Vec<Offered> = Vec()
+		var unmet: Vec<Unmet> = Vec()
+		for constraint in constraints {
+			val def = self.program.interfaces[constraint.interfaceId].clone()
+			var found: Option<FnId> = .None
+			for m in def.methods {
+				if found.isNone() && self.program.fns[m.id].name == name then found = .Some(m.id)
+			}
+			if found is .Some(method) then
+				offered.push(Offered(
+					interfaceId: constraint.interfaceId,
+					method: method,
+					args: constraint.args,
+				))
+			val args = self.program.types.list(constraint.args).toVec()
+			for method in def.extensions {
+				if self.program.fns[method].name != name then continue
+				match self.extensionUnmet(method, param, &args) {
+					.None => offered.push(Offered(
+						interfaceId: constraint.interfaceId,
+						method: method,
+						args: constraint.args,
+					))
+					.Some((at, missing)) => unmet.push(Unmet(
+						method: method,
+						interfaceId: constraint.interfaceId,
+						args: constraint.args,
+						param: at,
+						missing: missing,
+					))
+				}
+			}
+		}
+		return (move offered, move unmet)
+	}
+
+	/// Which of the interface's types, `args`, does not meet extension
+	/// `method`'s condition for a value of `value`, and what it lacks;
+	/// nothing where all do.
+	var fn extensionUnmet(method: FnId, value: Ty, args: &[Ty]): Option<(i64, Constraint)> = {
+		val generics = self.program.fns[method].generics.clone()
+		// `Self`, then the interface's types: what the condition is read in.
+		var known = Vec::of(own [value])
+		for arg in args {
+			known.push(arg)
+		}
+		for (at, arg) in args.forwards().enumerate() {
+			if at + 1 >= generics.len() then continue
+			for constraint in generics[at + 1].interfaces {
+				val written = self.program.types.list(constraint.args).toVec()
+				var wanted: Vec<Ty> = Vec()
+				for ty in written {
+					wanted.push(self.program.types.subst(ty, &known))
+				}
+				if !self.implementsArgs(arg, constraint.interfaceId, &wanted) then
+					return .Some((at, constraint))
+			}
+		}
+		return .None
+	}
+
+	/// A call of a name two interfaces give the type: reported, since which
+	/// one is meant is in question. `subject` is how the type is named.
+	var fn ambiguousMethod(offered: &[Offered], subject: str, name: ast::Name) = {
+		val text = String::of(self.text(name.sym))
+		var interfaces: Vec<String> = Vec()
+		for offer in offered {
+			val named = "`\(self.text(self.program.interfaces[offer.interfaceId].name))`"
+			if !interfaces.contains(&named) then interfaces.push(move named)
+		}
+		var diagnostic = Diagnostic::error(
+			AMBIGUOUS_METHOD,
+			"`\(text)` of `\(subject)` is in question",
+			name.span,
+			"\(interfaces.join(" and ")) each give it",
+		).withNote(
+			String::of(
+				"a method that two interfaces give a type is not chosen between: a type's own method of the name would be the one",
+			),
+		)
+		for offer in offered {
+			diagnostic = diagnostic.withSecondary(
+				self.program.fns[offer.method].nameSpan,
+				String::of("one of them"),
+			)
+		}
+		self.report(move diagnostic)
+	}
+
+	/// An extension of that name whose condition the value's types do not
+	/// meet: the call says so, rather than that no method exists.
+	var fn unmetExtension(unmet: Unmet, subject: str, name: ast::Name) = {
+		val text = String::of(self.text(name.sym))
+		val declared = self.program.fns[unmet.method].nameSpan
+		val interfaceText = String::of(self.text(self.program.interfaces[unmet.interfaceId].name))
+		// The block's own names: `Iterator<T>`, where `T: Add + Zero`.
+		val count = self.program.interfaces[unmet.interfaceId].generics.len()
+		var params: Vec<GenericParamDef> = Vec()
+		val generics = &self.program.fns[unmet.method].generics
+		var i = 1
+		while i < generics.len() && i <= count {
+			params.push(generics[i].clone())
+			i += 1
+		}
+		var names: Vec<String> = Vec()
+		for p in params {
+			names.push(String::of(self.text(p.name)))
+		}
+		val param = params[unmet.param].clone()
+		val subjectParam = self.internParam(unmet.param + 1, &param)
+		var condition: Vec<String> = Vec()
+		for c in param.interfaces {
+			condition.push(self.constraintName(c, subjectParam))
+		}
+		val actual = self.program.types.list(unmet.args)[unmet.param]
+		val lacking = String::of(self.text(self.program.interfaces[unmet.missing.interfaceId].name))
+		val generic = "\(interfaceText)<\(names.join(", "))>"
+		var givenNames: Vec<String> = Vec()
+		for ty in self.program.types.list(unmet.args) {
+			givenNames.push(self.program.tyName(ty, self.interner))
+		}
+		val given = "\(interfaceText)<\(givenNames.join(", "))>"
+		var diagnostic = Diagnostic::error(
+			NOT_A_METHOD,
+			"no method `\(text)` on `\(subject)`",
+			name.span,
+			"`\(text)` is \(article(&generic)) `\(generic)`'s where `\(names[unmet.param]): \(condition.join(" + "))`",
+		).withSecondary(declared, String::of("declared here"))
+		val actualName = self.tyName(actual)
+		diagnostic = match self.kind(actual) {
+			// A type parameter has what its constraints promise.
+			.Param(
+				_,
+			) => diagnostic.withNote("`\(subject)` is \(article(&given)) `\(given)`, and nothing says \(actualName) implements `\(lacking)`").withHelp("constrain it: `\(actualName.toStr().trimMatches("`")): \(lacking)`")
+			_ => diagnostic.withNote("`\(subject)` is \(article(&given)) `\(given)`, and \(actualName) does not implement `\(lacking)`")
+		}
+		self.report(move diagnostic)
+	}
+
+	/// The type parameter a generic parameter's place stands for.
+	var fn internParam(index: i64, param: &GenericParamDef): Ty = self.intern(
+		.Param(TyParam(index: index as u32, name: param.name, copy: param.copy)),
+	)
+}

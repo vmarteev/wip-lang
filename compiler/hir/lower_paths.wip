@@ -1,0 +1,169 @@
+// Paths that name items: `a::b::Item`, `Enum::Variant` and
+// `pkg::Enum::Variant`.
+
+import syntax as ast
+import syntax::{Diagnostic, Span, Symbol, UNKNOWN_MODULE}
+
+/// A function or variant used in an expression: the arguments of the call
+/// around it, if there is one, the type arguments written in its path, and
+/// the type expected of the value.
+@derive(Clone)
+view struct ItemUse {
+	args: Option<&[ast::ExprId]>
+	/// The names the arguments were given, if any.
+	names: &[Option<ast::Name>]
+	typeArgs: Option<&ast::TypeArgs>
+	/// The segment of the path that names the generic item, which type
+	/// arguments must follow.
+	nameSegment: i64
+	hint: Option<Ty>
+	/// For a `static fn` reached through a type alias, the type the alias
+	/// names, which says what the owner's parameters are.
+	ownerTy: Option<Ty>
+	/// For a call through a constraint, the interface's own type arguments,
+	/// which the constraint carries.
+	interfaceArgs: TyList
+	/// For a method call, the receiver, already checked: it is the first
+	/// parameter, and is not written among the arguments.
+	receiver: Option<ExprId>
+	/// For a call of an interface's method through a type parameter, the type
+	/// `Self` stands for.
+	selfTy: Option<Ty>
+	span: Span
+}
+
+/// No names, for a use that kept none.
+val NO_NAMES: [Option<ast::Name>; 0] = []
+
+/// `NO_NAMES`, lent.
+fn noNames(): &[Option<ast::Name>] = lend NO_NAMES
+
+extend ItemUse {
+	/// The name each argument was given: none, where no names were kept.
+	fn argNames(): Vec<Option<ast::Name>> = {
+		val count = match self.args {
+			.Some(args) => args.len()
+			.None => 0
+		}
+		var names: Vec<Option<ast::Name>> = Vec()
+		for i in 0..count {
+			names.push(if i < self.names.len() then self.names[i] else .None)
+		}
+		return move names
+	}
+
+	/// A use with no type arguments written.
+	static fn plain(args: Option<&[ast::ExprId]>, hint: Option<Ty>, span: Span): ItemUse = ItemUse(
+		args: args,
+		names: &noNames(),
+		typeArgs: .None,
+		nameSegment: 0,
+		hint: hint,
+		receiver: .None,
+		selfTy: .None,
+		ownerTy: .None,
+		interfaceArgs: TyList::empty(),
+		span: span,
+	)
+}
+
+/// What a path names once its module is known.
+@derive(Clone)
+enum PathTarget {
+	/// An item of the module: a function or a type.
+	Item(module: i64, name: ast::Name)
+	/// A variant: the module, the enum's name and the variant's name.
+	Variant(module: i64, enumName: ast::Name, variant: ast::Name)
+	/// A path already reported: it names no module, or starts with an import
+	/// that was reported.
+	Broken
+}
+
+extend Lowerer {
+	/// Splits a path into the module it names and the segments after it. A
+	/// path that starts with an imported item continues in that item's
+	/// module, under the item's own name, and a path that names no module
+	/// belongs to the current one. Nothing if the path starts with an import
+	/// that was already reported.
+	fn splitPath(segments: &[ast::Name]): Option<(i64, Vec<ast::Name>)> = {
+		if segments.isEmpty() then return .None
+		val first = segments[0]
+		if segments.len() > 1 && self.imports.modules.get(&first.sym) is .Some(module) then
+			return .Some((module, segments[1..segments.len()].toVec()))
+		match self.imported(first) {
+			.Some(.Item(module, name: item)) => {
+				var renamed = segments.toVec()
+				renamed[0] = item
+				return .Some((module, move renamed))
+			}
+			.Some(.Broken) => return .None
+			.None => {}
+		}
+		var end = segments.len() - 1
+		while end >= 1 {
+			var written = String()
+			for i in 0..end {
+				if i > 0 then written.push("::")
+				written.push(self.text(segments[i].sym))
+			}
+			val meant = self.moduleMeant(written.toStr())
+			for (index, module) in self.modules.forwards().enumerate() {
+				if module.path == meant then
+					return .Some((index, segments[end..segments.len()].toVec()))
+			}
+			end -= 1
+		}
+		return .Some((self.current, segments.toVec()))
+	}
+
+	/// The module and item a path names, where it names one, without
+	/// reporting what it cannot find: a caller that goes on resolves the path
+	/// again, and that reports.
+	fn resolvePathQuietly(segments: &[ast::Name]): PathTarget = match self.splitPath(&segments) {
+		.Some((module, rest)) =>
+			if rest.len() == 1 then .Item(module: module, name: rest[0]) else .Broken
+		.None => .Broken
+	}
+
+	/// Whether `module` holds a type called `sym`, and no function of that
+	/// name: the prelude's, where `module` is this one.
+	fn moduleTypesContain(module: i64, sym: Symbol): bool = {
+		val here = &self.modules[module]
+		if here.fns.contains(&sym) then return false
+		return here.types.contains(&sym) ||
+			here.aliases.contains(&sym) ||
+			(module == self.current &&
+				self.preludeModule(sym).isSome() &&
+				self.preludeFn(sym).isNone())
+	}
+
+	/// Resolves the module a path starts in, and what the rest of it names.
+	/// `Enum::Variant` is accepted only if `variants` is set. Anything else
+	/// is reported as an unknown module, with `note`.
+	var fn resolvePath(segments: &[ast::Name], variants: bool, note: str): PathTarget = {
+		val .Some((module, rest)) = self.splitPath(&segments) else {
+			return .Broken
+		}
+		if rest.len() == 1 then return .Item(module: module, name: rest[0])
+		if rest.len() == 2 && variants then
+			return .Variant(module: module, enumName: rest[0], variant: rest[1])
+		if !rest.isEmpty() then self.unknownModule(rest[0], note)
+		return .Broken
+	}
+
+	/// Reports `name` as a module that does not exist.
+	var fn unknownModule(name: ast::Name, note: str) = {
+		val text = String::of(self.text(name.sym))
+		self.report(
+			Diagnostic::error(
+				UNKNOWN_MODULE,
+				"cannot find module `\(text)`",
+				name.span,
+				String::of("unknown module"),
+			).withNote(String::of(note)),
+		)
+	}
+}
+
+/// The note for an unknown module in most paths.
+val MODULE_NOTE: str = "a module is a directory, named by its path"

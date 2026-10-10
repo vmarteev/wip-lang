@@ -1,0 +1,357 @@
+// The lexer: what it makes of each kind of token, what it reports, and
+// that every fix it suggests makes text that lexes cleanly.
+
+/// The kinds of the tokens `src` lexes to, as `wip lex` names them, with a
+/// character's or a byte's value.
+fn kindsOf(src: str): String = {
+	var interner = Interner::new()
+	val lexed = lex(src, &var interner)
+	var out = String()
+	for token in lexed.tokens {
+		if !out.isEmpty() then out.push(" ")
+		match token.kind {
+			.Char(value) => out.push("char(\(value))")
+			.Byte(value) => out.push("byte(\(value))")
+			_ => match token.kind.text() {
+				.Some(text) => out.push(text)
+				.None => out.push(token.kind.class())
+			}
+		}
+	}
+	return move out
+}
+
+/// The codes of what lexing `src` reports, in order.
+fn codesOf(src: str): String = {
+	var interner = Interner::new()
+	val lexed = lex(src, &var interner)
+	var out = String()
+	for diagnostic in lexed.diagnostics {
+		if !out.isEmpty() then out.push(" ")
+		out.push(diagnostic.code.text())
+	}
+	return move out
+}
+
+@test
+fn everyKeywordAndPunctuation() = {
+	val src =
+		"as defer else enum extern false fn if let match move own return struct true val var while\n{ } ( ) [ ] , : :: ; . -> => _\n= == != < <= > >= + - * / % ! & && ||\n"
+	var interner = Interner::new()
+	val lexed = lex(src, &var interner)
+	assert(lexed.diagnostics.isEmpty())
+	val expected = """
+		1:1     as
+		1:4     defer
+		1:10    else
+		1:15    enum
+		1:20    extern
+		1:27    false
+		1:33    fn
+		1:36    if
+		1:39    let
+		1:43    match
+		1:49    move
+		1:54    own
+		1:58    return
+		1:65    struct
+		1:72    true
+		1:77    val
+		1:81    var
+		1:85    while
+		2:1     {
+		2:3     }
+		2:5     (
+		2:7     )
+		2:9     [
+		2:11    ]
+		2:13    ,
+		2:15    :
+		2:17    ::
+		2:20    ;
+		2:22    .
+		2:24    ->
+		2:27    =>
+		2:30    _
+		3:1     =
+		3:3     ==
+		3:6     !=
+		3:9     <
+		3:11    <=
+		3:14    >
+		3:16    >=
+		3:19    +
+		3:21    -
+		3:23    *
+		3:25    /
+		3:27    %
+		3:29    !
+		3:31    &
+		3:33    &&
+		3:36    ||
+		4:1     eof
+		"""
+	assert(dump(src, &lexed.tokens) == "\(expected)\n")
+}
+
+@test
+fn literalsAndIdentifiers() = {
+	val src = "x _x x_1 i64 0 42 1.5 0.25e-3 2e10 1E+2 \"a\\tb\" \"\" \"日本\""
+	var interner = Interner::new()
+	val lexed = lex(src, &var interner)
+	assert(lexed.diagnostics.isEmpty())
+	val expected = """
+		1:1     ident   x
+		1:3     ident   _x
+		1:6     ident   x_1
+		1:10    ident   i64
+		1:14    int     0
+		1:16    int     42
+		1:19    float   1.5
+		1:23    float   0.25e-3
+		1:31    float   2e10
+		1:36    float   1E+2
+		1:41    str     "a\\tb"
+		1:48    str     ""
+		1:51    str     "日本"
+		1:55    eof
+		"""
+	assert(dump(src, &lexed.tokens) == "\(expected)\n")
+}
+
+/// Compound assignments are one token each, except `<<=`
+/// and `>>=`, which are two, as `<<` and `>>` are.
+@test
+fn compoundAssignments() = {
+	val src = "+= -= *= /= %= &= |= ^= <<= >>= -> && ||"
+	assert(codesOf(src) == "")
+	assert(kindsOf(src) == "+= -= *= /= %= &= |= ^= < <= > >= -> && || eof")
+}
+
+/// `|` and `^`, and literals in other bases.
+@test
+fn bitwiseOperatorsAndNumberBases() = {
+	val src = "| ^ 0xff 0o17 0b1010_1010 1_000_000 2.5_0 0xAbC"
+	assert(codesOf(src) == "")
+	assert(kindsOf(src) == "| ^ int int int int float int eof")
+}
+
+@test
+fn numberAndOperatorErrors() = {
+	val cases = [
+		("~x", "E0009"),
+		("1__000", "E0010"),
+		("1_", "E0010"),
+		("0x", "E0011"),
+		("0xg", "E0011"),
+		("0b102", "E0011"),
+		("0o9", "E0011"),
+		("0xfg", "E0007"),
+		("0755", "E0005"),
+	]
+	for (src, expected) in cases {
+		assert(codesOf(src) == expected, src)
+	}
+}
+
+@test
+fn numberAndOperatorFixesApplyCleanly() = {
+	for src in ["~x", "1__000", "1_", "0_1"] {
+		var interner = Interner::new()
+		val lexed = lex(src, &var interner)
+		assert(lexed.diagnostics.len() == 1, src)
+		val .Some(fix) = lexed.diagnostics[0].fix else {
+			panic("a fix")
+		}
+		val fixed = fix.apply(src)
+		assert(codesOf(fixed.toStr()) == "", fixed)
+	}
+}
+
+@test
+fn nestedGenericsLexAsSeparateGt() = {
+	assert(codesOf(">>") == "")
+	assert(kindsOf(">>") == "> > eof")
+}
+
+@test
+fn stringContentsAreUnescaped() = {
+	var interner = Interner::new()
+	val lexed = lex("\"tab\\t nl\\n cr\\r nul\\0 bs\\\\ q\\\" é\"", &var interner)
+	assert(lexed.diagnostics.isEmpty())
+	val .Str(symbol) = lexed.tokens[0].kind else {
+		panic("not a string")
+	}
+	assert(interner.resolve(symbol) == "tab\t nl\n cr\r nul\0 bs\\ q\" é")
+}
+
+/// A text block: the closing `"""`'s indentation off
+/// every line, a blank line empty, space at the end of a line dropped
+/// unless an escape wrote it, and no line break after the opening or
+/// before the closing.
+@test
+fn textBlocksLoseTheirIndentation() = {
+	var interner = Interner::new()
+	val src = "\"\"\"  \n\t\tfirst \"x\" \n\n\t\t  second\\t\n\t\t\"\"\""
+	val lexed = lex(src, &var interner)
+	assert(lexed.diagnostics.isEmpty())
+	val .Str(symbol) = lexed.tokens[0].kind else {
+		panic("not a string")
+	}
+	assert(interner.resolve(symbol) == "first \"x\"\n\n  second\t")
+	assert(lexed.tokens[1].kind == .Eof)
+}
+
+@test
+fn integerThenFieldAccess() = {
+	assert(codesOf("1.x") == "")
+	assert(kindsOf("1.x") == "int . ident eof")
+}
+
+@test
+fn commentsAndTrivia() = {
+	val src = "\u{feff}// only\n  a // trailing\r\n//// more\nb// no newline"
+	assert(codesOf(src) == "")
+	assert(kindsOf(src) == "ident ident eof")
+}
+
+@test
+fn eofIsLastAndEmpty() = {
+	var interner = Interner::new()
+	for src in ["", "   ", "x", "\"open", "@"] {
+		val lexed = lex(src, &var interner)
+		val last = &lexed.tokens[lexed.tokens.len() - 1]
+		assert(last.kind == .Eof, src)
+		assert(last.span == Span::at(src.len() as u32), src)
+		var eofs = 0
+		for token in lexed.tokens {
+			if token.kind == .Eof then eofs += 1
+		}
+		assert(eofs == 1, src)
+	}
+}
+
+@test
+fn errorCodes() = {
+	assert(codesOf("$") == "E0001")
+	assert(codesOf("a $# b") == "E0001", "a run of bad characters is one error")
+	assert(codesOf("$ #") == "E0001 E0001")
+	assert(codesOf("\"abc\nx") == "E0002")
+	assert(codesOf("\"abc") == "E0002")
+	assert(codesOf("\"abc\\") == "E0002")
+	assert(codesOf("\"\\q\\w\"") == "E0003 E0003")
+	assert(codesOf("1.") == "E0004")
+	assert(codesOf("1.;") == "E0004")
+	assert(codesOf("007") == "E0005")
+	assert(codesOf("00.5") == "E0005")
+	assert(codesOf("a | b ^ c") == "", "bitwise operators")
+	assert(codesOf("~x") == "E0009")
+	assert(codesOf("12abc") == "E0007")
+	assert(codesOf("3e") == "E0007")
+	assert(codesOf("3e+") == "E0007")
+	// A character literal holds one character.
+	assert(codesOf("'x' '\\n' '\\'' '\\u{1F600}' 'é'") == "")
+	assert(codesOf("''") == "E0008", "an empty character is one error")
+	assert(codesOf("'it\"s'") == "E0008", "more than one character")
+	assert(codesOf("'x\n'") == "E0008 E0008", "a character does not run past its line")
+	assert(codesOf("'\\u{D800}'") == "E0003", "a surrogate is no character")
+	// A byte literal holds one ASCII character.
+	assert(codesOf("b'x' b'\\n' b'\\'' b'\\u{7F}'") == "")
+	assert(codesOf("b'é'") == "E0012", "not ASCII")
+	assert(codesOf("b'\\u{80}'") == "E0012", "past 127")
+	assert(codesOf("b''") == "E0008", "an empty byte is one error")
+	assert(codesOf("b'xy'") == "E0008", "more than one character")
+	assert(codesOf("0 0.0 10 1e5 1.5E-5") == "")
+}
+
+@test
+fn errorsStillProduceTokens() = {
+	assert(kindsOf("\"abc\nx") == "str ident eof")
+	assert(kindsOf("1.;") == "float ; eof")
+	assert(kindsOf("007") == "int eof")
+	assert(kindsOf("a | b") == "ident | ident eof")
+	assert(kindsOf("~x") == "! ident eof")
+	assert(kindsOf("12abc;") == "int ; eof")
+	assert(kindsOf("a $ b") == "ident ident eof")
+	assert(kindsOf("f('xy')") == "ident ( char(120) ) eof")
+	// `b'` begins a byte; `b` before anything else is a name.
+	assert(kindsOf("b'/' b ab'x'") == "byte(47) ident ident char(120) eof")
+}
+
+/// A file after the first of a program has its spans after the files
+/// before it, and so do its fixes' edits and the gaps the lexer leaves:
+/// a fix once inserted its text into the program's first file.
+@test
+fn fixesAndGapsAreInTheirFile() = {
+	val base: u32 = 1000
+	for src in [
+		"1.",
+		"3e",
+		"\"\"\" x\n\"\"\"",
+		"\"\"\"\na\"\"\"b\n\"\"\"",
+		"\"\\q\"",
+		"\"abc",
+		"\"\"\"\n",
+	] {
+		var interner = Interner::new()
+		val lexed = lexAt(src, base, &var interner)
+		val end = base + src.len() as u32
+		assert(!lexed.diagnostics.isEmpty(), src)
+		for diagnostic in lexed.diagnostics {
+			if diagnostic.fix is .Some(fix) {
+				for edit in fix.edits {
+					assert(base <= edit.span.lo && edit.span.hi <= end, src)
+				}
+			}
+		}
+		for gap in lexed.gaps {
+			assert(base <= gap.lo && gap.hi <= end, src)
+		}
+	}
+}
+
+/// What the lexer cannot read, beginning with a letter of any script —
+/// a category `L…`, as the library's `isLetter` says — is told that a
+/// name is ASCII; beginning with a number written as a letter, `Ⅻ`, or a
+/// symbol, it is not.
+@test
+fn aLetterIsToldNamesAreAscii() = {
+	for (src, notes) in [("é", 1), ("中", 1), ("Ⅻ", 0), ("😀", 0)] {
+		var interner = Interner::new()
+		val lexed = lex(src, &var interner)
+		assert(lexed.diagnostics[0].notes.len() == notes, src)
+	}
+}
+
+/// Every fix the lexer suggests must produce source that lexes cleanly.
+@test
+fn fixesApplyCleanly() = {
+	val cases = [
+		"let x = 007;",
+		"let x = 1.;",
+		"let x = 3e;",
+		"let p = \"C:\\Users\";",
+		"let x = ~y;",
+		"let x = 1__000;",
+		"let c = 'xy';",
+		"let c = b'xy';",
+		"let x =\u{a0}1;",
+	]
+	for src in cases {
+		var interner = Interner::new()
+		var fixed = String::of(src)
+		// Fixes from one run are independent, so apply them back to front.
+		val lexed = lex(src, &var interner)
+		assert(!lexed.diagnostics.isEmpty(), src)
+		var fixes: Vec<&Fix> = Vec()
+		for diagnostic in lexed.diagnostics {
+			if diagnostic.fix is .Some(fix) then fixes.push(&fix)
+		}
+		assert(fixes.len() == lexed.diagnostics.len(), src)
+		fixes.sortByKey((fix) => -(fix.edits[0].span.lo as i64))
+		for fix in fixes {
+			fixed = fix.apply(fixed.toStr())
+		}
+		assert(codesOf(fixed.toStr()) == "", fixed)
+	}
+}

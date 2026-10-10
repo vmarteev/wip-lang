@@ -1,0 +1,976 @@
+// The checked program, written one fact a line, for `wip check --dump-hir`:
+// what the checker made of a program, so that two checkers can be compared,
+// and a reader can see what a name became.
+//
+// The program's own modules are written whole: every item, with its
+// signature, and every body, each expression with its kind, its type and
+// where it is. The standard library's items are left out, but for the
+// instances of its generic functions the program made, by name, unless they
+// are asked for: a file of the prelude is no program on its own, and so is
+// printed no other way. A line is indented under the one it belongs to, and ends with where its node is: an
+// item's `@file:line:col..line:col`, a node's `@line:col..line:col`. Types
+// are spelled as a symbol spells them, every type argument written.
+
+import std::collections::{Set}
+import syntax::{Interner, Span, Symbol, quoted}
+
+/// The program, written. `locate` names the file and the line and column of a
+/// position, as the program's sources know them; `library` writes the
+/// standard library's items whole too.
+pub fn dump(
+	program: &Program,
+	interner: &Interner,
+	locate: &(at: u32) => (String, u32, u32),
+	library: bool,
+): String = {
+	var dumper = Dumper(
+		program: &program,
+		interner: &interner,
+		locate: locate,
+		library: library,
+		out: String(),
+		depth: 0,
+	)
+	dumper.writeProgram()
+	return move dumper.out
+}
+
+/// The program's own constants, as `dump` writes them: what `wip mir` writes
+/// first, once the evaluator has worked out those whose code runs.
+pub fn dumpConstants(
+	program: &Program,
+	interner: &Interner,
+	locate: &(at: u32) => (String, u32, u32),
+): String = {
+	var dumper = Dumper(
+		program: &program,
+		interner: &interner,
+		locate: locate,
+		library: false,
+		out: String(),
+		depth: 0,
+	)
+	for def in program.consts {
+		if dumper.isOwn(def.module) then dumper.constDef(&def)
+	}
+	return move dumper.out
+}
+
+/// The expressions, statements and locals a tree of expressions is read
+/// from: a body's, or a default's, which has expressions alone.
+view struct Tree {
+	exprs: &Arena<Expr>
+	stmts: &Arena<Stmt>
+	locals: &Arena<Local>
+	body: Option<&Body>
+}
+
+view struct Dumper {
+	program: &Program
+	interner: &Interner
+	locate: &(at: u32) => (String, u32, u32)
+	/// The standard library's items are written too, as the program's own
+	/// are.
+	library: bool
+	out: String
+	depth: i64
+}
+
+fn pubWord(isPub: bool): str = if isPub then "pub " else ""
+
+/// ` order 1 0`, where an order is written.
+fn orderText(order: &[u32]): String = {
+	if order.isEmpty() then return String()
+	var parts: Vec<String> = Vec()
+	for n in order {
+		parts.push("\(n)")
+	}
+	return " order \(parts.join(" "))"
+}
+
+extend Dumper {
+	/// The indentation of a line at this depth.
+	fn indent(): String = {
+		var text = String()
+		for _ in 0..self.depth {
+			text.push("  ")
+		}
+		return move text
+	}
+
+	/// A line of an item, which says the file it is in.
+	var fn itemLine(text: str, span: Span) = {
+		val (file, l1, c1) = self.locate(span.lo)
+		val (_, l2, c2) = self.locate(span.hi)
+		self.out.push("\(self.indent())\(text)  @\(file):\(l1):\(c1)..\(l2):\(c2)\n")
+	}
+
+	/// A line of something inside an item, in the item's file.
+	var fn line(text: str, span: Span) = {
+		val (_, l1, c1) = self.locate(span.lo)
+		val (_, l2, c2) = self.locate(span.hi)
+		self.out.push("\(self.indent())\(text)  @\(l1):\(c1)..\(l2):\(c2)\n")
+	}
+
+	/// A line that is nowhere in particular: what a list holds.
+	var fn bare(text: str) = self.out.push("\(self.indent())\(text)\n")
+
+	fn name(symbol: Symbol): str = self.interner.resolve(symbol)
+
+	/// Whether a module's items are written whole: the program's, and the
+	/// standard library's where they are asked for.
+	fn isOwn(module: u32): bool = {
+		val path = &self.program.modules[module as i64]
+		return self.library || (path != "std" && !path.startsWith("std::"))
+	}
+
+	/// An integer's bits as the number they are in `ty`: with its sign, where
+	/// `ty` is a signed integer.
+	fn intText(value: u128, ty: Option<Ty>): String = {
+		if ty is .Some(t) && self.program.types.kind(t) is .Int(int) && int.signed() {
+			val shift = (128 - int.bits()) as u128
+			return "\((value << shift) as i128 >> shift as i128)"
+		}
+		return "\(value)"
+	}
+
+	fn ty(ty: Ty): String = self.program.symbolName(ty, self.interner)
+
+	fn args(args: TyList): String = self.program.symbolArgs(args, self.interner)
+
+	/// A function by its name: its module, the type it belongs to, its name,
+	/// an instance's type arguments, and where a lambda is, since every
+	/// lambda has the one name.
+	fn fnText(id: FnId): String = {
+		val def = &self.program.fns[id]
+		val (module, args) = match def.instanceOf {
+			.Some((generic, list)) => (self.program.fns[generic].module, list)
+			.None => (def.module, TyList::empty())
+		}
+		var name = "\(self.name(def.name))\(self.args(args))"
+		if self.program.ownerOfFn(id) is .Some(owner) then name = "\(self.ownerText(owner)).\(name)"
+		val path = &self.program.modules[module as i64]
+		if !path.isEmpty() then name = "\(path)::\(name)"
+		val lambda = match def.instanceOf {
+			.Some((generic, _)) => self.program.fns[generic].isLambda
+			.None => def.isLambda
+		}
+		if lambda {
+			val (_, line, col) = self.locate(def.span.lo)
+			name = "\(name)@\(line):\(col)"
+		}
+		return move name
+	}
+
+	fn ownerText(owner: TypeDef): String = self.program.ownerName(owner, self.interner)
+
+	fn interfaceText(
+		id: InterfaceId,
+		args: TyList,
+	): String = "\(self.name(self.program.interfaces[id].name))\(self.args(args))"
+
+	/// Type parameters, `<T: Eq + Hash, K = T, type Item>`.
+	fn generics(generics: &[GenericParamDef]): String = {
+		if generics.isEmpty() then return String()
+		var params: Vec<String> = Vec()
+		for g in generics {
+			params.push(self.generic(&g))
+		}
+		return "<\(params.join(", "))>"
+	}
+
+	fn generic(g: &GenericParamDef): String = {
+		var text = String()
+		if g.decided then text.push("type ")
+		text.push(self.name(g.name))
+		if g.written != g.name then text.push(" as \(self.name(g.written))".toStr())
+		var bounds: Vec<String> = Vec()
+		if g.copy then bounds.push(String::of("copy"))
+		for c in g.interfaces {
+			bounds.push(self.interfaceText(c.interfaceId, c.args))
+		}
+		if !bounds.isEmpty() then text.push(": \(bounds.join(" + "))".toStr())
+		match g.default {
+			.None => {}
+			.Pending => text.push(" = pending")
+			.Ty(ty) => text.push(" = \(self.ty(ty))".toStr())
+		}
+		return move text
+	}
+
+	var fn writeProgram() = {
+		val program = self.program
+		for (index, path) in program.modules.forwards().enumerate() {
+			if self.isOwn(index as u32) then self.bare("module \(quoted(&path, '"'))")
+		}
+		for def in program.structs {
+			if self.isOwn(def.module) then self.structDef(&def)
+		}
+		for def in program.enums {
+			if self.isOwn(def.module) then self.enumDef(&def)
+		}
+		for def in program.interfaces {
+			if self.isOwn(def.module) then self.interfaceDef(&def)
+		}
+		for def in program.impls {
+			if self.isOwn(def.module) then self.implDef(&def)
+		}
+		for def in program.opaques {
+			if self.isOwn(def.module) then
+				self.itemLine("\(pubWord(def.isPub))type \(self.name(def.name))", def.span)
+		}
+		for def in program.globals {
+			if self.isOwn(def.module) then self.global(&def)
+		}
+		for def in program.consts {
+			if self.isOwn(def.module) then self.constDef(&def)
+		}
+		for id in program.fns.ids() {
+			val def = &program.fns[id]
+			match def.instanceOf {
+				// An instance of the program's own generic function, whose body is
+				// the generic one's with the calls made concrete.
+				.Some((generic, _)) if self.isOwn(program.fns[generic].module) => self.fnDef(
+					id,
+					&def,
+				)
+				.Some(_) => self.bare("instance \(self.fnText(id))")
+				.None if self.isOwn(def.module) => self.fnDef(id, &def)
+				.None => {}
+			}
+		}
+		self.tables()
+	}
+
+	var fn structDef(def: &StructDef) = {
+		var text = "\(pubWord(def.isPub))struct \(self.name(def.name))\(self.generics(&def.generics))"
+		if def.isExtern then text.push(" extern")
+		if def.isUnion then text.push(" union")
+		if def.isOpaque then text.push(" opaque")
+		if def.isIntrinsic then text.push(" intrinsic")
+		if def.isEnv then text.push(" env")
+		if def.isView then text.push(" view")
+		if def.isTuple then text.push(" tuple")
+		if def.header is .Some(header) then
+			text.push(" header \(quoted(self.name(header), '"'))".toStr())
+		self.itemLine(&text, def.span)
+		self.depth += 1
+		for field in def.fields {
+			self.field(&field)
+		}
+		for (get, set) in def.accessors {
+			self.bare("accessors \(self.fnText(get)) \(self.fnText(set))")
+		}
+		if def.generator is .Some(generator) {
+			var line = "generator next \(self.fnText(generator.next)) yields \(self.ty(generator.elem))"
+			if generator.of is .Some(of) then line.push(" of \(self.fnText(of))".toStr())
+			self.bare(&line)
+		}
+		for method in def.methods {
+			self.bare("method \(self.fnText(method))")
+		}
+		self.depth -= 1
+	}
+
+	var fn field(field: &FieldDef) = {
+		val mutable = if field.isVar then "var " else ""
+		self.line(
+			"field \(pubWord(field.isPub))\(mutable)\(self.name(field.name)): \(self.ty(field.ty))",
+			field.span,
+		)
+		if field.default is .Some(default) {
+			self.depth += 1
+			self.defaultValue(&default)
+			self.depth -= 1
+		}
+	}
+
+	var fn defaultValue(default: &DefaultValue) = match default {
+		.Constant(exprs, root) => {
+			// A default has expressions alone.
+			val stmts: Arena<Stmt> = Arena()
+			val locals: Arena<Local> = Arena()
+			val tree = Tree(exprs: &exprs, stmts: &stmts, locals: &locals, body: .None)
+			self.bare("default")
+			self.depth += 1
+			self.expr(&tree, root)
+			self.depth -= 1
+		}
+		.Code(id) => self.bare("default code \(self.fnText(id))")
+	}
+
+	var fn enumDef(def: &EnumDef) = {
+		val view = if def.isView then " view" else ""
+		self.itemLine(
+			"\(pubWord(def.isPub))enum \(self.name(def.name))\(self.generics(&def.generics))\(view)",
+			def.span,
+		)
+		self.depth += 1
+		for variant in def.variants {
+			self.line("variant \(self.name(variant.name))", variant.span)
+			self.depth += 1
+			for field in variant.fields {
+				self.field(&field)
+			}
+			self.depth -= 1
+		}
+		for method in def.methods {
+			self.bare("method \(self.fnText(method))")
+		}
+		self.depth -= 1
+	}
+
+	var fn interfaceDef(def: &InterfaceDef) = {
+		self.itemLine(
+			"\(pubWord(def.isPub))interface \(self.name(def.name))\(self.generics(&def.generics))",
+			def.span,
+		)
+		self.depth += 1
+		for method in def.methods {
+			val withDefault = if method.hasDefault then " default" else ""
+			self.bare("method \(self.fnText(method.id))\(withDefault)")
+		}
+		for oneOf in def.oneOf {
+			var names: Vec<str> = Vec()
+			for (n, _) in oneOf.names {
+				names.push(self.name(n))
+			}
+			self.line("one of \(names.join(", "))", oneOf.span)
+		}
+		for extension in def.extensions {
+			self.bare("extension \(self.fnText(extension))")
+		}
+		self.depth -= 1
+	}
+
+	var fn implDef(def: &ImplDef) = {
+		self.itemLine(
+			"impl \(self.interfaceText(def.interfaceId, def.args)) for \(self.ownerText(def.ty))\(self.generics(&def.conditions))",
+			def.span,
+		)
+		self.depth += 1
+		for method in def.methods {
+			self.bare("method \(self.fnText(method))")
+		}
+		self.depth -= 1
+	}
+
+	var fn global(def: &GlobalDef) = {
+		val keyword = if def.isMut then "var" else "val"
+		var text = "\(pubWord(def.isPub))extern \(keyword) \(self.name(def.name)): \(self.ty(def.ty))"
+		if def.symbol is .Some(symbol) then
+			text.push(" symbol \(quoted(self.name(symbol), '"'))".toStr())
+		if def.header is .Some(header) then
+			text.push(" header \(quoted(self.name(header), '"'))".toStr())
+		text.push(" get \(self.fnText(def.getter))".toStr())
+		if def.setter is .Some(setter) then text.push(" set \(self.fnText(setter))".toStr())
+		self.itemLine(&text, def.span)
+	}
+
+	var fn constDef(def: &ConstDef) = {
+		var text = "\(pubWord(def.isPub))val \(self.name(def.name)): \(self.ty(def.ty))"
+		match def.value {
+			.Some(value) => text.push(" = \(self.constValue(&value, .Some(def.ty)))".toStr())
+			.None => text.push(" = unknown")
+		}
+		if def.code is .Some(code) then text.push(" code \(self.fnText(code))".toStr())
+		self.itemLine(&text, def.span)
+	}
+
+	/// Constants, each of its type where it is known, joined.
+	fn constList(values: &[ConstValue], tys: &[Option<Ty>]): String = {
+		var parts: Vec<String> = Vec()
+		for (i, v) in values.forwards().enumerate() {
+			val ty: Option<Ty> = if i < tys.len() then tys[i] else .None
+			parts.push(self.constValue(&v, ty))
+		}
+		return parts.join(", ")
+	}
+
+	/// A constant's value, of `ty` where it is known, so that a number is
+	/// written with its sign.
+	fn constValue(value: &ConstValue, ty: Option<Ty>): String = match value {
+		.Int(n) => self.intText(n, ty)
+		.Float(f) => "\(f)"
+		.Bool(b) => "\(b)"
+		.Str(s) => quoted(self.name(s), '"')
+		.Array(values) => {
+			val elem: Option<Ty> = match ty {
+				.Some(t) => self.elementOf(t)
+				.None => .None
+			}
+			var tys: Vec<Option<Ty>> = Vec()
+			for _ in 0..values.len() {
+				tys.push(elem)
+			}
+			"[\(self.constList(&values, &tys))]"
+		}
+		.Struct(values) => {
+			var tys: Vec<Option<Ty>> = Vec()
+			if ty is .Some(t) && self.program.types.kind(t) is .Struct(id, args) then
+				tys = self.fieldTys(&self.program.structs[id].fields, args)
+			"{\(self.constList(&values, &tys))}"
+		}
+		.Variant(variant, fields) => {
+			if ty is .Some(t) && self.program.types.kind(t) is .Enum(id, args) {
+				val v = &self.program.enums[id].variants[variant as i64]
+				val tys = self.fieldTys(&v.fields, args)
+				return ".\(self.name(v.name))(\(self.constList(&fields, &tys)))"
+			}
+			val none: [Option<Ty>; 0] = []
+			"#\(variant)(\(self.constList(&fields, &none)))"
+		}
+		.Bytes(bytes, ..) => "bytes \(bytes.len())"
+	}
+
+	/// The types of fields, in a struct or a variant with `args`.
+	fn fieldTys(fields: &[FieldDef], args: TyList): Vec<Option<Ty>> = {
+		val types = &self.program.types
+		var tys: Vec<Option<Ty>> = Vec()
+		for f in fields {
+			tys.push(types.trySubstFind(f.ty, &types.list(args)))
+		}
+		return move tys
+	}
+
+	var fn fnDef(id: FnId, def: &FnDef) = {
+		val program = self.program
+		val keyword = match def.receiver {
+			.Some(receiver) => receiver.text()
+			.None => "fn"
+		}
+		var text = "\(pubWord(def.isPub))\(keyword) \(self.fnText(id))\(self.generics(&def.generics))"
+		var params: Vec<String> = Vec()
+		for p in def.params {
+			params.push("\(self.name(p.name)): \(self.ty(p.ty))")
+		}
+		text.push("(\(params.join(", "))): \(self.ty(def.ret))".toStr())
+		if def.lendsFrom is .Some(lends) {
+			var named: Vec<String> = Vec()
+			for from in lends {
+				named.push(
+					match from {
+						.Param(i) => "param \(i)"
+						.Borrowed(i) => "borrowed \(i)"
+					},
+				)
+			}
+			text.push(" from \(named.join(", "))".toStr())
+		}
+		if !def.keeps.isEmpty() {
+			var kept: Vec<String> = Vec()
+			for k in def.keeps {
+				kept.push("\(k)")
+			}
+			text.push(" keeps \(kept.join(", "))".toStr())
+		}
+		if def.interfaceId is .Some(interfaceId) then
+			text.push(" of \(self.name(program.interfaces[interfaceId].name))".toStr())
+		if def.isExtern then text.push(" extern")
+		if def.exportsC then text.push(" export")
+		if def.isVariadic then text.push(" variadic")
+		if def.isLambda then text.push(" lambda")
+		if def.isTailrec then text.push(" tailrec")
+		if def.isInline then text.push(" inline")
+		if def.isTest then text.push(" test")
+		if def.compileTime then text.push(" compile-time")
+		if program.derived.contains(&id) then text.push(" derived")
+		if program.lentHalves.contains(&id) then text.push(" lent-half")
+		if program.fnValues.contains(&id) then text.push(" value")
+		if def.header is .Some(header) then
+			text.push(" header \(quoted(self.name(header), '"'))".toStr())
+		if def.symbol is .Some(symbol) then
+			text.push(" symbol \(quoted(self.name(symbol), '"'))".toStr())
+		match def.accesses {
+			.Some(.Global(global)) => text.push(
+				" accesses \(self.name(program.globals[global].name))".toStr(),
+			)
+			.Some(.Field(id: owner, index)) => {
+				val sdef = &program.structs[owner]
+				text.push(
+					" accesses \(self.name(sdef.name)).\(self.name(sdef.fields[index as i64].name))".toStr(),
+				)
+			}
+			.None => {}
+		}
+		if def.variadicOf is .Some(of) then text.push(" variadic-of \(self.fnText(of))".toStr())
+		if def.generator is .Some(generator) then
+			text.push(" next-of \(self.name(program.structs[generator].name))".toStr())
+		// Each is a name alone, which its text writes as the variant it is,
+		// `.FromIndex`.
+		if def.generated is .Some(generated) then
+			text.push(" generated \("\(generated)".toStr().trimStartMatches("."))".toStr())
+		if def.intrinsic is .Some(intrinsic) then
+			text.push(" intrinsic \("\(intrinsic)".toStr().trimStartMatches("."))".toStr())
+		match def.projects {
+			.Some(.Param(i)) => text.push(" projects param \(i)".toStr())
+			.Some(.Tables) => text.push(" projects tables")
+			.None => {}
+		}
+		self.itemLine(&text, def.span)
+		self.depth += 1
+		for param in def.params {
+			if param.default is .Some(default) {
+				self.line("param \(self.name(param.name))", param.span)
+				self.depth += 1
+				self.defaultValue(&default)
+				self.depth -= 1
+			}
+		}
+		if def.body is .Some(body) then self.body(&body)
+		self.depth -= 1
+	}
+
+	var fn body(body: &Body) = {
+		val tree = Tree(
+			exprs: &body.exprs,
+			stmts: &body.stmts,
+			locals: &body.locals,
+			body: .Some(&body),
+		)
+		for id in body.locals.ids() {
+			val local = &body.locals[id]
+			val kind = match local.kind {
+				.Param => "param"
+				.Let(..) => "val"
+				.Var => "var"
+				.Binding => "binding"
+			}
+			var text = "\(kind) \(self.localText(&tree, id)): \(self.ty(local.ty))"
+			if body.aliasBindings.contains(&id) then text.push(" alias")
+			if body.copiedBindings.contains(&id) then text.push(" copied")
+			if body.aliases.get(&id) is .Some(of) {
+				val (_, line, col) = self.locate(body.exprs[of].span.lo)
+				text.push(" aliases \(line):\(col)".toStr())
+			}
+			self.line(&text, local.span)
+		}
+		if body.value is .Some(value) {
+			self.bare("value")
+			self.depth += 1
+			self.expr(&tree, value)
+			self.depth -= 1
+		}
+	}
+
+	fn localText(
+		tree: &Tree,
+		id: LocalId,
+	): String = "\(self.name(tree.locals[id].name))#\(id.index())"
+
+	var fn block(tree: &Tree, role: str, block: &Block) = {
+		self.line("\(role)block", block.span)
+		self.depth += 1
+		for stmt in block.stmts {
+			self.stmt(&tree, stmt)
+		}
+		if block.value is .Some(value) {
+			self.bare("value")
+			self.depth += 1
+			self.expr(&tree, value)
+			self.depth -= 1
+		}
+		self.depth -= 1
+	}
+
+	var fn stmt(tree: &Tree, id: StmtId) = {
+		val stmt = &tree.stmts[id]
+		val span = stmt.span
+		match stmt.kind {
+			.Let(local, init) => {
+				self.line("let \(self.localText(&tree, local))", span)
+				self.depth += 1
+				self.expr(&tree, init)
+				self.depth -= 1
+			}
+			.Guard(scrutinee, pattern, elseBlock) => {
+				self.line("guard", span)
+				self.depth += 1
+				self.expr(&tree, scrutinee)
+				self.pattern(&tree, &pattern, .Some(tree.exprs[scrutinee].ty))
+				if elseBlock is .Some(block) then self.block(&tree, "else ", &block)
+				self.depth -= 1
+			}
+			.Defer(e) => {
+				self.line("defer", span)
+				self.depth += 1
+				self.expr(&tree, e)
+				self.depth -= 1
+			}
+			.Return(value) => {
+				self.line("return", span)
+				if value is .Some(v) {
+					self.depth += 1
+					self.expr(&tree, v)
+					self.depth -= 1
+				}
+			}
+			.While(cond, body) => {
+				self.line("while", span)
+				self.depth += 1
+				self.expr(&tree, cond)
+				self.block(&tree, "", &body)
+				self.depth -= 1
+			}
+			.ForElements(binding, elements, body) => {
+				self.line("for elements", span)
+				self.depth += 1
+				val elem = self.elementOf(tree.exprs[elements].ty)
+				self.pattern(&tree, &binding, elem)
+				self.expr(&tree, elements)
+				self.block(&tree, "", &body)
+				self.depth -= 1
+			}
+			.ForRange(binding, lo, hi, inclusive, body) => {
+				var text = String::of(if inclusive then "for range inclusive" else "for range")
+				if binding is .Some(local) then
+					text.push(" \(self.localText(&tree, local))".toStr())
+				self.line(&text, span)
+				self.depth += 1
+				self.expr(&tree, lo)
+				self.expr(&tree, hi)
+				self.block(&tree, "", &body)
+				self.depth -= 1
+			}
+			.Break(depth) => self.line("break \(depth)", span)
+			.Continue(depth) => self.line("continue \(depth)", span)
+			.Expr(e) => {
+				self.line("expr", span)
+				self.depth += 1
+				self.expr(&tree, e)
+				self.depth -= 1
+			}
+			.Yield(e) => {
+				self.line("yield", span)
+				self.depth += 1
+				self.expr(&tree, e)
+				self.depth -= 1
+			}
+		}
+	}
+
+	/// The type of what a `for` walks: an array's, a slice's, through a
+	/// reference or an `own`, where it is one of those.
+	fn elementOf(ty: Ty): Option<Ty> = match self.program.types.kind(ty) {
+		.Array(elem, ..) | .Slice(elem) => .Some(elem)
+		.Ref(inner, ..) | .Own(inner) => self.elementOf(inner)
+		_ => .None
+	}
+
+	/// What an expression is, without what is inside it.
+	fn exprKind(tree: &Tree, expr: &Expr): String = {
+		val program = self.program
+		return match expr.kind {
+			.Int(n) => "int \(self.intText(n, .Some(expr.ty)))"
+			.Float(f) => "float \(f)"
+			.Bool(b) => "bool \(b)"
+			.Str(s) => "str \(quoted(self.name(s), '"'))"
+			.Table(id) => "table \(self.name(program.consts[id].name))"
+			.Null => String::of("null")
+			.Zeroed => String::of("zeroed")
+			.IsNull(..) => String::of("is-null")
+			.StrCmp(..) => String::of("str-compare")
+			.CstrToStr(..) => String::of("cstring-to-str")
+			.Local(local) => "local \(self.localText(&tree, local))"
+			.Lend(..) => String::of("lend")
+			.FnRef(id, typeArgs) => "fn \(self.fnText(id))\(self.args(typeArgs))"
+			.CallValue(..) => String::of("call-value")
+			.Call(callee, typeArgs, order, ..) =>
+				"call \(self.fnText(callee))\(self.args(typeArgs))\(orderText(&order))"
+			.Unary(op, ..) => match op {
+				.Neg => String::of("unary -")
+				.Not => String::of("unary !")
+			}
+			.Binary(op, wrapping, ..) => "binary \(op.text())\(if wrapping then "%" else "")"
+			.Cast(..) => String::of("cast")
+			.VariantIndex(..) => String::of("variant-index")
+			.Len(..) => String::of("len")
+			.Block(..) => String::of("block")
+			.If(..) => String::of("if")
+			.Assign(op, wrapping, ..) => match op {
+				.Some(o) => "assign \(o.text())\(if wrapping then "%" else "")="
+				.None => String::of("assign =")
+			}
+			.Field(base, index) => match program.types.kind(tree.exprs[base].ty) {
+				.Struct(id: sid, ..) =>
+					"field \(index) \(self.name(program.structs[sid].fields[index as i64].name))"
+				_ => "field \(index)"
+			}
+			.Index(..) => String::of("index")
+			.SubSlice(lo, hi, ..) =>
+				"subslice\(if lo.isSome() then " lo" else "")\(if hi.isSome() then " hi" else "")"
+			.Deref(..) => String::of("deref")
+			.Ref(..) => String::of("ref")
+			.Undropped(..) => String::of("undropped")
+			.Move(..) => String::of("move")
+			.Own(..) => String::of("own")
+			.Union(id, field) => {
+				val def = &program.structs[id]
+				match field {
+					.Some((index, _)) =>
+						"union \(self.name(def.name)) field \(self.name(def.fields[index as i64].name))"
+					.None => "union \(self.name(def.name))"
+				}
+			}
+			.Struct(id, order, ..) =>
+				"struct \(self.name(program.structs[id].name))\(orderText(&order))"
+			.Variant(id, variant, order, ..) => {
+				val def = &program.enums[id]
+				"variant \(self.name(def.name)).\(self.name(def.variants[variant as i64].name))\(orderText(&order))"
+			}
+			.Array(..) => String::of("array")
+			.ArrayRepeat(count, ..) => "array-repeat \(count)"
+			.OwnRepeat(..) => String::of("own-repeat")
+			.Unsize(..) => String::of("unsize")
+			.DynRef(interfaceId, ..) => "dyn \(self.name(program.interfaces[interfaceId].name))"
+			.Closure(id, ..) => "closure \(self.fnText(id))"
+			.DropRef(ty) => "drop-ref \(self.ty(ty))"
+			.LendClosure(..) => String::of("lend-closure")
+			.CallClosure(codeTy, ..) => "call-closure \(self.ty(codeTy))"
+			.DynCall(interfaceId, index, fnTy, order, ..) => {
+				val def = &program.interfaces[interfaceId]
+				"dyn-call \(self.fnText(def.methods[index as i64].id)) \(self.ty(fnTy))\(orderText(&order))"
+			}
+			.Panic(message, ..) => match message {
+				.Some(m) => "panic \(quoted(self.name(m), '"'))"
+				.None => String::of("panic")
+			}
+			.Is(..) => String::of("is")
+			.Match(..) => String::of("match")
+			.Places(..) => String::of("places")
+			.Error => String::of("error")
+		}
+	}
+
+	var fn expr(tree: &Tree, id: ExprId) = {
+		val expr = &tree.exprs[id]
+		var text = "\(self.exprKind(&tree, &expr)): \(self.ty(expr.ty))"
+		if tree.body is .Some(body) {
+			if body.sequenceWalks.contains(&id) then text.push(" walk")
+			if body.tailCalls.contains(&id) then text.push(" tail")
+		}
+		self.line(&text, expr.span)
+		self.depth += 1
+		match expr.kind {
+			.Block(block) => {
+				for stmt in block.stmts {
+					self.stmt(&tree, stmt)
+				}
+				if block.value is .Some(value) {
+					self.bare("value")
+					self.depth += 1
+					self.expr(&tree, value)
+					self.depth -= 1
+				}
+			}
+			.If(cond, thenBlock, elseBlock) => {
+				self.expr(&tree, cond)
+				self.block(&tree, "then ", &thenBlock)
+				if elseBlock is .Some(block) then self.block(&tree, "else ", &block)
+			}
+			.Is(scrutinee, pattern) => {
+				self.expr(&tree, scrutinee)
+				self.pattern(&tree, &pattern, .Some(tree.exprs[scrutinee].ty))
+			}
+			.Match(scrutinee, arms) => {
+				self.expr(&tree, scrutinee)
+				val ty = tree.exprs[scrutinee].ty
+				for arm in arms {
+					self.line("arm", arm.span)
+					self.depth += 1
+					self.pattern(&tree, &arm.pattern, .Some(ty))
+					if arm.guard is .Some(guard) {
+						self.bare("guard")
+						self.depth += 1
+						self.expr(&tree, guard)
+						self.depth -= 1
+					}
+					self.expr(&tree, arm.body)
+					self.depth -= 1
+				}
+			}
+			kind => {
+				for child in kind.children() {
+					self.expr(&tree, child)
+				}
+			}
+		}
+		self.depth -= 1
+	}
+
+	/// A pattern, tested against a value of `ty` where that is known, so
+	/// that a variant and a field are named.
+	var fn pattern(tree: &Tree, pattern: &Pattern, ty: Option<Ty>) = {
+		val program = self.program
+		val kind: Option<TyKind> = match ty {
+			.Some(t) => .Some(program.types.kind(t))
+			.None => .None
+		}
+		match pattern {
+			.Wildcard => self.bare("pattern _")
+			.Binding(local) => self.bare("pattern bind \(self.localText(&tree, local))")
+			.Variant(variant, binders) => {
+				var name = "#\(variant)"
+				var fields: Vec<Option<Ty>> = Vec()
+				if kind is .Some(.Enum(id, args)) {
+					val def = &program.enums[id]
+					val v = &def.variants[variant as i64]
+					fields = self.fieldTys(&v.fields, args)
+					name = "\(self.name(def.name)).\(self.name(v.name))"
+				}
+				self.bare("pattern variant \(name)")
+				self.depth += 1
+				self.binders(&tree, &binders, &fields)
+				self.depth -= 1
+			}
+			.Fields(binders) => {
+				var fields: Vec<Option<Ty>> = Vec()
+				if kind is .Some(.Struct(id, args)) then
+					fields = self.fieldTys(&program.structs[id].fields, args)
+				self.bare("pattern fields")
+				self.depth += 1
+				self.binders(&tree, &binders, &fields)
+				self.depth -= 1
+			}
+			.Int(n) => self.bare("pattern int \(self.intText(n, ty))")
+			.Bool(b) => self.bare("pattern bool \(b)")
+			.Str(s) => self.bare("pattern str \(quoted(self.name(s), '"'))")
+			.Range(lo, hi) => {
+				val low = match lo {
+					.Some(n) => self.intText(n, ty)
+					.None => String()
+				}
+				val high = match hi {
+					.Some(n) => self.intText(n, ty)
+					.None => String()
+				}
+				self.bare("pattern range \(low)..=\(high)")
+			}
+			.Any(alternatives, binding) => {
+				match binding {
+					.Some(n) => self.bare("pattern any binding \(n)")
+					.None => self.bare("pattern any")
+				}
+				self.depth += 1
+				for alternative in alternatives {
+					self.pattern(&tree, &alternative, ty)
+				}
+				self.depth -= 1
+			}
+			.Slice(prefix, rest, suffix) => {
+				val elem: Option<Ty> = match ty {
+					.Some(t) => self.elementOf(t)
+					.None => .None
+				}
+				val restText = match rest {
+					.None => String()
+					.Some(.Ignored) => String::of(" rest")
+					.Some(.Bind(local)) => " rest \(self.localText(&tree, local))"
+				}
+				self.bare("pattern slice\(restText)")
+				self.depth += 1
+				var prefixTys: Vec<Option<Ty>> = Vec()
+				for _ in 0..prefix.len() {
+					prefixTys.push(elem)
+				}
+				self.binders(&tree, &prefix, &prefixTys)
+				if !suffix.isEmpty() {
+					self.bare("suffix")
+					var suffixTys: Vec<Option<Ty>> = Vec()
+					for _ in 0..suffix.len() {
+						suffixTys.push(elem)
+					}
+					self.depth += 1
+					self.binders(&tree, &suffix, &suffixTys)
+					self.depth -= 1
+				}
+				self.depth -= 1
+			}
+			.Deref(inner) => {
+				val innerTy: Option<Ty> = match kind {
+					.Some(.Ref(inner: t, ..)) | .Some(.Own(inner: t)) => .Some(t)
+					_ => .None
+				}
+				self.bare("pattern deref")
+				self.depth += 1
+				self.pattern(&tree, &inner, innerTy)
+				self.depth -= 1
+			}
+			.Error => self.bare("pattern error")
+		}
+	}
+
+	var fn binders(tree: &Tree, binders: &[Binder], tys: &[Option<Ty>]) = {
+		for (i, binder) in binders.forwards().enumerate() {
+			val ty: Option<Ty> = if i < tys.len() then tys[i] else .None
+			match binder {
+				.Ignored => self.bare("\(i): _")
+				.Bind(local) => self.bare("\(i): bind \(self.localText(&tree, local))")
+				.Nested(pattern) => {
+					self.bare("\(i):")
+					self.depth += 1
+					self.pattern(&tree, &pattern, ty)
+					self.depth -= 1
+				}
+			}
+		}
+	}
+
+	/// What the program made for itself beyond its items: the tables of
+	/// methods, the functions that drop each type and run each generator,
+	/// what is used as a value, and what C is given.
+	var fn tables() = {
+		val program = self.program
+		for vtable in program.vtables {
+			var methods: Vec<String> = Vec()
+			for m in vtable.methods {
+				methods.push(self.fnText(m))
+			}
+			self.bare("vtable \(self.interfaceText(vtable.interfaceId, TyList::empty())) for \(self.ty(vtable.ty)): \(methods.join(", "))")
+		}
+		var drops: Vec<String> = Vec()
+		for i in 0..program.dropFns.len() {
+			drops.push("drop \(self.ty(program.dropFns.keyAt(i).clone())) = \(self.fnText(program.dropFns.valueAt(i).clone()))")
+		}
+		drops.sort()
+		var nexts: Vec<String> = Vec()
+		for i in 0..program.generatorNext.len() {
+			nexts.push("next \(self.ty(program.generatorNext.keyAt(i).clone())) = \(self.fnText(program.generatorNext.valueAt(i).clone()))")
+		}
+		nexts.sort()
+		for line in drops {
+			self.bare(&line)
+		}
+		for line in nexts {
+			self.bare(&line)
+		}
+		for id in program.asserts {
+			if self.isOwn(program.fns[id].module) then self.bare("assert \(self.fnText(id))")
+		}
+		if program.entryReport is .Some(entry) then self.bare("entry-report \(self.fnText(entry))")
+		for library in program.libraries {
+			self.bare("link \(quoted(&library, '"'))")
+		}
+		for framework in program.frameworks {
+			self.bare("framework \(quoted(&framework, '"'))")
+		}
+		for (module, text) in program.cIncludes {
+			self.bare("include \(quoted(&program.modules[module], '"')) \(quoted(&text, '"'))")
+		}
+		for (module, text) in program.cPrefix {
+			self.bare("prefix \(quoted(&program.modules[module], '"')) \(quoted(&text, '"'))")
+		}
+		for (module, text) in program.cDefines {
+			self.bare("define \(quoted(&program.modules[module], '"')) \(quoted(&text, '"'))")
+		}
+		for (module, path, language) in program.cSources {
+			var line = "source \(quoted(&program.modules[module], '"')) \(quoted(&path, '"'))"
+			match language {
+				.Some(.C) => line.push(" c")
+				.Some(.ObjectiveC) => line.push(" objective-c")
+				.None => {}
+			}
+			self.bare(&line)
+		}
+	}
+}

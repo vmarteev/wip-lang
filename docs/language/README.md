@@ -33,9 +33,9 @@ holds today is written down, not how it came to be.
 ## The examples are compiled
 
 Every Wip example on these pages — and in the repository's
-[README](../../README.md) — is a program the compiler is run against by
-`crates/wip-lang/tests/reference.rs`, so an example cannot quietly stop
-being true. The fence says what is expected:
+[README](../../README.md) — is a program the compiler is run against by the
+repository's gate, `tests/gate`, so an example cannot quietly stop being
+true. The fence says what is expected:
 
 - **`wip`** — it compiles. A block that declares no items is read as the
   body of a `main`, so an example can be a few statements.

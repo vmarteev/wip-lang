@@ -1,0 +1,490 @@
+// The mid-level IR.
+//
+// A function body becomes a control-flow graph: typed locals, and blocks of
+// statements that each end in a terminator. Everything the typed IR leaves
+// implicit is explicit here: evaluation order, drops, `defer`, temporaries,
+// moves and bounds checks. A backend translates the statements one by one,
+// and never decides when anything is dropped.
+
+import hir::{
+	BOOL,
+	CSTRING,
+	ConstId,
+	FnId,
+	I64,
+	InterfaceId,
+	PTR_U8,
+	Program,
+	Ty,
+	TyKind,
+	U8,
+	UnaryOp
+}
+import syntax::{BinaryOp, Span, Symbol}
+
+/// A local of a body: a parameter, a variable, a temporary or the result.
+@derive(Eq, Ord, Hash, Clone, Text)
+pub struct Local {
+	pub index: u32
+}
+
+extend Local {
+	/// The local numbered `index`.
+	pub static fn of(index: u32): Local = Local(index: index)
+}
+
+/// A block of a body. Block 0 is the entry, and nothing jumps to it.
+@derive(Eq, Ord, Hash, Clone, Text)
+pub struct BlockId {
+	pub index: u32
+}
+
+@derive(Clone)
+pub struct Body {
+	pub var locals: Vec<LocalDecl>
+	/// One local per parameter, in order.
+	pub var params: Vec<Local>
+	/// The result, or nothing for a body that returns nothing. For an
+	/// aggregate result, a backend makes this local the memory the caller
+	/// supplied.
+	pub var ret: Option<Local>
+	pub var blocks: Vec<Block>
+}
+
+extend Body {
+	pub fn local(local: Local): &LocalDecl = lend self.locals[local.index as i64]
+
+	pub fn block(block: BlockId): &Block = lend self.blocks[block.index as i64]
+}
+
+@derive(Clone)
+pub struct LocalDecl {
+	pub var ty: Ty
+	pub var kind: LocalKind
+	/// The variable or parameter of the source it is, if it is one.
+	pub var source: Option<Source>
+}
+
+/// A variable or parameter as the source has it, for a debugger to show.
+@derive(Clone)
+pub struct Source {
+	pub name: Symbol
+	/// The name where it is declared.
+	pub at: Span
+	/// Where the code that can see it ends: its block's, its `match` arm's or
+	/// its loop's end.
+	pub seenUntil: u32
+	/// Whether the local holds the address of what the name stands for, as a
+	/// binding that aliases the value it matched does.
+	pub byAddress: bool
+}
+
+extend LocalDecl {
+	/// A local the source does not name.
+	pub static fn unnamed(ty: Ty, kind: LocalKind): LocalDecl = LocalDecl(
+		ty: ty,
+		kind: kind,
+		source: .None,
+	)
+}
+
+@derive(Eq, Clone, Text)
+pub enum LocalKind {
+	Param
+	/// A variable of the source, including a `match` binding.
+	Var
+	Temp
+	Return
+}
+
+@derive(Clone)
+pub struct Block {
+	pub var statements: Vec<Statement>
+	pub var terminator: Terminator
+}
+
+/// A location: a local, and a path of projections into it.
+@derive(Eq, Clone)
+pub struct Place {
+	pub var local: Local
+	pub var projections: Vec<Projection>
+}
+
+extend Place {
+	pub static fn of(local: Local): Place = Place(local: local, projections: Vec())
+
+	/// This place, followed by `projection`.
+	pub fn project(projection: Projection): Place = {
+		var place = self.clone()
+		place.projections.push(projection)
+		return move place
+	}
+}
+
+@derive(Eq, Hash, Clone, Text)
+pub enum Projection {
+	/// Through an `own<T>`, `&T` or `&var T`.
+	Deref
+	/// A struct field. On a `str`, a slice, a reference to a slice or a
+	/// buffer, 0 is the pointer to the first byte or element and 1 is the
+	/// length.
+	Field(index: u32)
+	/// A field of an enum's payload.
+	VariantField(variant: u32, field: u32)
+	/// The element whose index a local holds. Not checked: a `Check` before
+	/// it compares the index with the length.
+	Index(local: Local)
+	/// The element at a constant index.
+	ConstIndex(index: u64)
+}
+
+@derive(Eq, Clone)
+pub enum Operand {
+	/// The value a place holds. An aggregate operand is passed by address.
+	Copy(place: Place)
+	Const(value: Const)
+}
+
+@derive(Eq, Clone)
+pub enum Const {
+	/// The bits of an integer, truncated to its type; a pointer's null is `0`
+	/// with the pointer's type.
+	Int(bits: u128, ty: Ty)
+	Float(value: f64, ty: Ty)
+	Bool(value: bool)
+	/// The address of a string's NUL-terminated bytes.
+	CStr(symbol: Symbol)
+	/// The address of a constant table, which the program keeps once, in
+	/// read-only data; `ty` is the `&T` it is.
+	Table(id: ConstId, ty: Ty)
+	/// The address of a function, of the function type `ty`.
+	Fn(id: FnId, ty: Ty)
+	/// The address of a type's table of methods for an interface, which a
+	/// `&dyn` carries beside the value.
+	VTable(interfaceId: InterfaceId, ty: Ty)
+	/// The address of the drop function of `own<ty>`, which an owned closure's
+	/// environment carries so that the closure can be dropped without knowing
+	/// which lambda made it.
+	DropFn(ty: Ty)
+	/// The address of the block of zeroed words the program has once, where
+	/// the runtime written in Wip keeps its counters.
+	RuntimeWords
+	/// The address of the list of the modules' tables of functions and lines,
+	/// which the prelude's object holds.
+	FrameTables
+	/// The size of `of` as C's `sizeof` answers it — the distance between two
+	/// in an array — and its alignment, as an integer of type `ty`; the
+	/// layout decides both, when the program is laid out.
+	SizeOf(of: Ty, ty: Ty)
+	AlignOf(of: Ty, ty: Ty)
+}
+
+/// What a call calls.
+@derive(Eq, Clone)
+pub enum Callee {
+	Fn(id: FnId)
+	/// The runtime's comparison of two strings' bytes.
+	StrCmp
+	/// A value of a function type.
+	Value(operand: Operand)
+}
+
+@derive(Eq, Clone)
+pub enum Rvalue {
+	Use(operand: Operand)
+	Unary(op: UnaryOp, operand: Operand)
+	/// Never `&&` or `||`, which are branches.
+	Binary(op: BinaryOp, lhs: Operand, rhs: Operand)
+	Cast(operand: Operand, ty: Ty)
+	AddressOf(place: Place)
+	/// Which variant the enum at a place holds, as an `i32`.
+	Variant(place: Place)
+	/// The length of a C string: the bytes before its NUL, found by walking
+	/// it.
+	CstrLen(operand: Operand)
+	/// A float operation the machine does exactly.
+	Float(op: FloatOp, operand: Operand)
+	/// The first times the second, plus the third, rounded once: IEEE 754's
+	/// fused multiply-add.
+	MulAdd(first: Operand, second: Operand, third: Operand)
+	/// What the machine counts or reorders of an integer's bits. The answer
+	/// is the operand's type.
+	Integer(op: IntegerOp, operand: Operand)
+	/// An integer's bits turned by an amount of its own type, taken modulo
+	/// its width.
+	Rotate(turn: Turn, lhs: Operand, rhs: Operand)
+	/// Whether `lhs op rhs` — `+`, `-` or `*` on integers of up to 64 bits,
+	/// signed by their type — does not fit that type: a `bool`, from the
+	/// instruction a checked `+` uses, which panics on it instead.
+	Overflows(op: BinaryOp, lhs: Operand, rhs: Operand)
+	/// A scalar's bits, as the type of the place it is assigned: a float's as
+	/// the unsigned integer of its width, and back.
+	Bits(operand: Operand)
+	/// The function address at `index` of a table of function addresses: a
+	/// type's methods for an interface, or the header of an owned closure's
+	/// environment, whose first word is its drop function.
+	VTableFn(table: Operand, index: u32, methods: bool)
+	/// A type's table of methods, which is constant and never freed,
+	/// where an environment's header is memory freed and used again.
+}
+
+/// What `Rvalue::Float` does: each exact, so every machine and the compiler
+/// give one answer.
+@derive(Eq, Clone, Text)
+pub enum FloatOp {
+	/// The square root, correctly rounded, as IEEE 754 has it.
+	Sqrt
+	Floor
+	Ceil
+	Trunc
+}
+
+/// What `Rvalue::Integer` does to an integer's bits.
+@derive(Eq, Clone, Text)
+pub enum IntegerOp {
+	/// How many bits are one.
+	CountOnes
+	/// How many zeros come before the highest one bit: the width, for 0.
+	LeadingZeros
+	/// How many zeros come after the lowest one bit: the width, for 0.
+	TrailingZeros
+	/// The bytes in the other order.
+	SwapBytes
+	/// The bits in the other order.
+	ReverseBits
+}
+
+/// Which way `Rvalue::Rotate` turns the bits.
+@derive(Eq, Clone, Text)
+pub enum Turn {
+	Left
+	Right
+}
+
+@derive(Eq, Clone)
+pub enum Statement {
+	Assign(place: Place, rvalue: Rvalue)
+	/// Writes the enum's tag, or the null that stands for the empty variant
+	/// of a niche. The fields are assigned separately.
+	SetVariant(place: Place, variant: u32)
+	/// Fills a place with zeros: what a move out of it leaves behind.
+	Zero(place: Place)
+	/// Fills a place with a pattern no value holds: what a move out of it
+	/// leaves behind, in place of zeros, in a build that checks moves, for a
+	/// type whose `destroy` would run on zeros.
+	Poison(place: Place)
+	/// Panics where the place holds what `Statement::Poison` left: a value
+	/// about to be dropped after it was moved away.
+	CheckMoved(place: Place, at: Span)
+	Call(callee: Callee, args: Vec<Operand>, dest: Option<Place>)
+	/// Heap memory for one value of `ty`; its address goes to `dest`.
+	Alloc(dest: Place, ty: Ty)
+	/// Heap memory for `count` elements of type `elem`, which must not be
+	/// negative. The pointer and `count` go to `dest`, an `own<[elem]>`. The
+	/// program stops if the size in bytes does not fit in an `i64`.
+	AllocBuffer(dest: Place, elem: Ty, count: Operand)
+	Free(operand: Operand)
+	/// Calls the drop function of an `own<ty>` with a pointer, which may be
+	/// null (`lowerDropFn`).
+	DropFn(ty: Ty, ptr: Operand)
+	/// Drops the value of `ty` at `place` where it lies, by calling the
+	/// function that does, given its address, and frees nothing
+	/// (`lowerDropInPlaceFn`): a buffer's element, which may hold a buffer of
+	/// its own type, and in a debug build any struct, enum or array, whose
+	/// drop is then written once. It reads the place and writes it, as the
+	/// drop zeroes what it owned.
+	DropInPlace(ty: Ty, place: Place)
+	/// `dest = lhs op rhs` for `+`, `-` and `*` on integers, which panics if
+	/// the answer does not fit. It is one statement because the answer and
+	/// whether it fits come from one instruction.
+	Arith(dest: Place, op: BinaryOp, lhs: Operand, rhs: Operand, at: Span)
+	/// A value of `ty` — `bool` or an integer of up to 64 bits — at
+	/// `address`, read, written or changed as one step that no other thread
+	/// sees half of, sequentially consistent: what the runtime's counters, a
+	/// thread's "finished" and `std::sync::Atomic` need. What changes it
+	/// answers what was there before, in `dest`.
+	Atomic(
+		op: AtomicOp,
+		ty: Ty,
+		address: Operand,
+		value: Option<Operand>,
+		expected: Option<Operand>,
+		dest: Option<Place>,
+	)
+	/// What a compare-and-swap expects to find.
+	/// Panics if `fails` is true, with the message its kind gives and the
+	/// place `at` names.
+	Check(fails: Operand, kind: CheckKind, at: Span)
+	/// What follows was written at the span: the source position the code
+	/// generator gives the instructions after it, which debug information maps
+	/// to a line. It does nothing.
+	At(span: Span)
+}
+
+/// Which atomic operation a `Statement::Atomic` is.
+@derive(Eq, Clone, Text)
+pub enum AtomicOp {
+	Add
+	Subtract
+	Swap
+	CompareSwap
+	Load
+	Store
+}
+
+/// What a check reports, with what the runtime formats into its message.
+@derive(Eq, Clone)
+pub enum CheckKind {
+	/// An index or a range outside the elements.
+	Bounds(index: Operand, length: Operand)
+	/// A negative length for a buffer.
+	Length(length: Operand)
+	/// A division or remainder by zero.
+	Division
+	/// An answer that does not fit the type it is written in. The operator is
+	/// what the message names.
+	Overflow(op: BinaryOp)
+}
+
+@derive(Eq, Clone)
+pub enum Terminator {
+	Goto(target: BlockId)
+	/// A panic: the message, and where it was written. A message built when
+	/// the program runs is `note`, a `str`, and what is written in the
+	/// program follows it.
+	Panic(note: Option<Operand>, message: Option<Symbol>, at: Span)
+	Branch(cond: Operand, thenBlock: BlockId, otherwise: BlockId)
+	/// Goes to the block of the case equal to `value`, an `i32`, or to
+	/// `otherwise`.
+	Switch(value: Operand, cases: Vec<(u32, BlockId)>, otherwise: BlockId)
+	Return
+	/// Control never gets here: after a `match` that covered every variant, or
+	/// in a block that nothing reaches.
+	Unreachable
+}
+
+extend Terminator {
+	/// The blocks control goes to next, once per edge.
+	pub fn successors(): Vec<BlockId> = match self {
+		.Goto(target) => Vec::of(own [target])
+		.Branch(thenBlock, otherwise, ..) => Vec::of(own [thenBlock, otherwise])
+		.Switch(cases, otherwise, ..) => {
+			var targets: Vec<BlockId> = Vec()
+			for (_, target) in cases {
+				targets.push(target)
+			}
+			targets.push(otherwise)
+			move targets
+		}
+		.Return | .Unreachable | .Panic(..) => Vec()
+	}
+}
+
+/// Whether values of type `ty` live in memory and are passed by address:
+/// structs, enums, arrays, `str`, slices, references to slices and buffers.
+pub fn isAggregate(program: &Program, ty: Ty): bool =
+	program.types.kind(ty) is .Struct(..) | .Enum(..) | .Array(..) | .Str | .Slice(..) ||
+	isSlicePointer(&program, ty) ||
+	isDynPointer(&program, ty) ||
+	isClosurePointer(&program, ty)
+
+/// Whether a value of type `ty` is one machine value: an integer, a float, a
+/// `bool`, a `cstring`, or an `own` or reference to anything but a slice.
+pub fn isScalar(program: &Program, ty: Ty): bool =
+	program.types.kind(
+		// A C pointer is a scalar: one word, copied.
+		ty,
+	) is .Int(..) | .Float(..) | .Bool | .Char | .Cstring | .Fn(..) | .Own(..) | .Ptr(..) | .Ref(..) &&
+	!isSlicePointer(&program, ty) &&
+	!isDynPointer(&program, ty) &&
+	!isClosurePointer(&program, ty)
+
+/// A reference to a `dyn Interface`: a pointer to the value, and the address
+/// of its type's table of methods.
+pub fn isDynPointer(program: &Program, ty: Ty): bool = match program.types.kind(ty) {
+	.Ref(inner, ..) => program.types.kind(inner) is .Dyn(..)
+	_ => false
+}
+
+/// A closure lent for one call: what it captured, and the address of its
+/// code.
+pub fn isClosurePointer(program: &Program, ty: Ty): bool = match program.types.kind(ty) {
+	.Ref(inner: e, ..) | .Own(inner: e) => program.types.kind(e) is .Fn(..)
+	_ => false
+}
+
+/// A reference to a slice or a buffer: a pointer to the elements, and their
+/// number. A block of slots is the same two words.
+pub fn isSlicePointer(program: &Program, ty: Ty): bool = match program.types.kind(ty) {
+	.Slots(..) => true
+	.Ref(inner: e, ..) | .Own(inner: e) => program.types.kind(e) is .Slice(..)
+	_ => false
+}
+
+/// The element type of an array, a slice, a reference to a slice, or a
+/// buffer.
+pub fn elementTy(program: &Program, ty: Ty): Option<Ty> = match program.types.kind(ty) {
+	.Array(elem: e, ..) | .Slice(elem: e) | .Slots(inner: e) => .Some(e)
+	// A `str` is bytes.
+	.Str => .Some(U8)
+	// A C pointer points at the first of however many there are.
+	.Ptr(inner) => .Some(inner)
+	.Ref(inner: e, ..) | .Own(inner: e) => match program.types.kind(e) {
+		.Slice(elem) => .Some(elem)
+		_ => .None
+	}
+	_ => .None
+}
+
+/// The type of what `projection` reaches in a place of type `ty`.
+pub fn projectTy(program: &Program, ty: Ty, projection: Projection): Ty = {
+	val kind = program.types.kind(ty)
+	val words =
+		kind is .Str | .Slice(..) ||
+		isSlicePointer(&program, ty) ||
+		isDynPointer(&program, ty) ||
+		isClosurePointer(&program, ty)
+	return match projection {
+		.Deref => match kind {
+			.Own(inner: e) | .Ref(inner: e, ..) | .Ptr(inner: e) => e
+			_ => panic("\(projection) does not apply to a value of this type")
+		}
+		.Field(index) if kind is .Struct(..) => program.fieldTy(ty, index)
+		// A pointer, then a length; a `&dyn`'s second word is its table of
+		// methods, and a closure's are its code and its captures, all
+		// addresses.
+		.Field(index: 0) if words => PTR_U8
+		.Field(index: 1) if isDynPointer(&program, ty) || isClosurePointer(&program, ty) => PTR_U8
+		.Field(index: 1) if words => I64
+		.VariantField(variant, field) if kind is .Enum(..) => program.variantFieldTy(
+			ty,
+			variant,
+			field,
+		)
+		.Index(..) | .ConstIndex(..) => match elementTy(&program, ty) {
+			.Some(elem) => elem
+			.None => panic("\(projection) of a value that has no elements")
+		}
+		_ => panic("\(projection) does not apply to a value of this type")
+	}
+}
+
+/// The type of a place of `body`.
+pub fn placeTy(program: &Program, body: &Body, place: &Place): Ty = {
+	var ty = body.local(place.local).ty
+	for projection in place.projections {
+		ty = projectTy(&program, ty, projection)
+	}
+	return ty
+}
+
+/// The type of an operand of `body`.
+pub fn operandTy(program: &Program, body: &Body, operand: &Operand): Ty = match operand {
+	.Copy(place) => placeTy(&program, &body, &place)
+	.Const(.Int(ty, ..) | .Float(ty, ..)) => ty
+	.Const(.Bool(..)) => BOOL
+	.Const(.CStr(..)) => CSTRING
+	.Const(.Fn(ty, ..) | .Table(ty, ..) | .SizeOf(ty, ..) | .AlignOf(ty, ..)) => ty
+	// A table of methods is an address.
+	.Const(.VTable(..) | .DropFn(..) | .RuntimeWords | .FrameTables) => PTR_U8
+}

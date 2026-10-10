@@ -1,0 +1,135 @@
+// A generator's frame: the locals of its `next` live in the generator, after
+// its declared fields, so that each call finds them where the last one left
+// them.
+//
+// Every local but the generator itself and the result is kept there, and
+// every place of the body that names one is rewritten to reach it through the
+// generator: `_3.1` becomes `(*_0).4.1`. An index names a local, not a place,
+// so a kept index is copied into a local of its own just before the statement
+// that reads it.
+
+import std::collections::{Map}
+import std::mem
+import hir::{Ty}
+
+/// Which field of the generator each local of `body` is kept in, counted from
+/// `base`, its first field after the declared ones: `None` for the generator
+/// itself and the result, which stay where they are.
+fn fields(body: &Body, base: u32): Vec<Option<u32>> = {
+	var next = base
+	var fields: Vec<Option<u32>> = Vec()
+	for i in 0..(body.locals.len() as u32) {
+		val local = Local(i)
+		if body.params.contains(&local) || body.ret == Option::Some(local) {
+			fields.push(.None)
+			continue
+		}
+		fields.push(.Some(next))
+		next += 1
+	}
+	return move fields
+}
+
+/// The types of what a generator keeps between calls: its frame, in the order
+/// of its fields.
+pub fn frameTys(body: &Body): Vec<Ty> = {
+	var tys: Vec<Ty> = Vec()
+	val kept = fields(&body, 0)
+	for (i, field) in kept.forwards().enumerate() {
+		if field.isSome() then tys.push(body.locals[i].ty)
+	}
+	return move tys
+}
+
+/// Moves the locals of a generator's `next` into the generator, whose declared
+/// fields are the first `base`.
+pub fn keepInFrame(body: &var Body, base: u32) = {
+	var rewrite = Keeper(
+		this: body.params[0],
+		fields: fields(&body, base),
+		shadows: Map(),
+		locals: mem::replace(&var body.locals, Vec()),
+		copies: Vec(),
+	)
+	for b in 0..body.blocks.len() {
+		var statements: Vec<Statement> = Vec()
+		for statement in mem::replace(&var body.blocks[b].statements, Vec()) {
+			val rewritten = rewriteStatement(move statement, &var rewrite)
+			for copy in mem::replace(&var rewrite.copies, Vec()) {
+				statements.push(copy.clone())
+			}
+			statements.push(move rewritten)
+		}
+		val terminator = mem::replace(&var body.blocks[b].terminator, .Unreachable)
+		body.blocks[b].terminator = rewriteTerminator(move terminator, &var rewrite)
+		for copy in mem::replace(&var rewrite.copies, Vec()) {
+			statements.push(copy.clone())
+		}
+		body.blocks[b].statements = move statements
+	}
+	body.locals = move rewrite.locals
+}
+
+struct Keeper {
+	this: Local
+	fields: Vec<Option<u32>>
+	/// For each kept local that is read as an index, the local its value is
+	/// copied into first.
+	shadows: Map<Local, Local>
+	locals: Vec<LocalDecl>
+	/// What the statement being rewritten copies first: its kept indices.
+	copies: Vec<Statement>
+}
+
+extend Keeper {
+	/// Where a kept local is: a field of the generator.
+	fn kept(local: Local): Option<Place> = {
+		val at = local.index as i64
+		if at >= self.fields.len() then return .None
+		val .Some(field) = self.fields[at] else {
+			return .None
+		}
+		return .Some(Place::of(self.this).project(.Deref).project(.Field(field)))
+	}
+
+	var fn place(place: Place): Place = {
+		val local = place.local
+		var projections: Vec<Projection> = Vec()
+		for projection in move place.projections {
+			val .Index(index) = projection else {
+				projections.push(move projection)
+				continue
+			}
+			val .Some(kept) = self.kept(index) else {
+				projections.push(.Index(index))
+				continue
+			}
+			val shadow = match self.shadows.get(&index) {
+				.Some(shadow) => shadow
+				.None => {
+					val ty = self.locals[index.index as i64].ty
+					self.locals.push(LocalDecl::unnamed(ty, .Temp))
+					val shadow = Local((self.locals.len() - 1) as u32)
+					self.shadows.put(index, shadow)
+					shadow
+				}
+			}
+			self.copies.push(.Assign(place: Place::of(shadow), rvalue: .Use(.Copy(move kept))))
+			projections.push(.Index(shadow))
+		}
+		val .Some(kept) = self.kept(local) else {
+			return Place(local: local, projections: move projections)
+		}
+		var moved = move kept
+		moved.projections.pushAll(&projections)
+		return move moved
+	}
+}
+
+extend Keeper: Rewrite {
+	var fn read(place: Place): Place = self.place(move place)
+
+	var fn written(place: Place): Place = self.place(move place)
+
+	fn rewritesCallee(): bool = true
+}

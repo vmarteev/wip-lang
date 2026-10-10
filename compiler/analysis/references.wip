@@ -1,0 +1,438 @@
+// Reference arguments and `&var` parameters.
+
+import hir::{ExprId, FnId, Ty, evaluationOrder}
+import syntax::{
+	CHANGED_WHILE_BORROWED,
+	CONFLICTING_REFERENCES,
+	Diagnostic,
+	Span,
+	VAR_PARAMETER_LEFT_EMPTY
+}
+
+/// Whether `path` goes into a payload field of the place `matched`, or its
+/// elements. Only the bindings of a `match` on that place, or of one nested
+/// inside it, reach there, so the `match` may write through them.
+fn intoPayload(path: &Path, matched: &Path): bool = {
+	if !path.within(&matched) || path.projs.len() <= matched.projs.len() then return false
+	return path.projs[matched.projs.len()] is .Payload(..) | .Element | .Elements
+}
+
+/// How a reference argument is said in messages.
+fn referenceLabel(writes: bool): str = if writes then "a `&var` reference" else "a `&` reference"
+
+extend Checker {
+	/// Whether a value of `ty` is a closure lent for a call, `&(…) => R` or
+	/// `&var (…) => R`.
+	fn isLentClosure(ty: Ty): bool = match self.program.types.kind(ty) {
+		.Ref(inner, ..) => self.program.types.kind(inner) is .Fn(..)
+		_ => false
+	}
+
+	/// The arguments of a call, `params` in the order of the parameters of
+	/// `callee`, where it is known, evaluated in `order`. A place lent to the
+	/// call is lent when the call begins, after every argument: what its
+	/// expression computes is checked where it is written, and what that
+	/// lends is held from there, so a later argument may change the place but
+	/// not its index or key (E0414). A value that borrows — a `str`, a view, a
+	/// closure — borrows where it is made, and must stay valid while the
+	/// later arguments are evaluated (E0414). No reference argument may
+	/// overlap a `&var` one (E0413).
+	var fn callArgs(params: &[ExprId], order: &[u32], callee: Option<FnId>, state: &var State) = {
+		var args: Vec<ExprId> = Vec()
+		for i in evaluationOrder(&order, params.len()) {
+			args.push(params[i])
+		}
+		val mark = self.borrows.len()
+		// The places the call may change, through its `&var` arguments.
+		var changes: Vec<(Path, Span)> = Vec()
+		// The places lent when the call begins: each argument, and its place.
+		var lent: Vec<(ExprId, ExprId)> = Vec()
+		val body = self.body
+		for arg in args {
+			if body.exprs[arg].kind is .Ref(place) {
+				if self.keptReferenceBehind(place).isNone() && self.place(place).isNone() {
+					// A reference to what is no place of its own — a
+					// sub-slice, a temporary — is lent where it is made.
+					self.expr(arg, .Value, &var state)
+					val writes = self.isVarRef(body.exprs[arg].ty)
+					var paths: Vec<(Path, bool)> = Vec()
+					match self.accessPath(place) {
+						.Some(path) => paths.push((move path, writes))
+						.None => {}
+					}
+					self.lendArgument(arg, .Some(place), move paths, mark, &var changes)
+					continue
+				}
+				if self.place(place).isSome() && self.keptReferenceBehind(place).isNone() {
+					self.placeParts(place, &var state)
+					for (path, span, writes) in self.operandBorrows(place, &state) {
+						self.borrows.push(Borrow(
+							path: move path,
+							span: span,
+							writes: writes,
+							holder: .View,
+							heap: false,
+						))
+					}
+					lent.push((arg, place))
+					continue
+				}
+			}
+			self.expr(arg, .Value, &var state)
+			val ty = body.exprs[arg].ty
+			val writes = self.isVarRef(ty)
+			// The places a value argument refers to: those a reference chosen
+			// by an `if`, or kept in a variable, may point into, or a view's;
+			// each with whether the call may write it.
+			// A `str` or a view: what it borrows stays as it is until the
+			// call starts.
+			if self.isView(ty) {
+				for path in self.lentRoots(arg, Lends::all(), &state).paths {
+					self.borrows.push(Borrow(
+						path: path.clone(),
+						span: body.exprs[arg].span,
+						writes: false,
+						holder: .View,
+						heap: false,
+					))
+				}
+				continue
+			}
+			var paths: Vec<(Path, bool)> = Vec()
+			if self.borrowsAsView(ty) {
+				for path in self.lentRoots(arg, Lends::all(), &state).paths {
+					paths.push((path.clone(), writes))
+				}
+			} else if self.isLentClosure(ty) {
+				// A lent closure refers to what it captured, for as long as
+				// the call may call it: so it may not capture what the call is
+				// also given `&var`. A closure written here holds a `&var` to
+				// what it writes and a `&` to what it only reads, so it writes
+				// only the first.
+				match self.closureCaptures(arg, &var state) {
+					.Some(captured) => paths = move captured
+					.None => {
+						for path in self.lentRoots(arg, Lends::all(), &state).paths {
+							paths.push((path.clone(), writes))
+						}
+					}
+				}
+			} else {
+				continue
+			}
+			self.lendArgument(arg, .None, move paths, mark, &var changes)
+		}
+		// The places, lent now: each must still be there, after what the
+		// arguments written after it did.
+		for (arg, place) in lent {
+			self.useFound(place, .Inspect, &var state)
+			// What it is found from must still be there: a later argument may
+			// have moved it.
+			match self.accessPath(place) {
+				.Some(path) => {
+					val name = self.rootName(&path)
+					self.checkLive(&path, &name, body.exprs[place].span, &state)
+				}
+				.None => {}
+			}
+			val writes = self.isVarRef(body.exprs[arg].ty)
+			var paths: Vec<(Path, bool)> = Vec()
+			match self.accessPath(place) {
+				.Some(path) => paths.push((move path, writes))
+				.None => {}
+			}
+			self.lendArgument(arg, .Some(place), move paths, mark, &var changes)
+		}
+		self.borrows.truncate(mark)
+		// What the call changes, every `str` that borrows it is stale from
+		// here; one passed to the same call is an error now.
+		if !changes.isEmpty() {
+			self.checkCallStrs(&args, &state)
+			self.varTakesRoots(&params, callee, &var state)
+			for (path, span) in changes {
+				self.changed(&path, span, .PassedAsVar, &var state)
+			}
+		}
+	}
+
+	/// Holds what an argument lends for the call: `paths`, each with whether
+	/// the call may write it, are checked against what the call's other
+	/// arguments hold (E0413), and a `&var` place against a `match` or a
+	/// `for` around the call that refers into it.
+	var fn lendArgument(
+		arg: ExprId,
+		place: Option<ExprId>,
+		paths: Vec<(Path, bool)>,
+		mark: i64,
+		changes: &var Vec<(Path, Span)>,
+	) = {
+		val span = self.body.exprs[arg].span
+		for (path, writes) in move paths {
+			if writes then changes.push((path.clone(), span))
+			// A `&var` argument could change what a `match` or `for` around
+			// the call refers into.
+			if writes {
+				if place is .Some(p) then
+					self.checkNotHeld(p, &path, "borrow", " as `&var`", span, "borrowed here", mark)
+			}
+			var conflict: Option<(Span, bool)> = .None
+			for i in mark..self.borrows.len() {
+				val b = &self.borrows[i]
+				if b.holder != .View &&
+					(writes || b.writes) &&
+					(path.within(&b.path) || b.path.within(&path)) {
+					conflict = .Some((b.span, b.writes))
+					break
+				}
+			}
+			if conflict is .Some((earlier, earlierWrites)) {
+				val name = match place {
+					.Some(p) => self.display(p)
+					.None => self.rootName(&path)
+				}
+				val message =
+					if writes then
+						"`\(name)` is passed as `&var` together with another reference to it"
+					else "`\(name)` is passed together with a `&var` reference to it"
+				val diagnostic = Diagnostic::error(
+					CONFLICTING_REFERENCES,
+					move message,
+					span,
+					referenceLabel(writes),
+				).withSecondary(earlier, referenceLabel(earlierWrites)).withNote(
+					"while a function runs, a `&var` argument must be the only reference to its place",
+				)
+				self.report(move diagnostic)
+			}
+			self.borrows.push(Borrow(
+				path: move path,
+				span: span,
+				writes: writes,
+				holder: .Argument,
+				heap: false,
+			))
+		}
+	}
+
+	/// What a closure written as the argument captured, each place with
+	/// whether it holds a `&var` to it — what it writes — rather than a `&`;
+	/// nothing where the argument is not a closure made there.
+	var fn closureCaptures(arg: ExprId, state: &var State): Option<Vec<(Path, bool)>> = {
+		val body = self.body
+		val .Closure(env, ..) = body.exprs[arg].kind else {
+			return .None
+		}
+		val .Struct(fields, ..) = body.exprs[env].kind else {
+			return .None
+		}
+		var paths: Vec<(Path, bool)> = Vec()
+		for field in fields {
+			val writes = self.isVarRef(body.exprs[field].ty)
+			match body.exprs[field].kind {
+				.Ref(place) if self.keptReferenceBehind(place).isNone() => match self.accessPath(
+					place,
+				) {
+					.Some(path) => paths.push((move path, writes))
+					.None => {}
+				}
+				_ => {
+					for path in self.lentRoots(field, Lends::all(), &state).paths {
+						paths.push((path.clone(), writes))
+					}
+				}
+			}
+		}
+		return .Some(move paths)
+	}
+
+	/// The place a reference argument refers to, for comparing arguments:
+	/// through `own` and references, and the whole array for any element of
+	/// it, since indices are not known.
+	fn accessPath(id: ExprId): Option<Path> = match self.body.exprs[id].kind {
+		// A `match` alias refers into the place it was matched from.
+		.Local(local) => match self.aliases.get(&local) {
+			.Some(path) => .Some(path.clone())
+			.None => .Some(Path(local: local, projs: Vec()))
+		}
+		.Field(base, index) => match self.accessPath(base) {
+			.Some(path) => {
+				var further = move path
+				further.projs.push(.Field(index))
+				Option::Some(move further)
+			}
+			.None => .None
+		}
+		.Deref(inner) => {
+			// The `&own<T>` to `&T` coercion wraps the reference it converts:
+			// `Deref(Ref(x))` is `x`.
+			if self.body.exprs[inner].kind is .Ref(x) then return self.accessPath(x)
+			// What a projection lends is somewhere in its argument.
+			if self.body.exprs[inner].kind is .Call(..) then return self.accessPath(inner)
+			match self.accessPath(inner) {
+				.Some(path) => {
+					var further = move path
+					further.projs.push(.Deref)
+					Option::Some(move further)
+				}
+				.None => .None
+			}
+		}
+		.Index(base, ..) | .SubSlice(base, ..) => self.accessPath(base)
+		// `&place` refers to what it borrows.
+		.Ref(place) => self.accessPath(place)
+		// What a projection lends belongs to the argument it was taken from,
+		// so a borrow of it is a borrow of that.
+		.Call(callee, args, ..) => match self.program.fns[callee].projects {
+			// A projection of tables alone holds nothing.
+			.Some(.Param(base)) =>
+				if (base as i64) < args.len() then self.accessPath(args[base as i64]) else .None
+			_ => .None
+		}
+		_ => .None
+	}
+
+	/// A place borrowed by an earlier argument of a call whose arguments are
+	/// being evaluated cannot be moved or assigned before the call (E0414).
+	var fn checkNotBorrowed(id: ExprId, ctx: Ctx) = {
+		// Taking something from behind a `&` reference is E0405 already, and
+		// writing through one is a type error.
+		if self.borrows.isEmpty() || self.throughSharedRef(id) then return
+		val .Some(path) = self.accessPath(id) else {
+			return
+		}
+		val (verb, span, label) = match ctx {
+			.Move(span) => ("move", span, "moved here")
+			_ => ("assign to", self.body.exprs[id].span, "assigned here")
+		}
+		self.checkNotHeld(id, &path, verb, "", span, label, self.borrows.len())
+	}
+
+	/// Reports doing `verb` to `path` while one of the first `end` borrows
+	/// holds it (E0414).
+	var fn checkNotHeld(
+		id: ExprId,
+		path: &Path,
+		verb: str,
+		how: str,
+		span: Span,
+		label: str,
+		end: i64,
+	) = {
+		var found: Option<(Span, Holder)> = .None
+		for i in 0..end {
+			val b = &self.borrows[i]
+			val holds = match b.holder {
+				.Argument | .View | .Assign(..) | .Operand(..) =>
+					path.within(&b.path) || b.path.within(&path)
+				// Bindings may write into the payload they alias.
+				.Match | .Test | .Guard | .Loop =>
+					!intoPayload(&path, &b.path) && (path.within(&b.path) || b.path.within(&path))
+			}
+			if holds {
+				found = .Some((b.span, b.holder.clone()))
+				break
+			}
+		}
+		val .Some((borrowed, holder)) = found else {
+			return
+		}
+		val name = self.display(id)
+		val diagnostic = match holder {
+			.Match => Diagnostic::error(
+				CHANGED_WHILE_BORROWED,
+				"cannot \(verb) `\(name)`\(how) while a `match` binding refers to it",
+				span,
+				String::of(label),
+			).withSecondary(borrowed, "matched here; the arm's bindings refer to it").withNote(
+				"the bindings of a `match` on a place are aliases for its fields, so the place must not change until the arm ends",
+			)
+			.Test => Diagnostic::error(
+				CHANGED_WHILE_BORROWED,
+				"cannot \(verb) `\(name)`\(how) while an `is` binding refers to it",
+				span,
+				String::of(label),
+			).withSecondary(borrowed, "tested here; the bindings refer to it").withNote(
+				"the bindings of an `is` test on a place are aliases for its fields, so the place must not change until the block ends",
+			)
+			.Guard => Diagnostic::error(
+				CHANGED_WHILE_BORROWED,
+				"cannot \(verb) `\(name)`\(how) while the bindings of a `val` pattern refer to it",
+				span,
+				String::of(label),
+			).withSecondary(
+				borrowed,
+				"matched here; the bindings refer to it until the block ends",
+			).withNote(
+				"the bindings of `val pattern = place else { … }` are aliases for its fields, so the place must not change until the block ends",
+			)
+			.Loop => Diagnostic::error(
+				CHANGED_WHILE_BORROWED,
+				"cannot \(verb) `\(name)`\(how) while a `for` loop walks it",
+				span,
+				String::of(label),
+			).withSecondary(
+				borrowed,
+				"walked here; the loop's binding refers to its elements",
+			).withNote(
+				"a `for` binding refers to the element itself, so what the loop walks must not change until the loop ends",
+			)
+			.Argument | .View => Diagnostic::error(
+				CHANGED_WHILE_BORROWED,
+				"cannot \(verb) `\(name)`\(how) while an earlier argument borrows it",
+				span,
+				String::of(label),
+			).withSecondary(borrowed, "borrowed here, until the call returns").withNote(
+				"arguments are evaluated left to right, and what an argument borrows must stay as it is until the call starts",
+			)
+			.Assign(target) => Diagnostic::error(
+				CHANGED_WHILE_BORROWED,
+				"cannot \(verb) `\(name)`\(how) in the value assigned to `\(self.display(target))`",
+				span,
+				String::of(label),
+			).withSecondary(borrowed, "the place, read before the value").withNote(
+				"`op=` reads its place before it computes the value, so the value must not change what the place is in",
+			)
+			.Operand(target) => Diagnostic::error(
+				CHANGED_WHILE_BORROWED,
+				"cannot \(verb) `\(name)`\(how) in the value assigned to `\(self.display(target))`",
+				span,
+				String::of(label),
+			).withSecondary(borrowed, "taken here, before the value").withNote(
+				"the place's index or key is taken before the value, so the value must not change it",
+			)
+		}
+		self.report(move diagnostic)
+	}
+
+	fn throughSharedRef(id: ExprId): bool = match self.place(id) {
+		.Some(.ThroughRef(reference)) =>
+			self.program.types.kind(self.ty(reference)) is .Ref(kind: .Shared, ..)
+		_ => false
+	}
+
+	/// Checks that every `&var` parameter holds a value at an exit (E0415).
+	var fn checkVarParams(exit: Span, state: &State) = {
+		for param in self.varParams.clone() {
+			val path = Path(local: param, projs: Vec::of(own [Proj::Deref]))
+			val .Some(at) = state.conflict(&path) else {
+				continue
+			}
+			val m = &state.moved.values()[at]
+			val first = m.spans[0]
+			if self.quiet > 0 || !self.reported.add(first) then continue
+			val name = self.interner.resolve(self.body.locals[param].name)
+			val verb = if m.definite then "is" else "may be"
+			val diagnostic = Diagnostic::error(
+				VAR_PARAMETER_LEFT_EMPTY,
+				"`\(name)` \(verb) left without a value when `\(self.fnName)` returns",
+				exit,
+				"returns here",
+			).withSecondary(first, "`\(m.name)` moved here").
+				withNote(
+					"a `&var` parameter is the caller's variable, so it must hold a value again before the call returns",
+				).
+				withHelp("assign `\(name)` a new value before this point")
+			self.report(move diagnostic)
+		}
+	}
+}

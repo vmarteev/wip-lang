@@ -1,0 +1,996 @@
+// What a `str` borrows.
+//
+// A `str` is a pointer and a length into bytes it does not own. Each value of
+// one has *roots*: the places whose bytes it may point into. A literal has
+// none, and neither has a `str` parameter, which is valid for the whole call.
+// A call that answers a `str` borrows from the arguments whose types can hold
+// what it refers to, by the callee's signature (`lends.wip`), so its roots
+// follow from its arguments alone.
+//
+// Changing a root — assigning it, moving it, passing it as `&var`, or
+// dropping it where its block ends — makes every `str` that borrows it stale,
+// and using a stale `str` is an error (E0436). Nothing is reported for a
+// `str` that is not used again, which is what freezing a place until the
+// last use of what borrows it means. A `str` that would outlive its roots —
+// as a result, as the value of the block that declares them, kept from a
+// temporary, or given to a `&var` parameter — is refused where it would
+// leave (E0437).
+
+import hir::{Block, ExprId, FnId, LocalId, NEVER, Pattern, STR, Ty}
+import syntax::{
+	BORROWED_ACROSS_YIELD,
+	Diagnostic,
+	Edit,
+	KEEPS,
+	STR_OUTLIVED_ITS_BYTES,
+	STR_OUTLIVES_ITS_ROOT,
+	Span,
+	Symbol,
+	VAR_CONTENTS_KEPT
+}
+
+/// What a `str` value borrows.
+struct Roots {
+	paths: SortedSet<Path> = SortedSet()
+	/// A temporary it borrows, which is dropped at the end of its statement.
+	temporary: Option<Span> = .None
+}
+
+extend Roots {
+	/// Takes in what `other` borrows as well.
+	var fn add(other: Roots) = {
+		for path in other.paths {
+			self.paths.add(path.clone())
+		}
+		if self.temporary.isNone() then self.temporary = other.temporary
+	}
+}
+
+/// How a kind of view borrows, said in messages.
+view struct Borrowing {
+	/// Why it must not be used after what it borrows changed (E0436).
+	stale: str
+	/// What it may borrow where it leaves a function (E0437).
+	leaving: str
+	/// What to keep instead.
+	instead: str
+}
+
+/// A `str` whose roots changed after it was made.
+@derive(Eq, Clone)
+struct Stale {
+	/// Changed on every path to this point, rather than only on some.
+	definite: bool
+	/// Where the root was changed, and how.
+	change: Span
+	how: Change
+	/// The root, as written: `owned`.
+	root: String
+}
+
+/// How a root changed.
+@derive(Eq, Clone)
+enum Change {
+	Assigned
+	Moved
+	PassedAsVar
+	Dropped
+	/// A generator's local, at a `yield`: it may be moved with the generator
+	/// before the generator goes on.
+	AcrossYield
+}
+
+extend Change {
+	/// The change, as messages say it: `` `owned` dropped here ``.
+	fn text(): str = match self {
+		.Assigned => "assigned"
+		.Moved => "moved"
+		.PassedAsVar => "passed as `&var`"
+		.Dropped => "dropped"
+		.AcrossYield => "is held across a `yield`"
+	}
+}
+
+/// Where a `str` goes that outlives the function or block it was made in.
+@derive(Eq, Clone)
+enum Leaving {
+	/// Returned from the function.
+	Result
+	/// Handed over by a generator's `yield`.
+	Yield
+	/// Assigned through a `&var` parameter, to the caller's variable.
+	Param(local: LocalId)
+}
+
+/// Why nothing may borrow a generator's local across a `yield`.
+val ACROSS_YIELD_NOTE: str =
+	"a generator keeps its locals inside itself, and may be moved while it waits, so nothing may point into them across a `yield`; what lies on the heap, as a `Vec`'s elements do, stays where it is"
+
+/// Whether a name is said with `an`.
+fn startsWithVowel(text: str): bool = {
+	for vowel in ["A", "E", "I", "O", "U", "a", "e", "i", "o", "u"] {
+		if text.startsWith(vowel) then return true
+	}
+	return false
+}
+
+extend Checker {
+	/// Whether a value of `ty` borrows: a `str`, a view, or what holds one. A
+	/// reference is a parameter's, and is tracked as a place instead.
+	fn isView(ty: Ty): bool =
+		self.program.holdsView(ty) && !(self.program.types.kind(ty) is .Ref(..))
+
+	/// Whether a value of `ty` borrows as a view does: a view, or a `&`
+	/// reference kept as one. A lent closure is not one; it borrows what it
+	/// captured.
+	fn borrowsAsView(ty: Ty): bool = self.isView(ty) || self.isSharedRef(ty)
+
+	/// Whether `ty` is a `&` reference to a value, not to a closure.
+	fn isSharedRef(ty: Ty): bool = match self.program.types.kind(ty) {
+		.Ref(inner, kind: .Shared) => !(self.program.types.kind(inner) is .Fn(..))
+		_ => false
+	}
+
+	/// Whether `local` holds a `&` reference of its own, kept as a view: a
+	/// `val` or `var` declared as one, or a binding of a reference that is not
+	/// an alias for part of a place. It borrows what the reference points
+	/// into, as a `str` variable borrows its bytes, and a parameter or an alias
+	/// does not: they stand for the place itself.
+	fn isKeptRef(local: LocalId): bool = {
+		val def = &self.body.locals[local]
+		if !self.isSharedRef(def.ty) then return false
+		return match def.kind {
+			.Param => false
+			.Binding =>
+				!self.body.aliasBindings.contains(&local) || self.keptBindings.contains(&local)
+			.Let(..) | .Var => true
+		}
+	}
+
+	/// The reference `place` lies behind, where that reference is kept — in a
+	/// local, a view's field, an element, or the place an alias refers to —
+	/// rather than being a parameter or an alias itself: the outermost such.
+	/// What `&place` borrows is what that reference borrows, and a use of the
+	/// place is a use of what holds it.
+	fn keptReferenceBehind(place: ExprId): Option<ExprId> = {
+		var e = place
+		while true {
+			match self.body.exprs[e].kind {
+				.Field(base, ..) | .Index(base, ..) | .SubSlice(base, ..) => e = base
+				.Deref(inner) => {
+					val kept =
+						self.isSharedRef(self.ty(inner)) &&
+						match self.body.exprs[inner].kind {
+							.Local(local) => self.isKeptRef(local)
+							.Field(..) | .Index(..) | .Deref(..) => true
+							_ => false
+						}
+					if kept then return .Some(inner)
+					e = inner
+				}
+				// What a projection lends lies in the argument it lends from,
+				// `names[0]` in `names`; and `&place` is the place.
+				.Call(callee, args, ..) => {
+					val .Some(.Param(base)) = self.program.fns[callee].projects else {
+						return .None
+					}
+					if (base as i64) >= args.len() then return .None
+					e = args[base as i64]
+				}
+				.Ref(inner) => e = inner
+				_ => return .None
+			}
+		}
+		return .None
+	}
+
+	/// Whether a value of `ty` is a closure that reads what it captured,
+	/// `&(…) => R`, which a `val` may keep: it borrows what it captured as a
+	/// view borrows.
+	fn isKeptClosure(ty: Ty): bool = match self.program.types.kind(ty) {
+		.Ref(inner, kind: .Shared) => self.program.types.kind(inner) is .Fn(..)
+		_ => false
+	}
+
+	/// `local`, a closure kept in a `val`, borrows what its value captured.
+	var fn bindClosure(local: LocalId, value: ExprId, state: &var State) = {
+		var roots = self.lentRoots(value, Lends::all(), &state)
+		// What it captured may borrow in turn: another kept closure, or a
+		// `str`. It reaches that too.
+		var reached: Vec<Path> = Vec()
+		for path in roots.paths {
+			if !path.projs.isEmpty() then continue
+			if state.roots.get(&path.local) is .Some(paths) {
+				for p in paths {
+					reached.push(p.clone())
+				}
+			}
+		}
+		for path in move reached {
+			roots.paths.add(move path)
+		}
+		state.roots.put(local, move roots.paths)
+		state.stale.remove(&local)
+	}
+
+	/// What the arguments of a call of `callee` lend its result, each as its
+	/// parameter says: every one lends all it can where the callee is a
+	/// function value, or where there are more arguments than parameters.
+	fn callRoots(callee: Option<FnId>, args: &[ExprId], state: &State): Roots = {
+		var roots = Roots()
+		for (i, arg) in args.forwards().enumerate() {
+			val lends = match callee {
+				.Some(c) => {
+					val signature = &self.signatures[c.index()]
+					if i < signature.len() then signature[i].clone() else Lends::all()
+				}
+				.None => Lends::all()
+			}
+			roots.add(self.lentRoots(arg, self.argLends(callee, i, arg, lends), &state))
+		}
+		return move roots
+	}
+
+	/// What argument `i` of a call of `callee` lends, as its parameter's
+	/// `lends` say. A reference passed where the parameter is not one — a type
+	/// parameter given `&Node` — is the value the parameter holds, and what
+	/// that value borrows is the place it points to.
+	fn argLends(callee: Option<FnId>, i: i64, arg: ExprId, lends: Lends): Lends = {
+		val byValue = match callee {
+			.Some(c) => {
+				val params = &self.program.fns[c].params
+				i < params.len() && !(self.program.types.kind(params[i].ty) is .Ref(..))
+			}
+			.None => false
+		}
+		return if lends.borrows && byValue && self.isSharedRef(self.ty(arg)) then Lends::all()
+		else lends
+	}
+
+	/// The roots of the value of `id`, an expression of type `str`, in
+	/// `state`, after it has been checked.
+	fn strRoots(id: ExprId, state: &State): Roots = {
+		val body = self.body
+		var roots = Roots()
+		match body.exprs[id].kind {
+			// A variable, an element of one, or a `for` binding that refers to
+			// an element: what the variable borrows.
+			.Local(..) | .Index(..) | .Deref(..) | .Field(..) => {
+				if self.accessPath(id) is .Some(path) {
+					if state.roots.get(&path.local) is .Some(paths) {
+						for p in paths {
+							roots.paths.add(p.clone())
+						}
+					}
+				}
+			}
+			// A view borrows what its fields do.
+			.Struct(fields: parts, ..) | .Variant(args: parts, ..) => {
+				for part in parts {
+					roots.add(self.lentRoots(part, Lends::all(), &state))
+				}
+			}
+			.Array(elems) => {
+				for elem in elems {
+					roots.add(self.strRoots(elem, &state))
+				}
+			}
+			.ArrayRepeat(elem, ..) => roots = self.strRoots(elem, &state)
+			// `own view` borrows what the view does. A value moved on borrows
+			// what it did where it was: `f(move words)` answers what `words`
+			// borrows.
+			.Own(inner) | .Move(inner) => roots = self.strRoots(inner, &state)
+			.SubSlice(base, ..) => roots = self.strRoots(base, &state)
+			// `&place`: the place, or what the reference it lies behind
+			// borrows.
+			.Ref(..) | .LendClosure(..) => roots = self.lentRoots(id, Lends::all(), &state)
+			.Call(callee, args, ..) => roots = self.callRoots(.Some(callee), &args, &state)
+			.DynCall(interfaceId, index, args, ..) => {
+				val method = self.program.interfaces[interfaceId].methods[index as i64].id
+				roots = self.callRoots(.Some(method), &args, &state)
+			}
+			// A function value or closure may answer what it captured, so the
+			// callee is borrowed as well.
+			.CallValue(callee, args) | .CallClosure(callee, args, ..) => {
+				roots = self.callRoots(.None, &args, &state)
+				if self.accessPath(callee) is .Some(path) then roots.paths.add(path.clone())
+			}
+			.Block(block) => roots = self.blockRoots(&block, &state)
+			.If(thenBlock, elseBlock, ..) => {
+				roots = self.blockRoots(&thenBlock, &state)
+				if elseBlock is .Some(b) then roots.add(self.blockRoots(&b, &state))
+			}
+			.Match(arms, ..) => {
+				for arm in arms {
+					if self.ty(arm.body) != NEVER then roots.add(self.strRoots(arm.body, &state))
+				}
+			}
+			// A literal's bytes live forever, and C's are the program's to
+			// keep. A `str` reached through a parameter is valid for the whole
+			// call.
+			_ => {}
+		}
+		return move roots
+	}
+
+	fn blockRoots(block: &Block, state: &State): Roots = match block.value {
+		.Some(value) if self.ty(value) != NEVER => self.strRoots(value, &state)
+		_ => Roots()
+	}
+
+	/// What an argument lends to what the call answers, as `lends` says: the
+	/// place a reference refers to, what the argument borrows — a `str`'s
+	/// roots, a view's — or both.
+	fn lentRoots(arg: ExprId, lends: Lends, state: &State): Roots = {
+		val body = self.body
+		val ty = self.ty(arg)
+		if self.isView(ty) then return if lends.borrows then self.strRoots(arg, &state) else Roots()
+		if !(self.program.types.kind(ty) is .Ref(..)) || lends.isNothing() then return Roots()
+		var roots = Roots()
+		var e = arg
+		// The conversions a reference passes through keep what it refers to.
+		while true {
+			match body.exprs[e].kind {
+				.Unsize(inner) | .DynRef(value: inner, ..) => e = inner
+				_ => break
+			}
+		}
+		match body.exprs[e].kind {
+			// A lent closure refers to what it captured.
+			.Closure(env, ..) => {
+				if body.exprs[env].kind is .Struct(fields, ..) {
+					for field in fields {
+						if self.accessPath(field) is .Some(path) then roots.paths.add(path.clone())
+					}
+				}
+			}
+			.Ref(inner) | .LendClosure(inner) => {
+				// `&lexer` lends what the view borrows; `&"text"` lends a
+				// literal, whose bytes live forever.
+				if lends.borrows && self.isView(self.ty(inner)) then
+					roots.add(self.strRoots(inner, &state))
+				// A place behind a kept reference lies in what that reference
+				// borrows, and not in what holds it.
+				if lends.place {
+					match self.keptReferenceBehind(inner) {
+						.Some(reference) => roots.add(self.strRoots(reference, &state))
+						.None => match self.accessPath(inner) {
+							.Some(path) => roots.add(self.placeRoots(move path, &state))
+							.None => {
+								if self.place(inner) is .None | .Some(.Temporary(..)) then
+									roots.temporary = .Some(body.exprs[arg].span)
+							}
+						}
+					}
+				}
+			}
+			// A reference kept in a variable points where its roots are.
+			.Local(local) if self.isKeptRef(local) => roots = self.strRoots(e, &state)
+			// A reference parameter, or a binding that refers into a place:
+			// the place, and what it borrows.
+			.Local(..) => {
+				if lends.borrows then roots.add(self.strRoots(e, &state))
+				if lends.place {
+					match self.accessPath(e) {
+						.Some(path) => roots.add(self.placeRoots(move path, &state))
+						.None => {}
+					}
+				}
+			}
+			// A reference read from a view's field: what the view borrows,
+			// which is where the reference points.
+			_ => roots = self.strRoots(e, &state)
+		}
+		return move roots
+	}
+
+	/// What a place borrows, as a root: the place itself, or, where it lies
+	/// behind a reference kept in a variable — an element of what a `&Vec<T>`
+	/// variable points to — what that reference borrows.
+	fn placeRoots(path: Path, state: &State): Roots = {
+		var roots = Roots()
+		if !path.projs.isEmpty() && self.isKeptRef(path.local) {
+			if state.roots.get(&path.local) is .Some(paths) {
+				for p in paths {
+					roots.paths.add(p.clone())
+				}
+			}
+			return move roots
+		}
+		roots.paths.add(move path)
+		return move roots
+	}
+
+	/// What a value is, for messages: "a `str`", or its type.
+	fn aView(value: ExprId): String = {
+		val ty = self.ty(value)
+		if ty == STR then return String::of("a `str`")
+		val name = self.tyName(ty)
+		val article = if startsWithVowel(name.toStr()) then "an" else "a"
+		return "\(article) `\(name)`"
+	}
+
+	/// The interface that declares `method`, for messages.
+	fn interfaceName(method: FnId): String = match self.program.fns[method].interfaceId {
+		.Some(interfaceId) => String::of(
+			self.interner.resolve(self.program.interfaces[interfaceId].name),
+		)
+		.None => String::of(self.interner.resolve(self.program.fns[method].name))
+	}
+
+	/// The root, as the programmer wrote it, for messages.
+	fn rootName(path: &Path): String = String::of(
+		self.interner.resolve(self.body.locals[path.local].name),
+	)
+
+	/// The bindings of `pattern` that are values of their own, and views: they
+	/// borrow what `scrutinee` borrows.
+	var fn bindViews(pattern: &Pattern, scrutinee: ExprId, state: &var State) = {
+		var locals: Vec<LocalId> = Vec()
+		pattern.locals(&var locals)
+		var views: Vec<LocalId> = Vec()
+		for local in locals {
+			if self.isView(self.body.locals[local].ty) || self.isKeptRef(local) then
+				views.push(local)
+		}
+		if views.isEmpty() then return
+		val roots = self.strRoots(scrutinee, &state)
+		for local in views {
+			state.roots.put(local, roots.paths.clone())
+			state.stale.remove(&local)
+		}
+	}
+
+	/// After a call, a `&var` argument that holds views may hold what the
+	/// other arguments borrow: `words.push(piece)`. `args` are in the order of
+	/// `callee`'s parameters, and each lends what its type can hold of what
+	/// the `&var` argument's views refer to.
+	var fn varTakesRoots(args: &[ExprId], callee: Option<FnId>, state: &var State) = {
+		for (i, arg) in args.forwards().enumerate() {
+			val .Ref(inner, kind: .Var) = self.program.types.kind(self.ty(arg)) else {
+				continue
+			}
+			if !self.isView(inner) then continue
+			val .Some(path) = self.accessPath(arg) else {
+				continue
+			}
+			// What each parameter lends to the value the `&var` one refers to,
+			// as the callee declares them.
+			val lends: Option<Vec<Lends>> = match callee {
+				.Some(c) => {
+					val def = &self.program.fns[c]
+					var params: Vec<Ty> = Vec()
+					for p in def.params {
+						params.push(p.ty)
+					}
+					val pointee = if i < params.len() {
+						match self.program.types.kind(params[i]) {
+							.Ref(inner: p, ..) => p
+							_ => inner
+						}
+					} else {
+						inner
+					}
+					.Some(lendsTo(self.program, &def.generics, &params, pointee))
+				}
+				.None => .None
+			}
+			// What the callee says it keeps; a call through a function value
+			// says nothing, and is taken to keep every argument.
+			var taken: SortedSet<Path> = SortedSet()
+			for (j, other) in args.forwards().enumerate() {
+				// What another `&var` argument reaches is lent for the call
+				// alone, and nothing of it stays.
+				val lentForWriting = self.isVarRef(self.ty(other))
+				val kept = match callee {
+					.Some(c) => {
+						val index = j as u32
+						self.program.fns[c].keeps.contains(&index)
+					}
+					.None => true
+				}
+				if other != arg && !lentForWriting && kept {
+					val given = match lends {
+						.Some(all) => if j < all.len() then all[j].clone() else Lends::all()
+						.None => Lends::all()
+					}
+					for p in self.lentRoots(
+						other,
+						self.argLends(callee, j, other, given),
+						&state,
+					).paths {
+						taken.add(p.clone())
+					}
+				}
+			}
+			if self.isRefParam(path.local) {
+				val span = self.body.exprs[arg].span
+				self.checkVarContentsKept(path.local, &taken, span, "keeps a view of `{lent}` here")
+			}
+			if !taken.isEmpty() {
+				val at = state.roots.slot(path.local, SortedSet())
+				for p in taken {
+					state.roots.valueAt(at).add(p.clone())
+				}
+			}
+		}
+	}
+
+	/// Reports a view kept in `param`, a reference parameter, that points into
+	/// what another `&var` parameter reaches: that is lent for the call alone,
+	/// and its caller writes it again. `{lent}` in the label is that
+	/// parameter.
+	var fn checkVarContentsKept(param: LocalId, roots: &SortedSet<Path>, span: Span, label: str) = {
+		var found: Option<LocalId> = .None
+		for root in roots {
+			if !root.isLent() &&
+				root.local != param &&
+				self.body.locals[root.local].kind == .Param &&
+				self.isVarRef(self.body.locals[root.local].ty) {
+				found = .Some(root.local)
+				break
+			}
+		}
+		val .Some(lentLocal) = found else {
+			return
+		}
+		val kept = self.interner.resolve(self.body.locals[param].name)
+		val lent = self.interner.resolve(self.body.locals[lentLocal].name)
+		val diagnostic = Diagnostic::error(
+			VAR_CONTENTS_KEPT,
+			"`\(kept)` would keep what `\(lent)` reaches, which is lent for this call alone",
+			span,
+			label.replace("{lent}", by: lent),
+		).withSecondary(self.body.locals[lentLocal].span, "`\(lent)` is lent for writing").
+			withNote(
+				"what a `&var` argument reaches is not kept by another argument: its caller writes it again, and would find what kept it stale",
+			).
+			withHelp("keep a copy, an index or a handle into `\(lent)` instead, as an `Arena`'s handle names what it holds")
+		self.report(move diagnostic)
+	}
+
+	/// Reports that the body keeps what `kept`, a parameter, holds or borrows
+	/// in `param`, a `&var` one, where `keeps` does not name it; with the fix
+	/// that names it.
+	var fn reportKeptUnnamed(param: LocalId, kept: LocalId, span: Span) = {
+		val keptName = self.interner.resolve(self.body.locals[kept].name)
+		val into = self.interner.resolve(self.body.locals[param].name)
+		var diagnostic = Diagnostic::error(
+			KEEPS,
+			"`\(self.fnName)` keeps `\(keptName)` in `\(into)`, and its signature does not say it does",
+			span,
+			"keeps what `\(keptName)` holds or borrows",
+		).withSecondary(self.body.locals[kept].span, "`\(keptName)` is not in `keeps`").withNote(
+			"a call keeps nothing of its arguments but what its `keeps` names, so that its callers know what stays borrowed",
+		)
+		if self.keepsAt is .Some((at, written)) {
+			val text = if written then ", \(keptName)" else " keeps \(keptName)"
+			diagnostic = diagnostic.withFix(
+				"say that `\(self.fnName)` keeps `\(keptName)`",
+				own [Edit::insert(at, move text)],
+			)
+		}
+		self.report(move diagnostic)
+	}
+
+	fn isRefParam(local: LocalId): bool =
+		self.body.locals[local].kind == .Param &&
+		self.program.types.kind(self.body.locals[local].ty) is .Ref(..)
+
+	/// `path` changes at `span`: every `str` that borrows it is stale from
+	/// here on.
+	fn changed(path: &Path, span: Span, how: Change, state: &var State) = {
+		var stale: Vec<LocalId> = Vec()
+		for (i, local) in state.roots.keys().forwards().enumerate() {
+			if state.roots.values()[i].items().any((root) => root.overlaps(&path)) then
+				stale.push(local)
+		}
+		for local in stale {
+			state.stale.put(local, Stale(
+				definite: true,
+				change: span,
+				how: how,
+				root: self.rootName(&path),
+			))
+		}
+	}
+
+	/// `local`, a `str` variable, now holds the value of `value`.
+	var fn bindStr(local: LocalId, value: ExprId, state: &var State) = {
+		var roots = self.strRoots(value, &state)
+		if roots.temporary is .Some(temporary) then self.keptTemporary(local, value, temporary)
+		state.roots.put(local, move roots.paths)
+		state.stale.remove(&local)
+	}
+
+	/// An element of `local`, an array of `str`s, now holds the value of
+	/// `value`: the array borrows what it borrowed, and that as well.
+	var fn addStr(local: LocalId, value: ExprId, state: &var State) = {
+		val roots = self.strRoots(value, &state)
+		if roots.temporary is .Some(temporary) then self.keptTemporary(local, value, temporary)
+		val at = state.roots.slot(local, SortedSet())
+		for path in roots.paths {
+			state.roots.valueAt(at).add(path.clone())
+		}
+	}
+
+	/// A generator stops at a `yield`, and may be moved before it goes on,
+	/// with its locals inside it: nothing may point into them across one.
+	/// What a loop walks or a `match` binds into is refused here; a view that
+	/// borrows one is stale from here on.
+	var fn yielded(span: Span, state: &var State) = {
+		var held: Vec<Borrow> = Vec()
+		for b in self.borrows {
+			if !self.isRefParam(b.path.local) && !b.heap then held.push(b.clone())
+		}
+		for b in held {
+			val name = self.rootName(&b.path)
+			val (by, help) = match b.holder {
+				// A parameter the function that yields was given by value is
+				// the generator's; given by reference, it would not be.
+				.Loop if self.body.locals[b.path.local].kind == .Param => (
+					"the loop walks it",
+					"take `\(name)` by reference, `&`, which the generator then borrows, or walk it by index, `for i in 0..\(name).len() { yield \(name)[i] }`",
+				)
+				.Loop => (
+					"the loop walks it",
+					"walk `\(name)` by index, `for i in 0..\(name).len() { yield \(name)[i] }`, or make it outside the generator, which then borrows it",
+				)
+				.Match | .Test | .Guard => (
+					"a pattern binds into it",
+					"take what is yielded out of `\(name)` before the `yield`",
+				)
+				_ => ("borrowed here", "borrow `\(name)` after the `yield`")
+			}
+			val diagnostic = Diagnostic::error(
+				BORROWED_ACROSS_YIELD,
+				"`\(name)` is borrowed across a `yield`",
+				span,
+				"the generator stops here, with `\(name)` borrowed",
+			).withSecondary(b.span, String::of(by)).
+				withNote(String::of(ACROSS_YIELD_NOTE)).
+				withHelp(move help)
+			self.report(move diagnostic)
+		}
+		var owned: SortedSet<LocalId> = SortedSet()
+		for paths in state.roots.values() {
+			for path in paths {
+				if !self.isRefParam(path.local) then owned.add(path.local)
+			}
+		}
+		for local in owned {
+			val whole = Path(local: local, projs: Vec())
+			self.changed(&whole, span, .AcrossYield, &var state)
+		}
+	}
+
+	/// Reports a use of a `str` variable whose roots changed (E0436). `name`
+	/// is the use as written: `words[…]`, or a `for` binding.
+	var fn checkStale(local: LocalId, name: str, span: Span, state: &State) = {
+		val .Some(stale) = state.stale.get(&local) else {
+			return
+		}
+		// One report for each change, however many uses follow it.
+		if self.quiet > 0 || !self.staleReported.add((local, stale.change)) then return
+		val root = &stale.root
+		val def = &self.body.locals[local]
+		// A generator's local, which the generator may have been moved with
+		// while it waited.
+		if stale.how == .AcrossYield {
+			var given = false
+			for l in self.body.locals {
+				if l.kind == .Param && self.interner.resolve(l.name) == root.toStr() {
+					given = true
+					break
+				}
+			}
+			val help =
+				if given then
+					"take `\(root)` by reference, `&`, which the generator then borrows, or keep a copy that owns its bytes with `String::of(…)`"
+				else "make `\(root)` outside the generator, which then borrows it, or keep a copy that owns its bytes with `String::of(…)`"
+			// The iterator a `for` walks has no name a program wrote.
+			if def.name == Symbol::walked() {
+				val diagnostic = Diagnostic::error(
+					BORROWED_ACROSS_YIELD,
+					"this loop's iterator borrows `\(root)` across a `yield`",
+					span,
+					"each pass calls `next()` here, after the generator went on",
+				).withSecondary(stale.change, "the generator stops here").
+					withNote(String::of(ACROSS_YIELD_NOTE)).
+					withHelp(move help)
+				self.report(move diagnostic)
+				return
+			}
+			val variable = self.interner.resolve(def.name)
+			val diagnostic = Diagnostic::error(
+				BORROWED_ACROSS_YIELD,
+				"`\(name)` borrows `\(root)` across a `yield`",
+				span,
+				"used here, after the generator went on",
+			).withSecondary(stale.change, "the generator stops here").
+				withSecondary(def.span, "`\(variable)` borrows `\(root)`, the generator's own").
+				withNote(String::of(ACROSS_YIELD_NOTE)).
+				withHelp(move help)
+			self.report(move diagnostic)
+			return
+		}
+		// The variable a `for` walks an iterator in has no name a program
+		// wrote.
+		if def.name == Symbol::walked() {
+			val diagnostic = Diagnostic::error(
+				STR_OUTLIVED_ITS_BYTES,
+				"this loop's iterator borrows `\(root)`, which changes inside it",
+				span,
+				"each pass calls `next()` here",
+			).withSecondary(stale.change, "`\(root)` \(stale.how.text()) here").
+				withNote(
+					"what the iterator was made from must not change while the loop still walks it",
+				).
+				withHelp("change `\(root)` after the loop, or walk a copy that owns its bytes")
+			self.report(move diagnostic)
+			return
+		}
+		val variable = self.interner.resolve(def.name)
+		val verb = if stale.definite then "was" else "may have been"
+		// A closure kept in a `val` reads what it captured where it is.
+		if self.isKeptClosure(def.ty) {
+			val diagnostic = Diagnostic::error(
+				STR_OUTLIVED_ITS_BYTES,
+				"`\(name)` is used after `\(root)`, which it captures, \(verb) \(stale.how.text())",
+				span,
+				"used here",
+			).withSecondary(stale.change, "`\(root)` \(stale.how.text()) here").
+				withSecondary(def.span, "`\(variable)` captures `\(root)`").
+				withNote(
+					"a closure kept in a `val` reads what it captures where it is, so that must not change while the closure is still used",
+				).
+				withHelp("call `\(name)` before `\(root)` changes, or give it `\(root)` as an argument")
+			self.report(move diagnostic)
+			return
+		}
+		val what = if stale.how == .Dropped then "dropped" else "changed"
+		val borrowing = self.borrowing(def.ty)
+		val diagnostic = Diagnostic::error(
+			STR_OUTLIVED_ITS_BYTES,
+			"`\(name)` is used after `\(root)`, which it borrows, \(verb) \(what)",
+			span,
+			"used here",
+		).withSecondary(stale.change, "`\(root)` \(stale.how.text()) here").
+			withSecondary(def.span, "`\(variable)` borrows `\(root)`").
+			withNote(String::of(borrowing.stale)).
+			withHelp("use `\(name)` before `\(root)` changes, or \(borrowing.instead)")
+		self.report(move diagnostic)
+	}
+
+	/// How a value of `ty` borrows, for messages: a `str` its bytes, a `&`
+	/// reference its place, a view what its parts borrow.
+	fn borrowing(ty: Ty): Borrowing =
+		if ty == STR then
+			Borrowing(
+				stale: "a `str` points into the bytes of what it borrows, so those must not change while the `str` is still used",
+				leaving: "a `str` that leaves a function may only borrow what its reference parameters refer to",
+				instead: "keep a copy that owns its bytes with `String::of(…)`",
+			)
+		else if self.isSharedRef(ty) then
+			Borrowing(
+				stale: "a `&` reference points into the place it borrows, so that must not change while the reference is still used",
+				leaving: "a `&` reference that leaves a function may only point into what its reference parameters refer to",
+				instead: "keep a copy of the value it points to",
+			)
+		else Borrowing(
+			stale: "a view points into what it borrows — a `str` into bytes, a `&` into a place — so that must not change while the view is still used",
+			leaving: "a view that leaves a function may only borrow what its reference parameters refer to",
+			instead: "keep a value that owns its data",
+		)
+
+	/// In one call, a `str` argument must not borrow what a `&var` argument
+	/// lets the call change: `text.push(text.toStr())` reads bytes that the
+	/// push may move (E0436).
+	var fn checkCallStrs(args: &[ExprId], state: &State) = {
+		val body = self.body
+		var vars: Vec<(ExprId, Path)> = Vec()
+		for arg in args {
+			if !self.isVarRef(self.ty(arg)) then continue
+			match self.accessPath(arg) {
+				.Some(path) => vars.push((arg, move path))
+				.None => {}
+			}
+		}
+		if vars.isEmpty() then return
+		for arg in args {
+			if !self.isView(self.ty(arg)) then continue
+			val roots = self.strRoots(arg, &state)
+			var found: Option<i64> = .None
+			for (k, entry) in vars.forwards().enumerate() {
+				if roots.paths.items().any((root) => root.overlaps(&entry.1)) {
+					found = .Some(k)
+					break
+				}
+			}
+			val .Some(k) = found else {
+				continue
+			}
+			val root = self.rootName(&vars[k].1)
+			val diagnostic = Diagnostic::error(
+				STR_OUTLIVED_ITS_BYTES,
+				"this argument borrows `\(root)`, which the same call may change",
+				body.exprs[arg].span,
+				"borrows `\(root)`",
+			).withSecondary(body.exprs[vars[k].0].span, "passed as `&var` here").
+				withNote(
+					"a `&var` argument may change its place while the call still reads the `str`, which points into it",
+				).
+				withHelp("copy the text first: `String::of(…)` owns its bytes")
+			self.report(move diagnostic)
+		}
+	}
+
+	/// Reports a `str` kept in `local` that borrows a temporary (E0437).
+	var fn keptTemporary(local: LocalId, value: ExprId, temporary: Span) = {
+		val name = self.interner.resolve(self.body.locals[local].name)
+		val diagnostic = Diagnostic::error(
+			STR_OUTLIVES_ITS_ROOT,
+			"`\(name)` would borrow a temporary",
+			self.body.exprs[value].span,
+			"\(self.aView(value)) is kept here",
+		).withSecondary(temporary, "a temporary, dropped at the end of the statement").
+			withNote("a view points into what it borrows, which must live as long as it does").
+			withHelp("bind the value with `val` first, then borrow it")
+		self.report(move diagnostic)
+	}
+
+	/// A `str` that leaves the function: every root must be something a
+	/// reference parameter refers to, which outlives the call (E0437).
+	var fn checkLeaving(value: ExprId, leaving: Leaving, state: &State) = {
+		val roots = self.strRoots(value, &state)
+		val span = self.body.exprs[value].span
+		if leaving is .Param(param) then
+			self.checkVarContentsKept(param, &roots.paths, span, "points into `{lent}`")
+		val what = match leaving {
+			.Result => String::of("return")
+			.Yield => String::of("yield")
+			.Param(param) => "give `\(self.interner.resolve(self.body.locals[param].name))`"
+		}
+		if roots.temporary is .Some(temporary) {
+			val diagnostic = Diagnostic::error(
+				STR_OUTLIVES_ITS_ROOT,
+				"cannot \(what) \(self.aView(value)) that borrows a temporary",
+				span,
+				"leaves the function here",
+			).withSecondary(temporary, "a temporary, dropped at the end of the statement").
+				withNote(String::of(self.borrowing(self.ty(value)).leaving)).
+				withHelp("answer a value that owns its data, as a `String` owns its bytes")
+			self.report(move diagnostic)
+			return
+		}
+		if leaving == .Result {
+			// A result points into a reference parameter's place only where
+			// the signature lends it: its callers keep only what the signature
+			// says.
+			var unlent: Option<(Path, i64)> = .None
+			for p in roots.paths {
+				if p.isLent() then continue
+				val .Some(param) = self.body.params.indexOf(&p.local) else {
+					continue
+				}
+				if param >= self.lends.len() then continue
+				if self.isRefParam(p.local) && !self.lends[param].place {
+					unlent = .Some((p.clone(), param))
+					break
+				}
+			}
+			if unlent is .Some((root, param)) {
+				val name = self.rootName(&root)
+				val declared = match self.implements {
+					.Some(method) =>
+						"`\(self.fnName)`, as `\(self.interfaceName(method))` declares it,"
+					.None => "`\(self.fnName)`"
+				}
+				val note =
+					if self.saysFrom then
+						"\(declared) says with `from` what its result borrows, and `\(name)` itself is not among it; its callers keep only that"
+					else "\(declared) answers what its parameters' types can hold, and `\(name)`'s does not hold, as its own, what the result refers to; its callers keep only that"
+				val diagnostic = Diagnostic::error(
+					STR_OUTLIVES_ITS_ROOT,
+					"cannot \(what) \(self.aView(value)) that points into `\(name)`",
+					span,
+					"points into `\(name)`",
+				).withSecondary(self.body.locals[self.body.params[param]].span, "`\(name)` is `\(self.tyName(self.body.locals[root.local].ty))`").
+					withNote(move note).
+					withHelp("answer what `\(name)` borrows, or a value that owns its data")
+				self.report(move diagnostic)
+				return
+			}
+			// What a parameter borrows leaves only where `from` names it.
+			var unnamed: Option<(Path, i64)> = .None
+			for p in roots.paths {
+				if !p.isLent() then continue
+				val .Some(param) = self.body.params.indexOf(&p.local) else {
+					continue
+				}
+				if param >= self.lends.len() then continue
+				if !self.lends[param].borrows {
+					unnamed = .Some((p.clone(), param))
+					break
+				}
+			}
+			if unnamed is .Some((root, param)) {
+				val name = self.rootName(&root)
+				val diagnostic = Diagnostic::error(
+					STR_OUTLIVES_ITS_ROOT,
+					"cannot \(what) \(self.aView(value)) that borrows what `\(name)` borrows",
+					span,
+					"borrows what `\(name)` borrows",
+				).withSecondary(self.body.locals[self.body.params[param]].span, "`\(name)` is not named after `from`").
+					withNote("`\(self.fnName)` says with `from` what its result borrows, and its callers keep only that").
+					withHelp("name `\(name)` after `from`, or answer from what it names")
+				self.report(move diagnostic)
+				return
+			}
+		}
+		var found: Option<Path> = .None
+		for p in roots.paths {
+			if !p.isLent() && !self.isRefParam(p.local) {
+				found = .Some(p.clone())
+				break
+			}
+		}
+		val .Some(root) = found else {
+			return
+		}
+		val name = self.rootName(&root)
+		val owner =
+			if self.generator then "`\(name)` is the generator's own, and moves with it"
+			else if self.body.locals[root.local].kind == .Param then
+				"`\(name)` belongs to `\(self.fnName)`, and is dropped when it returns"
+			else "`\(name)` is a local of `\(self.fnName)`, dropped when it returns"
+		val (note, help) = match leaving {
+			.Yield => (
+				"what a generator yields may borrow what it was given, but not what it holds itself, which moves with it",
+				"yield a `String`, which owns its bytes, or make the value outside the generator, which then borrows it",
+			)
+			_ => (
+				self.borrowing(self.ty(value)).leaving,
+				"answer a value that owns its data, as a `String` owns its bytes",
+			)
+		}
+		val diagnostic = Diagnostic::error(
+			STR_OUTLIVES_ITS_ROOT,
+			"cannot \(what) \(self.aView(value)) that borrows `\(name)`",
+			span,
+			move owner,
+		).withSecondary(self.body.locals[root.local].span, "`\(name)` declared here").
+			withNote(String::of(note)).
+			withHelp(String::of(help))
+		self.report(move diagnostic)
+	}
+
+	/// The value of a block, or of a `match` arm, that borrows one of
+	/// `dying`, which are dropped where it ends (E0437).
+	var fn checkBlockValue(value: ExprId, dying: &[LocalId], what: str, state: &State) = {
+		if !self.borrowsAsView(self.ty(value)) || dying.isEmpty() then return
+		val roots = self.strRoots(value, &state)
+		var found: Option<Path> = .None
+		for p in roots.paths {
+			if dying.contains(&p.local) {
+				found = .Some(p.clone())
+				break
+			}
+		}
+		val .Some(root) = found else {
+			return
+		}
+		val name = self.rootName(&root)
+		val diagnostic = Diagnostic::error(
+			STR_OUTLIVES_ITS_ROOT,
+			"the value of this \(what) borrows `\(name)`, which is dropped where it ends",
+			self.body.exprs[value].span,
+			"borrows `\(name)`",
+		).withSecondary(self.body.locals[root.local].span, "`\(name)` declared here").
+			withNote(
+				"a `str`, a view or a `&` reference points into what it borrows, which must live as long as it does",
+			).
+			withHelp("declare `\(name)` outside the \(what), or answer a value that owns its data")
+		self.report(move diagnostic)
+	}
+}

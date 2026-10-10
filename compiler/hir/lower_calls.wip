@@ -1,0 +1,1006 @@
+// Calls and paths in expressions: functions of this module or another, with
+// or without type arguments.
+
+import syntax as ast
+import syntax::{
+	ARGUMENT_COUNT,
+	CANNOT_INLINE,
+	Code,
+	Diagnostic,
+	Edit,
+	NAMED_ARGUMENT_TO_VALUE,
+	NAMED_VARIADIC_ARGUMENT,
+	NOT_A_VALUE,
+	NOT_CALLABLE,
+	NOT_C_COMPATIBLE,
+	PACKAGE,
+	PANIC_ARGUMENT,
+	REST_NOT_LAST,
+	Span,
+	Symbol,
+	TYPE_ARGUMENT_COUNT,
+	UNKNOWN_MODULE,
+	UNKNOWN_NAME
+}
+
+/// No arguments, for a use that has none.
+val NO_ARGS: [ast::ExprId; 0] = []
+
+/// `NO_ARGS`, lent.
+fn noArgs(): &[ast::ExprId] = lend NO_ARGS
+
+/// The first name given among a call's arguments, if one is.
+fn firstName(names: &[Option<ast::Name>]): Option<ast::Name> = {
+	for name in names {
+		if name is .Some(n) then return .Some(n)
+	}
+	return .None
+}
+
+/// How many arguments were given, as a call that counts them says it.
+fn givenCount(given: i64): String = if given == 1 then String::of("1 was") else "\(given) were"
+
+extend Lowerer {
+	var fn callExpr(
+		callee: ast::ExprId,
+		args: &[ast::ExprId],
+		names: &[Option<ast::Name>],
+		rest: Option<ast::ExprId>,
+		hint: Option<Ty>,
+		span: Span,
+	): ExprId = {
+		val file = self.ast
+		val calleeExpr = &file.exprs[callee]
+		var used = ItemUse::plain(.Some(&args), hint, span)
+		used.names = &names
+		// A struct, built as a variant is: by its name, or `Self`, where no
+		// function or variable has that name.
+		if calleeExpr.kind is .Name(sym) && self.namesStruct(sym) {
+			val path = [ast::Name(sym: sym, span: calleeExpr.span)]
+			val lit = StructLit(
+				typeArgs: .None,
+				fields: Written(args: &args, names: &names),
+				rest: rest,
+				hint: hint,
+				span: span,
+			)
+			return self.structLit(&path, lit)
+		}
+		if rest is .Some(r) && !(calleeExpr.kind is .Path(..)) then self.restWithoutStruct(r)
+		match calleeExpr.kind {
+			// A qualified name: a variant of an enum, or an item of another
+			// module.
+			.Path(leadingDot, segments, typeArgs) => {
+				var item = used
+				item.typeArgs = typeArgs.asRef()
+				return self.pathCall(leadingDot, &segments, item, rest)
+			}
+			.Field(base, name) => {
+				if self.variantWithDot(base, name, used) is .Some(variant) then return variant
+				// A method of the receiver's type; otherwise a field of function
+				// type, checked below.
+				if self.methodCall(base, name, used) is .Some(call) then return call
+			}
+			// `panic(message)` does not return.
+			.Name(sym) if self.lookup(sym).isNone() &&
+				self.text(sym) == "panic" => return self.panicCall(&args, &names, span)
+			// A variable of the function around a lambda is called as the value
+			// it is, below, whatever a function of the module is called.
+			.Name(sym) if self.lookup(sym).isNone() && !self.namesAround(sym) => {
+				if self.fns().get(&sym) is .Some(f) then return self.call(f, used)
+				// A function of another module, imported by name.
+				val imported = self.imported(ast::Name(sym: sym, span: calleeExpr.span))
+				match imported {
+					.Some(.Item(module, name: item)) if self.modules[module].fns.contains(
+						&item.sym,
+					) => return self.moduleFn(module, item, used)
+					.Some(.Broken) => return self.giveUp(&args, span)
+					_ => {}
+				}
+				if self.preludeFn(sym) is .Some(id) then return self.call(id, used)
+				// A closure a closure or a generator captured is called as a
+				// value, below.
+				if !self.types().contains(&sym) && imported.isNone() && !self.namedAround(sym) {
+					val diagnostic = self.unknownName(sym, calleeExpr.span)
+					self.report(move diagnostic)
+					return self.giveUp(&args, span)
+				}
+			}
+			_ => {}
+		}
+		val c = self.infer(callee, .None)
+		val ty = self.tyOf(c)
+		// A closure is called like any other function value; its code takes
+		// what it captured first.
+		if self.kind(ty) is .Ref(inner, ..) | .Own(inner) && self.kind(inner) is .Fn(params, ret) {
+			if firstName(&names) is .Some(name) then
+				self.report(
+					Diagnostic::error(
+						NAMED_ARGUMENT_TO_VALUE,
+						"arguments to a closure cannot be named",
+						name.span,
+						"a named argument",
+					).withNote(
+						"the names in a function type document it, and are not part of the type",
+					),
+				)
+			return self.callClosure(c, params, ret, &args, span)
+		}
+		if self.kind(ty) is .Fn(params, ret) {
+			if firstName(&names) is .Some(name) then
+				self.report(
+					Diagnostic::error(
+						NAMED_ARGUMENT_TO_VALUE,
+						"arguments to a function value cannot be named",
+						name.span,
+						"a named argument",
+					).withNote(
+						"the names in a function type document it, and are not part of the type, so a value's names are not known",
+					).withHelp("pass the arguments by position"),
+				)
+			return self.callValue(c, params, ret, &args, span)
+		}
+		if !self.isPoisoned(ty) then
+			self.report(
+				Diagnostic::error(
+					NOT_CALLABLE,
+					"a value of type \(self.tyName(ty)) cannot be called",
+					calleeExpr.span,
+					"not a function",
+				).withNote(
+					"functions, and values of a function type such as `(x: i64) => i64`, can be called",
+				),
+			)
+		return self.giveUp(&args, span)
+	}
+
+	/// `panic(message)`: a call the checker knows, of type `never`, whose
+	/// message is any text and whose place comes from its span.
+	var fn panicCall(args: &[ast::ExprId], names: &[Option<ast::Name>], span: Span): ExprId = {
+		if firstName(&names) is .Some(name) then
+			self.report(
+				Diagnostic::error(
+					PANIC_ARGUMENT,
+					"the message of a panic is not named",
+					name.span,
+					"a named argument",
+				).withNote("`panic` takes one string: `panic(\"…\")`"),
+			)
+		var message: Option<ExprKind> = .None
+		if args.len() == 1 {
+			// A string written at the call is kept in the program; anything
+			// else is built when the panic happens.
+			if self.messageText(args[0], PANIC_ARGUMENT, "a panic's message") is .Some(value) then
+				message = match self.state.body.exprs[value].kind {
+					.Str(symbol) => .Some(.Panic(note: .None, message: .Some(symbol)))
+					_ => .Some(.Panic(note: .Some(value), message: .None))
+				}
+		} else {
+			self.report(
+				Diagnostic::error(
+					PANIC_ARGUMENT,
+					"`panic` takes one message, but \(args.len()) were given",
+					span,
+					"a panic takes one string",
+				),
+			)
+			for arg in args {
+				self.infer(arg, .None)
+			}
+		}
+		return match move message {
+			.Some(panicked) => self.alloc(move panicked, NEVER, span)
+			.None => self.errorExpr(span)
+		}
+	}
+
+	/// A panic's message or an assert's note: a `str`, or a `String` lent as
+	/// one. Anything else is reported with `code`.
+	var fn messageText(e: ast::ExprId, code: Code, what: str): Option<ExprId> = {
+		val value = self.inferArgument(e, .Some(STR))
+		val ty = self.tyOf(value)
+		if self.isPoisoned(ty) then return .None
+		if ty == STR then return .Some(value)
+		if self.lendString(value) is .Some(lent) then return .Some(lent)
+		self.report(
+			Diagnostic::error(
+				code,
+				"\(what) is text",
+				self.state.body.exprs[value].span,
+				"a value of type \(self.tyName(ty))",
+			).withHelp("write it in a string: `\"\\(value)\"`").withNote(
+				"a failure says what went wrong in text, built when it happens",
+			),
+		)
+		return .None
+	}
+
+	/// A call of `callee`, with the type arguments written in its path, if
+	/// any, and arguments given by position, by name or by default.
+	var fn call(callee: FnId, item: ItemUse): ExprId = {
+		// A file's contents, which the checker reads now: no call is made.
+		if self.program.fns[callee].intrinsic is .Some(which) &&
+			which is .EmbedBytes | .EmbedText | .EmbedTextOr {
+			return self.embed(which, item)
+		}
+		// A call to a C function that takes more than it declares is made
+		// through C of the compiler's writing, with the types this call
+		// passes.
+		if self.program.fns[callee].isVariadic then return self.variadicCall(callee, item)
+		val args = item.args.unwrap()
+		val hint = item.hint
+		val span = item.span
+		val generics = self.program.fns[callee].generics.clone()
+		var ret = self.program.fns[callee].ret
+		val sigSpan = self.program.fns[callee].span
+		val nameSym = self.program.fns[callee].name
+		val name = String::of(self.text(nameSym))
+		// A method's receiver is its first parameter, and is not written among
+		// the arguments.
+		val taken: i64 = if item.receiver.isSome() then 1 else 0
+		// Most calls give every parameter by position, and need no matching.
+		var plain = args.len() + taken == self.program.fns[callee].params.len()
+		for n in item.names {
+			if n.isSome() then plain = false
+		}
+		for p in self.program.fns[callee].params {
+			if p.default.isSome() then plain = false
+		}
+		val explicit = self.explicitTypeArgs(nameSym, &generics, item.typeArgs, item.nameSegment)
+		var inference = Inference::new(move explicit)
+		if item.ownerTy is .Some(ownerTy) then
+			self.ownerTypeArgs(callee, &generics, ownerTy, &var inference)
+		// A call through a constraint knows the interface's own types, which
+		// the constraint carries: `C: At<i64, T>` says what `at` takes and what
+		// it lends. They follow `Self`, which is the method's first parameter.
+		if item.interfaceArgs != TyList::empty() {
+			val interfaceArgs = self.program.types.list(item.interfaceArgs).toVec()
+			for (n, arg) in interfaceArgs.forwards().enumerate() {
+				if n + 1 >= generics.len() then break
+				val param = &generics[n + 1]
+				val declared = self.intern(
+					.Param(TyParam(index: (n + 1) as u32, name: param.name, copy: param.copy)),
+				)
+				self.unify(declared, arg, &var inference.tys)
+			}
+		}
+		// A `static fn` called through a type parameter knows `Self`.
+		if item.selfTy is .Some(selfTy) && !generics.isEmpty() {
+			val declared = self.intern(
+				.Param(TyParam(index: 0, name: generics[0].name, copy: generics[0].copy)),
+			)
+			self.unify(declared, selfTy, &var inference.tys)
+		}
+		// What the receiver is decides the type's parameters: `T` of
+		// `Option<T>` in `opt.unwrapOr(0)`.
+		if item.receiver is .Some(receiver) {
+			val declared = self.program.fns[callee].params[0].ty
+			val actual = self.tyOf(receiver)
+			self.unify(declared, actual, &var inference.tys)
+		}
+		// The result's type may decide what is still undecided, unless the
+		// value is discarded or lent by a projection. It comes after the
+		// receiver, which is what the value is: `Option<i64>`'s `unwrap`
+		// answers an `i64` whatever is expected of it, and a `str` expected
+		// is then a mismatch, not an `unwrap<str>` of an `Option<i64>`.
+		if hint is .Some(h) && h != UNIT && !(self.kind(ret) is .Ref(..)) then
+			self.unify(ret, h, &var inference.tys)
+		var params: Vec<ParamDef> = Vec()
+		val all = &self.program.fns[callee].params
+		for i in taken..all.len() {
+			params.push(all[i].clone())
+		}
+		val argNames = item.argNames()
+		self.swappedArguments(&params, &args, &argNames, &name)
+		// Defaults that are code, called with this call's type arguments once
+		// they are known.
+		val defaults = self.state.unsettledDefaults.len()
+		var hirArgs: Vec<ExprId> = Vec()
+		var order: Vec<u32> = Vec()
+		if plain {
+			var operands: Vec<GenericOperand> = Vec()
+			for i in 0..args.len() {
+				if i >= params.len() then break
+				operands.push(GenericOperand(
+					expr: args[i],
+					declared: params[i].ty,
+					context: .Some((params[i].span, "parameter declared here")),
+					isArg: true,
+				))
+			}
+			hirArgs = self.genericOperands(&operands, &var inference.tys)
+		} else {
+			val (matchedArgs, matchedOrder) = self.matchedCall(
+				callee,
+				item,
+				&var inference,
+				&name,
+				sigSpan,
+			)
+			hirArgs = move matchedArgs
+			order = move matchedOrder
+		}
+		if item.receiver is .Some(receiver) {
+			// The receiver is evaluated first, before the arguments.
+			hirArgs.insert(0, receiver)
+			if !order.isEmpty() {
+				var shifted = Vec::of(own [0 as u32])
+				for i in order {
+					shifted.push(i + 1)
+				}
+				order = move shifted
+			}
+		}
+		var typeList = TyList::empty()
+		if !generics.isEmpty() {
+			val sliced = self.arraysAsSlices(&generics, &var inference.tys)
+			val written = "\(name)<\(elided(generics.len()))>(…)"
+			val tys = self.finishTypeArgs(&name, &written, &generics, move inference, span)
+			// An array passed as the slice it lends goes in converted to one.
+			if sliced {
+				var declaredTys: Vec<Ty> = Vec()
+				for p in self.program.fns[callee].params {
+					declaredTys.push(p.ty)
+				}
+				var i = 0
+				while i < hirArgs.len() && i < declaredTys.len() {
+					val declared = self.program.types.subst(declaredTys[i], &tys)
+					if self.tyOf(hirArgs[i]) != declared then
+						hirArgs[i] = self.coerce(hirArgs[i], declared, .None)
+					i += 1
+				}
+			}
+			typeList = self.program.types.internList(&tys)
+			ret = self.program.types.subst(ret, &tys)
+			self.settleDefaults(defaults, &tys)
+		}
+		val call = self.alloc(
+			.Call(callee: callee, args: move hirArgs, typeArgs: typeList, order: move order),
+			ret,
+			span,
+		)
+		// A projection's call is a place, seen through like a reference
+		// parameter. A function that answers a type parameter answers a value,
+		// a reference included.
+		val projects = self.kind(self.program.fns[callee].ret) is .Ref(..)
+		if projects && self.kind(ret) is .Ref(inner: pointee, ..) then
+			return self.alloc(.Deref(call), pointee, span)
+		return call
+	}
+
+	/// `printf(format, name, count)`: the declared parameters are checked as
+	/// any others, and what follows them must already be what C expects,
+	/// since nothing widens on the way. The call is pointed at a declaration
+	/// of exactly these types, which the compiler writes a C wrapper for.
+	var fn variadicCall(callee: FnId, item: ItemUse): ExprId = {
+		val args = item.args.unwrap()
+		val declared = self.program.fns[callee].params.clone()
+		val ret = self.program.fns[callee].ret
+		val nameSym = self.program.fns[callee].name
+		val sigSpan = self.program.fns[callee].span
+		if firstName(item.names) is .Some(name) then
+			self.report(
+				Diagnostic::error(
+					NAMED_VARIADIC_ARGUMENT,
+					"a call C reads in order cannot name its arguments",
+					name.span,
+					"a named argument",
+				).withNote(
+					"what follows the declared parameters is matched by position, so the rest of the call is too",
+				),
+			)
+		if args.len() < declared.len() {
+			val text = String::of(self.text(nameSym))
+			val missing = declared.len() - args.len()
+			self.report(
+				Diagnostic::error(
+					ARGUMENT_COUNT,
+					"`\(text)` takes \(plural(declared.len(), "argument", "arguments")) and then as many as C reads",
+					item.span,
+					"\(missing) missing",
+				).withSecondary(sigSpan, "declared here"),
+			)
+		}
+		var lowered: Vec<ExprId> = Vec()
+		for (i, arg) in args.forwards().enumerate() {
+			val value = if i < declared.len() {
+				val context: Option<(Span, str)> = .Some(
+					(declared[i].span, "parameter declared here"),
+				)
+				self.checkArgument(arg, declared[i].ty, context)
+			} else if self.ast.exprs[arg].kind is .Str(..) {
+				// A literal has no type of its own yet, and the only string C
+				// reads here is a `cstring` — so a written one becomes that,
+				// which widens nothing.
+				self.checkIn(arg, CSTRING, .None)
+			} else {
+				val v = self.infer(arg, .None)
+				val ty = self.tyOf(v)
+				self.checkVariadicArg(ty, self.ast.exprs[arg].span)
+				v
+			}
+			lowered.push(value)
+		}
+		// The call keeps the declaration it names. Which C wrapper it goes
+		// through is settled once every body is checked.
+		return self.alloc(
+			.Call(callee: callee, args: move lowered, typeArgs: TyList::empty(), order: Vec()),
+			ret,
+			item.span,
+		)
+	}
+
+	/// What may follow the parameters a C function declares: the scalars C
+	/// reads with `va_arg`, already the width C expects.
+	var fn checkVariadicArg(ty: Ty, span: Span) = {
+		val ok = match self.kind(ty) {
+			.Str | .Fn(..) | .Struct(..) | .Ref(..) => false
+			_ => self.cCompatible(ty, false)
+		}
+		if ok || self.isPoisoned(ty) then return
+		self.report(
+			Diagnostic::error(
+				NOT_C_COMPATIBLE,
+				"\(self.tyName(ty)) cannot be read by a C function that takes more",
+				span,
+				"not a value C reads there",
+			).withNote(
+				"what follows the declared parameters is read one at a time, so it is the scalars C knows: integers of up to 64 bits, the floats, `bool`, `cstring` and `ptr<T>`",
+			).withHelp(
+				"a `str` has no NUL: give C a `cstring`, or the two of `text.len()` and the bytes",
+			),
+		)
+	}
+
+	/// The arguments of a call that names some, leaves some to their
+	/// defaults, or gives the wrong number: matched to the parameters, in
+	/// their order, with the order they are evaluated in.
+	var fn matchedCall(
+		callee: FnId,
+		item: ItemUse,
+		inference: &var Inference,
+		name: str,
+		sigSpan: Span,
+	): (Vec<ExprId>, Vec<u32>) = {
+		val args = item.args.unwrap()
+		val names = item.argNames()
+		val taken: i64 = if item.receiver.isSome() then 1 else 0
+		var slots: Vec<Slot> = Vec()
+		val all = &self.program.fns[callee].params
+		for i in taken..all.len() {
+			slots.push(Slot(
+				name: all[i].name,
+				ty: all[i].ty,
+				span: all[i].span,
+				default: all[i].default.clone(),
+			))
+		}
+		val matched = self.matchArguments(&slots, &args, &names, "parameter", name)
+		// `f(a < b, c > (d))` reads as one argument, `a<b, c>(d)`; that is
+		// reported, and the count would only repeat it.
+		var misread = false
+		for a in args {
+			if self.misreadComparison(a) then misread = true
+		}
+		if !misread then
+			self.reportArgumentCount(name, &slots, &matched, &names, sigSpan, item.span)
+		// The matched arguments, as written.
+		var written: Vec<(i64, i64)> = Vec()
+		for (slot, arg) in matched.slots.forwards().enumerate() {
+			if arg is .Some(a) then written.push((a, slot))
+		}
+		written.sortUnstable()
+		var operands: Vec<GenericOperand> = Vec()
+		for (arg, slot) in written {
+			operands.push(GenericOperand(
+				expr: args[arg],
+				declared: slots[slot].ty,
+				context: .Some((slots[slot].span, "parameter declared here")),
+				isArg: true,
+			))
+		}
+		val values = self.genericOperands(&operands, &var inference.tys)
+		var checked: Vec<Option<ExprId>> = Vec()
+		for _ in 0..args.len() {
+			checked.push(.None)
+		}
+		for (i, (arg, _)) in written.forwards().enumerate() {
+			if i < values.len() then checked[arg] = .Some(values[i])
+		}
+		for arg in matched.unmatched {
+			self.inferArgument(args[arg], .None)
+		}
+		return self.arrangeArguments(&slots, &matched, &checked, item.span)
+	}
+
+	/// Reports arguments left over, and parameters given no value. A call
+	/// that names nothing, of a function without defaults, is counted.
+	/// `names` has the name of each argument given, if it has one.
+	var fn reportArgumentCount(
+		name: str,
+		slots: &[Slot],
+		matched: &Matched,
+		names: &[Option<ast::Name>],
+		sigSpan: Span,
+		span: Span,
+	) = {
+		val given = names.len()
+		val missing = matched.missing(&slots)
+		if missing.isEmpty() && matched.extra == 0 then return
+		var plain = true
+		for n in names {
+			if n.isSome() then plain = false
+		}
+		for s in slots {
+			if s.default.isSome() then plain = false
+		}
+		val diagnostic = if plain || matched.extra > 0 {
+			Diagnostic::error(
+				ARGUMENT_COUNT,
+				"`\(name)` takes \(plural(slots.len(), "argument", "arguments")) but \(givenCount(given)) given",
+				span,
+				"expected \(plural(slots.len(), "argument", "arguments"))",
+			)
+		} else {
+			var listed: Vec<String> = Vec()
+			for i in missing {
+				listed.push("`\(self.text(slots[i].name))`")
+			}
+			val which = if missing.len() == 1 then "the argument" else "the arguments"
+			Diagnostic::error(
+				ARGUMENT_COUNT,
+				"`\(name)` is missing \(which) \(listed.join(", "))",
+				span,
+				"missing \(listed.join(", "))",
+			)
+		}
+		self.report(diagnostic.withSecondary(sigSpan, "declared here"))
+	}
+
+	/// Whether a call of `sym` builds a struct: `Self`, or the name of a type
+	/// here, imported or of the prelude, where no function or variable is
+	/// called that. An enum's name is taken too, for the literal to say it is
+	/// not a struct.
+	fn namesStruct(sym: Symbol): bool = {
+		if self.lookup(sym).isSome() ||
+			self.namesAround(sym) ||
+			self.fns().contains(&sym) ||
+			self.preludeFn(sym).isSome() {
+			return false
+		}
+		val name = ast::Name(sym: sym, span: Span::new(0, 0))
+		return match self.imported(name) {
+			.Some(.Item(module, name: item)) =>
+				!self.modules[module].fns.contains(&item.sym) &&
+					(self.modules[module].types.contains(&item.sym) ||
+						self.modules[module].aliases.contains(&item.sym))
+			_ =>
+				self.text(sym) == "Self" ||
+					self.types().contains(&sym) ||
+					self.modules[self.current].aliases.contains(&sym) ||
+					self.preludeModule(sym).isSome()
+		}
+	}
+
+	/// `..base` in a call that builds no struct.
+	var fn restWithoutStruct(rest: ast::ExprId) = {
+		val span = self.ast.exprs[rest].span
+		self.report(
+			Diagnostic::error(
+				REST_NOT_LAST,
+				"`..` takes the fields of a struct the call builds, and this call builds none",
+				span,
+				"not a struct's fields",
+			).withNote(
+				"`Name(field: value, ..base)` builds a struct whose fields not named are `base`'s",
+			),
+		)
+		self.infer(rest, .None)
+	}
+
+	/// A call whose callee is a path: a struct built, where the path names
+	/// one, and otherwise what `pathExpr` finds.
+	var fn pathCall(
+		leadingDot: bool,
+		segments: &[ast::Name],
+		item: ItemUse,
+		rest: Option<ast::ExprId>,
+	): ExprId = {
+		if !leadingDot &&
+			self.resolvePathQuietly(&segments) is .Item(module, name) &&
+			self.moduleTypesContain(module, name.sym) {
+			val fields = match item.args {
+				.Some(a) => Written(args: a, names: item.names)
+				.None => Written(args: &noArgs(), names: item.names)
+			}
+			val lit = StructLit(
+				typeArgs: item.typeArgs,
+				fields: fields,
+				rest: rest,
+				hint: item.hint,
+				span: item.span,
+			)
+			return self.structLitOf(module, name, segments.len() - 1, lit)
+		}
+		if rest is .Some(r) then self.restWithoutStruct(r)
+		return self.pathExpr(leadingDot, &segments, item)
+	}
+
+	var fn pathExpr(leadingDot: bool, segments: &[ast::Name], item: ItemUse): ExprId = {
+		if item.typeArgs is .Some(typeArgs) &&
+			self.variableWithTypeArgs(&segments, &typeArgs) is .Some(diagnostic) {
+			self.report(move diagnostic)
+			return self.giveUpItem(item)
+		}
+		if leadingDot {
+			if segments.len() != 1 {
+				self.report(
+					Diagnostic::error(
+						UNKNOWN_MODULE,
+						"a leading `.` names a variant, and takes no path",
+						segments[0].span,
+						"not a variant name",
+					).withNote(MODULE_NOTE),
+				)
+				return self.giveUpItem(item)
+			}
+			var used = item
+			used.typeArgs = .None
+			used.nameSegment = 0
+			return self.variantLit(.None, segments[0], used)
+		}
+		return match self.resolvePath(&segments, true, MODULE_NOTE) {
+			// A function, of this module or another.
+			.Item(module, name) => {
+				var used = item
+				used.nameSegment = segments.len() - 1
+				self.moduleFn(module, name, used)
+			}
+			// `Enum::Variant`, in this module or in another.
+			.Variant(module, enumName: typeName, variant: member) => {
+				var used = item
+				used.nameSegment = segments.len() - 2
+				// `T::name(…)` is a function of an interface the type parameter
+				// requires.
+				if module == self.current &&
+					self.constrainedStatic(typeName, member, used) is .Some(call) {
+					return call
+				}
+				// `Type::name(…)` is a static function, where the type has one;
+				// otherwise a variant.
+				if self.staticFn(module, typeName, member, used) is .Some(call) then return call
+				self.variantLit(.Some((module, typeName)), member, used)
+			}
+			.Broken => self.giveUpItem(item)
+		}
+	}
+
+	/// Whether an argument is a variable followed by what reads as type
+	/// arguments, which `variableWithTypeArgs` reports.
+	fn misreadComparison(arg: ast::ExprId): bool = {
+		val file = self.ast
+		var e = arg
+		if file.exprs[e].kind is .Call(callee, ..) then e = callee
+		return match file.exprs[e].kind {
+			.Path(segments, typeArgs: .Some(_), ..) =>
+				segments.len() == 1 && self.lookup(segments[0].sym).isSome()
+			_ => false
+		}
+	}
+
+	/// A variable followed by what reads as type arguments: `x < y, z > (w)`
+	/// in an argument list is `x<y, z>(w)`. Reports it with a fix that makes
+	/// the first comparison one.
+	fn variableWithTypeArgs(
+		segments: &[ast::Name],
+		typeArgs: &ast::TypeArgs,
+	): Option<Diagnostic> = {
+		if segments.len() != 1 then return .None
+		val name = segments[0]
+		if self.lookup(name.sym).isNone() then return .None
+		val text = self.text(name.sym)
+		var diagnostic = Diagnostic::error(
+			TYPE_ARGUMENT_COUNT,
+			"`\(text)` is a variable, and takes no type arguments",
+			typeArgs.span,
+			"read as type arguments",
+		).withNote(
+			"after a name, `<` starts type arguments when `(`, `{` or `::` follows the matching `>`",
+		)
+		if !typeArgs.args.isEmpty() {
+			val end = self.ast.types[typeArgs.args[0]].span.hi
+			diagnostic = diagnostic.withFix("to compare, put the comparison in parentheses", own [
+				Edit::insert(name.span.lo, "("),
+				Edit::insert(end, ")"),
+			])
+		}
+		return .Some(move diagnostic)
+	}
+
+	/// A function named through its module: `io::print(1)`.
+	var fn moduleFn(module: i64, item: ast::Name, used: ItemUse): ExprId = {
+		val span = used.span
+		val name = String::of(self.text(item.sym))
+		// A constant of that module, which is not called.
+		if self.modules[module].consts.get(&item.sym) is .Some(id) &&
+			self.program.consts[id].isPub {
+			val value = self.constUse(id, item.span)
+			if used.args.isSome() {
+				self.report(
+					Diagnostic::error(
+						NOT_CALLABLE,
+						"`\(name)` is a constant, not a function",
+						span,
+						"called here",
+					),
+				)
+				return self.giveUpItem(used)
+			}
+			return self.referent(value, used.hint, item.span)
+		}
+		// A variable that module's C owns, read through the accessor the
+		// compiler declared for it.
+		if self.modules[module].globals.get(&item.sym) is .Some(id) &&
+			self.program.globals[id].isPub {
+			val getter = self.program.globals[id].getter
+			val ty = self.program.globals[id].ty
+			if used.args.isSome() {
+				self.report(
+					Diagnostic::error(
+						NOT_CALLABLE,
+						"`\(name)` is a variable C owns, not a function",
+						span,
+						"called here",
+					),
+				)
+				return self.giveUpItem(used)
+			}
+			return self.alloc(
+				.Call(callee: getter, args: Vec(), typeArgs: TyList::empty(), order: Vec()),
+				ty,
+				item.span,
+			)
+		}
+		var found: Option<FnId> = match self.modules[module].fns.get(&item.sym) {
+			.Some(id) => .Some(id)
+			.None => .None
+		}
+		// A function of the prelude, where the path named this module.
+		if found.isNone() && module == self.current then found = self.preludeFn(item.sym)
+		val .Some(id) = found else {
+			val path = self.modules[module].path.clone()
+			// The module of `package::NAME` holds `VERSION` only where the
+			// package says what its version is.
+			if (path == "package" || path.endsWith("::package")) && name == "VERSION" {
+				self.report(
+					Diagnostic::error(
+						PACKAGE,
+						"this package says no version",
+						item.span,
+						"`package::VERSION` is its `@version`",
+					).withHelp("write `@version(\"1.0.0\")` above `package` in its `package.wip`"),
+				)
+				return self.giveUpItem(used)
+			}
+			var candidates: Vec<str> = Vec()
+			val fns = &self.modules[module].fns
+			for i in 0..fns.len() {
+				candidates.push(self.text(fns.keyAt(i).clone()))
+			}
+			val consts = &self.modules[module].consts
+			for i in 0..consts.len() {
+				candidates.push(self.text(consts.keyAt(i).clone()))
+			}
+			// A path that names no module is a name of this one: said as an
+			// unknown name is, with what left the prelude.
+			if module == self.current && leftThePrelude(&name) is .Some(help) {
+				self.report(
+					Diagnostic::error(
+						UNKNOWN_NAME,
+						"cannot find `\(name)` in this scope",
+						item.span,
+						"not found",
+					).withHelp(move help),
+				)
+				return self.giveUpItem(used)
+			}
+			var diagnostic = Diagnostic::error(
+				UNKNOWN_NAME,
+				"cannot find `\(name)` in module `\(path)`",
+				item.span,
+				"unknown name",
+			)
+			if suggest(&name, &candidates) is .Some(similar) then
+				diagnostic = diagnostic.withFix(
+					"did you mean `\(similar)`?",
+					own [Edit::replace(item.span, String::of(similar))],
+				)
+			self.report(move diagnostic)
+			return self.giveUpItem(used)
+		}
+		if !self.visible(module, self.program.fns[id].isPub) then
+			self.privateItem(module, "fn", item)
+		return if used.args.isSome() then self.call(id, used) else self.fnValue(id, used, .None)
+	}
+
+	/// A function of a type reached through an alias of the type knows what
+	/// the type's own parameters are: they are inferred from the type the
+	/// alias names.
+	var fn ownerTypeArgs(
+		id: FnId,
+		generics: &[GenericParamDef],
+		ownerTy: Ty,
+		inference: &var Inference,
+	) = {
+		val .Some(owner) = self.program.ownerOfFn(id) else {
+			return
+		}
+		var params: Vec<Ty> = Vec()
+		for (index, param) in generics.forwards().enumerate() {
+			params.push(
+				self.intern(
+					.Param(TyParam(index: index as u32, name: param.name, copy: param.copy)),
+				),
+			)
+		}
+		val list = self.program.types.internList(&params)
+		if self.program.typeOf(owner, list) is .Some(declared) then
+			self.unify(declared, ownerTy, &var inference.tys)
+	}
+
+	/// A function named as a value: its address, of a function type. A
+	/// generic function takes its type arguments from those written after
+	/// its name, or from the function type expected. `shown` is how it was
+	/// written where that is more than its name, `Shape::area`, for what is
+	/// reported.
+	var fn fnValue(id: FnId, item: ItemUse, shown: Option<str>): ExprId = {
+		val name = match shown {
+			.Some(s) => String::of(s)
+			.None => String::of(self.text(self.program.fns[id].name))
+		}
+		val nameSym = self.program.fns[id].name
+		val ret = self.program.fns[id].ret
+		val span = item.span
+		// `@inline` promises that every call is spliced, and a call through a
+		// value has no callee to splice.
+		if self.program.fns[id].isInline {
+			val declared = self.program.fns[id].span
+			self.report(
+				Diagnostic::error(
+					CANNOT_INLINE,
+					"`\(name)` is `@inline`, so it cannot be a value",
+					span,
+					"taken as a value here",
+				).withSecondary(declared, "declared `@inline` here").
+					withNote(
+						"`@inline` promises that every call to it is spliced into its caller, and a call through a value has no callee to splice",
+					).
+					withHelp("write a lambda that calls it, or remove `@inline`"),
+			)
+			return self.errorExpr(span)
+		}
+		// What the compiler writes where it is called has no code of its own
+		// to be the address of.
+		if self.program.fns[id].intrinsic.isSome() {
+			self.report(
+				Diagnostic::error(
+					NOT_A_VALUE,
+					"`\(name)` is written where it is called, and is not a value",
+					span,
+					"no code of its own",
+				).withNote(
+					"the compiler writes its body at each call, so there is no function to hand over",
+				).withHelp("write a lambda that calls it"),
+			)
+			return self.errorExpr(span)
+		}
+		if self.kind(ret) is .Ref(..) {
+			self.report(
+				Diagnostic::error(
+					NOT_A_VALUE,
+					"`\(name)` is a projection, and cannot be a value yet",
+					span,
+					"lends a place",
+				).withNote(
+					"a projection lends a place to its caller; a function value returns a value",
+				).withHelp("write a lambda that calls it"),
+			)
+			return self.errorExpr(span)
+		}
+		var paramTys: Vec<Ty> = Vec()
+		for p in self.program.fns[id].params {
+			paramTys.push(p.ty)
+		}
+		val generics = self.program.fns[id].generics.clone()
+		val params = self.program.types.internList(&paramTys)
+		var ty = self.intern(.Fn(params: params, ret: ret))
+		val explicit = self.explicitTypeArgs(nameSym, &generics, item.typeArgs, item.nameSegment)
+		var inference = Inference::new(move explicit)
+		if item.ownerTy is .Some(ownerTy) then
+			self.ownerTypeArgs(id, &generics, ownerTy, &var inference)
+		// Where a closure is wanted, lent or owned, the function it would be
+		// lent as is what says the types.
+		if item.hint is .Some(hint) {
+			val wanted = match self.kind(hint) {
+				.Ref(inner, ..) | .Own(inner) if self.kind(inner) is .Fn(..) => inner
+				_ => hint
+			}
+			self.unify(ty, wanted, &var inference.tys)
+		}
+		var typeArgs = TyList::empty()
+		if !generics.isEmpty() {
+			val written = "\(name)<\(elided(generics.len()))>"
+			val tys = self.finishTypeArgs(&name, &written, &generics, move inference, span)
+			typeArgs = self.program.types.internList(&tys)
+			ty = self.program.types.subst(ty, &tys)
+		}
+		return self.alloc(.FnRef(id: id, typeArgs: typeArgs), ty, span)
+	}
+
+	/// A call through a value of the function type `(params) => ret`.
+	var fn callValue(
+		callee: ExprId,
+		paramList: TyList,
+		ret: Ty,
+		args: &[ast::ExprId],
+		span: Span,
+	): ExprId = {
+		val params = self.program.types.list(paramList).toVec()
+		if args.len() != params.len() {
+			val calleeTy = self.tyOf(callee)
+			self.report(
+				Diagnostic::error(
+					ARGUMENT_COUNT,
+					"the function takes \(plural(params.len(), "argument", "arguments")) but \(givenCount(args.len())) given",
+					span,
+					"expected \(plural(params.len(), "argument", "arguments"))",
+				).withSecondary(self.state.body.exprs[callee].span, self.tyName(calleeTy)),
+			)
+		}
+		var hirArgs: Vec<ExprId> = Vec()
+		for (i, a) in args.forwards().enumerate() {
+			val arg =
+				if i < params.len() then self.checkArgument(a, params[i], .None)
+				else self.inferArgument(a, .None)
+			hirArgs.push(arg)
+		}
+		return self.alloc(.CallValue(callee: callee, args: move hirArgs), ret, span)
+	}
+
+	/// A call through a closure: the arguments are checked as any other
+	/// call's, and the code takes what was captured first.
+	var fn callClosure(
+		callee: ExprId,
+		params: TyList,
+		ret: Ty,
+		args: &[ast::ExprId],
+		span: Span,
+	): ExprId = {
+		val value = self.callValue(callee, params, ret, &args, span)
+		val .CallValue(args: checked, ..) = self.state.body.exprs[value].kind.clone() else {
+			panic("a call through a value was just built")
+		}
+		// The code's own type: what it captured, then the arguments.
+		var paramTys = Vec::of(own [PTR_U8])
+		for t in self.program.types.list(params) {
+			paramTys.push(t)
+		}
+		val list = self.program.types.internList(&paramTys)
+		val codeTy = self.intern(.Fn(params: list, ret: ret))
+		self.state.body.exprs[value].kind = .CallClosure(
+			callee: callee,
+			args: move checked,
+			codeTy: codeTy,
+		)
+		return value
+	}
+}
+
+/// `…` for each of `count` type arguments, as a message writes them.
+fn elided(count: i64): String = {
+	var parts: Vec<str> = Vec()
+	for _ in 0..count {
+		parts.push("…")
+	}
+	return parts.join(", ")
+}

@@ -1,0 +1,1347 @@
+// Items: structs, enums, functions and extern blocks.
+
+/// What a struct's or an enum's body holds: its fields or variants, and its
+/// methods, which may be written among them.
+enum Member<E> {
+	Item(item: E)
+	Method(decl: FnDecl)
+}
+
+fn splitMembers<E>(members: Vec<Member<E>>): (Vec<E>, Vec<FnDecl>) = {
+	var items: Vec<E> = Vec()
+	var methods: Vec<FnDecl> = Vec()
+	for member in move members {
+		match move member {
+			.Item(item) => items.push(move item)
+			.Method(decl) => methods.push(move decl)
+		}
+	}
+	return (move items, move methods)
+}
+
+/// What an extern block declares: a C function, or an opaque C type.
+enum ExternMember {
+	Fn(decl: ExternFn)
+	Type(declared: ExternType)
+	Global(global: ExternGlobal)
+	/// A `struct` or a `union` written in the block, which is C's layout
+	/// without saying `extern` again.
+	Struct(decl: StructDecl)
+}
+
+/// What a struct declaration is, which says whether it may be written
+/// without braces.
+@derive(Eq, Clone)
+enum StructKind {
+	/// `struct Name`, which may be.
+	Plain
+	/// `view struct Name`, with where `view` was written.
+	View(at: Span)
+	/// `extern struct Name`, or `struct Name` in an `extern` block.
+	Extern
+	/// `extern union Name`, or `union Name` in an `extern` block.
+	Union
+}
+
+/// An annotation's argument begins with a literal, or with the name before
+/// `=`.
+fn startsAnnotationArg(kind: TokenKind): bool =
+	isIdent(kind) || kind is .Int | .Str(..) | .True | .False
+
+/// A member begins with its name, with the words that declare a method, or
+/// with an annotation.
+fn startsMember(kind: TokenKind): bool =
+	isIdent(kind) || kind is .At | .Fn | .Pub | .Var | .Move | .Static | .Lend
+
+extend Parser {
+	/// A `package.wip`: annotations, `package NAME`, and the end of the
+	/// file.
+	var fn packageFile(): (Vec<Annotation>, Option<Name>) = {
+		while self.eat(.Semi) {}
+		val annotations = self.annotations()
+		var name: Option<Name> = .None
+		if self.peek() is .Ident(..) && self.nthText(0) == "package" {
+			self.bump()
+			name = self.name("the package's name")
+		} else {
+			val diagnostic = self.expected("`package` and the package's name").withNote(
+				"a `package.wip` is annotations and `package NAME`, and nothing else",
+			)
+			self.report(move diagnostic)
+		}
+		while self.eat(.Semi) {}
+		if name.isSome() && !self.at(.Eof) {
+			val diagnostic = Diagnostic::error(
+				EXPECTED,
+				"a `package.wip` holds nothing after its `package`",
+				self.span(),
+				"not part of a package's declaration",
+			).withNote(
+				"the package's modules are its directories; `package.wip` only names it and says what it depends on",
+			)
+			self.report(move diagnostic)
+		}
+		return (move annotations, name)
+	}
+
+	var fn program() = {
+		while true {
+			while self.eat(.Semi) {}
+			if self.at(.Eof) then return
+			self.beginRegion()
+			// Annotations come first, then `pub`, then the item.
+			val annotations = self.annotations()
+			val isPub = self.at(.Pub)
+			val pubSpan: Option<Span> = if isPub then .Some(self.bump()) else .None
+			match self.item(isPub, pubSpan, move annotations) {
+				.Some(found) => self.ast.items.push(move found)
+				.None => {}
+			}
+		}
+	}
+
+	/// One item of the file, after its annotations and its `pub`.
+	var fn item(isPub: bool, pubSpan: Option<Span>, annotations: Vec<Annotation>): Option<Item> = {
+		val kind = self.peek()
+		if kind == .Val then
+			return match self.valDecl(isPub, move annotations) {
+				.Some(decl) => .Some(.Val(decl: move decl))
+				.None => .None
+			}
+		// Checked while the program is compiled.
+		if kind is .Assert(message) && !isPub {
+			val start = self.span()
+			val assertion = self.assertExpr(message)
+			val span = start.to(self.prevSpan())
+			return .Some(.Assert(decl: AssertDecl(
+				annotations: move annotations,
+				assertion: assertion,
+				span: span,
+			)))
+		}
+		if kind is .Var | .Let {
+			val span = self.span()
+			val diagnostic = Diagnostic::error(
+				EXPECTED,
+				"a global variable is not supported yet",
+				span,
+				"not a constant",
+			).withNote(
+				"a top-level `val` is a constant, whose value is known where it is written; a variable that lives as long as the program raises questions of its own",
+			).withHelp("write `val`, or declare it inside a function")
+			self.report(move diagnostic)
+			self.skipToItem()
+			return .None
+		}
+		if kind == .Struct then
+			return self.structItem(self.structDeclWith(isPub, .Plain, move annotations))
+		// `view struct Name { … }`: a struct that borrows.
+		// `view` is a word only here, so a program
+		// may still name something `view`.
+		if kind is .Ident(..) && self.nthText(0) == "view" && self.nth(1) == .Struct {
+			val view = self.bump()
+			var .Some(decl) = self.structDeclWith(isPub, .View(at: view), move annotations) else {
+				return .None
+			}
+			decl.span = view.to(decl.span)
+			return .Some(.Struct(decl: move decl))
+		}
+		// `view enum Name { … }`: an enum whose variants borrow.
+		if kind is .Ident(..) && self.nthText(0) == "view" && self.nth(1) == .Enum {
+			val view = self.bump()
+			var .Some(decl) = self.enumDecl(isPub, move annotations) else {
+				return .None
+			}
+			decl.isView = true
+			decl.span = view.to(decl.span)
+			return .Some(.Enum(decl: move decl))
+		}
+		// `type Id = i64`: another name for a type.
+		// Inside an extern block `type` declares
+		// a C type instead.
+		if kind == .Type {
+			self.noAnnotations(&annotations, "a type alias")
+			return match self.typeAlias(isPub) {
+				.Some(alias) => .Some(.Type(alias: move alias))
+				.None => .None
+			}
+		}
+		if kind == .Enum then
+			return match self.enumDecl(isPub, move annotations) {
+				.Some(decl) => .Some(.Enum(decl: move decl))
+				.None => .None
+			}
+		if kind == .Fn then
+			return match self.fnDecl(pubSpan, move annotations) {
+				.Some(decl) => .Some(.Fn(decl: move decl))
+				.None => .None
+			}
+		// `extend Type: Interface { … }`. `extend`
+		// is a word only where an item begins, so a program may
+		// still name something `extend`.
+		if !isPub && self.atExtend() then
+			return match self.extendBlock(move annotations) {
+				.Some(block) => .Some(.Extend(block: move block))
+				.None => .None
+			}
+		if kind == .Impl {
+			val span = self.bump()
+			val diagnostic = Diagnostic::error(
+				IMPL_KEYWORD,
+				"`impl` is written `extend`",
+				span,
+				"not a word of the language",
+			).withFix("write `extend`", own [Edit::replace(span, "extend")]).withNote(
+				"a type's methods are `extend Type { … }`, and an interface's are `extend Type: Interface { … }`",
+			)
+			self.report(move diagnostic)
+			self.skipBraced()
+			return .None
+		}
+		if kind == .Interface then
+			return match self.interfaceDecl(isPub, move annotations) {
+				.Some(decl) => .Some(.Interface(decl: move decl))
+				.None => .None
+			}
+		if kind == .Import && !isPub {
+			self.noAnnotations(&annotations, "an import")
+			return match self.importDecl() {
+				.Some(decl) => .Some(.Import(decl: move decl))
+				.None => .None
+			}
+		}
+		// `extern struct Name { … }` is a C layout, not a block of
+		// declarations.
+		if kind == .Extern && self.nth(1) == .Struct {
+			self.bump()
+			return self.structItem(self.structDeclWith(isPub, .Extern, move annotations))
+		}
+		// `extern union Name { … }`: every field over the same
+		// bytes. `union` is a word only here, so a
+		// program may still name something `union`.
+		if kind == .Extern && isIdent(self.nth(1)) && self.nthText(1) == "union" {
+			self.bump()
+			return self.structItem(self.structDeclWith(isPub, .Union, move annotations))
+		}
+		if kind == .Extern && !isPub then
+			return match self.externBlock(move annotations) {
+				.Some(block) => .Some(.Extern(block: move block))
+				.None => .None
+			}
+		if isPub {
+			val diagnostic = Diagnostic::error(
+				EXPECTED,
+				"`pub` belongs on a function, struct or enum",
+				pubSpan.unwrapOr(self.span()),
+				"nothing to export here",
+			).withNote("`import` and `extern` declarations are never exported")
+			self.report(move diagnostic)
+			self.skipToItem()
+			return .None
+		}
+		var diagnostic = self.expected(
+			"an item (`fn`, `val`, `struct`, `enum`, `interface`, `extend`, `import` or `extern`)",
+		)
+		if isStmtKeyword(self.peek()) || canStartExpr(self.peek()) then
+			diagnostic = diagnostic.withHelp("statements belong inside a function body")
+		self.report(move diagnostic)
+		self.bump()
+		self.skipToItem()
+		return .None
+	}
+
+	/// A struct declaration as an item, where one was read.
+	fn structItem(decl: Option<StructDecl>): Option<Item> = match move decl {
+		.Some(decl) => .Some(.Struct(decl: move decl))
+		.None => .None
+	}
+
+	/// `interface Name { … }`: method signatures, each with the receiver it
+	/// takes and a default body where one is written.
+	var fn interfaceDecl(isPub: bool, annotations: Vec<Annotation>): Option<InterfaceDecl> = {
+		val start = self.bump()
+		val .Some(name) = self.name("an interface name") else {
+			self.skipToItem()
+			return .None
+		}
+		// `interface From<T>`: an interface about other types.
+		val generics = self.genericParams()
+		val open = self.itemBodyOpen()?
+		val list = BraceList(sep: .Comma, what: "a method", items: "methods", code: SEPARATOR)
+		val (methods, close) = self.braceList(
+			open,
+			list,
+			(kind) => startsMember(kind),
+			(p) => p.interfaceMethod(),
+		)
+		return .Some(InterfaceDecl(
+			annotations: move annotations,
+			name: name,
+			generics: move generics,
+			methods: move methods,
+			isPub: isPub,
+			span: start.to(close),
+		))
+	}
+
+	/// One method of an interface: `fn area(): f64`, or with `= expr` a
+	/// default body.
+	var fn interfaceMethod(): Option<InterfaceMethod> = {
+		// An interface method is a signature, which nothing annotates yet.
+		val annotations = self.annotations()
+		self.noAnnotations(&annotations, "an interface method")
+		val start = self.span()
+		val receiver: Receiver = match self.peek() {
+			.Fn => .Read
+			.Var => .Var
+			.Move => .Move
+			.Static => .Static
+			_ => {
+				val diagnostic = self.expected("a method")
+				self.report(move diagnostic)
+				self.skipUntil((k, lineBreak) => lineBreak || k == .Comma)
+				return .None
+			}
+		}
+		var keyword = start
+		if receiver != .Read {
+			keyword = self.bump()
+			if !self.at(.Fn) {
+				val diagnostic = Diagnostic::error(
+					MEMBER_SYNTAX,
+					"expected `fn` after `\(self.text(keyword))`",
+					Span::at(keyword.hi),
+					"expected `fn`",
+				).withNote("`\(receiver.text())` declares a method")
+				self.report(move diagnostic)
+				self.skipUntil((k, lineBreak) => lineBreak || k == .Comma)
+				return .None
+			}
+		}
+		val sig = self.fnSig()?
+		val default: Option<ExprId> = if self.eat(.Eq) then .Some(self.expr()) else .None
+		val end = match default {
+			.Some(body) => self.exprSpan(body)
+			.None => sig.span
+		}
+		return .Some(InterfaceMethod(
+			sig: move sig,
+			receiver: (receiver, keyword),
+			default: default,
+			span: start.to(end),
+		))
+	}
+
+	/// `extend [T] { … }`, at the `[`. The name inside it
+	/// declares the element, as a type parameter of the block.
+	var fn sliceExtend(start: Span, annotations: Vec<Annotation>): Option<ExtendBlock> = {
+		val open = self.bump()
+		val .Some(elem) = self.name("the element's name") else {
+			self.skipToItem()
+			return .None
+		}
+		// `extend [T: Ord] { … }`: methods a slice has where its element
+		// answers the constraint.
+		val bounds = self.bounds()?
+		self.expectClosing(.RBracket, open)
+		val (interfaceModule, interfaceName, interfaceArgs) = self.extendedInterface()?
+		val body = self.itemBodyOpen()?
+		val list = BraceList(sep: .Comma, what: "a method", items: "methods", code: SEPARATOR)
+		val (members, close) = self.braceList(
+			body,
+			list,
+			(kind) => startsMember(kind),
+			(p) => p.member((q, _) => q.noMember()),
+		)
+		val (_, methods) = splitMembers(move members)
+		val param = GenericParam(
+			decided: .None,
+			name: elem,
+			bounds: move bounds,
+			default: .None,
+			span: elem.span.to(self.prevSpan()),
+		)
+		return .Some(ExtendBlock(
+			annotations: move annotations,
+			sliceOf: .Some(elem),
+			interfaceName: interfaceName,
+			interfaceModule: move interfaceModule,
+			interfaceArgs: move interfaceArgs,
+			path: Vec::of(own [elem]),
+			generics: Vec::of(own [move param]),
+			methods: move methods,
+			derived: .None,
+			span: start.to(close),
+		))
+	}
+
+	/// What an `extend` block's body holds where a method should be:
+	/// reported, and the rest of the line skipped.
+	var fn noMember(): Option<Field> = {
+		val diagnostic = self.expected("a method")
+		self.report(move diagnostic)
+		self.skipUntil((k, lineBreak) => lineBreak || k == .Comma)
+		return .None
+	}
+
+	/// `: Interface`, with the interface's own type arguments where it
+	/// takes any.
+	var fn extendedInterface(): Option<(Vec<Name>, Option<Name>, Option<TypeArgs>)> = {
+		if !self.eat(.Colon) then return .Some((Vec(), .None, .None))
+		val (module, named) = match self.interfaceName("an interface name") {
+			.Some(found) => move found
+			.None => {
+				self.skipBraced()
+				return .None
+			}
+		}
+		var args: Option<TypeArgs> = .None
+		if self.at(.Lt) {
+			val (types, span) = self.typeArgList()
+			args = .Some(TypeArgs(after: 0, args: move types, span: span))
+		}
+		// One interface per block, so that every method belongs to one.
+		if self.at(.Plus) {
+			val span = self.span()
+			val diagnostic = Diagnostic::error(
+				EXPECTED,
+				"one interface at a time",
+				span,
+				"a second interface",
+			).withNote(
+				"a block is exactly one interface's methods, so that a method belongs to one of them",
+			).withHelp("write another `extend` block for it")
+			self.report(move diagnostic)
+			self.skipBraced()
+			return .None
+		}
+		return .Some((move module, .Some(named), move args))
+	}
+
+	/// Whether an item begins `extend`, which is a word only here.
+	var fn atExtend(): bool = isIdent(self.peek()) && self.text(self.span()) == "extend"
+
+	/// `extend Type { … }` and `extend Type: Interface { … }`: the type
+	/// first, and the interface written as a constraint is.
+	var fn extendBlock(annotations: Vec<Annotation>): Option<ExtendBlock> = {
+		val start = self.bump()
+		// `extend [T] { … }`: methods of a slice, whose element the block
+		// declares.
+		if self.at(.LBracket) then return self.sliceExtend(start, move annotations)
+		val .Some(name) = self.name("a type name") else {
+			self.skipToItem()
+			return .None
+		}
+		// A path is parsed so that `extend pkg::Type` is reported as what
+		// it is: a type of another module.
+		var path = Vec::of(own [name])
+		while self.eat(.ColonColon) {
+			match self.name("a type name") {
+				.Some(next) => path.push(next)
+				.None => {
+					self.skipToItem()
+					return .None
+				}
+			}
+		}
+		// The type's own parameters: `extend Slots<T>`, `extend Boxed<V>`.
+		val generics = self.genericParams()
+		val (interfaceModule, interfaceName, interfaceArgs) = self.extendedInterface()?
+		val open = self.itemBodyOpen()?
+		val list = BraceList(sep: .Comma, what: "a method", items: "methods", code: SEPARATOR)
+		val (members, close) = self.braceList(
+			open,
+			list,
+			(kind) => startsMember(kind),
+			(p) => p.member((q, _) => q.noMember()),
+		)
+		val (_, methods) = splitMembers(move members)
+		return .Some(ExtendBlock(
+			annotations: move annotations,
+			sliceOf: .None,
+			interfaceName: interfaceName,
+			interfaceModule: move interfaceModule,
+			interfaceArgs: move interfaceArgs,
+			path: move path,
+			generics: move generics,
+			methods: move methods,
+			derived: .None,
+			span: start.to(close),
+		))
+	}
+
+	/// Expects `{` to open the body of an item; on failure, skips to the next
+	/// item.
+	var fn itemBodyOpen(): Option<Span> = {
+		if self.at(.LBrace) then return .Some(self.bump())
+		val diagnostic = self.expected("`{`")
+		self.report(move diagnostic)
+		self.skipToItem()
+		return .None
+	}
+
+	/// `type Name<T> = type`.
+	var fn typeAlias(isPub: bool): Option<TypeAlias> = {
+		val start = self.bump()
+		val name = self.name("a name for the type")?
+		val generics = self.genericParams()
+		if !self.expect(.Eq) {
+			self.skipToItem()
+			return .None
+		}
+		val ty = self.ty()
+		return .Some(TypeAlias(
+			isPub: isPub,
+			name: name,
+			generics: move generics,
+			ty: ty,
+			span: start.to(self.prevSpan()),
+		))
+	}
+
+	/// A struct, `struct Name { … }`, or a `view` one, which may borrow, or
+	/// C's layout, `extern struct Name { … }` and `extern union Name { … }`.
+	/// A plain struct with no fields is its name alone, `struct Csv`: the
+	/// declaration ends at its line, as any item does.
+	var fn structDeclWith(
+		isPub: bool,
+		kind: StructKind,
+		annotations: Vec<Annotation>,
+	): Option<StructDecl> = {
+		val isExtern = kind is .Extern | .Union
+		val isUnion = kind == .Union
+		val isView = kind is .View(..)
+		val start = self.bump()
+		val what = if isUnion then "a union name" else "a struct name"
+		val .Some(name) = self.name(what) else {
+			self.skipToItem()
+			return .None
+		}
+		val generics = self.genericParams()
+		if self.onLaterLine() {
+			if !self.at(.LBrace) {
+				self.noBody(kind, start)
+				return .Some(StructDecl(
+					annotations: move annotations,
+					isExtern: isExtern,
+					isUnion: isUnion,
+					isView: isView,
+					name: name,
+					generics: move generics,
+					fields: Vec(),
+					methods: Vec(),
+					isPub: isPub,
+					span: start.to(self.prevSpan()),
+				))
+			}
+			// A body on the next line: reported, and read as the body all
+			// the same, so that what is in it is read as it was meant.
+			val brace = self.span()
+			val (gapLo, gapHi) = (self.prevSpan().hi, brace.lo)
+			val diagnostic = Diagnostic::error(
+				STRUCT_BODY,
+				"a struct's body starts on the line of its name",
+				brace,
+				"on the next line",
+			).withNote(
+				"a struct with no fields is written without braces, so a `{` on the line after its name would begin nothing",
+			).withFix("move the `{` up", own [Edit::replace(Span::new(gapLo, gapHi), " ")])
+			self.report(move diagnostic)
+		}
+		val open = self.itemBodyOpen()?
+		val list = BraceList(sep: .Comma, what: "a field", items: "fields", code: SEPARATOR)
+		val (members, close) = self.braceList(
+			open,
+			list,
+			(kind) => startsMember(kind),
+			(p) => p.member((q, pubSpan) => q.structField(pubSpan)),
+		)
+		val (fields, methods) = splitMembers(move members)
+		return .Some(StructDecl(
+			annotations: move annotations,
+			isExtern: isExtern,
+			isUnion: isUnion,
+			isView: isView,
+			name: name,
+			generics: move generics,
+			fields: move fields,
+			methods: move methods,
+			isPub: isPub,
+			span: start.to(close),
+		))
+	}
+
+	/// A struct's field: `name: T = value`, where the value is what a
+	/// literal that leaves the field out puts there.
+	var fn structField(pubSpan: Option<Span>): Option<Field> = {
+		// `pub var x: i64` is written by anyone; `pub x: i64` is
+		// read by anyone and written where it is declared.
+		val varSpan: Option<Span> = if self.at(.Var) then .Some(self.bump()) else .None
+		var field = self.field("a field name")?
+		field.isPub = pubSpan.isSome()
+		field.isVar = varSpan.isSome()
+		if varSpan is .Some(at) && pubSpan.isNone() {
+			val diagnostic = Diagnostic::error(
+				MEMBER_SYNTAX,
+				"`var` on a field says who else may write it",
+				at,
+				"not exported",
+			).withNote(
+				"a field its module does not export is that module's to read and write; `pub var` is what lets another module write it",
+			).withFix("remove `var`", own [Edit::replace(at, "")])
+			self.report(move diagnostic)
+		}
+		self.fieldDefault(&var field)
+		if pubSpan is .Some(at) then field.span = at.to(field.span)
+		return .Some(move field)
+	}
+
+	/// A struct written without braces that needs them: a `view` one, which
+	/// borrows through fields it would not have, or C's layout, which has
+	/// no struct without members.
+	var fn noBody(kind: StructKind, start: Span) = {
+		val diagnostic = match kind {
+			.Plain => return
+			.View(at) => Diagnostic::error(
+				STRUCT_BODY,
+				"a `view struct` borrows through its fields, and this one has none",
+				at,
+				"a view of nothing",
+			).withNote(
+				"a struct with no fields borrows nothing, so it is a plain one",
+			).withFix("remove `view`", own [Edit::replace(Span::new(at.lo, start.lo), "")])
+			.Extern | .Union => Diagnostic::error(
+				STRUCT_BODY,
+				"C has no struct or union without members",
+				start,
+				"C's layout, and nothing in it",
+			).withHelp(
+				"a C type whose contents Wip does not know is `type Name` in an `extern \"C\"` block",
+			)
+		}
+		self.report(move diagnostic)
+	}
+
+	var fn enumDecl(isPub: bool, annotations: Vec<Annotation>): Option<EnumDecl> = {
+		val start = self.bump()
+		val .Some(name) = self.name("an enum name") else {
+			self.skipToItem()
+			return .None
+		}
+		val generics = self.genericParams()
+		val open = self.itemBodyOpen()?
+		val list = BraceList(sep: .Comma, what: "a variant", items: "variants", code: SEPARATOR)
+		val (members, close) = self.braceList(
+			open,
+			list,
+			(kind) => startsMember(kind),
+			(p) => p.member(
+				(q, pubSpan) => {
+					// A variant is exported with its enum: there is nothing
+					// for `pub` to say.
+					if pubSpan is .Some(at) {
+						val diagnostic = Diagnostic::error(
+							MEMBER_SYNTAX,
+							"`pub` belongs on a field or a method",
+							at,
+							"not a field or a method",
+						).withNote(
+							"an enum's variants are exported with it, and so are the fields they carry",
+						).withFix("remove `pub`", own [Edit::replace(at, "")])
+						q.report(move diagnostic)
+					}
+					return q.variant()
+				},
+			),
+		)
+		val (variants, methods) = splitMembers(move members)
+		return .Some(EnumDecl(
+			annotations: move annotations,
+			name: name,
+			generics: move generics,
+			variants: move variants,
+			methods: move methods,
+			isPub: isPub,
+			isView: false,
+			span: start.to(close),
+		))
+	}
+
+	/// A member of a struct or an enum: a field or a variant, or a method.
+	/// They may be written in any order.
+	var fn member<E>(
+		elem: &var (p: &var Parser, pubSpan: Option<Span>) => Option<E>,
+	): Option<Member<E>> = {
+		// A method may carry annotations; a field or a variant may not.
+		val annotations = self.annotations()
+		val isPub = self.at(.Pub)
+		val pubSpan: Option<Span> = if isPub then .Some(self.bump()) else .None
+		var receiver: Option<Receiver> = match self.peek() {
+			.Fn => .Some(.Read)
+			.Var => .Some(.Var)
+			.Move => .Some(.Move)
+			.Static => .Some(.Static)
+			// `lend fn`: both halves of a lending pair.
+			.Lend if self.nth(1) == .Fn => .Some(.Lend)
+			_ => .None
+		}
+		// `pub var x: i64`: a field another module may write, not a
+		// method. `var` before a name is the field's;
+		// before `fn` it is the method's receiver.
+		if receiver == .Some(.Var) && isIdent(self.nth(1)) && self.nth(2) == .Colon then
+			receiver = .None
+		val .Some(declared) = receiver else {
+			self.noAnnotations(&annotations, "a field or a variant")
+			// `pub` on a field exports it; what the
+			// element is decides whether it may carry one.
+			return match elem(&var self, pubSpan) {
+				.Some(item) => .Some(.Item(item: move item))
+				.None => .None
+			}
+		}
+		// `var`, `move`, `static` and `lend` stand before `fn`.
+		val start = self.span()
+		var keyword = start
+		if declared != .Read {
+			keyword = self.bump()
+			if !self.at(.Fn) {
+				val diagnostic = Diagnostic::error(
+					MEMBER_SYNTAX,
+					"expected `fn` after `\(self.text(keyword))`",
+					Span::at(keyword.hi),
+					"expected `fn`",
+				).withNote("`\(declared.text())` declares a method")
+				self.report(move diagnostic)
+				// The rest of the line is skipped, and the body goes on with
+				// the next member.
+				self.skipUntil((k, lineBreak) => lineBreak || k == .Comma)
+				return .None
+			}
+		}
+		var decl = self.fnDecl(pubSpan, move annotations)?
+		decl.receiver = .Some((declared, keyword))
+		decl.span = pubSpan.unwrapOr(start).to(decl.span)
+		return .Some(.Method(decl: move decl))
+	}
+
+	var fn variant(): Option<Variant> = {
+		val name = self.name("a variant name")?
+		var fields: Vec<Field> = Vec()
+		if self.at(.LParen) {
+			val open = self.bump()
+			// A type with no name before it, as a tuple variant is written
+			// in Rust or Swift: each is read as a type, so that the rest
+			// parses, and all are reported together below.
+			var unnamed: Vec<Span> = Vec()
+			// A field may say what it is when a literal leaves it out, as
+			// a struct's may.
+			val (parsed, close) = self.list(
+				open,
+				.RParen,
+				"a field",
+				(kind) => canStartType(kind),
+				(p): Option<Field> => {
+					val named = isIdent(p.peek()) && (p.nth(1) == .Colon || canStartType(p.nth(1)))
+					if !named {
+						val ty = p.ty()
+						unnamed.push(p.ast.types[ty].span)
+						return .None
+					}
+					var .Some(field) = p.field("a field name") else {
+						return .None
+					}
+					p.fieldDefault(&var field)
+					return .Some(move field)
+				},
+			)
+			if !unnamed.isEmpty() {
+				val first = unnamed[0]
+				var diagnostic = Diagnostic::error(
+					EXPECTED,
+					"a variant's fields are named",
+					first,
+					"a type without a name",
+				).withNote(
+					"a field is `name: type`, as a struct's is: a pattern binds it by its name, and a variant built with two or more fields names each",
+				)
+				for i in 1..unnamed.len() {
+					diagnostic = diagnostic.withSecondary(unnamed[i], "and this")
+				}
+				if unnamed.len() == 1 && parsed.isEmpty() {
+					val help = "name it, as `value: \(self.text(first))`"
+					diagnostic = diagnostic.withFix(
+						move help,
+						own [Edit::insert(first.lo, "value: ")],
+					)
+				} else {
+					diagnostic = diagnostic.withHelp("name each, as `name: type`")
+				}
+				self.report(move diagnostic)
+			} else if parsed.isEmpty() && self.text(close) == ")" {
+				val parens = open.to(close)
+				val diagnostic = Diagnostic::error(
+					EXPECTED,
+					"a variant without fields is written without parentheses",
+					parens,
+					"empty parentheses",
+				).withFix("remove the parentheses", own [Edit::replace(parens, "")])
+				self.report(move diagnostic)
+			}
+			fields = move parsed
+		}
+		return .Some(Variant(name: name, fields: move fields, span: name.span.to(self.prevSpan())))
+	}
+
+	/// `name: type` — struct fields, variant fields and parameters.
+	var fn field(what: str): Option<Field> = {
+		val name = self.name(what)?
+		return self.fieldAfter(name)
+	}
+
+	/// A field's or a parameter's `: Type`, after its name.
+	var fn fieldAfter(name: Name): Option<Field> = {
+		if !self.eat(.Colon) {
+			var diagnostic = self.expected("`:` and a type")
+			val typeFollows = canStartType(self.peek()) && !self.onLaterLine()
+			if typeFollows then
+				diagnostic = diagnostic.withFix("add `:`", own [Edit::insert(name.span.hi, ":")])
+			self.report(move diagnostic)
+			if !typeFollows then return .None
+		}
+		val ty = self.ty()
+		return .Some(Field(
+			isPub: false,
+			isVar: false,
+			name: name,
+			ty: ty,
+			default: .None,
+			span: name.span.to(self.ast.types[ty].span),
+		))
+	}
+
+	/// `= value` after a field's or a parameter's type: what is put there
+	/// when nothing else is.
+	var fn fieldDefault(field: &var Field) = {
+		if self.eat(.Eq) {
+			val value = self.expr()
+			field.default = .Some(value)
+			field.span = field.span.to(self.exprSpan(value))
+		}
+	}
+
+	var fn param(): Option<Param> = {
+		if self.at(.DotDotDot) {
+			// `...` is not a parameter: the signature remembers it, and
+			// what a call may pass there is the checker's.
+			self.variadic = .Some(self.bump())
+			return .None
+		}
+		val name = self.paramName("a parameter name")?
+		var param = self.fieldAfter(name)?
+		self.fieldDefault(&var param)
+		return .Some(move param)
+	}
+
+	var fn fnSig(): Option<FnSig> = {
+		val start = self.bump()
+		val .Some(name) = self.name("a function name") else {
+			self.skipToItem()
+			return .None
+		}
+		val generics = self.genericParams()
+		if !self.at(.LParen) {
+			val diagnostic = self.expected("`(`")
+			self.report(move diagnostic)
+			self.skipToItem()
+			return .None
+		}
+		val open = self.bump()
+		val outer = self.variadic
+		self.variadic = .None
+		val (params, close) = self.list(
+			open,
+			.RParen,
+			"a parameter",
+			(kind) => canStartParam(kind),
+			(p) => p.param(),
+		)
+		val variadic = self.variadic
+		self.variadic = outer
+		var ret: Option<TypeId> = .None
+		match self.peek() {
+			.Colon => {
+				self.bump()
+				ret = .Some(self.ty())
+			}
+			.Arrow => {
+				val arrow = self.bump()
+				val diagnostic = Diagnostic::error(
+					ARROW_RETURN_TYPE,
+					"return types are written with `:`",
+					arrow,
+					"`->` is not used in Wip",
+				).withFix("write `: T` after the parameters", own [
+					Edit::replace(Span::new(close.hi, arrow.hi), ":"),
+				])
+				self.report(move diagnostic)
+				ret = .Some(self.ty())
+			}
+			_ => {}
+		}
+		var end = match ret {
+			.Some(ty) => self.ast.types[ty].span
+			.None => close
+		}
+		val lendsFrom = if ret.isSome() then self.lendsFrom() else Vec()
+		if !lendsFrom.isEmpty() then end = lendsFrom[lendsFrom.len() - 1].span
+		val keeps = self.keeps()
+		if !keeps.isEmpty() then end = keeps[keeps.len() - 1].span
+		return .Some(FnSig(
+			name: name,
+			generics: move generics,
+			params: move params,
+			variadic: variadic,
+			ret: ret,
+			lendsFrom: move lendsFrom,
+			keeps: move keeps,
+			span: start.to(end),
+		))
+	}
+
+	/// `keeps value, key` after the parameters, the result type and
+	/// `from`: the parameters a call may keep. `keeps` is a word here
+	/// alone.
+	var fn keeps(): Vec<Name> = {
+		var names: Vec<Name> = Vec()
+		if !(isIdent(self.peek()) && self.nthText(0) == "keeps") then return move names
+		self.bump()
+		while self.name("a parameter the call keeps") is .Some(name) {
+			names.push(name)
+			if !self.eat(.Comma) then break
+		}
+		return move names
+	}
+
+	/// `from a, self.ast` after a result type: the parameters, or fields
+	/// reached from one, that the result borrows. `from` is a word here
+	/// alone.
+	var fn lendsFrom(): Vec<LendPath> = {
+		var paths: Vec<LendPath> = Vec()
+		if !(self.peek() is .Ident(symbol) && symbol == Symbol::fromWord()) then return move paths
+		self.bump()
+		while true {
+			var root: Option<Name> = .None
+			var start = self.span()
+			if self.at(.SelfKw) {
+				start = self.bump()
+			} else {
+				val .Some(name) = self.name(
+					"a parameter, or `self`, that the result borrows",
+				) else {
+					break
+				}
+				root = .Some(name)
+				start = name.span
+			}
+			var fields: Vec<Name> = Vec()
+			while self.at(.Dot) {
+				self.bump()
+				val .Some(field) = self.name("a field") else {
+					break
+				}
+				fields.push(field)
+			}
+			val end = if fields.isEmpty() then start else fields[fields.len() - 1].span
+			paths.push(LendPath(root: root, fields: move fields, span: start.to(end)))
+			if !self.eat(.Comma) then break
+		}
+		return move paths
+	}
+
+	/// The annotations before a declaration: `@name`, or `@name(a, b = 1)`.
+	/// The names mean nothing to the parser; the checker
+	/// knows the set and where each may be written.
+	var fn annotations(): Vec<Annotation> = {
+		var annotations: Vec<Annotation> = Vec()
+		while self.at(.At) {
+			val start = self.bump()
+			val .Some(name) = self.name("an annotation name") else {
+				self.skipUntil((k, lineBreak) => lineBreak || k == .At)
+				continue
+			}
+			var args: Vec<AnnotationArg> = Vec()
+			var parens: Option<Span> = .None
+			if self.at(.LParen) {
+				val open = self.bump()
+				val (parsed, close) = self.list(
+					open,
+					.RParen,
+					"an argument",
+					(kind) => startsAnnotationArg(kind),
+					(p) => p.annotationArg(),
+				)
+				args = move parsed
+				parens = .Some(open.to(close))
+			}
+			val span = start.to(parens.unwrapOr(name.span))
+			annotations.push(Annotation(name: name, args: move args, parens: parens, span: span))
+			// One annotation per line is the style; several on a line are
+			// read the same way.
+			while self.eat(.Semi) {}
+		}
+		return move annotations
+	}
+
+	/// One argument of an annotation: a literal, or `name = literal`.
+	var fn annotationArg(): Option<AnnotationArg> = {
+		val start = self.span()
+		var name: Option<Name> = .None
+		if isIdent(self.peek()) && self.nth(1) == .Eq {
+			name = .Some(self.name("an argument name")?)
+			self.bump()
+		}
+		val found: (AnnotationValue, Span) = match self.peek() {
+			.Int => {
+				val at = self.span()
+				val number = self.intValue(at)
+				self.bump()
+				(.Int(value: number), at)
+			}
+			.Str(symbol) => (.Str(symbol: symbol), self.bump())
+			.True => (.Bool(value: true), self.bump())
+			.False => (.Bool(value: false), self.bump())
+			// A name, as `@derive(Eq, Hash)` takes. What it
+			// names is the checker's to decide.
+			.Ident(symbol) => (.Name(symbol: symbol), self.bump())
+			_ => {
+				val at = self.span()
+				val diagnostic = Diagnostic::error(
+					ANNOTATION_SYNTAX,
+					"an annotation takes numbers, strings, `true` or `false`, and names",
+					at,
+					"not a literal",
+				).withNote(
+					"an annotation is read before the program has a meaning, so nothing in it is computed",
+				)
+				self.report(move diagnostic)
+				self.bump()
+				(.Error, at)
+			}
+		}
+		val (value, span) = move found
+		return .Some(AnnotationArg(name: name, value: move value, span: start.to(span)))
+	}
+
+	/// Reports annotations that bind to nothing, or to a declaration that
+	/// cannot carry them.
+	var fn noAnnotations(annotations: &[Annotation], what: str) = {
+		for annotation in annotations {
+			val diagnostic = Diagnostic::error(
+				ANNOTATION_SYNTAX,
+				"an annotation cannot be written on \(what)",
+				annotation.span,
+				"nothing here takes an annotation",
+			).withNote(
+				"an annotation belongs on a function, a struct, an enum, an interface or an `extend` block",
+			)
+			self.report(move diagnostic)
+		}
+	}
+
+	/// `val NAME: T = value` at the top level: a constant.
+	var fn valDecl(isPub: bool, annotations: Vec<Annotation>): Option<ValDecl> = {
+		val start = self.bump()
+		val name = self.name("a constant's name")?
+		val ty: Option<TypeId> = if self.eat(.Colon) then .Some(self.ty()) else .None
+		val value = if self.expect(.Eq) then self.expr() else self.errorExpr()
+		return .Some(ValDecl(
+			annotations: move annotations,
+			name: name,
+			ty: ty,
+			value: value,
+			isPub: isPub,
+			span: start.to(self.exprSpan(value)),
+		))
+	}
+
+	/// A `fn` declaration. A method's receiver is set by its caller.
+	var fn fnDecl(pubSpan: Option<Span>, annotations: Vec<Annotation>): Option<FnDecl> = {
+		val isPub = pubSpan.isSome()
+		val sig = self.fnSig()?
+		// `@intrinsic` says the compiler writes the body, so none is here.
+		var intrinsic = false
+		for annotation in annotations {
+			if self.text(annotation.name.span) == "intrinsic" then intrinsic = true
+		}
+		if intrinsic && !self.at(.Eq) {
+			val span = sig.span
+			return .Some(FnDecl(
+				annotations: move annotations,
+				sig: move sig,
+				body: .None,
+				isPub: isPub,
+				pubSpan: pubSpan,
+				receiver: .None,
+				span: span,
+			))
+		}
+		val body = if self.eat(.Eq) {
+			self.expr()
+		} else if self.at(.LBrace) {
+			val brace = self.span()
+			val diagnostic = Diagnostic::error(
+				FUNCTION_BODY,
+				"expected `=` before the function body",
+				brace,
+				"the body starts here",
+			).withNote("a function is declared `fn name(…): T = body`").withFix("add `=`", own [
+				Edit::insert(brace.lo, "= "),
+			])
+			self.report(move diagnostic)
+			self.expr()
+		} else {
+			val diagnostic = Diagnostic::error(
+				FUNCTION_BODY,
+				"function `\(self.text(sig.name.span))` has no body",
+				Span::at(sig.span.hi),
+				"expected `= …` here",
+			).withHelp("to declare a C function, put it in an `extern \"C\" { … }` block")
+			self.report(move diagnostic)
+			self.errorExpr()
+		}
+		val span = sig.span.to(self.exprSpan(body))
+		return .Some(FnDecl(
+			annotations: move annotations,
+			sig: move sig,
+			body: .Some(body),
+			isPub: isPub,
+			pubSpan: pubSpan,
+			receiver: .None,
+			span: span,
+		))
+	}
+
+	/// `import a::b::c`, `import a::b::c as name`, or
+	/// `import a::b::{self, Item, other as name}`.
+	var fn importDecl(): Option<ImportDecl> = {
+		val start = self.bump()
+		var path = Vec::of(own [self.name("a module name")?])
+		var items: Option<Vec<ImportItem>> = .None
+		while self.eat(.ColonColon) {
+			if self.at(.LBrace) {
+				items = .Some(self.importItems(self.prevSpan()))
+				break
+			}
+			path.push(self.name("a module name")?)
+		}
+		var alias: Option<Name> = .None
+		if self.at(.As) {
+			val keyword = self.bump()
+			val name = self.name("a name for the module")?
+			if items.isSome() {
+				val diagnostic = Diagnostic::error(
+					IMPORT_LIST,
+					"an import list cannot be renamed",
+					keyword.to(name.span),
+					"renames the whole list",
+				).withHelp("to bind the module, name it in the list: `{self as \(self.text(name.span))}`").withNote(
+					"an import list binds only the names in it",
+				)
+				self.report(move diagnostic)
+			} else {
+				alias = .Some(name)
+			}
+		}
+		return .Some(ImportDecl(
+			span: start.to(self.prevSpan()),
+			path: move path,
+			alias: alias,
+			items: move items,
+		))
+	}
+
+	/// The braces of an import, after the `::` at `colons`:
+	/// `{self, Item, other as name}`.
+	var fn importItems(colons: Span): Vec<ImportItem> = {
+		val open = self.bump()
+		val list = BraceList(sep: .Comma, what: "a name to import", items: "names", code: SEPARATOR)
+		val (items, close) = self.braceList(
+			open,
+			list,
+			(kind) => isIdent(kind) || kind == .SelfKw,
+			(p): Option<ImportItem> => {
+				// `self` in the list binds the module itself.
+				var name: Option<Name> = .None
+				var span = p.span()
+				if p.at(.SelfKw) {
+					span = p.bump()
+				} else {
+					val .Some(named) = p.name("a name to import") else {
+						return .None
+					}
+					name = .Some(named)
+					span = named.span
+				}
+				var alias: Option<Name> = .None
+				if p.eat(.As) {
+					val .Some(given) = p.name("a name for it") else {
+						return .None
+					}
+					alias = .Some(given)
+				}
+				return .Some(ImportItem(name: name, span: span, alias: alias))
+			},
+		)
+		if items.isEmpty() {
+			val diagnostic = Diagnostic::error(
+				IMPORT_LIST,
+				"an import list must name something",
+				open.to(close),
+				"names nothing",
+			).withFix("import the module itself", own [Edit::replace(colons.to(close), "")])
+			self.report(move diagnostic)
+		}
+		return move items
+	}
+
+	var fn externBlock(annotations: Vec<Annotation>): Option<ExternBlock> = {
+		val start = self.bump()
+		var abi = Span::at(0)
+		if self.peek() is .Str(..) {
+			abi = self.bump()
+			val text = self.text(abi)
+			if text != "\"C\"" {
+				val diagnostic = Diagnostic::error(
+					UNSUPPORTED_ABI,
+					"unsupported ABI \(text)",
+					abi,
+					"only \"C\" is supported",
+				).withNote("a library in another language is called through its C interface")
+				self.report(move diagnostic)
+			}
+		} else {
+			val at = self.span().lo
+			val diagnostic = self.expected("an ABI string").withFix("add the C ABI", own [
+				Edit::insert(at, "\"C\" "),
+			])
+			self.report(move diagnostic)
+			abi = Span::at(self.prevSpan().hi)
+		}
+		val open = self.itemBodyOpen()?
+		val list = BraceList(
+			sep: .Semi,
+			what: "a function declaration",
+			items: "declarations",
+			code: SEPARATOR,
+		)
+		val (members, close) = self.braceList(
+			open,
+			list,
+			(k) => k is .Fn | .Pub | .Type | .Val | .Var | .At | .Struct || isIdent(k),
+			(p) => p.externMember(),
+		)
+		var fns: Vec<ExternFn> = Vec()
+		var types: Vec<ExternType> = Vec()
+		var globals: Vec<ExternGlobal> = Vec()
+		var structs: Vec<StructDecl> = Vec()
+		for member in move members {
+			match move member {
+				.Fn(decl) => fns.push(move decl)
+				.Type(declared) => types.push(move declared)
+				.Global(global) => globals.push(move global)
+				.Struct(decl) => structs.push(move decl)
+			}
+		}
+		return .Some(ExternBlock(
+			annotations: move annotations,
+			abi: abi,
+			fns: move fns,
+			types: move types,
+			globals: move globals,
+			structs: move structs,
+			span: start.to(close),
+		))
+	}
+
+	/// A declaration inside an extern block: a function, an opaque C type,
+	/// or a variable C owns.
+	var fn externMember(): Option<ExternMember> = {
+		// `@symbol("sqlite3_open")` says what C calls it, so a module of
+		// bindings can use Wip's own names.
+		val annotations = self.annotations()
+		// `pub` exports a C declaration from its module, so that bindings
+		// are a module people share.
+		val isPub = self.at(.Pub)
+		if isPub then self.bump()
+		// `struct Name { … }` and `union Name { … }` in a block are C's
+		// layout: the block says `extern` once.
+		if self.at(.Struct) then
+			return match self.structDeclWith(isPub, .Extern, move annotations) {
+				.Some(decl) => .Some(.Struct(decl: move decl))
+				.None => .None
+			}
+		if isIdent(self.peek()) && self.text(self.span()) == "union" then
+			return match self.structDeclWith(isPub, .Union, move annotations) {
+				.Some(decl) => .Some(.Struct(decl: move decl))
+				.None => .None
+			}
+		if self.at(.Type) {
+			self.bump()
+			val name = self.name("a C type's name")?
+			return .Some(.Type(declared: ExternType(
+				name: name,
+				annotations: move annotations,
+				isPub: isPub,
+			)))
+		}
+		// `val optind: c_int` reads it; `var` writes it too.
+		if self.peek() is .Val | .Var {
+			val isMut = self.at(.Var)
+			val start = self.bump()
+			val name = self.name("a variable's name")?
+			if !self.eat(.Colon) {
+				val at = self.prevSpan().hi
+				val diagnostic = self.expected(
+					"`:` and the variable's type",
+				).withFix("give it a type", own [Edit::insert(at, ": c_int")])
+				self.report(move diagnostic)
+				return .None
+			}
+			val ty = self.ty()
+			return .Some(.Global(global: ExternGlobal(
+				name: name,
+				annotations: move annotations,
+				ty: ty,
+				isMut: isMut,
+				isPub: isPub,
+				span: start.to(self.ast.types[ty].span),
+			)))
+		}
+		val sig = self.externFn()?
+		return .Some(.Fn(decl: ExternFn(
+			sig: move sig,
+			annotations: move annotations,
+			isPub: isPub,
+		)))
+	}
+
+	var fn externFn(): Option<FnSig> = {
+		val sig = self.fnSig()?
+		if self.peek() is .Eq | .LBrace {
+			val start = self.span()
+			self.eat(.Eq)
+			val body = self.expr()
+			val name = self.text(sig.name.span)
+			val diagnostic = Diagnostic::error(
+				FUNCTION_BODY,
+				"extern functions cannot have a body",
+				start,
+				"body starts here",
+			).withHelp("extern functions are defined in C; to define `\(name)` in Wip, move it out of the extern block").withFix("remove the body", own [
+				Edit::replace(Span::new(sig.span.hi, self.exprSpan(body).hi), ""),
+			])
+			self.report(move diagnostic)
+		}
+		return .Some(move sig)
+	}
+}

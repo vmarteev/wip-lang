@@ -1,0 +1,350 @@
+// Structs and unions of many shapes, by value across the C boundary, and C
+// that knows what every field should hold. For each shape:
+//
+// - Wip passes one to C, and C checks it;
+// - C returns one, and C checks it again through a pointer, which has
+//   always been right;
+// - Wip passes one after enough scalars that the registers run out, and
+//   four of one shape with a `float` among them, so that on arm64 one part
+//   of the registers is left and the next struct does not fit;
+// - C calls a Wip `@export("C")` function with one, and checks what comes
+//   back, and calls the two above as exports too;
+// - Wip calls that exported function itself.
+//
+// A wrong classification does not crash — it hands C the wrong numbers —
+// which is why every scalar is checked.
+
+/// A scalar a field holds.
+@derive(Eq, Clone)
+enum Kind {
+	Int(bits: i64, signed: bool)
+	F32
+	F64
+	Bool
+}
+
+/// A field: a scalar, an array of them, or another shape, by its index.
+@derive(Clone)
+enum Field {
+	Prim(kind: Kind)
+	Array(kind: Kind, len: i64)
+	Nested(shape: i64)
+}
+
+/// A struct, or a union, whose fields all start at 0.
+struct Shape {
+	isUnion: bool
+	fields: Vec<Field>
+}
+
+extend Kind {
+	fn wip(): String = match self {
+		.Int(bits, signed) => if signed then "i\(bits)" else "u\(bits)"
+		.F32 => String::of("f32")
+		.F64 => String::of("f64")
+		.Bool => String::of("bool")
+	}
+
+	fn c(): String = match self {
+		.Int(bits, signed) => if signed then "int\(bits)_t" else "uint\(bits)_t"
+		.F32 => String::of("float")
+		.F64 => String::of("double")
+		.Bool => String::of("_Bool")
+	}
+
+	fn size(): i64 = match self {
+		.Int(bits, ..) => bits / 8
+		.F32 => 4
+		.F64 => 8
+		.Bool => 1
+	}
+
+	/// The value the `n`th scalar of shape `k` holds, in Wip and in C:
+	/// small, exact in a `float`, and different from its neighbours.
+	fn value(k: i64, n: i64): (String, String) = match self {
+		.Int(signed, ..) => {
+			val v = (k * 7 + n * 13 + 1) % 100
+			val held = if signed then v - 50 else v
+			return ("\(held)", "\(held)")
+		}
+		.F32 => {
+			val text = quarters((k * 3 + n * 5) % 40 + 2)
+			return (text.clone(), "\(text)f")
+		}
+		.F64 => {
+			val text = quarters((k * 3 + n * 5) % 40 + 2)
+			return (text.clone(), move text)
+		}
+		.Bool => {
+			val v = (k + n) % 2 == 1
+			return ("\(v)", if v then String::of("1") else String::of("0"))
+		}
+	}
+}
+
+/// A number of quarters as a decimal literal, whole or not: `2.25`, `1.0`,
+/// `-0.75`.
+fn quarters(count: i64): String = {
+	val sign = if count < 0 then "-" else ""
+	val whole = count.abs()
+	return "\(sign)\(whole / 4).\(FRACTIONS[whole % 4])"
+}
+
+val FRACTIONS = ["0", "25", "5", "75"]
+
+/// Numbers from a fixed seed, so that a failure is the same failure again.
+struct Seeded {
+	state: u64
+}
+
+extend Seeded {
+	static fn of(seed: u64): Seeded = Seeded(state: seed)
+
+	/// The next number below `below`.
+	var fn next(below: i64): i64 = {
+		self.state = self.state *% 6364136223846793005 +% 1442695040888963407
+		return ((self.state >> 33) % (below as u64)) as i64
+	}
+}
+
+val PRIMS = [
+	Kind::Int(bits: 8, signed: false),
+	Kind::Int(bits: 8, signed: true),
+	Kind::Int(bits: 16, signed: true),
+	Kind::Int(bits: 32, signed: true),
+	Kind::Int(bits: 32, signed: false),
+	Kind::Int(bits: 64, signed: true),
+	Kind::F32,
+	Kind::F64,
+	Kind::Bool,
+]
+
+fn prim(seeded: &var Seeded): Kind = PRIMS[seeded.next(PRIMS.len())].clone()
+
+/// The shapes: the ones a real binding passes, then a spread of the rest,
+/// then unions — each written and read through its first field, which is
+/// made as large as the union, so that every byte is checked.
+fn shapes(): Vec<Shape> = {
+	val f = Field::Prim(kind: .F32)
+	val d = Field::Prim(kind: .F64)
+	val i32 = Field::Prim(kind: .Int(bits: 32, signed: true))
+	val u8 = Field::Prim(kind: .Int(bits: 8, signed: false))
+	val i64 = Field::Prim(kind: .Int(bits: 64, signed: true))
+	var structs: Vec<Vec<Field>> = Vec()
+	structs.push([f.clone(), f.clone()].toVec()) // Vector2
+	structs.push([f.clone(), f.clone(), f.clone()].toVec()) // Vector3
+	structs.push([f.clone(), f.clone(), f.clone(), f.clone()].toVec()) // Vector4, Rectangle
+	structs.push([u8.clone(), u8.clone(), u8.clone(), u8.clone()].toVec()) // Color
+	structs.push([Field::Array(kind: .F32, len: 16)].toVec()) // Matrix
+	structs.push([f.clone(), f.clone(), f.clone(), f.clone(), f.clone()].toVec()) // five floats: no longer homogeneous
+	structs.push([d.clone(), d.clone()].toVec())
+	structs.push([d.clone(), d.clone(), d.clone(), d.clone()].toVec()) // 32 bytes, still homogeneous
+	structs.push([f.clone(), i32.clone()].toVec()) // a mixed eightbyte
+	structs.push([d.clone(), f.clone()].toVec())
+	structs.push([f.clone(), d.clone()].toVec())
+	structs.push([i64.clone(), d.clone()].toVec())
+	structs.push([Field::Prim(kind: .Int(bits: 8, signed: true)), d.clone()].toVec())
+	structs.push([Field::Array(kind: .Int(bits: 8, signed: false), len: 3)].toVec()) // three bytes
+	structs.push([i64.clone(), i64.clone(), i64.clone()].toVec()) // 24 bytes of integers
+	structs.push([i32.clone(), i32.clone(), i32.clone()].toVec()) // 12 bytes of integers
+	structs.push([Field::Prim(kind: .Bool), f.clone()].toVec())
+	structs.push([Field::Nested(shape: 0), Field::Nested(shape: 0)].toVec()) // two Vector2: four floats
+	structs.push([Field::Nested(shape: 1), f.clone()].toVec()) // Vector3 and a float
+	structs.push([Field::Nested(shape: 3), f.clone()].toVec()) // Color and a float
+	var seeded = Seeded::of(0x5eedcafe)
+	for _ in 0..60 {
+		val count = 1 + seeded.next(6)
+		var fields: Vec<Field> = Vec()
+		for _ in 0..count {
+			val choice = seeded.next(10)
+			if choice == 0 {
+				val kind = prim(&var seeded)
+				fields.push(.Array(kind: kind, len: 1 + seeded.next(4)))
+			} else if choice == 1 && structs.len() > 1 {
+				fields.push(.Nested(shape: seeded.next(structs.len().min(20))))
+			} else {
+				fields.push(.Prim(kind: prim(&var seeded)))
+			}
+		}
+		structs.push(move fields)
+	}
+	var shapes: Vec<Shape> = Vec()
+	for fields in move structs {
+		shapes.push(Shape(isUnion: false, fields: move fields))
+	}
+	val firstUnion = shapes.len()
+	val unions = [
+		[Field::Array(kind: .F32, len: 2), f.clone()].toVec(), // two floats' worth: homogeneous
+		[d.clone(), f.clone()].toVec(), // two floating types: not
+		[d.clone(), i32.clone()].toVec(), // an integer over a double
+		[Field::Array(kind: .F32, len: 4), Field::Array(kind: .F32, len: 2)].toVec(), // four floats' worth
+		[Field::Array(kind: .F64, len: 3), i64.clone()].toVec(), // over sixteen bytes
+		[
+			Field::Array(kind: .Int(bits: 32, signed: true), len: 4),
+			Field::Array(kind: .F32, len: 4),
+		].toVec(), // sixteen bytes, integer and floating
+		[Field::Array(kind: .F32, len: 3), f.clone()].toVec(), // three floats' worth
+		[Field::Array(kind: .F32, len: 5), f.clone()].toVec(),
+	] // five: no longer homogeneous
+	for fields in unions {
+		shapes.push(Shape(isUnion: true, fields: fields.clone()))
+	}
+	// Unions from the same seed: a first field, and smaller ones over it.
+	for _ in 0..12 {
+		val kind = prim(&var seeded)
+		val first =
+			if seeded.next(2) == 0 then Field::Prim(kind: kind.clone())
+			else Field::Array(kind: kind.clone(), len: 1 + seeded.next(4))
+		val room = match first {
+			.Prim(kind) => kind.size()
+			.Array(kind, len) => kind.size() * len
+			.Nested(_) => panic("a first field of scalars")
+		}
+		var fields: Vec<Field> = Vec()
+		fields.push(move first)
+		val more = 1 + seeded.next(3)
+		for _ in 0..more {
+			val kind = prim(&var seeded)
+			if kind.size() > room then continue
+			val most = room / kind.size()
+			if seeded.next(2) == 0 then fields.push(.Prim(kind: kind))
+			else fields.push(.Array(kind: kind, len: 1 + seeded.next(most)))
+		}
+		shapes.push(Shape(isUnion: true, fields: move fields))
+	}
+	// Structs that hold a union.
+	shapes.push(Shape(
+		isUnion: false,
+		fields: [Field::Nested(shape: firstUnion), f.clone()].toVec(),
+	)) // three floats' worth
+	shapes.push(Shape(
+		isUnion: false,
+		fields: [Field::Nested(shape: firstUnion + 1), i32.clone()].toVec(),
+	))
+	return move shapes
+}
+
+/// What one shape writes: its Wip literal, its C initialiser, and the C
+/// that checks each scalar through a pointer.
+struct Written {
+	wip: String
+	c: String
+	checks: Vec<String>
+}
+
+fn writeValue(shapes: &Vec<Shape>, index: i64, k: i64, n: &var i64, at: str): Written = {
+	var wip = "S\(index)("
+	var c = String::of("{ ")
+	var checks: Vec<String> = Vec()
+	// A union is written through its first field, which C's initialiser sets
+	// too when it names none.
+	val shape = &shapes[index]
+	val written = if shape.isUnion then 1 else shape.fields.len()
+	for i in 0..written {
+		val name = "f\(i)"
+		val path = "\(at).\(name)"
+		if i > 0 {
+			wip.push(", ")
+			c.push(", ")
+		}
+		match shape.fields[i] {
+			.Prim(kind) => {
+				val (w, cv) = kind.value(k, n)
+				n += 1
+				wip.push("\(name): \(w)")
+				c.push(cv.toStr())
+				checks.push("s\(path) == \(cv)")
+			}
+			.Array(kind, len) => {
+				var ws: Vec<String> = Vec()
+				var cs: Vec<String> = Vec()
+				for j in 0..len {
+					val (w, cv) = kind.value(k, n)
+					n += 1
+					checks.push("s\(path)[\(j)] == \(cv)")
+					ws.push(move w)
+					cs.push(move cv)
+				}
+				wip.push("\(name): [\(ws.join(", "))]")
+				c.push("{ \(cs.join(", ")) }")
+			}
+			.Nested(inner) => {
+				val nested = writeValue(&shapes, inner, k, &var n, path.toStr())
+				wip.push("\(name): \(nested.wip)")
+				c.push(nested.c.toStr())
+				for check in nested.checks {
+					checks.push(check.clone())
+				}
+			}
+		}
+	}
+	wip.push(")")
+	c.push(" }")
+	return Written(wip: move wip, c: move c, checks: move checks)
+}
+
+/// What C calls a shape: `struct S3` or `union S3`.
+fn typeOf(shapes: &Vec<Shape>, index: i64): String = {
+	val keyword = if shapes[index].isUnion then "union" else "struct"
+	return "\(keyword) S\(index)"
+}
+
+/// `i0: i64, …` and its kin: `count` of `each(i)`, joined.
+fn listOf(count: i64, each: &(i: i64) => String): String = {
+	var all: Vec<String> = Vec()
+	for i in 0..count {
+		all.push(each(i))
+	}
+	return all.join(", ")
+}
+
+/// The program, its C, and how many shapes it passes.
+fn structsProgram(): (String, String, i64) = {
+	val shapes = shapes()
+	var wip = String::of("import std::io\n\nextern \"C\" {\n")
+	var c = String::of("#include <stdint.h>\n\n")
+	var tests = String()
+	val ints = listOf(7, (i) => "i\(i): i64")
+	val doubles = listOf(8, (i) => "d\(i): f64")
+	val cInts = listOf(7, (i) => "int64_t i\(i)")
+	val cDoubles = listOf(8, (i) => "double d\(i)")
+	val intArgs = listOf(7, (i) => "\(i + 1)")
+	val doubleArgs = listOf(8, (i) => "\(i + 1).5")
+	val intChecks = listOf(7, (i) => "i\(i) == \(i + 1)").replace(", ", " && ")
+	val doubleChecks = listOf(8, (i) => "d\(i) == \(i + 1).5").replace(", ", " && ")
+	for k in 0..shapes.len() {
+		val fields = &shapes[k].fields
+		val s = "S\(k)"
+		val t = typeOf(&shapes, k)
+		// The declaration, in Wip and in C.
+		wip.push("    \(t) {\n")
+		c.push("\(t) {\n")
+		for i in 0..fields.len() {
+			val (w, declared) = match fields[i] {
+				.Prim(kind) => (kind.wip(), "\(kind.c()) f\(i)")
+				.Array(kind, len) => ("[\(kind.wip()); \(len)]", "\(kind.c()) f\(i)[\(len)]")
+				.Nested(inner) => ("S\(inner)", "\(typeOf(&shapes, inner)) f\(i)")
+			}
+			val comma = if i + 1 < fields.len() then "," else ""
+			wip.push("        f\(i): \(w)\(comma)\n")
+			c.push("    \(declared);\n")
+		}
+		wip.push("    }\n")
+		c.push("};\n\n")
+
+		var n = 0
+		val value = writeValue(&shapes, k, k, &var n, "")
+		val checks = value.checks.join(" && ").replace("s.", "s->")
+		c.push("int32_t check_ptr_\(s)(const \(t) *s) { return \(checks); }\nint32_t check_\(s)(\(t) s) { return check_ptr_\(s)(&s); }\n\(t) make_\(s)(void) { \(t) s = \(value.c); return s; }\nint32_t late_\(s)(\(cInts), \(cDoubles), \(t) s, int64_t tail) {\n    return \(intChecks) && \(doubleChecks) && tail == 99 && check_ptr_\(s)(&s);\n}\nint32_t four_\(s)(\(t) a, \(t) b, \(t) c, float f, \(t) d,\n    int64_t tail) {\n    return check_ptr_\(s)(&a) && check_ptr_\(s)(&b) && check_ptr_\(s)(&c) && f == 0.5f\n        && check_ptr_\(s)(&d) && tail == 99;\n}\nint32_t wip_check_\(s)(\(t) s);\n\(t) wip_echo_\(s)(\(t) s, int64_t n);\nint32_t wip_late_\(s)(\(cInts), \(cDoubles), \(t) s, int64_t tail);\nint32_t wip_four_\(s)(\(t) a, \(t) b, \(t) c, float f, \(t) d,\n    int64_t tail);\nint32_t drive_\(s)(void) {\n    \(t) s = make_\(s)();\n    if (!wip_check_\(s)(s)) return 0;\n    if (!wip_late_\(s)(1, 2, 3, 4, 5, 6, 7, 1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5, 8.5, s, 99)) return 0;\n    if (!wip_four_\(s)(s, s, s, 0.5f, s, 99)) return 0;\n    \(t) back = wip_echo_\(s)(s, 5);\n    return check_ptr_\(s)(&back);\n}\n\n")
+		wip.push("    fn check_ptr_\(s)(s: &\(s)): i32\n    fn check_\(s)(s: \(s)): i32\n    fn make_\(s)(): \(s)\n    fn late_\(s)(\(ints), \(doubles), s: \(s), tail: i64): i32\n    fn four_\(s)(a: \(s), b: \(s), c: \(s), f: f32, d: \(s), tail: i64): i32\n    fn drive_\(s)(): i32\n\n")
+		tests.push("@export(\"C\")\nfn wip_check_\(s)(s: \(s)): i32 = check_ptr_\(s)(&s)\n\n@export(\"C\")\nfn wip_echo_\(s)(s: \(s), n: i64): \(s) = s\n\n@export(\"C\")\nfn wip_late_\(s)(\(ints), \(doubles), s: \(s), tail: i64): i32 =\n    if i0 == 1 && i6 == 7 && d0 == 1.5 && d7 == 8.5 && tail == 99 { check_ptr_\(s)(&s) } else { 0 }\n\n@export(\"C\")\nfn wip_four_\(s)(a: \(s), b: \(s), c: \(s), f: f32, d: \(s), tail: i64): i32 =\n    if f == 0.5 && tail == 99 && check_ptr_\(s)(&a) == 1 && check_ptr_\(s)(&b) == 1 &&\n        check_ptr_\(s)(&c) == 1 { check_ptr_\(s)(&d) } else { 0 }\n\nfn test_\(s)(): i64 = {\n    var failed = 0\n    val s = \(value.wip)\n    if check_\(s)(s) != 1 { io::println(\"\(s): passed to C\"); failed += 1 }\n    val made = make_\(s)()\n    if check_ptr_\(s)(&made) != 1 { io::println(\"\(s): returned by C\"); failed += 1 }\n    if late_\(s)(\(intArgs), \(doubleArgs), s, 99) != 1 { io::println(\"\(s): after the registers\"); failed += 1 }\n    if four_\(s)(s, s, s, 0.5, s, 99) != 1 { io::println(\"\(s): four, a float among them\"); failed += 1 }\n    if drive_\(s)() != 1 { io::println(\"\(s): C calling Wip\"); failed += 1 }\n    val echoed = wip_echo_\(s)(s, 5)\n    if check_ptr_\(s)(&echoed) != 1 { io::println(\"\(s): Wip calling its export\"); failed += 1 }\n    failed\n}\n\n")
+	}
+	wip.push("}\n\n")
+	wip.push(tests.toStr())
+	wip.push("fn main(): i64 = {\n    var failed = 0\n")
+	for k in 0..shapes.len() {
+		wip.push("    failed += test_S\(k)()\n")
+	}
+	wip.push("    io::println(\"\\(failed) failed\")\n    failed\n}\n")
+	return (move wip, move c, shapes.len())
+}

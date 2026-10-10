@@ -1,0 +1,210 @@
+// A generator's `next`: its loop, run on from the `yield` it stopped at.
+//
+// The body is lowered as any other, with each `yield` a place it stops: it
+// writes `.Some(value)` to the result, notes where it is in the generator's
+// `state#` and returns. The entry block reads `state#` and goes on from there.
+// The frame then moves the body's locals into the generator, after its
+// declared fields, so they are where they were when it is asked again.
+//
+// `state#` is 0 before the first call, `2k` while it waits at the `k`th
+// `yield`, and `DONE` once it has ended. A drop adds one and calls `next`:
+// `2k + 1` goes to what drops the locals in scope at the `k`th `yield`, 1 to
+// what drops what it was given and never started on, and `DONE + 1` to
+// nothing.
+
+import hir::{ExprId, FnDef, I32, LocalId, Ty}
+
+/// The state of a generator that has ended, or was dropped. One more is still
+/// no case, so dropping it does nothing.
+pub val DONE: i32 = -2
+
+/// A generator's `next` being lowered.
+struct Generator {
+	/// The parameter: the generator itself, `&var generator#`.
+	this: Local
+	/// Where the body starts, and where it goes when it has ended.
+	start: BlockId
+	done: BlockId
+	/// The blocks the entry goes to for each state.
+	cases: Vec<(u32, BlockId)>
+}
+
+extend Builder {
+	/// The body of a generator's `next`.
+	var fn generator(def: &FnDef) = {
+		val hir = self.hir
+		val thisHir = hir.params[0]
+		val this = self.newLocal(hir.locals[thisHir].ty, .Param)
+		self.params.push(this)
+		self.vars.put(thisHir, this)
+		self.ret = .Some(self.newLocal(def.ret, .Return))
+		val start = self.newBlock()
+		val done = self.newBlock()
+		self.generatorState = .Some(Generator(this: this, start: start, done: done, cases: Vec()))
+
+		// The body, from its start, into `done` at its end. What a function
+		// that yields was given is in the generator's fields after `state#`,
+		// and is taken out of them when it starts: from then on it is the
+		// body's, and dropped as its parameters would be.
+		self.switchTo(start)
+		var given: Vec<(LocalId, u32)> = Vec()
+		for i in 1..hir.params.len() {
+			given.push((hir.params[i], i as u32))
+		}
+		var cleanups: Vec<Cleanup> = Vec()
+		for (param, field) in given {
+			val ty = hir.locals[param].ty
+			val variable = self.sourceLocal(param, .Var)
+			self.vars.put(param, variable)
+			val held = self.fieldOfThis(field)
+			self.assign(Place::of(variable), .Use(.Copy(held.clone())))
+			if self.needsDrop(ty) then self.push(.Zero(move held))
+			self.setFlag(param, true)
+			cleanups.push(.Drop(param))
+		}
+		self.scopes.push(move cleanups)
+		self.expr(hir.valueId())
+		if !self.dead {
+			self.dropTemps(0)
+			self.dropScope()
+			self.terminate(.Goto(done))
+		}
+		self.switchTo(done)
+		self.stopped()
+
+		// Dropped before it started: what it was given is still where the
+		// function put it.
+		val unstarted = self.newBlock()
+		self.switchTo(unstarted)
+		for (param, field) in given.backwards() {
+			val ty = hir.locals[param].ty
+			val held = self.fieldOfThis(field)
+			self.dropPlace(&held, ty)
+		}
+		self.stopped()
+
+		// The entry: on from where it stopped.
+		self.switchTo(BlockId(0))
+		val state = self.statePlace()
+		val now = self.value(I32, .Use(.Copy(move state)))
+		val finished = self.newBlock()
+		val start = self.generatorOf().start
+		var cases: Vec<(u32, BlockId)> = Vec::of(own [(0, start), (1, unstarted)])
+		cases.pushAll(&self.generatorOf().cases)
+		self.terminate(.Switch(value: move now, cases: move cases, otherwise: finished))
+		self.switchTo(finished)
+		self.answerNone()
+		self.terminate(.Return)
+	}
+
+	/// The generator being lowered.
+	fn generatorOf(): &Generator = match self.generatorState {
+		.Some(generator) => lend generator
+		.None => panic("in a generator")
+	}
+
+	/// `(*this).state#`.
+	fn statePlace(): Place = self.fieldOfThis(0)
+
+	/// A declared field of the generator.
+	fn fieldOfThis(field: u32): Place = Place::of(self.generatorOf().this).project(.Deref).project(
+		.Field(field),
+	)
+
+	var fn setState(state: i32) = {
+		val place = self.statePlace()
+		val bits = state as u32 as u128
+		self.assign(move place, .Use(Builder::int(bits, I32)))
+	}
+
+	/// `None`, as the result.
+	var fn answerNone() = {
+		val .Some(ret) = self.ret else {
+			panic("a generator answers an `Option`")
+		}
+		val .Enum(id, ..) = self.program.types.kind(self.localTy(ret)) else {
+			panic("a generator answers an `Option`")
+		}
+		var none: Option<u32> = .None
+		for (i, variant) in self.program.enums[id].variants.forwards().enumerate() {
+			if self.interner.resolve(variant.name) == "None" {
+				none = .Some(i as u32)
+				break
+			}
+		}
+		val .Some(variant) = none else {
+			panic("`Option` has `None`")
+		}
+		self.push(.SetVariant(place: Place::of(ret), variant: variant))
+	}
+
+	/// The generator has ended: it answers nothing, now and from here on.
+	var fn stopped() = {
+		self.setState(DONE)
+		self.answerNone()
+		self.terminate(.Return)
+	}
+
+	/// `yield value`: `.Some(value)` is the result, and the generator stops
+	/// here until it is asked again, or dropped.
+	var fn yieldStmt(value: ExprId, mark: i64) = {
+		val .Some(ret) = self.ret else {
+			panic("a generator answers an `Option`")
+		}
+		self.storeExpr(value, Place::of(ret))
+		self.dropTemps(mark)
+		if self.dead then return
+		val k = self.generatorOf().cases.len() as u32 / 2 + 1
+		val resume = self.newBlock()
+		val drop = self.newBlock()
+		self.setState((2 * k) as i32)
+		self.terminate(.Return)
+
+		// Dropped while it waits here: what is in scope here is dropped, as a
+		// `return` from here would drop it.
+		self.switchTo(drop)
+		self.dropPendingTemps()
+		self.dropAllScopes()
+		self.stopped()
+
+		val .Some(taken) = self.generatorState.take() else {
+			panic("in a generator")
+		}
+		var generator = move taken
+		generator.cases.push((2 * k, resume))
+		generator.cases.push((2 * k + 1, drop))
+		self.generatorState = .Some(move generator)
+		self.switchTo(resume)
+	}
+
+	/// `return` in a generator: it ends, having dropped what is in scope.
+	var fn generatorReturn() = {
+		self.dropPendingTemps()
+		self.dropAllScopes()
+		val done = self.generatorOf().done
+		self.terminate(.Goto(done))
+		self.dead = true
+	}
+
+	/// Drops a generator: its `next`, told to drop what it holds where it
+	/// stopped rather than to go on.
+	var fn dropGenerator(place: &Place, ty: Ty) = {
+		val .Some(next) = self.program.generatorNext.get(&ty) else {
+			panic("the monomorphizer made the `next` of every generator a program drops")
+		}
+		val state = place.project(.Field(0))
+		val now = self.value(I32, .Use(.Copy(state.clone())))
+		val asked = self.value(I32, .Binary(op: .Add, lhs: move now, rhs: Builder::int(1, I32)))
+		self.assign(move state, .Use(move asked))
+		val def = &self.program.fns[next]
+		val thisTy = def.params[0].ty
+		val retTy = def.ret
+		val address = self.value(thisTy, .AddressOf(place.clone()))
+		val result = self.temp(retTy)
+		self.push(.Call(
+			callee: .Fn(next),
+			args: Vec::of(own [move address]),
+			dest: .Some(Place::of(result)),
+		))
+	}
+}

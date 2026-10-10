@@ -1,0 +1,560 @@
+// Completion: what could be written where the cursor is.
+//
+// Where completion is asked for, the text is rarely a program: `ball.` does
+// not parse. So the server writes a placeholder name at the cursor —
+// `ball.__wipComplete` — and checks that text instead. What comes before the
+// placeholder is then checked as it always is, and the placeholder is
+// reported and ignored. What the text before the cursor ends with says what
+// is asked:
+//
+// - after `.`, the fields and methods of the value before it;
+// - after `a::`, the items of the module `a`, or the static functions and
+//   variants of the type `a`;
+// - anywhere else, the names in scope: the function's locals declared above
+//   the cursor, the module's items, what it imports, the prelude's items,
+//   and the keywords.
+
+import std::collections::{Set}
+import std::json::{Json}
+import std::path
+import hir::{BuiltinOwner, FloatTy, FnId, IntTy, LocalId, PRELUDE, Program, Ty, TypeDef}
+import syntax::{Interner, Receiver, Span, Symbol}
+
+/// The name written at the cursor, so that the text there parses.
+pub val PLACEHOLDER = "__wipComplete"
+
+/// What the text before the cursor asks for.
+@derive(Eq, Clone)
+pub enum Asked {
+	/// Members of the value that ends at this byte offset: the `.`'s.
+	Member(dot: i64)
+	/// Candidates of what this path names.
+	Path(segments: Vec<String>)
+	/// The names in scope.
+	Scope
+}
+
+/// Whether a word is one of Wip's keywords, which no name may be.
+pub fn isKeyword(word: str): bool = {
+	for keyword in KEYWORDS {
+		if keyword == word then return true
+	}
+	return false
+}
+
+/// What is asked at `cursor` in `text`.
+pub fn asked(text: str, cursor: i64): Asked = {
+	val before = text[0..cursor]
+	var start = before.len()
+	while start > 0 && lastCharOf(before[0..start]) is .Some(c) && isWordChar(c) {
+		start -= c.utf8Len()
+	}
+	val head = before[0..start]
+	if head.stripSuffix("::") is .Some(written) {
+		// The path is what runs back from the `::` through names and `::`s.
+		var from = written.len()
+		while from > 0 && lastCharOf(written[0..from]) is .Some(c) && (isWordChar(c) || c == ':') {
+			from -= c.utf8Len()
+		}
+		var segments: Vec<String> = Vec()
+		for segment in written[from..written.len()].split("::") {
+			if !segment.isEmpty() then segments.push(String::of(segment))
+		}
+		if !segments.isEmpty() then return .Path(move segments)
+	}
+	// `a.` asks for a member, but `0..` is a range.
+	if head.endsWith(".") && !head.endsWith("..") then return .Member(start - 1)
+	return .Scope
+}
+
+// The protocol's numbers for kinds of completion.
+val COMPLETE_METHOD = 2
+val COMPLETE_FUNCTION = 3
+val COMPLETE_FIELD = 5
+val COMPLETE_VARIABLE = 6
+val COMPLETE_INTERFACE = 8
+val COMPLETE_MODULE = 9
+val COMPLETE_ENUM = 13
+val COMPLETE_KEYWORD = 14
+val COMPLETE_ENUM_MEMBER = 20
+val COMPLETE_CONSTANT = 21
+val COMPLETE_STRUCT = 22
+
+val KEYWORDS: [str; 35] = [
+	"fn",
+	"val",
+	"var",
+	"if",
+	"else",
+	"then",
+	"match",
+	"while",
+	"for",
+	"in",
+	"return",
+	"break",
+	"continue",
+	"struct",
+	"enum",
+	"interface",
+	"extend",
+	"import",
+	"extern",
+	"type",
+	"pub",
+	"is",
+	"as",
+	"own",
+	"move",
+	"lend",
+	"from",
+	"keeps",
+	"defer",
+	"assert",
+	"true",
+	"false",
+	"null",
+	"static",
+	"dyn",
+]
+
+view struct Candidates {
+	program: &Program
+	interner: &Interner
+	/// The module the cursor is in, which sees what it does not export.
+	module: u32
+}
+
+/// The items gathered so far, each label once.
+struct Listed {
+	items: Vec<Json> = Vec()
+	seen: Set<String> = Set()
+}
+
+extend Candidates {
+	fn push(out: &var Listed, label: str, kind: i64, target: Option<Meant>) = {
+		if label.isEmpty() || label == PLACEHOLDER || label.startsWith("<") then return
+		if !out.seen.add(String::of(label)) then return
+		var item = object([("label", jsonText(label)), ("kind", .Int(kind))])
+		if target is .Some(target) then
+			item = withField(
+				move item,
+				"detail",
+				.Text(describe(self.program, self.interner, target.clone())),
+			)
+		out.items.push(move item)
+	}
+
+	fn name(sym: Symbol): String = String::of(self.interner.resolve(sym))
+
+	fn sees(module: u32, isPub: bool): bool = isPub || module == self.module
+
+	/// What can follow `value.`: its fields, and its methods.
+	fn members(given: Ty, out: &var Listed) = {
+		val p = &self.program
+		var ty = given
+		while true {
+			ty = match p.types.kind(ty) {
+				.Ref(inner, ..) | .Own(inner) => inner
+				_ => break
+			}
+		}
+		val kind = p.types.kind(ty)
+		if kind is .Struct(id, ..) {
+			val def = &p.structs[id]
+			for (i, field) in def.fields.forwards().enumerate() {
+				if self.sees(def.module, field.isPub) then
+					self.push(
+						&var out,
+						self.name(field.name).toStr(),
+						COMPLETE_FIELD,
+						.Some(.Field(owner: id, index: i as u32)),
+					)
+			}
+		}
+		var methods: Vec<FnId> = match kind {
+			.Struct(id, ..) => p.structs[id].methods.clone()
+			.Enum(id, ..) => p.enums[id].methods.clone()
+			.Dyn(interfaceId, ..) => {
+				var ids: Vec<FnId> = Vec()
+				for m in p.interfaces[interfaceId].methods {
+					ids.push(m.id)
+				}
+				move ids
+			}
+			.Array(..) => builtinMethods(&p, .Slice)
+			_ => match BuiltinOwner::of(kind.clone()) {
+				.Some(owner) => builtinMethods(&p, owner)
+				.None => Vec()
+			}
+		}
+		for id in extensions(&p, ty) {
+			methods.push(id)
+		}
+		for id in methods {
+			val def = &p.fns[id]
+			if def.receiver is .None | .Some(.Static) then continue
+			if self.sees(def.module, def.isPub) then
+				self.push(&var out, self.name(def.name).toStr(), COMPLETE_METHOD, .Some(.Fn(id)))
+		}
+	}
+
+	/// What can follow `Type::`: its static functions, and an enum's variants.
+	fn statics(owner: TypeDef, out: &var Listed) = {
+		val p = &self.program
+		val methods: Vec<FnId> = match owner {
+			.Struct(id) => p.structs[id].methods.clone()
+			.Enum(id) => {
+				for (i, variant) in p.enums[id].variants.forwards().enumerate() {
+					self.push(
+						&var out,
+						self.name(variant.name).toStr(),
+						COMPLETE_ENUM_MEMBER,
+						.Some(.Variant(id: id, index: i as u32)),
+					)
+				}
+				p.enums[id].methods.clone()
+			}
+			.Builtin(builtin) => builtinMethods(&p, builtin)
+		}
+		for id in methods {
+			val def = &p.fns[id]
+			if def.receiver == .Some(.Static) && self.sees(def.module, def.isPub) then
+				self.push(&var out, self.name(def.name).toStr(), COMPLETE_FUNCTION, .Some(.Fn(id)))
+		}
+	}
+
+	/// The items a module declares: all of them from inside it, and what it
+	/// exports from outside.
+	fn moduleItems(module: u32, out: &var Listed) = {
+		val p = &self.program
+		for id in p.fns.ids() {
+			val def = &p.fns[id]
+			val free = def.owner.isNone() && !def.isLambda && def.generated.isNone()
+			if free &&
+				def.instanceOf.isNone() &&
+				def.module == module &&
+				self.sees(module, def.isPub) {
+				self.push(&var out, self.name(def.name).toStr(), COMPLETE_FUNCTION, .Some(.Fn(id)))
+			}
+		}
+		for id in p.structs.ids() {
+			val def = &p.structs[id]
+			// What the compiler made — a closure's environment, a generator —
+			// has no name to write.
+			if def.module == module &&
+				self.sees(module, def.isPub) &&
+				!def.isEnv &&
+				!def.isTuple &&
+				def.generator.isNone() {
+				self.push(
+					&var out,
+					self.name(def.name).toStr(),
+					COMPLETE_STRUCT,
+					.Some(.Struct(id)),
+				)
+			}
+		}
+		for id in p.enums.ids() {
+			val def = &p.enums[id]
+			if def.module == module && self.sees(module, def.isPub) then
+				self.push(&var out, self.name(def.name).toStr(), COMPLETE_ENUM, .Some(.Enum(id)))
+		}
+		for def in p.interfaces {
+			if def.module == module && self.sees(module, def.isPub) then
+				self.push(&var out, self.name(def.name).toStr(), COMPLETE_INTERFACE, .None)
+		}
+		for id in p.consts.ids() {
+			val def = &p.consts[id]
+			if def.module == module && self.sees(module, def.isPub) then
+				self.push(
+					&var out,
+					self.name(def.name).toStr(),
+					COMPLETE_CONSTANT,
+					.Some(.Const(id)),
+				)
+		}
+		for id in p.globals.ids() {
+			val def = &p.globals[id]
+			if def.module == module && self.sees(module, def.isPub) then
+				self.push(
+					&var out,
+					self.name(def.name).toStr(),
+					COMPLETE_VARIABLE,
+					.Some(.Global(id)),
+				)
+		}
+	}
+
+	/// The struct or enum a name means, preferring the module's own.
+	fn typeNamed(name: str): Option<TypeDef> = {
+		val p = &self.program
+		var found: Vec<(u32, TypeDef)> = Vec()
+		for id in p.structs.ids() {
+			val d = &p.structs[id]
+			if self.interner.resolve(d.name) == name && self.sees(d.module, d.isPub) then
+				found.push((d.module, .Struct(id)))
+		}
+		for id in p.enums.ids() {
+			val d = &p.enums[id]
+			if self.interner.resolve(d.name) == name && self.sees(d.module, d.isPub) then
+				found.push((d.module, .Enum(id)))
+		}
+		for (module, def) in found {
+			if module == self.module then return .Some(def.clone())
+		}
+		return if found.isEmpty() then .None else .Some(found[0].1.clone())
+	}
+}
+
+/// What the interfaces `ty` implements give it through their extensions,
+/// where the implementation's types meet the condition: `text.chars().`
+/// lists `max`, and not `sum`.
+fn extensions(program: &Program, ty: Ty): Vec<FnId> = {
+	val kind = program.types.kind(ty)
+	val owner: TypeDef = match kind {
+		.Struct(id, ..) => .Struct(id)
+		.Enum(id, ..) => .Enum(id)
+		_ => match BuiltinOwner::of(kind.clone()) {
+			.Some(builtin) => .Builtin(builtin)
+			.None => return Vec()
+		}
+	}
+	var given: Vec<Ty> = Vec()
+	if kind is .Struct(args, ..) | .Enum(args, ..) {
+		for t in program.types.list(args) {
+			given.push(t)
+		}
+	}
+	var found: Vec<FnId> = Vec()
+	for implementation in program.impls {
+		if implementation.ty != owner then continue
+		var args: Vec<Ty> = Vec()
+		var all = true
+		for arg in program.types.list(implementation.args) {
+			match program.types.trySubstFind(arg, &given) {
+				.Some(t) => args.push(t)
+				.None => all = false
+			}
+		}
+		if !all then continue
+		for method in program.interfaces[implementation.interfaceId].extensions {
+			val generics = &program.fns[method].generics
+			var met = true
+			for (at, arg) in args.forwards().enumerate() {
+				if at + 1 >= generics.len() then continue
+				for c in generics[at + 1].interfaces {
+					if !program.implements(arg, c.interfaceId) then met = false
+				}
+			}
+			if met then found.push(method)
+		}
+	}
+	return move found
+}
+
+/// The methods the prelude gives a built-in type.
+fn builtinMethods(program: &Program, owner: BuiltinOwner): Vec<FnId> = match program.builtins.get(
+	&owner,
+) {
+	.Some(b) => b.methods.clone()
+	.None => Vec()
+}
+
+/// What could be written at `cursor` in the open file, whose text the
+/// program was checked with the placeholder written at the cursor. `base` is
+/// where the file's spans begin in the program.
+pub fn completionItems(
+	loaded: &Loaded,
+	program: &Program,
+	file: &OpenFile,
+	base: u32,
+	cursor: i64,
+): Json = {
+	val pos = base + cursor as u32
+	// The function the cursor is in, if it is in one.
+	var around: Option<FnId> = .None
+	for id in program.fns.ids() {
+		if around.isSome() then break
+		val def = &program.fns[id]
+		if def.instanceOf.isSome() || def.isLambda then continue
+		if def.body is .Some(body) && body.value is .Some(v) {
+			val span = body.exprs[v].span
+			if span.lo <= pos && pos <= span.hi then around = .Some(id)
+		}
+	}
+	val module: u32 = match around {
+		.Some(id) => program.fns[id].module
+		.None => match moduleOf(&loaded, file.path.toStr()) {
+			.Some(m) => m
+			.None => 0
+		}
+	}
+	val items = Candidates(program: &program, interner: &loaded.interner, module: module)
+	var listed = Listed()
+	match asked(file.text.toStr(), cursor) {
+		.Member(dot) => {
+			val end = base + dot as u32
+			// The largest expression that ends at the `.`, in any body: `a.b`
+			// of `a.b.`, not `b`.
+			var best: Option<(Span, Ty)> = .None
+			for def in program.fns {
+				val .Some(body) = def.body else {
+					continue
+				}
+				for e in body.exprs {
+					if e.span.hi != end then continue
+					val wider = match best {
+						.Some((b, _)) => e.span.lo < b.lo
+						.None => true
+					}
+					if wider then best = .Some((e.span, e.ty))
+				}
+			}
+			if best is .Some((_, ty)) then items.members(ty, &var listed)
+		}
+		.Path(segments) => {
+			val prefix = program.modules[module as i64].toStr()
+			val package: Option<str> =
+				if prefix.contains("::") then prefix.split("::").next() else .None
+			val imported = importsOf(file.text.toStr(), file.path.toStr())
+			// An alias stands for the path it was imported as.
+			var written = segments.join("::")
+			for (name, full) in imported {
+				if name == segments[0] {
+					var whole = full.clone()
+					for segment in segments[1..segments.len()] {
+						whole.push("::")
+						whole.push(segment.toStr())
+					}
+					written = move whole
+					break
+				}
+			}
+			val withOwn = match package {
+				.Some(name) => "\(name)::\(written)"
+				.None => String()
+			}
+			var target: Option<i64> = .None
+			for (at, m) in program.modules.forwards().enumerate() {
+				if target.isNone() && !m.isEmpty() && (m == written || m == withOwn) then
+					target = .Some(at)
+			}
+			match target {
+				.Some(at) => items.moduleItems(at as u32, &var listed)
+				.None => {
+					val last = segments[segments.len() - 1].toStr()
+					var owner = items.typeNamed(last)
+					if owner.isNone() &&
+						builtinNamed(last) is .Some(builtin) &&
+						program.builtins.contains(&builtin) {
+						owner = .Some(.Builtin(builtin))
+					}
+					if owner is .Some(def) then items.statics(def.clone(), &var listed)
+				}
+			}
+		}
+		.Scope => {
+			if around is .Some(id) && program.fns[id].body is .Some(body) {
+				// The locals declared above the cursor, the nearest last, so
+				// it is the one a repeated name keeps.
+				var locals: Vec<(Span, LocalId)> = Vec()
+				for local in body.locals.ids() {
+					if body.locals[local].span.hi <= pos then
+						locals.push((body.locals[local].span, local))
+				}
+				locals.sortBy((a, b) => a.0.lo > b.0.lo)
+				for (_, local) in locals {
+					items.push(
+						&var listed,
+						items.name(body.locals[local].name).toStr(),
+						COMPLETE_VARIABLE,
+						.Some(.Local(id: id, local: local)),
+					)
+				}
+			}
+			items.moduleItems(module, &var listed)
+			for (name, _) in importsOf(file.text.toStr(), file.path.toStr()) {
+				items.push(&var listed, name.toStr(), COMPLETE_MODULE, .None)
+			}
+			for (at, m) in program.modules.forwards().enumerate() {
+				if m == PRELUDE {
+					items.moduleItems(at as u32, &var listed)
+					break
+				}
+			}
+			for keyword in KEYWORDS {
+				items.push(&var listed, keyword, COMPLETE_KEYWORD, .None)
+			}
+		}
+	}
+	return object([("isIncomplete", Json::Bool(false)), ("items", .Array(move listed.items))])
+}
+
+/// The built-in type a name means, for `i64::` and the like.
+fn builtinNamed(name: str): Option<BuiltinOwner> = match name {
+	"i8" => .Some(.Int(.I8))
+	"i16" => .Some(.Int(.I16))
+	"i32" => .Some(.Int(.I32))
+	"i64" => .Some(.Int(.I64))
+	"u8" => .Some(.Int(.U8))
+	"u16" => .Some(.Int(.U16))
+	"u32" => .Some(.Int(.U32))
+	"u64" => .Some(.Int(.U64))
+	"f32" => .Some(.Float(.F32))
+	"f64" => .Some(.Float(.F64))
+	"bool" => .Some(.Bool)
+	"char" => .Some(.Char)
+	"str" => .Some(.Str)
+	_ => .None
+}
+
+/// The module whose directory holds `file`.
+fn moduleOf(loaded: &Loaded, file: str): Option<u32> = {
+	val canonical = canonicalFile(file)
+	val dir = path::parent(canonical.toStr())
+	for (at, m) in loaded.modules.forwards().enumerate() {
+		if m.dir.isEmpty() then continue
+		val inside = canonicalFile(path::join(m.dir.toStr(), "x").toStr())
+		if path::parent(inside.toStr()) == dir then return .Some(at as u32)
+	}
+	return .None
+}
+
+/// The names the file's imports bind to modules, and the path each names.
+fn importsOf(text: str, file: str): Vec<(String, String)> = {
+	val parsed = parseFile(SourceFile(name: String::of(file), text: String::of(text)))
+	var bound: Vec<(String, String)> = Vec()
+	for item in parsed.ast.items {
+		val .Import(decl) = item else {
+			continue
+		}
+		var parts: Vec<str> = Vec()
+		for n in decl.path {
+			parts.push(parsed.interner.resolve(n.sym))
+		}
+		val full = parts.join("::")
+		val last = String::of(if parts.isEmpty() then "" else parts[parts.len() - 1])
+		match decl.items {
+			// Only the names in braces are bound, and `self` binds the module.
+			.Some(names) => {
+				for name in names {
+					if name.name.isSome() then continue
+					val boundAs = match name.alias {
+						.Some(alias) => String::of(parsed.interner.resolve(alias.sym))
+						.None => last.clone()
+					}
+					bound.push((move boundAs, full.clone()))
+				}
+			}
+			.None => {
+				val boundAs = match decl.alias {
+					.Some(alias) => String::of(parsed.interner.resolve(alias.sym))
+					.None => last.clone()
+				}
+				bound.push((move boundAs, full.clone()))
+			}
+		}
+	}
+	return move bound
+}

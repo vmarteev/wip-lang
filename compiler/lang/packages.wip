@@ -1,0 +1,742 @@
+// Packages: what a `package.wip` says, where a dependency is, and what a
+// module of one may import from another.
+
+import std::collections::{Deque}
+import std::fs
+import std::path
+import fmt::{Style}
+import syntax::{
+	Annotation,
+	Diagnostic,
+	INTERNAL_MODULE,
+	Interner,
+	PACKAGE,
+	Span,
+	Symbol,
+	UNKNOWN_MODULE,
+	lexAt,
+	parsePackageAt
+}
+
+/// A package of the program: where its modules are, and what its
+/// `package.wip` says. The program's own is first.
+@derive(Clone)
+pub struct Package {
+	pub name: Option<String>
+	pub version: Option<String>
+	/// Its root, as the program was told where it is.
+	pub dir: String
+	/// The same, resolved: two paths to one directory are one package.
+	identity: String
+	/// Empty for the program's own package, and its name for a
+	/// dependency: what begins its modules' paths.
+	pub prefix: String
+	/// The packages it depends on: the name, which package, and where the
+	/// `@depends` was written.
+	pub depends: Vec<(String, i64, Span)>
+}
+
+/// What a `package.wip` says.
+struct Manifest {
+	name: Option<(String, Span)>
+	version: Option<String>
+	/// The name each dependency is imported by, where its root is relative
+	/// to this package's, and where the `@depends` was written.
+	depends: Vec<(String, String, Span)>
+}
+
+/// One argument of a package's annotation: its key, where it has one, its
+/// text, where it is a string, and where it was written.
+struct Said {
+	key: Option<String>
+	value: Option<String>
+	span: Span
+}
+
+/// Reads the `package.wip` at `dir`, if there is one, reporting what is
+/// wrong with it into `loaded`. Its text joins the sources, so that what is
+/// reported can be shown.
+fn manifest(dir: str, loaded: &var Loaded, overlay: &Overlay): Option<Manifest> = {
+	val file = path::join(dir, "package.wip")
+	val .Ok(text) = overlay.read(file.toStr()) else {
+		return .None
+	}
+	val base = loaded.sources.add(file.clone(), text.clone())
+	val lexed = lexAt(text.toStr(), base, &var loaded.interner)
+	val parsed = parsePackageAt(text.toStr(), base, &lexed)
+	for diagnostic in lexed.diagnostics {
+		loaded.diagnostics.push(diagnostic.clone())
+	}
+	for diagnostic in parsed.diagnostics {
+		loaded.diagnostics.push(diagnostic.clone())
+	}
+	var manifest = Manifest(
+		name: match parsed.name {
+			.Some(name) => .Some((String::of(loaded.interner.resolve(name.sym)), name.span))
+			.None => .None
+		},
+		version: .None,
+		depends: Vec(),
+	)
+	for annotation in parsed.annotations {
+		val what = String::of(loaded.interner.resolve(annotation.name.sym))
+		var strings: Vec<Said> = Vec()
+		for arg in annotation.args {
+			strings.push(Said(
+				key: match arg.name {
+					.Some(name) => .Some(String::of(loaded.interner.resolve(name.sym)))
+					.None => .None
+				},
+				value: match arg.value {
+					.Str(symbol) => .Some(String::of(loaded.interner.resolve(symbol)))
+					_ => .None
+				},
+				span: arg.span,
+			))
+		}
+		match what.toStr() {
+			"version" => {
+				val version = if strings.len() == 1 &&
+					strings[0].key.isNone() &&
+					strings[0].value is .Some(v) {
+					v.clone()
+				} else {
+					loaded.diagnostics.push(
+						Diagnostic::error(
+							PACKAGE,
+							String::of("`@version` takes one version, as in `@version(\"1.4.0\")`"),
+							annotation.span,
+							String::of("not a version"),
+						).withNote(
+							String::of(
+								"a package's version is a semantic version: `MAJOR.MINOR.PATCH`, with a `-pre` and a `+build` if written",
+							),
+						),
+					)
+					continue
+				}
+				if !isSemver(version.toStr()) then
+					loaded.diagnostics.push(
+						Diagnostic::error(
+							PACKAGE,
+							"`\(version)` is not a semantic version",
+							annotation.span,
+							String::of("not `MAJOR.MINOR.PATCH`"),
+						).withNote(
+							String::of(
+								"versions must compare once a dependency can name one, so a package's is `MAJOR.MINOR.PATCH`, with a `-pre` and a `+build` if written, as in `1.4.0` or `2.0.0-rc.1`",
+							),
+						),
+					)
+				else if manifest.version.isSome() then
+					loaded.diagnostics.push(
+						Diagnostic::error(
+							PACKAGE,
+							String::of("a package has one version"),
+							annotation.span,
+							String::of("a second `@version`"),
+						),
+					)
+				else manifest.version = .Some(move version)
+			}
+			"depends" => {
+				val name = if !strings.isEmpty() &&
+					strings[0].key.isNone() &&
+					strings[0].value is .Some(n) {
+					n.clone()
+				} else {
+					loaded.diagnostics.push(
+						Diagnostic::error(
+							PACKAGE,
+							String::of(
+								"`@depends` begins with the name the dependency is imported by",
+							),
+							annotation.span,
+							String::of("no name"),
+						).withHelp(
+							String::of("write `@depends(\"engine\", path = \"../engine\")`"),
+						),
+					)
+					continue
+				}
+				var remote = false
+				for said in strings {
+					if said.key is .Some(key) && key.toStr() is "git" | "rev" then remote = true
+				}
+				if remote {
+					loaded.diagnostics.push(
+						Diagnostic::error(
+							PACKAGE,
+							"`\(name)` is named by where it is fetched from, which is not built yet",
+							annotation.span,
+							String::of("a remote package"),
+						).withNote(
+							String::of(
+								"a remote source is reserved for when a program needs one, with a lock file; today a dependency is a directory, `path = \"…\"`",
+							),
+						),
+					)
+					continue
+				}
+				var unknown: Option<Span> = .None
+				for i in 1..strings.len() {
+					val isPath = strings[i].key is .Some(key) && key == "path"
+					if !isPath && unknown.isNone() then unknown = .Some(strings[i].span)
+				}
+				var found: Option<String> = .None
+				for said in strings {
+					if found.isNone() && said.key is .Some(key) && key == "path" then
+						found = said.value.clone()
+				}
+				val .Some(dependency) = if unknown.isNone() then move found else Option::None else {
+					loaded.diagnostics.push(
+						Diagnostic::error(
+							PACKAGE,
+							"`@depends` says where `\(name)` is with `path = \"…\"`, and nothing else",
+							unknown.unwrapOr(annotation.span),
+							String::of("not what a dependency takes"),
+						).withHelp("write `@depends(\"\(name)\", path = \"../\(name)\")`"),
+					)
+					continue
+				}
+				manifest.depends.push((move name, move dependency, annotation.span))
+			}
+			// How `wip fmt` lays the package out, which the formatter reads
+			// for itself.
+			"format" => {
+				if formatSettings(&annotation, &loaded.interner) is .Err(message) then
+					loaded.diagnostics.push(
+						Diagnostic::error(
+							PACKAGE,
+							message.clone(),
+							annotation.span,
+							String::of("not a layout `wip fmt` knows"),
+						),
+					)
+			}
+			_ => {
+				loaded.diagnostics.push(
+					Diagnostic::error(
+						PACKAGE,
+						"`@\(what)` is not something a package says",
+						annotation.span,
+						String::of("not a package's annotation"),
+					).withHelp(
+						String::of(
+							"a `package.wip` takes `@version(\"1.4.0\")`, `@depends(\"engine\", path = \"../engine\")` and `@format(width = 120)`",
+						),
+					),
+				)
+			}
+		}
+	}
+	return .Some(move manifest)
+}
+
+/// What a `@format(…)` says, over the default style: `width`,
+/// `indent = "tabs"` or `"spaces"`, and `size`.
+fn formatSettings(annotation: &Annotation, interner: &Interner): Result<Style, String> = {
+	var style = Style()
+	for arg in annotation.args {
+		val key = match arg.name {
+			.Some(name) => interner.resolve(name.sym)
+			.None => ""
+		}
+		match arg.value {
+			.Int(value) if key == "width" && value >= 40 && value <= 400 =>
+				style.width = value as i64
+			.Int(value) if key == "size" && value >= 1 && value <= 16 => style.size = value as i64
+			.Str(symbol) if key == "indent" => {
+				match interner.resolve(symbol) {
+					"tabs" => style.tabs = true
+					"spaces" => style.tabs = false
+					other => return .Err("`indent = \"\(other)\"` is neither `\"tabs\"` nor `\"spaces\"`")
+				}
+			}
+			_ => return .Err(
+				String::of(
+					"`@format` takes `width` (40 to 400), `indent = \"tabs\"` or `\"spaces\"`, and `size` (1 to 16)",
+				),
+			)
+		}
+	}
+	return .Ok(style)
+}
+
+/// How `wip fmt` lays out `file`: what the `@format` of the nearest
+/// `package.wip` above it says, or the defaults.
+pub fn formatStyle(file: str): Result<Style, String> = {
+	val isDirectory = match fs::meta(file) {
+		.Ok(meta) => meta.isDirectory()
+		.Err(_) => false
+	}
+	val start = if isDirectory then file else path::parent(file)
+	var dir = identity(start)
+	while true {
+		val manifest = path::join(dir.toStr(), "package.wip")
+		if fs::readFile(manifest.toStr()) is .Ok(text) {
+			var interner = Interner::new()
+			val lexed = lexAt(text.toStr(), 0, &var interner)
+			val parsed = parsePackageAt(text.toStr(), 0, &lexed)
+			for annotation in parsed.annotations {
+				if interner.resolve(annotation.name.sym) != "format" then continue
+				return match formatSettings(&annotation, &interner) {
+					.Ok(style) => .Ok(style)
+					.Err(message) => .Err("\(manifest): \(message)")
+				}
+			}
+			return .Ok(Style())
+		}
+		val up = path::parent(dir.toStr())
+		if up == dir.toStr() then break
+		dir = String::of(up)
+	}
+	return .Ok(Style())
+}
+
+/// `MAJOR.MINOR.PATCH`, with a `-pre` and a `+build` if written: what
+/// Semantic Versioning 2.0.0 says, which is what makes two versions
+/// comparable.
+fn isSemver(text: str): bool = {
+	val built: (str, Option<str>) = match text.splitOnce("+") {
+		.Some((rest, build)) => (rest, .Some(build))
+		.None => (text, .None)
+	}
+	val (rest, build) = built
+	val released: (str, Option<str>) = match rest.splitOnce("-") {
+		.Some((core, pre)) => (core, .Some(pre))
+		.None => (rest, .None)
+	}
+	val (core, pre) = released
+	var parts = 0
+	for part in core.split(".") {
+		parts += 1
+		if !isNumber(part) then return false
+	}
+	if parts != 3 then return false
+	if pre is .Some(pre) && !identifiers(pre) then return false
+	if build is .Some(build) && !identifiers(build) then return false
+	return true
+}
+
+/// A part of a version's core: digits, with no leading zero but in `0`.
+fn isNumber(part: str): bool = {
+	if part.isEmpty() then return false
+	for b in part {
+		if !(b is b'0'..=b'9') then return false
+	}
+	return part == "0" || !part.startsWith("0")
+}
+
+/// A version's `-pre` or `+build`: identifiers of letters, digits and `-`,
+/// separated by `.`, none empty.
+fn identifiers(text: str): bool = {
+	for part in text.split(".") {
+		if part.isEmpty() then return false
+		for b in part {
+			if !(b is b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-') then return false
+		}
+	}
+	return true
+}
+
+/// A path with `a/..` taken out, so that a dependency's files are named
+/// `engine/render.wip` rather than `game/../engine/render.wip` in what is
+/// reported. Nothing is resolved: that is `identity`'s job.
+fn tidy(written: str): String = {
+	val absolute = written.startsWith("/")
+	var parts: Vec<str> = Vec()
+	for part in written.split("/") {
+		if part.isEmpty() || part == "." then continue
+		if part == ".." && !parts.isEmpty() && parts[parts.len() - 1] != ".." {
+			parts.pop()
+			continue
+		}
+		// The root has no parent.
+		if part == ".." && absolute && parts.isEmpty() then continue
+		parts.push(part)
+	}
+	val joined = parts.join("/")
+	return if absolute then "/\(joined)" else move joined
+}
+
+/// Whether there is a file at `path`, a link to one followed.
+fn isFile(path: str): bool = fs::meta(path) is .Ok(meta) && meta.isFile()
+
+/// Whether there is a directory at `path`, a link to one followed.
+pub fn isDirectory(path: str): bool = fs::meta(path) is .Ok(meta) && meta.isDirectory()
+
+/// Where a directory really is, so that two paths to it are one; the path
+/// as it was where it cannot be found.
+fn identity(dir: str): String = {
+	val named = if dir.isEmpty() then "." else dir
+	return match fs::realPath(named) {
+		.Ok(real) => move real
+		.Err(_) => String::of(named)
+	}
+}
+
+/// The program's package, whose root is `root`, and every package it
+/// depends on, however far down. A package is identified by its directory,
+/// so two paths to it are one package; its name must be the one it is
+/// depended on by; and a cycle is reported.
+fn packages(root: str, loaded: &var Loaded, overlay: &Overlay): Vec<Package> = {
+	val ownManifest = manifest(root, &var loaded, &overlay)
+	var packages = Vec::of(own [
+		Package(
+			name: match ownManifest {
+				.Some(m) => match m.name {
+					.Some((n, _)) => .Some(n.clone())
+					.None => .None
+				}
+				.None => .None
+			},
+			version: match ownManifest {
+				.Some(m) => m.version.clone()
+				.None => .None
+			},
+			dir: String::of(root),
+			identity: identity(root),
+			prefix: String(),
+			depends: Vec(),
+		),
+	])
+	var queue: Deque<(i64, Manifest)> = Deque()
+	if ownManifest is .Some(..) {
+		val .Some(m) = move ownManifest else {
+			panic("a manifest")
+		}
+		queue.pushBack((0, move m))
+	}
+	while queue.popFront() is .Some(entry) {
+		val (owner, said) = move entry
+		for (name, dependency, span) in move said.depends {
+			if name == "std" || name == "package" {
+				loaded.diagnostics.push(
+					Diagnostic::error(
+						PACKAGE,
+						"`\(name)` is a name every package has already",
+						span,
+						String::of("taken"),
+					).withNote(
+						String::of(
+							"`std` is the standard library, and `package::NAME` is a package's own name",
+						),
+					),
+				)
+				continue
+			}
+			val dir = tidy(path::join(packages[owner].dir.toStr(), dependency.toStr()).toStr())
+			if !isFile(path::join(dir.toStr(), "package.wip").toStr()) {
+				loaded.diagnostics.push(
+					Diagnostic::error(
+						PACKAGE,
+						"`\(dir)` has no `package.wip`",
+						span,
+						String::of("not a package"),
+					).withNote(
+						String::of(
+							"a dependency is a directory whose `package.wip` names it; `path` is relative to this package's root",
+						),
+					),
+				)
+				continue
+			}
+			val id = identity(dir.toStr())
+			var known: Option<i64> = .None
+			for (i, package) in packages.forwards().enumerate() {
+				if known.isNone() && package.identity == id then known = .Some(i)
+			}
+			if known is .Some(found) {
+				// Reached again: a diamond, which is one package, or a
+				// cycle, which is reported below.
+				val same = packages[found].name is .Some(n) && n == name
+				if !same {
+					val called = match packages[found].name {
+						.Some(n) => n.clone()
+						.None => String::of("without a name")
+					}
+					loaded.diagnostics.push(
+						Diagnostic::error(
+							PACKAGE,
+							"`\(dir)` is package `\(called)`, not `\(name)`",
+							span,
+							String::of("named differently here"),
+						),
+					)
+					continue
+				}
+				packages[owner].depends.push((move name, found, span))
+				continue
+			}
+			var taken = false
+			for package in packages {
+				if package.name is .Some(n) && n == name then taken = true
+			}
+			if taken {
+				loaded.diagnostics.push(
+					Diagnostic::error(
+						PACKAGE,
+						"two packages of this program are named `\(name)`",
+						span,
+						String::of("a second one"),
+					).withNote(
+						String::of(
+							"a package's name is the first segment of the paths that reach it, so one program has one package of each name",
+						),
+					),
+				)
+				continue
+			}
+			val .Some(theirs) = manifest(dir.toStr(), &var loaded, &overlay) else {
+				continue
+			}
+			match theirs.name {
+				.Some((declared, _)) if declared == name => {}
+				.Some((declared, declaredSpan)) => {
+					loaded.diagnostics.push(
+						Diagnostic::error(
+							PACKAGE,
+							"`\(dir)` is package `\(declared)`, not `\(name)`",
+							span,
+							String::of("depended on by this name"),
+						).withSecondary(declaredSpan, String::of("it says this")).withNote(
+							String::of(
+								"a package is imported by the name it gives itself, so that a name is never a local alias of something else; `import engine as e` renames it where it is used",
+							),
+						),
+					)
+					continue
+				}
+				.None => continue
+			}
+			val index = packages.len()
+			packages.push(Package(
+				name: .Some(name.clone()),
+				version: theirs.version.clone(),
+				dir: move dir,
+				identity: move id,
+				prefix: name.clone(),
+				depends: Vec(),
+			))
+			packages[owner].depends.push((move name, index, span))
+			queue.pushBack((index, move theirs))
+		}
+	}
+	if packageCycle(&packages) is .Some(diagnostic) then loaded.diagnostics.push(move diagnostic)
+	return move packages
+}
+
+/// A package that depends on itself, however far round: the first one
+/// found, reported where the `@depends` that closes it was written.
+fn packageCycle(packages: &[Package]): Option<Diagnostic> = {
+	var trail = Vec::of(own [0])
+	var done: Vec<i64> = Vec()
+	val .Some((from, to, span)) = packageWalk(0, &packages, &var trail, &var done) else {
+		return .None
+	}
+	return .Some(
+		Diagnostic::error(
+			PACKAGE,
+			"packages `\(packageName(&packages, from))` and `\(packageName(&packages, to))` depend on each other",
+			span,
+			String::of("this closes the circle"),
+		).withNote(
+			String::of(
+				"packages form a tree without cycles, so that each can be compiled after what it uses; what both need belongs in a third",
+			),
+		),
+	)
+}
+
+/// The walk `packageCycle` makes from one package: the first dependency
+/// that leads back onto `trail`.
+fn packageWalk(
+	at: i64,
+	packages: &[Package],
+	trail: &var Vec<i64>,
+	done: &var Vec<i64>,
+): Option<(i64, i64, Span)> = {
+	for (_, to, span) in packages[at].depends {
+		if trail.contains(&to) then return .Some((at, to, span))
+		if done.contains(&to) then continue
+		trail.push(to)
+		if packageWalk(to, &packages, &var trail, &var done) is .Some(found) then
+			return .Some(found)
+		trail.pop()
+		done.push(to)
+	}
+	return .None
+}
+
+/// A package's name for a message.
+fn packageName(packages: &[Package], i: i64): String = match packages[i].name {
+	.Some(name) => name.clone()
+	.None => String::of("the program's")
+}
+
+/// Which package a module is in, and its path within it: nothing for the
+/// standard library. A dependency's modules begin with its name.
+pub fn locateModule(packages: &[Package], module: str): Option<(i64, String)> = {
+	if module == "std" || module.startsWith("std::") then return .None
+	val (first, rest) = match module.splitOnce("::") {
+		.Some((first, rest)) => (first, rest)
+		.None => (module, "")
+	}
+	for i in 1..packages.len() {
+		if packages[i].prefix == first then return .Some((i, String::of(rest)))
+	}
+	return .Some((0, String::of(module)))
+}
+
+/// The module a path written in `owner`'s package means, as the checker
+/// works it out: `std`'s and a dependency's as written, and one of the
+/// package's own from its root.
+pub fn meant(packages: &[Package], owner: Option<i64>, written: str): String = {
+	val .Some(owner) = owner else {
+		return String::of(written)
+	}
+	val package = &packages[owner]
+	val first = firstSegment(written)
+	var depended = false
+	for (name, _, _) in package.depends {
+		if name == first then depended = true
+	}
+	if package.prefix.isEmpty() || first == "std" || depended then return String::of(written)
+	if written.isEmpty() then return package.prefix.clone()
+	return "\(package.prefix)::\(written)"
+}
+
+/// What a path begins with: `a` of `a::b`.
+fn firstSegment(written: str): str = match written.splitOnce("::") {
+	.Some((first, _)) => first
+	.None => written
+}
+
+/// What is wrong with an import that crosses from `owner`'s package into
+/// another: a package it does not depend on, a module of its own named
+/// like a dependency, or one under another package's `internal/`.
+pub fn importAcrossPackages(
+	packages: &[Package],
+	owner: Option<i64>,
+	written: str,
+	imported: str,
+	span: Span,
+): Option<Diagnostic> = {
+	val .Some(owner) = owner else {
+		return .None
+	}
+	val .Some((target, local)) = locateModule(&packages, imported) else {
+		return .None
+	}
+	val first = firstSegment(written)
+	var depends = false
+	for (name, _, _) in packages[owner].depends {
+		if name == first then depends = true
+	}
+	if depends && isDirectory(moduleDir(packages[owner].dir.toStr(), first).toStr()) then
+		return .Some(
+			Diagnostic::error(
+				PACKAGE,
+				"`\(first)` is both a package this one depends on and a module of its own",
+				span,
+				String::of("which one is meant"),
+			).withHelp("rename the directory `\(first)`, or depend on the package by another name"),
+		)
+	if target == owner then return .None
+	if !depends {
+		val name = packages[target].name.clone().unwrapOr(String())
+		return .Some(
+			Diagnostic::error(
+				PACKAGE,
+				"this package does not depend on `\(name)`",
+				span,
+				String::of("not a dependency"),
+			).withHelp("say so in `package.wip`: `@depends(\"\(name)\", path = \"…\")`"),
+		)
+	}
+	var internal = false
+	for segment in local.split("::") {
+		if segment == "internal" then internal = true
+	}
+	if internal {
+		val name = packages[target].name.clone().unwrapOr(String())
+		return .Some(
+			Diagnostic::error(
+				INTERNAL_MODULE,
+				"`\(written)` is internal to package `\(name)`",
+				span,
+				String::of("not its interface"),
+			).withNote(
+				String::of(
+					"a module under a directory named `internal` can be imported by its own package's modules and by no other package's",
+				),
+			),
+		)
+	}
+	return .None
+}
+
+/// The `.c` files of one module for `target`, and on an Apple target its
+/// `.m` files, in name order. The standard library is compiled in and has
+/// none; a module that cannot be read has its missing import reported
+/// elsewhere.
+pub fn moduleCFiles(dir: str, target: Target): Vec<String> = {
+	val listing = if dir.isEmpty() then "." else dir
+	val .Ok(entries) = fs::readDir(listing) else {
+		return Vec()
+	}
+	var files: Vec<String> = Vec()
+	for entry in entries {
+		val name = entry.name.toStr()
+		// Objective-C is Apple's, so a `.m` file is glue for an Apple
+		// target, and passed over elsewhere. A `.c` file may say which
+		// target it is for in its name.
+		val extension = path::extension(name)
+		val takes =
+			extension == .Some("c") || (extension == .Some("m") && target.vendor() == "apple")
+		if takes && takesFile(name, target) then files.push(path::join(dir, name))
+	}
+	files.sort()
+	return move files
+}
+
+/// The first import cycle, if the modules form one.
+pub fn importCycle(edges: &[(String, String, Span)]): Option<Diagnostic> = {
+	var trail = Vec::of(own [String()])
+	var done: Vec<String> = Vec()
+	val .Some((to, from, span)) = importWalk("", &edges, &var trail, &var done) else {
+		return .None
+	}
+	return .Some(
+		Diagnostic::error(
+			UNKNOWN_MODULE,
+			"modules `\(to)` and `\(from)` import each other",
+			span,
+			String::of("this import closes the circle"),
+		).withNote(
+			String::of("modules form a directed acyclic graph, so each can be compiled on its own"),
+		),
+	)
+}
+
+/// The walk `importCycle` makes from one module: the first import that
+/// leads back onto `trail`.
+fn importWalk(
+	at: str,
+	edges: &[(String, String, Span)],
+	trail: &var Vec<String>,
+	done: &var Vec<String>,
+): Option<(String, String, Span)> = {
+	for (from, to, span) in edges {
+		if from != at then continue
+		if trail.contains(&to) then return .Some((to.clone(), from.clone(), span))
+		if done.contains(&to) then continue
+		trail.push(to.clone())
+		if importWalk(to.toStr(), &edges, &var trail, &var done) is .Some(found) then
+			return .Some(move found)
+		trail.pop()
+		done.push(to.clone())
+	}
+	return .None
+}

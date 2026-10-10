@@ -177,8 +177,9 @@ Where line breaks are significant:
    the start of a line begins something new; it does not continue the line
    above. An incomplete expression — a line ending in an operator, `.`, `=`,
    `=>`, `then`, `,` or an open bracket — continues onto the next line.
-3. **One token continues the line above:** `else`, which cannot begin a
-   statement. A `.` does not: at the start of a line it begins a variant.
+3. **Two tokens continue the line above:** `else`, and the `|` before a
+   pattern's next alternative, neither of which can begin a statement. A
+   `.` does not: at the start of a line it begins a variant.
 
 **A long expression wraps after an operator or a `.`** that ends its line,
 or inside parentheses, where line breaks are whitespace:
@@ -200,8 +201,8 @@ val also = (price
 Outside brackets, the operator or the `.` goes at the end of the line it
 continues from, never at the start of the next one.
 
-A line that starts with a binary operator other than `-` and `&` is an
-error (E0113), with a fix that joins it to the line above. A line starting
+A line that starts with a binary operator other than `-` and `&`, and
+other than a `|` between alternatives, is an error (E0113), with a fix that joins it to the line above. A line starting
 with `-` is a new expression, so `total = price` followed by `- discount` on
 the next line is two statements; the type checker warns that the second one
 has no effect (E0320).
@@ -278,7 +279,7 @@ variant     = IDENT ( "(" params ")" )? ;
                                          (* a field's `= value` is its default,
                                             as a parameter's *)
 
-extendBlock = "extend" extendType ( ":" IDENT typeArgs? )?
+extendBlock = "extend" extendType ( ":" path typeArgs? )?
               "{" ( method ( lsep method )* lsep? )? "}" ;
 extendType  = path generics?              (* a type of this module, or an
                                              interface of it, extended under
@@ -301,12 +302,17 @@ method      = annotation* "pub"? ( "var" | "move" | "static" | "lend" )? fnDecl 
                                             method does with its receiver;
                                             `lend` both ways *)
 
-fnDecl      = "fn" IDENT generics? "(" params? ")" ( ":" type lendsFrom? )? "=" expr ;
+fnDecl      = "fn" IDENT generics? "(" params? ")" ( ":" type lendsFrom? )? keeps? "=" expr ;
 lendsFrom   = "from" lendPath ( "," lendPath )* ;
                                          (* what the result borrows, and
                                             nothing else; `from` is a word
                                             here alone *)
 lendPath    = ( IDENT | "self" ) ( "." IDENT )* ;
+keeps       = "keeps" IDENT ( "," IDENT )* ;
+                                         (* the parameters a call may keep in
+                                            its `&var` arguments, and no
+                                            others; `keeps` is a word here
+                                            alone *)
 generics    = "<" typeParam ( "," typeParam )* ","? ">" ;
 typeParam   = "type"? IDENT ( ":" constraint ( "+" constraint )* )?
               ( "=" type )? ;
@@ -316,8 +322,10 @@ typeParam   = "type"? IDENT ( ":" constraint ( "+" constraint )* )?
                                             implementation decides, after
                                             the others and with no
                                             default *)
-constraint  = IDENT typeArgs? ;          (* `copy`, or an interface with the
-                                            types it takes *)
+constraint  = path typeArgs? ;           (* `copy`, or an interface with the
+                                            types it takes: `Area`, or another
+                                            module's by its path,
+                                            `shapes::Area` *)
 params      = param ( "," param )* ","? ;
 param       = ( IDENT | "_" ) ":" type ( "=" expr )? ;
                                           (* a default: a constant;
@@ -358,7 +366,7 @@ type        = "own" "<" type ">"           (* `own<(…) => R>` is an owned
                                            (* a length is a literal or a
                                               constant *)
             | "[" type "]"                 (* a slice: only behind "&" *)
-            | "dyn" IDENT                  (* some type that implements the interface:
+            | "dyn" path typeArgs?         (* some type that implements the interface:
                                               only behind "&" *)
             | "(" ( param ( "," param )* ","? )? ")" "=>" type
                                            (* a function type, `=> void` for none;

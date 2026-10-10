@@ -558,7 +558,8 @@ Work may also borrow what is around it, where the call that runs it waits
 for it. `future::together(first, second)` runs `first` on
 a thread of its own and `second` on this one, and answers both results
 once both are done; `future::each(items, work)` and `future::map(items,
-work)` split a slice among the processors. The closures are lent for the
+work)` split a slice among the processors, as many as `future::cores()`
+says are working. The closures are lent for the
 call, so what they capture is checked as the call's arguments are: what
 one writes, no other touches, and several may read one place.
 
@@ -595,6 +596,7 @@ fn main() = {
         counted.add(1)
     })
     assert(counted.load() == 4 && cells[0] == 2)
+    assert(future::cores() >= 1)
 
     val names: Mutex<Vec<String>> = Mutex::of(Vec())
     future::together(
@@ -732,6 +734,59 @@ fn main() = {
 
 A program that ends with a code other than 0 has answered, not failed:
 `exit.success()` asks. Failing to start is an `IoError`.
+
+It is given this program's environment and directory unless its command
+says otherwise: `env(name, value)` sets a variable, `unset(name)` leaves
+one out, each in the order written, and `directory(path)` is where it
+starts. It is given none of the files, sockets and pipes this program has
+open, only its standard streams:
+
+```wip,run
+import std::process::{Command}
+
+fn main() = {
+    val script = "echo $GREETING ${HOME-nowhere}"
+    val command = Command::of("sh").env("GREETING", "hello").unset("HOME")
+    val .Ok(said) = command.args(["-c", script]).output() else {
+        assert(false, "sh is there")
+        return
+    }
+    assert(said.stdout == "hello nowhere\n")
+}
+```
+
+`connect()` starts it to be talked to as it runs: what this program writes
+with `writeText`, it reads on its standard input, and what it writes this
+program reads through `output()`, an `io::Reader`, by lines, by length or
+to the end. Its standard error is this program's. `closeInput()` ends its
+input, which is how many programs know to finish, and `wait()` closes it
+and waits; dropped, it is closed and waited for too. Writing to a program
+that has stopped reading answers `.BrokenPipe`. A `Reader` — this one, a
+file's or standard input — may be told how long a read waits for
+something to come, `setTimeout(.Some(Duration::seconds(5)))`, after which
+it answers `.WouldBlock`; what it had read is appended where it was asked
+for, so that asking again with the same `String` goes on from there:
+
+```wip,run
+import std::io
+import std::process::{Command}
+import std::time::{Duration}
+
+fn main() = {
+    var echo = Command::of("cat").connect().unwrap()
+    var line = String()
+    echo.writeText("one\n").unwrap()
+    echo.output().readLine(&var line).unwrap()
+    echo.writeText("\(line), two\n").unwrap() // the next, from what came back
+    line.clear()
+    echo.output().readLine(&var line).unwrap()
+    assert(line == "one, two")
+
+    echo.output().setTimeout(.Some(Duration::millis(50)))
+    assert(echo.output().readLine(&var line) == .Err(io::IoError::WouldBlock))
+    assert(echo.wait().success())
+}
+```
 
 `input(text)` gives it text to read on its standard input, which
 `output()` writes while it reads what the program prints and `run()`
@@ -1148,6 +1203,18 @@ val HELP: str = embed::text("help.txt")
 val LEVELS: [Level; 12] = parseLevels(embed::text("levels.txt"))
 
 assert(FONT.len() > 0)
+```
+
+`embed::textOr(path, otherwise)` is the text of a file that may not be
+there: what a build writes beside a module, a commit or a date, which a
+copy of the source does not have. Where the file is not there it is
+`otherwise`, a string literal too; anything else wrong with the path is
+refused as `embed::text` refuses it:
+
+```wip,ignore
+import std::embed
+
+val BUILT: str = embed::textOr("built.txt", "")
 ```
 
 ## What the target is

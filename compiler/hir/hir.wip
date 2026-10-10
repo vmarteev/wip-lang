@@ -1,0 +1,1907 @@
+// The typed program.
+//
+// Compared with the syntax tree: names are resolved to `LocalId`s, `FnId`s
+// and field or variant indices; every expression has a `Ty`; parentheses are
+// gone; `else if` is an `else` block whose value is the inner `if`; a
+// block's value is separated from its statements, and a value that is
+// discarded is a statement; and auto-deref and the `&own<T>` to `&T`
+// coercion appear as explicit `ExprKind::Deref` and `ExprKind::Ref` nodes.
+// Spans are kept on every node for the diagnostics of later phases.
+
+import std::collections::{Map, Set}
+import syntax::{BinaryOp, Interner, Receiver, Span, Symbol}
+
+pub type InterfaceId = Id<InterfaceDef>
+pub type StructId = Id<StructDef>
+pub type EnumId = Id<EnumDef>
+pub type FnId = Id<FnDef>
+/// A top-level `val`.
+pub type ConstId = Id<ConstDef>
+pub type GlobalId = Id<GlobalDef>
+/// A C type declared `type name` in an extern block.
+pub type OpaqueId = Id<OpaqueDef>
+pub type LocalId = Id<Local>
+pub type ExprId = Id<Expr>
+pub type StmtId = Id<Stmt>
+
+@derive(Clone)
+pub struct Program {
+	pub var types: Types
+	/// The interfaces of every module.
+	pub var interfaces: Arena<InterfaceDef>
+	/// What implements what: the interface, the type, and the function of
+	/// each of the interface's methods, in its order.
+	pub var impls: Vec<ImplDef>
+	/// The tables of methods a program needs: one per interface and type
+	/// used behind `&dyn`, with the function of each method.
+	pub var vtables: Vec<VTableDef>
+	/// Each top-level `assert`, as the function the compiler runs to check
+	/// it.
+	pub var asserts: Vec<FnId>
+	/// Every module's path, `a::b::c`, with the root module first and empty.
+	pub var modules: Vec<String>
+	pub var structs: Arena<StructDef>
+	pub var enums: Arena<EnumDef>
+	/// Wip functions and extern declarations, in source order.
+	pub var fns: Arena<FnDef>
+	/// The functions the program uses as values, each an instance once the
+	/// generic ones are made: any of them may be handed to C as a function
+	/// pointer, and called by it.
+	pub var fnValues: Set<FnId>
+	/// Whether moves leave poison and drops check for it: a debug build
+	/// does, a release build does not. The build says so before the program
+	/// is compiled.
+	pub var checkMoves: bool
+	/// Whether a struct, an enum or an array is dropped by calling the
+	/// function that drops its type, written once, as a debug build is, or
+	/// field by field where it is dropped, which a release build's optimiser
+	/// sees through. The build says so before the program is compiled.
+	pub var dropsByCall: bool
+	/// The C libraries the program links, from `@link("name")` on an extern
+	/// block, in the order they were read and without repeats.
+	pub var libraries: Vec<String>
+	/// The frameworks an Apple target links, from `@framework("Cocoa")`, in
+	/// the order they were read and without repeats.
+	pub var frameworks: Vec<String>
+	/// The directories the program's C looks for headers in, from
+	/// `@include("src")`: the module that named each, as an index into
+	/// `modules`, and the path relative to the module's own directory.
+	pub var cIncludes: Vec<(i64, String)>
+	/// The C files a module names with `@source("src/rcore.c")`, which live
+	/// below its own directory and are compiled with the program: the
+	/// module, as an index into `modules`, the path relative to it, and the
+	/// language it said they are, where it said.
+	pub var cSources: Vec<(i64, String, Option<CLanguage>)>
+	/// The header a module puts before every C file of its own, from
+	/// `@prefix("build.h")`: how a vendored library is configured, since its
+	/// settings must reach each of its translation units.
+	pub var cPrefix: Vec<(i64, String)>
+	/// What each module's C is compiled with defined, `NAME` or
+	/// `NAME=value`, by the module that said so.
+	pub var cDefines: Vec<(i64, String)>
+	/// Top-level `val`s: constants, whose values are known where they are
+	/// written and put in place of every use.
+	pub var consts: Arena<ConstDef>
+	/// C types declared `type name`, whose contents Wip does not know.
+	pub var opaques: Arena<OpaqueDef>
+	/// The variables C owns, declared `val` or `var` in an extern block.
+	pub var globals: Arena<GlobalDef>
+	/// The prelude's items the compiler itself uses — the interface `==`
+	/// goes through, the enum `main` may return — by what each is for.
+	pub var preludeItems: PreludeItems
+	/// The environment of a closure made from a named function: a struct
+	/// with nothing in it, shared by all of them.
+	pub var fnClosureEnv: Option<StructId>
+	/// The environment of an owned closure made from a named function: a
+	/// struct with nothing in it but the function that drops it, which every
+	/// owned closure's environment begins with.
+	pub var fnOwnedClosureEnv: Option<StructId>
+	/// The writing halves of `lend fn`s, whose bodies are the reading
+	/// halves' checked again with `self` a `&var Self`.
+	pub var lentHalves: Set<FnId>
+	/// The methods `@derive` wrote as code: checked as the program's own,
+	/// but placed at the annotation, so an editor passes over them.
+	pub var derived: Set<FnId>
+	/// The instance of one of those two that this program's entry point
+	/// calls, made by the monomorphizer.
+	pub var entryReport: Option<FnId>
+	/// The methods the prelude gave each built-in type.
+	pub var builtins: Map<BuiltinOwner, BuiltinImpl>
+	/// For every type that cleans up after itself, the function to call
+	/// where a value of it ends: concrete, so a generic type's instance has
+	/// its own.
+	pub var dropFns: Map<Ty, FnId>
+	/// Names that leave no expression of their own, and what each named,
+	/// for an editor: a type written in a signature, a field or an
+	/// annotation, and a constant, whose value takes its place.
+	pub var names: Vec<(Span, Named)>
+	/// For every generator type a program ends a value of or walks, the
+	/// instance of its `next`, which its drop calls too.
+	pub var generatorNext: Map<Ty, FnId>
+	/// The frame of each generator type: the types of the locals of its
+	/// `next`, which the generator keeps between calls, after its declared
+	/// fields. Known once the monomorphizer has made the instances, and read
+	/// by `fieldTys`.
+	pub var frames: Map<Ty, Vec<Ty>>
+}
+
+/// What a name written in the program named.
+@derive(Clone)
+pub enum Named {
+	Type(ty: Ty)
+	Const(id: ConstId)
+	/// The type an `extend` block gives methods to, or a static function or
+	/// a variant is named through: `Ball` in `Ball::new()`.
+	Owner(owner: TypeDef)
+	/// A variant, in an expression or a pattern.
+	Variant(id: EnumId, variant: u32)
+}
+
+extend Program {
+	/// A program of these modules, with nothing declared yet.
+	pub static fn new(modules: Vec<String>): Program = Program(
+		types: Types::new(),
+		interfaces: Arena(),
+		impls: Vec(),
+		vtables: Vec(),
+		asserts: Vec(),
+		modules: move modules,
+		structs: Arena(),
+		enums: Arena(),
+		fns: Arena(),
+		fnValues: Set(),
+		checkMoves: false,
+		dropsByCall: false,
+		libraries: Vec(),
+		frameworks: Vec(),
+		cIncludes: Vec(),
+		cSources: Vec(),
+		cPrefix: Vec(),
+		cDefines: Vec(),
+		consts: Arena(),
+		opaques: Arena(),
+		globals: Arena(),
+		preludeItems: PreludeItems(),
+		fnClosureEnv: .None,
+		fnOwnedClosureEnv: .None,
+		lentHalves: Set(),
+		derived: Set(),
+		entryReport: .None,
+		builtins: Map(),
+		dropFns: Map(),
+		names: Vec(),
+		generatorNext: Map(),
+		frames: Map(),
+	)
+
+	/// Whether `ty` is the prelude's `String`, which text patterns and `==`
+	/// treat as the text it holds.
+	pub fn isString(ty: Ty): bool =
+		self.types.kind(ty) is .Struct(id, ..) && self.preludeItems.structure(.String) == .Some(id)
+
+	/// The type as it is written in source, for diagnostics.
+	pub fn tyName(ty: Ty, interner: &Interner): String = self.nameOf(ty, &interner, false)
+
+	/// The type as a symbol spells it: every type argument written, and a
+	/// generator named by the number of its struct.
+	pub fn symbolName(ty: Ty, interner: &Interner): String = self.nameOf(ty, &interner, true)
+
+	/// Type arguments as a symbol spells them: as a message would, but for a
+	/// generator, which is named by the number of its struct, since every
+	/// one would read `Iterator<T>`.
+	pub fn symbolArgs(args: TyList, interner: &Interner): String = self.argsOf(
+		"",
+		args,
+		&interner,
+		true,
+	)
+
+	/// A struct or enum with its type arguments, as a message writes it:
+	/// without those at the end that are their defaults, as the program
+	/// would write it. A symbol spells every one.
+	fn writtenArgs(
+		name: str,
+		generics: &[GenericParamDef],
+		args: TyList,
+		interner: &Interner,
+		symbol: bool,
+	): String = {
+		val all = self.types.list(args)
+		var shown = all.len()
+		if !symbol {
+			while shown > 0 {
+				if shown - 1 >= generics.len() then break
+				val .Ty(default) = generics[shown - 1].default else {
+					break
+				}
+				if self.types.trySubstFind(default, &all[0..shown - 1]) != .Some(all[shown - 1]) {
+					break
+				}
+				shown -= 1
+			}
+		}
+		if shown == all.len() then return self.argsOf(name, args, &interner, symbol)
+		if shown == 0 then return String::of(name)
+		var written: Vec<String> = Vec()
+		for i in 0..shown {
+			written.push(self.nameOf(all[i], &interner, symbol))
+		}
+		return "\(name)<\(written.join(", "))>"
+	}
+
+	fn nameOf(ty: Ty, interner: &Interner, symbol: bool): String = match self.types.kind(ty) {
+		.Error => String::of("{unknown}")
+		.Never => String::of("never")
+		.Ptr(inner) => "ptr<\(self.nameOf(inner, &interner, symbol))>"
+		.Slots(inner) => "Slots<\(self.nameOf(inner, &interner, symbol))>"
+		.Opaque(id) => String::of(interner.resolve(self.opaques[id].name))
+		.Unit => String::of("void")
+		.Int(t) => String::of(t.name())
+		.Float(.F32) => String::of("f32")
+		.Float(.F64) => String::of("f64")
+		.Bool => String::of("bool")
+		.Char => String::of("char")
+		.Str => String::of("str")
+		.Cstring => String::of("cstring")
+		.Dyn(interfaceId: id, args) => {
+			val name = "dyn \(interner.resolve(self.interfaces[id].name))"
+			self.argsOf(name.toStr(), args, &interner, symbol)
+		}
+		// `I::Item`: the type, and the interface's name for its parameter.
+		.Assoc(base, interfaceId: id, index) => {
+			val generics = &self.interfaces[id].generics
+			val param =
+				if (index as i64) < generics.len() then
+					interner.resolve(generics[index as i64].name)
+				else "?"
+			"\(self.nameOf(base, &interner, symbol))::\(param)"
+		}
+		.Struct(id, args) => {
+			val def = &self.structs[id]
+			// A tuple is the prelude's struct, and prints as the tuple it was
+			// written as.
+			if def.isTuple {
+				var written: Vec<String> = Vec()
+				for t in self.types.list(args) {
+					written.push(self.nameOf(t, &interner, symbol))
+				}
+				return "(\(written.join(", ")))"
+			}
+			// A generator has no name a program could write, so it is called
+			// by what it is.
+			if def.generator is .Some(generator) {
+				if symbol then
+					return self.argsOf("generator\(id.index())".toStr(), args, &interner, symbol)
+				val elem = self.types.substFind(generator.elem, &self.types.list(args))
+				return "Iterator<\(self.nameOf(elem, &interner, symbol))>"
+			}
+			val name = self.declaredName(def.name, def.module, &interner)
+			self.writtenArgs(name.toStr(), &def.generics, args, &interner, symbol)
+		}
+		.Enum(id, args) => {
+			val def = &self.enums[id]
+			val name = self.declaredName(def.name, def.module, &interner)
+			self.writtenArgs(name.toStr(), &def.generics, args, &interner, symbol)
+		}
+		.Param(param) => String::of(interner.resolve(param.name))
+		.Fn(params, ret) => {
+			var written: Vec<String> = Vec()
+			for t in self.types.list(params) {
+				written.push(self.nameOf(t, &interner, symbol))
+			}
+			// Names are not part of the type, so messages leave them out.
+			"(\(written.join(", "))) => \(self.nameOf(ret, &interner, symbol))"
+		}
+		.Own(inner) => "own<\(self.nameOf(inner, &interner, symbol))>"
+		.Ref(inner, kind: .Shared) => "&\(self.nameOf(inner, &interner, symbol))"
+		.Ref(inner, kind: .Var) => "&var \(self.nameOf(inner, &interner, symbol))"
+		.Array(elem, len) => "[\(self.nameOf(elem, &interner, symbol)); \(len)]"
+		.Slice(elem) => "[\(self.nameOf(elem, &interner, symbol))]"
+	}
+
+	/// A type's name as a message says it: with its module's path where the
+	/// program has another type of that name, so that a program's own `Map`
+	/// and `std::collections::Map` read apart. The root module's is written
+	/// bare, as the program writes it.
+	pub fn declaredName(name: Symbol, module: u32, interner: &Interner): String = {
+		val bare = interner.resolve(name)
+		val path = &self.modules[module as i64]
+		if path.isEmpty() then return String::of(bare)
+		var shared = false
+		for s in self.structs {
+			if !s.isEnv && !s.isTuple && s.name == name && s.module != module then shared = true
+		}
+		for e in self.enums {
+			if e.name == name && e.module != module then shared = true
+		}
+		return if shared then "\(path)::\(bare)" else String::of(bare)
+	}
+
+	/// `name<A, B>`, or `name` without type arguments.
+	pub fn withArgs(name: str, args: TyList, interner: &Interner): String = self.argsOf(
+		name,
+		args,
+		&interner,
+		false,
+	)
+
+	fn argsOf(name: str, args: TyList, interner: &Interner, symbol: bool): String = {
+		val all = self.types.list(args)
+		if all.isEmpty() then return String::of(name)
+		var written: Vec<String> = Vec()
+		for t in all {
+			written.push(self.nameOf(t, &interner, symbol))
+		}
+		return "\(name)<\(written.join(", "))>"
+	}
+
+	/// The type of an array's or a slice's elements.
+	pub fn elementTy(ty: Ty): Ty = match self.types.kind(ty) {
+		.Array(elem, ..) | .Slice(elem) => elem
+		_ => panic("elements of a type that is not an array or a slice")
+	}
+
+	/// The type of field `index` of a struct type, with the struct's type
+	/// arguments in place of its parameters.
+	pub fn fieldTy(ty: Ty, index: u32): Ty = {
+		val .Struct(id, args) = self.types.kind(ty) else {
+			panic("fields of a type that is not a struct")
+		}
+		val fields = &self.structs[id].fields
+		// A generator's frame follows its declared fields.
+		if index as i64 >= fields.len() then return self.frames.at(&ty)[index as i64 - fields.len()]
+		val field = fields[index as i64].ty
+		return self.types.substFind(field, &self.types.list(args))
+	}
+
+	/// The types of a struct type's fields, in order: for a generator, its
+	/// frame too, once it is known.
+	pub fn fieldTys(ty: Ty): Vec<Ty> = {
+		val .Struct(id, ..) = self.types.kind(ty) else {
+			panic("fields of a type that is not a struct")
+		}
+		var tys: Vec<Ty> = Vec()
+		for i in 0..self.structs[id].fields.len() {
+			tys.push(self.fieldTy(ty, i as u32))
+		}
+		if self.frames.get(&ty) is .Some(frame) {
+			for t in frame {
+				tys.push(t)
+			}
+		}
+		return move tys
+	}
+
+	/// The type of field `field` of variant `variant` of an enum type.
+	pub fn variantFieldTy(ty: Ty, variant: u32, field: u32): Ty = {
+		val .Enum(id, args) = self.types.kind(ty) else {
+			panic("variants of a type that is not an enum")
+		}
+		val declared = self.enums[id].variants[variant as i64].fields[field as i64].ty
+		return self.types.substFind(declared, &self.types.list(args))
+	}
+
+	/// The types of the fields of each variant of an enum type.
+	pub fn variantFieldTys(ty: Ty): Vec<Vec<Ty>> = {
+		val .Enum(id, ..) = self.types.kind(ty) else {
+			panic("variants of a type that is not an enum")
+		}
+		var all: Vec<Vec<Ty>> = Vec()
+		val variants = &self.enums[id].variants
+		for v in 0..variants.len() {
+			var tys: Vec<Ty> = Vec()
+			for f in 0..variants[v].fields.len() {
+				tys.push(self.variantFieldTy(ty, v as u32, f as u32))
+			}
+			all.push(move tys)
+		}
+		return move all
+	}
+
+	/// Whether a type cleans up after itself: it implements `Destroy`, and
+	/// the compiler calls its method where a value of it ends.
+	pub fn hasDrop(ty: Ty): bool = {
+		// A generator left half-run drops what it holds at the `yield` it
+		// stopped at, which its bits cannot say.
+		if self.types.kind(ty) is .Struct(id, ..) && self.structs[id].generator.isSome() then
+			return true
+		val .Some(destroy) = self.preludeItems.interfaceOf(.Destroy) else {
+			return false
+		}
+		val .Some(def) = self.typeDef(ty) else {
+			return false
+		}
+		for i in self.impls {
+			if i.interfaceId == destroy && i.ty == def then return true
+		}
+		return false
+	}
+
+	/// Whether `ty` implements `interfaceId`. The checker has its own, which
+	/// also knows what a type parameter promises; this one answers for a
+	/// concrete type, which is what the entry point and the monomorphizer ask
+	/// about.
+	pub fn implements(ty: Ty, interfaceId: InterfaceId): bool = {
+		if self.isClone(interfaceId) && self.clonesByCopy(ty) then return true
+		if self.referred(ty) is .Some(inner) then
+			return self.answeredThroughReferences(interfaceId) &&
+				self.implements(inner, interfaceId)
+		val owner: TypeDef = match self.typeDef(ty) {
+			.Some(def) => def
+			.None => match BuiltinOwner::of(self.types.kind(ty)) {
+				.Some(builtin) => .Builtin(builtin)
+				.None => return false
+			}
+		}
+		for i in self.impls {
+			if i.interfaceId == interfaceId && i.ty == owner then return true
+		}
+		return false
+	}
+
+	/// What a `&` reference to a value refers to, where `ty` is one: not a
+	/// lent closure, which is its code and what it captured.
+	pub fn referred(ty: Ty): Option<Ty> = match self.types.kind(ty) {
+		.Ref(inner, kind: .Shared) if !(self.types.kind(inner) is .Fn(..)) => .Some(inner)
+		_ => .None
+	}
+
+	/// Whether `ty` is plain data, whose clone is a copy of it: it owns no
+	/// memory, and holds no `&var` reference or lent closure, of which a copy
+	/// would make a second. A type whose fields were never made is not known
+	/// to be, and is taken not to be.
+	pub fn clonesByCopy(ty: Ty): bool = {
+		var seen: Set<Ty> = Set()
+		return self.plain(ty, &var seen)
+	}
+
+	/// `clonesByCopy`, with the types already met.
+	fn plain(ty: Ty, seen: &var Set<Ty>): bool = {
+		if self.hasDrop(ty) || self.isIntrinsicType(ty) then return false
+		return match self.types.kind(ty) {
+			.Own(..) | .Slots(..) | .Error => false
+			.Param(param) => param.copy
+			// What an implementation decides is anything, as an
+			// unconstrained parameter is.
+			.Assoc(..) => false
+			.Ref(kind: .Var, ..) => false
+			.Ref(inner, ..) => !(self.types.kind(inner) is .Fn(..))
+			.Struct(id, args) => {
+				var fields: Vec<Ty> = Vec()
+				for f in self.structs[id].fields {
+					fields.push(f.ty)
+				}
+				!seen.add(ty) || self.allPlain(&fields, args, &var seen)
+			}
+			.Enum(id, args) => {
+				var fields: Vec<Ty> = Vec()
+				for v in self.enums[id].variants {
+					for f in v.fields {
+						fields.push(f.ty)
+					}
+				}
+				!seen.add(ty) || self.allPlain(&fields, args, &var seen)
+			}
+			.Array(elem, len) => len == 0 || self.plain(elem, &var seen)
+			_ => true
+		}
+	}
+
+	/// Whether each of `fields`, in a type of `args`, is plain data.
+	fn allPlain(fields: &[Ty], args: TyList, seen: &var Set<Ty>): bool = {
+		for field in fields {
+			val .Some(found) = self.types.trySubstFind(field, &self.types.list(args)) else {
+				return false
+			}
+			if !self.plain(found, &var seen) then return false
+		}
+		return true
+	}
+
+	/// Whether `ty` is a struct the standard library declares `@intrinsic`.
+	pub fn isIntrinsicType(ty: Ty): bool =
+		self.types.kind(ty) is .Struct(id, ..) && self.structs[id].isIntrinsic
+
+	/// Whether `ty` is an `Option` of a function, laid out as the C function
+	/// pointer with `.None` as null.
+	pub fn nullableFunction(ty: Ty): bool = {
+		val .Enum(id, args) = self.types.kind(ty) else {
+			return false
+		}
+		return self.preludeItems.enumeration(.Option) == .Some(id) &&
+			self.types.kind(self.types.list(args)[0]) is .Fn(..)
+	}
+
+	/// Whether `interfaceId` is the prelude's `Clone`, which plain data
+	/// implements by being copied.
+	pub fn isClone(interfaceId: InterfaceId): bool =
+		self.preludeItems.interfaceOf(.Clone) == .Some(interfaceId)
+
+	/// Whether a `&T` implements `interfaceId` where `T` does, answered by
+	/// `T`'s implementation: every method reads `Self` through a `&` alone,
+	/// as `Eq`, `Ord`, `Hash` and `Text` do, so each is given what the
+	/// references point to. One that takes `Self` by value, changes it or
+	/// answers one is not about the value alone.
+	pub fn answeredThroughReferences(interfaceId: InterfaceId): bool = {
+		for method in self.interfaces[interfaceId].methods {
+			val def = &self.fns[method.id]
+			for param in def.params {
+				val readsSelf =
+					self.types.kind(param.ty) is .Ref(inner, kind: .Shared) &&
+					self.isSelf(interfaceId, self.types.kind(inner))
+				if !readsSelf && self.mentionsSelf(interfaceId, param.ty) then return false
+			}
+			if self.mentionsSelf(interfaceId, def.ret) then return false
+		}
+		return true
+	}
+
+	/// Whether a parameter of an interface's method stands for `Self`: the
+	/// method's first type parameter, or one of the interface's own whose
+	/// default is `Self`, as `Add<Rhs = Self, Out = Self>`'s are. In a
+	/// method's types, `Self` is the first parameter and the interface's own
+	/// follow it.
+	fn standsForSelf(interfaceId: InterfaceId, index: u32): bool = {
+		if index == 0 then return true
+		val generics = &self.interfaces[interfaceId].generics
+		val at = index as i64 - 1
+		if at >= generics.len() then return false
+		val .Ty(default) = generics[at].default else {
+			return false
+		}
+		return self.types.any(default, (kind) => kind is .Param(p) && p.index == 0)
+	}
+
+	fn isSelf(interfaceId: InterfaceId, kind: TyKind): bool =
+		kind is .Param(p) && self.standsForSelf(interfaceId, p.index)
+
+	fn mentionsSelf(interfaceId: InterfaceId, ty: Ty): bool = self.types.any(ty, (
+		kind,
+	) => self.isSelf(interfaceId, kind))
+
+	/// The function that drops a value of `ty`, where its type implements
+	/// `Destroy`.
+	pub fn dropMethod(ty: Ty): Option<FnId> = {
+		val destroy = self.preludeItems.interfaceOf(.Destroy)?
+		val def = self.typeDef(ty)?
+		for i in self.impls {
+			if i.interfaceId == destroy && i.ty == def then
+				return if i.methods.isEmpty() then .None else .Some(i.methods[0])
+		}
+		return .None
+	}
+
+	/// The declaration a type belongs to, for looking up what implements
+	/// what.
+	fn typeDef(ty: Ty): Option<TypeDef> = match self.types.kind(ty) {
+		.Struct(id, ..) => .Some(.Struct(id))
+		.Enum(id, ..) => .Some(.Enum(id))
+		_ => .None
+	}
+
+	/// Whether a value of `ty` borrows: a `str`, a `view struct`, a
+	/// reference, or anything that holds one — an array of them, or a
+	/// generic type given one. Such a value is kept to parameters, locals and
+	/// results, and to the fields of a view.
+	pub fn holdsView(ty: Ty): bool = match self.types.kind(ty) {
+		.Str | .Ref(..) => true
+		.Struct(id, args) => self.structs[id].isView || self.anyHoldsView(args)
+		.Enum(id, args) => self.enums[id].isView || self.anyHoldsView(args)
+		.Array(elem: inner, ..) | .Own(inner) | .Slice(elem: inner) => self.holdsView(inner)
+		_ => false
+	}
+
+	fn anyHoldsView(args: TyList): bool = {
+		for a in self.types.list(args) {
+			if self.holdsView(a) then return true
+		}
+		return false
+	}
+
+	/// Whether dropping a value of type `ty` does anything: it owns heap
+	/// memory — `own` anywhere inside it, through structs, arrays and enum
+	/// payloads — or it, or something inside it, cleans up after itself. A
+	/// type parameter may, unless it is `copy`. A value of this type is
+	/// moved, not copied; so is one of a type the compiler knows, which holds
+	/// no memory but must not be copied.
+	pub fn ownsMemory(ty: Ty): bool = {
+		var seen: Set<Ty> = Set()
+		return self.owning(ty, &var seen)
+	}
+
+	/// `ownsMemory`, with the types already met.
+	fn owning(ty: Ty, seen: &var Set<Ty>): bool = {
+		if self.hasDrop(ty) || self.isIntrinsicType(ty) then return true
+		return match self.types.kind(ty) {
+			// A block of slots frees itself.
+			.Own(..) | .Slots(..) => true
+			.Param(param) => !param.copy
+			.Assoc(..) => true
+			.Struct(..) => {
+				if !seen.add(ty) then return false
+				for f in self.fieldTys(ty) {
+					if self.owning(f, &var seen) then return true
+				}
+				false
+			}
+			.Enum(..) => {
+				if !seen.add(ty) then return false
+				for fields in self.variantFieldTys(ty) {
+					for f in fields {
+						if self.owning(f, &var seen) then return true
+					}
+				}
+				false
+			}
+			.Array(elem, len) => len > 0 && self.owning(elem, &var seen)
+			_ => false
+		}
+	}
+}
+
+/// A type parameter of a generic item.
+@derive(Clone)
+pub struct GenericParamDef {
+	/// The name the parameter was declared with, which its type carries.
+	pub name: Symbol
+	/// An interface's parameter declared `type`: each implementation decides
+	/// it, so it is not part of which implementation one is, and a
+	/// constraint may leave it out.
+	pub decided: bool
+	/// The name it is written under here: an `extend` block may rename the
+	/// type's parameters, and they are the same parameters.
+	pub written: Symbol
+	/// Declared `T: copy`.
+	pub copy: bool
+	/// The interfaces it must implement, with the types each takes where it
+	/// takes any.
+	pub var interfaces: Vec<Constraint>
+	/// What it is where a use of the type leaves it out.
+	pub var default: ParamDefault
+	pub span: Span
+}
+
+/// What a struct's or an enum's type parameter is where a use leaves it
+/// out: `struct Arena<T, K = T>`.
+@derive(Eq, Clone)
+pub enum ParamDefault {
+	/// Nothing: a use writes it, or it is inferred.
+	None
+	/// Written, and not read yet: defaults are read after every type is
+	/// named, and before the types' bodies.
+	Pending
+	/// The type, which may name the parameters before it.
+	Ty(ty: Ty)
+}
+
+/// One constraint on a type parameter: an interface, and the types it takes
+/// here — `T: Eq` has none, `C: Items<T>` has one.
+@derive(Eq, Clone)
+pub struct Constraint {
+	pub interfaceId: InterfaceId
+	pub args: TyList
+}
+
+/// An interface: methods a type may implement. Its methods are checked with
+/// `Self` as its one type parameter, so an implementation substitutes the
+/// type for it.
+@derive(Clone)
+pub struct InterfaceDef {
+	pub name: Symbol
+	/// `interface From<T>`: the types it is about, which come after `Self` in
+	/// its methods' type parameters.
+	pub var generics: Vec<GenericParamDef>
+	/// One function per method, in the order they are written.
+	pub var methods: Vec<InterfaceMethodDef>
+	/// `@oneOf(toString, appendTo)`: groups of methods with defaults, of each
+	/// of which an implementation writes one at least.
+	pub var oneOf: Vec<OneOf>
+	/// `extend Iterator<T: Ord> { move fn max() … }`: the methods every
+	/// implementer has where the interface's types meet the block's
+	/// condition. Each is generic as a default is, in `Self` and then the
+	/// interface's types, which carry the condition as their constraints;
+	/// none is in the interface's table, and no implementation writes one.
+	pub var extensions: Vec<FnId>
+	/// The module that declares it, and whether it is exported.
+	pub module: u32
+	pub isPub: bool
+	pub span: Span
+}
+
+/// One `@oneOf` of an interface: the methods it names, each where it was
+/// named, and the annotation.
+@derive(Clone)
+pub struct OneOf {
+	pub names: Vec<(Symbol, Span)>
+	pub span: Span
+}
+
+/// A method of an interface.
+@derive(Clone)
+pub struct InterfaceMethodDef {
+	pub id: FnId
+	/// Whether it has a default body, which an implementation may leave out.
+	pub hasDefault: bool
+}
+
+/// `extend Type: Interface`: which function implements each of the
+/// interface's methods, in its order.
+@derive(Clone)
+pub struct ImplDef {
+	pub interfaceId: InterfaceId
+	/// What the interface's own type parameters are here: the arguments of
+	/// `extend ConfigError: From<io::IoError>`.
+	pub args: TyList
+	pub ty: TypeDef
+	pub var methods: Vec<FnId>
+	/// What the type's own parameters must satisfy for this implementation to
+	/// hold: `extend Vec<T: Eq>: Eq` holds where `T` implements `Eq`, and
+	/// holds always where nothing is written. One per parameter of the type,
+	/// in its order.
+	pub conditions: Vec<GenericParamDef>
+	/// The module that writes it.
+	pub module: u32
+	/// The name of the type, as written.
+	pub span: Span
+}
+
+/// A type's table of methods for an interface, as code generation needs it:
+/// every method concrete, in the interface's order.
+@derive(Clone)
+pub struct VTableDef {
+	pub interfaceId: InterfaceId
+	pub ty: Ty
+	pub methods: Vec<FnId>
+}
+
+/// A type of the program: what a name means in the types scope, and which
+/// type a method belongs to.
+@derive(Eq, Hash, Clone)
+pub enum TypeDef {
+	Struct(id: StructId)
+	Enum(id: EnumId)
+	/// A built-in type, which no module declares: the prelude may give it
+	/// methods.
+	Builtin(owner: BuiltinOwner)
+}
+
+/// A built-in type an `extend` block may name, keyed by its shape rather
+/// than by a type, since `extend [T]` is generic in its element.
+@derive(Eq, Hash, Clone)
+pub enum BuiltinOwner {
+	Int(int: IntTy)
+	Float(float: FloatTy)
+	Bool
+	/// `char`.
+	Char
+	Str
+	Cstring
+	Slice
+	/// `Slots<T>`, the prelude's uninitialized storage.
+	Slots
+	/// `void`, whose one value compares, hashes and is written.
+	Void
+}
+
+extend BuiltinOwner {
+	/// The built-in type a type belongs to, where it is one.
+	pub static fn of(kind: TyKind): Option<BuiltinOwner> = match kind {
+		.Int(t) => .Some(.Int(t))
+		.Float(t) => .Some(.Float(t))
+		.Bool => .Some(.Bool)
+		.Char => .Some(.Char)
+		.Str => .Some(.Str)
+		.Cstring => .Some(.Cstring)
+		.Slice(..) => .Some(.Slice)
+		.Slots(..) => .Some(.Slots)
+		.Unit => .Some(.Void)
+		_ => .None
+	}
+
+	/// The type as it is written, for messages and for symbols.
+	pub fn text(): String = match self {
+		.Int(t) => String::of(t.name())
+		.Float(.F32) => String::of("f32")
+		.Float(_) => String::of("f64")
+		.Bool => String::of("bool")
+		.Char => String::of("char")
+		.Str => String::of("str")
+		.Cstring => String::of("cstring")
+		.Slice => String::of("slice")
+		.Slots => String::of("Slots")
+		.Void => String::of("void")
+	}
+}
+
+/// What the prelude declared for one built-in type.
+@derive(Clone)
+pub struct BuiltinImpl {
+	/// The element parameter of `extend [T]`; empty for the rest.
+	pub var generics: Vec<GenericParamDef> = Vec()
+	pub var methods: Vec<FnId> = Vec()
+}
+
+@derive(Clone)
+pub struct StructDef {
+	pub name: Symbol
+	/// `extern struct`: C's layout, and fields C can write.
+	pub isExtern: bool
+	/// `extern union`: every field at offset 0, over the same bytes.
+	pub isUnion: bool
+	/// `@opaque`: C knows where the fields are and Wip does not, so a value
+	/// of this type is only ever behind a `ptr<T>`, and each field is read
+	/// and written through C.
+	pub isOpaque: bool
+	/// `@intrinsic`, in the standard library: a type the compiler knows,
+	/// reached only through its intrinsic methods, and moved rather than
+	/// copied though it holds no memory — `std::sync::Atomic`, a copy of
+	/// which would be a read that is not atomic.
+	pub isIntrinsic: bool
+	/// `@header("config.h")` on the declaration, which the C that reaches its
+	/// fields includes.
+	pub header: Option<Symbol>
+	/// For an `@opaque` struct, the pair of functions that read and write
+	/// each field, in the fields' order.
+	pub var accessors: Vec<(FnId, FnId)>
+	/// Its type parameters, which its fields' types refer to.
+	pub var generics: Vec<GenericParamDef>
+	pub var fields: Vec<FieldDef>
+	/// Its methods and static functions, in source order.
+	pub var methods: Vec<FnId>
+	/// What a closure captured: a hidden struct of references, made for one
+	/// lambda.
+	pub isEnv: bool
+	/// `view struct`: may hold a `str` or a `&` reference, and is kept where
+	/// a `str` is.
+	pub isView: bool
+	/// A tuple: the prelude's `TupleN`, which `(A, B)` is written into and
+	/// which prints as it was written.
+	pub isTuple: bool
+	/// A generator: the state of a loop or a function that yields, made by
+	/// the compiler and not named by a program.
+	pub var generator: Option<GeneratorDef>
+	/// The module that declares it, and whether it is exported.
+	pub module: u32
+	pub isPub: bool
+	/// The name in the declaration.
+	pub span: Span
+}
+
+/// What makes a struct a generator: the method that runs it on to its next
+/// `yield`, and the type of what it yields. Its fields are where it is,
+/// first, and then what it was given; what its `next` keeps between calls
+/// comes after them, in `Program.frames`.
+@derive(Clone)
+pub struct GeneratorDef {
+	pub next: FnId
+	pub elem: Ty
+	/// The function that answers it, where it is a function that yields
+	/// rather than a loop: its parameters are the generator's fields.
+	pub of: Option<FnId>
+}
+
+@derive(Clone)
+pub struct FieldDef {
+	/// Whether another module may read it. A field is the declaring module's
+	/// unless it says `pub`.
+	pub isPub: bool
+	/// Whether another module may write it: `pub var`. A `pub` field is read
+	/// out there and written here.
+	pub isVar: bool
+	pub name: Symbol
+	pub var ty: Ty
+	pub span: Span
+	/// What a literal that leaves the field out puts there.
+	pub var default: Option<DefaultValue>
+}
+
+@derive(Clone)
+pub struct EnumDef {
+	pub name: Symbol
+	pub var generics: Vec<GenericParamDef>
+	pub var variants: Vec<VariantDef>
+	/// Its methods and static functions, in source order.
+	pub var methods: Vec<FnId>
+	/// The module that declares it, and whether it is exported.
+	pub module: u32
+	pub isPub: bool
+	/// `view enum`: its variants may borrow.
+	pub isView: bool
+	pub span: Span
+}
+
+@derive(Clone)
+pub struct VariantDef {
+	pub name: Symbol
+	pub var fields: Vec<FieldDef>
+	pub span: Span
+}
+
+@derive(Clone)
+pub struct FnDef {
+	pub name: Symbol
+	pub nameSpan: Span
+	/// For a method, how it takes its receiver and the type it belongs to;
+	/// the receiver is its first parameter, except for a `static fn`.
+	pub receiver: Option<Receiver>
+	pub owner: Option<TypeDef>
+	/// For a method of an interface, that interface; its `Self` is the
+	/// method's first type parameter.
+	pub interfaceId: Option<InterfaceId>
+	/// Its type parameters. A generic function's body is checked once, and
+	/// never compiled: only its instances are.
+	pub var generics: Vec<GenericParamDef>
+	/// For an instance, the generic function and the type arguments it was
+	/// made with.
+	pub var instanceOf: Option<(FnId, TyList)>
+	pub var params: Vec<ParamDef>
+	pub var ret: Ty
+	pub retSpan: Option<Span>
+	pub isExtern: bool
+	/// `@export("C")`: C calls it by a plain symbol, its own name.
+	pub exportsC: bool
+	/// `@header("<math.h>")` on the block it was declared in: it may be a
+	/// macro or a `static inline`, with no symbol to call, so every call goes
+	/// through C that includes the header.
+	pub header: Option<Symbol>
+	/// `@symbol("sqlite3_open")`: what C calls it, when the declaration
+	/// gives it a name of Wip's own.
+	pub symbol: Option<Symbol>
+	/// What this reads, or writes when it takes the value as its last
+	/// argument: an accessor the compiler declared, not a function C has.
+	pub accesses: Option<Access>
+	/// `...`: a C function that takes more arguments than it declares. Each
+	/// call to one is made through C of the compiler's writing, with the
+	/// types that call passes.
+	pub isVariadic: bool
+	/// For a declaration the compiler made from a call to a variadic one:
+	/// which declaration it was made from. Its own parameters are the types
+	/// that call passes.
+	pub variadicOf: Option<FnId>
+	/// The hidden function of a lambda, which has no name of its own.
+	pub isLambda: bool
+	/// The `next` of this generator: its body is the loop or the function
+	/// that yields, run on from where it last stopped.
+	pub var generator: Option<StructId>
+	/// `@tailrec`: every call it makes to itself is a tail call, and each is
+	/// compiled as a jump back to the top.
+	pub isTailrec: bool
+	/// `@inline`: every call to it is spliced into its caller, or the program
+	/// does not compile.
+	pub isInline: bool
+	/// `@test`: a test `wip test` runs. It takes nothing, answers nothing,
+	/// and is compiled only by `wip test`, since it lives in a `.test.wip`
+	/// file.
+	pub isTest: bool
+	/// A body the compiler writes rather than a program.
+	pub generated: Option<Generated>
+	/// `@intrinsic`: what the compiler writes in place of its body.
+	pub intrinsic: Option<Intrinsic>
+	/// Nothing for extern functions, and until the body has been checked.
+	pub var body: Option<Body>
+	/// What `from` after the result type says it borrows, where it says: the
+	/// result borrows those and nothing else, and the body is held to it.
+	pub var lendsFrom: Option<Vec<LendFrom>>
+	/// The parameters, by index, that `keeps` says a call may keep in its
+	/// `&var` arguments. Empty where nothing is written: the call keeps
+	/// nothing of its arguments.
+	pub var keeps: Vec<u32>
+	/// Where a name is added to `keeps`, for the fix that adds one: the end
+	/// of the signature, and whether a `keeps` is written there already.
+	/// Nothing for a function the compiler writes.
+	pub keepsAt: Option<(u32, bool)>
+	/// A projection lends a place that belongs to one of its reference
+	/// parameters, or to a constant table. Once the body has been checked,
+	/// this says which; a projection's return type is a reference.
+	pub var projects: Option<Lent>
+	/// Whether the compiler runs it once the program is checked, and does
+	/// not compile it: the initializer of a `@comptime` constant, or a
+	/// top-level `assert`.
+	pub var compileTime: bool
+	/// The module that declares it, and whether it is exported.
+	pub module: u32
+	pub isPub: bool
+	/// The signature.
+	pub span: Span
+}
+
+/// A body the compiler writes. Each is a method of `Slots<T>`, the one type
+/// that holds memory holding nothing, or what a program reads through the
+/// compiler.
+@derive(Eq, Clone, Text)
+pub enum Intrinsic {
+	/// `Slots::alloc(count)`: a block of that many slots.
+	SlotsAlloc
+	/// `slots.moveIn(index, value)`: the value goes in the slot, and nothing
+	/// is dropped, since the slot held nothing.
+	SlotsMoveIn
+	/// `slots.moveOut(index)`: the value comes out, and the slot holds
+	/// nothing again.
+	SlotsMoveOut
+	/// `assumed(&option)` and `assumedVar(&var option)`: what an `Option`
+	/// holds, lent where it lies and not checked — for the standard library,
+	/// where something it keeps says the option is not empty.
+	OptionAssumed
+	/// `slots.slot(index)`: the slot, lent where it lies and not checked:
+	/// the prelude has checked the index against what it knows holds a
+	/// value, which the slots do not know.
+	SlotsSlot
+	/// `slots.takeBuffer(length)`: the block, as a buffer of its first
+	/// `length` slots, which hold values; the slots are left holding no
+	/// block at all.
+	SlotsTakeBuffer
+	/// `Slots::takeFrom(&var buffer)`: a buffer's block as slots, all of
+	/// which hold values; the buffer is left empty.
+	SlotsTakeFrom
+	/// `Slots::over(elements)`: slots over elements they do not own, the same
+	/// pointer and count, for a `String` that is never dropped.
+	SlotsOver
+	/// `slots.release()`: the slots are left holding no block, and the block
+	/// is not freed: what slots over elements they do not own end with.
+	SlotsRelease
+	/// `str::fromBytes(bytes)`: the bytes, seen as text. A `str` and a
+	/// `&[u8]` are the same pair — a pointer and a length — so this copies it
+	/// and says nothing about what the bytes mean.
+	StrFromBytes
+	/// `cstring::fromBytes(bytes)`: the pointer alone, which the caller
+	/// promises ends with a NUL.
+	CstringFromBytes
+	/// `c::pointerTo(values)`: the address of a slice's first element, for C
+	/// to read.
+	SlicePointer
+	/// `x.toBits()` and `f64::fromBits(bits)`: a float's bits as the unsigned
+	/// integer of its width, and back.
+	FloatToBits
+	FloatFromBits
+	/// `x.sqrt()`, `x.floor()`, `x.ceil()`, `x.trunc()`: what the machine
+	/// does exactly, one instruction each.
+	FloatSqrt
+	FloatFloor
+	FloatCeil
+	FloatTrunc
+	/// `x.mulAdd(a, b)`: `x * a + b`, rounded once.
+	FloatMulAdd
+	/// `x.countOnes()`, `x.leadingZeros()`, `x.trailingZeros()`,
+	/// `x.swapBytes()`, `x.reverseBits()`: an integer's bits, one
+	/// instruction each.
+	IntCountOnes
+	/// `x.addOverflows(y)`, `x.subOverflows(y)`, `x.mulOverflows(y)`:
+	/// whether the answer does not fit, for the methods that answer nothing
+	/// or a limit instead of panicking.
+	IntAddOverflows
+	IntSubOverflows
+	IntMulOverflows
+	IntLeadingZeros
+	IntTrailingZeros
+	IntSwapBytes
+	IntReverseBits
+	/// `x.rotateLeft(n)` and `x.rotateRight(n)`: its bits turned, those that
+	/// leave one end coming in at the other.
+	IntRotateLeft
+	IntRotateRight
+	/// `text.items()`: the bytes a `str` is, seen as a slice — the same pair
+	/// the other way about, which is what lets `for byte in text` walk a
+	/// `str`.
+	StrBytes
+	/// `values.swap(i, j)`: the two elements change places. It is not a move
+	/// out of either, since it leaves no hole, which is why it works for
+	/// elements that own memory.
+	SliceSwap
+	/// `char::fromScalar(code)`: the number, as the character it already is.
+	/// The prelude calls it only where it has checked the number is a
+	/// Unicode scalar value.
+	CharFromScalar
+	/// `values.len()`, `text.len()`: the length a slice or a `str` carries
+	/// beside its pointer. A direct call is read by the checker; this is the
+	/// body the method has for everything else.
+	Len
+	/// `intoAddress(own value)`: the address of the box, as a `ptr<u8>` C
+	/// can hold; the box is no longer the `own`'s to free.
+	OwnIntoAddress
+	/// `fromAddress(address)`: the box at an address `intoAddress` gave,
+	/// owned again.
+	OwnFromAddress
+	/// `unbox(boxed)`: the value an `own` holds, taken out, and the box freed
+	/// with nothing in it dropped.
+	OwnUnbox
+	/// `addressOf(&var value)`: the reference's address, as the `void *` C
+	/// holds for a callback.
+	ReferenceAddress
+	/// `referenceAt(data)`: the `&var` at an address `addressOf` gave, for a
+	/// callback C made.
+	AddressReference
+	/// `sizeOf<T>()` and `alignOf<T>()`: what C's `sizeof` and `_Alignof`
+	/// answer for `T`, which the layout decides.
+	SizeOf
+	AlignOf
+	/// `atomicAdd(at, amount)`: the integer at an address — a C pointer, or a
+	/// `&` to an `Atomic`'s value — added to as one step that no other thread
+	/// sees half of; answers what it held before.
+	AtomicAdd
+	/// `atomicLoad(at)`: the value there, read as one step.
+	AtomicLoad
+	/// `atomicStore(at, value)`: the value there, written as one step.
+	AtomicStore
+	/// `boxAddress(value)`: the address of the box an `own` points to, which
+	/// the `own` keeps: what C is given of a `c::Pinned`.
+	BoxAddress
+	/// `sliceAt(first, count)`: the slice of `count` elements from an
+	/// address, lent for writing: how a slice is lent in two parts that do
+	/// not overlap, for the standard library alone.
+	SliceAt
+	/// `closureCode(work)` and `closureCaptures(work)`: a closure lent for a
+	/// call, as the address of its code and of what it captured, which a
+	/// thread the call waits for is given.
+	ClosureCode
+	ClosureCaptures
+	/// `atomicSubtract(at, amount)`, as `atomicAdd`.
+	AtomicSubtract
+	/// `atomicSwap(at, value)`: written, answering what was there.
+	AtomicSwap
+	/// `atomicCompareSwap(at, expected, value)`: written only where it held
+	/// `expected`; answers what it held, so that it was written where that is
+	/// `expected`.
+	AtomicCompareSwap
+	/// `offsetBytes(pointer, bytes)`: the address that many bytes on from a C
+	/// pointer, which C writes `p + n`.
+	OffsetBytes
+	/// `frameTables()`: the program's tables of functions and lines, one for
+	/// each module, listed in the prelude's object.
+	FrameTables
+	/// `embed::bytes(path)` and `embed::text(path)`: a file's contents, read
+	/// when the program is compiled, as a constant of the program;
+	/// `embed::textOr(path, otherwise)`, or `otherwise` where there is no
+	/// such file. The checker answers them, and no call is made.
+	EmbedBytes
+	EmbedText
+	EmbedTextOr
+	/// `runtimeWords()`: the address of a block of zeroed words the program
+	/// has once, which the allocator keeps its counters in.
+	RuntimeWords
+}
+
+/// A C type whose contents Wip does not know: `type sqlite3` in an extern
+/// block. Only `ptr<sqlite3>` is ever written.
+@derive(Clone)
+pub struct OpaqueDef {
+	pub name: Symbol
+	pub module: u32
+	/// Exported from its module, so that a module of bindings can name it in
+	/// what it exports.
+	pub isPub: bool
+	pub span: Span
+}
+
+/// What a C file of a module is compiled as, where `@source` says so rather
+/// than its extension.
+@derive(Eq, Clone)
+pub enum CLanguage {
+	C
+	ObjectiveC
+}
+
+/// What a projection lends from, which is what a call to it holds.
+@derive(Eq, Clone)
+pub enum Lent {
+	/// The reference parameter of that index: the call holds the argument.
+	Param(index: u32)
+	/// Constant tables alone, which live as long as the program and which
+	/// nothing writes: the call holds nothing.
+	Tables
+}
+
+/// A method whose body the compiler writes.
+@derive(Eq, Clone, Text)
+pub enum Generated {
+	/// `count()`: how many variants an enum that carries nothing has.
+	VariantCount
+	/// `fromIndex(n)`: the variant with that number, or nothing.
+	FromIndex
+	/// `all()`: every variant, in order, as an array.
+	AllVariants
+}
+
+/// What an accessor the compiler declared reaches: a variable C owns, or a
+/// field of a struct C lays out.
+@derive(Eq, Clone)
+pub enum Access {
+	Global(id: GlobalId)
+	Field(id: StructId, index: u32)
+}
+
+/// A variable C owns: `extern "C" { var optind: c_int }`. Wip never reads or
+/// writes it directly. Both go through C of the compiler's writing, since
+/// the name may be a macro rather than a symbol — `errno` is one — and C is
+/// what knows.
+@derive(Clone)
+pub struct GlobalDef {
+	pub name: Symbol
+	/// `@symbol("__stderrp")`: what C calls it.
+	pub symbol: Option<Symbol>
+	pub var ty: Ty
+	/// `var`: Wip may write it. A `val` is read-only.
+	pub isMut: bool
+	/// `@header` on the block it was declared in, which the C that reads it
+	/// includes.
+	pub header: Option<Symbol>
+	/// The function a use of it becomes, and the one an assignment becomes.
+	pub getter: FnId
+	pub setter: Option<FnId>
+	pub module: u32
+	pub isPub: bool
+	pub span: Span
+}
+
+/// A top-level `val`: a constant. Its value is worked out where it is
+/// written, so nothing runs before `main` and a use is the value itself.
+@derive(Clone)
+pub struct ConstDef {
+	pub name: Symbol
+	pub var ty: Ty
+	/// Nothing until it has been worked out, and where working it out failed.
+	pub var value: Option<ConstValue>
+	/// Where folding cannot work it out, the function that computes it,
+	/// which the compiler runs once the program is checked; its value is
+	/// nothing until then.
+	pub var code: Option<FnId>
+	pub module: u32
+	pub isPub: bool
+	pub span: Span
+}
+
+/// What a constant is: the value a use of it stands for.
+@derive(Eq, Clone)
+pub enum ConstValue {
+	Int(value: u128)
+	Float(value: f64)
+	Bool(value: bool)
+	/// A `str` or a `cstring` literal; which one the constant's type says.
+	Str(symbol: Symbol)
+	/// An array of constants.
+	Array(values: Vec<ConstValue>)
+	/// A struct or a tuple of constants, its fields in declaration order.
+	Struct(values: Vec<ConstValue>)
+	/// A variant of an enum, and the constants it holds.
+	Variant(variant: u32, fields: Vec<ConstValue>)
+	/// A file's bytes, embedded: a `&[u8]`, or a `str` whose bytes are UTF-8,
+	/// pointing at them where the program keeps them. `origin` is the
+	/// constant they were embedded as, which every copy of them names, so
+	/// that the program keeps each file's bytes once.
+	Bytes(bytes: Vec<u8>, origin: ConstId)
+}
+
+extend ConstValue {
+	/// Whether it holds a file's bytes, which are read where the program
+	/// keeps them, never made again where it is used.
+	pub fn holdsBytes(): bool = match self {
+		.Bytes(..) => true
+		.Array(parts) | .Struct(parts) => {
+			for part in parts {
+				if part.holdsBytes() then return true
+			}
+			false
+		}
+		.Variant(fields, ..) => {
+			for field in fields {
+				if field.holdsBytes() then return true
+			}
+			false
+		}
+		.Int(..) | .Float(..) | .Bool(..) | .Str(..) => false
+	}
+
+	/// Whether the program keeps it once and reads it where it lies: an
+	/// array, a struct or tuple, or a variant that holds something. A
+	/// number, a `bool`, a string or a bare variant is written where it is
+	/// used.
+	pub fn isTable(): bool = match self {
+		.Array(..) | .Struct(..) | .Bytes(..) => true
+		.Variant(fields, ..) => !fields.isEmpty()
+		.Int(..) | .Float(..) | .Bool(..) | .Str(..) => false
+	}
+}
+
+/// One thing `from` names a function's result as borrowing.
+@derive(Eq, Clone)
+pub enum LendFrom {
+	/// The parameter, by its index: the place a reference refers to, and what
+	/// it borrows.
+	Param(index: u32)
+	/// What the parameter borrows, and not its place: `self.ast`, a view's
+	/// `&` field, which points outside the view.
+	Borrowed(index: u32)
+}
+
+@derive(Clone)
+pub struct ParamDef {
+	pub name: Symbol
+	pub nameSpan: Span
+	pub var ty: Ty
+	pub span: Span
+	/// The value a call that gives the parameter nothing passes.
+	pub var default: Option<DefaultValue>
+}
+
+/// A field's or a parameter's default.
+@derive(Clone)
+pub enum DefaultValue {
+	/// A constant, copied into each literal or call that uses it.
+	Constant(exprs: Arena<Expr>, root: ExprId)
+	/// Code: the body of a function of its own, generic in the type
+	/// parameters of the type or function it belongs to, which each literal
+	/// or call that uses it calls with its own type arguments.
+	Code(id: FnId)
+}
+
+@derive(Clone)
+pub struct Body {
+	pub var locals: Arena<Local> = Arena()
+	/// For each binding that aliases part of a place, the expression it was
+	/// matched from, so that a projection can tell what it lends.
+	pub var aliases: Map<LocalId, ExprId> = Map()
+	/// Each binding that is an alias for part of a place, whose type is a
+	/// reference to that part. A binding whose type is a reference and that
+	/// is not here holds a reference of its own, a payload's `&Node`.
+	pub var aliasBindings: Set<LocalId> = Set()
+	/// The `match`es that are a step of a walk one place at a time: the
+	/// binding refers into the walked container, which the step holds, as a
+	/// `for` over a slice does.
+	pub var sequenceWalks: Set<ExprId> = Set()
+	/// The bindings that took a copy of plain data: a `val … else`'s, so that
+	/// a write through one says where it would go, and a `match`'s or an
+	/// `is`'s that nothing writes through.
+	pub var copiedBindings: Set<LocalId> = Set()
+	/// One local per parameter, in order.
+	pub var params: Vec<LocalId> = Vec()
+	pub var exprs: Arena<Expr> = Arena()
+	pub var stmts: Arena<Stmt> = Arena()
+	/// The expression after `=`, whose value the function returns. Set once
+	/// the body has been checked.
+	pub var value: Option<ExprId> = .None
+	/// The calls of a `@tailrec` function to itself, which are compiled as a
+	/// jump back to the top rather than a call.
+	pub var tailCalls: Vec<ExprId> = Vec()
+}
+
+extend Body {
+	/// The function's body expression.
+	pub fn valueId(): ExprId = match self.value {
+		.Some(value) => value
+		.None => panic("a checked body has a value")
+	}
+
+	/// Renumbers every type in the body. Only locals and expressions hold
+	/// types, and calls and function values hold lists of them: nothing else
+	/// inside an `ExprKind` or a `Pattern` is one, and a type added there
+	/// would have to be renumbered here too.
+	pub var fn mapTypes(map: &var (ty: Ty) => Ty, mapList: &var (list: TyList) => TyList) = {
+		for id in self.locals.ids() {
+			self.locals[id].ty = map(self.locals[id].ty)
+		}
+		for id in self.exprs.ids() {
+			self.exprs[id].ty = map(self.exprs[id].ty)
+			if !(self.exprs[id].kind is .Call(..) | .FnRef(..) | .CallClosure(..) | .DropRef(..)
+			| .DynCall(..)) {
+				continue
+			}
+			self.exprs[id].kind = match self.exprs[id].kind.clone() {
+				.Call(callee, args, typeArgs, order) => .Call(
+					callee: callee,
+					args: move args,
+					typeArgs: mapList(typeArgs),
+					order: move order,
+				)
+				.FnRef(id: fnId, typeArgs) => .FnRef(id: fnId, typeArgs: mapList(typeArgs))
+				// The code's type as it is called.
+				.CallClosure(callee, args, codeTy) => .CallClosure(
+					callee: callee,
+					args: move args,
+					codeTy: map(codeTy),
+				)
+				// The environment whose drop function this is.
+				.DropRef(ty) => .DropRef(map(ty))
+				// The method's type as it is called.
+				.DynCall(interfaceId, index, fnTy, args, order) => .DynCall(
+					interfaceId: interfaceId,
+					index: index,
+					fnTy: map(fnTy),
+					args: move args,
+					order: move order,
+				)
+				other => move other
+			}
+		}
+	}
+
+	/// Whether `id` denotes a storage location: a local, a field or element
+	/// of one, or the value behind a reference or `own`.
+	pub fn isPlace(id: ExprId): bool = match self.exprs[id].kind {
+		.Local(..) | .Deref(..) => true
+		.Field(base, ..) | .Index(base, ..) => self.isPlace(base)
+		_ => false
+	}
+}
+
+@derive(Clone)
+pub struct Local {
+	pub name: Symbol
+	pub var ty: Ty
+	pub kind: LocalKind
+	/// The name where it is declared.
+	pub span: Span
+}
+
+@derive(Eq, Clone)
+pub enum LocalKind {
+	Param
+	Let(keyword: Span)
+	Var
+	/// A name bound by a `match` pattern.
+	Binding
+}
+
+extend Local {
+	pub fn mutable(): bool = self.kind == .Var
+}
+
+@derive(Clone)
+pub struct Block {
+	pub var stmts: Vec<StmtId> = Vec()
+	/// The block's value: its last expression, unless that is discarded (a
+	/// block whose value is not needed keeps it as a statement).
+	pub var value: Option<ExprId> = .None
+	pub span: Span
+}
+
+@derive(Clone)
+pub struct Stmt {
+	pub var kind: StmtKind
+	pub span: Span
+}
+
+@derive(Clone)
+pub enum StmtKind {
+	Let(local: LocalId, init: ExprId)
+	/// `val pattern = value else { … }`: the bindings are in scope for the
+	/// rest of the block; the `else` block leaves.
+	Guard(scrutinee: ExprId, pattern: Pattern, elseBlock: Option<Block>)
+	Defer(value: ExprId)
+	Return(value: Option<ExprId>)
+	While(cond: ExprId, body: Block)
+	/// `for` over the elements of an array, a slice or a buffer. The pattern
+	/// binds each element in turn, as a `match` binding refers to a field: a
+	/// name, `_`, or a struct taken apart.
+	ForElements(binding: Pattern, elements: ExprId, body: Block)
+	/// `for` over the integers from `lo` up to `hi`, not including it, or
+	/// including it where it is `inclusive`.
+	ForRange(binding: Option<LocalId>, lo: ExprId, hi: ExprId, inclusive: bool, body: Block)
+	/// How many loops out the jump goes: 0 is the innermost, and a name
+	/// written on it says which.
+	Break(depth: u32)
+	Continue(depth: u32)
+	Expr(value: ExprId)
+	/// `yield value` in a generator: hands `.Some(value)`, which this holds,
+	/// to whoever asked, and waits to be asked again.
+	Yield(value: ExprId)
+}
+
+extend StmtKind {
+	/// The expressions directly inside this statement, in the order they are
+	/// evaluated, but for what a block of it holds: those are `blocks`, as
+	/// for an expression.
+	pub fn children(): Vec<ExprId> = match self {
+		.Let(init: e, ..) | .Guard(scrutinee: e, ..) | .Defer(e) | .While(cond: e, ..)
+		| .ForElements(elements: e, ..) | .Expr(e) | .Yield(e) => Vec::of(own [e])
+		.ForRange(lo, hi, ..) => Vec::of(own [lo, hi])
+		.Return(value) => match value {
+			.Some(e) => Vec::of(own [e])
+			.None => Vec()
+		}
+		.Break(..) | .Continue(..) => Vec()
+	}
+
+	/// The blocks this statement holds: a loop's body, a guard's `else`.
+	pub fn blocks(): Vec<&Block> from self = match self {
+		.Guard(elseBlock: .Some(b), ..) | .While(body: b, ..) | .ForElements(body: b, ..)
+		| .ForRange(body: b, ..) => Vec::of(own [&b])
+		_ => Vec()
+	}
+
+	/// The locals this statement declares, if it declares any.
+	pub fn declares(): Vec<LocalId> = match self {
+		.Let(local, ..) => Vec::of(own [local])
+		.ForRange(binding, ..) => match binding {
+			.Some(local) => Vec::of(own [local])
+			.None => Vec()
+		}
+		// A `for` binds a name, or a struct's fields.
+		.ForElements(binding, ..) => {
+			var locals: Vec<LocalId> = Vec()
+			binding.locals(&var locals)
+			move locals
+		}
+		_ => Vec()
+	}
+}
+
+@derive(Clone)
+pub struct Expr {
+	pub var kind: ExprKind
+	pub var ty: Ty
+	pub span: Span
+}
+
+@derive(Clone)
+pub enum ExprKind {
+	/// The value's bits, truncated to the width of its type; a negative value
+	/// is in two's complement.
+	Int(value: u128)
+	Float(value: f64)
+	Bool(value: bool)
+	Str(symbol: Symbol)
+	/// A `&T` to a constant table, which the program keeps once, in read-only
+	/// data: a use of the table is this, dereferenced.
+	Table(id: ConstId)
+	/// `null`: a C pointer that points at nothing.
+	Null
+	/// A value of its type with every byte zero: what a field of an
+	/// `extern struct` that a literal leaves out is, as C's designated
+	/// initializer leaves it.
+	Zeroed
+	/// `p.isNull`: whether a C pointer points at nothing.
+	IsNull(inner: ExprId)
+	/// Two strings compared by their bytes: negative, zero or positive, as
+	/// C's `memcmp` is.
+	StrCmp(lhs: ExprId, rhs: ExprId)
+	/// `s.toStr()`: C's NUL-terminated bytes, seen as a `str` — the pointer C
+	/// gave, and the length found by walking to the NUL.
+	CstrToStr(inner: ExprId)
+	Local(local: LocalId)
+	/// `yield place` in a projection: lends the place and returns its
+	/// address to the caller. `lend place`.
+	Lend(place: ExprId)
+	/// A function named as a value: its address. A generic function has its
+	/// type arguments, until an instance replaces it.
+	FnRef(id: FnId, typeArgs: TyList)
+	/// A call through a value of a function type.
+	CallValue(callee: ExprId, args: Vec<ExprId>)
+	/// A call. `args` are in the order of the parameters, and are evaluated in
+	/// `order` (`evaluationOrder`).
+	Call(callee: FnId, args: Vec<ExprId>, typeArgs: TyList, order: Vec<u32>)
+	Unary(op: UnaryOp, operand: ExprId)
+	/// `+%`, `-%` and `*%`: the answer wraps rather than the program
+	/// panicking.
+	Binary(op: BinaryOp, lhs: ExprId, rhs: ExprId, wrapping: bool)
+	/// A numeric conversion to the expression's type.
+	Cast(inner: ExprId)
+	/// `colour as i64`: which variant an enum that carries nothing holds, as
+	/// the expression's integer type.
+	VariantIndex(inner: ExprId)
+	/// The length of an array or `str`, as an `i64`.
+	Len(inner: ExprId)
+	Block(block: Block)
+	/// Without an `else`, the type is `()`.
+	If(cond: ExprId, thenBlock: Block, elseBlock: Option<Block>)
+	/// `place = value`, or `place op= value` with `op`, checked as the
+	/// operator is, or wrapping where `wrapping` says. `place` satisfies
+	/// `Body.isPlace`.
+	Assign(place: ExprId, op: Option<BinaryOp>, wrapping: bool, value: ExprId)
+	/// A field of a struct-typed expression (never a reference or `own`).
+	Field(base: ExprId, index: u32)
+	/// An element of an array or slice.
+	Index(base: ExprId, index: ExprId)
+	/// The elements `lo..hi` of an array or slice, as a slice; only ever
+	/// borrowed. An array coerced to a slice is this with no bounds.
+	SubSlice(base: ExprId, lo: Option<ExprId>, hi: Option<ExprId>)
+	/// The value behind a `&T` or `own<T>`.
+	Deref(inner: ExprId)
+	/// `&expr`: a reference to a place, or to a temporary.
+	Ref(inner: ExprId)
+	/// A temporary that is lent for its statement and never dropped: a
+	/// `String` over a `str`'s own bytes, `String::over(text)`, where a
+	/// `&String` is taken. Only ever what a `Ref` refers to.
+	Undropped(inner: ExprId)
+	Move(inner: ExprId)
+	/// `own expr`: a heap allocation.
+	Own(inner: ExprId)
+	/// `Event { key: … }` or `Event {}`: a C union, whose bytes are zero and
+	/// then the one field it names, since every field is the same bytes.
+	Union(id: StructId, field: Option<(u32, ExprId)>)
+	/// Field values in declaration order, evaluated in `order`.
+	Struct(id: StructId, fields: Vec<ExprId>, order: Vec<u32>)
+	/// Field values in declaration order, evaluated in `order`.
+	Variant(id: EnumId, variant: u32, args: Vec<ExprId>, order: Vec<u32>)
+	Array(elems: Vec<ExprId>)
+	ArrayRepeat(elem: ExprId, count: u64)
+	/// `own [elem; count]` with a count known only at run time: `count`
+	/// copies of `elem` in a new allocation, as an `own<[T]>`.
+	OwnRepeat(elem: ExprId, count: ExprId)
+	/// An `own<[T; N]>` as an `own<[T]>`: the length moves from the type into
+	/// the value.
+	Unsize(inner: ExprId)
+	/// A `&T` as a `&dyn Interface`: the reference, with the table of `T`'s
+	/// methods for that interface beside it.
+	DynRef(value: ExprId, interfaceId: InterfaceId)
+	/// A closure: what it captured, and the address of its code. `env` builds
+	/// the captures — in the creator's frame for a closure lent for one call,
+	/// on the heap for an owned one, whose environment holds its own drop
+	/// function first.
+	Closure(id: FnId, env: ExprId)
+	/// The address of the drop function of `own<ty>`, which an owned
+	/// closure's environment carries so that a closure value can be dropped
+	/// without knowing which lambda made it.
+	DropRef(ty: Ty)
+	/// An owned closure lent for one call: the same pair, seen as
+	/// `&(…) => R`.
+	LendClosure(inner: ExprId)
+	/// A call through a closure: the code takes what was captured first.
+	/// `codeTy` is the function type as it is called, with the captures'
+	/// pointer before the arguments.
+	CallClosure(callee: ExprId, args: Vec<ExprId>, codeTy: Ty)
+	/// A call through a `&dyn Interface`: the method at `index` of the
+	/// interface, found in the table the reference carries. `args[0]` is the
+	/// receiver.
+	DynCall(interfaceId: InterfaceId, index: u32, fnTy: Ty, args: Vec<ExprId>, order: Vec<u32>)
+	/// `panic(message)`: the message and the place go to standard error, and
+	/// the program ends. Its type is `never`. A message built when the
+	/// program runs is `note`, a `str`, and what is written in the program
+	/// follows it.
+	Panic(note: Option<ExprId>, message: Option<Symbol>)
+	/// `value is pattern`: a `bool`. Its bindings, if any, are bound where the
+	/// test succeeds.
+	Is(scrutinee: ExprId, pattern: Pattern)
+	/// The scrutinee has already been dereferenced to the enum (or other
+	/// value) the patterns test.
+	Match(scrutinee: ExprId, arms: Vec<Arm>)
+	/// A tuple written as a `match`'s scrutinee, which is not built: each
+	/// element is matched where it is, as a `match` on it alone would match
+	/// it. Its type is the tuple's; nothing but the `match` reads it, and the
+	/// arms' patterns are the tuple's.
+	Places(elems: Vec<ExprId>)
+	Error
+}
+
+/// The indices of `len` operands, in the order they are evaluated: the order
+/// they were written. `order` lists them, and is empty when that is the
+/// order they are stored in.
+pub fn evaluationOrder(order: &[u32], len: i64): Vec<i64> = {
+	var indices: Vec<i64> = Vec::withCapacity(len)
+	for i in 0..len {
+		indices.push(if i < order.len() then order[i] as i64 else i)
+	}
+	return move indices
+}
+
+/// The `order` of operands evaluated in the sequence `written`, a list of
+/// their indices: empty when that is already `0, 1, …`.
+pub fn orderOf(written: Vec<u32>): Vec<u32> = {
+	for (i, j) in written.forwards().enumerate() {
+		if i as u32 != j then return move written
+	}
+	return Vec()
+}
+
+@derive(Eq, Clone)
+pub enum UnaryOp {
+	Neg
+	Not
+}
+
+extend ExprKind {
+	/// Every expression directly inside this one, in the order they are
+	/// evaluated, but for what a block or a `match` arm holds: those are
+	/// `blocks` and `arms`, since an expression that holds statements is not
+	/// the same as one that holds expressions.
+	///
+	/// A walk written against this keeps working when a kind is added: the
+	/// structure of an expression is described here, once.
+	pub fn children(): Vec<ExprId> = match self {
+		.Int(..) | .Float(..) | .Bool(..) | .Str(..) | .Table(..) | .Null | .Zeroed | .Local(..)
+		| .FnRef(..) | .DropRef(..) | .Error => Vec()
+		.Panic(note, ..) => match note {
+			.Some(e) => Vec::of(own [e])
+			.None => Vec()
+		}
+		.Lend(e) | .Unary(operand: e, ..) | .Cast(e) | .VariantIndex(e) | .Len(e)
+		| .Field(base: e, ..) | .Deref(e) | .Ref(e) | .Undropped(e) | .Move(e) | .Own(e)
+		| .ArrayRepeat(elem: e, ..) | .Unsize(e) | .IsNull(e) | .CstrToStr(e)
+		| .DynRef(value: e, ..) | .Closure(env: e, ..) | .LendClosure(e) | .Is(scrutinee: e, ..)
+		| .Match(scrutinee: e, ..) | .If(cond: e, ..) => Vec::of(own [e])
+		.Binary(lhs, rhs, ..) | .StrCmp(lhs, rhs) => Vec::of(own [lhs, rhs])
+		.Assign(place, value, ..) => Vec::of(own [place, value])
+		.Index(base, index) => Vec::of(own [base, index])
+		.OwnRepeat(elem, count) => Vec::of(own [elem, count])
+		.SubSlice(base, lo, hi) => {
+			var parts = Vec::of(own [base])
+			if lo is .Some(lo) then parts.push(lo)
+			if hi is .Some(hi) then parts.push(hi)
+			move parts
+		}
+		.Union(field, ..) => match field {
+			.Some((_, e)) => Vec::of(own [e])
+			.None => Vec()
+		}
+		.Struct(fields: parts, ..) | .Variant(args: parts, ..) | .Array(parts)
+		| .Call(args: parts, ..) | .Places(parts) | .DynCall(args: parts, ..) => parts.clone()
+		.CallValue(callee, args) | .CallClosure(callee, args, ..) => {
+			var parts = Vec::of(own [callee])
+			for a in args {
+				parts.push(a)
+			}
+			move parts
+		}
+		.Block(..) => Vec()
+	}
+
+	/// The blocks this expression holds: its own, and the branches of an
+	/// `if`. A block holds statements, so what is inside one runs whether or
+	/// not the block produces a value.
+	pub fn blocks(): Vec<&Block> from self = match self {
+		.Block(block) => Vec::of(own [&block])
+		.If(thenBlock, elseBlock, ..) => match elseBlock {
+			.Some(b) => Vec::of(own [&thenBlock, &b])
+			.None => Vec::of(own [&thenBlock])
+		}
+		_ => Vec()
+	}
+
+	/// The arms of a `match`, whose bodies run in place of one another.
+	pub fn arms(): &[Arm] = match self {
+		.Match(arms, ..) => lend arms.items()
+		_ => lend NO_ARMS
+	}
+}
+
+/// What a `match` that is not one has as its arms.
+val NO_ARMS: [Arm; 0] = []
+
+@derive(Clone)
+pub struct Arm {
+	pub pattern: Pattern
+	/// `if …` after the pattern: the arm matches only where it is true.
+	pub guard: Option<ExprId>
+	pub body: ExprId
+	pub span: Span
+}
+
+pub enum Pattern {
+	Wildcard
+	Binding(local: LocalId)
+	/// `binders[i]` takes field `i`.
+	Variant(variant: u32, binders: Vec<Binder>)
+	/// `Point(x, y)`: a struct taken apart where it is bound. It matches
+	/// every value of its type, so it tests nothing and only binds.
+	Fields(binders: Vec<Binder>)
+	/// A number the value must equal, in the bits of the scrutinee's own
+	/// type.
+	Int(value: u128)
+	Bool(value: bool)
+	/// Text the value must equal, by its bytes.
+	Str(symbol: Symbol)
+	/// The values from `lo` to `hi`, both included, in the bits of the
+	/// scrutinee's type; an end left off is the type's least or greatest
+	/// value, and is not tested.
+	Range(lo: Option<u128>, hi: Option<u128>)
+	/// `.Round(..) | .Square(..)`: any one of them. Where they bind, each
+	/// binds the same locals, and `binding` numbers them within the body:
+	/// which one matched is kept under that number, to bind from.
+	Any(alternatives: Vec<Pattern>, binding: Option<u32>)
+	/// `[first, ..rest]`: the elements of an array or a slice, `prefix` from
+	/// its start and `suffix` from its end. With a `rest`, it matches as many
+	/// elements as these name or more, and the rest binds those between, as a
+	/// slice; without one, exactly as many.
+	Slice(prefix: Vec<Binder>, rest: Option<SliceRest>, suffix: Vec<Binder>)
+	/// A value that is a reference, tested through it: what it refers to
+	/// matches the pattern. Its bindings alias what they name there, to read,
+	/// and take nothing.
+	Deref(inner: own<Pattern>)
+	Error
+}
+
+extend Pattern: Clone {
+	fn clone(): Pattern = match self {
+		.Wildcard => .Wildcard
+		.Binding(local) => .Binding(local)
+		.Variant(variant, binders) => .Variant(variant: variant, binders: binders.clone())
+		.Fields(binders) => .Fields(binders.clone())
+		.Int(value) => .Int(value)
+		.Bool(value) => .Bool(value)
+		.Str(symbol) => .Str(symbol)
+		.Range(lo, hi) => .Range(lo: lo, hi: hi)
+		.Any(alternatives, binding) => .Any(alternatives: alternatives.clone(), binding: binding)
+		.Slice(prefix, rest, suffix) => .Slice(
+			prefix: prefix.clone(),
+			rest: rest.clone(),
+			suffix: suffix.clone(),
+		)
+		.Deref(inner) => .Deref(own inner.clone())
+		.Error => .Error
+	}
+}
+
+/// The `..` of a slice pattern.
+@derive(Clone)
+pub enum SliceRest {
+	/// `..`: the elements between are passed over.
+	Ignored
+	/// `..rest`: they are bound, as a reference to a slice of where they lie.
+	Bind(local: LocalId)
+}
+
+/// What a pattern does with one field.
+@derive(Clone)
+pub enum Binder {
+	/// The field is not named, or is named `_`.
+	Ignored
+	/// The field, bound under a name.
+	Bind(local: LocalId)
+	/// The field, taken apart in turn.
+	Nested(pattern: Pattern)
+}
+
+extend Binder {
+	/// The locals this binder declares, at any depth.
+	pub fn locals(out: &var Vec<LocalId>) = match self {
+		.Ignored => {}
+		.Bind(local) => out.push(local)
+		.Nested(pattern) => pattern.locals(&var out)
+	}
+}
+
+extend Pattern {
+	/// What an arm's pattern on a tuple matched in place asks of each of its
+	/// `n` elements: the tuple pattern's, or `_` for each where the arm takes
+	/// them all.
+	pub fn elements(n: i64): Vec<Pattern> = {
+		var out: Vec<Pattern> = Vec()
+		match self {
+			.Fields(binders) => {
+				for binder in binders {
+					out.push(
+						match binder {
+							.Ignored => .Wildcard
+							.Bind(local) => .Binding(local)
+							.Nested(pattern) => pattern.clone()
+						},
+					)
+				}
+			}
+			.Error => {
+				for _ in 0..n {
+					out.push(.Error)
+				}
+			}
+			_ => {
+				for _ in 0..n {
+					out.push(.Wildcard)
+				}
+			}
+		}
+		return move out
+	}
+
+	/// The locals this pattern declares, at any depth.
+	pub fn locals(out: &var Vec<LocalId>) = match self {
+		.Wildcard | .Error | .Int(..) | .Range(..) | .Bool(..) | .Str(..) => {}
+		.Binding(local) => out.push(local)
+		.Variant(binders, ..) | .Fields(binders) => {
+			for b in binders {
+				b.locals(&var out)
+			}
+		}
+		.Slice(prefix, rest, suffix) => {
+			for b in prefix {
+				b.locals(&var out)
+			}
+			if rest is .Some(.Bind(local)) then out.push(local)
+			for b in suffix {
+				b.locals(&var out)
+			}
+		}
+		// Any one of several. Each binds the same locals.
+		.Any(alternatives, ..) => {
+			if !alternatives.isEmpty() then alternatives[0].locals(&var out)
+		}
+		.Deref(inner) => inner.locals(&var out)
+	}
+}

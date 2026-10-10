@@ -1,0 +1,417 @@
+// The checker's own rules: suggestions, what only the prelude can break, and
+// whether a `match` covers every value.
+
+import syntax::{Interner, lex, parse}
+import syntax as ast
+
+@test
+fn suggestions() = {
+	assert(suggest("pritn", ["print", "main"]) == .Some("print"))
+	assert(suggest("cuont", ["count", "total"]) == .Some("count"))
+	assert(suggest("Pint", ["Point", "Shape"]) == .Some("Point"))
+	assert(suggest("x", ["y", "z"]) == .None)
+	assert(suggest("count", ["total", "main"]) == .None)
+	assert(editDistance("kitten", "sitting") == 3)
+	assert(editDistance("hieght", "height") == 1)
+}
+
+/// The tree of one file.
+fn parsed(text: str, interner: &var Interner): ast::Ast = {
+	val lexed = lex(text, &var interner)
+	var result = parse(text, &lexed)
+	return move result.ast
+}
+
+/// Lowers two modules, the prelude and then the root.
+fn withPrelude(prelude: str, root: str): Lowered = {
+	var interner = Interner::new()
+	val preludeAst = parsed(prelude, &var interner)
+	val rootAst = parsed(root, &var interner)
+	val modules = [
+		ModuleAst(
+			path: String::of(PRELUDE),
+			files: Vec::of(own [&preludeAst]),
+			prefix: String(),
+			depends: Vec(),
+			dir: .None,
+			root: .None,
+		),
+		ModuleAst(
+			path: String(),
+			files: Vec::of(own [&rootAst]),
+			prefix: String(),
+			depends: Vec(),
+			dir: .None,
+			root: .None,
+		),
+	]
+	return lower(&modules, &interner, 3)
+}
+
+/// Lowers two modules — the prelude, then the root — and answers the
+/// messages, for rules that only the prelude can break.
+fn preludeErrors(prelude: str, root: str): Vec<String> = {
+	val lowered = withPrelude(prelude, root)
+	var messages: Vec<String> = Vec()
+	for d in lowered.diagnostics {
+		messages.push(d.message.clone())
+	}
+	return move messages
+}
+
+/// Whether any of the messages says this.
+fn anySays(messages: &[String], text: str): bool = {
+	for m in messages {
+		if m.contains(text) then return true
+	}
+	return false
+}
+
+/// A tuple written as a `match`'s scrutinee has the prelude's tuple type
+/// inside the prelude too, where the prelude is the module being lowered
+/// rather than another. It was the error type there, reported nowhere, and
+/// what came after it met it.
+@test
+fn aTupleMatchedInPlaceInsideThePreludeHasItsType() = {
+	val lowered = withPrelude(
+		"pub struct Tuple2<A, B> {\n    pub var _0: A\n    pub var _1: B\n}\n\npub fn both(a: bool, b: bool): bool = match (a, b) {\n    (true, true) => true\n    _ => false\n}\n",
+		"fn main() = {}\n",
+	)
+	assert(lowered.diagnostics.isEmpty())
+	var found: Option<FnId> = .None
+	for id in lowered.program.fns.ids() {
+		val f = &lowered.program.fns[id]
+		if found.isNone() && f.body.isSome() && f.params.len() == 2 then found = .Some(id)
+	}
+	val both = found.unwrap()
+	val .Some(body) = lowered.program.fns[both].body else {
+		panic("it has a body")
+	}
+	for e in body.exprs {
+		assert(e.ty != ERROR, "no expression of it has the error type")
+	}
+}
+
+@test
+fn aSliceHasNoMoveMethod() = {
+	val messages = preludeErrors(
+		"extend [T] {\n    pub move fn take(): i64 = 0\n}\n",
+		"fn main() = {}\n",
+	)
+	assert(anySays(&messages, "no value to move"))
+}
+
+@test
+fn aBuiltinTypeCannotCleanUpAfterItself() = {
+	val messages = preludeErrors(
+		"pub interface Destroy {\n    var fn destroy()\n}\n\nextend i64: Destroy {\n    var fn destroy() = {}\n}\n",
+		"fn main() = {}\n",
+	)
+	assert(anySays(&messages, "cannot clean up after itself"))
+}
+
+/// A program that declares what `text` does, and the interner that reads its
+/// names.
+fn program(text: str): (Program, Interner) = {
+	var interner = Interner::new()
+	val file = parsed(text, &var interner)
+	val lowered = lowerFile(&file, &interner)
+	assert(lowered.diagnostics.isEmpty())
+	return (move lowered.program, move interner)
+}
+
+/// The type called `name` that `program` declares.
+fn declaredTy(program: &var Program, interner: &Interner, name: str): Ty = {
+	for id in program.enums.ids() {
+		if interner.resolve(program.enums[id].name) == name then
+			return program.types.intern(.Enum(id: id, args: TyList::empty()))
+	}
+	for id in program.structs.ids() {
+		if interner.resolve(program.structs[id].name) == name then
+			return program.types.intern(.Struct(id: id, args: TyList::empty()))
+	}
+	panic("the program declares it")
+}
+
+fn variant(index: u32, fields: Vec<Shape>): Shape = .Ctor(
+	ctor: .Variant(index),
+	fields: move fields,
+)
+
+fn boolean(value: bool): Shape = .Ctor(ctor: .Bool(value), fields: Vec())
+
+/// What `arms`, one column of `ty`, leave uncovered, as the message writes
+/// it; nothing where they cover every value.
+fn uncovered(program: &Program, interner: &Interner, arms: Vec<Shape>, ty: Ty): Option<String> = {
+	var matrix: Vec<Vec<Shape>> = Vec()
+	for arm in move arms {
+		matrix.push(Vec::of(own [move arm]))
+	}
+	return match useful(&program, &matrix, [Shape::Wild], [ty]) {
+		.Some(found) => .Some(found.text(&program, ty, &interner))
+		.None => .None
+	}
+}
+
+val SHAPES = "enum Shape {\n    Dot\n    Round(radius: i64)\n    Square\n}\n"
+
+@test
+fn aMissingVariantIsNamed() = {
+	var (program, interner) = program(SHAPES)
+	val shape = declaredTy(&var program, &interner, "Shape")
+	val arms = Vec::of(own [variant(0, Vec()), variant(1, Vec::of(own [Shape::Wild]))])
+	assert(uncovered(&program, &interner, move arms, shape) == .Some(String::of(".Square")))
+}
+
+@test
+fn everyVariantCoversTheEnum() = {
+	var (program, interner) = program(SHAPES)
+	val shape = declaredTy(&var program, &interner, "Shape")
+	val arms = Vec::of(own [
+		variant(0, Vec()),
+		variant(1, Vec::of(own [Shape::Wild])),
+		variant(2, Vec()),
+	])
+	assert(uncovered(&program, &interner, move arms, shape) == .None)
+}
+
+@test
+fn anArmAfterAWildcardIsUnreachable() = {
+	var (program, interner) = program(SHAPES)
+	val shape = declaredTy(&var program, &interner, "Shape")
+	val above = Vec::of(own [Vec::of(own [Shape::Wild])])
+	assert(useful(&program, &above, [variant(0, Vec())], [shape]).isNone())
+	// And one the arms above leave something to is not.
+	val first = Vec::of(own [Vec::of(own [variant(0, Vec())])])
+	assert(useful(&program, &first, [variant(2, Vec())], [shape]).isSome())
+}
+
+@test
+fn eitherOfTwoPatternsCoversBoth() = {
+	var (program, interner) = program(SHAPES)
+	val shape = declaredTy(&var program, &interner, "Shape")
+	val arms = Vec::of(own [Shape::Any(Vec::of(own [variant(0, Vec()), variant(2, Vec())]))])
+	assert(uncovered(&program, &interner, move arms, shape) == .Some(String::of(".Round(_)")))
+}
+
+@test
+fn whatIsMissingInsideAVariantIsNamedThere() = {
+	var (program, interner) = program(
+		"enum Inner {\n    X\n    Y\n}\n\nenum Outer {\n    Some(value: Inner)\n    None\n}\n",
+	)
+	val outer = declaredTy(&var program, &interner, "Outer")
+	val arms = Vec::of(own [variant(0, Vec::of(own [variant(0, Vec())])), variant(1, Vec())])
+	assert(uncovered(&program, &interner, move arms, outer) == .Some(String::of(".Some(.Y)")))
+}
+
+/// A pair of the one shape a struct has.
+fn only(a: Shape, b: Shape): Shape = .Ctor(ctor: .Only, fields: Vec::of(own [move a, move b]))
+
+@test
+fn aStructOfBoolsIsCoveredFieldByField() = {
+	var (program, interner) = program("struct Pair {\n    a: bool\n    b: bool\n}\n")
+	val pair = declaredTy(&var program, &interner, "Pair")
+	val some = Vec::of(own [only(boolean(true), Shape::Wild), only(boolean(false), boolean(true))])
+	val left = uncovered(&program, &interner, move some, pair).unwrap()
+	assert(left.contains("false") && !left.contains("true"), "one pair is left")
+	val all = Vec::of(own [only(boolean(true), Shape::Wild), only(boolean(false), Shape::Wild)])
+	assert(uncovered(&program, &interner, move all, pair) == .None)
+}
+
+/// The range of `ty`'s values from `lo` to `hi`, as a pattern would write
+/// it; an end left off runs to the least or greatest value.
+fn range(program: &Program, ty: Ty, lo: Option<i128>, hi: Option<i128>): Shape = {
+	val (least, greatest) = program.types.orderRange(ty).unwrap()
+	val from = match lo {
+		.Some(n) => program.types.orderKey(ty, n as u128).unwrap()
+		.None => least
+	}
+	val to = match hi {
+		.Some(n) => program.types.orderKey(ty, n as u128).unwrap()
+		.None => greatest
+	}
+	return .Ctor(ctor: .Range(lo: from, hi: to), fields: Vec())
+}
+
+fn value(program: &Program, ty: Ty, n: i128): Shape = range(&program, ty, .Some(n), .Some(n))
+
+@test
+fn numbersAreCoveredByRangesThatMeet() = {
+	val (program, interner) = program("")
+	val meeting = Vec::of(own [
+		range(&program, I64, .None, .Some(-1)),
+		value(&program, I64, 0),
+		range(&program, I64, .Some(1), .None),
+	])
+	assert(uncovered(&program, &interner, move meeting, I64) == .None)
+	val halves = Vec::of(own [
+		range(&program, U8, .Some(0), .Some(127)),
+		range(&program, U8, .Some(128), .Some(255)),
+	])
+	assert(uncovered(&program, &interner, move halves, U8) == .None)
+}
+
+@test
+fn whatNoRangeCoversIsWrittenAsOne() = {
+	val (program, interner) = program("")
+	assert(
+		uncovered(&program, &interner, Vec::of(own [range(&program, I64, .None, .Some(9))]), I64) ==
+			.Some(String::of("10..")),
+	)
+	assert(
+		uncovered(&program, &interner, Vec::of(own [range(&program, I64, .Some(0), .None)]), I64) ==
+			.Some(String::of("..0")),
+	)
+	val apart = Vec::of(own [
+		range(&program, I64, .None, .Some(-1)),
+		range(&program, I64, .Some(3), .None),
+	])
+	assert(uncovered(&program, &interner, move apart, I64) == .Some(String::of("0..=2")))
+	val two = Vec::of(own [value(&program, I64, 1), value(&program, I64, 2)])
+	assert(uncovered(&program, &interner, move two, I64) == .Some(String::of("..1")))
+	assert(uncovered(&program, &interner, Vec::of(own [Shape::Wild]), I64) == .None)
+}
+
+@test
+fn aCharacterRangeSkipsTheSurrogates() = {
+	val (program, interner) = program("")
+	val around = Vec::of(own [
+		range(&program, CHAR, .None, .Some(0xD7FF)),
+		range(&program, CHAR, .Some(0xE000), .None),
+	])
+	assert(uncovered(&program, &interner, move around, CHAR) == .None)
+	val upTo = Vec::of(own [range(&program, CHAR, .None, .Some('a' as i128))])
+	assert(uncovered(&program, &interner, move upTo, CHAR) == .Some(String::of("'b'..")))
+}
+
+fn length(n: u64): Shape = .Ctor(ctor: .Length(n), fields: wilds(n as i64))
+
+fn atLeast(prefix: u64, suffix: u64): Shape = .Ctor(
+	ctor: .AtLeast(prefix: prefix, suffix: suffix),
+	fields: wilds((prefix + suffix) as i64),
+)
+
+@test
+fn aSliceIsCoveredByLengthsAndWhatIsLonger() = {
+	var (program, interner) = program("")
+	val slice = program.types.intern(.Slice(I64))
+	// `[]`, `[x]`, `[first, ..rest]`.
+	assert(
+		uncovered(&program, &interner, Vec::of(own [length(0), length(1), atLeast(1, 0)]), slice) ==
+			.None,
+	)
+	// `[]`, `[x]`: two or more are left.
+	assert(
+		uncovered(&program, &interner, Vec::of(own [length(0), length(1)]), slice) ==
+			.Some(String::of("[_, _, ..]")),
+	)
+	// `[first, ..]` and `[.., last]` both need one: none is left.
+	assert(
+		uncovered(&program, &interner, Vec::of(own [atLeast(1, 0), atLeast(0, 1)]), slice) ==
+			.Some(String::of("[]")),
+	)
+}
+
+@test
+fn aSlicePatternInsideALongerOneAboveIsUnreachable() = {
+	var (program, _) = program("")
+	val slice = program.types.intern(.Slice(I64))
+	// `[..]` above `[a, ..]`, and `[a, ..]` above `[a, b, c]`.
+	val any = Vec::of(own [Vec::of(own [atLeast(0, 0)])])
+	assert(useful(&program, &any, [atLeast(1, 0)], [slice]).isNone())
+	val oneOrMore = Vec::of(own [Vec::of(own [atLeast(1, 0)])])
+	assert(useful(&program, &oneOrMore, [length(3)], [slice]).isNone())
+	// `[a, b]` above `[a, ..]` leaves it one and three and more.
+	val two = Vec::of(own [Vec::of(own [length(2)])])
+	assert(useful(&program, &two, [atLeast(1, 0)], [slice]).isSome())
+}
+
+/// A pair of the one length an array of two has.
+fn pairOf(a: Shape, b: Shape): Shape = .Ctor(
+	ctor: .Length(2),
+	fields: Vec::of(own [move a, move b]),
+)
+
+@test
+fn anArrayHasItsOneLength() = {
+	var (program, interner) = program("")
+	val array = program.types.intern(.Array(elem: BOOL, len: 2))
+	val covering = Vec::of(own [pairOf(boolean(true), Shape::Wild), atLeast(0, 1)])
+	assert(uncovered(&program, &interner, move covering, array) == .None)
+	val half = Vec::of(own [pairOf(boolean(true), Shape::Wild)])
+	assert(uncovered(&program, &interner, move half, array) == .Some(String::of("[false, false]")))
+}
+
+@test
+fn aRangeInsideOneAboveIsUnreachable() = {
+	val (program, _) = program("")
+	val letters = range(&program, CHAR, .Some('a' as i128), .Some('z' as i128))
+	val hex = range(&program, CHAR, .Some('a' as i128), .Some('f' as i128))
+	val upper = range(&program, CHAR, .Some('A' as i128), .Some('Z' as i128))
+	val above = Vec::of(own [Vec::of(own [letters.clone()])])
+	assert(useful(&program, &above, [move hex], [CHAR]).isNone())
+	val overlapping = range(&program, CHAR, .Some('X' as i128), .Some('c' as i128))
+	val both = Vec::of(own [Vec::of(own [move letters]), Vec::of(own [move upper])])
+	assert(useful(&program, &both, [move overlapping], [CHAR]).isSome())
+}
+
+/// `&text` where a `str` is taken lends the `String` the reference holds:
+/// `toStr` is given a `&String`. It was given the reference lent again, a
+/// `&&String`, and read the text from the wrong place.
+@test
+fn aStringIsLentThroughAReference() = {
+	val lowered = withPrelude(
+		"pub struct String {\n    pub var n: i64\n}\n\nextend String {\n    pub fn toStr(): str = \"\"\n}\n",
+		"fn says(text: str): i64 = text.len()\n\nfn main() = {\n    val name = String(n: 1)\n    says(&name)\n}\n",
+	)
+	assert(lowered.diagnostics.isEmpty())
+	val program = &lowered.program
+	var lent = 0
+	for f in program.fns {
+		val .Some(body) = f.body else {
+			continue
+		}
+		for e in body.exprs {
+			val .Call(callee, args, ..) = e.kind else {
+				continue
+			}
+			if program.fns[callee].params.len() != 1 || program.fns[callee].ret != STR then continue
+			val .Ref(inner, ..) = program.types.kind(body.exprs[args[0]].ty) else {
+				panic("`toStr` is given a reference")
+			}
+			assert(
+				program.types.kind(inner) is .Struct(..),
+				"a reference to the `String`, not to a reference",
+			)
+			lent += 1
+		}
+	}
+	assert(lent == 1)
+}
+
+/// The `|`s that bind are numbered in each body from 0, whatever was checked
+/// before it: the count went on from one body to the next.
+@test
+fn alternativesAreNumberedInEachBody() = {
+	val (program, _) = program(
+		"enum Shape {\n    Round(size: i64)\n    Square(size: i64)\n    Dot\n}\n\nfn size(s: Shape): i64 = match s {\n    .Round(size) | .Square(size) => size\n    .Dot => 0\n}\n\nfn twice(s: Shape): i64 = match s {\n    .Round(size) | .Square(size) => size * 2\n    .Dot => 0\n}\n",
+	)
+	var numbered = 0
+	for f in program.fns {
+		val .Some(body) = f.body else {
+			continue
+		}
+		for e in body.exprs {
+			val .Match(arms, ..) = e.kind else {
+				continue
+			}
+			for arm in arms {
+				if arm.pattern is .Any(binding, ..) {
+					assert(binding == .Some(0))
+					numbered += 1
+				}
+			}
+		}
+	}
+	assert(numbered == 2)
+}

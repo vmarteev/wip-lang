@@ -1,0 +1,480 @@
+// Projections: a function that lends a place to its caller.
+
+import syntax as ast
+import syntax::{Diagnostic, LEND_OUTSIDE_PROJECTION, MISMATCHED_TYPES, PROJECTION_BODY, Span}
+
+/// Where a yielded place is rooted.
+@derive(Clone)
+enum LendRoot {
+	/// A reference parameter of the projection, by index.
+	Param(index: u32)
+	/// A call to another projection: what it lends is rooted wherever that
+	/// projection lends from, and the call is this one.
+	Forwarded(call: ExprId)
+	/// A constant table, which lives as long as the program.
+	Table(id: ConstId)
+	/// Nothing the projection may lend.
+	None
+}
+
+/// What a projection lends, once the ones it calls are known.
+@derive(Clone)
+enum Lends {
+	/// The reference parameter it is rooted in.
+	Param(index: u32)
+	/// A constant table.
+	Table
+	/// A projection it forwards to has not been worked out yet.
+	Waiting
+	/// Nothing it may lend.
+	Nothing
+}
+
+/// The walk down a yielded place to what it belongs to, which the check in a
+/// body and the one that follows every body share.
+fn lentRoot(body: &Body, place: ExprId, types: &Types): LendRoot = {
+	var e = place
+	while true {
+		match body.exprs[e].kind {
+			.Field(base, ..) | .Index(base, ..) | .SubSlice(base, ..) | .Deref(base) => e = base
+			// A reference refers to what it borrows, which is how the argument
+			// of a forwarded call is written.
+			.Ref(base) => e = base
+			// A call to a projection is a place of whatever that projection
+			// lends from.
+			.Call(..) => return .Forwarded(e)
+			.Table(id) => return .Table(id)
+			.Local(local) => {
+				// A binding aliases part of the place it was matched from.
+				if body.locals[local].kind == .Binding &&
+					body.aliases.get(&local) is .Some(source) {
+					e = source
+					continue
+				}
+				val def = &body.locals[local]
+				if def.kind != .Param || !(types.kind(def.ty) is .Ref(..)) then return .None
+				for (i, p) in body.params.forwards().enumerate() {
+					if p == local then return .Param(i as u32)
+				}
+				return .None
+			}
+			_ => return .None
+		}
+	}
+	return .None
+}
+
+/// Whether a body lends a place of one of its parameters directly, not
+/// through another projection.
+fn lendsParamDirectly(body: &Body, types: &Types): bool = {
+	for expr in body.exprs {
+		if expr.kind is .Lend(place) && lentRoot(&body, place, &types) is .Param(..) then
+			return true
+	}
+	return false
+}
+
+extend Lowerer {
+	/// `lend place`: lends a place that belongs to one of the projection's
+	/// reference parameters, or to a constant table.
+	var fn lendExpr(value: ast::ExprId, span: Span): ExprId = {
+		val .Ref(inner: pointee, kind) = self.kind(self.state.ret) else {
+			self.report(
+				Diagnostic::error(
+					LEND_OUTSIDE_PROJECTION,
+					"`lend` outside a projection",
+					span,
+					"not in a projection",
+				).withHelp(
+					"a projection declares a reference result, as in `fn heaviest(bag: &var Bag): &var Item`",
+				),
+			)
+			self.infer(value, .None)
+			return self.errorExpr(span)
+		}
+		self.state.lends += 1
+		// A `yield` lends what it names, so a range of elements may be yielded
+		// as it may be borrowed.
+		var place = self.inferBorrowed(value, .Some(pointee))
+		// Lend what an `own` points to, as the `&own<T>` to `&T` coercion does
+		// for an argument.
+		while true {
+			val ty = self.tyOf(place)
+			if ty == pointee then break
+			val .Own(inner) = self.kind(ty) else {
+				break
+			}
+			val at = self.state.body.exprs[place].span
+			place = self.alloc(.Deref(place), inner, at)
+		}
+		// An array is lent as a slice where one is the result, as it is passed
+		// where one is taken.
+		if self.kind(self.tyOf(place)) is .Array(elem, ..) &&
+			self.kind(pointee) is .Slice(elem: want) &&
+			elem == want {
+			val at = self.state.body.exprs[place].span
+			place = self.alloc(.SubSlice(base: place, lo: .None, hi: .None), pointee, at)
+		}
+		val ty = self.tyOf(place)
+		val placeSpan = self.state.body.exprs[place].span
+		if self.isPoisoned(ty) then return self.alloc(.Lend(place), NEVER, span)
+		if ty != pointee {
+			val found = self.tyName(ty)
+			val expected = self.tyName(pointee)
+			self.report(
+				Diagnostic::error(MISMATCHED_TYPES, "mismatched types", placeSpan, "expected \(expected), found \(found)"),
+			)
+		}
+		match lentRoot(&self.state.body, place, &self.program.types) {
+			// A call to another projection lends what that one lends, and what
+			// that is cannot be known until every body is checked, so it is
+			// worked out afterwards.
+			.Forwarded(_) => {}
+			.Param(index) => match self.state.lentParam {
+				// The caller borrows the argument that was lent from, so every
+				// path must lend from the same one.
+				.Some(first) if first != index => {
+					val firstName = self.paramName(first)
+					val thisName = self.paramName(index)
+					self.report(
+						Diagnostic::error(
+							PROJECTION_BODY,
+							"every `lend` must name a place in the same parameter, but an earlier one lends part of `\(firstName)`",
+							placeSpan,
+							"part of `\(thisName)`",
+						).withNote(
+							"the call borrows the argument a projection lends from, and that is one argument",
+						),
+					)
+				}
+				_ => self.state.lentParam = .Some(index)
+			}
+			// A constant table lives as long as the program, and nothing writes
+			// it: the call holds nothing for it.
+			.Table(id) if kind == .Var => {
+				val name = String::of(self.text(self.program.consts[id].name))
+				self.report(
+					Diagnostic::error(
+						PROJECTION_BODY,
+						"a `&var` projection cannot lend `\(name)`, a constant",
+						placeSpan,
+						"a constant cannot change",
+					).withHelp("declare the result `&`: a constant is lent for reading").withNote(
+						"a top-level `val` is kept once, in memory nothing writes",
+					),
+				)
+				return self.alloc(.Lend(place), NEVER, span)
+			}
+			.Table(_) => self.state.lentTable = true
+			.None => {
+				// A number, a `bool` or a variant of nothing is written where it is
+				// used, so there is no place to lend.
+				val isValue =
+					self.state.body.exprs[place].kind is .Int(..) | .Float(..) | .Bool(..)
+					| .Variant(..)
+				val diagnostic =
+					if isValue then
+						Diagnostic::error(
+							PROJECTION_BODY,
+							"a projection lends a place, and this is a value",
+							placeSpan,
+							"a value, not a place",
+						).withHelp("answer it by value: declare the result without `&`").withNote(
+							"a number, a `bool` or a variant of nothing is written where it is used, even from a top-level `val`, so there is no place to lend",
+						)
+					else Diagnostic::error(
+						PROJECTION_BODY,
+						"a projection yields a place that belongs to one of its reference parameters",
+						placeSpan,
+						"not part of a reference parameter",
+					).withNote(
+						"what a projection lends belongs to its caller, or to a constant table, which is why it needs no lifetime",
+					)
+				self.report(move diagnostic)
+			}
+		}
+		if kind == .Var && !self.writableForWriting(place) {
+			// The writing half of a `lend fn` is its body checked again: a place
+			// it can only read means it only ever reads.
+			val diagnostic =
+				if self.state.lentHalf then
+					Diagnostic::error(
+						PROJECTION_BODY,
+						"a `lend fn` lends a place its writing half cannot write",
+						placeSpan,
+						"only ever read",
+					).withHelp("declare it `fn`: what it lends is for reading only").withNote(
+						"`lend fn` is checked twice, once reading and once writing, and each must lend what it names",
+					)
+				else Diagnostic::error(
+					PROJECTION_BODY,
+					"a `&var` projection yields a place it cannot write",
+					placeSpan,
+					"cannot be written",
+				).withHelp("take the parameter as `&var`, or declare the result `&`")
+			self.report(move diagnostic)
+		}
+		return self.alloc(.Lend(place), NEVER, span)
+	}
+
+	/// The name of the body's parameter of that index.
+	fn paramName(index: u32): String = {
+		val local = self.state.body.params[index as i64]
+		return String::of(self.text(self.state.body.locals[local].name))
+	}
+
+	/// Whether every path through an expression leaves: it yields, panics,
+	/// returns, or never ends. A projection's body is checked against its
+	/// result type, so its own type does not say.
+	fn alwaysLeaves(id: ExprId): bool = match self.state.body.exprs[id].kind {
+		.Lend(..) | .Panic(..) => true
+		.Block(block) => match block.value {
+			.Some(value) => self.alwaysLeaves(value)
+			.None => false
+		}
+		.If(thenBlock, elseBlock: .Some(elseBlock), ..) =>
+			self.blockLeaves(&thenBlock) && self.blockLeaves(&elseBlock)
+		.Match(arms, ..) => {
+			if arms.isEmpty() then return false
+			for arm in arms {
+				if !self.alwaysLeaves(arm.body) then return false
+			}
+			true
+		}
+		// A `return`, a `break`, or a call that does not return.
+		_ => self.tyOf(id) == NEVER
+	}
+
+	/// Whether a block's value always leaves.
+	fn blockLeaves(block: &Block): bool = match block.value {
+		.Some(value) => self.alwaysLeaves(value)
+		.None => false
+	}
+
+	/// A projection yields exactly once, as its last expression, and cannot
+	/// `defer` yet.
+	var fn checkProjection(id: FnId, value: ExprId) = {
+		val span = self.state.body.exprs[value].span
+		val yieldsEverywhere = self.alwaysLeaves(value)
+		if self.state.lends == 0 then
+			self.report(
+				Diagnostic::error(
+					PROJECTION_BODY,
+					"a projection must end with `lend`",
+					span,
+					"yields nothing",
+				).withHelp("lend the place it hands over, as in `= lend bag.items[i]`"),
+			)
+		else if !yieldsEverywhere then
+			self.report(
+				Diagnostic::error(
+					PROJECTION_BODY,
+					"every path through a projection must `lend`",
+					span,
+					"a path lends nothing",
+				).withNote(
+					"an `if` without `else`, or anything after the `lend`, leaves a path that reaches the end without lending",
+				),
+			)
+		var returns: Vec<Span> = Vec()
+		var deferred: Vec<Span> = Vec()
+		for stmt in self.state.body.stmts {
+			if stmt.kind is .Return(..) then returns.push(stmt.span)
+			if stmt.kind is .Defer(..) then deferred.push(stmt.span)
+		}
+		for ret in returns {
+			self.report(
+				Diagnostic::error(
+					PROJECTION_BODY,
+					"a projection ends with `lend`, not `return`",
+					ret,
+					"returns instead of lending",
+				).withNote(
+					"a projection lends a place that belongs to its caller; there is no value to return",
+				),
+			)
+		}
+		for deferSpan in deferred {
+			self.report(
+				Diagnostic::error(
+					PROJECTION_BODY,
+					"a projection cannot `defer` yet",
+					deferSpan,
+					"runs after the caller is done",
+				).withNote(
+					"a projection's `defer`s are to run when the borrow ends; this version returns the address and stops",
+				),
+			)
+		}
+		// What the call holds: the parameter, where any path lends from one,
+		// and nothing where every path lends a table.
+		self.program.fns[id].projects = match self.state.lentParam {
+			.Some(index) => .Some(.Param(index))
+			.None =>
+				if self.state.lentTable && self.state.lends > 0 && !self.lendsForwarded() then
+					.Some(.Tables)
+				else .None
+		}
+	}
+
+	/// Whether any `lend` in the body forwards another projection's, which is
+	/// worked out once every body is checked.
+	fn lendsForwarded(): bool = {
+		for expr in self.state.body.exprs {
+			if expr.kind is .Lend(place) &&
+				lentRoot(&self.state.body, place, &self.program.types) is .Forwarded(..) {
+				return true
+			}
+		}
+		return false
+	}
+
+	/// What every projection that forwards to another lends, once each body is
+	/// checked. A body cannot know what another lends while both are being
+	/// checked, so the answers settle here, in rounds: a chain resolves from
+	/// the end, `Grid::at` after the `Vec::at` it calls.
+	var fn resolveForwarded() = {
+		// The projections that forward, and the places they yield, in the order
+		// they were declared.
+		var work: Vec<(FnId, Vec<ExprId>)> = Vec()
+		for id in self.program.fns.ids() {
+			val def = &self.program.fns[id]
+			val .Some(body) = def.body else {
+				continue
+			}
+			if !(self.program.types.kind(def.ret) is .Ref(..)) then continue
+			var forwarded: Vec<ExprId> = Vec()
+			for expr in body.exprs {
+				if expr.kind is .Lend(place) &&
+					lentRoot(&body, place, &self.program.types) is .Forwarded(..) {
+					forwarded.push(place)
+				}
+			}
+			if !forwarded.isEmpty() then work.push((id, move forwarded))
+		}
+		// Each round answers the projections whose callees were answered in the
+		// one before, so a chain of `n` needs at most `n` of them.
+		for _ in 0..work.len() + 1 {
+			var moved = false
+			for (id, places) in work {
+				if self.program.fns[id].projects.isSome() then continue
+				val answer = self.forwardedAnswer(id, &places)
+				if answer is .Some(lent) {
+					self.program.fns[id].projects = .Some(lent)
+					moved = true
+				}
+			}
+			if !moved then break
+		}
+		// What is still unanswered is reported, and what disagrees with an
+		// earlier `yield` is reported as it is inside a body.
+		var diagnostics: Vec<Diagnostic> = Vec()
+		for (id, places) in work {
+			val body = self.program.fns[id].body.clone().unwrap()
+			val first: Option<u32> = match self.program.fns[id].projects {
+				.Some(.Param(index)) => .Some(index)
+				_ => .None
+			}
+			for place in places {
+				val span = body.exprs[place].span
+				match self.lendsOf(&body, place) {
+					.Table => {}
+					.Param(index) => {
+						if first is .Some(earlier) && earlier != index {
+							val firstName = String::of(
+								self.text(body.locals[body.params[earlier as i64]].name),
+							)
+							val thisName = String::of(
+								self.text(body.locals[body.params[index as i64]].name),
+							)
+							diagnostics.push(
+								Diagnostic::error(
+									PROJECTION_BODY,
+									"every `lend` must name a place in the same parameter, but an earlier one lends part of `\(firstName)`",
+									span,
+									"part of `\(thisName)`",
+								).withNote(
+									"the call borrows the argument a projection lends from, and that is one argument",
+								),
+							)
+						}
+					}
+					lends => {
+						var diagnostic = Diagnostic::error(
+							PROJECTION_BODY,
+							"a projection yields a place that belongs to one of its reference parameters",
+							span,
+							"not part of a reference parameter",
+						).withNote(
+							"what a projection lends belongs to its caller, or to a constant table, which is why it needs no lifetime",
+						)
+						// A projection that reaches itself never arrives at a place,
+						// and neither does anything it forwards to.
+						if lends is .Waiting then
+							diagnostic = diagnostic.withHelp(
+								"this lends what another projection lends, and that one never reaches a place of its own",
+							)
+						diagnostics.push(move diagnostic)
+					}
+				}
+			}
+		}
+		for d in move diagnostics {
+			self.report(move d)
+		}
+	}
+
+	/// What one forwarding projection lends, where its places settle it this
+	/// round.
+	fn forwardedAnswer(id: FnId, places: &[ExprId]): Option<Lent> = {
+		val .Some(body) = self.program.fns[id].body else {
+			return .None
+		}
+		var lends: Option<u32> = .None
+		var settled = true
+		for place in places {
+			match self.lendsOf(&body, place) {
+				.Param(index) if lends.isNone() => lends = .Some(index)
+				.Waiting => settled = false
+				_ => {}
+			}
+		}
+		if lends is .Some(index) then return .Some(.Param(index))
+		// Every path settled and none lends a parameter: tables alone, here or
+		// in what it forwards to. A `lend` of a parameter's place elsewhere in
+		// the body was recorded where the body was checked.
+		var tables = settled
+		for place in places {
+			if !(self.lendsOf(&body, place) is .Table) then tables = false
+		}
+		if tables && !lendsParamDirectly(&body, &self.program.types) then return .Some(.Tables)
+		return .None
+	}
+
+	/// What a yielded place is rooted in, following the projections it
+	/// forwards to.
+	fn lendsOf(body: &Body, start: ExprId): Lends = {
+		var place = start
+		while true {
+			match lentRoot(&body, place, &self.program.types) {
+				.Param(index) => return .Param(index)
+				.Table(_) => return .Table
+				.None => return .Nothing
+				.Forwarded(call) => {
+					val .Call(callee, args, ..) = body.exprs[call].kind else {
+						return .Nothing
+					}
+					match self.program.fns[callee].projects {
+						.Some(.Param(index)) => {
+							if (index as i64) < args.len() then place = args[index as i64]
+							else return .Nothing
+						}
+						.Some(.Tables) => return .Table
+						.None => return .Waiting
+					}
+				}
+			}
+		}
+		return .Nothing
+	}
+}

@@ -1,0 +1,224 @@
+// Debug information as LLVM's metadata: a compile unit, a file for each file
+// the program's code was written in, a subprogram for each function, and for
+// each instruction the place it was written at. LLVM writes it as DWARF and
+// keeps it through its inlining, so that the DWARF says which calls were
+// inlined where. The table a panic reads its calls from is made from that
+// DWARF (`frames.wip`).
+//
+// The module's other metadata — a branch's weights, and what a load of a
+// reference may assume — is numbered here too, since all of it is numbered
+// as one.
+
+import std::collections::{Map}
+import std::fs
+import std::process
+import syntax::{Span}
+
+/// A function's subprogram, and the file it was written in.
+@derive(Eq, Clone)
+pub struct Subprogram {
+	pub node: i64
+	pub file: i64
+}
+
+view struct Debug {
+	locations: &(at: Span) => (String, u32, u32)
+	compDir: String
+	/// The metadata, node `i` being `!i`.
+	nodes: Vec<Node>
+	unit: i64
+	unitFile: i64
+	subroutine: i64
+	flags: (i64, i64)
+	files: Map<String, i64>
+	/// Each file as the DWARF names it, with the name a panic gives it.
+	paths: Map<String, String>
+	/// A subprogram's places in a file other than its own.
+	scopes: Map<(i64, i64), i64>
+	places: Map<(i64, u32, u32), i64>
+	constants: Map<Node, i64>
+	/// Whether the code is a release build's, which a debugger is told so
+	/// that it expects variables kept only where the optimiser kept them.
+	optimized: bool
+}
+
+extend Debug {
+	static fn new(locations: &(at: Span) => (String, u32, u32), optimized: bool): Debug = {
+		val compDir = match process::currentDir() {
+			.Ok(dir) => move dir
+			.Err(..) => String()
+		}
+		var debug = Debug(
+			locations: locations,
+			compDir: move compDir,
+			nodes: Vec(),
+			unit: 0,
+			unitFile: 0,
+			subroutine: 0,
+			flags: (0, 0),
+			files: Map(),
+			paths: Map(),
+			scopes: Map(),
+			places: Map(),
+			constants: Map(),
+			optimized: optimized,
+		)
+		debug.unitFile = debug.file("wip")
+		debug.unit = debug.node(.CompileUnit(file: debug.unitFile, optimized: debug.optimized))
+		debug.subroutine = debug.node(.SubroutineType)
+		// DWARF 4, which every debugger the platforms ship reads.
+		val version = debug.node(
+			.Tuple(
+				Vec::of(own [
+					MetaItem::Int(bits: 32, value: 7),
+					MetaItem::Text(String::of("Dwarf Version")),
+					MetaItem::Int(bits: 32, value: 4),
+				]),
+			),
+		)
+		val info = debug.node(
+			.Tuple(
+				Vec::of(own [
+					MetaItem::Int(bits: 32, value: 2),
+					MetaItem::Text(String::of("Debug Info Version")),
+					MetaItem::Int(bits: 32, value: 3),
+				]),
+			),
+		)
+		debug.flags = (version, info)
+		return move debug
+	}
+
+	var fn node(node: Node): i64 = {
+		self.nodes.push(move node)
+		return self.nodes.len() - 1
+	}
+
+	/// A file by the name a panic gives it, named in the DWARF as the file
+	/// system names it, so that a debugger finds it.
+	var fn file(name: str): i64 = {
+		val key = String::of(name)
+		if self.files.get(&key) is .Some(node) then return node
+		val path = pathOf(name)
+		val node = self.node(.File(filename: path.clone(), directory: self.compDir.clone()))
+		self.paths.put(move path, String::of(name))
+		self.files.put(move key, node)
+		return node
+	}
+
+	/// The subprogram of a function named `name` in a panic's calls and the
+	/// debugger, declared at `at`; code the compiler writes on its own has no
+	/// place, and is marked artificial, as a panic's calls pass over it. No
+	/// linkage name: a debugger would show the symbol for the name, and the
+	/// table finds each function's symbol in the object.
+	var fn subprogram(name: str, at: Option<Span>): Subprogram = {
+		val (file, line, artificial) = match at {
+			.Some(span) => {
+				val (fileName, line, _) = (self.locations)(span)
+				(self.file(fileName.toStr()), line, false)
+			}
+			.None => (self.unitFile, 0 as u32, true)
+		}
+		val node = self.node(.Subprogram(
+			name: String::of(name),
+			file: file,
+			line: line,
+			typeNode: self.subroutine,
+			artificial: artificial,
+			optimized: self.optimized,
+			unit: self.unit,
+		))
+		return Subprogram(node: node, file: file)
+	}
+
+	/// The location of code written at `span` in `subprogram`, in `block`
+	/// where it is in the function's own file and a variable's scope holds
+	/// it; nothing when the span says no line.
+	var fn location(subprogram: Subprogram, span: Span, block: Option<i64>): Option<i64> = {
+		val (fileName, line, column) = (self.locations)(span)
+		if line == 0 then return .None
+		val file = self.file(fileName.toStr())
+		// Code spliced from a function `@inline` names is the function's own,
+		// at the line it was written at, which may be in another file.
+		val scope = if file == subprogram.file {
+			block.unwrapOr(subprogram.node)
+		} else {
+			val key = (subprogram.node, file)
+			match self.scopes.get(&key) {
+				.Some(scope) => scope
+				.None => {
+					val scope = self.node(.LexicalBlockFile(scope: subprogram.node, file: file))
+					self.scopes.put(key, scope)
+					scope
+				}
+			}
+		}
+		return .Some(self.place(scope, line, column))
+	}
+
+	/// The location that says no line, in `subprogram`: code the compiler
+	/// wrote on its own.
+	var fn noLine(subprogram: Subprogram): i64 = self.place(subprogram.node, 0, 0)
+
+	var fn place(scope: i64, line: u32, column: u32): i64 = {
+		val key = (scope, line, column)
+		if self.places.get(&key) is .Some(node) then return node
+		val node = self.node(.Location(line: line, column: column, scope: scope))
+		self.places.put(key, node)
+		return node
+	}
+
+	/// The weights of a branch to a panic: taken once in two thousand, which
+	/// keeps the panic's code out of the way of the rest.
+	var fn unlikely(): i64 = self.constant(
+		.Tuple(
+			Vec::of(own [
+				MetaItem::Text(String::of("branch_weights")),
+				MetaItem::Int(bits: 32, value: 1),
+				MetaItem::Int(bits: 32, value: 2000),
+			]),
+		),
+	)
+
+	/// A node of its own, numbered now and written by `fill`, for what refers
+	/// to itself: a struct whose field points back to it.
+	var fn reserve(): i64 = self.node(.Unfilled)
+
+	/// What a node `reserve` numbered says.
+	var fn fill(at: i64, node: Node) = self.nodes[at] = move node
+
+	/// A node of its own, written now.
+	var fn add(node: Node): i64 = self.node(move node)
+
+	/// Where a span was written: its file's node, its line and its column.
+	var fn at(span: Span): (i64, u32, u32) = {
+		val (fileName, line, column) = (self.locations)(span)
+		return (self.file(fileName.toStr()), line, column)
+	}
+
+	/// A node that is only what it says, as `!{i64 8}`, once however often it
+	/// is asked for.
+	var fn constant(node: Node): i64 = {
+		if self.constants.get(&node) is .Some(number) then return number
+		val number = self.node(node.clone())
+		self.constants.put(move node, number)
+		return number
+	}
+
+	/// The module's metadata, for the end of its text.
+	fn write(out: &var String) = {
+		out.push("!llvm.dbg.cu = !{!\(self.unit)}\n")
+		out.push("!llvm.module.flags = !{!\(self.flags.0), !\(self.flags.1)}\n")
+		for (i, node) in self.nodes.forwards().enumerate() {
+			out.push("!\(i) = \(node.text())\n")
+		}
+	}
+}
+
+/// A file as the debugger is to find it: where it is on this machine, if it
+/// is there, and as it is named otherwise — the standard library's files live
+/// in the compiler.
+fn pathOf(name: str): String = match fs::realPath(name) {
+	.Ok(path) => move path
+	.Err(..) => String::of(name)
+}

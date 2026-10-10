@@ -1,0 +1,96 @@
+// The bitcode `wip` writes, read by `clang` to the module its text is: each
+// case that runs, built for debugging and for use, every part of a debug
+// build, written once as text and once as bitcode, and each read back by
+// `clang -S -emit-llvm`, but for the lines that name the file it was read
+// from. The bitcode writer and the text writer write one module. `clang`
+// is `$WIP_CLANG`, or `clang`.
+
+import std::fs
+import std::io
+import std::path
+import std::process::{Command}
+import check::{Checked, Gate, across, listed, run, said}
+import snapshot
+
+val CASES = "tests/cases"
+
+pub fn check(gate: &Gate): Checked = {
+	var names: Vec<String> = Vec()
+	for name in listed("\(CASES)/ok".toStr()) {
+		val case = "ok/\(name)"
+		if gate.takes(case.toStr()) then names.push(move case)
+	}
+	val clang = io::env("WIP_CLANG").unwrapOr(String::of("clang"))
+	val failed = across(
+		names.len(),
+		(index) => one(&gate, names[index].toStr(), clang.toStr(), index),
+	)
+	return Checked::of(names.len(), move failed)
+}
+
+/// One case, debug and release.
+fn one(gate: &Gate, name: str, clang: str, index: i64): Option<String> = {
+	var found: Vec<String> = Vec()
+	for release in [false, true] {
+		val build = if release then "release" else "debug"
+		val at = gate.work.join("bitcode-\(index)-\(build)")
+		val main = "\(name)/main.wip"
+		var written = true
+		for (emit, file) in [("llvm-ir", "main.ll"), ("llvm-bc", "main.bc")] {
+			val dir = path::join(at.toStr(), emit)
+			fs::makeDirs(dir.toStr())
+			val output = path::join(dir.toStr(), file)
+			val built =
+				if release then
+					gate.wip(CASES, [
+						"build",
+						"--emit",
+						emit,
+						"--release",
+						main.toStr(),
+						"-o",
+						output.toStr(),
+					])
+				else gate.wip(CASES, ["build", "--emit", emit, main.toStr(), "-o", output.toStr()])
+			if !built.exit.success() {
+				found.push("\(build), --emit \(emit)\(said(&built))")
+				written = false
+			}
+		}
+		if !written then continue
+		val textDir = path::join(at.toStr(), "llvm-ir")
+		for part in listed(textDir.toStr()) {
+			val stem = path::stem(part.toStr())
+			val text = path::join(textDir.toStr(), part.toStr())
+			val bitcode = path::join(at.toStr(), "llvm-bc/\(stem).bc".toStr())
+			match (readByClang(clang, text.toStr()), readByClang(clang, bitcode.toStr())) {
+				(.Ok(fromText), .Ok(fromBitcode)) => {
+					if fromText != fromBitcode then
+						found.push("\(build), \(stem): the bitcode is read otherwise\n\(snapshot::difference(fromText.toStr(), fromBitcode.toStr()))")
+				}
+				(.Err(why), _) => found.push("\(build), \(stem): \(why)")
+				(_, .Err(why)) => found.push("\(build), \(stem): \(why)")
+			}
+		}
+	}
+	if found.isEmpty() then return .None
+	var out = String::of(name)
+	for why in found {
+		out.push("\n  \(why)")
+	}
+	return .Some(move out)
+}
+
+/// What `clang` reads a module to, printed as text: the module it compiles,
+/// but for the lines that name the file it was read from.
+fn readByClang(clang: str, file: str): Result<String, String> = {
+	val read = run(Command::of(clang).args(["-S", "-emit-llvm", "-o", "-", file]))
+	if !read.exit.success() then return .Err("\(clang) refuses `\(file)`\(said(&read))")
+	var module = String()
+	for line in read.stdout.lines() {
+		if line.startsWith("; ModuleID") || line.startsWith("source_filename") then continue
+		module.push(line)
+		module.push("\n")
+	}
+	return .Ok(move module)
+}

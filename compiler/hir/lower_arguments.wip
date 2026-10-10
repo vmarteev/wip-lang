@@ -1,0 +1,490 @@
+// Matching the arguments of a call, or the values of a variant, to the
+// parameters or fields they are for: by position, by name, or from a
+// default.
+
+import std::collections::{Map}
+import std::mem
+import syntax as ast
+import syntax::{
+	ARGUMENTS_SWAPPED,
+	ARGUMENT_NAMED_WITH_EQUALS,
+	ARGUMENT_TWICE,
+	Diagnostic,
+	Edit,
+	INVALID_DEFAULT,
+	Span,
+	Symbol,
+	UNKNOWN_ARGUMENT_NAME
+}
+
+/// A parameter or field that an argument can give a value to.
+@derive(Clone)
+struct Slot {
+	name: Symbol
+	ty: Ty
+	/// Where it is declared.
+	span: Span
+	default: Option<DefaultValue>
+}
+
+/// Where the arguments of one call went.
+struct Matched {
+	/// For each slot, the argument that gives it a value, if one does.
+	slots: Vec<Option<i64>>
+	/// Arguments that give no slot a value: an unknown name, a slot given
+	/// twice, or more positional arguments than slots. They are still
+	/// checked, so that the mistakes inside them are reported.
+	unmatched: Vec<i64>
+	/// How many positional arguments had no slot.
+	extra: i64
+	/// Whether an argument named no slot. The slot it was probably meant for
+	/// is then not reported as missing too.
+	unknown: bool
+}
+
+extend Matched {
+	/// The slots that get neither an argument nor a default, unless an
+	/// unknown name was probably meant for one of them.
+	fn missing(slots: &[Slot]): Vec<i64> = {
+		var missing: Vec<i64> = Vec()
+		if self.unknown then return move missing
+		for i in 0..slots.len() {
+			if self.slots[i].isNone() && slots[i].default.isNone() then missing.push(i)
+		}
+		return move missing
+	}
+}
+
+/// The slot of a name, among `slots`.
+fn slotNamed(slots: &[Slot], sym: Symbol): Option<i64> = {
+	for (i, s) in slots.forwards().enumerate() {
+		if s.name == sym then return .Some(i)
+	}
+	return .None
+}
+
+extend Lowerer {
+	/// Matches arguments to slots: positional arguments to the first slots,
+	/// named ones to the slots of their names. Reports unknown names and slots
+	/// given twice; the caller reports what is missing or extra. `what` is
+	/// "parameter" or "field", and `owner` the function or variant.
+	var fn matchArguments(
+		slots: &[Slot],
+		args: &[ast::ExprId],
+		names: &[Option<ast::Name>],
+		what: str,
+		owner: str,
+	): Matched = {
+		var slotted: Vec<Option<i64>> = Vec()
+		for _ in 0..slots.len() {
+			slotted.push(.None)
+		}
+		var matched = Matched(slots: move slotted, unmatched: Vec(), extra: 0, unknown: false)
+		var positional = 0
+		for (i, name) in names.forwards().enumerate() {
+			// `f(style = x)`, meant as `f(style: x)`: an assignment to a
+			// parameter's name, where nothing of that name is in scope.
+			var meant: Option<Symbol> = .None
+			if name.isNone() &&
+				self.ast.exprs[args[i]].kind is .Assign(target, op: .None, value, ..) &&
+				self.ast.exprs[target].kind is .Name(sym) &&
+				self.lookup(sym).isNone() &&
+				slotNamed(&slots, sym).isSome() {
+				val between = Span::new(
+					lo: self.ast.exprs[target].span.hi,
+					hi: self.ast.exprs[value].span.lo,
+				)
+				self.report(
+					Diagnostic::error(
+						ARGUMENT_NAMED_WITH_EQUALS,
+						"an argument is named with `:`, as `\(self.text(sym)): …`",
+						self.ast.exprs[args[i]].span,
+						"an assignment",
+					).withFix("name it", own [Edit::replace(between, ": ")]).withNote(
+						"`=` assigns, and an assignment is an expression, so `f(x = 1)` would assign to `x`; an argument is named as a struct literal's field is",
+					),
+				)
+				self.state.namedByEquals.add(args[i])
+				meant = .Some(sym)
+			}
+			var slot = 0
+			if name is .Some(n) {
+				val .Some(found) = slotNamed(&slots, n.sym) else {
+					val text = self.text(n.sym)
+					var texts: Vec<str> = Vec()
+					for s in slots {
+						texts.push(self.text(s.name))
+					}
+					var diagnostic = Diagnostic::error(
+						UNKNOWN_ARGUMENT_NAME,
+						"`\(owner)` has no \(what) named `\(text)`",
+						n.span,
+						"no such \(what)",
+					)
+					if suggest(text, &texts) is .Some(similar) {
+						diagnostic = diagnostic.withFix(
+							"did you mean `\(similar)`?",
+							own [Edit::replace(n.span, String::of(similar))],
+						)
+					} else {
+						var quoted: Vec<String> = Vec()
+						for s in slots {
+							quoted.push("`\(self.text(s.name))`")
+						}
+						if !quoted.isEmpty() then
+							diagnostic = diagnostic.withNote("the \(what)s are \(quoted.join(", "))")
+					}
+					self.report(move diagnostic)
+					matched.unmatched.push(i)
+					matched.unknown = true
+					continue
+				}
+				slot = found
+			} else if meant is .Some(sym) {
+				slot = slotNamed(&slots, sym).unwrap()
+			} else {
+				slot = positional
+				positional += 1
+				if slot >= slots.len() {
+					matched.extra += 1
+					matched.unmatched.push(i)
+					continue
+				}
+			}
+			if matched.slots[slot] is .Some(first) {
+				val text = self.text(slots[slot].name)
+				val this = match name {
+					.Some(n) => n.span
+					.None => self.ast.exprs[args[i]].span
+				}
+				self.report(
+					Diagnostic::error(
+						ARGUMENT_TWICE,
+						"the \(what) `\(text)` is given twice",
+						this,
+						"given again here",
+					).withSecondary(self.ast.exprs[args[first]].span, "given here first"),
+				)
+				matched.unmatched.push(i)
+				continue
+			}
+			matched.slots[slot] = .Some(i)
+		}
+		return move matched
+	}
+
+	/// A warning for a call whose arguments by position include two or more
+	/// that are the parameters' own names, each in another's place:
+	/// `draw(height, width)` for `draw(width, height)`. One named as another
+	/// parameter whose own argument is something else — `rhs` in `lhs` and
+	/// `size` in `rhs` — is a chain a program writes on purpose, and is not
+	/// one. Naming the arguments says the order is meant.
+	var fn swappedArguments(
+		params: &[ParamDef],
+		args: &[ast::ExprId],
+		names: &[Option<ast::Name>],
+		callee: str,
+	) = {
+		var given: Vec<Option<Symbol>> = Vec()
+		var i = 0
+		while i < args.len() && i < names.len() && names[i].isNone() {
+			given.push(self.argumentName(args[i]))
+			i += 1
+		}
+		var swapped: Vec<i64> = Vec()
+		for at in 0..given.len() {
+			if paramElsewhere(&params, &given, at) is .Some(j) &&
+				paramElsewhere(&params, &given, j).isSome() {
+				swapped.push(at)
+			}
+		}
+		if swapped.len() < 2 then return
+		var quoted: Vec<String> = Vec()
+		for k in swapped {
+			if given[k] is .Some(sym) then quoted.push("`\(self.text(sym))`")
+		}
+		val message = if quoted.len() == 2 {
+			"\(quoted[0]) and \(quoted[1]) are passed in each other's places"
+		} else {
+			var head: Vec<String> = Vec()
+			for k in 0..quoted.len() - 1 {
+				head.push(quoted[k].clone())
+			}
+			"\(head.join(", ")) and \(quoted[quoted.len() - 1]) are passed in one another's places"
+		}
+		var diagnostic = Diagnostic::warning(
+			ARGUMENTS_SWAPPED,
+			move message,
+			self.ast.exprs[args[swapped[0]]].span,
+			"given as `\(self.text(params[swapped[0]].name))`",
+		)
+		for k in 1..swapped.len() {
+			val at = swapped[k]
+			diagnostic = diagnostic.withSecondary(self.ast.exprs[args[at]].span, "given as `\(self.text(params[at].name))`")
+		}
+		// Named from the first of them on, since nothing by position may follow
+		// a named argument.
+		var edits: Vec<Edit> = Vec()
+		for k in swapped[0]..given.len() {
+			edits.push(
+				Edit::insert(self.ast.exprs[args[k]].span.lo, "\(self.text(params[k].name)): "),
+			)
+		}
+		var order: Vec<String> = Vec()
+		for k in 0..given.len() {
+			order.push("`\(self.text(params[k].name))`")
+		}
+		diagnostic = diagnostic.withFix(
+			"if that is meant, name them",
+			(move edits).intoBuffer(),
+		).withNote("`\(callee)` takes \(order.join(", ")), in that order")
+		self.report(move diagnostic)
+	}
+
+	/// The name an argument is written by: a variable's, or a field's that is
+	/// read, through `&`, `&var`, `move` and parentheses.
+	fn argumentName(arg: ast::ExprId): Option<Symbol> = match self.ast.exprs[arg].kind {
+		.Name(sym) => .Some(sym)
+		.Field(name, ..) => .Some(name.sym)
+		.Paren(inner) => self.argumentName(inner)
+		.Unary(op: .Ref | .RefVar | .Move, operand, ..) => self.argumentName(operand)
+		_ => .None
+	}
+
+	/// The checked values of matched arguments, in slot order, with defaults
+	/// copied in and error expressions for what is missing, and the order in
+	/// which they are evaluated: the written arguments as written, then the
+	/// defaults.
+	var fn arrangeArguments(
+		slots: &[Slot],
+		matched: &Matched,
+		checked: &[Option<ExprId>],
+		span: Span,
+	): (Vec<ExprId>, Vec<u32>) = {
+		var values: Vec<ExprId> = Vec()
+		var written: Vec<(i64, u32)> = Vec()
+		var rest: Vec<u32> = Vec()
+		for (slot, arg) in matched.slots.forwards().enumerate() {
+			val value = match arg {
+				.Some(a) => {
+					written.push((a, slot as u32))
+					checked[a].unwrap()
+				}
+				.None => {
+					rest.push(slot as u32)
+					match slots[slot].default {
+						.Some(default) => self.useDefault(&default, span)
+						.None => self.errorExpr(span)
+					}
+				}
+			}
+			values.push(value)
+		}
+		written.sortUnstable()
+		var order: Vec<u32> = Vec()
+		for (_, slot) in written {
+			order.push(slot)
+		}
+		for slot in rest {
+			order.push(slot)
+		}
+		return (move values, orderOf(move order))
+	}
+
+	/// What a literal or a call that leaves a field or a parameter out puts
+	/// there: a copy of a constant, or a call of the default's own function. A
+	/// generic one's call is given its type arguments when the literal's or
+	/// the call's are known: `settleDefaults`.
+	var fn useDefault(default: &DefaultValue, span: Span): ExprId = match default {
+		.Constant(exprs, root) => self.copyDefault(&exprs, root, span)
+		.Code(code) => {
+			val ret = self.program.fns[code].ret
+			val call = self.alloc(
+				.Call(callee: code, args: Vec(), typeArgs: TyList::empty(), order: Vec()),
+				ret,
+				span,
+			)
+			if !self.program.fns[code].generics.isEmpty() then
+				self.state.unsettledDefaults.push(call)
+			call
+		}
+	}
+
+	/// Gives the calls of generic defaults made since `mark` the type
+	/// arguments of the literal or the call that uses them, which are the
+	/// defaults' own.
+	var fn settleDefaults(mark: i64, args: &[Ty]) = {
+		var calls: Vec<ExprId> = Vec()
+		while self.state.unsettledDefaults.len() > mark {
+			calls.push(self.state.unsettledDefaults.remove(mark))
+		}
+		if calls.isEmpty() then return
+		val list = self.program.types.internList(&args)
+		for call in calls {
+			val .Call(
+				callee,
+				args: callArgs,
+				order,
+				..,
+			) = self.state.body.exprs[call].kind.clone() else {
+				continue
+			}
+			val ret = self.program.types.subst(self.program.fns[callee].ret, &args)
+			self.state.body.exprs[call].kind = .Call(
+				callee: callee,
+				args: move callArgs,
+				typeArgs: list,
+				order: move order,
+			)
+			self.state.body.exprs[call].ty = ret
+		}
+	}
+
+	/// A copy of a constant default's expressions in the body being checked,
+	/// at the literal or the call that uses it.
+	var fn copyDefault(exprs: &Arena<Expr>, id: ExprId, span: Span): ExprId = {
+		val ty = exprs[id].ty
+		val kind: ExprKind = match exprs[id].kind {
+			.Unary(op, operand) => .Unary(op: op, operand: self.copyDefault(&exprs, operand, span))
+			.Variant(id: enumId, variant, args, order) => {
+				var copied: Vec<ExprId> = Vec()
+				for a in args {
+					copied.push(self.copyDefault(&exprs, a, span))
+				}
+				.Variant(id: enumId, variant: variant, args: move copied, order: order.clone())
+			}
+			.Struct(id: structId, fields, order) => {
+				var copied: Vec<ExprId> = Vec()
+				for f in fields {
+					copied.push(self.copyDefault(&exprs, f, span))
+				}
+				.Struct(id: structId, fields: move copied, order: order.clone())
+			}
+			.Array(elems) => {
+				var copied: Vec<ExprId> = Vec()
+				for e in elems {
+					copied.push(self.copyDefault(&exprs, e, span))
+				}
+				.Array(move copied)
+			}
+			.ArrayRepeat(elem, count) => .ArrayRepeat(
+				elem: self.copyDefault(&exprs, elem, span),
+				count: count,
+			)
+			other => other.clone()
+		}
+		return self.alloc(move kind, ty, span)
+	}
+
+	/// Whether a parameter may have a default at all: a C function's may not,
+	/// nor may a reference parameter, which a value would not be a place for.
+	/// What is refused is reported.
+	var fn defaultAllowed(value: ast::ExprId, ty: Ty, param: &ast::Param, isExtern: bool): bool = {
+		val span = self.ast.exprs[value].span
+		val refusal: Option<str> =
+			if isExtern then .Some("a C function's parameters have no defaults")
+			else if self.kind(ty) is .Ref(..) then
+				.Some("a reference parameter has no default: a value is not a place")
+			else .None
+		if refusal is .Some(message) {
+			self.report(
+				Diagnostic::error(
+					INVALID_DEFAULT,
+					String::of(message),
+					span,
+					"a default",
+				).withSecondary(param.name.span, "for this parameter"),
+			)
+			return false
+		}
+		return true
+	}
+
+	/// A default, checked as a value of the type it is for, once every
+	/// function is declared, with the type parameters of what it belongs to
+	/// in scope. A constant is kept to be copied in where it is used; a
+	/// default that is code is the body of a function of its own, which is
+	/// called there.
+	var fn defaultOf(value: ast::ExprId, ty: Ty): Option<DefaultValue> = {
+		val span = self.ast.exprs[value].span
+		val outer = mem::replace(&var self.state.body, Body())
+		val scopes = mem::replace(&var self.state.scopes, Vec::of(own [Map()]))
+		val ret = self.state.ret
+		val retSpan = self.state.retSpan
+		// A `return` in a default leaves its function, with a value of the type
+		// the default is.
+		self.state.ret = ty
+		self.state.retSpan = .None
+		val root = self.check(value, ty)
+		val constant = self.isConstant(root)
+		var body = mem::replace(&var self.state.body, move outer)
+		self.state.scopes = move scopes
+		self.state.ret = ret
+		self.state.retSpan = retSpan
+		if constant then return .Some(.Constant(exprs: move body.exprs, root: root))
+		body.value = .Some(root)
+		val code = self.program.fns.add(FnDef(
+			name: Symbol::defaultCode(),
+			nameSpan: span,
+			symbol: .None,
+			receiver: .None,
+			owner: .None,
+			interfaceId: .None,
+			generics: self.typeParams.clone(),
+			instanceOf: .None,
+			params: Vec(),
+			ret: ty,
+			retSpan: .None,
+			isExtern: false,
+			exportsC: false,
+			header: .None,
+			accesses: .None,
+			isVariadic: false,
+			variadicOf: .None,
+			lendsFrom: .None,
+			keeps: Vec(),
+			keepsAt: .None,
+			isLambda: false,
+			generator: .None,
+			isTailrec: false,
+			isTest: false,
+			isInline: false,
+			generated: .None,
+			intrinsic: .None,
+			body: .Some(move body),
+			projects: .None,
+			compileTime: false,
+			module: self.current as u32,
+			isPub: false,
+			span: span,
+		))
+		return .Some(.Code(code))
+	}
+
+	/// Whether a checked expression is a constant.
+	fn isConstant(id: ExprId): bool = match self.state.body.exprs[id].kind {
+		.Int(..) | .Float(..) | .Bool(..) | .Str(..) | .Error => true
+		.Unary(operand, ..) => self.isConstant(operand)
+		.Variant(args: parts, ..) | .Struct(fields: parts, ..) | .Array(elems: parts) => {
+			for p in parts {
+				if !self.isConstant(p) then return false
+			}
+			true
+		}
+		.ArrayRepeat(elem, ..) => self.isConstant(elem)
+		_ => false
+	}
+}
+
+/// The parameter a value given at `at` is named as, where it is another
+/// parameter than its own.
+fn paramElsewhere(params: &[ParamDef], given: &[Option<Symbol>], at: i64): Option<i64> = {
+	if at >= given.len() then return .None
+	val .Some(sym) = given[at] else {
+		return .None
+	}
+	for (other, p) in params.forwards().enumerate() {
+		if p.name == sym then return if other != at then .Some(other) else .None
+	}
+	return .None
+}

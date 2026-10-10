@@ -1,0 +1,475 @@
+// `for` over an iterator: what lends no slice is walked by calling `next()`
+// until it answers nothing.
+//
+// The loop is written into what the rest of the compiler already knows:
+//
+//     for x in it { body }
+//         ⇒ { var iterator# = it                  // only where `it` is not a place
+//             while true {
+//                 match iterator#.next() {
+//                     .Some(x) => { body },
+//                     .None => { break },
+//                 }
+//             } }
+//
+// so the move checker, the MIR and the code generator see a loop and a
+// `match`, and nothing new. A place is walked where it is: the loop moves it
+// on, and after a `break` it is where the loop left it.
+
+import std::collections::{Map}
+import syntax as ast
+import syntax::{Diagnostic, Edit, NOT_ITERABLE, Span, Symbol}
+
+/// A type's `next`, as `for` calls it.
+@derive(Clone)
+struct Next {
+	method: FnId
+	typeArgs: TyList
+	/// What `next` answers: `Option<T>`.
+	answer: Ty
+	/// `T`.
+	elem: Ty
+}
+
+/// A type's `len` and `at`, as `for` calls them.
+@derive(Clone)
+struct SequenceOf {
+	len: FnId
+	placeAt: FnId
+	typeArgs: TyList
+	/// `T`.
+	elem: Ty
+}
+
+extend Lowerer {
+	/// The first argument of a type parameter's constraint by an interface:
+	/// what it is constrained to walk or lend.
+	fn constrainedElem(param: TyParam, interfaceId: InterfaceId): Option<Ty> = {
+		if param.index as i64 >= self.typeParams.len() then return .None
+		for c in self.typeParams[param.index as i64].interfaces {
+			if c.interfaceId == interfaceId {
+				val list = self.program.types.list(c.args)
+				return if list.isEmpty() then .None else .Some(list[0])
+			}
+		}
+		return .None
+	}
+
+	/// The one implementation of an interface for a type, where there is
+	/// exactly one: which kind of element must not be in question.
+	fn onlyImpl(owner: TypeDef, interfaceId: InterfaceId): Option<i64> = {
+		var found: Option<i64> = .None
+		var count = 0
+		for (at, i) in self.program.impls.forwards().enumerate() {
+			if i.interfaceId == interfaceId && i.ty == owner {
+				count += 1
+				if found.isNone() then found = .Some(at)
+			}
+		}
+		return if count == 1 then found else .None
+	}
+
+	/// How `ty` is walked one element at a time, if it implements the
+	/// prelude's `Iterator`, directly or through a constraint.
+	var fn iteratorOf(ty: Ty): Option<Next> = {
+		val interfaceId = self.program.preludeItems.interfaceOf(.Iterator)?
+		var method = self.program.interfaces[interfaceId].methods[0].id
+		var args: Vec<Ty> = Vec()
+		if self.kind(ty) is .Param(param) {
+			val elem = self.constrainedElem(param, interfaceId)?
+			args = Vec::of(own [ty, elem])
+		} else {
+			val owner = self.ownerOf(ty)?
+			// Which kind of element must not be in question, as for `Items`.
+			val at = self.onlyImpl(owner, interfaceId)?
+			if self.program.impls[at].methods.isEmpty() then return .None
+			method = self.program.impls[at].methods[0]
+			args = match self.kind(ty) {
+				.Struct(args: a, ..) | .Enum(args: a, ..) => self.program.types.list(a).toVec()
+				_ => Vec()
+			}
+		}
+		val answer = self.program.types.subst(self.program.fns[method].ret, &args)
+		val .Enum(id: option, args: elems) = self.kind(answer) else {
+			return .None
+		}
+		if .Some(option) != self.program.preludeItems.enumeration(.Option) then return .None
+		val list = self.program.types.list(elems)
+		if list.isEmpty() then return .None
+		val elem = list[0]
+		return .Some(Next(
+			method: method,
+			typeArgs: self.program.types.internList(&args),
+			answer: answer,
+			elem: elem,
+		))
+	}
+
+	/// `c.intoIterator()`, where `c`, moved, gives up its elements to an
+	/// iterator: the call, which takes `c`, and how the iterator it answers
+	/// is walked. Nothing where `c`'s type does not.
+	var fn givenUpIterator(moved: ExprId): Option<(ExprId, Next)> = {
+		val interfaceId = self.program.preludeItems.interfaceOf(.IntoIterator)?
+		val ty = self.tyOf(moved)
+		// A type parameter gives them up because a constraint says so, and the
+		// call goes through the interface's own method, which its instance
+		// replaces.
+		var method = self.program.interfaces[interfaceId].methods[0].id
+		var args: Vec<Ty> = Vec()
+		if self.kind(ty) is .Param(param) {
+			val iterator = self.constrainedElem(param, interfaceId)?
+			args = Vec::of(own [ty, iterator])
+		} else {
+			val owner = self.ownerOf(ty)?
+			val at = self.onlyImpl(owner, interfaceId)?
+			if self.program.impls[at].methods.isEmpty() then return .None
+			method = self.program.impls[at].methods[0]
+			args = self.ownerArgs(ty)
+		}
+		val iterator = self.program.types.subst(self.program.fns[method].ret, &args)
+		val next = self.iteratorOf(iterator)?
+		val span = self.state.body.exprs[moved].span
+		val typeArgs = self.program.types.internList(&args)
+		val call = self.alloc(
+			.Call(
+				callee: method,
+				args: Vec::of(own [moved]),
+				typeArgs: typeArgs,
+				order: Vec::of(own [0]),
+			),
+			iterator,
+			span,
+		)
+		return .Some((call, move next))
+	}
+
+	/// A local of the loop's own that holds what it walks, and the statement
+	/// that gives it its value.
+	var fn walkedLocal(ty: Ty, init: ExprId, span: Span, stmts: &var Vec<StmtId>): LocalId = {
+		val local = self.state.body.locals.add(Local(
+			name: Symbol::walked(),
+			ty: ty,
+			kind: .Var,
+			span: span,
+		))
+		stmts.push(
+			self.state.body.stmts.add(Stmt(kind: .Let(local: local, init: init), span: span)),
+		)
+		return local
+	}
+
+	/// `for binding in walked { body }`, where `walked` is an iterator: the
+	/// loop above.
+	var fn walkIterator(
+		label: Option<&ast::Name>,
+		binding: &ast::Pattern,
+		walked: ExprId,
+		next: Next,
+		body: &ast::Block,
+	): StmtKind = {
+		val span = self.state.body.exprs[walked].span
+		val ty = self.tyOf(walked)
+		self.state.scopes.push(Map())
+		var stmts: Vec<StmtId> = Vec()
+		// An iterator made on the heap where the loop is written, `own
+		// walk(child)`, is walked in a variable of the loop's own that holds
+		// the `own`: a recursive generator's.
+		var heapOwned: Option<ExprId> = .None
+		if self.state.body.exprs[walked].kind is .Deref(owned) &&
+			self.kind(self.tyOf(owned)) is .Own(..) &&
+			self.placeRoot(owned) is .NotAPlace {
+			heapOwned = .Some(owned)
+		}
+		val place = if heapOwned is .Some(owned) {
+			val ownedTy = self.tyOf(owned)
+			val local = self.walkedLocal(ownedTy, owned, span, &var stmts)
+			val held = self.alloc(.Local(local), ownedTy, span)
+			self.alloc(.Deref(held), ty, span)
+		} else if self.placeRoot(walked) is .NotAPlace {
+			// A place is walked where it is, so it must be one that can change;
+			// anything else is walked in a variable of the loop's own.
+			val local = self.walkedLocal(ty, walked, span, &var stmts)
+			self.alloc(.Local(local), ty, span)
+		} else {
+			if !self.writable(walked) then self.walkedUnchangeable(walked)
+			walked
+		}
+		val lentTy = self.intern(.Ref(inner: ty, kind: .Var))
+		val lent = self.alloc(.Ref(place), lentTy, span)
+		val call = self.alloc(
+			.Call(
+				callee: next.method,
+				args: Vec::of(own [lent]),
+				typeArgs: next.typeArgs,
+				order: Vec::of(own [0]),
+			),
+			next.answer,
+			span,
+		)
+		// Each element is the loop's own: the binding takes it, as a `match` on
+		// a value does.
+		val inner = self.pattern(&binding, next.elem, Binds())
+		val binder: Binder = match move inner {
+			.Binding(local) => .Bind(local)
+			.Wildcard => .Ignored
+			other => .Nested(move other)
+		}
+		val (some, none) = self.optionVariants()
+		val bodySpan = body.span
+		val (userBlock, userTy) = self.typedLoopBody(label, &body)
+		val user = self.alloc(.Block(move userBlock), userTy, bodySpan)
+		val breakStmt = self.state.body.stmts.add(Stmt(kind: .Break(0), span: span))
+		val stop = self.alloc(
+			.Block(Block(stmts: Vec::of(own [breakStmt]), value: .None, span: span)),
+			NEVER,
+			span,
+		)
+		val arms = Vec::of(own [
+			Arm(
+				pattern: .Variant(variant: some, binders: Vec::of(own [move binder])),
+				guard: .None,
+				body: user,
+				span: bodySpan,
+			),
+			Arm(
+				pattern: .Variant(variant: none, binders: Vec()),
+				guard: .None,
+				body: stop,
+				span: span,
+			),
+		])
+		val step = self.alloc(.Match(scrutinee: call, arms: move arms), UNIT, bodySpan)
+		val stepStmt = self.state.body.stmts.add(Stmt(kind: .Expr(step), span: bodySpan))
+		val cond = self.alloc(.Bool(true), BOOL, span)
+		val whole = span.to(bodySpan)
+		stmts.push(
+			self.state.body.stmts.add(Stmt(
+				kind: .While(cond: cond, body: Block(
+					stmts: Vec::of(own [stepStmt]),
+					value: .None,
+					span: bodySpan,
+				)),
+				span: whole,
+			)),
+		)
+		self.state.scopes.pop()
+		val block = self.alloc(
+			.Block(Block(stmts: move stmts, value: .None, span: whole)),
+			UNIT,
+			whole,
+		)
+		return .Expr(block)
+	}
+
+	/// The method of an implementation of the given name.
+	fn methodNamedIn(methods: &[FnId], name: str): Option<FnId> = {
+		for m in methods {
+			if self.text(self.program.fns[m].name) == name then return .Some(m)
+		}
+		return .None
+	}
+
+	/// How `ty` is walked one place at a time, if it implements the prelude's
+	/// `Sequence`, directly or through a constraint.
+	var fn sequenceOf(ty: Ty): Option<SequenceOf> = {
+		val interfaceId = self.program.preludeItems.interfaceOf(.Sequence)?
+		var methods: Vec<FnId> = Vec()
+		var args: Vec<Ty> = Vec()
+		if self.kind(ty) is .Param(param) {
+			val elem = self.constrainedElem(param, interfaceId)?
+			for m in self.program.interfaces[interfaceId].methods {
+				methods.push(m.id)
+			}
+			args = Vec::of(own [ty, elem])
+		} else {
+			val owner = self.ownerOf(ty)?
+			// Which kind of element must not be in question, as for `Items`.
+			val at = self.onlyImpl(owner, interfaceId)?
+			methods = self.program.impls[at].methods.clone()
+			args = match self.kind(ty) {
+				.Struct(args: a, ..) | .Enum(args: a, ..) => self.program.types.list(a).toVec()
+				_ => Vec()
+			}
+		}
+		val len = self.methodNamedIn(&methods, "len")?
+		val placeAt = self.methodNamedIn(&methods, "at")?
+		val lent = self.program.types.subst(self.program.fns[placeAt].ret, &args)
+		val .Ref(inner: elem, ..) = self.kind(lent) else {
+			return .None
+		}
+		return .Some(SequenceOf(
+			len: len,
+			placeAt: placeAt,
+			typeArgs: self.program.types.internList(&args),
+			elem: elem,
+		))
+	}
+
+	/// `for binding in walked { body }`, where `walked` lends its elements one
+	/// place at a time:
+	///
+	///     { var index# = 0
+	///       while index# < walked.len() {
+	///           index# += 1
+	///           match walked.at(index# - 1) { binding => body }
+	///       } }
+	///
+	/// The binding is an alias of the place, for the whole body, as a `match`
+	/// binding of a place is, and the place is lent for writing where
+	/// `walked` can be written and its type has the writing half. The count
+	/// goes up before the body, so that `continue` moves on.
+	var fn walkSequence(
+		label: Option<&ast::Name>,
+		binding: &ast::Pattern,
+		walked: ExprId,
+		sequence: SequenceOf,
+		body: &ast::Block,
+	): StmtKind = {
+		val span = self.state.body.exprs[walked].span
+		val ty = self.tyOf(walked)
+		self.state.scopes.push(Map())
+		var stmts: Vec<StmtId> = Vec()
+		// What is not a place is walked in a variable of the loop's own, which
+		// the loop may write.
+		val place = if self.placeRoot(walked) is .NotAPlace {
+			val local = self.walkedLocal(ty, walked, span, &var stmts)
+			self.alloc(.Local(local), ty, span)
+		} else {
+			walked
+		}
+		val index = self.state.body.locals.add(Local(
+			name: Symbol::walked(),
+			ty: I64,
+			kind: .Var,
+			span: span,
+		))
+		val zero = self.alloc(.Int(0), I64, span)
+		stmts.push(
+			self.state.body.stmts.add(Stmt(kind: .Let(local: index, init: zero), span: span)),
+		)
+		val shared = self.intern(.Ref(inner: ty, kind: .Shared))
+		// `index# < walked.len()`
+		val counted = self.alloc(.Local(index), I64, span)
+		val lentForLen = self.alloc(.Ref(place), shared, span)
+		val len = self.alloc(
+			.Call(
+				callee: sequence.len,
+				args: Vec::of(own [lentForLen]),
+				typeArgs: sequence.typeArgs,
+				order: Vec::of(own [0]),
+			),
+			I64,
+			span,
+		)
+		val cond = self.alloc(.Binary(op: .Lt, lhs: counted, rhs: len, wrapping: false), BOOL, span)
+		// `index# += 1`
+		val target = self.alloc(.Local(index), I64, span)
+		val one = self.alloc(.Int(1), I64, span)
+		val step = self.alloc(
+			.Assign(place: target, op: .Some(.Add), wrapping: false, value: one),
+			UNIT,
+			span,
+		)
+		val stepStmt = self.state.body.stmts.add(Stmt(kind: .Expr(step), span: span))
+		// `walked.at(index# - 1)`, the writing half where it can be.
+		val current = self.alloc(.Local(index), I64, span)
+		val another = self.alloc(.Int(1), I64, span)
+		val at = self.alloc(
+			.Binary(op: .Sub, lhs: current, rhs: another, wrapping: false),
+			I64,
+			span,
+		)
+		val lentForAt = self.alloc(.Ref(place), shared, span)
+		val reads = self.intern(.Ref(inner: sequence.elem, kind: .Shared))
+		val call = self.alloc(
+			.Call(
+				callee: sequence.placeAt,
+				args: Vec::of(own [lentForAt, at]),
+				typeArgs: sequence.typeArgs,
+				order: Vec::of(own [0, 1]),
+			),
+			reads,
+			span,
+		)
+		// The writing half, where the walked place can be written; the
+		// receivers along the way are switched to theirs too.
+		self.swapInWriter(call)
+		val element = self.alloc(.Deref(call), sequence.elem, span)
+		// `match … { binding => body }`: the binding refers to the place, and
+		// can write it where the place can be written, as a `for` binding of a
+		// slice's element does.
+		val kind: RefKind = if self.writable(element) then .Var else .Shared
+		val elementTy = self.intern(.Ref(inner: sequence.elem, kind: kind))
+		// Writing through the binding writes the element, which is what the
+		// walk is for: the container, which the `match` holds, is what may not
+		// change.
+		val pattern = self.elementPattern(&binding, elementTy, .Some(sequence.elem), kind, .None)
+		val bodySpan = body.span
+		val (userBlock, userTy) = self.typedLoopBody(label, &body)
+		val user = self.alloc(.Block(move userBlock), userTy, bodySpan)
+		val visit = self.alloc(
+			.Match(
+				scrutinee: element,
+				arms: Vec::of(own [
+					Arm(pattern: move pattern, guard: .None, body: user, span: bodySpan),
+				]),
+			),
+			UNIT,
+			bodySpan,
+		)
+		self.state.body.sequenceWalks.add(visit)
+		val visitStmt = self.state.body.stmts.add(Stmt(kind: .Expr(visit), span: bodySpan))
+		val whole = span.to(bodySpan)
+		stmts.push(
+			self.state.body.stmts.add(Stmt(
+				kind: .While(cond: cond, body: Block(
+					stmts: Vec::of(own [stepStmt, visitStmt]),
+					value: .None,
+					span: bodySpan,
+				)),
+				span: whole,
+			)),
+		)
+		self.state.scopes.pop()
+		val block = self.alloc(
+			.Block(Block(stmts: move stmts, value: .None, span: whole)),
+			UNIT,
+			whole,
+		)
+		return .Expr(block)
+	}
+
+	/// Where `Option`'s `Some` and `None` are among its variants.
+	fn optionVariants(): (u32, u32) = {
+		val .Some(option) = self.program.preludeItems.enumeration(.Option) else {
+			panic("an iterator answers the prelude's `Option`")
+		}
+		var some: Option<u32> = .None
+		var none: Option<u32> = .None
+		for (i, v) in self.program.enums[option].variants.forwards().enumerate() {
+			if some.isNone() && self.text(v.name) == "Some" then some = .Some(i as u32)
+			if none.isNone() && self.text(v.name) == "None" then none = .Some(i as u32)
+		}
+		return (some.unwrap(), none.unwrap())
+	}
+
+	/// A place a `for` would walk, which cannot change: `val words`.
+	var fn walkedUnchangeable(walked: ExprId) = {
+		val span = self.state.body.exprs[walked].span
+		var diagnostic = Diagnostic::error(
+			NOT_ITERABLE,
+			"a `for` over an iterator moves it on, and this cannot change",
+			span,
+			"walked where it is",
+		).withNote(
+			"each pass calls `next()`, which changes the iterator; a variable is walked where it is, so after a `break` it is where the loop left it",
+		)
+		if self.state.body.exprs[walked].kind is .Local(local) &&
+			self.state.body.locals[local].kind is .Let(keyword) {
+			diagnostic = diagnostic.withFix("declare it with `var`", own [
+				Edit::replace(keyword, "var"),
+			])
+		}
+		self.report(move diagnostic)
+	}
+}

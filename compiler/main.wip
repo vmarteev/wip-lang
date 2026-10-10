@@ -1,0 +1,1198 @@
+// `wip`, the compiler for Wip, written in Wip: its commands, and the options
+// each takes.
+
+import std::args::{Arguments}
+import std::fs
+import std::future
+import std::io
+import std::path
+import fmt::{OFF, Style, format, switchedOff}
+import mir
+import hir::{dump as dumpHir}
+import std::process::{Command}
+import lang::{
+	BuildOptions,
+	Cpu,
+	Debugger,
+	Emit,
+	Loaded,
+	Profile,
+	buildLoaded,
+	Search,
+	SourceFile,
+	Target,
+	TempDir,
+	Timings,
+	Unique,
+	bindgen,
+	buildTests,
+	cacheDir,
+	checkLoaded,
+	checkTypes,
+	cleanCache,
+	debug,
+	dump as dumpDiagnosticsOf,
+	findClang,
+	printItem,
+	read as readDocs,
+	readForLookup,
+	writeSite,
+	formatStyle,
+	isDirectory,
+	loadFor,
+	loadMode,
+	parseFile,
+	renderAll,
+	renderProgram,
+	scripts as debuggerScripts,
+	serve
+}
+import syntax::{Diagnostic, Interner, Span, dump, dumpAst, lex}
+
+fn main(args: &[cstring]): i64 = {
+	var arguments = Arguments::of(&args)
+	var command: Option<str> = .None
+	// What follows the command: a file, or for `fmt` any number of paths.
+	var paths: Vec<str> = Vec()
+	// `fmt`'s options.
+	var layout = Layout(width: .None, tabs: false, spaces: .None)
+	var stdinPath: Option<str> = .None
+	var check = false
+	// `check`'s options: the checked program, or its diagnostics, written
+	// for tools; and the targets it is checked for, each as that target
+	// compiles it.
+	var dumpHirOption = false
+	var libraryOption = false
+	var dumpDiagnosticsOption = false
+	var targets: Vec<str> = Vec()
+	// `mir`'s, `build`'s, `run`'s and `test`'s option: a release build's
+	// form.
+	var releaseOption = false
+	// An option only `mir`, `build`, `run` and `test` take, given to another
+	// command.
+	var mirOption: Option<str> = .None
+	// `build`'s, `run`'s and `test`'s options: where the C a program binds
+	// is, and the processor it is built for.
+	var search = Search()
+	var cpuOption = "baseline"
+	// An option only `build`, `run` and `test` take, given to another
+	// command.
+	var runOption: Option<str> = .None
+	// `build`'s options: where the build is written, what it writes, where
+	// the declarations of what a library exports go, and whether to say how
+	// long each phase took.
+	var outputOption: Option<str> = .None
+	var emitOption = "program"
+	var headerOption: Option<str> = .None
+	var noDebugInfoOption = false
+	var timeOption = false
+	// `doc`'s option: the standard library alone.
+	var stdOption = false
+	// `debug`'s options: which debugger, or only where its scripts are.
+	var debuggerOption: Option<str> = .None
+	var scriptsOption = false
+	// An option only `debug` takes, given to another command.
+	var debugOption: Option<str> = .None
+	// An option only `build` takes, given to another command.
+	var buildOption: Option<str> = .None
+	// What `run` hands the program: everything after its file.
+	var programArgs: Vec<str> = Vec()
+	// An option only `check` takes, given to another command.
+	var checkOption: Option<str> = .None
+	// An option only `fmt` takes, given to another command.
+	var fmtOption: Option<str> = .None
+	// How many threads the phases that read a program split their work
+	// across: one a processor where it is not said.
+	var threadsOption = 0
+	// What `wip` says of itself: its help, and its version.
+	var helpOption = false
+	var versionOption = false
+	// When to colour diagnostics: `auto`, where standard error is a terminal
+	// and `NO_COLOR` is not set.
+	var colorChoice = "auto"
+	while true {
+		val argument = match arguments.next() {
+			.Ok(.Some(argument)) => argument
+			.Ok(.None) => break
+			.Err(error) => {
+				io::eprintln("error: \(error)")
+				return 2
+			}
+		}
+		match argument {
+			.Long("color") => {
+				colorChoice = match arguments.value() {
+					.Ok(value) if value is "auto" | "always" | "never" => value
+					.Ok(value) => {
+						io::eprintln("error: `--color` is `auto`, `always` or `never`, not `\(value)`")
+						return 2
+					}
+					.Err(error) => {
+						io::eprintln("error: \(error)")
+						return 2
+					}
+				}
+			}
+			.Long("threads") => {
+				threadsOption = match arguments.int() {
+					.Ok(n) if n >= 0 => n
+					.Ok(n) => {
+						io::eprintln("error: `--threads` takes a number of threads, not `\(n)`")
+						return 2
+					}
+					.Err(error) => {
+						io::eprintln("error: \(error)")
+						return 2
+					}
+				}
+			}
+			.Long("stdin-path") => {
+				fmtOption = .Some("--stdin-path")
+				stdinPath = match arguments.value() {
+					.Ok(value) => .Some(value)
+					.Err(error) => {
+						io::eprintln("error: \(error)")
+						return 2
+					}
+				}
+			}
+			.Long("check") => {
+				fmtOption = .Some("--check")
+				check = true
+			}
+			.Long("dump-hir") => {
+				checkOption = .Some("--dump-hir")
+				dumpHirOption = true
+			}
+			.Long("library") => libraryOption = true
+			.Long("release") => {
+				mirOption = .Some("--release")
+				releaseOption = true
+			}
+			.Short('o') | .Long("output") => {
+				outputOption = match arguments.value() {
+					.Ok(value) => .Some(value)
+					.Err(error) => {
+						io::eprintln("error: \(error)")
+						return 2
+					}
+				}
+			}
+			.Long("no-debug-info") => {
+				buildOption = .Some("--no-debug-info")
+				noDebugInfoOption = true
+			}
+			.Long("header") => {
+				buildOption = .Some("--header")
+				headerOption = match arguments.value() {
+					.Ok(value) => .Some(value)
+					.Err(error) => {
+						io::eprintln("error: \(error)")
+						return 2
+					}
+				}
+			}
+			.Short('I') | .Long("include") | .Short('L') | .Long("library-path") => {
+				val include = argument is .Short('I') | .Long("include")
+				runOption = .Some(if include then "--include" else "--library-path")
+				match arguments.value() {
+					.Ok(value) if include => search.includes.push(value)
+					.Ok(value) => search.libraryPaths.push(value)
+					.Err(error) => {
+						io::eprintln("error: \(error)")
+						return 2
+					}
+				}
+			}
+			.Long("cpu") => {
+				runOption = .Some("--cpu")
+				cpuOption = match arguments.value() {
+					.Ok(value) => value
+					.Err(error) => {
+						io::eprintln("error: \(error)")
+						return 2
+					}
+				}
+			}
+			.Long("emit") => {
+				buildOption = .Some("--emit")
+				emitOption = match arguments.value() {
+					.Ok(value) => value
+					.Err(error) => {
+						io::eprintln("error: \(error)")
+						return 2
+					}
+				}
+			}
+			.Short('h') | .Long("help") => helpOption = true
+			.Short('V') | .Long("version") => versionOption = true
+			.Long("std") => stdOption = true
+			.Long("scripts") => {
+				debugOption = .Some("--scripts")
+				scriptsOption = true
+			}
+			.Long("debugger") => {
+				debugOption = .Some("--debugger")
+				debuggerOption = match arguments.value() {
+					.Ok(value) => .Some(value)
+					.Err(error) => {
+						io::eprintln("error: \(error)")
+						return 2
+					}
+				}
+			}
+			.Long("time") => {
+				buildOption = .Some("--time")
+				timeOption = true
+			}
+			.Long("dump-diagnostics") => {
+				checkOption = .Some("--dump-diagnostics")
+				dumpDiagnosticsOption = true
+			}
+			.Long("target") => {
+				checkOption = .Some("--target")
+				match arguments.value() {
+					.Ok(value) => targets.push(value)
+					.Err(error) => {
+						io::eprintln("error: \(error)")
+						return 2
+					}
+				}
+			}
+			.Long("tabs") => {
+				fmtOption = .Some("--tabs")
+				layout.tabs = true
+			}
+			.Long("width") | .Long("spaces") => {
+				val option = if argument == .Long("width") then "--width" else "--spaces"
+				fmtOption = .Some(option)
+				val n = match arguments.int() {
+					.Ok(n) if n >= 0 => n
+					.Ok(n) => {
+						io::eprintln("error: `\(option)` takes a number of columns, not `\(n)`")
+						return 2
+					}
+					.Err(error) => {
+						io::eprintln("error: \(error)")
+						return 2
+					}
+				}
+				if option == "--width" then layout.width = .Some(n) else layout.spaces = .Some(n)
+			}
+			.Positional(word) => {
+				if command == .None {
+					command = .Some(word)
+					// What follows `bindgen` is the tool's, as it was written.
+					if word == "bindgen" {
+						programArgs = arguments.rest()
+						break
+					}
+				} else {
+					paths.push(word)
+					// What follows `run`'s file, or the program `debug` starts,
+					// is the program's, as it was written.
+					if command is .Some("run") | .Some("debug") {
+						programArgs = arguments.rest()
+						break
+					}
+				}
+			}
+			_ => {
+				io::eprintln("error: \(argument.unexpected())")
+				return 2
+			}
+		}
+	}
+	val color = match colorChoice {
+		"always" => true
+		"never" => false
+		_ => io::isTerminal(.Errors) && io::env("NO_COLOR") == .None
+	}
+	val threads = if threadsOption > 0 then threadsOption else future::cores()
+	if versionOption {
+		io::print(versionText().toStr())
+		return 0
+	}
+	// `wip help build` is `wip build --help`.
+	if helpOption || command == .Some("help") {
+		val asked: Option<str> = match command {
+			.Some("help") => if paths.isEmpty() then .None else .Some(paths[0])
+			_ => command
+		}
+		return match helpOf(asked) {
+			.Some(text) => {
+				io::print(text.toStr())
+				0
+			}
+			.None => {
+				val name = match asked {
+					.Some(name) => name
+					.None => ""
+				}
+				io::eprintln("error: there is no command `\(name)`; `wip --help` lists them")
+				2
+			}
+		}
+	}
+	if command == .Some("fmt") then return fmtCommand(&paths, stdinPath, check, &layout, color)
+	if fmtOption is .Some(option) {
+		io::eprintln("error: `\(option)` is an option of `fmt`")
+		return 2
+	}
+	if command != .Some("check") && checkOption is .Some(option) {
+		io::eprintln("error: `\(option)` is an option of `check`")
+		return 2
+	}
+	if !(command is .Some("mir") | .Some("build") | .Some("run") | .Some("test")) &&
+		mirOption is .Some(option) {
+		io::eprintln("error: `\(option)` is an option of `mir`, `build`, `run` and `test`")
+		return 2
+	}
+	if !(command is .Some("build") | .Some("run") | .Some("test")) && runOption is .Some(option) {
+		io::eprintln("error: `\(option)` is an option of `build`, `run` and `test`")
+		return 2
+	}
+	if command != .Some("build") && buildOption is .Some(option) {
+		io::eprintln("error: `\(option)` is an option of `build`")
+		return 2
+	}
+	if !(command is .Some("build") | .Some("doc")) && outputOption.isSome() {
+		io::eprintln("error: `--output` is an option of `build` and `doc`")
+		return 2
+	}
+	if command != .Some("debug") && debugOption is .Some(option) {
+		io::eprintln("error: `\(option)` is an option of `debug`")
+		return 2
+	}
+	if command == .Some("lsp") then serve(threads)
+	if command == .Some("bindgen") then return bindgenCommand(&programArgs, color, threads)
+	if command == .Some("debug") {
+		val program: Option<str> = if paths.isEmpty() then .None else .Some(paths[0])
+		return debugCommand(debuggerOption, scriptsOption, program, &programArgs)
+	}
+	if command != .Some("doc") && stdOption {
+		io::eprintln("error: `--std` is an option of `doc`")
+		return 2
+	}
+	// What is written for tools is one program's, on this machine.
+	if libraryOption && !dumpHirOption && command != .Some("mir") {
+		io::eprintln("error: `--library` is for `check --dump-hir` and `mir`")
+		return 2
+	}
+	if dumpHirOption && (dumpDiagnosticsOption || !targets.isEmpty()) ||
+		dumpDiagnosticsOption && !targets.isEmpty() {
+		io::eprintln(
+			"error: `--dump-hir`, `--dump-diagnostics` and `--target` are not given together",
+		)
+		return 2
+	}
+	if command == .Some("doc") {
+		if paths.len() > 1 {
+			io::eprintln("error: `doc` documents one program, or prints one item")
+			return 2
+		}
+		val target: Option<str> = if paths.isEmpty() then .None else .Some(paths[0])
+		if stdOption && target.isSome() {
+			io::eprintln(
+				"error: `--std` documents the standard library alone, and takes no program",
+			)
+			return 2
+		}
+		return docCommand(target, outputOption, stdOption, threads)
+	}
+	if command == .Some("cache") {
+		if paths.len() != 1 || paths[0] != "clean" {
+			io::eprintln("error: `cache` is `cache clean`")
+			return 2
+		}
+		return cacheClean()
+	}
+	// `test`'s file may be followed by the text of the tests to run.
+	val filter: Option<str> =
+		if command == .Some("test") && paths.len() == 2 then .Some(paths[1]) else .None
+	if paths.len() != 1 && filter.isNone() {
+		io::eprintln("error: \(USAGE)")
+		return 2
+	}
+	val path = paths[0]
+	return match command {
+		.Some("lex") => lexFile(path, color)
+		.Some("parse") => parseFileCommand(path, color)
+		.Some("check") if dumpHirOption => checkDumped(path, libraryOption, color, threads)
+		.Some("check") if !targets.isEmpty() => checkForTargets(path, &targets, color, threads)
+		.Some("check") => checkCommand(path, dumpDiagnosticsOption, color, threads)
+		.Some("mir") => mirCommand(path, releaseOption, libraryOption, color, threads)
+		.Some("build") | .Some("run") | .Some("test") => {
+			val cpu = match Cpu::parse(cpuOption) {
+				.Ok(cpu) => move cpu
+				.Err(message) => {
+					io::eprintln("error: invalid value '\(cpuOption)' for '--cpu <CPU>': \(message)")
+					return 2
+				}
+			}
+			val .Some(emit) = Emit::parse(emitOption) else {
+				io::eprintln("error: `--emit` is `program`, `static`, `dynamic` or `llvm-ir`, not `\(emitOption)`")
+				return 2
+			}
+			val options = BuildOptions(
+				search: move search,
+				emit: move emit,
+				header: match headerOption {
+					.Some(header) => .Some(String::of(header))
+					.None => .None
+				},
+				profile: if releaseOption then Profile::Release else Profile::Debug,
+				cpu: move cpu,
+				debugInfo: !noDebugInfoOption,
+			)
+			match command {
+				.Some("run") => runCommand(path, &options, &programArgs, color, threads)
+				.Some("test") => testCommand(path, &options, filter, color, threads)
+				_ => buildCommand(path, outputOption, &options, timeOption, color, threads)
+			}
+		}
+		_ => {
+			io::eprintln("error: \(USAGE)")
+			return 2
+		}
+	}
+}
+
+val USAGE =
+	"the commands are `lex file`, `parse file`, `check path`, `mir path`, `build path`, `run path [arguments]`, `test path [filter]`, `doc [path or item]`, `debug program [arguments]`, `bindgen header [options]`, `cache clean` and `fmt paths`"
+
+/// `lex`: the tokens of a file, one a line, and what is wrong in them.
+fn lexFile(path: str, color: bool): i64 = {
+	val source = match SourceFile::read(path) {
+		.Ok(source) => move source
+		.Err(message) => {
+			io::eprintln("error: \(message)")
+			return 2
+		}
+	}
+	var interner = Interner::new()
+	val lexed = lex(source.text.toStr(), &var interner)
+	io::print(dump(source.text.toStr(), &lexed.tokens))
+	io::eprint(renderAll(&lexed.diagnostics, source.name.toStr(), source.text.toStr(), color))
+	return errors(&lexed.diagnostics)
+}
+
+/// `parse`: the syntax tree of a file, one node a line, and what is wrong
+/// in it.
+fn parseFileCommand(path: str, color: bool): i64 = {
+	val source = match SourceFile::read(path) {
+		.Ok(source) => move source
+		.Err(message) => {
+			io::eprintln("error: \(message)")
+			return 2
+		}
+	}
+	val parsed = parseFile(&source)
+	io::print(dumpAst(&parsed.ast, source.text.toStr(), &parsed.interner))
+	io::eprint(renderAll(&parsed.diagnostics, source.name.toStr(), source.text.toStr(), color))
+	return errors(&parsed.diagnostics)
+}
+
+/// `check --dump-hir`: the checked program, one fact a line, and what is
+/// wrong in it. A package is checked whole, every module of it, imported or
+/// not.
+fn checkDumped(path: str, library: bool, color: bool, threads: i64): i64 = {
+	var timings = Timings()
+	val loaded = match loadMode(path, .Package, &var timings, threads) {
+		.Ok(loaded) => move loaded
+		.Err(message) => {
+			io::eprintln("error: \(message)")
+			return 2
+		}
+	}
+	val checked = checkTypes(&loaded, &var timings)
+	val sources = &loaded.sources
+	io::print(
+		dumpHir(&checked.program, &loaded.interner, (at) => sources.locate(Span::at(at)), library),
+	)
+	io::eprint(renderProgram(&checked.diagnostics, &loaded.sources, color))
+	return errors(&checked.diagnostics)
+}
+
+/// `check`: what is wrong in a program, drawn, or written one fact a line
+/// for tools. A package is checked whole, every module of it, imported or
+/// not.
+fn checkCommand(path: str, dumpDiagnostics: bool, color: bool, threads: i64): i64 = {
+	var timings = Timings()
+	var loaded = match loadMode(path, .Package, &var timings, threads) {
+		.Ok(loaded) => move loaded
+		.Err(message) => {
+			io::eprintln("error: \(message)")
+			return 2
+		}
+	}
+	val checked = checkLoaded(&var loaded, &var timings)
+	if dumpDiagnostics then io::print(dumpDiagnosticsOf(&checked.diagnostics, &loaded.sources))
+	else io::eprint(renderProgram(&checked.diagnostics, &loaded.sources, color))
+	return errors(&checked.diagnostics)
+}
+
+/// `mir`: the program as a build compiles it, and what is wrong in it. A
+/// debug build drops a struct by a call, and a release build in place, as a
+/// build says before the program is compiled.
+fn mirCommand(path: str, release: bool, library: bool, color: bool, threads: i64): i64 = {
+	var timings = Timings()
+	var loaded = match loadMode(path, .Program, &var timings, threads) {
+		.Ok(loaded) => move loaded
+		.Err(message) => {
+			io::eprintln("error: \(message)")
+			return 2
+		}
+	}
+	val checked = checkLoaded(&var loaded, &var timings)
+	for diagnostic in checked.diagnostics {
+		if diagnostic.isError() {
+			io::eprint(renderProgram(&checked.diagnostics, &loaded.sources, color))
+			return errors(&checked.diagnostics)
+		}
+	}
+	var program = move checked.program
+	program.dropsByCall = !release
+	val sources = &loaded.sources
+	io::print(
+		mir::dumpProgram(
+			&program,
+			&loaded.interner,
+			(at) => sources.locate(Span::at(at)),
+			release,
+			library,
+		),
+	)
+	io::eprint(renderProgram(&checked.diagnostics, &loaded.sources, color))
+	return errors(&checked.diagnostics)
+}
+
+/// `build`: the program, compiled and linked, or its LLVM IR.
+fn buildCommand(
+	path: str,
+	output: Option<str>,
+	options: &BuildOptions,
+	time: bool,
+	color: bool,
+	threads: i64,
+): i64 = {
+	// The IR is written before `clang` would be run.
+	val unique = Unique::new()
+	if options.emit != Emit::LlvmIr && !clangFound(&unique) then return 1
+	var timings = Timings()
+	var loaded = match loadMode(path, .Program, &var timings, threads) {
+		.Ok(loaded) => move loaded
+		.Err(message) => {
+			io::eprintln("error: \(message)")
+			return 2
+		}
+	}
+	// A package is built as what it calls itself, into its own root; a
+	// program of files, as its entry file, where the command is typed.
+	val written: String = match output {
+		.Some(given) => String::of(given)
+		.None => {
+			val named = isDirectory(path) || path::name(path) == "package.wip"
+			match loaded.packages[0].name {
+				.Some(name) if named => path::join(
+					loaded.packages[0].dir.toStr(),
+					defaultOutput(name.toStr(), options.emit.clone()).toStr(),
+				)
+				_ => defaultOutput(path::stem(path), options.emit.clone())
+			}
+		}
+	}
+	val result = buildLoaded(&var loaded, written.toStr(), &options, &unique, &var timings)
+	if time then io::eprint(timings.toString())
+	return match result {
+		.Ok(warnings) => {
+			io::eprint(renderProgram(&warnings, &loaded.sources, color))
+			errors(&warnings)
+		}
+		.Err(.Diagnostics(diagnostics)) => {
+			io::eprint(renderProgram(&diagnostics, &loaded.sources, color))
+			errors(&diagnostics)
+		}
+		.Err(.Link(message)) => {
+			io::eprintln("error: \(message)")
+			1
+		}
+	}
+}
+
+/// `run`: the program, built in a directory of its own and run with what
+/// followed its file, its exit code this command's.
+fn runCommand(path: str, options: &BuildOptions, args: &[str], color: bool, threads: i64): i64 = {
+	val unique = Unique::new()
+	if !clangFound(&unique) then return 1
+	var timings = Timings()
+	var loaded = match loadMode(path, .Program, &var timings, threads) {
+		.Ok(loaded) => move loaded
+		.Err(message) => {
+			io::eprintln("error: \(message)")
+			return 2
+		}
+	}
+	val dir = match TempDir::new(&unique) {
+		.Ok(dir) => move dir
+		.Err(message) => {
+			io::eprintln("error: \(message)")
+			return 1
+		}
+	}
+	val exe = dir.join("program")
+	match buildLoaded(&var loaded, exe.toStr(), &options, &unique, &var timings) {
+		.Ok(warnings) => {
+			io::eprint(renderProgram(&warnings, &loaded.sources, color))
+			if errors(&warnings) != 0 then return 1
+		}
+		.Err(.Diagnostics(diagnostics)) => {
+			io::eprint(renderProgram(&diagnostics, &loaded.sources, color))
+			return errors(&diagnostics)
+		}
+		.Err(.Link(message)) => {
+			io::eprintln("error: \(message)")
+			return 1
+		}
+	}
+	return match Command::of(exe.toStr()).args(&args).run() {
+		.Ok(.Code(code)) => code
+		.Ok(exit) => {
+			io::eprintln("error: the program was terminated: \(exit)")
+			1
+		}
+		.Err(error) => {
+			io::eprintln("error: cannot run the program: \(error)")
+			1
+		}
+	}
+}
+
+/// `test`: the program's tests, built in a directory of their own and run,
+/// in the package's root where the program is a package, so that the paths
+/// they name are its own wherever the command is typed; the runner's exit
+/// code is this command's.
+fn testCommand(
+	path: str,
+	options: &BuildOptions,
+	filter: Option<str>,
+	color: bool,
+	threads: i64,
+): i64 = {
+	val unique = Unique::new()
+	if !clangFound(&unique) then return 1
+	var timings = Timings()
+	var loaded = match loadMode(path, .Tests, &var timings, threads) {
+		.Ok(loaded) => move loaded
+		.Err(message) => {
+			io::eprintln("error: \(message)")
+			return 2
+		}
+	}
+	val dir = match TempDir::new(&unique) {
+		.Ok(dir) => move dir
+		.Err(message) => {
+			io::eprintln("error: \(message)")
+			return 1
+		}
+	}
+	val exe = dir.join("tests")
+	match buildTests(&var loaded, exe.toStr(), &options, filter, &unique, &var timings) {
+		.Ok((warnings, count)) => {
+			io::eprint(renderProgram(&warnings, &loaded.sources, color))
+			if errors(&warnings) != 0 then return 1
+			// Nothing to run is not a failure: a program may have no tests
+			// yet.
+			if count == 0 {
+				io::println("running 0 tests")
+				return 0
+			}
+		}
+		.Err(.Diagnostics(diagnostics)) => {
+			io::eprint(renderProgram(&diagnostics, &loaded.sources, color))
+			return errors(&diagnostics)
+		}
+		.Err(.Link(message)) => {
+			io::eprintln("error: \(message)")
+			return 1
+		}
+	}
+	val root = &loaded.packages[0]
+	var tests = Command::of(exe.toStr())
+	if root.name.isSome() && !root.dir.isEmpty() then tests = tests.directory(root.dir.toStr())
+	return match tests.run() {
+		.Ok(.Code(code)) => code
+		.Ok(exit) => {
+			io::eprintln("error: the tests were terminated: \(exit)")
+			1
+		}
+		.Err(error) => {
+			io::eprintln("error: cannot run the tests: \(error)")
+			1
+		}
+	}
+}
+
+/// `doc`: an item printed, where the target is a path of names rather than
+/// a file — looked up in the program here, or in the standard library where
+/// there is none — and otherwise the pages written.
+fn docCommand(target: Option<str>, output: Option<str>, std: bool, threads: i64): i64 = {
+	if target is .Some(item) && (item.contains("::") || !fs::exists(item)) {
+		val docs = match readForLookup(".", threads) {
+			.Ok(docs) => move docs
+			.Err(message) => {
+				io::eprintln("error: \(message)")
+				return 2
+			}
+		}
+		return match printItem(&docs, item) {
+			.Ok(text) => {
+				io::print(text.toStr())
+				0
+			}
+			.Err(message) => {
+				io::eprintln("error: \(message)")
+				1
+			}
+		}
+	}
+	val entry = match target {
+		.Some(entry) => entry
+		.None => "."
+	}
+	val docs = match if std then readDocs(.None, threads) else readDocs(.Some(entry), threads) {
+		.Ok(docs) => move docs
+		.Err(message) => {
+			io::eprintln("error: \(message)")
+			return 2
+		}
+	}
+	val dir = match output {
+		.Some(dir) => dir
+		.None => "doc"
+	}
+	return match writeSite(&docs, dir) {
+		.Ok(pages) => {
+			io::println("wrote \(pages) pages: \(path::join(dir, "index.html"))")
+			0
+		}
+		.Err(message) => {
+			io::eprintln("error: \(message)")
+			2
+		}
+	}
+}
+
+/// `bindgen`: the binding generator, a program in Wip the compiler carries,
+/// built the first time it is asked for and run with what it was given.
+fn bindgenCommand(args: &[str], color: bool, threads: i64): i64 = {
+	val unique = Unique::new()
+	val exe = match bindgen(color, &unique, threads) {
+		.Ok(exe) => move exe
+		.Err(message) => {
+			io::eprintln("error: \(message)")
+			return 1
+		}
+	}
+	return match Command::of(exe.toStr()).args(&args).run() {
+		.Ok(.Code(code)) => code
+		.Ok(exit) => {
+			io::eprintln("error: `wip bindgen` was terminated: \(exit)")
+			1
+		}
+		.Err(error) => {
+			io::eprintln("error: cannot run `wip bindgen`: \(error)")
+			1
+		}
+	}
+}
+
+/// `debug`: the debugger on `program`, with the scripts loaded, or, with
+/// `--scripts`, where the scripts are.
+fn debugCommand(
+	debugger: Option<str>,
+	listScripts: bool,
+	program: Option<str>,
+	args: &[str],
+): i64 = {
+	if listScripts {
+		if program.isSome() {
+			io::eprintln("error: `--scripts` says where the scripts are, and starts no program")
+			return 2
+		}
+		return match debuggerScripts() {
+			.Ok(scripts) => {
+				io::println("lldb: \(scripts.lldb)")
+				io::println("gdb: \(scripts.gdb)")
+				0
+			}
+			.Err(message) => {
+				io::eprintln("error: \(message)")
+				1
+			}
+		}
+	}
+	val .Some(program) = program else {
+		io::eprintln("error: `debug` takes the program to start, as `wip build` wrote it")
+		return 2
+	}
+	val chosen = match debugger {
+		.Some("lldb") => Debugger::Lldb
+		.Some("gdb") => Debugger::Gdb
+		.Some(other) => {
+			io::eprintln("error: `--debugger` is `lldb` or `gdb`, not `\(other)`")
+			return 2
+		}
+		.None => Debugger::native()
+	}
+	return match debug(chosen, program, &args) {
+		.Ok(code) => code
+		.Err(message) => {
+			io::eprintln("error: \(message)")
+			1
+		}
+	}
+}
+
+/// `cache clean`: what `wip` keeps in its cache removed, and how much that
+/// was said.
+fn cacheClean(): i64 = {
+	val cache = cacheDir()
+	return match cleanCache() {
+		.Ok(0) => {
+			io::println("nothing to remove in \(cache)")
+			0
+		}
+		.Ok(freed) => {
+			io::println("removed \(bytes(freed)) from \(cache)")
+			0
+		}
+		.Err(message) => {
+			io::eprintln("error: \(message)")
+			1
+		}
+	}
+}
+
+/// A number of bytes as a person reads it: `2.9 GB`, `412 KB`.
+fn bytes(count: i64): String = {
+	val units = ["KB", "MB", "GB", "TB"]
+	if count < 1000 then return "\(count) bytes"
+	var size = (count as f64) / 1000.0
+	var unit = 0
+	while size >= 1000.0 && unit + 1 < units.len() {
+		size /= 1000.0
+		unit += 1
+	}
+	return if size < 10.0 then "\(size, precision: 1) \(units[unit])"
+	else "\(size, precision: 0) \(units[unit])"
+}
+
+/// Whether there is a `clang` to build with, said before a program is read.
+fn clangFound(unique: &Unique): bool = match findClang(&unique) {
+	.Ok(..) => true
+	.Err(message) => {
+		io::eprintln("error: \(message)")
+		false
+	}
+}
+
+/// What a build writes when `-o` does not say: `board`, `board.ll`,
+/// `libboard.a`, `libboard.dylib`.
+fn defaultOutput(stem: str, emit: Emit): String = match emit {
+	.Program => String::of(stem)
+	.LlvmIr => "\(stem).ll"
+	.LlvmBc => "\(stem).bc"
+	.Static => "lib\(stem).a"
+	.Dynamic => if TARGET_OS == "macos" then "lib\(stem).dylib" else "lib\(stem).so"
+}
+
+/// One diagnostic, said once, as `check --target` found it: with the first
+/// target that reported it, whose sources it is drawn from, and every
+/// target that did.
+struct Found {
+	said: String
+	diagnostic: Diagnostic
+	first: i64
+	targets: Vec<String>
+}
+
+/// `check --target`: the program checked as each target compiles it, each
+/// diagnostic said once, with the targets that found it where not every
+/// one did.
+fn checkForTargets(path: str, names: &[str], color: bool, threads: i64): i64 = {
+	var targets: Vec<Target> = Vec()
+	for name in names {
+		match Target::parse(name) {
+			.Ok(parsed) => {
+				for target in parsed {
+					if !targets.contains(&target) then targets.push(target.clone())
+				}
+			}
+			.Err(message) => {
+				io::eprintln("error: \(message)")
+				return 2
+			}
+		}
+	}
+	var programs: Vec<Loaded> = Vec()
+	var found: Vec<Found> = Vec()
+	for (index, target) in targets.forwards().enumerate() {
+		var timings = Timings()
+		var loaded = match loadFor(path, .Package, target.clone(), &var timings, threads) {
+			.Ok(loaded) => move loaded
+			.Err(message) => {
+				io::eprintln("error: \(message)")
+				return 2
+			}
+		}
+		val checked = checkLoaded(&var loaded, &var timings)
+		for diagnostic in checked.diagnostics {
+			val one = Vec::of(own [diagnostic.clone()])
+			val said = renderProgram(&one, &loaded.sources, false)
+			var seen = false
+			for f in found {
+				if f.said == said {
+					f.targets.push(target.name())
+					seen = true
+					break
+				}
+			}
+			if !seen then
+				found.push(Found(
+					said: move said,
+					diagnostic: diagnostic.clone(),
+					first: index,
+					targets: Vec::of(own [target.name()]),
+				))
+		}
+		programs.push(move loaded)
+	}
+	var shown: Vec<Diagnostic> = Vec()
+	for f in found {
+		var diagnostic = f.diagnostic.clone()
+		if f.targets.len() < targets.len() then
+			diagnostic.notes.push("found when checking for \(f.targets.join(", "))")
+		val one = Vec::of(own [diagnostic.clone()])
+		io::eprint(renderProgram(&one, &programs[f.first].sources, color))
+		shown.push(move diagnostic)
+	}
+	return errors(&shown)
+}
+
+/// How a command that reports `diagnostics` ends: 0 where none is an
+/// error, and 1 after saying how many are.
+fn errors(diagnostics: &[Diagnostic]): i64 = {
+	var count = 0
+	for diagnostic in diagnostics {
+		if diagnostic.isError() then count += 1
+	}
+	if count == 0 then return 0
+	if count == 1 then io::eprintln("1 error") else io::eprintln("\(count) errors")
+	return 1
+}
+
+/// `fmt`: files laid out in place, or standard input to standard output.
+fn fmtCommand(
+	paths: &[str],
+	stdinPath: Option<str>,
+	check: bool,
+	layout: &Layout,
+	color: bool,
+): i64 = {
+	if layout.tabs && layout.spaces.isSome() {
+		io::eprintln("error: `--tabs` and `--spaces` cannot be used together")
+		return 2
+	}
+	var stdin = false
+	for p in paths {
+		if p == "-" then stdin = true
+	}
+	if stdin {
+		if paths.len() > 1 || check {
+			io::eprintln(
+				"error: `wip fmt -` formats standard input alone, and has nothing to check",
+			)
+			return 2
+		}
+		return formatStdin(stdinPath, &layout, color)
+	}
+	if stdinPath.isSome() {
+		io::eprintln(
+			"error: `--stdin-path` names the file standard input stands for, and needs `-`",
+		)
+		return 2
+	}
+	return formatFiles(&paths, check, &layout, color)
+}
+
+/// How `wip fmt` was asked to lay files out, over what their packages say.
+struct Layout {
+	width: Option<i64>
+	tabs: bool
+	spaces: Option<i64>
+}
+
+extend Layout {
+	/// The style for `file`: its package's `@format`, then the command line.
+	fn style(file: str): Result<Style, String> = {
+		var style = formatStyle(file)?
+		if self.width is .Some(width) then style.width = width
+		if self.tabs then style.tabs = true
+		if self.spaces is .Some(n) {
+			style.tabs = false
+			style.size = n
+		}
+		return .Ok(style)
+	}
+}
+
+/// `text`, of `file`, laid out; nothing when it cannot be, with why shown.
+/// A file that does not parse has its errors shown; one the formatter gets
+/// wrong is reported as its bug.
+fn formatText(file: str, text: str, layout: &Layout, color: bool): Option<String> = {
+	val style = match layout.style(file) {
+		.Ok(style) => style
+		.Err(message) => {
+			io::eprintln("error: \(message)")
+			return .None
+		}
+	}
+	val package = path::name(file) == "package.wip"
+	return match format(text, style, package) {
+		.Ok(formatted) => .Some(move formatted)
+		.Err(.Parse(diagnostics)) => {
+			io::eprint(renderAll(&diagnostics, file, text, color))
+			return .None
+		}
+		.Err(.Bug(message)) => {
+			io::eprintln("error: `\(file)` was left as it was, since `wip fmt` got it wrong: \(message). This is a bug in `wip fmt`.")
+			return .None
+		}
+	}
+}
+
+/// `wip fmt -`: standard input laid out to standard output, as
+/// `stdinPath`'s package says. What does not parse writes nothing, so an
+/// editor keeps its buffer as it was.
+fn formatStdin(stdinPath: Option<str>, layout: &Layout, color: bool): i64 = {
+	var text = String()
+	if io::stdin().readAll(&var text) is .Err(error) {
+		io::eprintln("error: cannot read standard input: \(error)")
+		return 1
+	}
+	// A file that asks to be left as written is given back as it came.
+	if switchedOff(text.toStr()) {
+		io::print(text.toStr())
+		return 0
+	}
+	val file = match stdinPath {
+		.Some(file) => file
+		.None => "<stdin>"
+	}
+	return match formatText(file, text.toStr(), &layout, color) {
+		.Some(formatted) => {
+			io::print(formatted.toStr())
+			return 0
+		}
+		.None => 1
+	}
+}
+
+/// `wip fmt`: each file laid out as its package says, or as the command
+/// line does. A file that cannot be is left alone, and so is one that asks
+/// to be, which is said rather than passed over.
+fn formatFiles(paths: &[str], check: bool, layout: &Layout, color: bool): i64 = {
+	var files: Vec<String> = Vec()
+	if paths.isEmpty() then wipFiles(".", &var files)
+	for root in paths {
+		if isDirectory(root) then wipFiles(root, &var files) else files.push(String::of(root))
+	}
+	files.sortBy((a, b) => comparePaths(a.toStr(), b.toStr()) < 0)
+	var changed = 0
+	var failed = 0
+	var left: Vec<str> = Vec()
+	for file in files {
+		val text = match fs::readFile(file.toStr()) {
+			.Ok(text) => move text
+			.Err(error) => {
+				io::eprintln("error: cannot read `\(file)`: \(error)")
+				failed += 1
+				continue
+			}
+		}
+		if switchedOff(text.toStr()) {
+			left.push(file.toStr())
+			continue
+		}
+		match formatText(file.toStr(), text.toStr(), &layout, color) {
+			.Some(formatted) => {
+				if formatted == text then continue
+				changed += 1
+				if check {
+					io::println(file.toStr())
+				} else if fs::writeFile(file.toStr(), formatted.toStr()) is .Err(error) {
+					io::eprintln("error: cannot write `\(file)`: \(error)")
+					failed += 1
+				}
+			}
+			.None => failed += 1
+		}
+	}
+	if left.len() == 1 then io::eprintln("`\(left[0])` is left as written: it says `\(OFF)`")
+	else if left.len() > 1 then
+		io::eprintln("\(left.len()) files are left as written: each says `\(OFF)`")
+	return if failed > 0 || (check && changed > 0) then 1 else 0
+}
+
+/// Every `.wip` file under `dir`, but not what is hidden or built.
+fn wipFiles(dir: str, out: &var Vec<String>) = {
+	val .Ok(entries) = fs::readDir(dir) else {
+		return
+	}
+	for entry in entries {
+		val name = entry.name.toStr()
+		if name.startsWith(".") || name == "target" then continue
+		val joined = path::join(dir, name)
+		if isDirectory(joined.toStr()) then wipFiles(joined.toStr(), &var out)
+		else if path::extension(name) == .Some("wip") then out.push(move joined)
+	}
+}
+
+/// How two paths are ordered: name by name, as Rust orders them, so that
+/// `a/b.wip` comes before `a-c/d.wip`. A `.` the path starts with
+/// comes before any name, and the `.`s and empty names inside it are not
+/// names.
+fn comparePaths(a: str, b: str): i64 = {
+	val left = components(a)
+	val right = components(b)
+	var i = 0
+	while i < left.len() && i < right.len() {
+		val (rankA, nameA) = left[i]
+		val (rankB, nameB) = right[i]
+		if rankA != rankB then return rankA - rankB
+		if nameA != nameB then return if nameA < nameB then -1 else 1
+		i += 1
+	}
+	return left.len() - right.len()
+}
+
+/// A path's parts, each with its kind first: 0 the root, 1 a leading `.`,
+/// 2 `..` and 3 a name.
+fn components(p: str): Vec<(i64, str)> = {
+	var parts: Vec<(i64, str)> = Vec()
+	if p.startsWith("/") then parts.push((0, "/"))
+	var first = true
+	for part in p.split("/") {
+		if part.isEmpty() then continue
+		if part == "." {
+			if first && !p.startsWith("/") then parts.push((1, "."))
+		} else if part == ".." {
+			parts.push((2, ".."))
+		} else {
+			parts.push((3, part))
+		}
+		first = false
+	}
+	return move parts
+}

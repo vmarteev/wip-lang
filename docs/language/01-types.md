@@ -560,7 +560,7 @@ struct Pool<T, K = T> {
 }
 
 extend Pool<T, K> {
-    var fn add(value: T): Tag<K> = {
+    var fn add(value: T): Tag<K> keeps value = {
         self.items.push(move value)
         return Tag(self.items.len())
     }

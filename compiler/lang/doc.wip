@@ -1,0 +1,695 @@
+// `wip doc`: a program's documentation, from what its source says of itself.
+// Each file is read on its own — its opening `//` paragraph, and its `pub`
+// items with the `///` lines above them — into the model here, which
+// `doc_html` writes as pages and `doc_text` prints one item of. Nothing is
+// type-checked: a declaration is shown as it was written.
+//
+// Its item and file are `DocItem` and `DocFile`: this module has the
+// renderer's `File` too, and files of it import the syntax tree's `Item`.
+
+import std::mem
+import syntax::{
+	Annotation,
+	Ast,
+	EnumDecl,
+	ExtendBlock,
+	ExternBlock,
+	FnDecl,
+	GenericParam,
+	ImportDecl,
+	InterfaceDecl,
+	Interner,
+	Item as AstItem,
+	Name,
+	Span,
+	StructDecl,
+	lex,
+	parse
+}
+
+/// Every module documented, the program's first, then its dependencies',
+/// then the standard library's.
+pub struct Docs {
+	pub modules: Vec<Module>
+}
+
+/// Whose a module is, which says where the index lists it.
+@derive(Eq, Clone)
+pub enum Group {
+	Program
+	Dependency
+	Std
+}
+
+/// One module: its path, `std::collections`, empty for a program's root,
+/// and its files in order.
+pub struct Module {
+	pub path: String
+	pub group: Group
+	pub files: Vec<DocFile>
+}
+
+/// One file of a module: its name, the `//` paragraph it begins with, and
+/// its `pub` items in order.
+pub struct DocFile {
+	pub name: String
+	pub about: String
+	pub var items: Vec<DocItem>
+	/// What the file imports by name, and from which module: how a name in
+	/// a declaration is found, for its link.
+	pub imports: Vec<(String, String)>
+}
+
+@derive(Eq, Clone)
+pub enum Kind {
+	Struct
+	Enum
+	Interface
+	Function
+	Constant
+	Alias
+	/// A type the language has, whose methods the prelude writes: `str`,
+	/// `i64`, `[T]`.
+	BuiltIn
+	/// A C type, function or variable a module binds.
+	C
+}
+
+/// A `pub` item: its declaration as written, its `///` lines, and, for a
+/// type, its fields or variants, its methods and what it implements.
+pub struct DocItem {
+	pub kind: Kind
+	pub name: String
+	pub decl: String
+	pub doc: String
+	pub members: Vec<Member> = Vec()
+	pub var methods: Vec<Methods> = Vec()
+	pub var implements: Vec<String> = Vec()
+}
+
+/// A field, a variant, a method or an interface's method.
+@derive(Clone)
+pub struct Member {
+	pub name: String
+	pub decl: String
+	pub doc: String
+}
+
+/// Methods from one place: the type's own body, or an `extend` block, whose
+/// header is kept where it says more than the type does — `extend Vec<T:
+/// Eq>`, methods only where `T` has `==`.
+pub struct Methods {
+	pub header: Option<String>
+	pub var methods: Vec<Member>
+}
+
+extend DocItem {
+	/// Whether the item has a page of its own: a type with methods.
+	pub fn hasPage(): bool = {
+		if !(self.kind is .Struct | .Enum | .BuiltIn) then return false
+		for group in self.methods {
+			if !group.methods.isEmpty() then return true
+		}
+		return false
+	}
+}
+
+extend Module {
+	/// How the module is named on its page: its path, or the program's root
+	/// module.
+	pub fn title(): str = if self.path.isEmpty() then "the program" else self.path.toStr()
+}
+
+/// The documentation of the program at `entry`, with its dependencies and
+/// the standard library; or of the standard library alone, where there is
+/// no entry.
+pub fn read(entry: Option<str>, threads: i64): Result<Docs, String> = {
+	var modules: Vec<Module> = Vec()
+	if entry is .Some(entry) {
+		var timings = Timings()
+		val loaded = loadMode(entry, .Program, &var timings, threads)?
+		for module in programModules(&loaded) {
+			modules.push(move module)
+		}
+	}
+	val home = findHome()?
+	for path in stdModules() {
+		val read = stdFiles(home.toStr(), path, Target::host())?
+		var files: Vec<(String, String)> = Vec()
+		for (name, text) in move read {
+			if !name.endsWith(".test.wip") then files.push((move name, move text))
+		}
+		modules.push(readModule(path, .Std, &files))
+	}
+	return .Ok(Docs(modules: move modules))
+}
+
+/// The program's modules and its dependencies', from what was loaded: the
+/// standard library's are read whole instead, above.
+fn programModules(loaded: &Loaded): Vec<Module> = {
+	var out: Vec<Module> = Vec()
+	for module in loaded.modules {
+		if module.path == "std" || module.path.startsWith("std::") then continue
+		// Each file's name and text, by where its items' spans lie.
+		var files: Vec<(String, String)> = Vec()
+		for parsed in module.files {
+			if parsed.ast.items.isEmpty() then continue
+			if loaded.sources.of(itemSpan(&parsed.ast.items[0])) is .Some((name, text, _)) then
+				files.push((String::of(name), String::of(text)))
+		}
+		// A dependency's modules are written from its name; the program's own
+		// from nothing.
+		val group = if module.prefix.isEmpty() then Group::Program else Group::Dependency
+		out.push(readModule(module.path.toStr(), group, &files))
+	}
+	return move out
+}
+
+/// A module's files read, and the methods of each type gathered from every
+/// file onto the type.
+fn readModule(path: str, group: Group, files: &[(String, String)]): Module = {
+	var docFiles: Vec<DocFile> = Vec()
+	var extensions: Vec<(i64, Extension)> = Vec()
+	for (name, text) in files {
+		val (file, extended) = readFile(name.toStr(), text.toStr())
+		val at = docFiles.len()
+		docFiles.push(move file)
+		for extension in move extended {
+			extensions.push((at, move extension))
+		}
+	}
+	// An `extend` block's methods go to the type wherever it is declared in
+	// the module; one for a type the module does not declare is a built-in
+	// type's, which the prelude extends, and has an item made for it in the
+	// file of its first block.
+	for (at, extension) in move extensions {
+		var found: Option<(i64, i64)> = .None
+		for (f, file) in docFiles.forwards().enumerate() {
+			for (i, item) in file.items.forwards().enumerate() {
+				if found.isNone() && item.name == extension.target && isType(item.kind.clone()) then
+					found = .Some((f, i))
+			}
+		}
+		val (f, i) = match found {
+			.Some(place) => place
+			.None if extension.declaredHere => continue
+			.None => {
+				// An interface implemented for a type of another module's, as a
+				// built-in one may be: listed with the built-in type in the
+				// prelude, not here.
+				if extension.implemented.isSome() &&
+					extension.methods.isEmpty() &&
+					path != "std::prelude" {
+					continue
+				}
+				docFiles[at].items.push(DocItem(
+					kind: .BuiltIn,
+					name: extension.target.clone(),
+					decl: "built-in type \(extension.target)",
+					doc: String(),
+				))
+				(at, docFiles[at].items.len() - 1)
+			}
+		}
+		if extension.implemented is .Some(implemented) {
+			if !docFiles[f].items[i].implements.contains(&implemented) then
+				docFiles[f].items[i].implements.push(implemented.clone())
+			continue
+		}
+		if extension.methods.isEmpty() then continue
+		docFiles[f].items[i].methods.push(Methods(
+			header: extension.header.clone(),
+			methods: extension.methods.clone(),
+		))
+	}
+	// A type's own methods first, then those of blocks that ask more of its
+	// parameters, each kind in the order the files have them. Blocks with
+	// the same header are one group, wherever they are.
+	for file in docFiles {
+		for item in file.items {
+			var merged: Vec<Methods> = Vec()
+			for group in mem::replace(&var item.methods, Vec()) {
+				var same = false
+				for m in merged {
+					if m.header == group.header {
+						for method in group.methods {
+							m.methods.push(method.clone())
+						}
+						same = true
+						break
+					}
+				}
+				if !same then merged.push(move group)
+			}
+			merged.sortByKey((group) => group.header.isSome())
+			item.methods = move merged
+		}
+	}
+	return Module(path: String::of(path), group: move group, files: move docFiles)
+}
+
+fn isType(kind: Kind): bool = kind is .Struct | .Enum | .BuiltIn | .C
+
+/// What an `extend` block adds to a type: the type's name as an item is
+/// named, the interface it implements if it does, its `pub` methods, and its
+/// header where it constrains the type's parameters.
+struct Extension {
+	target: String
+	implemented: Option<String>
+	methods: Vec<Member>
+	header: Option<String>
+	/// Whether the module declares a type of that name, so that a block for
+	/// a type not found is not a built-in's.
+	declaredHere: bool
+}
+
+/// One file read on its own: its paragraph, its items, and its `extend`
+/// blocks, which the module gives to their types.
+fn readFile(name: str, text: str): (DocFile, Vec<Extension>) = {
+	var interner = Interner::new()
+	val lexed = lex(text, &var interner)
+	val parsed = parse(text, &lexed)
+	val reader = Reader(text: text, ast: &parsed.ast, interner: &interner)
+	var items: Vec<DocItem> = Vec()
+	var extensions: Vec<Extension> = Vec()
+	for item in parsed.ast.items {
+		match item {
+			.Extend(block) => extensions.push(reader.extension(&block))
+			_ => {
+				for one in reader.item(&item) {
+					items.push(move one)
+				}
+			}
+		}
+	}
+	for extension in extensions {
+		var declared = false
+		for item in items {
+			if item.name == extension.target then declared = true
+		}
+		extension.declaredHere = declared
+	}
+	var imports: Vec<(String, String)> = Vec()
+	for item in parsed.ast.items {
+		if item is .Import(decl) {
+			for one in reader.imports(&decl) {
+				imports.push(move one)
+			}
+		}
+	}
+	val file = DocFile(
+		name: String::of(name),
+		about: fileParagraph(text),
+		items: move items,
+		imports: move imports,
+	)
+	return (move file, move extensions)
+}
+
+/// The `//` lines a file begins with, which say what it is for: the
+/// paragraph that opens every file of the standard library. A blank comment
+/// line parts paragraphs, as a blank `///` line does.
+pub fn fileParagraph(text: str): String = {
+	var lines: Vec<str> = Vec()
+	for line in text.lines() {
+		val .Some(rest) = trimStartSpace(line).stripPrefix("//") else {
+			break
+		}
+		if rest.startsWith("/") then break
+		lines.push(
+			match rest.stripPrefix(" ") {
+				.Some(after) => after
+				.None => rest
+			},
+		)
+	}
+	return lines.join("\n")
+}
+
+/// `text` without the white space it begins with, as Unicode counts it.
+fn trimStartSpace(text: str): str = {
+	var start = 0
+	while start < text.len() {
+		val (c, width) = text.charAt(start)
+		if !c.isWhitespace() then break
+		start += width
+	}
+	return text[start..text.len()]
+}
+
+/// `text` without the white space at either end, as Unicode counts it.
+fn trimSpace(text: str): str = trimEndSpace(trimStartSpace(text))
+
+/// What reads one file's items: its text, its syntax tree and the names in
+/// it.
+view struct Reader {
+	text: str
+	ast: &Ast
+	interner: &Interner
+}
+
+extend Reader {
+	fn name(name: Name): String = String::of(self.interner.resolve(name.sym))
+
+	fn source(lo: u32, hi: u32): str = self.text[lo as i64..hi as i64]
+
+	/// The `///` lines above a declaration that starts at `at`.
+	fn doc(at: u32): String = documentation(self.text, at as i64)
+
+	/// Where a declaration begins: its first annotation, or itself.
+	static fn start(annotations: &[Annotation], span: Span): u32 =
+		if annotations.isEmpty() then span.lo else annotations[0].span.lo
+
+	/// Text as a declaration line: white space run together, `pub` left out,
+	/// since everything shown is.
+	static fn line(text: str): String = {
+		var line = String()
+		for word in text.splitWhitespace() {
+			if !line.isEmpty() then line.push(" ")
+			line.push(word)
+		}
+		// A list written a line an element ends with a comma, which a line
+		// of its own has no use for.
+		line = line.replace("( ", "(").
+			replace(" )", ")").
+			replace(",)", ")").
+			replace(", >", ">").
+			replace(",>", ">")
+		return match line.toStr().stripPrefix("pub ") {
+			.Some(rest) => String::of(rest)
+			.None => move line
+		}
+	}
+
+	fn item(item: &AstItem): Vec<DocItem> = match item {
+		.Fn(f) if f.isPub => Vec::of(own [
+			DocItem(
+				kind: .Function,
+				name: self.name(f.sig.name),
+				decl: self.fnDecl(&f),
+				doc: self.doc(f.span.lo),
+			),
+		])
+		.Struct(s) if s.isPub => Vec::of(own [self.structItem(&s, .Struct)])
+		.Enum(e) if e.isPub => Vec::of(own [self.enumItem(&e)])
+		.Interface(i) if i.isPub => Vec::of(own [self.interfaceItem(&i)])
+		.Val(v) if v.isPub => {
+			val decl = match v.ty {
+				.Some(ty) =>
+					"val \(self.name(v.name)): \(self.source(self.ast.types[ty].span.lo, self.ast.types[ty].span.hi))"
+				.None => "val \(self.name(v.name))"
+			}
+			Vec::of(own [
+				DocItem(
+					kind: .Constant,
+					name: self.name(v.name),
+					decl: move decl,
+					doc: self.doc(Reader::start(&v.annotations, v.span)),
+				),
+			])
+		}
+		.Type(t) if t.isPub => Vec::of(own [
+			DocItem(
+				kind: .Alias,
+				name: self.name(t.name),
+				decl: Reader::line(self.source(t.span.lo, t.span.hi)),
+				doc: self.doc(t.span.lo),
+			),
+		])
+		.Extern(block) => self.externItems(&block)
+		_ => Vec()
+	}
+
+	/// A function's declaration: from its annotations or its first word to
+	/// the end of its signature, `= …` and the body left out.
+	fn fnDecl(f: &FnDecl): String = self.withAnnotations(
+		&f.annotations,
+		Reader::line(self.source(f.span.lo, f.sig.span.hi)).toStr(),
+	)
+
+	/// A declaration's head with its annotations before it, as `annotations`
+	/// shows them, in place of those the head was written with.
+	fn withAnnotations(annotations: &[Annotation], head: str): String = {
+		val shown = self.annotations(&annotations)
+		val bare = trimSpace(
+			match head.stripPrefix(trimSpace(shown.toStr())) {
+				.Some(rest) => rest
+				.None => head
+			},
+		)
+		return if shown.isEmpty() then String::of(bare) else "\(shown) \(bare)"
+	}
+
+	/// The annotations a declaration carries, as written, but for the
+	/// compiler's own: `@intrinsic` says how the compiler writes the body,
+	/// which a reader of the documentation has no use for.
+	fn annotations(annotations: &[Annotation]): String = {
+		var shown: Vec<String> = Vec()
+		for a in annotations {
+			if self.name(a.name) != "intrinsic" then
+				shown.push(Reader::line(self.source(a.span.lo, a.span.hi)))
+		}
+		return shown.join(" ")
+	}
+
+	fn methods(methods: &[FnDecl]): Vec<Member> = {
+		var out: Vec<Member> = Vec()
+		for m in methods {
+			if m.isPub then
+				out.push(Member(
+					name: self.name(m.sig.name),
+					decl: self.fnDecl(&m),
+					doc: self.doc(m.span.lo),
+				))
+		}
+		return move out
+	}
+
+	/// A type's header: `struct Pair<A, B>`, its annotations before it.
+	fn typeHeader(
+		annotations: &[Annotation],
+		lo: u32,
+		nameHi: u32,
+		generics: &[GenericParam],
+	): String = {
+		var hi = nameHi
+		if !generics.isEmpty() {
+			// The `>` after the last parameter.
+			val last = generics[generics.len() - 1].span.hi
+			val after = self.text[last as i64..self.text.len()]
+			hi =
+				last +
+					match after.find(">") {
+						.Some(i) => (i + 1) as u32
+						.None => 0
+					}
+		}
+		return self.withAnnotations(&annotations, Reader::line(self.source(lo, hi)).toStr())
+	}
+
+	fn structItem(s: &StructDecl, kind: Kind): DocItem = {
+		val lo = Reader::start(&s.annotations, s.span)
+		var members: Vec<Member> = Vec()
+		for f in s.fields {
+			if f.isPub || s.isExtern then
+				members.push(Member(
+					name: self.name(f.name),
+					decl: Reader::line(self.source(f.span.lo, f.span.hi)),
+					doc: self.doc(f.span.lo),
+				))
+		}
+		return DocItem(
+			kind: move kind,
+			name: self.name(s.name),
+			decl: self.typeHeader(&s.annotations, s.span.lo, s.name.span.hi, &s.generics),
+			doc: self.doc(lo),
+			members: move members,
+			methods: ownMethods(self.methods(&s.methods)),
+			implements: self.derived(&s.annotations),
+		)
+	}
+
+	fn enumItem(e: &EnumDecl): DocItem = {
+		val lo = Reader::start(&e.annotations, e.span)
+		var members: Vec<Member> = Vec()
+		for v in e.variants {
+			members.push(Member(
+				name: self.name(v.name),
+				decl: Reader::line(self.source(v.span.lo, v.span.hi)),
+				doc: self.doc(v.span.lo),
+			))
+		}
+		return DocItem(
+			kind: .Enum,
+			name: self.name(e.name),
+			decl: self.typeHeader(&e.annotations, e.span.lo, e.name.span.hi, &e.generics),
+			doc: self.doc(lo),
+			members: move members,
+			methods: ownMethods(self.methods(&e.methods)),
+			implements: self.derived(&e.annotations),
+		)
+	}
+
+	/// The interfaces `@derive` writes for a type.
+	fn derived(annotations: &[Annotation]): Vec<String> = {
+		var out: Vec<String> = Vec()
+		for a in annotations {
+			if self.name(a.name) != "derive" then continue
+			for arg in a.args {
+				out.push(Reader::line(self.source(arg.span.lo, arg.span.hi)))
+			}
+		}
+		return move out
+	}
+
+	fn interfaceItem(i: &InterfaceDecl): DocItem = {
+		val lo = Reader::start(&i.annotations, i.span)
+		var members: Vec<Member> = Vec()
+		for m in i.methods {
+			members.push(Member(
+				name: self.name(m.sig.name),
+				decl: Reader::line(self.source(m.span.lo, m.sig.span.hi)),
+				doc: self.doc(m.span.lo),
+			))
+		}
+		return DocItem(
+			kind: .Interface,
+			name: self.name(i.name),
+			decl: self.typeHeader(&i.annotations, i.span.lo, i.name.span.hi, &i.generics),
+			doc: self.doc(lo),
+			members: move members,
+		)
+	}
+
+	/// A C block's `pub` types, functions, variables and structs.
+	fn externItems(block: &ExternBlock): Vec<DocItem> = {
+		var items: Vec<DocItem> = Vec()
+		for t in block.types {
+			if !t.isPub then continue
+			val lo = Reader::start(&t.annotations, t.name.span)
+			items.push(DocItem(
+				kind: .C,
+				name: self.name(t.name),
+				decl: "type \(self.name(t.name))",
+				doc: self.doc(lo),
+			))
+		}
+		for s in block.structs {
+			if s.isPub then items.push(self.structItem(&s, .C))
+		}
+		for f in block.fns {
+			if !f.isPub then continue
+			val lo = Reader::start(&f.annotations, f.sig.span)
+			items.push(DocItem(
+				kind: .C,
+				name: self.name(f.sig.name),
+				decl: Reader::line(self.source(f.sig.span.lo, f.sig.span.hi)),
+				doc: self.doc(lo),
+			))
+		}
+		for g in block.globals {
+			if !g.isPub then continue
+			val lo = Reader::start(&g.annotations, g.span)
+			items.push(DocItem(
+				kind: .C,
+				name: self.name(g.name),
+				decl: Reader::line(self.source(g.span.lo, g.span.hi)),
+				doc: self.doc(lo),
+			))
+		}
+		return move items
+	}
+
+	/// The names an import brings in, each with its module: `import
+	/// std::collections::{Map, Set}`.
+	fn imports(decl: &ImportDecl): Vec<(String, String)> = {
+		var path: Vec<String> = Vec()
+		for n in decl.path {
+			path.push(self.name(n))
+		}
+		val module = path.join("::")
+		var out: Vec<(String, String)> = Vec()
+		if decl.items is .Some(items) {
+			for item in items {
+				if item.name is .Some(n) then out.push((self.name(n), module.clone()))
+			}
+		}
+		return move out
+	}
+
+	/// The interface an `extend` block implements, if it does, as the block
+	/// names it: another module's as `shapes::Area`, and with what it takes.
+	fn implemented(block: &ExtendBlock): Option<String> = {
+		val .Some(name) = block.interfaceName else {
+			return .None
+		}
+		val args = match block.interfaceArgs {
+			.Some(a) => Reader::line(self.source(a.span.lo, a.span.hi))
+			.None => String()
+		}
+		var path: Vec<String> = Vec()
+		for m in block.interfaceModule {
+			path.push(self.name(m))
+		}
+		path.push(self.name(name))
+		return .Some("\(path.join("::"))\(args)")
+	}
+
+	fn extension(block: &ExtendBlock): Extension = {
+		val target = match block.sliceOf {
+			.Some(elem) => "[\(self.name(elem))]"
+			.None =>
+				if block.path.isEmpty() then String()
+				else self.name(block.path[block.path.len() - 1])
+		}
+		val implemented = self.implemented(&block)
+		// The header says more than the type where it constrains a parameter:
+		// `extend Vec<T: Eq>`.
+		var constrains = false
+		for g in block.generics {
+			if !g.bounds.isEmpty() then constrains = true
+		}
+		var header: Option<String> = .None
+		if constrains {
+			val lo = block.span.lo
+			val open = match self.text[lo as i64..self.text.len()].find("{") {
+				.Some(i) => lo + i as u32
+				.None => block.span.hi
+			}
+			header = .Some(Reader::line(self.source(lo, open)))
+		}
+		return Extension(
+			target: move target,
+			methods: if implemented.isSome() then Vec() else self.methods(&block.methods),
+			implemented: move implemented,
+			header: move header,
+			declaredHere: false,
+		)
+	}
+}
+
+/// The methods a type's own body declares, as the one group they are.
+fn ownMethods(methods: Vec<Member>): Vec<Methods> =
+	if methods.isEmpty() then Vec()
+	else Vec::of(own [Methods(header: .None, methods: move methods)])
+
+/// Where an item's text begins, to find the file it was read from.
+fn itemSpan(item: &AstItem): Span = match item {
+	.Import(i) => i.span
+	.Val(v) => v.span
+	.Struct(s) => s.span
+	.Enum(e) => e.span
+	.Fn(f) => f.span
+	.Extern(e) => e.span
+	.Extend(e) => e.span
+	.Interface(i) => i.span
+	.Type(t) => t.span
+	.Assert(a) => a.span
+}
+
+/// The program at `entry`, read for one item: what a program at the current
+/// directory would be, or the standard library alone where there is none.
+pub fn readForLookup(entry: str, threads: i64): Result<Docs, String> = {
+	if read(.Some(entry), threads) is .Ok(docs) then return .Ok(move docs)
+	return read(.None, threads)
+}

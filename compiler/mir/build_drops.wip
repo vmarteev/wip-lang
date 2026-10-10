@@ -1,0 +1,786 @@
+// Unwinding and drops: the cleanups of scopes and temporaries, drops
+// elaborated into statements, and drop functions.
+
+import hir as hir
+import hir::{BOOL, ExprId, ExprKind, I32, I64, LocalId, PTR_U8, Ty, TyKind, UNIT}
+import syntax::{BinaryOp}
+
+/// A part of a value that needs dropping, and the projection that reaches it.
+type DropPart = (Projection, Ty)
+
+extend Builder {
+	/// The fields of a struct, or the elements of an array, that need
+	/// dropping, in declaration order.
+	var fn parts(ty: Ty): Vec<DropPart> = {
+		val program = self.program
+		var all: Vec<DropPart> = Vec()
+		match self.kind(ty) {
+			.Struct(..) => {
+				val fields = program.fieldTys(ty)
+				for (i, field) in fields.forwards().enumerate() {
+					all.push((.Field(i as u32), field))
+				}
+			}
+			.Array(elem, len) => {
+				for i in 0..len {
+					all.push((.ConstIndex(i), elem))
+				}
+			}
+			_ => {}
+		}
+		var parts: Vec<DropPart> = Vec()
+		for (projection, part) in move all {
+			if self.needsDrop(part) then parts.push((move projection, part))
+		}
+		return move parts
+	}
+
+	/// The fields of each variant of an enum that need dropping, in
+	/// declaration order.
+	var fn variantParts(ty: Ty): Vec<Vec<DropPart>> = {
+		var variants: Vec<Vec<DropPart>> = Vec()
+		val tys = self.program.variantFieldTys(ty)
+		for (v, fields) in tys.forwards().enumerate() {
+			var parts: Vec<DropPart> = Vec()
+			for (i, field) in fields.forwards().enumerate() {
+				if self.needsDrop(field) then
+					parts.push((.VariantField(variant: v as u32, field: i as u32), field))
+			}
+			variants.push(move parts)
+		}
+		return move variants
+	}
+
+	/// Drops the value at `place`: fields and elements in reverse order, an
+	/// enum's payload by a switch on its variant, and an `own` by freeing what
+	/// it points to, after which the pointer is zeroed.
+	var fn dropPlace(place: &Place, ty: Ty) = {
+		val inPlace = self.droppingInPlace
+		self.droppingInPlace = false
+		if !self.needsDrop(ty) then return
+		// A value moved away is never dropped; a build that checks moves says
+		// so where it would be.
+		if self.checkMoves && self.poisons(ty) then
+			self.push(.CheckMoved(place: place.clone(), at: self.dropAt))
+		// A generator drops what it holds where it stopped, which only its
+		// `next` knows.
+		if self.kind(ty) is .Struct(id, ..) && self.program.structs[id].generator.isSome() {
+			self.dropGenerator(&place, ty)
+			return
+		}
+		// A debug build writes a type's drop once, in the function that drops
+		// it where it lies, and calls that.
+		if self.dropsByCall && !inPlace && self.kind(ty) is .Struct(..) | .Enum(..) | .Array(..) {
+			self.push(.DropInPlace(ty: ty, place: place.clone()))
+			return
+		}
+		self.callDrop(&place, ty)
+		match self.kind(ty) {
+			// A block of slots frees itself and nothing else: it does not know
+			// which slots hold values.
+			.Slots(..) => {
+				val pointer = self.value(PTR_U8, .Use(.Copy(place.project(.Field(0)))))
+				val notNull = self.value(BOOL, .Binary(
+					op: .Ne,
+					lhs: pointer.clone(),
+					rhs: Builder::int(0, PTR_U8),
+				))
+				val free = self.newBlock()
+				val next = self.newBlock()
+				self.terminate(.Branch(cond: move notNull, thenBlock: free, otherwise: next))
+				self.switchTo(free)
+				self.push(.Free(move pointer))
+				self.terminate(.Goto(next))
+				self.switchTo(next)
+				self.push(.Zero(place.clone()))
+			}
+			.Own(inner) => {
+				if self.kind(inner) is .Slice(elem) {
+					self.dropBuffer(&place, elem)
+					return
+				}
+				// An owned closure's type says nothing about which lambda made
+				// it, so its environment carries its drop function.
+				if self.kind(inner) is .Fn(..) {
+					self.dropClosure(&place)
+					return
+				}
+				val ptr = self.value(ty, .Use(.Copy(place.clone())))
+				self.dropOwned(move ptr, ty, inner)
+				self.push(.Zero(place.clone()))
+			}
+			.Struct(..) | .Array(..) => {
+				val parts = self.parts(ty)
+				for (projection, part) in parts.backwards() {
+					val reached = place.project(projection)
+					self.dropPlace(&reached, part)
+				}
+			}
+			// The fields of whichever variant the value holds.
+			.Enum(..) => {
+				val variants = self.variantParts(ty)
+				val variant = self.value(I32, .Variant(place.clone()))
+				val done = self.newBlock()
+				var cases: Vec<(u32, BlockId)> = Vec()
+				for (v, parts) in variants.forwards().enumerate() {
+					if !parts.isEmpty() then cases.push((v as u32, self.newBlock()))
+				}
+				self.terminate(.Switch(value: move variant, cases: cases.clone(), otherwise: done))
+				for (v, block) in cases {
+					self.switchTo(block)
+					for (projection, part) in variants[v as i64].backwards() {
+						val reached = place.project(projection)
+						self.dropPlace(&reached, part)
+					}
+					self.terminate(.Goto(done))
+				}
+				self.switchTo(done)
+			}
+			_ => {}
+		}
+	}
+
+	/// Drops a buffer: its elements, last first, then its allocation. A
+	/// moved-out buffer holds a null pointer and no elements.
+	var fn dropBuffer(place: &Place, elem: Ty) = {
+		if self.needsDrop(elem) {
+			val i = self.temp(I64)
+			self.assign(Place::of(i), .Use(.Copy(place.project(.Field(1)))))
+			val header = self.newBlock()
+			val body = self.newBlock()
+			val exit = self.newBlock()
+			self.terminate(.Goto(header))
+			self.switchTo(header)
+			val done = self.value(BOOL, .Binary(
+				op: .Le,
+				lhs: .Copy(Place::of(i)),
+				rhs: Builder::int(0, I64),
+			))
+			self.terminate(.Branch(cond: move done, thenBlock: exit, otherwise: body))
+			self.switchTo(body)
+			val previous = self.value(I64, .Binary(
+				op: .Sub,
+				lhs: .Copy(Place::of(i)),
+				rhs: Builder::int(1, I64),
+			))
+			self.assign(Place::of(i), .Use(move previous))
+			// Out of line: the element may hold a buffer of its own type.
+			self.push(.DropInPlace(ty: elem, place: place.project(.Index(i))))
+			self.terminate(.Goto(header))
+			self.switchTo(exit)
+		}
+		val ptr = self.value(PTR_U8, .Use(.Copy(place.project(.Field(0)))))
+		val notNull = self.value(BOOL, .Binary(
+			op: .Ne,
+			lhs: ptr.clone(),
+			rhs: Builder::int(0, PTR_U8),
+		))
+		val free = self.newBlock()
+		val next = self.newBlock()
+		self.terminate(.Branch(cond: move notNull, thenBlock: free, otherwise: next))
+		self.switchTo(free)
+		self.push(.Free(move ptr))
+		self.terminate(.Goto(next))
+		self.switchTo(next)
+		self.push(.Zero(place.clone()))
+	}
+
+	/// Drops an owned closure: the first word of the pair is its environment,
+	/// whose first word is the drop function of that environment's type, which
+	/// drops what was captured and frees it. A closure that was moved out of
+	/// holds a null environment.
+	var fn dropClosure(place: &Place) = {
+		val env = self.value(PTR_U8, .Use(.Copy(place.project(.Field(0)))))
+		val notNull = self.value(BOOL, .Binary(
+			op: .Ne,
+			lhs: env.clone(),
+			rhs: Builder::int(0, PTR_U8),
+		))
+		val drop = self.newBlock()
+		val next = self.newBlock()
+		self.terminate(.Branch(cond: move notNull, thenBlock: drop, otherwise: next))
+		self.switchTo(drop)
+		val ty = self.dropFnTy()
+		val code = self.value(ty, .VTableFn(table: env.clone(), index: 0, methods: false))
+		self.push(.Call(callee: .Value(move code), args: Vec::of(own [move env]), dest: .None))
+		self.terminate(.Goto(next))
+		self.switchTo(next)
+		self.push(.Zero(place.clone()))
+	}
+
+	/// The type of a drop function, `(ptr<u8>) => void`: an owned closure's
+	/// environment holds one, so it is interned wherever one is created.
+	fn dropFnTy(): Ty = {
+		val types = &self.program.types
+		val .Some(list) = types.findList([PTR_U8]) else {
+			panic("an owned closure's environment holds a drop function")
+		}
+		val .Some(ty) = types.find(.Fn(params: list, ret: UNIT)) else {
+			panic("an owned closure's environment holds a drop function")
+		}
+		return ty
+	}
+
+	/// Frees the allocation `ptr` points to, after dropping what it holds. A
+	/// null pointer, from a place that was moved out of, is skipped.
+	var fn dropOwned(ptr: Operand, pointerTy: Ty, pointee: Ty) = {
+		if self.needsDrop(pointee) {
+			// Out of line, since the pointee may hold an `own` of its own type.
+			// The drop function skips null and frees.
+			self.push(.DropFn(ty: pointee, ptr: move ptr))
+			return
+		}
+		val notNull = self.value(BOOL, .Binary(
+			op: .Ne,
+			lhs: ptr.clone(),
+			rhs: Builder::int(0, pointerTy),
+		))
+		val free = self.newBlock()
+		val next = self.newBlock()
+		self.terminate(.Branch(cond: move notNull, thenBlock: free, otherwise: next))
+		self.switchTo(free)
+		self.push(.Free(move ptr))
+		self.terminate(.Goto(next))
+		self.switchTo(next)
+	}
+
+	/// Drops what an assignment replaces. A whole local that was moved away
+	/// holds nothing to drop, which its flag says: without looking, the zeroes
+	/// a move leaves were dropped as a value — a `destroy` run on nothing.
+	var fn dropReplaced(place: ExprId, dest: &Place, ty: Ty) = {
+		self.dropAt = self.hir.exprs[place].span
+		val flag: Option<Local> = match self.hir.exprs[place].kind {
+			.Local(local) => match self.flags.get(&local) {
+				.Some(flag) => .Some(flag)
+				.None => .None
+			}
+			.Field(..) => self.fieldFlagOf(place)
+			_ => match self.referentOf(place) {
+				.Some(reference) => match self.referentFlags.get(&reference) {
+					.Some(flag) => .Some(flag)
+					.None => .None
+				}
+				.None => .None
+			}
+		}
+		if flag is .Some(flag) {
+			val live = Operand::Copy(Place::of(flag))
+			val drop = self.newBlock()
+			val next = self.newBlock()
+			self.terminate(.Branch(cond: move live, thenBlock: drop, otherwise: next))
+			self.switchTo(drop)
+			self.dropPlace(&dest, ty)
+			self.terminate(.Goto(next))
+			self.switchTo(next)
+			return
+		}
+		// A field with a field moved out of it holds only what is left.
+		if self.fieldOfLocal(place) is .Some((local, path)) {
+			self.dropRemainsAt(local, &path, &dest, ty)
+			return
+		}
+		self.dropPlace(&dest, ty)
+	}
+
+	/// The flag of a field `place` is: of a local's field, or else of a field
+	/// of what a reference refers to.
+	fn fieldFlagOf(place: ExprId): Option<Local> = {
+		if self.fieldOfLocal(place) is .Some(field) && self.fieldFlags.get(&field) is .Some(flag) {
+			return .Some(flag)
+		}
+		if self.fieldOfReferent(place) is .Some(field) &&
+			self.referentFieldFlags.get(&field) is .Some(flag) {
+			return .Some(flag)
+		}
+		return .None
+	}
+
+	var fn dropLocal(local: LocalId) = {
+		val ty = self.hir.locals[local].ty
+		if !self.needsDrop(ty) then return
+		self.dropAt = self.hir.locals[local].span
+		val variable = match self.vars.get(&local) {
+			.Some(found) => found.clone()
+			.None => return
+		}
+		// A local that was moved somewhere may hold nothing by now. An `own`
+		// says so itself, with a null pointer; anything else — a type that
+		// cleans up after itself, and holds no `own` — needs a flag.
+		val flag = match self.flags.get(&local) {
+			.Some(found) => found.clone()
+			.None => {
+				val reached = Place::of(variable)
+				self.dropRemains(local, &reached, ty)
+				return
+			}
+		}
+		val live = Operand::Copy(Place::of(flag))
+		val drop = self.newBlock()
+		val next = self.newBlock()
+		self.terminate(.Branch(cond: move live, thenBlock: drop, otherwise: next))
+		self.switchTo(drop)
+		val reached = Place::of(variable)
+		self.dropRemains(local, &reached, ty)
+		self.terminate(.Goto(next))
+		self.switchTo(next)
+	}
+
+	/// Drops a local, or, where the body moves fields out of it, what is left
+	/// of it: each field moved out only where its flag says it is still there.
+	/// Without this, the zeroes a move leaves were dropped as a value — a
+	/// `destroy` run on nothing.
+	var fn dropRemains(local: LocalId, place: &Place, ty: Ty) = {
+		val root: Vec<u32> = Vec()
+		self.dropRemainsAt(local, &root, &place, ty)
+	}
+
+	/// What is left of the part of a local at `prefix`, a path of field
+	/// indices: a field moved out is dropped where its flag says it is still
+	/// there, and one with a field moved out of it is taken apart in turn.
+	var fn dropRemainsAt(local: LocalId, prefix: &[u32], place: &Place, ty: Ty) = {
+		val moved = self.movedFields(local)
+		if !below(&moved, &prefix) {
+			self.dropPlace(&place, ty)
+			return
+		}
+		val parts = self.parts(ty)
+		for (projection, part) in parts.backwards() {
+			val .Field(index) = projection else {
+				val reached = place.project(projection)
+				self.dropPlace(&reached, part)
+				continue
+			}
+			var path = prefix.toVec()
+			path.push(index)
+			val partPlace = place.project(projection)
+			val key = (local, path.clone())
+			if self.fieldFlags.get(&key) is .Some(flag) {
+				val live = Operand::Copy(Place::of(flag))
+				val drop = self.newBlock()
+				val next = self.newBlock()
+				self.terminate(.Branch(cond: move live, thenBlock: drop, otherwise: next))
+				self.switchTo(drop)
+				self.dropPlace(&partPlace, part)
+				self.terminate(.Goto(next))
+				self.switchTo(next)
+			} else if below(&moved, &path) {
+				self.dropRemainsAt(local, &path, &partPlace, part)
+			} else {
+				self.dropPlace(&partPlace, part)
+			}
+		}
+	}
+
+	/// The fields the body moves out of a local's struct, each as its path of
+	/// field indices — `all.row.entries` is two deep — where each struct on the
+	/// way cleans up after itself field by field, and the field cleans up after
+	/// itself without an `own` to zero. None where the local's struct has a
+	/// `destroy` of its own, which drops it whole.
+	var fn movedFields(local: LocalId): Vec<Vec<u32>> = {
+		val ty = self.hir.locals[local].ty
+		if !(self.kind(ty) is .Struct(..)) || self.program.hasDrop(ty) then return Vec()
+		val hir = self.hir
+		var found: Vec<Vec<u32>> = Vec()
+		for id in hir.exprs.ids() {
+			if hir.exprs[id].kind is .Move(inner) &&
+				self.fieldOfLocal(inner) is .Some((l, path)) &&
+				l == local {
+				found.push(path.clone())
+			}
+		}
+		found.sort()
+		found.dedup()
+		var moved: Vec<Vec<u32>> = Vec()
+		for path in move found {
+			var at = ty
+			var dropped = true
+			for (depth, index) in path.forwards().enumerate() {
+				// Every struct on the way is one that is dropped field by field.
+				if depth > 0 && (!(self.kind(at) is .Struct(..)) || self.program.hasDrop(at)) {
+					dropped = false
+					break
+				}
+				at = self.program.fieldTy(at, index)
+			}
+			if dropped && self.needsDrop(at) && !self.zeroesItself(at) then moved.push(move path)
+		}
+		return move moved
+	}
+
+	/// Whether a reference parameter needs a flag for its referent: the body
+	/// moves the referent out, as `move self` does, and it cleans up after
+	/// itself without an `own` to zero.
+	var fn needsReferentFlag(param: LocalId): bool = {
+		val .Ref(inner: referent, ..) = self.kind(self.hir.locals[param].ty) else {
+			return false
+		}
+		if !self.needsDrop(referent) || self.zeroesItself(referent) then return false
+		val hir = self.hir
+		for id in hir.exprs.ids() {
+			if hir.exprs[id].kind is .Move(inner) &&
+				hir.exprs[inner].kind is .Deref(r) &&
+				hir.exprs[r].kind is .Local(l) &&
+				l == param {
+				return true
+			}
+		}
+		return false
+	}
+
+	/// The fields of what a reference parameter refers to that the body moves
+	/// out, and that clean up after themselves without an `own` to zero.
+	var fn movedReferentFields(param: LocalId): Vec<u32> = {
+		val .Ref(inner: referent, ..) = self.kind(self.hir.locals[param].ty) else {
+			return Vec()
+		}
+		if !(self.kind(referent) is .Struct(..)) then return Vec()
+		val fields = self.program.fieldTys(referent)
+		val hir = self.hir
+		var found: Vec<u32> = Vec()
+		for id in hir.exprs.ids() {
+			if hir.exprs[id].kind is .Move(inner) &&
+				hir.exprs[inner].kind is .Field(base, index) &&
+				hir.exprs[base].kind is .Deref(r) &&
+				hir.exprs[r].kind is .Local(l) &&
+				l == param {
+				found.push(index)
+			}
+		}
+		found.sort()
+		found.dedup()
+		var moved: Vec<u32> = Vec()
+		for index in found {
+			val field = fields[index as i64]
+			if self.needsDrop(field) && !self.zeroesItself(field) then moved.push(index)
+		}
+		return move moved
+	}
+
+	/// Whether a local needs a flag: its type cleans up after itself without an
+	/// `own` to zero, and the body moves it somewhere.
+	var fn needsFlag(local: LocalId): bool = {
+		val ty = self.hir.locals[local].ty
+		if !self.needsDrop(ty) || self.zeroesItself(ty) then return false
+		val hir = self.hir
+		for id in hir.exprs.ids() {
+			if hir.exprs[id].kind is .Move(inner) &&
+				hir.exprs[inner].kind is .Local(l) &&
+				l == local {
+				return true
+			}
+		}
+		return false
+	}
+
+	/// Whether a moved-out value of this type can be told from a live one by
+	/// its own bits: an `own` holds null, and a buffer holds null and zero.
+	fn zeroesItself(ty: Ty): bool = self.kind(ty) is .Own(..)
+
+	/// Drops a block's locals and runs its `defer`s, newest first.
+	var fn unwind(scope: Vec<Cleanup>) = {
+		for cleanup in scope.backwards() {
+			match cleanup {
+				.Drop(local) => self.dropLocal(local)
+				// Like an expression statement written at this exit.
+				.Defer(expr) => {
+					val mark = self.temps.len()
+					self.exprStmt(expr, mark)
+				}
+			}
+		}
+	}
+
+	/// Unwinds the innermost block.
+	var fn dropScope() = {
+		if self.scopes.pop() is .Some(scope) then self.unwind(move scope)
+	}
+
+	/// On `return`: unwinds every block of the function, innermost first,
+	/// without forgetting them, since the paths that do not return still
+	/// unwind them where their blocks end.
+	var fn dropAllScopes() = {
+		val scopes = self.scopes.clone()
+		for scope in scopes.backwards() {
+			self.unwind(scope.clone())
+		}
+	}
+
+	/// Registers a temporary to drop at the end of the current statement, if it
+	/// owns memory.
+	var fn ownTemp(place: Place, ty: Ty) = {
+		if !self.needsDrop(ty) then return
+		// A `match` or a `?` may take the value out of it, and a type that
+		// cleans up after itself cannot say so by its bits, so a flag says it.
+		if place.projections.isEmpty() && !self.zeroesItself(ty) && self.hasOwnDrop(ty) {
+			val flag = self.newLocal(BOOL, .Temp)
+			// False from the start: a temporary made in one branch of what its
+			// statement evaluates is dropped where the branches join, and on the
+			// others there is nothing to drop.
+			self.blocks[0].0.insert(0, .Assign(
+				place: Place::of(flag),
+				rvalue: .Use(.Const(.Bool(false))),
+			))
+			self.assign(Place::of(flag), .Use(.Const(.Bool(true))))
+			self.tempFlags.put(place.local, flag)
+		}
+		self.temps.push((move place, ty))
+	}
+
+	/// Whether dropping a value of this type runs a `destroy` a program wrote,
+	/// anywhere inside it. Everything else that a drop does — freeing an `own`,
+	/// and the zeroing that follows — can tell a value that was moved away from
+	/// one that was not.
+	var fn hasOwnDrop(ty: Ty): bool = {
+		if self.program.hasDrop(ty) then return true
+		match self.kind(ty) {
+			.Struct(..) | .Array(..) => {
+				for (_, part) in self.parts(ty) {
+					if self.hasOwnDrop(part) then return true
+				}
+			}
+			.Enum(..) => {
+				for parts in self.variantParts(ty) {
+					for (_, part) in parts {
+						if self.hasOwnDrop(part) then return true
+					}
+				}
+			}
+			// An `own` says for itself that it was moved away: its pointer is
+			// null, and nothing below it is reached. That is also what keeps
+			// this from following a type that holds itself.
+			_ => {}
+		}
+		return false
+	}
+
+	/// The value at `place` is no longer the temporary's to drop: a `match` arm
+	/// or a `?` has taken it.
+	var fn takenFromTemp(place: &Place) = {
+		if self.tempFlags.get(&place.local) is .Some(flag) then
+			self.assign(Place::of(flag), .Use(.Const(.Bool(false))))
+	}
+
+	/// A finished part of something still being built, such as an argument or
+	/// a field, that owns memory. Until the whole is complete, the part is a
+	/// temporary: a later part may `return`, `break` or `continue`, which must
+	/// drop it.
+	var fn pendingPart(place: Place, ty: Ty, pending: &var Vec<i64>) = {
+		if self.needsDrop(ty) {
+			pending.push(self.temps.len())
+			self.temps.push((move place, ty))
+		}
+	}
+
+	/// The whole is complete and owns its parts. Temporaries registered after
+	/// them, by later parts, still end with their statement.
+	var fn forgetParts(pending: Vec<i64>) = {
+		for index in pending.backwards() {
+			self.temps.remove(index)
+		}
+	}
+
+	/// Whether evaluating `id` could leave it by `return`, `break` or
+	/// `continue`: only a block holds statements, and only `if`, `match` and
+	/// blocks hold blocks.
+	fn mayJump(id: ExprId): bool = {
+		val kind = &self.hir.exprs[id].kind
+		if kind is .Block(..) | .If(..) | .Match(..) then return true
+		for child in kind.children() {
+			if self.mayJump(child) then return true
+		}
+		return false
+	}
+
+	/// Drops the temporaries registered since `mark`, newest first. On a path
+	/// that has ended there is nothing left to drop: each `break`, `continue`
+	/// or `return` that ended it dropped them as it left.
+	var fn dropTemps(mark: i64) = {
+		if self.dead {
+			self.temps.truncate(mark)
+			return
+		}
+		while self.temps.len() > mark {
+			val .Some((place, ty)) = self.temps.pop() else {
+				panic("length checked")
+			}
+			self.dropTemp(&place, ty)
+		}
+	}
+
+	/// A temporary, which a `match` arm or a `?` may have taken the value out
+	/// of.
+	var fn dropTemp(place: &Place, ty: Ty) = {
+		val .Some(flag) = self.tempFlags.get(&place.local) else {
+			self.dropPlace(&place, ty)
+			return
+		}
+		val live = Operand::Copy(Place::of(flag))
+		val drop = self.newBlock()
+		val next = self.newBlock()
+		self.terminate(.Branch(cond: move live, thenBlock: drop, otherwise: next))
+		self.switchTo(drop)
+		self.dropPlace(&place, ty)
+		self.terminate(.Goto(next))
+		self.switchTo(next)
+	}
+
+	/// On `return`: drops the temporaries of the statements around it without
+	/// forgetting them, since the paths that do not return still drop them
+	/// when their statements end.
+	var fn dropPendingTemps() = {
+		val temps = self.temps.clone()
+		for (place, ty) in temps.backwards() {
+			self.dropTemp(&place, ty)
+		}
+	}
+
+	/// The body of the drop function that drops a value of `ty` where it
+	/// lies (`lowerDropInPlaceFn`).
+	var fn dropInPlaceFn(ty: Ty) = {
+		val .Some(pointer) = self.program.types.find(.Own(inner: ty)) else {
+			panic("interning a buffer of the type interns a pointer to it")
+		}
+		val param = self.newLocal(pointer, .Param)
+		self.params.push(param)
+		self.droppingInPlace = true
+		val reached = Place::of(param).project(.Deref)
+		self.dropPlace(&reached, ty)
+		self.terminate(.Return)
+	}
+
+	/// The body of the drop function of an `own<ty>`: a loop over a chain of
+	/// `own` values. Each iteration frees one allocation, and when what the
+	/// value drops last is an `own<ty>` again, continues with that pointer.
+	var fn dropFn(ty: Ty) = {
+		val .Some(owned) = self.program.types.find(.Own(inner: ty)) else {
+			panic("something drops an `own` of the type, so the type exists")
+		}
+		val param = self.newLocal(owned, .Param)
+		self.params.push(param)
+		val node = self.newLocal(owned, .Var)
+		self.assign(Place::of(node), .Use(.Copy(Place::of(param))))
+		val again = self.newBlock()
+		val body = self.newBlock()
+		val exit = self.newBlock()
+		self.terminate(.Goto(again))
+		self.switchTo(again)
+		val isNull = self.value(BOOL, .Binary(
+			op: .Eq,
+			lhs: .Copy(Place::of(node)),
+			rhs: Builder::int(0, owned),
+		))
+		self.terminate(.Branch(cond: move isNull, thenBlock: exit, otherwise: body))
+		self.switchTo(body)
+		val chain = Chain(target: ty, node: node, again: again)
+		self.dropLast(Place::of(node).project(.Deref), ty, chain)
+		self.switchTo(exit)
+		self.terminate(.Return)
+	}
+
+	/// A type that cleans up after itself runs its own drop first; its fields
+	/// are dropped after it returns.
+	var fn callDrop(place: &Place, ty: Ty) = {
+		val .Some(drop) = self.program.dropFns.get(&ty) else {
+			return
+		}
+		val address = self.value(PTR_U8, .AddressOf(place.clone()))
+		self.push(.Call(callee: .Fn(drop), args: Vec::of(own [move address]), dest: .None))
+	}
+
+	/// Drops the value of type `ty` at `place`, the last part of the chain's
+	/// node to be dropped, and then frees the node. If that last part is an
+	/// `own` of the chain's type, the loop continues with it instead of
+	/// calling the drop function again. Ends the current block.
+	var fn dropLast(place: Place, ty: Ty, chain: Chain) = {
+		self.callDrop(&place, ty)
+		// A generator drops what it holds through its `next`.
+		if self.kind(ty) is .Struct(id, ..) && self.program.structs[id].generator.isSome() {
+			self.dropPlace(&place, ty)
+			self.push(.Free(.Copy(Place::of(chain.node))))
+			self.terminate(.Return)
+			return
+		}
+		match self.kind(ty) {
+			.Own(inner) if inner == chain.target => {
+				val next = self.value(ty, .Use(.Copy(move place)))
+				self.push(.Free(.Copy(Place::of(chain.node))))
+				self.assign(Place::of(chain.node), .Use(move next))
+				self.terminate(.Goto(chain.again))
+			}
+			.Struct(..) | .Array(..) => {
+				val parts = self.parts(ty)
+				self.dropPartsLast(move place, &parts, chain)
+			}
+			.Enum(..) => {
+				val variants = self.variantParts(ty)
+				val variant = self.value(I32, .Variant(place.clone()))
+				// A variant that owns nothing only frees the node.
+				val ownsNothing = self.newBlock()
+				var cases: Vec<(u32, BlockId)> = Vec()
+				var bodies: Vec<(BlockId, Vec<DropPart>)> = Vec()
+				for (v, parts) in variants.forwards().enumerate() {
+					if parts.isEmpty() then continue
+					val block = self.newBlock()
+					cases.push((v as u32, block))
+					bodies.push((block, parts.clone()))
+				}
+				self.terminate(.Switch(
+					value: move variant,
+					cases: move cases,
+					otherwise: ownsNothing,
+				))
+				for (block, parts) in bodies {
+					self.switchTo(block)
+					self.dropPartsLast(place.clone(), &parts, chain)
+				}
+				self.switchTo(ownsNothing)
+				self.push(.Free(.Copy(Place::of(chain.node))))
+				self.terminate(.Return)
+			}
+			_ => {
+				self.dropPlace(&place, ty)
+				self.push(.Free(.Copy(Place::of(chain.node))))
+				self.terminate(.Return)
+			}
+		}
+	}
+
+	/// Drops the given parts of the value at `place`, listed in declaration
+	/// order, in reverse order. The first part is dropped last, through
+	/// `dropLast`. Ends the current block.
+	var fn dropPartsLast(place: Place, parts: &[DropPart], chain: Chain) = {
+		if parts.isEmpty() {
+			self.push(.Free(.Copy(Place::of(chain.node))))
+			self.terminate(.Return)
+			return
+		}
+		var i = parts.len()
+		while i > 1 {
+			i -= 1
+			val (projection, ty) = parts[i].clone()
+			val reached = place.project(projection)
+			self.dropPlace(&reached, ty)
+		}
+		val (first, firstTy) = parts[0].clone()
+		self.dropLast(place.project(first), firstTy, chain)
+	}
+}
+
+/// Whether a field the body moves out lies below the part of a local at
+/// `path`.
+fn below(moved: &[Vec<u32>], path: &[u32]): bool = {
+	for m in moved {
+		if m.len() > path.len() && startsWith(&m, &path) then return true
+	}
+	return false
+}
+
+/// An iteration of a drop function's loop: the local that holds the
+/// allocation being dropped, of type `own<target>`, and the block that takes
+/// the next one.
+@derive(Clone)
+struct Chain {
+	target: Ty
+	node: Local
+	again: BlockId
+}

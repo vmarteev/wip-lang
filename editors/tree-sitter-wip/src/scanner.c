@@ -3,8 +3,9 @@
 //
 // It is emitted only where the parser could end one there — which is never
 // inside `( )` or `[ ]`, nor after an operator, a comma or an open bracket,
-// so a line break there stays space — and never before `else`, which
-// continues the line above. And a text block's text: all of
+// so a line break there stays space — and never before `else`, nor before
+// the `|` of a pattern's next alternative, each of which continues the line
+// above. And a text block's text: all of
 // it up to a `\\` or the closing `"""`, line breaks and quotes included.
 
 #include "tree_sitter/parser.h"
@@ -103,7 +104,7 @@ bool tree_sitter_wip_external_scanner_scan(void *payload, TSLexer *lexer, const 
     }
     skip(lexer);
     lexer->mark_end(lexer);
-    // What begins the next line decides: `else` continues this one.
+    // What begins the next line decides: `else` or `|` continues this one.
     for (;;) {
         while (lexer->lookahead == ' ' || lexer->lookahead == '\t' || lexer->lookahead == '\r' ||
                lexer->lookahead == '\n') {
@@ -121,6 +122,12 @@ bool tree_sitter_wip_external_scanner_scan(void *payload, TSLexer *lexer, const 
         while (lexer->lookahead != '\n' && !lexer->eof(lexer)) {
             skip(lexer);
         }
+    }
+    // `|` alone continues a pattern's alternatives; `||` and `|=` begin no
+    // line, which the parser reports.
+    if (lexer->lookahead == '|') {
+        skip(lexer);
+        return lexer->lookahead == '|' || lexer->lookahead == '=';
     }
     const char *word = "else";
     for (size_t i = 0; i < strlen(word); i++) {

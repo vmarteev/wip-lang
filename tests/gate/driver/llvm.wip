@@ -1,0 +1,160 @@
+// What a release build tells LLVM, read in the IR `--emit llvm-ir` writes:
+// each program first runs as it should, and then its IR says what may be
+// assumed, and no more.
+
+import check::{Gate, read, run, wrong, write}
+
+/// The release build's IR of the program in `root`, or why there is none.
+fn irOf(gate: &Gate, root: str): Result<String, String> = {
+	val written = gate.wip(root, [
+		"build",
+		"--release",
+		"--emit",
+		"llvm-ir",
+		"main.wip",
+		"-o",
+		"program.ll",
+	])
+	if !written.exit.success() then
+		return .Err(wrong("`wip build --emit llvm-ir`", &written).unwrapOr(String()))
+	return .Ok(read(root, "program.ll"))
+}
+
+/// The line that defines the program's function `name`.
+fn defined(ir: str, name: str): String = {
+	val head = "@\"wip.\(name)."
+	for line in ir.lines() {
+		if line.startsWith("define") && line.contains(head.toStr()) then return String::of(line)
+	}
+	return String()
+}
+
+/// A `&` parameter is `noalias readonly` to LLVM where nothing changes its
+/// place while the call runs: not where the place holds an `Atomic` by
+/// value, which changes through a `&`, but where one is only reached
+/// through an `own`, which is other memory. An aggregate taken by value is
+/// `noalias`, and a closure given one place both by value and by `&` still
+/// reads it right. A reference is `nonnull`, and reaches its whole value,
+/// aligned.
+fn sharedReadOnly(gate: &Gate, root: str): Option<String> = {
+	write(
+		root,
+		"main.wip",
+		"import std::io\nimport std::sync::{Atomic}\n\nstruct Plain {\n    a: i64\n    b: i64\n}\n\nstruct Counted {\n    hits: Atomic<i64>\n}\n\nenum Maybe {\n    Counting(counted: Counted)\n    Not\n}\n\nstruct Boxed {\n    counted: own<Counted>\n}\n\nstruct Wide {\n    a: i64\n    b: i64\n    c: i64\n    d: i64\n}\n\nfn spanOf(w: Wide): i64 = w.d - w.a\n\nfn sumOf(p: &Plain): i64 = p.a + p.b\n\nfn hitsOf(c: &Counted): i64 = {\n    c.hits.add(1)\n    return c.hits.load()\n}\n\nfn hitsIn(m: &Maybe): i64 = match m {\n    .Counting(counted) => hitsOf(&counted)\n    .Not => 0\n}\n\nfn boxedHits(b: &Boxed): i64 = hitsOf(&b.counted)\n\nfn main() = {\n    val plain = Plain(a: 2, b: 3)\n    val counted = Counted(hits: Atomic::of(0))\n    val maybe = Maybe::Counting(counted: Counted(hits: Atomic::of(10)))\n    val boxed = Boxed(counted: own Counted(hits: Atomic::of(20)))\n    val wide = Wide(a: 1, b: 2, c: 3, d: 7)\n    val both = (w: Wide, at: &Wide) => w.c + at.d\n    io::println(\"\\(sumOf(&plain)) \\(hitsOf(&counted)) \\(hitsOf(&counted)) \\(hitsIn(&maybe)) \\(boxedHits(&boxed)) \\(spanOf(wide)) \\(both(wide, &wide))\")\n}\n",
+	)
+	val ran = gate.wip(root, ["run", "--release", "main.wip"])
+	if !ran.exit.success() || ran.stdout != "5 1 2 11 21 6 10\n" then
+		return wrong("`wip run --release main.wip`", &ran)
+	val ir = match irOf(gate, root) {
+		.Ok(ir) => move ir
+		.Err(why) => return .Some(move why)
+	}
+	for name in ["sumOf", "boxedHits"] {
+		val line = defined(ir.toStr(), name)
+		if !line.contains("ptr noalias readonly nonnull") then
+			return .Some("`\(name)` is defined as\n  \(line)")
+	}
+	val sum = defined(ir.toStr(), "sumOf")
+	if !sum.contains("nonnull dereferenceable(16) align 8 %p0") then
+		return .Some("`sumOf` is defined as\n  \(sum)")
+	for name in ["hitsOf", "hitsIn"] {
+		val line = defined(ir.toStr(), name)
+		if line.isEmpty() || line.contains("readonly") then
+			return .Some("`\(name)` is defined as\n  \(line)")
+	}
+	val span = defined(ir.toStr(), "spanOf")
+	if !span.contains("ptr noalias %p0") then return .Some("`spanOf` is defined as\n  \(span)")
+	return .None
+}
+
+/// A reference read out of memory is not null to LLVM, and aligned, but not
+/// promised to reach its value: where the place is an enum's payload, LLVM
+/// takes the promise as true even where the enum holds another variant, and
+/// reads through the reference before the branch that loads it — through
+/// whatever the payload's bytes were, a null pointer on Linux, where an
+/// optimised compiler crashed so. A parameter still promises it.
+fn referenceFromMemory(gate: &Gate, root: str): Option<String> = {
+	write(
+		root,
+		"main.wip",
+		"import std::collections::{Map}\nimport std::io\n\nstruct Pair {\n    a: i64\n    b: i64\n}\n\nfn first(seen: &Map<i64, Pair>, key: i64): i64 = match seen.get(&key) {\n    .Some(pair) => pair.a + pair.b\n    .None => 0\n}\n\nfn main() = {\n    var seen: Map<i64, Pair> = Map()\n    seen.put(1, Pair(a: 2, b: 3))\n    io::println(\"\\(first(&seen, 1)) \\(first(&seen, 5))\")\n}\n",
+	)
+	val ran = gate.wip(root, ["run", "--release", "main.wip"])
+	if !ran.exit.success() || ran.stdout != "5 0\n" then
+		return wrong("`wip run --release main.wip`", &ran)
+	val ir = match irOf(gate, root) {
+		.Ok(ir) => move ir
+		.Err(why) => return .Some(move why)
+	}
+	var loads = 0
+	for line in ir.lines() {
+		if !line.contains("load ptr") || !line.contains("!nonnull") then continue
+		loads += 1
+		if line.contains("!dereferenceable") then
+			return .Some("a reference loaded promises too much:\n  \(line)")
+	}
+	if loads == 0 then return .Some("no reference is loaded")
+	if !ir.contains("nonnull dereferenceable(") then return .Some("no parameter promises it")
+	return .None
+}
+
+/// Checked arithmetic is computed again past its check with LLVM's flags
+/// that say it does not wrap — `nsw` signed, `nuw` unsigned — and still
+/// panics where the answer does not fit.
+fn arithmeticDoesNotWrap(gate: &Gate, root: str): Option<String> = {
+	write(
+		root,
+		"main.wip",
+		"import std::io\n\nfn plus(a: i64, b: i64): i64 = a + b\n\nfn less(a: u32, b: u32): u32 = a - b\n\nfn main(args: &[cstring]) = {\n    io::printInt(plus(40, 2))\n    io::printInt(less(5, 3) as i64)\n    io::printInt(less(1, args.len() as u32 + 1) as i64)\n}\n",
+	)
+	val ran = gate.wip(root, ["run", "--release", "main.wip"])
+	if ran.exit != .Code(101) || ran.stdout != "42\n2\n" || !ran.stderr.contains("panicked") then
+		return wrong("`wip run --release main.wip`", &ran)
+	val ir = match irOf(gate, root) {
+		.Ok(ir) => move ir
+		.Err(why) => return .Some(move why)
+	}
+	if !ir.contains(" = add nsw i64 ") then return .Some("no `add nsw`")
+	if !ir.contains(" = sub nuw i32 ") then return .Some("no `sub nuw`")
+	return .None
+}
+
+/// What a call through a `&dyn` reads from its table of methods is read as
+/// LLVM's invariant, since the table is a constant never freed; what an
+/// owned closure's drop reads from its environment's header is not, since
+/// that memory is freed and used again.
+fn tableInvariant(gate: &Gate, root: str): Option<String> = {
+	write(
+		root,
+		"main.wip",
+		"import std::io\n\ninterface Step {\n    fn size(): i64\n}\n\nstruct Stride {\n    by: i64\n}\n\nextend Stride: Step {\n    fn size(): i64 = self.by\n}\n\nfn walk(step: &dyn Step, times: i64): i64 = {\n    var total = 0\n    var i = 0\n    while i < times {\n        total += step.size()\n        i += 1\n    }\n    return total\n}\n\nfn main() = {\n    val stride = Stride(by: 3)\n    val extra = 4\n    val add = own (x: i64) => x + extra\n    io::printInt(add(walk(&stride, 5)))\n}\n",
+	)
+	val ran = run(gate.command(root, ["run", "--release", "main.wip"]).env("WIP_CHECK_LEAKS", "1"))
+	if !ran.exit.success() || ran.stdout != "19\n" then
+		return wrong("`wip run --release main.wip`", &ran)
+	val ir = match irOf(gate, root) {
+		.Ok(ir) => move ir
+		.Err(why) => return .Some(move why)
+	}
+	val walk = body(ir.toStr(), "walk")
+	if !walk.contains("!invariant.load") then
+		return .Some("`walk` reads no table as invariant:\n\(walk)")
+	val main = body(ir.toStr(), "main")
+	if main.contains("!invariant.load") then
+		return .Some("`main` reads memory freed as invariant:\n\(main)")
+	return .None
+}
+
+/// The whole definition of the program's function `name`.
+fn body(ir: str, name: str): String = {
+	val head = "@\"wip.\(name)."
+	var rest = ir
+	while rest.find("\ndefine ") is .Some(at) {
+		rest = rest[at + 1..]
+		val line = rest.lines().next().unwrapOr("")
+		if !line.contains(head.toStr()) then continue
+		val end = rest.find("\n}\n").unwrapOr(rest.len())
+		return String::of(rest[0..end])
+	}
+	return String()
+}

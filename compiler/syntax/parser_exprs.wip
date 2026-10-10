@@ -1,0 +1,1546 @@
+// Expressions: precedence climbing, prefix and postfix operators, and the
+// primary forms.
+
+import std::text::{ParseError}
+
+/// One argument of a call: a value, with its name if it has one, or
+/// `..base`.
+enum CallArg {
+	Plain(name: Option<Name>, value: ExprId)
+	Rest(value: ExprId, dots: Span)
+}
+
+/// One element inside the braces of a struct literal written with braces,
+/// read only to say how it is written.
+enum FieldElem {
+	Init(field: BraceField)
+	/// `..value`: where the fields the literal does not name come from.
+	Rest(value: ExprId)
+}
+
+/// `name: value`, or `name` alone, which was `name: name`.
+struct BraceField {
+	name: Name
+	value: ExprId
+	span: Span
+	shorthand: bool
+}
+
+/// What a piece of an interpolation says of its width.
+struct Fitting {
+	width: ExprId
+	fill: Option<ExprId>
+	align: Option<ExprId>
+}
+
+/// How a piece of an interpolation is written: the method that makes the
+/// value it writes, `withPrecision` or `inRadix`, where its option was
+/// written, and what the option says.
+struct Written {
+	method: Symbol
+	span: Span
+	value: ExprId
+	/// `upper: …`, with a radix, and where it was written.
+	upper: Option<(Span, ExprId)>
+}
+
+/// What a piece of an interpolation says after its value.
+struct PieceOptions {
+	fitting: Option<Fitting>
+	written: Option<Written>
+}
+
+/// `f64`'s infinity, which a float literal too large for one is, as Rust
+/// reads it.
+val INFINITY_BITS: u64 = 0x7FF0000000000000
+
+extend Parser {
+	var fn expr(): ExprId = {
+		// `lend` hands a place to the caller. It
+		// takes the whole expression after it, like `return`.
+		if self.at(.Lend) {
+			val start = self.bump()
+			val value = self.expr()
+			val span = start.to(self.exprSpan(value))
+			return self.allocExpr(.Lend(value: value), span)
+		}
+		// `yield` is a statement, which hands a value to the list being
+		// built. Where a value is expected, it is
+		// most likely meant as a projection's `lend`.
+		if self.at(.Yield) {
+			val span = self.span()
+			val diagnostic = Diagnostic::error(
+				YIELD_KEYWORD,
+				"`yield` is a statement, not a value",
+				span,
+				"where a value is expected",
+			).withFix("to lend a place from a projection, write `lend`", own [
+				Edit::replace(span, "lend"),
+			]).withNote(
+				"`yield` is a statement that hands a value to the list being built, `own [for x in xs { yield x }]`, or to whoever asks a generator for it; in a `match` arm, it is written in braces, `{ yield x }`. A projection lends a place and stops, with `lend`",
+			)
+			self.report(move diagnostic)
+			self.bump()
+			val value = self.expr()
+			val whole = span.to(self.exprSpan(value))
+			return self.allocExpr(.Lend(value: value), whole)
+		}
+		return self.exprBp(0)
+	}
+
+	/// Precedence climbing over `infixBindingPower`. A complete expression
+	/// stops at a significant line break.
+	var fn exprBp(minBp: i64): ExprId = {
+		var lhs = self.prefix()
+		while true {
+			if self.lineBreak() then break
+			val op = self.peek()
+			// `value is pattern`, as tight as a comparison,
+			// and `value !is pattern`, its negation, `!` and `is` written
+			// together as `!=` is.
+			val negated = op == .Bang && self.nth(1) == .Is
+			if op == .Is || negated {
+				if IS_BINDING_POWER < minBp then break
+				val first = self.bump()
+				if negated {
+					val isSpan = self.bump()
+					if isSpan.lo != first.hi {
+						val (gapLo, gapHi) = (first.hi, isSpan.lo)
+						val between = Span::new(gapLo, gapHi)
+						val diagnostic = Diagnostic::error(
+							EXPECTED,
+							"`!is` is written together",
+							first.to(isSpan),
+							"`!` and `is` apart",
+						).withFix("write `!is`", own [Edit::replace(between, "")]).withNote(
+							"`x !is P` is `!(x is P)`, one operator, as `!=` is",
+						)
+						self.report(move diagnostic)
+					}
+				}
+				val pattern = self.pattern()
+				val span = self.exprSpan(lhs).to(pattern.span)
+				lhs = self.allocExpr(
+					.Is(scrutinee: lhs, pattern: move pattern, negated: negated),
+					span,
+				)
+				continue
+			}
+			if op == .As {
+				if CAST_BINDING_POWER < minBp then break
+				self.bump()
+				val ty = self.castTy()
+				val span = self.exprSpan(lhs).to(self.ast.types[ty].span)
+				lhs = self.allocExpr(.Cast(expr: lhs, ty: ty), span)
+				continue
+			}
+			// `place op= value`, as loose as `=`.
+			if self.compoundAssign() is .Some((assignOp, tokens, wrapping)) {
+				if ASSIGN_BINDING_POWER.0 < minBp then break
+				var opSpan = self.bump()
+				if tokens == 2 then opSpan = opSpan.to(self.bump())
+				val value = self.exprBp(ASSIGN_BINDING_POWER.1)
+				val span = self.exprSpan(lhs).to(self.exprSpan(value))
+				lhs = self.allocExpr(
+					.Assign(
+						target: lhs,
+						op: .Some((assignOp, opSpan)),
+						wrapping: wrapping,
+						value: value,
+					),
+					span,
+				)
+				continue
+			}
+			val shift = self.shift()
+			val bindingPower =
+				if shift.isSome() then .Some(SHIFT_BINDING_POWER) else infixBindingPower(op)
+			val .Some((leftBp, rightBp)) = bindingPower else {
+				break
+			}
+			if leftBp < minBp then break
+			var opSpan = self.bump()
+			if shift.isSome() then opSpan = opSpan.to(self.bump())
+			val rhs = self.exprBp(rightBp)
+			val span = self.exprSpan(lhs).to(self.exprSpan(rhs))
+			val wrapping = op is .PlusPercent | .MinusPercent | .StarPercent
+			val kind: ExprKind = match shift {
+				.Some(shifted) => .Binary(
+					op: shifted,
+					opSpan: opSpan,
+					lhs: lhs,
+					rhs: rhs,
+					wrapping: false,
+				)
+				.None if op == .Eq => .Assign(target: lhs, op: .None, wrapping: false, value: rhs)
+				.None => .Binary(
+					op: binaryOp(op),
+					opSpan: opSpan,
+					lhs: lhs,
+					rhs: rhs,
+					wrapping: wrapping,
+				)
+			}
+			lhs = self.allocExpr(move kind, span)
+		}
+		return lhs
+	}
+
+	/// `<<` or `>>` at the current token: two `<` or `>` with nothing between
+	/// them. They are not one token, so that `own<own<i64>>` closes two type
+	/// argument lists.
+	var fn shift(): Option<BinaryOp> = {
+		val op: BinaryOp = match self.peek() {
+			.Lt => .Shl
+			.Gt => .Shr
+			_ => return .None
+		}
+		if self.pos + 1 >= self.tokens.len() then return .None
+		val first = self.tokens[self.pos]
+		val second = self.tokens[self.pos + 1]
+		return if second.kind == first.kind && second.span.lo == first.span.hi then .Some(op)
+		else .None
+	}
+
+	/// A compound assignment at the current token, how many tokens it
+	/// takes, and whether it wraps: `<<=` is `<` and `<=` with nothing
+	/// between them, and `>>=` is `>` and `>=`; `+%=` is
+	/// `+%` and `=` the same way, and wraps.
+	var fn compoundAssign(): Option<(BinaryOp, i64, bool)> = {
+		val op: BinaryOp = match self.peek() {
+			.PlusPercent | .MinusPercent | .StarPercent => {
+				if self.pos + 1 >= self.tokens.len() then return .None
+				val first = self.tokens[self.pos]
+				val second = self.tokens[self.pos + 1]
+				val wrapped: BinaryOp = match first.kind {
+					.PlusPercent => .Add
+					.MinusPercent => .Sub
+					_ => .Mul
+				}
+				val adjacent = second.kind == .Eq && second.span.lo == first.span.hi
+				return if adjacent then .Some((wrapped, 2, true)) else .None
+			}
+			.PlusEq => .Add
+			.MinusEq => .Sub
+			.StarEq => .Mul
+			.SlashEq => .Div
+			.PercentEq => .Rem
+			.AmpEq => .BitAnd
+			.PipeEq => .BitOr
+			.CaretEq => .BitXor
+			.Lt | .Gt => {
+				if self.pos + 1 >= self.tokens.len() then return .None
+				val first = self.tokens[self.pos]
+				val second = self.tokens[self.pos + 1]
+				val shifted: BinaryOp = if first.kind == .Lt then .Shl else .Shr
+				val next: TokenKind = if first.kind == .Lt then .LtEq else .GtEq
+				val adjacent = second.kind == next && second.span.lo == first.span.hi
+				return if adjacent then .Some((shifted, 2, false)) else .None
+			}
+			_ => return .None
+		}
+		return .Some((op, 1, false))
+	}
+
+	var fn prefix(): ExprId = {
+		var op: UnaryOp = match self.peek() {
+			.Minus => .Neg
+			.Bang => .Not
+			.Amp => .Ref
+			.Move => .Move
+			.Own => .Own
+			.AmpAmp => {
+				val span = self.bump()
+				self.reportDoubleBorrow(span)
+				val operand = self.exprBp(PREFIX_BINDING_POWER)
+				val end = self.exprSpan(operand).hi
+				val innerOp = Span::new(span.lo + 1, span.hi)
+				val inner = self.allocExpr(
+					.Unary(op: .Ref, opSpan: innerOp, operand: operand),
+					Span::new(innerOp.lo, end),
+				)
+				val outerOp = Span::new(span.lo, span.lo + 1)
+				return self.allocExpr(
+					.Unary(op: .Ref, opSpan: outerOp, operand: inner),
+					Span::new(span.lo, end),
+				)
+			}
+			_ => return self.postfix()
+		}
+		var opSpan = self.bump()
+		if op == .Ref && self.at(.Var) {
+			opSpan = opSpan.to(self.bump())
+			op = .RefVar
+		}
+		// `own for x in xs { … }`: a list of what the loop yields.
+		val operand =
+			if op == .Own && self.at(.For) then self.element()
+			else self.exprBp(PREFIX_BINDING_POWER)
+		val span = opSpan.to(self.exprSpan(operand))
+		return self.allocExpr(.Unary(op: op, opSpan: opSpan, operand: operand), span)
+	}
+
+	var fn postfix(): ExprId = {
+		var e = self.primary()
+		while true {
+			var kind: Option<ExprKind> = .None
+			val next = self.peek()
+			// A `.` that starts a line begins a variant instead,
+			// so field access stays on its value's line,
+			// or inside brackets, where line breaks do not separate.
+			// `expr?`: the value, or an early return of the other
+			// variant.
+			if next == .Question && !self.lineBreak() {
+				self.bump()
+				kind = .Some(.Try(inner: e))
+			} else if next == .Dot && !self.lineBreak() {
+				self.bump()
+				// `pair.0`: a tuple's element, which lies in the field
+				// the prelude calls `_0`.
+				if self.peek() is .Int | .Float {
+					kind = self.tupleIndex(e)
+					if kind.isNone() then break
+				} else {
+					val .Some(name) = self.name("a field name") else {
+						break
+					}
+					kind = .Some(.Field(base: e, name: name))
+				}
+			} else if next == .LParen && !self.lineBreak() {
+				val open = self.bump()
+				val (args, _) = self.inParens(
+					(p) => p.list(
+						open,
+						.RParen,
+						"an argument",
+						(kind) => canStartExpr(kind) || kind == .DotDot,
+						(q) => {
+							// `..base`: the fields a struct built by the call
+							// does not name.
+							if q.at(.DotDot) {
+								val dots = q.bump()
+								val value = q.expr()
+								return .Some(CallArg::Rest(value: value, dots: dots))
+							}
+							// `name: value`.
+							var name: Option<Name> = .None
+							if isIdent(q.peek()) && q.nth(1) == .Colon {
+								name = q.name("a parameter name")
+								if name.isSome() then q.bump()
+							}
+							return .Some(CallArg::Plain(name: name, value: q.expr()))
+						},
+					),
+				)
+				val (plain, rest) = self.restLast(move args)
+				self.positionalAfterNamed(&plain)
+				var names: Vec<Option<Name>> = Vec()
+				var values: Vec<ExprId> = Vec()
+				for (name, value) in plain {
+					names.push(name)
+					values.push(value)
+				}
+				kind = .Some(.Call(callee: e, args: move values, names: move names, rest: rest))
+			} else if next == .LBracket && !self.lineBreak() {
+				val open = self.bump()
+				// `xs[i]`, or a range of elements `xs[lo..hi]` with
+				// either bound optional.
+				val indexed = self.inParens(
+					(p) => {
+						val lo: Option<ExprId> =
+							if !p.at(.DotDot) && !p.at(.DotDotEq) then .Some(p.expr()) else .None
+						if p.eat(.DotDot) {
+							val hi: Option<ExprId> =
+								if !p.at(.RBracket) then .Some(p.expr()) else .None
+							return ExprKind::SubSlice(base: e, lo: lo, hi: hi, inclusive: false)
+						}
+						if p.eat(.DotDotEq) {
+							// `..=` takes its end too, so it needs one.
+							val hi = p.expr()
+							return ExprKind::SubSlice(
+								base: e,
+								lo: lo,
+								hi: .Some(hi),
+								inclusive: true,
+							)
+						}
+						val .Some(index) = lo else {
+							panic("an index was parsed")
+						}
+						return ExprKind::Index(base: e, index: index)
+					},
+				)
+				self.expectClosing(.RBracket, open)
+				kind = .Some(move indexed)
+			}
+			val .Some(made) = move kind else {
+				break
+			}
+			val span = self.exprSpan(e).to(self.prevSpan())
+			e = self.allocExpr(move made, span)
+		}
+		return e
+	}
+
+	/// An interpolated literal, `"read \(rows) rows"`, rewritten here into
+	/// the block a program would write itself:
+	///
+	///     {
+	///         var text# = String::withCapacity(16)
+	///         text#.push("read ")
+	///         rows.appendTo(&var text#)
+	///         text#.push(" rows")
+	///         text#
+	///     }
+	///
+	/// Nothing after the parser knows the literal was one: the value is a
+	/// `String`, the errors are the errors of those calls, and a literal
+	/// with no `\(` in it stays a `str` that allocates nothing.
+	var fn interpolation(first: Symbol): ExprId = {
+		val start = self.span()
+		self.bump()
+		var stmts: Vec<StmtId> = Vec()
+		// How many bytes to ask for: the text as it is written, and a guess
+		// for each value. Space at the start and end of a line is left out,
+		// so that a text block asks for the same however it is indented.
+		var capacity = 0
+		var piece = (first, start, 3)
+		while true {
+			capacity += self.pushText(&var stmts, piece)
+			val (value, options) = self.inParens((p) => {
+				val value = p.expr()
+				return (value, p.pieceOptions())
+			})
+			capacity += 8
+			// A number written to a precision or in a radix is written as
+			// the value `withPrecision` or `inRadix` makes of it.
+			val written = match options.written {
+				.Some(how) => self.writtenAs(value, how)
+				.None => value
+			}
+			match options.fitting {
+				.Some(fitting) => self.pushFitted(&var stmts, written, fitting)
+				.None => self.pushAppend(&var stmts, written)
+			}
+			match self.peek() {
+				.StrMid(symbol) => {
+					val span = self.span()
+					self.bump()
+					piece = (symbol, span, 3)
+				}
+				.StrEnd(symbol) => {
+					val span = self.span()
+					self.bump()
+					capacity += self.pushText(&var stmts, (symbol, span, 2))
+					break
+				}
+				// The literal was not closed, which the lexer has reported.
+				_ => break
+			}
+		}
+		val span = start.to(self.prevSpan())
+		val init = self.stringInit(capacity, span)
+		stmts.insert(0, init)
+		// The block's value is the `String` it built, which it hands over:
+		// a value that owns memory is moved, never copied.
+		val built = self.allocExpr(.Name(symbol: Symbol::text()), span)
+		val moved = self.allocExpr(.Unary(op: .Move, opSpan: span, operand: built), span)
+		val last = self.allocStmt(.Expr(value: moved), span)
+		stmts.push(last)
+		return self.allocExpr(.Block(block: Block(stmts: move stmts, span: span)), span)
+	}
+
+	/// `var text# = String::withCapacity(capacity)`.
+	var fn stringInit(capacity: i64, span: Span): StmtId = {
+		val segments = Vec::of(own [
+			Name(sym: Symbol::stringType(), span: span),
+			Name(sym: Symbol::withCapacity(), span: span),
+		])
+		val callee = self.allocExpr(
+			.Path(leadingDot: false, segments: move segments, typeArgs: .None),
+			span,
+		)
+		val count = self.allocExpr(.Int(value: capacity as u128), span)
+		val init = self.allocExpr(
+			.Call(
+				callee: callee,
+				args: Vec::of(own [count]),
+				names: Vec::of(own [.None]),
+				rest: .None,
+			),
+			span,
+		)
+		return self.allocStmt(
+			.Let(mutable: true, name: Name(sym: Symbol::text(), span: span), ty: .None, init: init),
+			span,
+		)
+	}
+
+	/// `text#.push("…")`, for a piece of the literal's own text. The piece is
+	/// `(contents, span, how many bytes of that span are delimiters)`, and
+	/// what comes back is how much room the text asks for. An empty piece
+	/// pushes nothing.
+	var fn pushText(stmts: &var Vec<StmtId>, piece: (Symbol, Span, i64)): i64 = {
+		val (symbol, span, delimiters) = piece
+		val written = self.text(span)
+		var length = 0
+		for line in written.split("\n") {
+			length += trimLineSpace(line).len() + 1
+		}
+		val bytes = if length - 1 > delimiters then length - 1 - delimiters else 0
+		if bytes == 0 then return 0
+		val text = self.allocExpr(.Str(symbol: symbol), span)
+		val call = self.methodCall(Symbol::push(), text, span)
+		stmts.push(self.allocStmt(.Expr(value: call), span))
+		return bytes
+	}
+
+	/// What a piece of an interpolation says after a comma: its width,
+	/// `\(name, width: 16)`, `\(n, width: 4, fill: '0')`, `align: .Center`;
+	/// and how a number is written, `\(seconds, precision: 3)`,
+	/// `\(byte, radix: 16)`. Nothing where it says nothing.
+	var fn pieceOptions(): PieceOptions = {
+		var options = PieceOptions(fitting: .None, written: .None)
+		if !self.at(.Comma) then return move options
+		val start = self.span()
+		val [width, fill, align] = Symbol::fittingOptions()
+		val [precision, radix, withPrecision, inRadix] = Symbol::written()
+		val upper = Symbol::upper()
+		val names = [width, fill, align, precision, radix, upper]
+		var given: [Option<(Span, ExprId)>; 6] = [.None; 6]
+		while self.eat(.Comma) {
+			val .Some(name) = self.name(
+				"an option: `width`, `fill`, `align`, `precision`, `radix` or `upper`",
+			) else {
+				break
+			}
+			self.expect(.Colon)
+			val value = self.expr()
+			var which = -1
+			for i in 0..6 {
+				if names[i] == name.sym {
+					which = i
+					break
+				}
+			}
+			if which < 0 {
+				val diagnostic = Diagnostic::error(
+					INTERPOLATION_OPTION,
+					"a piece of an interpolation takes `width`, `fill`, `align`, `precision`, `radix` and `upper`",
+					name.span,
+					"not one of them",
+				).withNote(
+					"`\\(value, width: 4, fill: '0', align: .Right)` pads the text to a width; `precision: 3` writes a float with three digits after its point, `radix: 16` an integer in hexadecimal, and `upper: true` its digits above 9 in upper case",
+				)
+				self.report(move diagnostic)
+				continue
+			}
+			if given[which] is .Some((first, _)) {
+				val diagnostic = Diagnostic::error(
+					INTERPOLATION_OPTION,
+					"an option is given once",
+					name.span,
+					"given again",
+				).withSecondary(first, "first given here")
+				self.report(move diagnostic)
+				continue
+			}
+			given[which] = .Some((name.span, value))
+		}
+		val [widthGiven, fillGiven, alignGiven, precisionGiven, radixGiven, upperGiven] = given
+		// Upper-case digits are a radix's.
+		if upperGiven is .Some((span, _)) && radixGiven.isNone() {
+			val diagnostic = Diagnostic::error(
+				INTERPOLATION_OPTION,
+				"upper-case digits are a radix's",
+				span,
+				"no `radix:`",
+			).withNote(
+				"`\\(byte, radix: 16, upper: true)` writes an integer in hexadecimal with `A` to `F`",
+			)
+			self.report(move diagnostic)
+		}
+		// A precision is a float's and a radix an integer's, so no value
+		// takes both.
+		if precisionGiven is .Some((first, _)) && radixGiven is .Some((second, _)) {
+			val diagnostic = Diagnostic::error(
+				INTERPOLATION_OPTION,
+				"a piece is written to a precision or in a radix, not both",
+				second,
+				"and a radix",
+			).withSecondary(first, "a precision").withNote(
+				"a precision is the digits after a float's point, and a radix the base an integer is written in",
+			)
+			self.report(move diagnostic)
+		}
+		if precisionGiven is .Some((span, value)) then
+			options.written = .Some(Written(
+				method: withPrecision,
+				span: span,
+				value: value,
+				upper: .None,
+			))
+		else if radixGiven is .Some((span, value)) then
+			options.written = .Some(Written(
+				method: inRadix,
+				span: span,
+				value: value,
+				upper: upperGiven,
+			))
+		if widthGiven is .Some((_, widthValue)) {
+			options.fitting = .Some(Fitting(
+				width: widthValue,
+				fill: match fillGiven {
+					.Some((_, value)) => .Some(value)
+					.None => .None
+				},
+				align: match alignGiven {
+					.Some((_, value)) => .Some(value)
+					.None => .None
+				},
+			))
+		} else if fillGiven.isSome() || alignGiven.isSome() {
+			val diagnostic = Diagnostic::error(
+				INTERPOLATION_OPTION,
+				"a fill or an alignment needs a width",
+				start.to(self.prevSpan()),
+				"no `width:`",
+			).withNote("the fill makes up the text to the width, and the alignment says where")
+			self.report(move diagnostic)
+		}
+		return move options
+	}
+
+	/// `value.withPrecision(digits)` or `value.inRadix(radix)`: what a piece
+	/// written to a precision or in a radix writes, named where the option
+	/// is, so that a value of the wrong type is reported there.
+	var fn writtenAs(value: ExprId, written: Written): ExprId = {
+		val span = self.exprSpan(value)
+		val callee = self.allocExpr(
+			.Field(base: value, name: Name(sym: written.method, span: written.span)),
+			span,
+		)
+		var args = Vec::of(own [written.value])
+		var names: Vec<Option<Name>> = Vec::of(own [.None])
+		if written.upper is .Some((nameSpan, upper)) {
+			args.push(upper)
+			names.push(.Some(Name(sym: Symbol::upper(), span: nameSpan)))
+		}
+		return self.allocExpr(
+			.Call(callee: callee, args: move args, names: move names, rest: .None),
+			span,
+		)
+	}
+
+	/// `value.appendFitted(&var text#, width: …, fill: …, align: .Some(…))`:
+	/// a piece of an interpolation padded to its width.
+	var fn pushFitted(stmts: &var Vec<StmtId>, value: ExprId, fitting: Fitting) = {
+		val span = self.exprSpan(value)
+		val out = self.allocExpr(.Name(symbol: Symbol::text()), span)
+		val reference = self.allocExpr(.Unary(op: .RefVar, opSpan: span, operand: out), span)
+		val callee = self.allocExpr(
+			.Field(base: value, name: Name(sym: Symbol::appendFitted(), span: span)),
+			span,
+		)
+		val [width, fill, align] = Symbol::fittingOptions()
+		var args = Vec::of(own [reference, fitting.width])
+		var names: Vec<Option<Name>> = Vec::of(own [.None, .Some(Name(sym: width, span: span))])
+		if fitting.fill is .Some(given) {
+			args.push(given)
+			names.push(.Some(Name(sym: fill, span: span)))
+		}
+		if fitting.align is .Some(given) {
+			// The alignment said, where the parameter's `.None` lets the
+			// value choose.
+			val at = self.exprSpan(given)
+			val some = self.allocExpr(
+				.Path(
+					leadingDot: true,
+					segments: Vec::of(own [Name(sym: Symbol::some(), span: at)]),
+					typeArgs: .None,
+				),
+				at,
+			)
+			val wrapped = self.allocExpr(
+				.Call(
+					callee: some,
+					args: Vec::of(own [given]),
+					names: Vec::of(own [.None]),
+					rest: .None,
+				),
+				at,
+			)
+			args.push(wrapped)
+			names.push(.Some(Name(sym: align, span: span)))
+		}
+		val call = self.allocExpr(
+			.Call(callee: callee, args: move args, names: move names, rest: .None),
+			span,
+		)
+		stmts.push(self.allocStmt(.Expr(value: call), span))
+	}
+
+	var fn pushAppend(stmts: &var Vec<StmtId>, value: ExprId) = {
+		val span = self.exprSpan(value)
+		val out = self.allocExpr(.Name(symbol: Symbol::text()), span)
+		val reference = self.allocExpr(.Unary(op: .RefVar, opSpan: span, operand: out), span)
+		val callee = self.allocExpr(
+			.Field(base: value, name: Name(sym: Symbol::appendTo(), span: span)),
+			span,
+		)
+		val call = self.allocExpr(
+			.Call(
+				callee: callee,
+				args: Vec::of(own [reference]),
+				names: Vec::of(own [.None]),
+				rest: .None,
+			),
+			span,
+		)
+		stmts.push(self.allocStmt(.Expr(value: call), span))
+	}
+
+	/// `text#.name(arg)`.
+	var fn methodCall(name: Symbol, arg: ExprId, span: Span): ExprId = {
+		val receiver = self.allocExpr(.Name(symbol: Symbol::text()), span)
+		val callee = self.allocExpr(.Field(base: receiver, name: Name(sym: name, span: span)), span)
+		return self.allocExpr(
+			.Call(
+				callee: callee,
+				args: Vec::of(own [arg]),
+				names: Vec::of(own [.None]),
+				rest: .None,
+			),
+			span,
+		)
+	}
+
+	var fn primary(): ExprId = {
+		val start = self.span()
+		val kind: ExprKind = match self.peek() {
+			.Int => {
+				val span = self.bump()
+				.Int(value: self.intValue(span))
+			}
+			.Float => {
+				val span = self.bump()
+				// The lexer has already validated the form.
+				val written = self.text(span).replace("_", by: "")
+				.Float(
+					value: match written.toFloat() {
+						.Ok(value) => value
+						.Err(.TooLarge) => f64::fromBits(INFINITY_BITS)
+						.Err(_) => 0.0
+					},
+				)
+			}
+			.Str(symbol) => {
+				self.bump()
+				ExprKind::Str(symbol: symbol)
+			}
+			// `'x'`.
+			.Char(value) => {
+				self.bump()
+				ExprKind::Char(value: value)
+			}
+			// `b'x'`.
+			.Byte(value) => {
+				self.bump()
+				ExprKind::Byte(value: value)
+			}
+			// `"a\(x)b"`: a `String` built by pushes.
+			.StrStart(symbol) => return self.interpolation(symbol)
+			.Null => {
+				self.bump()
+				ExprKind::Null
+			}
+			.True => {
+				self.bump()
+				ExprKind::Bool(value: true)
+			}
+			.False => {
+				self.bump()
+				ExprKind::Bool(value: false)
+			}
+			// A leading `.` names a variant of the expected enum.
+			.Dot => return self.dotPathExpr()
+			.Ident(symbol) => return self.identExpr(symbol)
+			// `self` is a method's receiver.
+			.SelfKw => {
+				self.bump()
+				ExprKind::SelfRef
+			}
+			.LBracket => return self.arrayLit()
+			// A loop where a value stands: the checker says it is
+			// collected with `own for`.
+			.For => return self.element()
+			.LBrace => .Block(block: self.block())
+			.If => return self.ifExpr()
+			.Assert(message) => return self.assertExpr(message)
+			.Match => return self.matchExpr()
+			.LParen if self.looksLikeLambda() => return self.lambda()
+			.LParen => {
+				val open = self.bump()
+				// `(a, b)` is a tuple, and `(a)` is parentheses around
+				// one expression.
+				val (elems, comma) = self.inParens((p) => {
+					var elems: Vec<ExprId> = Vec()
+					if p.at(.RParen) then return (move elems, false)
+					elems.push(p.expr())
+					var comma = false
+					while p.eat(.Comma) {
+						comma = true
+						if p.at(.RParen) then break
+						elems.push(p.expr())
+					}
+					return (move elems, comma)
+				})
+				self.expectClosing(.RParen, open)
+				if elems.len() == 1 && !comma {
+					.Paren(inner: elems[0])
+				} else {
+					val span = start.to(self.prevSpan())
+					match self.tupleName(elems.len(), span, "expression") {
+						.Some(name) => self.tupleLit(name, move elems, span)
+						.None => .Error
+					}
+				}
+			}
+			_ => {
+				val diagnostic = self.expected("an expression")
+				self.report(move diagnostic)
+				return self.errorExpr()
+			}
+		}
+		val span = start.to(self.prevSpan())
+		return self.allocExpr(move kind, span)
+	}
+
+	/// Whether the `<` `n` tokens ahead starts type arguments rather than a
+	/// comparison (grammar R7): the tokens up to its matching
+	/// `>` can be types, and the token after that is `(`, `::`, a `{` that
+	/// starts a struct literal, or something no operand can start, as after
+	/// a function named as a value: `)`, `,`, `]`, `}`, `;` or the end of
+	/// the line. No correct program reads differently, since `bool` values
+	/// cannot be ordered, neither functions nor types can be compared, and a
+	/// comparison needs a right operand.
+	var fn typeArgsAt(n: i64): bool = {
+		if self.nth(n) != .Lt then return false
+		// `<<` is a shift, whatever follows.
+		if self.pos + n + 1 < self.tokens.len() {
+			val open = self.tokens[self.pos + n]
+			val next = self.tokens[self.pos + n + 1]
+			if next.kind == .Lt && next.span.lo == open.span.hi then return false
+		}
+		// Each token must be able to follow the one before it in a type, so
+		// that `a < xs[i], c > (d)` or `a < (b), c > (d)` stay comparisons.
+		// A `(` starts a function type, whose `)` must be followed by `=>`.
+		var angles = 0
+		var brackets = 0
+		// The parentheses open here, and whether each holds a comma, which
+		// is what tells a tuple type from a function type's parameters.
+		// `tuple` is set while the `)` just read closed
+		// one, since that `)` ends a type where a function type's does not.
+		var parens: Vec<bool> = Vec()
+		var tuple = false
+		var prev = TokenKind::Eof
+		var i = n
+		while true {
+			val kind = self.nth(i)
+			val ends = endsType(prev) || tuple
+			var fits = match kind {
+				.Lt if i == n => true
+				.Lt => prev is .Ident(..) | .Own
+				.Gt => ends
+				// A type, or a parameter's name.
+				.Ident(..) => startsType(prev) || prev == .ColonColon
+				.ColonColon => prev is .Ident(..)
+				.Comma => ends
+				.Amp | .Own | .LBracket | .LParen => startsType(prev)
+				.Var => prev == .Amp
+				.RParen => !parens.isEmpty() && (prev == .LParen || ends)
+				.Colon => !parens.isEmpty() && prev is .Ident(..)
+				.FatArrow => prev == .RParen
+				.Semi => brackets > 0 && endsType(prev)
+				.Int => prev == .Semi
+				.RBracket => brackets > 0 && (prev == .Int || endsType(prev))
+				_ => false
+			}
+			// A function type's `)` is followed by `=>`; a tuple's ends the
+			// type, so `Vec<(A, B)>` and `Map<(A, B), C>` read as types
+			// while `a < (b), c > (d)` stays a comparison.
+			fits = fits && (prev != .RParen || kind == .FatArrow || tuple)
+			if !fits then return false
+			tuple = false
+			match kind {
+				.Lt => angles += 1
+				.Gt => {
+					angles -= 1
+					if angles == 0 then break
+				}
+				.LBracket => brackets += 1
+				.RBracket => brackets -= 1
+				.LParen => parens.push(false)
+				.Comma => if !parens.isEmpty() then parens[parens.len() - 1] = true
+				.RParen => tuple = parens.pop().unwrapOr(false)
+				_ => {}
+			}
+			prev = kind
+			i += 1
+		}
+		return match self.nth(i + 1) {
+			.LParen | .ColonColon => true
+			.LBrace => !self.noStruct && !self.lineBreakAt(i + 1)
+			.RParen | .Comma | .RBracket | .RBrace | .Semi | .Eof => true
+			_ => self.lineBreakAt(i + 1)
+		}
+	}
+
+	/// A call's arguments, and its `..base`, which comes last and once.
+	var fn restLast(args: Vec<CallArg>): (Vec<(Option<Name>, ExprId)>, Option<ExprId>) = {
+		var plain: Vec<(Option<Name>, ExprId)> = Vec()
+		var rest: Option<(ExprId, Span)> = .None
+		for arg in move args {
+			match move arg {
+				.Plain(name, value) => {
+					if rest is .Some((_, dots)) {
+						val diagnostic = Diagnostic::error(
+							REST_NOT_LAST,
+							"`..` must come last in a call",
+							self.exprSpan(value),
+							"after `..`",
+						).withSecondary(dots, "the remaining fields").withHelp(
+							"`..base` stands for every field the call does not name",
+						)
+						self.report(move diagnostic)
+					}
+					plain.push((name, value))
+				}
+				.Rest(value, dots) => match rest {
+					.Some((_, first)) => {
+						val diagnostic = Diagnostic::error(
+							REST_NOT_LAST,
+							"a call takes one `..`",
+							dots,
+							"a second `..`",
+						).withSecondary(first, "the first one")
+						self.report(move diagnostic)
+					}
+					.None => rest = .Some((value, dots))
+				}
+			}
+		}
+		val restValue: Option<ExprId> = match rest {
+			.Some((value, _)) => .Some(value)
+			.None => .None
+		}
+		return (move plain, restValue)
+	}
+
+	/// Reports a positional argument after a named one (E0122).
+	var fn positionalAfterNamed(args: &[(Option<Name>, ExprId)]) = {
+		var firstNamed = -1
+		for (i, arg) in args.forwards().enumerate() {
+			if arg.0.isSome() {
+				firstNamed = i
+				break
+			}
+		}
+		if firstNamed < 0 then return
+		for i in firstNamed..args.len() {
+			val (name, value) = args[i]
+			if name.isNone() {
+				val .Some(named) = args[firstNamed].0 else {
+					panic("found above")
+				}
+				val diagnostic = Diagnostic::error(
+					POSITIONAL_AFTER_NAMED,
+					"a positional argument follows a named one",
+					self.exprSpan(value),
+					"positional",
+				).withSecondary(named.span, "named").
+					withHelp("name this argument too, or move it before the named ones").
+					withNote("positional arguments come first, then named ones in any order")
+				self.report(move diagnostic)
+				return
+			}
+		}
+	}
+
+	/// A `(` that opens a lambda's parameters rather than a parenthesized
+	/// expression: what follows its `)` is `=>`, or `:` and a type and then
+	/// `=>`. In a guard, the `=>` after a `)` is the arm's.
+	var fn looksLikeLambda(): bool =
+		!self.guard &&
+		(self.parenBefore(
+			// `(x): i64 => …`, a result type between the two.
+			.FatArrow,
+		) ||
+			self.parenBefore(.Colon))
+
+	/// Whether the token after the `)` that closes the `(` the parser is at
+	/// is `token`. It is what tells a lambda from a parenthesized
+	/// expression, and a function type from a tuple.
+	var fn parenBefore(token: TokenKind): bool = {
+		var depth = 0
+		var n = 0
+		while true {
+			match self.nth(n) {
+				.LParen | .LBracket | .LBrace => depth += 1
+				.RParen | .RBracket | .RBrace => {
+					depth -= 1
+					if depth == 0 then break
+				}
+				.Eof => return false
+				_ => {}
+			}
+			n += 1
+		}
+		return self.nth(n + 1) == token
+	}
+
+	/// `pair.0`, and `pair.0.1` — which the lexer reads as one float,
+	/// since `0.1` is a number wherever else it appears.
+	var fn tupleIndex(base: ExprId): Option<ExprKind> = {
+		val span = self.span()
+		val text = self.text(span)
+		val float = self.at(.Float)
+		self.bump()
+		var at = base
+		var kind: Option<ExprKind> = .None
+		for (n, digits) in text.split(".").enumerate() {
+			// `pair.0.` is a field access with its name left out, and
+			// `pair.1e3` is not an index at all.
+			val index = if n < 2 then parseIndex(digits) else -1
+			if index < 0 || index >= MAX_TUPLE {
+				var diagnostic = Diagnostic::error(
+					TUPLE_ARITY,
+					"`\(text)` is not a tuple's element",
+					span,
+					"not an element",
+				).withNote("a tuple's elements are reached by position, `pair.0` to `pair.3`")
+				if float && n == 0 then
+					diagnostic = diagnostic.withHelp(
+						"write the two positions in parentheses: `(pair.0).1`",
+					)
+				self.report(move diagnostic)
+				return .None
+			}
+			if kind is .Some(made) {
+				val whole = self.exprSpan(at).to(span)
+				at = self.allocExpr(made.clone(), whole)
+			}
+			kind = .Some(.Field(base: at, name: Name(sym: Symbol::tupleField(index), span: span)))
+		}
+		return move kind
+	}
+
+	/// `(a, b)`, which is the prelude's `Tuple2(a, b)`. The sugar is written
+	/// out here, so that a tuple is checked, moved, dropped and generated as
+	/// the struct it is.
+	var fn tupleLit(name: Symbol, elems: Vec<ExprId>, span: Span): ExprKind = {
+		val callee = self.allocExpr(.Name(symbol: name), span)
+		val names: Vec<Option<Name>> = Vec::filled(elems.len(), .None)
+		return .Call(callee: callee, args: move elems, names: move names, rest: .None)
+	}
+
+	/// The prelude's `TupleN` for a tuple of `n` elements, or a report that
+	/// there are too few or too many.
+	var fn tupleName(n: i64, span: Span, what: str): Option<Symbol> = {
+		if n >= MIN_TUPLE && n <= MAX_TUPLE then return .Some(Symbol::tuple(n))
+		var label = "too many elements"
+		var help = String::of("more than \(MAX_TUPLE) of them is a struct, whose fields have names; this one has \(n)")
+		if n < MIN_TUPLE {
+			label = "a tuple of one element or none"
+			// A pattern is not written in parentheses: a name of its
+			// own binds the whole value.
+			help = if what == "pattern" then String::of("a name on its own binds the whole value")
+			else "`(x)` is one \(what) in parentheses, and nothing at all is `void`"
+		}
+		val diagnostic = Diagnostic::error(
+			TUPLE_ARITY,
+			"a tuple has \(MIN_TUPLE) to \(MAX_TUPLE) elements",
+			span,
+			label,
+		).withHelp(move help).withNote(
+			"the prelude declares the tuples, and `(a, b)` is their sugar",
+		)
+		self.report(move diagnostic)
+		return .None
+	}
+
+	/// `(a, b: B): R => body`. A parameter's type, and the
+	/// result's, may be left out where the expected type gives them.
+	var fn lambda(): ExprId = {
+		val open = self.bump()
+		val (params, _) = self.list(
+			open,
+			.RParen,
+			"a parameter",
+			(kind) => isIdent(kind) || kind == .Underscore,
+			(p): Option<LambdaParam> => {
+				val .Some(name) = p.paramName("a parameter name") else {
+					return .None
+				}
+				val ty: Option<TypeId> = if p.eat(.Colon) then .Some(p.ty()) else .None
+				return .Some(LambdaParam(name: name, ty: ty, span: name.span.to(p.prevSpan())))
+			},
+		)
+		val ret: Option<TypeId> = if self.eat(.Colon) then .Some(self.ty()) else .None
+		val body = if self.expect(.FatArrow) then self.expr() else self.errorExpr()
+		val span = open.to(self.exprSpan(body))
+		return self.allocExpr(.Lambda(params: move params, ret: ret, body: body), span)
+	}
+
+	/// An expression starting with an identifier: a name, a struct literal or
+	/// a variant literal, decided by the next token.
+	var fn identExpr(symbol: Symbol): ExprId = {
+		val name = Name(sym: symbol, span: self.span())
+		// A `{` on the next line starts a block, not a struct literal.
+		val brace = self.nth(1) == .LBrace && !self.lineBreakAt(1)
+		val next = self.nth(1)
+		if next == .ColonColon then return self.pathExpr(name)
+		// `name<A, B>`, followed by a call or `::`.
+		if next == .Lt && self.typeArgsAt(1) then return self.pathExpr(name)
+		// `Row { … }`, a struct written with braces.
+		// In a condition, `IDENT {` is the name and the block, but a
+		// block does not start with `IDENT :`, so that one was meant as
+		// a struct too.
+		if brace && (!self.noStruct || (isIdent(self.nth(2)) && self.nth(3) == .Colon)) {
+			self.bump()
+			return self.braceLiteral(Vec::of(own [name]), .None)
+		}
+		self.bump()
+		return self.allocExpr(.Name(symbol: symbol), name.span)
+	}
+
+	/// `Row { name: x, size }`: a struct written with braces, which is
+	/// refused (E0133), with a fix that writes the call.
+	/// The call it stands for is what the parser goes on with, so what is
+	/// inside it is checked as well.
+	var fn braceLiteral(path: Vec<Name>, typeArgs: Option<TypeArgs>): ExprId = {
+		val open = self.bump()
+		val list = BraceList(sep: .Comma, what: "a field", items: "fields", code: SEPARATOR)
+		val (elems, close) = self.braceList(
+			open,
+			list,
+			(kind) => isIdent(kind) || kind == .DotDot,
+			(p) => p.fieldElem(),
+		)
+		var fields: Vec<BraceField> = Vec()
+		var rest: Option<ExprId> = .None
+		for elem in move elems {
+			match move elem {
+				.Init(field) => fields.push(move field)
+				.Rest(value) => if rest.isNone() then rest = .Some(value)
+			}
+		}
+		val start = path[0].span
+		val span = start.to(close)
+		// The call, written from what was written.
+		val headEnd = match typeArgs {
+			.Some(args) => args.span
+			.None => path[path.len() - 1].span
+		}
+		var parts: Vec<String> = Vec()
+		for field in fields {
+			if field.shorthand {
+				val written = self.text(field.name.span)
+				parts.push("\(written): \(written)")
+			} else {
+				parts.push(String::of(self.text(field.span)))
+			}
+		}
+		if rest is .Some(value) then parts.push("..\(self.text(self.exprSpan(value)))")
+		val call = "\(self.text(start.to(headEnd)))(\(parts.join(", ")))"
+		val diagnostic = Diagnostic::error(
+			BRACE_LITERAL,
+			"a struct is built with a call",
+			span,
+			"written with braces",
+		).withNote(
+			"a struct is built as a variant is: its name, and its fields as a call's arguments, by position and then by name",
+		).withFix("write `\(call)`", own [Edit::replace(span, call.clone())])
+		self.report(move diagnostic)
+		val callee =
+			if path.len() == 1 && typeArgs.isNone() then
+				self.allocExpr(.Name(symbol: path[0].sym), path[0].span)
+			else self.allocExpr(
+				.Path(leadingDot: false, segments: move path, typeArgs: move typeArgs),
+				start.to(headEnd),
+			)
+		var names: Vec<Option<Name>> = Vec()
+		var args: Vec<ExprId> = Vec()
+		for field in fields {
+			names.push(.Some(field.name))
+			args.push(field.value)
+		}
+		return self.allocExpr(
+			.Call(callee: callee, args: move args, names: move names, rest: rest),
+			span,
+		)
+	}
+
+	/// One element inside a struct literal's braces: a field, or `..value`.
+	var fn fieldElem(): Option<FieldElem> = {
+		if self.at(.DotDot) {
+			self.bump()
+			return .Some(.Rest(value: self.expr()))
+		}
+		return .Some(.Init(field: self.fieldInit()?))
+	}
+
+	var fn fieldInit(): Option<BraceField> = {
+		val name = self.name("a field name")?
+		// `Point { x, y }`: a field with nothing after it takes the value of
+		// the variable with its name.
+		val shorthand = self.peek() is .Comma | .RBrace || self.lineBreak()
+		val value = if self.eat(.Colon) {
+			self.expr()
+		} else {
+			if !shorthand {
+				val diagnostic = self.expected("`:` and a value")
+				self.report(move diagnostic)
+			}
+			self.allocExpr(.Name(symbol: name.sym), name.span)
+		}
+		return .Some(BraceField(
+			name: name,
+			value: value,
+			span: name.span.to(self.exprSpan(value)),
+			shorthand: shorthand,
+		))
+	}
+
+	/// `a::b::c`, a qualified name whose meaning is decided when it is
+	/// resolved. Any arguments belong to the call
+	/// around it.
+	var fn pathExpr(first: Name): ExprId = {
+		val start = self.bump()
+		var segments = Vec::of(own [first])
+		var typeArgs: Option<TypeArgs> = .None
+		while true {
+			// `<A, B>`: type arguments for the segment before it.
+			if self.typeArgsAt(0) then self.pathTypeArgs(&var typeArgs, segments.len() - 1)
+			if !self.eat(.ColonColon) then break
+			// `::<A, B>`, as Rust writes it.
+			if self.at(.Lt) {
+				val colons = self.prevSpan()
+				val diagnostic = Diagnostic::error(
+					TYPE_ARGS_COLONS,
+					"type arguments are written without `::`",
+					colons,
+					"not needed",
+				).withNote(
+					"after a name, `<` starts type arguments when `(`, `{` or `::` follows the matching `>`",
+				).withFix("remove the `::`", own [Edit::replace(colons, "")])
+				self.report(move diagnostic)
+				self.pathTypeArgs(&var typeArgs, segments.len() - 1)
+				if !self.eat(.ColonColon) then break
+			}
+			match self.name("a name after `::`") {
+				.Some(name) => segments.push(name)
+				.None => return self.allocExpr(.Error, start.to(self.prevSpan()))
+			}
+		}
+		// `pkg::Point { … }`, as an unqualified one.
+		if self.at(.LBrace) && !self.noStruct && !self.lineBreak() then
+			return self.braceLiteral(move segments, move typeArgs)
+		val span = start.to(self.prevSpan())
+		return self.allocExpr(
+			.Path(leadingDot: false, segments: move segments, typeArgs: move typeArgs),
+			span,
+		)
+	}
+
+	/// The type arguments at `<` in a path, for the segment `after`. A path
+	/// has one list of them.
+	var fn pathTypeArgs(typeArgs: &var Option<TypeArgs>, after: i64) = {
+		val (args, span) = self.typeArgList()
+		match typeArgs {
+			.Some(earlier) => {
+				val diagnostic = Diagnostic::error(
+					EXPECTED,
+					"a path has one list of type arguments",
+					span,
+					"a second list",
+				).withSecondary(earlier.span, "the first list")
+				self.report(move diagnostic)
+			}
+			.None => typeArgs = .Some(TypeArgs(after: after, args: move args, span: span))
+		}
+	}
+
+	/// `.Variant`, whose enum comes from the expected type.
+	var fn dotPathExpr(): ExprId = {
+		val start = self.bump()
+		val .Some(name) = self.name("a variant name") else {
+			return self.allocExpr(.Error, start.to(self.prevSpan()))
+		}
+		val span = start.to(self.prevSpan())
+		return self.allocExpr(
+			.Path(leadingDot: true, segments: Vec::of(own [name]), typeArgs: .None),
+			span,
+		)
+	}
+
+	var fn arrayLit(): ExprId = {
+		val open = self.bump()
+		val kind = self.inParens(
+			(p) => {
+				if p.eat(.RBracket) then return ExprKind::Array(elems: Vec())
+				val first = p.element()
+				if p.eat(.Semi) {
+					// A literal count is part of the array's type; any other is
+					// a length known only at run time.
+					val count =
+						if p.at(.Int) && p.nth(1) == .RBracket then
+							RepeatCount::Literal(count: p.intLiteral("a repeat count").unwrapOr(0))
+						else RepeatCount::Expr(count: p.expr())
+					p.expectClosing(.RBracket, open)
+					return ExprKind::ArrayRepeat(elem: first, count: count)
+				}
+				val (elems, _) = p.listAfter(
+					open,
+					.Some(first),
+					.RBracket,
+					"an element",
+					(t) => t == .For || canStartExpr(t),
+					(q) => .Some(q.element()),
+				)
+				return ExprKind::Array(elems: move elems)
+			},
+		)
+		val span = open.to(self.prevSpan())
+		return self.allocExpr(move kind, span)
+	}
+
+	/// An element of a list literal: a value, or `for x in xs { … }`,
+	/// whose `yield`s are its elements.
+	var fn element(): ExprId = {
+		if !self.at(.For) then return self.expr()
+		val start = self.bump()
+		val .Some((binding, source)) = self.forHeader() else {
+			return self.allocExpr(.Error, start)
+		}
+		val body = self.block()
+		val span = start.to(self.prevSpan())
+		return self.allocExpr(
+			.ForElement(binding: move binding, source: move source, body: move body),
+			span,
+		)
+	}
+
+	/// `assert(condition)`, or `assert(condition, "note")`.
+	/// The message a failure prints comes with the keyword's token, since
+	/// the lexer is what holds the interner.
+	var fn assertExpr(message: Option<Symbol>): ExprId = {
+		val start = self.bump()
+		if !self.at(.LParen) {
+			val diagnostic = self.expected("`(`").withNote(
+				"an assert is written as a call: `assert(condition)`",
+			)
+			self.report(move diagnostic)
+			return self.errorExpr()
+		}
+		val open = self.bump()
+		val (args, _) = self.inParens((p) => p.list(
+			open,
+			.RParen,
+			"the condition",
+			(kind) => canStartExpr(kind),
+			(q) => .Some(q.expr()),
+		))
+		val span = start.to(self.prevSpan())
+		if args.len() < 1 || args.len() > 2 {
+			val diagnostic = Diagnostic::error(
+				ASSERT_ARGUMENTS,
+				"`assert` takes a condition and a note, but \(args.len()) were given",
+				span,
+				"not a condition and a note",
+			).withNote("an assert is written `assert(condition)` or `assert(condition, \"note\")`")
+			self.report(move diagnostic)
+			return self.errorExpr()
+		}
+		val note: Option<ExprId> = if args.len() == 2 then .Some(args[1]) else .None
+		return self.allocExpr(.Assert(cond: args[0], note: note, message: message), span)
+	}
+
+	var fn ifExpr(): ExprId = self.ifInForm(.None)
+
+	/// `if c { … } else { … }`, or `if c then a else b`, whose branches are
+	/// one expression each. An `else if` chain takes one
+	/// form throughout: `chain` is the form of the `if` it continues.
+	var fn ifInForm(chain: Option<bool>): ExprId = {
+		val start = self.bump()
+		val cond = self.cond()
+		val thenAt: Option<Span> = if self.at(.Then) then .Some(self.span()) else .None
+		val thenForm = thenAt.isSome()
+		if chain is .Some(outer) && outer != thenForm then self.mixedChain(start, outer)
+		val thenBlock = match thenAt {
+			.Some(thenSpan) => {
+				self.bump()
+				self.oneExpressionBranch(thenSpan)
+			}
+			.None => self.block()
+		}
+		// `else` continues across a line break: it cannot begin a statement.
+		var elseBranch: Option<ExprId> = .None
+		if self.at(.Else) {
+			val elseSpan = self.bump()
+			if self.at(.If) {
+				elseBranch = .Some(self.ifInForm(.Some(thenForm)))
+			} else if thenForm && self.at(.LBrace) {
+				val diagnostic = Diagnostic::error(
+					EXPECTED,
+					"a `then` form's `else` is one expression, not a block",
+					self.span(),
+					"a block",
+				).withHelp(
+					"where a branch is more than one expression, write the whole `if` with braces: `if c { … } else { … }`",
+				).withNote("one `if` takes one form: `then` and expressions, or braces and blocks")
+				self.report(move diagnostic)
+				elseBranch = .Some(self.blockExpr(self.block()))
+			} else if thenForm {
+				elseBranch = .Some(self.blockExpr(self.oneExpressionBranch(elseSpan)))
+			} else if !self.at(.LBrace) && canStartExpr(self.peek()) {
+				val diagnostic = Diagnostic::error(
+					EXPECTED,
+					"a braced `if`'s `else` is a block",
+					self.span(),
+					"an expression without braces",
+				).withHelp(
+					"put the branch in braces, or write the whole `if` as `if c then a else b`",
+				).withNote("one `if` takes one form: `then` and expressions, or braces and blocks")
+				self.report(move diagnostic)
+				elseBranch = .Some(self.blockExpr(self.oneExpressionBranch(elseSpan)))
+			} else {
+				elseBranch = .Some(self.blockExpr(self.block()))
+			}
+		}
+		val span = start.to(self.prevSpan())
+		return self.allocExpr(
+			.If(cond: cond, thenBlock: move thenBlock, elseBranch: elseBranch),
+			span,
+		)
+	}
+
+	/// A block as an expression, at the block's own span.
+	var fn blockExpr(block: Block): ExprId = {
+		val span = block.span
+		return self.allocExpr(.Block(block: move block), span)
+	}
+
+	/// A branch of a `then` form: one expression, or a jump — `return`,
+	/// `break`, `continue` — held as a block of that one statement, which
+	/// is what the braced form's branch would be. `after`
+	/// is the `then` or `else` before it, which a block after it is told
+	/// to drop.
+	var fn oneExpressionBranch(after: Span): Block = {
+		val start = self.span()
+		if self.at(.LBrace) {
+			val diagnostic = Diagnostic::error(
+				EXPECTED,
+				"`then` is followed by one expression, not a block",
+				start,
+				"a block",
+			).withFix("drop `then`, for the braced form", own [Edit::replace(after, "")]).withNote(
+				"one `if` takes one form: `then` and expressions, or braces and blocks",
+			)
+			self.report(move diagnostic)
+			return self.block()
+		}
+		var stmts: Vec<StmtId> = Vec()
+		match self.peek() {
+			.Return | .Break | .Continue => { if self.stmt() is .Some(stmt) then stmts.push(stmt) }
+			kind if canStartExpr(kind) => {
+				val value = self.expr()
+				val span = self.exprSpan(value)
+				stmts.push(self.allocStmt(.Expr(value: value), span))
+			}
+			_ => {
+				val diagnostic = self.expected("an expression after `then`")
+				self.report(move diagnostic)
+			}
+		}
+		return Block(stmts: move stmts, span: start.to(self.prevSpan()))
+	}
+
+	/// An `else if` whose form is not the chain's: a chain is one `if`
+	/// with several branches, and takes one form.
+	var fn mixedChain(at: Span, outerThen: bool) = {
+		val (this, that) = if outerThen then ("braces", "`then`") else ("`then`", "braces")
+		val diagnostic = Diagnostic::error(
+			EXPECTED,
+			"this `else if` is written with \(this), and the `if` it continues with \(that)",
+			at,
+			"the other form",
+		).withHelp("write every branch of the chain one way").withNote(
+			"an `else if` chain is one `if` with several branches, and takes one form throughout",
+		)
+		self.report(move diagnostic)
+	}
+
+	var fn matchExpr(): ExprId = {
+		val start = self.bump()
+		val scrutinee = self.cond()
+		var arms: Vec<Arm> = Vec()
+		if self.at(.LBrace) {
+			val open = self.bump()
+			val list = BraceList(
+				sep: .Comma,
+				what: "a match arm",
+				items: "match arms",
+				code: MATCH_ARM_SEPARATOR,
+			)
+			val (read, _) = self.braceList(
+				open,
+				list,
+				(kind) => canStartPattern(kind),
+				(p) => .Some(p.arm()),
+			)
+			arms = move read
+		} else {
+			val diagnostic = self.expected("`{`")
+			self.report(move diagnostic)
+		}
+		val span = start.to(self.prevSpan())
+		return self.allocExpr(.Match(scrutinee: scrutinee, arms: move arms), span)
+	}
+}
+
+/// Whether a token of a type may come after `prev`: what begins a type.
+fn startsType(prev: TokenKind): bool =
+	prev is .Lt | .Comma | .Amp | .Var | .LParen | .Colon | .LBracket | .FatArrow
+
+/// Whether a type may end at `prev`.
+fn endsType(prev: TokenKind): bool = prev is .Ident(..) | .Gt | .RBracket
+
+/// A line of a literal's text without the space and tabs at its ends.
+fn trimLineSpace(line: str): str = {
+	var lo = 0
+	var hi = line.len()
+	while lo < hi && line[lo] is b' ' | b'\t' | b'\r' {
+		lo += 1
+	}
+	while hi > lo && line[hi - 1] is b' ' | b'\t' | b'\r' {
+		hi -= 1
+	}
+	return line[lo..hi]
+}
+
+/// `digits` as a position, Rust's `usize` parse: decimal digits, a `+`
+/// before them allowed; -1 where it is not one.
+fn parseIndex(digits: str): i64 = {
+	var at = if digits.startsWith("+") then 1 else 0
+	if at >= digits.len() then return -1
+	var value = 0
+	while at < digits.len() {
+		if !(digits[at] is b'0'..=b'9') then return -1
+		// Past what any index could be.
+		if value > 1000000000 then return 1000000000
+		value = value * 10 + (digits[at] - b'0') as i64
+		at += 1
+	}
+	return value
+}

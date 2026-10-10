@@ -1,0 +1,549 @@
+// What a place in a checked program names: where it was declared, and what
+// to show for it.
+//
+// Every expression keeps the span it was written at, so the smallest one
+// around a place says what is there: a local, a function called, a field, a
+// struct built. The names that leave no expression — a type in a signature,
+// a constant — the checker records in the program's `names`, and each
+// declaration answers for its own name.
+
+import hir
+import hir::{ConstId, EnumId, Expr, ExprId, FnId, GlobalId, LocalId, Program, StructId, Ty, UNIT}
+import syntax::{Interner, Span, Symbol}
+
+/// What a place names. Not this module's `Target`, which a program is
+/// compiled for.
+@derive(Clone, Eq)
+pub enum Meant {
+	Local(id: FnId, local: LocalId)
+	Fn(id: FnId)
+	Field(owner: StructId, index: u32)
+	Struct(id: StructId)
+	Enum(id: EnumId)
+	Variant(id: EnumId, index: u32)
+	Type(ty: Ty)
+	Const(id: ConstId)
+	Global(id: GlobalId)
+	/// A value with no name, as a literal: only its type.
+	Value(ty: Ty)
+}
+
+/// What is at a place: the span that holds it, what it names, where that
+/// was declared, and what it is, as Wip would write it.
+pub struct Hit {
+	pub span: Span
+	pub target: Meant
+	pub declared: Option<Span>
+	pub shown: String
+}
+
+/// A place in a program that names something: the span that holds the
+/// name, what it names, and the spans inside it that are not the name — a
+/// call's arguments, a field's value — so the name can be found in it.
+struct Naming {
+	span: Span
+	target: Meant
+	inner: Vec<Span>
+}
+
+/// Every place in `program` that names something, in the order an editor
+/// is answered from: the names that leave no expression, then each
+/// function's name, locals and expressions, then the defaults written in
+/// declarations, then the declarations themselves.
+fn places(program: &Program, interner: &Interner): Vec<Naming> = {
+	var found: Vec<Naming> = Vec()
+	for (span, named) in program.names {
+		val target: Option<Meant> = match named {
+			.Type(ty) => .Some(.Type(ty))
+			.Const(id) => .Some(.Const(id))
+			.Owner(.Struct(id)) => .Some(.Struct(id))
+			.Owner(.Enum(id)) => .Some(.Enum(id))
+			.Owner(.Builtin(..)) => .None
+			.Variant(id, variant) => .Some(.Variant(id: id, index: variant))
+		}
+		if target is .Some(target) then found.push(Naming(span: span, target: target, inner: Vec()))
+	}
+	for id in program.fns.ids() {
+		val def = &program.fns[id]
+		// An instance is its generic function again, with the types filled
+		// in; what the compiler wrote has no place in the source, and what
+		// `@derive` wrote is placed at the annotation.
+		if def.instanceOf.isSome() || def.generated.isSome() || program.derived.contains(&id) then
+			continue
+		// A lambda's function has no name, nor has a default's.
+		if !def.isLambda && !interner.isHidden(def.name) then
+			found.push(Naming(span: def.nameSpan, target: .Fn(id), inner: Vec()))
+		val .Some(body) = def.body else {
+			continue
+		}
+		for local in body.locals.ids() {
+			val l = &body.locals[local]
+			if !interner.isHidden(l.name) then
+				found.push(Naming(span: l.span, target: .Local(id: id, local: local), inner: Vec()))
+		}
+		exprPlaces(&program, &interner, .Some(id), &body.exprs, &var found)
+	}
+	// What a field or a parameter is when it is not given: written in the
+	// declaration, and checked on its own. One that is code is a function of
+	// its own, walked with the rest.
+	for def in program.structs {
+		for field in def.fields {
+			if field.default is .Some(.Constant(exprs, ..)) then
+				exprPlaces(&program, &interner, .None, &exprs, &var found)
+		}
+	}
+	for def in program.enums {
+		for variant in def.variants {
+			for field in variant.fields {
+				if field.default is .Some(.Constant(exprs, ..)) then
+					exprPlaces(&program, &interner, .None, &exprs, &var found)
+			}
+		}
+	}
+	for def in program.fns {
+		for param in def.params {
+			if param.default is .Some(.Constant(exprs, ..)) then
+				exprPlaces(&program, &interner, .None, &exprs, &var found)
+		}
+	}
+	for id in program.structs.ids() {
+		val def = &program.structs[id]
+		found.push(Naming(span: def.span, target: .Struct(id), inner: Vec()))
+		for (i, field) in def.fields.forwards().enumerate() {
+			found.push(Naming(
+				span: field.span,
+				target: .Field(owner: id, index: i as u32),
+				inner: Vec(),
+			))
+		}
+	}
+	for id in program.enums.ids() {
+		val def = &program.enums[id]
+		found.push(Naming(span: def.span, target: .Enum(id), inner: Vec()))
+		for (i, variant) in def.variants.forwards().enumerate() {
+			found.push(Naming(
+				span: variant.span,
+				target: .Variant(id: id, index: i as u32),
+				inner: Vec(),
+			))
+		}
+	}
+	for id in program.consts.ids() {
+		found.push(Naming(span: program.consts[id].span, target: .Const(id), inner: Vec()))
+	}
+	for id in program.globals.ids() {
+		found.push(Naming(span: program.globals[id].span, target: .Global(id), inner: Vec()))
+	}
+	return move found
+}
+
+/// The places the expressions of one body, or of one default, name
+/// something; `owner` is the function whose locals they are.
+fn exprPlaces(
+	program: &Program,
+	interner: &Interner,
+	owner: Option<FnId>,
+	exprs: &hir::Arena<Expr>,
+	found: &var Vec<Naming>,
+) = {
+	for id in exprs.ids() {
+		val e = &exprs[id]
+		val named: (Meant, Vec<Span>) = match e.kind {
+			.Local(local) => {
+				val .Some(fnId) = owner else {
+					continue
+				}
+				val hidden = match program.fns[fnId].body {
+					.Some(body) => interner.isHidden(body.locals[local].name)
+					.None => false
+				}
+				if hidden then continue
+				(.Local(id: fnId, local: local), Vec())
+			}
+			.FnRef(id: fnId, ..) => (.Fn(fnId), Vec())
+			.Call(callee, args, ..) => (.Fn(callee), spansOf(&exprs, &args))
+			.DynCall(interfaceId, index, args, ..) => {
+				val methods = &program.interfaces[interfaceId].methods
+				if index as i64 >= methods.len() then continue
+				(.Fn(methods[index as i64].id), spansOf(&exprs, &args))
+			}
+			.Field(base, index) => match program.types.kind(exprs[base].ty) {
+				.Struct(id: structId, ..) => (
+					.Field(owner: structId, index: index),
+					Vec::of(own [exprs[base].span]),
+				)
+				_ => continue
+			}
+			.Struct(id: structId, fields, ..) => (.Struct(structId), spansOf(&exprs, &fields))
+			.Union(id: structId, field) => {
+				var inner: Vec<Span> = Vec()
+				if field is .Some((_, value)) then inner.push(exprs[value].span)
+				(.Struct(structId), move inner)
+			}
+			.Variant(id: enumId, variant, args, ..) => (
+				.Variant(id: enumId, index: variant),
+				spansOf(&exprs, &args),
+			)
+			// A variant a pattern names: in `x is .Some(a)`, and in a
+			// `match`'s arms, outside their guards and bodies.
+			.Is(scrutinee, pattern: .Variant(variant, ..)) => match enumOf(
+				&program,
+				exprs[scrutinee].ty,
+			) {
+				.Some(enumId) => (
+					.Variant(id: enumId, index: variant),
+					Vec::of(own [exprs[scrutinee].span]),
+				)
+				.None => continue
+			}
+			.Match(scrutinee, arms) => {
+				if enumOf(&program, exprs[scrutinee].ty) is .Some(enumId) {
+					for arm in arms {
+						if arm.pattern is .Variant(variant, ..) {
+							var inner = Vec::of(own [exprs[arm.body].span])
+							if arm.guard is .Some(guard) then inner.push(exprs[guard].span)
+							found.push(Naming(
+								span: arm.span,
+								target: .Variant(id: enumId, index: variant),
+								inner: move inner,
+							))
+						}
+					}
+				}
+				continue
+			}
+			.Int(..) | .Float(..) | .Bool(..) | .Str(..) => (.Value(e.ty), Vec())
+			_ => continue
+		}
+		val (target, inner) = move named
+		found.push(Naming(span: e.span, target: move target, inner: move inner))
+	}
+}
+
+/// The spans of expressions.
+fn spansOf(exprs: &hir::Arena<Expr>, ids: &[ExprId]): Vec<Span> = {
+	var spans: Vec<Span> = Vec()
+	for id in ids {
+		spans.push(exprs[id].span)
+	}
+	return move spans
+}
+
+/// The enum a scrutinee of this type is, through references.
+fn enumOf(program: &Program, ty: Ty): Option<EnumId> = match program.types.kind(ty) {
+	.Enum(id, ..) => .Some(id)
+	.Ref(inner, ..) | .Own(inner) => enumOf(&program, inner)
+	_ => .None
+}
+
+/// What is at `pos`, a place in `program`'s sources.
+pub fn hitAt(program: &Program, interner: &Interner, pos: u32): Option<Hit> = {
+	var best: Option<(Span, Meant)> = .None
+	for place in places(&program, &interner) {
+		val inside = place.span.lo <= pos && pos <= place.span.hi
+		// Of two the same size, the later: an expression is made after the
+		// ones inside it, and a value the checker filled in has the span of
+		// what it was filled into.
+		val smaller = match best {
+			.Some((b, _)) => place.span.hi - place.span.lo <= b.hi - b.lo
+			.None => true
+		}
+		if inside && smaller then best = .Some((place.span, place.target.clone()))
+	}
+	val .Some((span, target)) = best else {
+		return .None
+	}
+	val shown = Shown(program: &program, interner: &interner)
+	val (declared, text) = shown.target(target.clone())
+	return .Some(Hit(span: span, target: move target, declared: declared, shown: move text))
+}
+
+/// Every place in `program` that names `written`, declared at `declared`,
+/// the declaration among them: the span of the name itself, as a rename
+/// would replace it. What the compiler wrote for a declaration — an enum's
+/// `fromIndex` — shares its span but not its name, and is not counted.
+/// `sources` hold the text a span is in.
+pub fn referencesTo(
+	program: &Program,
+	interner: &Interner,
+	written: str,
+	declared: Span,
+	sources: &Sources,
+): Vec<Span> = {
+	val shown = Shown(program: &program, interner: &interner)
+	var found: Vec<Span> = Vec()
+	for place in places(&program, &interner) {
+		if shown.declared(place.target.clone()) != .Some(declared) then continue
+		val .Some(name) = shown.nameOf(place.target.clone()) else {
+			continue
+		}
+		if name != written then continue
+		val .Some((_, text, base)) = sources.of(place.span) else {
+			continue
+		}
+		if nameIn(text, base, place.span, name.toStr(), &place.inner) is .Some(nameSpan) then
+			found.push(nameSpan)
+	}
+	found.sortBy((a, b) => a.lo < b.lo || a.lo == b.lo && a.hi < b.hi)
+	found.dedup()
+	return move found
+}
+
+/// Where `name` is written in `span` of `text` (which begins at `base`), as
+/// a whole word, outside the spans `inner`.
+fn nameIn(text: str, base: u32, span: Span, name: str, inner: &[Span]): Option<Span> = {
+	if span.lo < base || span.hi < base then return .None
+	val lo = (span.lo - base) as i64
+	val hi = ((span.hi - base) as i64).min(text.len())
+	if lo > hi then return .None
+	val within = text[lo..hi]
+	var from = 0
+	while within[from..within.len()].find(name) is .Some(found) {
+		val i = from + found
+		from = i + 1
+		val before = lastCharOf(within[0..i])
+		val after = firstCharOf(within[i + name.len()..within.len()])
+		if before is .Some(c) && isWordChar(c) then continue
+		if after is .Some(c) && isWordChar(c) then continue
+		val at = span.lo + i as u32
+		val found = Span::new(at, at + name.len() as u32)
+		// An inner span that holds the whole span was not written inside it:
+		// the checker filled it in, as a field's default.
+		var nested = false
+		for s in inner {
+			if s.lo <= span.lo && span.hi <= s.hi then continue
+			if s.lo <= found.lo && found.hi <= s.hi then nested = true
+		}
+		return if nested then .None else .Some(found)
+	}
+	return .None
+}
+
+/// Whether a character may be part of a name.
+fn isWordChar(c: char): bool = c.isAlphanumeric() || c == '_'
+
+fn firstCharOf(text: str): Option<char> = if text.isEmpty() then .None else .Some(text.charAt(0).0)
+
+fn lastCharOf(text: str): Option<char> = {
+	if text.isEmpty() then return .None
+	var start = text.len() - 1
+	while start > 0 && (text[start] & 0xC0) == 0x80 {
+		start -= 1
+	}
+	return .Some(text.charAt(start).0)
+}
+
+/// The name a target is written with, and the module that declares it, for
+/// what can be imported by name: a function, a type, a constant.
+fn importable(program: &Program, interner: &Interner, target: Meant): Option<(String, u32)> = {
+	val p = &program
+	val module: u32 = match target {
+		.Fn(f) if p.fns[f].owner.isNone() => p.fns[f].module
+		.Struct(id) => p.structs[id].module
+		.Enum(id) => p.enums[id].module
+		.Type(ty) => match p.types.kind(ty) {
+			.Struct(id, ..) => p.structs[id].module
+			.Enum(id, ..) => p.enums[id].module
+			_ => return .None
+		}
+		.Const(id) => p.consts[id].module
+		.Global(id) => p.globals[id].module
+		_ => return .None
+	}
+	val name = Shown(program: &program, interner: &interner).nameOf(target)?
+	return .Some((move name, module))
+}
+
+/// The name a target is written with.
+fn nameOfTarget(program: &Program, interner: &Interner, target: Meant): Option<String> = Shown(
+	program: &program,
+	interner: &interner,
+).nameOf(target)
+
+/// What a target is, as Wip would write it.
+fn describe(program: &Program, interner: &Interner, target: Meant): String = {
+	val (_, shown) = Shown(program: &program, interner: &interner).target(target)
+	return move shown
+}
+
+view struct Shown {
+	program: &Program
+	interner: &Interner
+}
+
+extend Shown {
+	fn ty(ty: Ty): String = self.program.tyName(ty, self.interner)
+
+	fn name(sym: Symbol): str = self.interner.resolve(sym)
+
+	/// Where a target was declared.
+	fn declared(target: Meant): Option<Span> = {
+		val p = &self.program
+		return match target {
+			.Local(id: f, local) => match p.fns[f].body {
+				.Some(body) => .Some(body.locals[local].span)
+				.None => .None
+			}
+			.Fn(f) => .Some(p.fns[f].nameSpan)
+			.Field(owner, index: i) =>
+				if (i as i64) < p.structs[owner].fields.len() then
+					.Some(p.structs[owner].fields[i as i64].span)
+				else .None
+			.Struct(id) => .Some(p.structs[id].span)
+			.Enum(id) => .Some(p.enums[id].span)
+			.Variant(id, index: i) =>
+				if (i as i64) < p.enums[id].variants.len() then
+					.Some(p.enums[id].variants[i as i64].span)
+				else .None
+			.Type(ty) => match p.types.kind(ty) {
+				.Struct(id, ..) => .Some(p.structs[id].span)
+				.Enum(id, ..) => .Some(p.enums[id].span)
+				_ => .None
+			}
+			.Const(id) => .Some(p.consts[id].span)
+			.Global(id) => .Some(p.globals[id].span)
+			.Value(..) => .None
+		}
+	}
+
+	/// The name a target is written with.
+	fn nameOf(target: Meant): Option<String> = {
+		val p = &self.program
+		val sym: Symbol = match target {
+			.Local(id: f, local) => match p.fns[f].body {
+				.Some(body) => body.locals[local].name
+				.None => return .None
+			}
+			.Fn(f) => p.fns[f].name
+			.Field(owner, index: i) => {
+				if i as i64 >= p.structs[owner].fields.len() then return .None
+				p.structs[owner].fields[i as i64].name
+			}
+			.Struct(id) => p.structs[id].name
+			.Enum(id) => p.enums[id].name
+			.Variant(id, index: i) => {
+				if i as i64 >= p.enums[id].variants.len() then return .None
+				p.enums[id].variants[i as i64].name
+			}
+			.Type(ty) => match p.types.kind(ty) {
+				.Struct(id, ..) => p.structs[id].name
+				.Enum(id, ..) => p.enums[id].name
+				_ => return .None
+			}
+			.Const(id) => p.consts[id].name
+			.Global(id) => p.globals[id].name
+			.Value(..) => return .None
+		}
+		return .Some(String::of(self.name(sym)))
+	}
+
+	/// Where the target was declared, and what it is.
+	fn target(target: Meant): (Option<Span>, String) = {
+		val p = &self.program
+		return match target {
+			.Local(id: f, local) => {
+				val .Some(body) = p.fns[f].body else {
+					return (.None, String())
+				}
+				val l = &body.locals[local]
+				val keyword = match l.kind {
+					.Param | .Binding => ""
+					.Let(..) => "val "
+					.Var => "var "
+				}
+				(.Some(l.span), "\(keyword)\(self.name(l.name)): \(self.ty(l.ty))")
+			}
+			.Fn(f) => {
+				val def = &p.fns[f]
+				var params: Vec<String> = Vec()
+				for param in def.params {
+					params.push("\(self.name(param.name)): \(self.ty(param.ty))")
+				}
+				val owner = match def.owner {
+					.Some(.Builtin(..)) | .None => String()
+					.Some(owner) => "\(p.ownerName(owner.clone(), self.interner))."
+				}
+				var shown = "fn \(owner)\(self.name(def.name))(\(params.join(", ")))"
+				if def.ret != UNIT then shown.push(": \(self.ty(def.ret))")
+				(.Some(def.nameSpan), move shown)
+			}
+			.Field(owner, index) => {
+				val def = &p.structs[owner]
+				if index as i64 >= def.fields.len() then return (.None, String())
+				val field = &def.fields[index as i64]
+				(
+					.Some(field.span),
+					"\(self.name(def.name)).\(self.name(field.name)): \(self.ty(field.ty))",
+				)
+			}
+			.Struct(id) => {
+				val def = &p.structs[id]
+				val keyword = if def.isUnion then "union" else "struct"
+				(.Some(def.span), "\(keyword) \(self.name(def.name))")
+			}
+			.Enum(id) => (.Some(p.enums[id].span), "enum \(self.name(p.enums[id].name))")
+			.Variant(id, index) => {
+				val def = &p.enums[id]
+				if index as i64 >= def.variants.len() then return (.None, String())
+				val variant = &def.variants[index as i64]
+				var shown = "\(self.name(def.name)).\(self.name(variant.name))"
+				if !variant.fields.isEmpty() {
+					var fields: Vec<String> = Vec()
+					for f in variant.fields {
+						fields.push("\(self.name(f.name)): \(self.ty(f.ty))")
+					}
+					shown.push("(\(fields.join(", ")))")
+				}
+				(.Some(variant.span), move shown)
+			}
+			.Type(ty) => match p.types.kind(ty) {
+				.Struct(id, ..) => {
+					val keyword = if p.structs[id].isUnion then "union" else "struct"
+					(.Some(p.structs[id].span), "\(keyword) \(self.ty(ty))")
+				}
+				.Enum(id, ..) => (.Some(p.enums[id].span), "enum \(self.ty(ty))")
+				_ => (.None, self.ty(ty))
+			}
+			.Const(id) => {
+				val def = &p.consts[id]
+				(.Some(def.span), "val \(self.name(def.name)): \(self.ty(def.ty))")
+			}
+			.Global(id) => {
+				val def = &p.globals[id]
+				val keyword = if def.isMut then "var" else "val"
+				(.Some(def.span), "\(keyword) \(self.name(def.name)): \(self.ty(def.ty))")
+			}
+			.Value(ty) => (.None, self.ty(ty))
+		}
+	}
+}
+
+/// The `///` lines just above the line `at` is on, past any annotations:
+/// what the declaration there says of itself.
+pub fn documentation(text: str, at: i64): String = {
+	val end = if at < text.len() then at else text.len()
+	val start = match text[0..end].findLast("\n") {
+		.Some(i) => i + 1
+		.None => 0
+	}
+	var above: Vec<str> = Vec()
+	for line in text[0..start].lines() {
+		above.push(line)
+	}
+	var lines: Vec<str> = Vec()
+	var i = above.len() - 1
+	while i >= 0 {
+		val line = trimSpace(above[i])
+		if line.stripPrefix("///") is .Some(doc) then
+			lines.push(
+				match doc.stripPrefix(" ") {
+					.Some(after) => after
+					.None => doc
+				},
+			)
+		else if !line.startsWith("@") then break
+		i -= 1
+	}
+	lines.reverse()
+	return lines.join("\n")
+}

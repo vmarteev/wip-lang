@@ -1,0 +1,219 @@
+// What every check shares: the `wip` it checks, the directory it builds
+// into, the work it spreads across the machine's processors, and how a
+// program it ran is reported.
+
+import std::fs
+import std::future
+import std::io
+import std::path
+import std::process::{Command, Exit}
+import std::sync::{Atomic, Mutex}
+
+/// What a check is given: the `wip` it runs, `program`, a whole path, so
+/// that it names the same program from any directory; the text a name must
+/// hold for its item to be checked, where it is not empty; whether it
+/// writes what it found beside a snapshot that differs; and the directory
+/// it builds into.
+pub struct Gate {
+	pub program: String
+	pub only: String
+	pub writes: bool
+	pub work: Work
+}
+
+/// What a check found: how many items it checked, and what is wrong with
+/// those that failed, each a name and then why.
+pub struct Checked {
+	pub count: i64
+	pub failed: Vec<String>
+}
+
+/// How a program ran: how it ended, and what it wrote on its standard
+/// output and its standard error.
+pub struct Ran {
+	pub exit: Exit
+	pub stdout: String
+	pub stderr: String
+}
+
+/// A directory of its own under the system's temporary directory, removed
+/// when it is dropped.
+pub struct Work {
+	pub path: String
+}
+
+extend Gate {
+	pub static fn of(program: String, only: String, writes: bool, work: Work): Gate = Gate(
+		program: move program,
+		only: move only,
+		writes: writes,
+		work: move work,
+	)
+
+	/// Whether the item named `name` is checked.
+	pub fn takes(name: str): bool = self.only.isEmpty() || name.contains(self.only.toStr())
+
+	/// `wip` with `arguments`, run in `directory`, for what it prints. Its
+	/// standard input reads nothing.
+	pub fn wip(directory: str, arguments: &[str]): Ran = run(self.command(directory, arguments))
+
+	/// `wip` with `arguments`, to be run in `directory`, for a check that
+	/// sets more of what it is run with.
+	pub fn command(directory: str, arguments: &[str]): Command = Command::of(
+		self.program.toStr(),
+	).args(&arguments).directory(directory)
+
+	/// `wip` with `arguments`, run in `directory`, its standard input
+	/// reading `text`.
+	pub fn wipReading(text: str, directory: str, arguments: &[str]): Ran = run(
+		self.command(directory, arguments).input(text),
+	)
+}
+
+extend Checked {
+	pub static fn of(count: i64, failed: Vec<String>): Checked = Checked(
+		count: count,
+		failed: move failed,
+	)
+}
+
+extend Work {
+	/// A fresh directory, named by this process, under `$TMPDIR` or `/tmp`.
+	pub static fn new(): Result<Work, String> = {
+		var root = io::env("TMPDIR").unwrapOr(String())
+		if root.isEmpty() then root = String::of("/tmp")
+		val dir = path::join(root.toStr(), "wip-gate-\(std::process::id())")
+		if fs::makeDirs(dir.toStr()) is .Err(error) then
+			return .Err("cannot create `\(dir)`: \(error)")
+		return .Ok(Work(path: move dir))
+	}
+
+	/// A file in it.
+	pub fn join(name: str): String = path::join(self.path.toStr(), name)
+}
+
+extend Work: Destroy {
+	var fn destroy() = {
+		fs::removeAll(self.path.toStr())
+	}
+}
+
+/// Runs `command` for what it prints, with its standard input reading
+/// nothing; a program that cannot be started is reported as one that
+/// printed why on its standard error and failed.
+pub fn run(command: Command): Ran = match command.output() {
+	.Ok(output) => Ran(
+		exit: output.exit,
+		stdout: output.stdout.clone(),
+		stderr: output.stderr.clone(),
+	)
+	.Err(error) => Ran(exit: .Code(127), stdout: String(), stderr: "cannot start it: \(error)\n")
+}
+
+/// How a program ran, as a snapshot writes it: how it ended, what it wrote
+/// on its standard output, and on its standard error where it wrote
+/// anything there.
+pub fn report(output: &Ran): String = {
+	val ended = match output.exit {
+		.Code(code) => "exit code \(code)"
+		.Signal(signal) => "terminated: signal \(signal)"
+	}
+	var report = "\(ended)\n--- stdout ---\n\(output.stdout)"
+	if !output.stderr.isEmpty() then report.push("--- stderr ---\n\(output.stderr)")
+	return move report
+}
+
+/// What a failed command wrote on its standard error, each line indented
+/// under the name of what failed.
+pub fn indented(text: str): String = {
+	var out = String()
+	for line in text.trimEnd().lines() {
+		out.push("\n  \(line)")
+	}
+	return move out
+}
+
+/// What a command printed, both streams, each line indented under the
+/// name of what failed.
+pub fn said(ran: &Ran): String = indented("\(ran.stdout)\(ran.stderr)".toStr())
+
+/// `work` done for every index below `count`, on as many threads as the
+/// machine has processors, each taking the next index as it finishes one,
+/// so that a slow item holds up nothing else. What each found wrong, in the
+/// order of the indexes.
+pub fn across(count: i64, work: &(index: i64) => Option<String>): Vec<String> = {
+	val next = Atomic::of(0 as i64)
+	val found: Mutex<Vec<(i64, String)>> = Mutex::of(Vec())
+	var threads: Vec<i64> = Vec()
+	for thread in 0..future::cores() {
+		threads.push(thread)
+	}
+	future::each(&var threads, (_) => {
+		while true {
+			val index = next.add(1)
+			if index >= count then break
+			if work(index) is .Some(why) then found.lock((all) => all.push((index, why.clone())))
+		}
+	})
+	var failed = found.lock((all) => {
+		all.sortByKey((item) => item.0)
+		var failed: Vec<String> = Vec()
+		for (_, why) in all {
+			failed.push(why.clone())
+		}
+		return move failed
+	})
+	return move failed
+}
+
+/// The names in a directory, in order: none where it cannot be read.
+pub fn listed(dir: str): Vec<String> = {
+	var names: Vec<String> = Vec()
+	if fs::readDir(dir) is .Ok(entries) {
+		for entry in entries {
+			names.push(entry.name.clone())
+		}
+	}
+	names.sort()
+	return move names
+}
+
+/// A file written under `root`, its directories made.
+pub fn write(root: str, name: str, text: str) = {
+	val at = path::join(root, name)
+	fs::makeDirs(path::parent(at.toStr()))
+	fs::writeFile(at.toStr(), text)
+}
+
+/// What a file under `root` holds: nothing where it cannot be read.
+pub fn read(root: str, name: str): String = fs::readFile(path::join(root, name).toStr()).unwrapOr(
+	String(),
+)
+
+/// Whether `name` under `root` is a file.
+pub fn isFile(root: str, name: str): bool = match fs::meta(path::join(root, name).toStr()) {
+	.Ok(meta) => meta.kind == .File
+	.Err(_) => false
+}
+
+/// Whether `name` under `root` is a directory.
+pub fn isDirectory(root: str, name: str): bool = match fs::meta(path::join(root, name).toStr()) {
+	.Ok(meta) => meta.isDirectory()
+	.Err(_) => false
+}
+
+/// What failed, and what the command said.
+pub fn wrong(what: str, ran: &Ran): Option<String> = .Some("\(what)\(said(&ran))")
+
+/// Whether a program of this name is in one of the directories of `PATH`:
+/// looked up there, not by whether starting it fails, since under Rosetta
+/// starting a program that is not there does not fail.
+pub fn onPath(tool: str): bool = {
+	val .Some(paths) = io::env("PATH") else {
+		return false
+	}
+	for dir in paths.split(":") {
+		if !dir.isEmpty() && isFile(dir, tool) then return true
+	}
+	return false
+}

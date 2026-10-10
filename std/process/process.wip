@@ -5,9 +5,12 @@
 // and kept — and waited for where it is dropped — or launched and let go.
 //
 // It is started by `posix_spawnp`, which finds it on `PATH`, and waited
-// for by `waitpid`, over `std::libc`.
+// for by `waitpid`, over `std::libc`. It is given nothing this program has
+// open but what its command says: every descriptor the library opens is
+// closed in a program started.
 
 import std::io
+import std::libc
 import std::libc::{
 	EAGAIN,
 	ENOMEM,
@@ -28,6 +31,7 @@ import std::libc::{
 	WNOHANG,
 	calloc,
 	close,
+	closeOnExec,
 	environ,
 	errno,
 	errnoAt,
@@ -63,9 +67,9 @@ import std::libc::{
 }
 
 /// A program to start: its name, found on `PATH` where it has no `/`, its
-/// arguments, the variables it sets in the environment it is given, the
-/// directory it starts in, and the text its standard input reads, where it
-/// is given one.
+/// arguments, what it changes of the environment it is given — `NAME=value`
+/// set, or `NAME` alone left out — the directory it starts in, and the text
+/// its standard input reads, where it is given one.
 pub struct Command {
 	program: String
 	arguments: Vec<String>
@@ -95,6 +99,17 @@ pub struct Output {
 /// A program started and kept. Where it is dropped, it is waited for.
 pub struct Child {
 	pid: i64
+	finished: bool = false
+}
+
+/// A program started to be talked to: its standard input this program's to
+/// write, until it is closed, and its standard output this program's to
+/// read. Where it is dropped, its input is closed and it is waited for.
+pub struct Connected {
+	pid: i64
+	// The writing end of its input; -1 once it is closed.
+	input: i64
+	reading: io::Reader
 	finished: bool = false
 }
 
@@ -140,6 +155,14 @@ extend Command {
 	pub move fn env(name: str, value: str): Command = {
 		var command = move self
 		command.sets.push("\(name)=\(value)")
+		return move command
+	}
+
+	/// The variable `name` left out of the environment it is given, where
+	/// this program's has it.
+	pub move fn unset(name: str): Command = {
+		var command = move self
+		command.sets.push(name)
 		return move command
 	}
 
@@ -230,9 +253,19 @@ extend Command {
 		return .Ok()
 	}
 
+	/// Starts it with its standard input and output connected to this
+	/// program, to be talked to: what this program writes, it reads, and
+	/// what it writes, this program reads, as it runs. Its standard error is
+	/// this program's. What `input` gave it is not written: it is given
+	/// what this program writes, when it writes it.
+	pub fn connect(): Result<Connected, io::IoError> = {
+		val (pid, output, _, input) = self.spawn(3, true)?
+		return .Ok(Connected(pid: pid, input: input, reading: io::reader(output as i32)))
+	}
+
 	/// Starts it: 0 with this program's streams, 1 with none, 2 with its
-	/// output and errors in pipes; and where `fed`, its standard input a
-	/// pipe too. The child, the reading ends of its output's pipes, and the
+	/// output and errors in pipes, 3 with its output in a pipe and its errors
+	/// this program's; and where `fed`, its standard input a pipe too. The child, the reading ends of its output's pipes, and the
 	/// writing end of its input's, each -1 where there is none.
 	fn spawn(mode: i64, fed: bool): Result<(i64, i64, i64, i64), io::IoError> = {
 		var program = self.program.clone()
@@ -266,7 +299,7 @@ extend Command {
 		var errors = Pipe(reading: -1, writing: -1)
 		var input = Pipe(reading: -1, writing: -1)
 		if fed {
-			if pipe(&var input) != 0 {
+			if openedPipe(&var input) != 0 {
 				val failed = io::lastError()
 				posix_spawn_file_actions_destroy(&var actions)
 				free(argv as ptr<u8>)
@@ -283,11 +316,13 @@ extend Command {
 			posix_spawn_file_actions_addopen(&var actions, 1, "/dev/null", O_WRONLY, 0)
 			posix_spawn_file_actions_addopen(&var actions, 2, "/dev/null", O_WRONLY, 0)
 		}
-		if mode == 2 {
-			if pipe(&var output) != 0 || pipe(&var errors) != 0 {
+		if mode == 2 || mode == 3 {
+			if openedPipe(&var output) != 0 || (mode == 2 && openedPipe(&var errors) != 0) {
 				val failed = io::lastError()
 				closeEnd(output.reading)
 				closeEnd(output.writing)
+				closeEnd(errors.reading)
+				closeEnd(errors.writing)
 				closeEnd(input.reading)
 				closeEnd(input.writing)
 				posix_spawn_file_actions_destroy(&var actions)
@@ -296,21 +331,29 @@ extend Command {
 				return .Err(failed)
 			}
 			posix_spawn_file_actions_adddup2(&var actions, output.writing, 1)
-			posix_spawn_file_actions_adddup2(&var actions, errors.writing, 2)
 			posix_spawn_file_actions_addclose(&var actions, output.reading)
-			posix_spawn_file_actions_addclose(&var actions, errors.reading)
 			posix_spawn_file_actions_addclose(&var actions, output.writing)
+		}
+		if mode == 2 {
+			posix_spawn_file_actions_adddup2(&var actions, errors.writing, 2)
+			posix_spawn_file_actions_addclose(&var actions, errors.reading)
 			posix_spawn_file_actions_addclose(&var actions, errors.writing)
 		}
 		// An empty directory is this program's own.
 		if !place.isEmpty() then
 			posix_spawn_file_actions_addchdir_np(&var actions, place.toCstring())
 		var child: c_int = 0
-		val failed = posix_spawnp(&var child, program.toCstring(), &actions, null, argv, envp)
+		// The standard streams the program shares with this one, which no
+		// file action gives it.
+		var kept: Vec<c_int> = Vec()
+		if !fed && mode == 0 then kept.push(0)
+		if mode == 0 then kept.push(1)
+		if mode == 0 || mode == 3 then kept.push(2)
+		val failed = started(&var child, program.toCstring(), &var actions, &kept, argv, envp)
 		posix_spawn_file_actions_destroy(&var actions)
 		free(argv as ptr<u8>)
 		free(envp as ptr<u8>)
-		if mode == 2 {
+		if mode == 2 || mode == 3 {
 			closeEnd(output.writing)
 			closeEnd(errors.writing)
 			if failed != 0 {
@@ -401,6 +444,67 @@ fn closeEnd(end: c_int) = {
 	if end >= 0 then close(end)
 }
 
+/// A pipe, both ends closed in every program started unless a file action
+/// gives it one: Linux makes it so marked.
+@target(os = "linux")
+fn openedPipe(ends: &var Pipe): c_int = libc::pipe2(&var ends, libc::O_CLOEXEC)
+
+/// A pipe, both ends marked closed in a program started. A Mac has no
+/// `pipe2`, so they are marked once made; what it starts is started with
+/// every descriptor closed but those its file actions name, so no program
+/// another thread starts in between is given them.
+@target(vendor = "apple")
+fn openedPipe(ends: &var Pipe): c_int = {
+	val made = pipe(&var ends)
+	if made == 0 {
+		closeOnExec(ends.reading)
+		closeOnExec(ends.writing)
+	}
+	return made
+}
+
+/// Starts the program: on Linux, as `posix_spawnp` does, each descriptor
+/// this program opened marked to be closed in it.
+@target(os = "linux")
+fn started(
+	child: &var c_int,
+	program: cstring,
+	actions: &var Hidden,
+	kept: &[c_int],
+	arguments: ptr<cstring>,
+	environment: ptr<cstring>,
+): c_int = posix_spawnp(&var child, program, &actions, null, arguments, environment)
+
+/// Starts the program: on a Mac with every descriptor closed but those its
+/// file actions give it and the standard streams `kept`, which it shares
+/// with this program.
+@target(vendor = "apple")
+fn started(
+	child: &var c_int,
+	program: cstring,
+	actions: &var Hidden,
+	kept: &[c_int],
+	arguments: ptr<cstring>,
+	environment: ptr<cstring>,
+): c_int = {
+	for fd in kept {
+		libc::posix_spawn_file_actions_addinherit_np(&var actions, fd)
+	}
+	var attributes = hidden()
+	libc::posix_spawnattr_init(&var attributes)
+	libc::posix_spawnattr_setflags(&var attributes, libc::POSIX_SPAWN_CLOEXEC_DEFAULT)
+	val failed = libc::posix_spawnpWith(
+		&var child,
+		program,
+		&actions,
+		&attributes,
+		arguments,
+		environment,
+	)
+	libc::posix_spawnattr_destroy(&var attributes)
+	return failed
+}
+
 // Writes what the pipe takes of `text` from `written` on, and closes it
 // after the last byte, or where the program has stopped reading: then the
 // rest is dropped.
@@ -447,8 +551,8 @@ fn releasePipeSignal(before: &Hidden) = {
 }
 
 // This program's environment, with each `NAME=value` of `sets` in place of
-// the variable of that name, or added: a list C takes, ended by a null,
-// or null where there was no memory for it.
+// the variable of that name, or added, and each `NAME` alone left out: a
+// list C takes, ended by a null, or null where there was no memory for it.
 fn environment(sets: &var Vec<String>): ptr<cstring> = {
 	// `environ` is read twice over: as the strings it is, and as the
 	// pointers they are, to find the null at its end.
@@ -465,18 +569,30 @@ fn environment(sets: &var Vec<String>): ptr<cstring> = {
 		list[length] = inherited[length]
 		length += 1
 	}
+	// Each change in the order the command made it: `NAME=value` in place
+	// of the variable of that name, or after the rest; `NAME` alone takes
+	// it out, the ones after it moving up into its place.
 	for i in 0..sets.len() {
 		val set = sets[i].toStr()
-		val name = match set.find("=") {
-			.Some(at) => set[0..at + 1]
-			.None => set
-		}
+		val removes = set.find("=").isNone()
+		val name = if removes then "\(set)=" else String::of(set[0..set.find("=").unwrapOr(0) + 1])
 		var j = 0
-		while j < length && !list[j].toStr().startsWith(name) {
+		while j < length && !list[j].toStr().startsWith(name.toStr()) {
 			j += 1
 		}
-		list[j] = sets[i].toCstring()
-		if j == length then length += 1
+		if !removes {
+			list[j] = sets[i].toCstring()
+			if j == length then length += 1
+		} else if j < length {
+			length -= 1
+			while j < length {
+				list[j] = list[j + 1]
+				j += 1
+			}
+			// The slot the last moved out of, read as the pointer it is.
+			val slots = list as ptr<ptr<u8>>
+			slots[length] = null
+		}
 	}
 	return list
 }
@@ -556,6 +672,85 @@ extend Child {
 	/// Ends it, as `SIGKILL` does; it is still waited for.
 	pub fn kill() = {
 		kill(self.pid as c_int, SIGKILL)
+	}
+}
+
+extend Connected {
+	/// Its process number.
+	pub fn id(): i64 = self.pid
+
+	/// Writes all of `bytes` to its standard input, waiting while the pipe
+	/// is full. A program that has stopped reading, or has ended, answers
+	/// `.BrokenPipe`, as does writing after `closeInput()`: the write holds
+	/// back the signal that would end this program for it.
+	pub fn writeAll(bytes: &[u8]): Result<void, io::IoError> = {
+		if self.input < 0 then return .Err(.BrokenPipe)
+		var written = 0
+		val held = holdPipeSignal()
+		while written < bytes.len() {
+			val wrote = write(self.input as c_int, &bytes[written..bytes.len()]) as i64
+			if wrote >= 0 {
+				written += wrote
+			} else if errno() != EINTR {
+				val failed = io::lastError()
+				releasePipeSignal(&held)
+				return .Err(failed)
+			}
+		}
+		releasePipeSignal(&held)
+		return .Ok()
+	}
+
+	/// Writes all of `text` to its standard input.
+	pub fn writeText(text: str): Result<void, io::IoError> = self.writeAll(&text)
+
+	/// What it writes on its standard output, read as any `io::Reader` is:
+	/// a line, a length, or all of it, and waiting at most what
+	/// `setTimeout` says.
+	pub var fn output(): &var io::Reader = lend self.reading
+
+	/// Closes its standard input: what it reads next is the end, which is
+	/// how many programs know to finish.
+	pub var fn closeInput() = {
+		closeEnd(self.input as c_int)
+		self.input = -1
+	}
+
+	/// How it ended, if it has, without waiting.
+	pub var fn tryWait(): Option<Exit> = {
+		if self.finished then return .None
+		val .Ok(.Some(exit)) = waitOn(self.pid, false) else {
+			return .None
+		}
+		self.finished = true
+		return .Some(exit)
+	}
+
+	/// Closes its input, waits for it, and says how it ended. Asked after
+	/// `tryWait` said so already, it has nothing more to say, and answers
+	/// `.Code(-1)`.
+	pub move fn wait(): Exit = {
+		var connected = move self
+		connected.closeInput()
+		if connected.finished then return .Code(-1)
+		connected.finished = true
+		return waitFor(connected.pid).unwrapOr(.Code(-1))
+	}
+
+	/// Ends it, as `SIGKILL` does; it is still waited for.
+	pub fn kill() = {
+		kill(self.pid as c_int, SIGKILL)
+	}
+}
+
+extend Connected: Destroy {
+	/// What a program starts is part of it until it ends: a dropped
+	/// program talked to has its input closed, so that one that reads to
+	/// the end of it ends, and is waited for. Its output is closed after.
+	var fn destroy() = {
+		self.closeInput()
+		if !self.finished then waitOn(self.pid, true)
+		closeEnd(io::descriptorOf(&self.reading) as c_int)
 	}
 }
 

@@ -1,0 +1,549 @@
+// A debug build's program as parts, each an LLVM module of its own that
+// `clang` compiles at once with the others, and that the cache keeps on its
+// own.
+//
+// At `-O0` nothing is inlined, so where a function goes changes nothing it
+// does. The functions are taken file by file, in the order each file's were
+// defined, and cut into parts of about a megabyte of text: each part is a
+// `clang` started, which costs as much as compiling a part a third that size,
+// and a smaller part is compiled again sooner after an edit, which changes
+// every line after it in its file. Where a part ends is decided by what is in
+// it, not by its place in the program, as rsync cuts a file into blocks:
+// after a function whose symbol's hash says so, once the part is large
+// enough, or where it is too large to go on. An edit changes the part it is
+// in, and the parts after it are cut where they were. Each part has what its
+// functions name: the program's data, its own copy of each constant, and the
+// metadata they reach; a function of another part is declared, which its
+// hidden linkage lets the linker find.
+//
+// A part is all that its object depends on, so it says nothing of the rest
+// of the program: its constants and its metadata are numbered in the order
+// its text names them, not as the whole program numbered them, and an edit to
+// one file leaves the other files' parts as they were. Each function moves
+// into its part, which a program's millions of instructions make worth more
+// than a copy.
+
+import std::collections::{Map}
+import std::future
+import std::mem
+
+/// How much of the functions' text a part holds before it may end: enough
+/// that starting `clang` is a small part of the work.
+val LEAST: i64 = 512 << 10
+
+/// How much it holds before it must end, so that a large program is compiled
+/// on several cores.
+val MOST: i64 = 1 << 20
+
+/// One function in this many, by its symbol's hash, may end a part.
+val ENDS: u64 = 16
+
+/// The program's parts, each a module of its own: the function `i` of
+/// `whole` was written in `files[i]`.
+fn split(whole: Module, files: &[String]): Vec<Module> = {
+	var module = move whole
+	var byFile: Map<String, Vec<i64>> = Map()
+	for (index, file) in files.forwards().enumerate() {
+		byFile.atOrPut(file.clone(), Vec()).push(index)
+	}
+	var names: Vec<String> = Vec()
+	for entry in byFile {
+		names.push(entry.key.clone())
+	}
+	names.sort()
+	var parts: Vec<Vec<i64>> = Vec()
+	var size = 0
+	var part: Vec<i64> = Vec()
+	for name in names {
+		for index in byFile.at(&name) {
+			val function = &module.functions[index]
+			size += function.textLength(&module.names)
+			part.push(index)
+			val ends = hash(module.names[function.symbol as i64].toStr()) % ENDS == 0
+			if size >= LEAST && ends || size >= MOST {
+				parts.push(move part)
+				part = Vec()
+				size = 0
+			}
+		}
+	}
+	if !part.isEmpty() then parts.push(move part)
+	// Where each function is defined, and how another part declares it.
+	var defined: Map<u32, (i64, Declaration)> = Map()
+	for (at, functions) in parts.forwards().enumerate() {
+		for index in functions {
+			val function = &module.functions[index]
+			defined.put(function.symbol, (at, function.declaration()))
+		}
+	}
+	// Each constant of the program's, by its name's number.
+	var data: Map<u32, i64> = Map()
+	for (index, global) in module.data.forwards().enumerate() {
+		data.put(global.name, index)
+	}
+	// Each function to its part, in the part's order.
+	var taken: Vec<Option<Function>> = Vec()
+	for function in mem::replace(&var module.functions, Vec()) {
+		taken.push(.Some(move function))
+	}
+	var works: Vec<PartWork> = Vec()
+	for (at, indices) in parts.forwards().enumerate() {
+		var functions: Vec<Function> = Vec()
+		for index in indices {
+			val .Some(function) = mem::replace(&var taken[index], .None) else {
+				panic("a function is in one part")
+			}
+			functions.push(move function)
+		}
+		works.push(PartWork(at: at, functions: move functions, made: .None))
+	}
+	// Each part made on a thread: they share only what they read.
+	future::each(&var works, (work) => {
+		var writing = PartWriter::new(&module, &data, &defined, work.at)
+		work.made = .Some(writing.part(mem::replace(&var work.functions, Vec())))
+	})
+	var made: Vec<Module> = Vec()
+	for work in move works {
+		val .Some(part) = move work.made else {
+			panic("every part is made")
+		}
+		made.push(move part)
+	}
+	return move made
+}
+
+/// A part to be made: its number, its functions, and the module made of
+/// them.
+struct PartWork {
+	at: i64
+	functions: Vec<Function>
+	made: Option<Module>
+}
+
+/// FNV-1a: a hash of `text` that is the same on every machine and in every
+/// build of the compiler.
+fn hash(text: str): u64 = {
+	var hash: u64 = 0xcbf29ce484222325
+	for i in 0..text.len() {
+		hash = (hash ^ text[i] as u64) *% 0x00000100000001b3
+	}
+	return hash
+}
+
+/// One part as it is made: what its functions name, numbered in the order
+/// its text names them.
+view struct PartWriter {
+	whole: &Module
+	/// Each constant of the program's, by its name's number.
+	wholeData: &Map<u32, i64>
+	defined: &Map<u32, (i64, Declaration)>
+	at: i64
+	/// The part's names, by its own numbers.
+	names: Vec<String>
+	/// Each of the program's numbers the part names, with its own.
+	numbers: Map<u32, u32>
+	/// The program's constants it names, in order.
+	dataOrder: Vec<i64>
+	/// Each node it reaches, by the program's number, with its own.
+	nodes: Map<i64, i64>
+	nodeOrder: Vec<i64>
+	/// The functions of other parts it calls or names, by its own numbers.
+	declared: Map<u32, Declaration>
+}
+
+extend PartWriter {
+	static fn new(
+		whole: &Module,
+		wholeData: &Map<u32, i64>,
+		defined: &Map<u32, (i64, Declaration)>,
+		at: i64,
+	): PartWriter = PartWriter(
+		whole: &whole,
+		wholeData: &wholeData,
+		defined: &defined,
+		at: at,
+		names: Vec(),
+		numbers: Map(),
+		dataOrder: Vec(),
+		nodes: Map(),
+		nodeOrder: Vec(),
+		declared: Map(),
+	)
+
+	/// The part of `functions`: the functions, then the constants they name,
+	/// the compile unit and the flags, and the nodes, each numbered as it is
+	/// first named.
+	var fn part(functions: Vec<Function>): Module = {
+		val whole = self.whole
+		var defined: Vec<Function> = Vec()
+		for function in move functions {
+			defined.push(self.function(move function))
+		}
+		var data: Vec<Global> = Vec()
+		var next = 0
+		while next < self.dataOrder.len() {
+			val global = whole.data[self.dataOrder[next]].clone()
+			next += 1
+			data.push(self.global(move global))
+		}
+		val unit = self.node(whole.unit)
+		val flags = (self.node(whole.flags.0), self.node(whole.flags.1))
+		var nodes: Vec<Node> = Vec()
+		var at = 0
+		while at < self.nodeOrder.len() {
+			val node = whole.nodes[self.nodeOrder[at]].clone()
+			at += 1
+			nodes.push(self.renumbered(move node))
+		}
+		var declared: Vec<Declared> = Vec()
+		for item in whole.declared {
+			declared.push(
+				match item {
+					.Function(declaration) => {
+						var renamed = declaration.clone()
+						renamed.symbol = self.named(declaration.symbol)
+						Declared::Function(move renamed)
+					}
+					.Global(global) => Declared::Global(self.global(global.clone()))
+				},
+			)
+		}
+		var mine: Vec<(String, Declaration)> = Vec()
+		for entry in self.declared {
+			mine.push((entry.value.text(&self.names), entry.value.clone()))
+		}
+		mine.sortBy((a, b) => a.0 < b.0)
+		for (_, declaration) in move mine {
+			declared.push(.Function(move declaration))
+		}
+		// The program's variables are defined once, in the first part, and
+		// declared in the others.
+		var globals: Vec<Global> = Vec()
+		for global in whole.globals {
+			var renamed = self.global(global.clone())
+			if self.at != 0 then renamed.init = .None
+			globals.push(move renamed)
+		}
+		return Module(
+			heading: String::of("; A part of a program, written by wip's LLVM backend."),
+			names: mem::replace(&var self.names, Vec()),
+			data: move data,
+			globals: move globals,
+			declared: move declared,
+			functions: move defined,
+			groups: whole.groups.clone(),
+			unit: unit,
+			flags: flags,
+			nodes: move nodes,
+		)
+	}
+
+	/// This part's number for what the program numbers `global`: a constant
+	/// renamed as the part's own, and another part's function declared.
+	var fn named(global: u32): u32 = {
+		if self.numbers.get(&global) is .Some(mine) then return mine
+		val constant = self.wholeData.get(&global)
+		val name = match constant {
+			.Some(index) => {
+				val written = "@\"wip.data.\(self.dataOrder.len())\""
+				self.dataOrder.push(index)
+				move written
+			}
+			.None => self.whole.names[global as i64].clone()
+		}
+		val mine = self.names.len() as u32
+		self.names.push(move name)
+		self.numbers.put(global, mine)
+		if constant.isNone() &&
+			self.defined.get(&global) is .Some((part, declaration)) &&
+			part != self.at {
+			var declared = declaration.clone()
+			declared.symbol = mine
+			self.declared.put(mine, move declared)
+		}
+		return mine
+	}
+
+	/// This part's number for the program's node `node`.
+	var fn node(node: i64): i64 = {
+		// None, which a module without debug information says by -1.
+		if node < 0 then return node
+		if self.nodes.get(&node) is .Some(mine) then return mine
+		val mine = self.nodeOrder.len()
+		self.nodes.put(node, mine)
+		self.nodeOrder.push(node)
+		return mine
+	}
+
+	var fn nodeOf(node: Option<i64>): Option<i64> = match node {
+		.Some(n) => .Some(self.node(n))
+		.None => .None
+	}
+
+	/// A global of the program's, as this part names it and what it names.
+	var fn global(global: Global): Global = {
+		var renamed = move global
+		renamed.name = self.named(renamed.name)
+		renamed.init = match move renamed.init {
+			.Some(init) => .Some(self.constant(move init))
+			.None => .None
+		}
+		return move renamed
+	}
+
+	var fn constant(constant: Constant): Constant = match move constant {
+		.Address(global) => .Address(self.named(global))
+		.Packed(fields) => {
+			var renamed: Vec<Constant> = Vec()
+			for field in move fields {
+				renamed.push(self.constant(move field))
+			}
+			.Packed(move renamed)
+		}
+		.Array(elements) => {
+			var renamed: Vec<Constant> = Vec()
+			for element in move elements {
+				renamed.push(self.constant(move element))
+			}
+			.Array(move renamed)
+		}
+		other => move other
+	}
+
+	/// A function as this part names what it names.
+	var fn function(function: Function): Function = {
+		var renamed = move function
+		renamed.symbol = self.named(renamed.symbol)
+		renamed.subprogram = self.node(renamed.subprogram)
+		var blocks: Vec<Block> = Vec()
+		for block in mem::replace(&var renamed.blocks, Vec()) {
+			var instructions: Vec<Instruction> = Vec()
+			for instruction in move block.instructions {
+				instructions.push(self.instruction(move instruction))
+			}
+			blocks.push(Block(label: block.label.clone(), instructions: move instructions))
+		}
+		renamed.blocks = move blocks
+		return move renamed
+	}
+
+	var fn instruction(instruction: Instruction): Instruction = {
+		var renamed = move instruction
+		renamed.op = self.op(move renamed.op)
+		renamed.at = self.nodeOf(renamed.at)
+		return move renamed
+	}
+
+	var fn value(value: Value): Value = match move value {
+		.Global(index) => .Global(self.named(index))
+		other => move other
+	}
+
+	var fn typedValue(given: Val): Val = {
+		var renamed = move given
+		renamed.v = self.value(move renamed.v)
+		return move renamed
+	}
+
+	/// An instruction's operands and nodes, in the order its text names
+	/// them.
+	var fn op(op: Op): Op = match move op {
+		.Load(t, address, align, assumes) => {
+			val from = self.value(move address)
+			val facts: Assumes = match assumes {
+				.Nothing => .Nothing
+				.Reference(nonnull, align: aligned) => {
+					val first = self.node(nonnull)
+					.Reference(nonnull: first, align: self.node(aligned))
+				}
+				.Invariant(node) => .Invariant(self.node(node))
+			}
+			.Load(t: move t, address: move from, align: align, assumes: move facts)
+		}
+		.LoadAtomic(t, address, align) => .LoadAtomic(
+			t: move t,
+			address: self.value(move address),
+			align: align,
+		)
+		.Store(value, address, align) => {
+			val stored = self.typedValue(move value)
+			.Store(value: move stored, address: self.value(move address), align: align)
+		}
+		.StoreAtomic(value, address, align) => {
+			val stored = self.typedValue(move value)
+			.StoreAtomic(value: move stored, address: self.value(move address), align: align)
+		}
+		.Offset(base, offset) => {
+			val from = self.value(move base)
+			.Offset(base: move from, offset: self.value(move offset))
+		}
+		.Arithmetic(op, wrap, left, right) => {
+			val first = self.typedValue(move left)
+			.Arithmetic(op: op, wrap: wrap, left: move first, right: self.value(move right))
+		}
+		.FNeg(value) => .FNeg(self.typedValue(move value))
+		.IntCompare(cond, left, right) => {
+			val first = self.typedValue(move left)
+			.IntCompare(cond: cond, left: move first, right: self.value(move right))
+		}
+		.FloatCompare(cond, left, right) => {
+			val first = self.typedValue(move left)
+			.FloatCompare(cond: cond, left: move first, right: self.value(move right))
+		}
+		.Cast(cast, value, to) => .Cast(cast: cast, value: self.typedValue(move value), to: move to)
+		.Select(select) => {
+			val c = self.value(select.condition.clone())
+			val a = self.typedValue(select.ifTrue.clone())
+			val b = self.typedValue(select.ifFalse.clone())
+			.Select(own Select(condition: move c, ifTrue: move a, ifFalse: move b))
+		}
+		.ExtractValue(aggregate, index) => .ExtractValue(
+			aggregate: self.typedValue(move aggregate),
+			index: index,
+		)
+		.InsertValue(insert) => {
+			val into = self.typedValue(insert.aggregate.clone())
+			val value = self.typedValue(insert.value.clone())
+			.InsertValue(own InsertValue(
+				aggregate: move into,
+				value: move value,
+				index: insert.index,
+			))
+		}
+		.Call(call) => {
+			val callee = self.value(call.callee.clone())
+			var args: Vec<Arg> = Vec()
+			for arg in call.args {
+				args.push(Arg(value: self.typedValue(arg.value.clone()), attrs: arg.attrs.clone()))
+			}
+			.Call(own Call(
+				ret: call.ret.clone(),
+				retAttrs: call.retAttrs.clone(),
+				variadic: call.variadic.clone(),
+				callee: move callee,
+				args: move args,
+			))
+		}
+		.AtomicRmw(op, address, value, align) => {
+			val at = self.value(move address)
+			.AtomicRmw(op: op, address: move at, value: self.typedValue(move value), align: align)
+		}
+		.CmpXchg(swap) => {
+			val at = self.value(swap.address.clone())
+			val wanted = self.typedValue(swap.expected.clone())
+			val stored = self.typedValue(swap.replacement.clone())
+			.CmpXchg(own CmpXchg(
+				address: move at,
+				expected: move wanted,
+				replacement: move stored,
+				align: swap.align,
+			))
+		}
+		.Declare(address, variable, expression) => {
+			val at = self.value(move address)
+			.Declare(address: move at, variable: self.node(variable), expression: expression)
+		}
+		.CondBr(condition, ifTrue, ifFalse, weights) => {
+			val c = self.value(move condition)
+			.CondBr(
+				condition: move c,
+				ifTrue: ifTrue,
+				ifFalse: ifFalse,
+				weights: self.nodeOf(weights),
+			)
+		}
+		.Switch(value, otherwise, cases) => .Switch(
+			value: self.typedValue(move value),
+			otherwise: otherwise,
+			cases: move cases,
+		)
+		.Ret(value) => match move value {
+			.Some(given) => .Ret(.Some(self.typedValue(move given)))
+			.None => .Ret(.None)
+		}
+		other => move other
+	}
+
+	/// A node as this part numbers what it names, in the order its text
+	/// names them.
+	var fn renumbered(node: Node): Node = match move node {
+		.CompileUnit(file, optimized) => .CompileUnit(file: self.node(file), optimized: optimized)
+		.Subprogram(name, file, line, typeNode, artificial, optimized, unit) => {
+			val inFile = self.node(file)
+			val subroutine = self.node(typeNode)
+			.Subprogram(
+				name: move name,
+				file: inFile,
+				line: line,
+				typeNode: subroutine,
+				artificial: artificial,
+				optimized: optimized,
+				unit: self.node(unit),
+			)
+		}
+		.LexicalBlock(scope, file, line, column) => {
+			val outer = self.node(scope)
+			.LexicalBlock(scope: outer, file: self.node(file), line: line, column: column)
+		}
+		.LexicalBlockFile(scope, file) => {
+			val outer = self.node(scope)
+			.LexicalBlockFile(scope: outer, file: self.node(file))
+		}
+		.Location(line, column, scope) => .Location(
+			line: line,
+			column: column,
+			scope: self.node(scope),
+		)
+		.LocalVariable(name, arg, scope, file, line, typeNode) => {
+			val outer = self.node(scope)
+			val inFile = self.node(file)
+			.LocalVariable(
+				name: move name,
+				arg: arg,
+				scope: outer,
+				file: inFile,
+				line: line,
+				typeNode: self.node(typeNode),
+			)
+		}
+		.PointerType(base, size) => .PointerType(base: self.nodeOf(base), size: size)
+		.Typedef(name, base) => .Typedef(name: move name, base: self.node(base))
+		.Member(name, scope, base, size, offset) => {
+			val outer = self.node(scope)
+			.Member(
+				name: move name,
+				scope: outer,
+				base: self.node(base),
+				size: size,
+				offset: offset,
+			)
+		}
+		.Structure(tag, name, size, elements) => .Structure(
+			tag: tag,
+			name: move name,
+			size: size,
+			elements: self.node(elements),
+		)
+		.ArrayType(base, size, elements) => {
+			val of = self.nodeOf(base)
+			.ArrayType(base: of, size: size, elements: self.node(elements))
+		}
+		.Enumeration(name, base, size, elements) => {
+			val written = self.node(base)
+			.Enumeration(name: move name, base: written, size: size, elements: self.node(elements))
+		}
+		.Tuple(items) => {
+			var renumbered: Vec<MetaItem> = Vec()
+			for item in move items {
+				renumbered.push(
+					match move item {
+						.Node(node) => MetaItem::Node(self.node(node))
+						other => move other
+					},
+				)
+			}
+			.Tuple(move renumbered)
+		}
+		other => move other
+	}
+}

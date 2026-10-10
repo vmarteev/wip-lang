@@ -1,0 +1,456 @@
+// `@inline`: the callee's body, spliced into its caller.
+//
+// A call in MIR is a statement rather than a terminator, so splicing is
+// cutting the block in two around it: what came before keeps its place, the
+// callee's blocks go between, and what came after becomes the block the
+// callee's `return` goes to. Its locals and blocks are renumbered into the
+// caller, and its parameters become the places the caller passed — so an
+// aggregate argument is not copied, it is simply used where it is.
+
+import std::collections::{Map, Set}
+import std::mem
+import hir::{FnId, Program, Ty}
+import syntax::{Interner, Span}
+
+/// Splices every call in `body` to a function that promised to be inlined.
+/// The callee is inlined first, so a chain of them is spliced once through.
+pub fn inline(program: &Program, interner: &Interner, body: &var Body) = {
+	var bodies = Bodies(
+		program: &program,
+		interner: &interner,
+		done: Map(),
+		lambdas: Set(),
+		open: Vec(),
+	)
+	bodies.spliceAll(&var body)
+}
+
+view struct Bodies {
+	program: &Program
+	interner: &Interner
+	/// The MIR of each `@inline` function, already inlined itself, so a
+	/// function called from several places is lowered once.
+	done: Map<FnId, Body>
+	/// The lambdas an `@inline` function was handed, whose calls were made
+	/// direct when its body was spliced: they are inlined too, which is what
+	/// makes internal iteration cost what a loop costs.
+	lambdas: Set<FnId>
+	/// What is being spliced, so that a body never splices itself.
+	open: Vec<FnId>
+}
+
+extend Bodies {
+	/// The body to splice for `id`, if the compiler has one to splice.
+	var fn of(id: FnId): Option<Body> = {
+		if !self.done.contains(&id) {
+			val def = &self.program.fns[id]
+			val .Some(hir) = def.body else {
+				return .None
+			}
+			var body = lowerFn(self.program, self.interner, &def, &hir)
+			self.open.push(id)
+			self.spliceAll(&var body)
+			self.open.pop()
+			self.done.put(id, move body)
+		}
+		return match self.done.get(&id) {
+			.Some(body) => .Some(body.clone())
+			.None => .None
+		}
+	}
+
+	/// Splices the calls of one body, from the last to the first, so that the
+	/// statements a splice moves are ones this pass has already seen.
+	var fn spliceAll(body: &var Body) = {
+		var block = 0
+		while block < body.blocks.len() {
+			var statement = 0
+			while statement < body.blocks[block].statements.len() {
+				val .Call(callee: .Fn(id), ..) = body.blocks[block].statements[statement] else {
+					statement += 1
+					continue
+				}
+				val wanted = self.program.fns[id].isInline || self.lambdas.contains(&id)
+				if !wanted || self.open.contains(&id) {
+					statement += 1
+					continue
+				}
+				val .Some(callee) = self.of(id) else {
+					statement += 1
+					continue
+				}
+				self.open.push(id)
+				val handed = splice(
+					self.program,
+					&var body,
+					BlockId(block as u32),
+					statement,
+					&callee,
+				)
+				self.open.pop()
+				for lambda in handed {
+					self.lambdas.add(lambda)
+				}
+				// What followed the call is now in a block of its own, so this
+				// one is finished.
+				break
+			}
+			block += 1
+		}
+	}
+}
+
+/// Puts `callee` in place of the call at `statement` of `block`, and says
+/// which lambdas the call handed it: the calls through those are direct now,
+/// so they are spliced in their turn.
+fn splice(
+	program: &Program,
+	body: &var Body,
+	block: BlockId,
+	statement: i64,
+	callee: &Body,
+): Vec<FnId> = {
+	val b = block.index as i64
+	val .Call(args, dest, ..) = body.blocks[b].statements[statement].clone() else {
+		panic("the caller found a call here")
+	}
+	// Where the call was written. The callee's own positions become this one,
+	// so that debug information and a panic's frames put the caller where it
+	// called, as they did before the call was spliced; the callee's blocks
+	// follow the caller's, and would otherwise lend their lines to what comes
+	// after them.
+	var calledAt: Option<Span> = .None
+	var i = statement
+	while i > 0 {
+		i -= 1
+		if body.blocks[b].statements[i] is .At(span) {
+			calledAt = .Some(span)
+			break
+		}
+	}
+	// What comes after the call waits in a block of its own.
+	var kept: Vec<Statement> = Vec()
+	var rest: Vec<Statement> = Vec()
+	if calledAt is .Some(span) then rest.push(.At(span))
+	val statements = mem::replace(&var body.blocks[b].statements, Vec())
+	for (at, s) in statements.forwards().enumerate() {
+		if at < statement then kept.push(s.clone()) else if at > statement then rest.push(s.clone())
+	}
+	body.blocks[b].statements = move kept
+	val after = BlockId(body.blocks.len() as u32)
+	val terminator = mem::replace(&var body.blocks[b].terminator, .Goto(after))
+	body.blocks.push(Block(statements: move rest, terminator: move terminator))
+
+	// A closure argument written at the call is a pair of a code address and
+	// an environment, and the code address is a constant the caller just
+	// wrote down. Finding it is what lets the call through the pair become a
+	// call to the lambda.
+	var handed: Map<Local, FnId> = Map()
+	for (index, arg) in args.forwards().enumerate() {
+		if arg is .Copy(pair) &&
+			pair.projections.isEmpty() &&
+			index < callee.params.len() &&
+			codeAddress(&body, block, statement, pair.local) is .Some(lambda) {
+			handed.put(callee.params[index], lambda)
+		}
+	}
+
+	// Each of the callee's locals becomes a place in the caller: a parameter
+	// is the place the argument named, and everything else is a local of its
+	// own.
+	val firstBlock = BlockId(body.blocks.len() as u32)
+	var places: Vec<Place> = Vec()
+	var prologue: Vec<Statement> = Vec()
+	for (i, decl) in callee.locals.forwards().enumerate() {
+		val local = Local(i as u32)
+		var param: Option<i64> = .None
+		for (p, candidate) in callee.params.forwards().enumerate() {
+			if candidate == local {
+				param = .Some(p)
+				break
+			}
+		}
+		val place = if param is .Some(index) {
+			match args[index] {
+				// An aggregate is passed by its address, so the callee reads and
+				// writes the caller's own place, as the call did. A scalar is a
+				// copy, and stays one: a local that is read as an index or a
+				// count must be a local.
+				.Copy(place) if isAggregate(&program, decl.ty) &&
+					!writesBack(&callee, local) => place.clone()
+				operand => {
+					val fresh = freshLocal(&var body, decl.ty, .Temp)
+					prologue.push(.Assign(place: Place::of(fresh), rvalue: .Use(operand.clone())))
+					Place::of(fresh)
+				}
+			}
+		} else if callee.ret == Option::Some(local) {
+			match dest {
+				// The result goes where the call's did, unless the caller is also
+				// reading that place as an argument.
+				.Some(place) if !aliases(&place, &args) => place.clone()
+				_ => Place::of(freshLocal(&var body, decl.ty, .Temp))
+			}
+		} else {
+			Place::of(freshLocal(&var body, decl.ty, decl.kind.clone()))
+		}
+		places.push(move place)
+	}
+
+	// A call through one of those pairs is a call to the lambda itself.
+	var direct: Vec<(Place, FnId)> = Vec()
+	for entry in handed {
+		var code = places[entry.key.index as i64].clone()
+		code.projections.push(.Field(1))
+		direct.push((move code, entry.value))
+	}
+
+	// The callee's blocks, renumbered, with `return` going to what follows the
+	// call.
+	var mapping = Mapping(places: &places)
+	for (i, original) in callee.blocks.forwards().enumerate() {
+		// A body reads the code address into a temporary before it calls
+		// through it, so what each temporary last held is followed here.
+		var copies: Vec<(Local, Place)> = Vec()
+		var statements: Vec<Statement> = Vec()
+		for s in original.statements {
+			// With no position for the call, the callee's are dropped, and its
+			// instructions keep whatever the caller's last one was.
+			val moved = match calledAt {
+				.Some(call) if s is .At(..) => Statement::At(call)
+				.None if s is .At(..) => continue
+				_ => s.clone()
+			}
+			val mapped = makeDirect(rewriteStatement(move moved, &var mapping), &direct, &copies)
+			followCopy(&mapped, &var copies)
+			statements.push(move mapped)
+		}
+		val terminator = mapTerminator(original.terminator.clone(), &var mapping, firstBlock, after)
+		if i == 0 {
+			var first = mem::replace(&var prologue, Vec())
+			if calledAt is .Some(span) then first.insert(0, .At(span))
+			for s in statements {
+				first.push(s.clone())
+			}
+			statements = move first
+		}
+		body.blocks.push(Block(statements: move statements, terminator: move terminator))
+	}
+	body.blocks[b].terminator = .Goto(firstBlock)
+
+	var lambdas: Vec<FnId> = Vec()
+	for entry in handed {
+		lambdas.push(entry.value)
+	}
+
+	// The result, when it could not be written where the call's went.
+	if dest is .Some(written) && callee.ret is .Some(ret) && places[ret.index as i64] != written {
+		val value = Operand::Copy(places[ret.index as i64].clone())
+		body.blocks[after.index as i64].statements.insert(0, .Assign(
+			place: written.clone(),
+			rvalue: .Use(move value),
+		))
+	}
+	return move lambdas
+}
+
+/// The lambda a closure pair holds, when the caller wrote its code address
+/// down as a constant before the call. A pair built anywhere else — one
+/// passed on from elsewhere, or held in a variable — has no constant to find,
+/// and the call through it stays a call.
+fn codeAddress(body: &Body, block: BlockId, before: i64, pair: Local): Option<FnId> = {
+	val statements = &body.blocks[block.index as i64].statements
+	var i = before
+	while i > 0 {
+		i -= 1
+		val .Assign(place, rvalue: .Use(.Const(.Fn(id, ..)))) = statements[i] else {
+			continue
+		}
+		if place.local == pair &&
+			place.projections.len() == 1 &&
+			place.projections[0] == Projection::Field(1) {
+			return .Some(id)
+		}
+	}
+	return .None
+}
+
+/// Turns a call through a closure pair into a call to the lambda it holds.
+fn makeDirect(
+	statement: Statement,
+	direct: &[(Place, FnId)],
+	copies: &[(Local, Place)],
+): Statement = {
+	val .Some(lambda) = directLambda(&statement, &direct, &copies) else {
+		return move statement
+	}
+	// The environment stays the first argument: what the lambda captured it
+	// still reads through it.
+	val .Call(args, dest, ..) = move statement else {
+		panic("a call through a pair, found above")
+	}
+	return .Call(callee: .Fn(lambda), args: move args, dest: move dest)
+}
+
+/// The lambda a call through a closure pair calls, where the pair is one of
+/// those the call handed over.
+fn directLambda(
+	statement: &Statement,
+	direct: &[(Place, FnId)],
+	copies: &[(Local, Place)],
+): Option<FnId> = {
+	val .Call(callee: .Value(.Copy(code)), ..) = statement else {
+		return .None
+	}
+	// What the call names, and what that was a copy of.
+	var held: Option<Place> = .None
+	if code.projections.isEmpty() {
+		for (local, place) in copies.backwards() {
+			if local == code.local {
+				held = .Some(place.clone())
+				break
+			}
+		}
+	}
+	for (place, lambda) in direct {
+		if held == Option::Some(place.clone()) || place == code then return .Some(lambda)
+	}
+	return .None
+}
+
+/// Remembers `x = y` for a local, and forgets what a local held when it is
+/// written any other way.
+fn followCopy(statement: &Statement, copies: &var Vec<(Local, Place)>) = {
+	val written: Option<Local> = match statement {
+		.Assign(place, rvalue) => {
+			if place.projections.isEmpty() && rvalue is .Use(.Copy(source)) {
+				copies.push((place.local, source.clone()))
+				return
+			}
+			.Some(place.local)
+		}
+		.SetVariant(place, ..) | .Zero(place) | .Poison(place) | .DropInPlace(place, ..) => .Some(
+			place.local,
+		)
+		.CheckMoved(..) => .None
+		.Arith(dest, ..) => .Some(dest.local)
+		.Call(dest, ..) | .Atomic(dest, ..) => match dest {
+			.Some(dest) => .Some(dest.local)
+			.None => .None
+		}
+		.Alloc(dest, ..) | .AllocBuffer(dest, ..) => .Some(dest.local)
+		_ => .None
+	}
+	if written is .Some(local) {
+		var kept: Vec<(Local, Place)> = Vec()
+		for (held, place) in mem::replace(&var copies, Vec()) {
+			if held != local then kept.push((held, place.clone()))
+		}
+		copies = move kept
+	}
+}
+
+/// Whether the callee assigns to one of its own parameters, in which case the
+/// caller's place cannot stand in for it.
+fn writesBack(callee: &Body, param: Local): bool = {
+	for block in callee.blocks {
+		for statement in block.statements {
+			val writes = match statement {
+				.Assign(place, ..) | .Zero(place) | .Poison(place) | .DropInPlace(place, ..) =>
+					place.local == param
+				.Call(dest, ..) => dest is .Some(d) && d.local == param
+				.Alloc(dest, ..) | .AllocBuffer(dest, ..) => dest.local == param
+				_ => false
+			}
+			if writes then return true
+		}
+	}
+	return false
+}
+
+/// Whether the place the result goes to is one of the arguments, which the
+/// callee may still be reading when it writes its result.
+fn aliases(dest: &Place, args: &[Operand]): bool = {
+	for arg in args {
+		if arg is .Copy(place) && place.local == dest.local then return true
+	}
+	return false
+}
+
+fn freshLocal(body: &var Body, ty: Ty, kind: LocalKind): Local = {
+	val local = Local(body.locals.len() as u32)
+	// A callee's return local is an ordinary local of the caller. Its name is
+	// the callee's; in the caller it is a temporary.
+	val fresh: LocalKind = match kind {
+		.Param | .Return => .Temp
+		other => move other
+	}
+	body.locals.push(LocalDecl::unnamed(ty, move fresh))
+	return local
+}
+
+/// The caller's places for the callee's locals.
+view struct Mapping {
+	places: &[Place]
+}
+
+extend Mapping {
+	/// The caller's place for one of the callee's: what its local became, with
+	/// the projections it was read through. An index is a local too, and it is
+	/// the caller's now.
+	fn place(place: Place): Place = {
+		// The callee's own projections first, since an index among them names
+		// one of its locals; the place it was passed may have projections of
+		// its own, which are the caller's already.
+		val mapped = &self.places[place.local.index as i64]
+		var projections = mapped.projections.clone()
+		for projection in move place.projections {
+			match projection {
+				.Index(index) => {
+					val at = &self.places[index.index as i64]
+					if !at.projections.isEmpty() then
+						panic("an index is a scalar, and a scalar argument is copied to a local")
+					projections.push(.Index(at.local))
+				}
+				other => projections.push(move other)
+			}
+		}
+		return Place(local: mapped.local, projections: move projections)
+	}
+}
+
+extend Mapping: Rewrite {
+	var fn read(place: Place): Place = self.place(move place)
+
+	var fn written(place: Place): Place = self.place(move place)
+
+	fn rewritesCallee(): bool = true
+}
+
+/// A callee's terminator in the caller: its operands mapped, its blocks
+/// renumbered, and its `return` gone on to what follows the call.
+fn mapTerminator(
+	terminator: Terminator,
+	mapping: &var Mapping,
+	first: BlockId,
+	after: BlockId,
+): Terminator = {
+	val moved = (block: BlockId) => BlockId(block.index + first.index)
+	return match rewriteTerminator(move terminator, &var mapping) {
+		.Goto(target) => .Goto(moved(target))
+		.Branch(cond, thenBlock, otherwise) => .Branch(
+			cond: move cond,
+			thenBlock: moved(thenBlock),
+			otherwise: moved(otherwise),
+		)
+		.Switch(value, cases, otherwise) => {
+			var targets: Vec<(u32, BlockId)> = Vec()
+			for (case, target) in cases {
+				targets.push((case, moved(target)))
+			}
+			.Switch(value: move value, cases: move targets, otherwise: moved(otherwise))
+		}
+		.Return => .Goto(after)
+		other => move other
+	}
+}

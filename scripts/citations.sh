@@ -13,7 +13,7 @@ set -uo pipefail
 cd "${1:-$(dirname "$0")/..}"
 
 published=(README.md CHANGELOG.md THIRD-PARTY-NOTICES.md docs/language docs/grammar.md
-    crates std tools tests editors examples scripts .github)
+    compiler bootstrap std tools tests editors examples scripts .github)
 skip=(--exclude-dir=target --exclude-dir=node_modules --exclude-dir=bench
     --exclude=publish.sh --exclude=speed.sh --exclude=citations.sh)
 
@@ -24,8 +24,9 @@ named='plan M[0-9]|[Ss]yntax reviews?|syntax-review|[Pp]rototype plan|prototype-
 
 found=$(
     grep -rIn -E "\\b($numbered) [0-9]+\\b|$named" "${published[@]}" "${skip[@]}" 2>/dev/null
-    # The word at the end of one line, and the number starting the next.
-    grep -rIn -A1 -E "\\b($numbered)[^A-Za-z0-9]*\$" "${published[@]}" "${skip[@]}" 2>/dev/null |
+    # The word at the end of one line, and the number starting the next;
+    # not a word that ends a sentence.
+    grep -rIn -A1 -E "\\b($numbered)[^A-Za-z0-9.]*\$" "${published[@]}" "${skip[@]}" 2>/dev/null |
         grep -E '^[^:]+-[0-9]+-[^A-Za-z0-9]*[0-9]+\b'
 )
 if [ -n "$found" ]; then

@@ -1,0 +1,218 @@
+// What a body keeps of its parameters. A call keeps nothing of its arguments
+// but what its `keeps` names, and the body is held to it. What a parameter
+// borrows is its caller's, and no root of the body's, so this follows the
+// values themselves: which locals hold what a parameter that may hold a view
+// was given — a `str`, a reference, a view, or a value of a type parameter,
+// which one instance makes a `str` — and whether one is stored in a `&var`
+// parameter's place, by a call that keeps it there or by an assignment
+// through the parameter.
+
+import std::collections::{Map, Set}
+import hir::{ExprId, LocalId, Ty}
+
+extend Checker {
+	/// Reports each value that may hold a view, stored in a `&var` parameter,
+	/// that holds a parameter `keeps` does not name.
+	var fn checkGenericKeeps() = {
+		var candidates: Vec<LocalId> = Vec()
+		for p in self.body.params {
+			val ty = self.body.locals[p].ty
+			if !self.isVarRef(ty) && self.mayHoldView(ty) && !self.keeps.contains(&p) then
+				candidates.push(p)
+		}
+		if candidates.isEmpty() || self.varParams.isEmpty() then return
+		val holds = self.holders(&candidates)
+		// Each parameter is reported once, where it is first stored: one
+		// `keeps` answers every place.
+		var reported: Set<LocalId> = Set()
+		val body = self.body
+		for expr in body.exprs {
+			match expr.kind {
+				.Call(callee, args, ..) => {
+					val keeps = &self.program.fns[callee].keeps
+					if keeps.isEmpty() then continue
+					for (i, into) in args.forwards().enumerate() {
+						// Only what can hold a view keeps one.
+						val .Ref(inner, kind: .Var) = self.program.types.kind(
+							body.exprs[into].ty,
+						) else {
+							continue
+						}
+						if !self.mayHoldView(inner) then continue
+						val .Some(param) = self.varParamRoot(into) else {
+							continue
+						}
+						for j in keeps {
+							if (j as i64) >= args.len() then continue
+							val kept = args[j as i64]
+							if j as i64 != i then
+								self.checkStored(kept, param, &holds, &var reported)
+						}
+					}
+				}
+				.Assign(place, value, op: .None, ..) => {
+					if self.mayHoldView(body.exprs[place].ty) {
+						if self.varParamRoot(place) is .Some(param) then
+							self.checkStored(value, param, &holds, &var reported)
+					}
+				}
+				_ => {}
+			}
+		}
+	}
+
+	/// Whether `ty` is a `&var` reference.
+	fn isVarRef(ty: Ty): bool = self.program.types.kind(ty) is .Ref(kind: .Var, ..)
+
+	/// Whether a value of `ty` may hold a view: it does, or its type stands
+	/// for different types in different instances.
+	fn mayHoldView(ty: Ty): bool = self.program.holdsView(ty) || self.program.types.isGeneric(ty)
+
+	/// The `&var` parameter whose place `id` is in, where it is in one.
+	fn varParamRoot(id: ExprId): Option<LocalId> = {
+		val .Some(path) = self.accessPath(id) else {
+			return .None
+		}
+		val local = &self.body.locals[path.local]
+		return if local.kind == .Param && self.isVarRef(local.ty) then .Some(path.local) else .None
+	}
+
+	/// For each local, the candidate parameters whose values it may hold:
+	/// what it is bound or assigned from, until nothing grows.
+	fn holders(candidates: &[LocalId]): Map<LocalId, Set<LocalId>> = {
+		var holds: Map<LocalId, Set<LocalId>> = Map()
+		for p in candidates {
+			var itself: Set<LocalId> = Set()
+			itself.add(p)
+			holds.put(p, move itself)
+		}
+		val body = self.body
+		while true {
+			var grew = false
+			for stmt in body.stmts {
+				var to: Vec<LocalId> = Vec()
+				val from = match stmt.kind {
+					.Let(local, init) => {
+						to.push(local)
+						init
+					}
+					.Guard(scrutinee, pattern, ..) => {
+						pattern.locals(&var to)
+						scrutinee
+					}
+					.ForElements(binding, elements, ..) => {
+						binding.locals(&var to)
+						elements
+					}
+					_ => continue
+				}
+				val held = self.heldBy(from, &holds)
+				if give(&var holds, &to, &held) then grew = true
+			}
+			for expr in body.exprs {
+				match expr.kind {
+					.Assign(place, value, ..) => {
+						if body.exprs[place].kind is .Local(local) {
+							val held = self.heldBy(value, &holds)
+							val assigned = Vec::of(own [local])
+							if give(&var holds, &assigned, &held) then grew = true
+						}
+					}
+					.Match(scrutinee, arms) => {
+						val held = self.heldBy(scrutinee, &holds)
+						for arm in arms {
+							var locals: Vec<LocalId> = Vec()
+							arm.pattern.locals(&var locals)
+							if give(&var holds, &locals, &held) then grew = true
+						}
+					}
+					.Is(scrutinee, pattern) => {
+						var locals: Vec<LocalId> = Vec()
+						pattern.locals(&var locals)
+						val held = self.heldBy(scrutinee, &holds)
+						if give(&var holds, &locals, &held) then grew = true
+					}
+					_ => {}
+				}
+			}
+			if !grew then return move holds
+		}
+		return move holds
+	}
+
+	/// The candidate parameters whose values the expression may hold: those
+	/// of every local it reads.
+	fn heldBy(id: ExprId, holds: &Map<LocalId, Set<LocalId>>): Set<LocalId> = {
+		val body = self.body
+		var found: Set<LocalId> = Set()
+		var stack = Vec::of(own [id])
+		while stack.pop() is .Some(e) {
+			// A value that can hold no view carries nothing of a parameter:
+			// `label.span` of a `&Label`.
+			if !self.mayHoldView(body.exprs[e].ty) then continue
+			val kind = &body.exprs[e].kind
+			if kind is .Local(local) {
+				if holds.get(&local) is .Some(params) {
+					for p in params {
+						found.add(p)
+					}
+				}
+			}
+			for child in kind.children() {
+				stack.push(child)
+			}
+			var blocks = kind.blocks()
+			while blocks.pop() is .Some(block) {
+				for s in block.stmts {
+					val stmt = &body.stmts[s].kind
+					for child in stmt.children() {
+						stack.push(child)
+					}
+					for inner in stmt.blocks() {
+						blocks.push(inner)
+					}
+				}
+				if block.value is .Some(value) then stack.push(value)
+			}
+			for arm in kind.arms() {
+				if arm.guard is .Some(guard) then stack.push(guard)
+				stack.push(arm.body)
+			}
+		}
+		return move found
+	}
+
+	/// Reports `value`, stored in `param`'s place, where it may hold a view
+	/// and holds a parameter `keeps` does not name.
+	var fn checkStored(
+		value: ExprId,
+		param: LocalId,
+		holds: &Map<LocalId, Set<LocalId>>,
+		reported: &var Set<LocalId>,
+	) = {
+		if !self.mayHoldView(self.body.exprs[value].ty) then return
+		var held: Vec<LocalId> = Vec()
+		for p in self.heldBy(value, &holds) {
+			if p != param then held.push(p)
+		}
+		held.sort()
+		if held.isEmpty() then return
+		val kept = held[0]
+		if !reported.add(kept) then return
+		val span = self.body.exprs[value].span
+		self.reportKeptUnnamed(param, kept, span)
+	}
+}
+
+/// Gives each of `to` the parameters of `from`, and says whether any of them
+/// grew.
+fn give(holds: &var Map<LocalId, Set<LocalId>>, to: &[LocalId], from: &Set<LocalId>): bool = {
+	var grew = false
+	for local in to {
+		if !holds.contains(&local) then holds.put(local, Set())
+		for p in from {
+			if holds.at(&local).add(p) then grew = true
+		}
+	}
+	return grew
+}

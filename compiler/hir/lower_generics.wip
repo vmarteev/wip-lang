@@ -1,0 +1,1119 @@
+// Generic items: type parameters, type arguments, and inferring them where a
+// generic function, struct or enum is used.
+
+import std::collections::{Map}
+import std::mem
+import syntax as ast
+import syntax::{
+	BUILTIN_REDEFINED,
+	CANNOT_INFER,
+	DECIDED_TYPE,
+	Diagnostic,
+	NOT_COPY,
+	OPAQUE_VALUE,
+	REF_OUTSIDE_PARAMETER,
+	Span,
+	Symbol,
+	TYPE_ARGUMENT_COUNT,
+	TYPE_PARAMETER_DEFAULT,
+	UNKNOWN_CONSTRAINT
+}
+
+/// An operand of a generic call or literal: the expression, the declared type
+/// it is checked against, which may mention the item's type parameters, and
+/// where that type was declared.
+@derive(Clone)
+view struct GenericOperand {
+	expr: ast::ExprId
+	declared: Ty
+	context: Option<(Span, str)>
+	/// A call argument, which may be a reference.
+	isArg: bool
+}
+
+/// The type arguments of one use of a generic item, as they become known.
+struct Inference {
+	tys: Vec<Option<Ty>>
+	/// Which were known at the start: written, or taken from a type that was
+	/// checked where it was made. They are not checked again.
+	given: Vec<bool>
+}
+
+extend Inference {
+	static fn new(tys: Vec<Option<Ty>>): Inference = {
+		var given: Vec<bool> = Vec()
+		for t in tys {
+			given.push(t.isSome())
+		}
+		return Inference(tys: move tys, given: move given)
+	}
+}
+
+/// The arguments of a solution, those not known yet the error type.
+fn solved(solution: &[Option<Ty>]): Vec<Ty> = {
+	var args: Vec<Ty> = Vec()
+	for t in solution {
+		args.push(t.unwrapOr(ERROR))
+	}
+	return move args
+}
+
+extend Lowerer {
+	/// The type parameters an item other than a struct or an enum declares,
+	/// which take no defaults.
+	var fn genericParams(params: &[ast::GenericParam]): Vec<GenericParamDef> = {
+		for param in params {
+			if param.default is .Some(default) {
+				val span = self.ast.types[default].span
+				self.report(
+					Diagnostic::error(
+						TYPE_PARAMETER_DEFAULT,
+						String::of("only a struct's or an enum's type parameter has a default"),
+						param.name.span.to(span),
+						String::of("a default"),
+					).withNote(
+						String::of(
+							"a default says what a type is where it is written with fewer type arguments; a function's are inferred where it is called, and an `extend` block names every one",
+						),
+					),
+				)
+			}
+		}
+		return self.paramsOf(&params, false, false)
+	}
+
+	/// The type parameters an interface declares, which may have defaults as
+	/// a struct's do, and whose defaults may name `Self`, the type that
+	/// implements it.
+	var fn interfaceGenericParams(params: &[ast::GenericParam]): Vec<GenericParamDef> = {
+		// The decided ones come last, as a constraint names a prefix of the
+		// rest, and have no default: the implementation says what they are.
+		var firstDecided: Option<Span> = .None
+		for param in params {
+			match (param.decided, firstDecided) {
+				(.Some(span), .None) => firstDecided = .Some(span.to(param.name.span))
+				(.None, .Some(first)) => {
+					val text = String::of(self.text(param.name.sym))
+					self.report(
+						Diagnostic::error(
+							DECIDED_TYPE,
+							"`\(text)` follows a type each implementation decides",
+							param.name.span,
+							String::of("not decided"),
+						).withSecondary(first, String::of("decided")).withNote(
+							String::of(
+								"a constraint leaves out what an implementation decides, so those come after the types it names",
+							),
+						),
+					)
+				}
+				_ => {}
+			}
+			if param.decided.isSome() && param.default is .Some(default) {
+				val text = String::of(self.text(param.name.sym))
+				self.report(
+					Diagnostic::error(
+						DECIDED_TYPE,
+						"`\(text)` is decided by each implementation, and has no default",
+						self.ast.types[default].span,
+						String::of("a default"),
+					).withNote(
+						String::of(
+							"an implementation says what a decided type is where it names the interface: `extend Chars: Iterator<char>`",
+						),
+					),
+				)
+			}
+		}
+		return self.typeGenericParamsOf(&params, true)
+	}
+
+	/// The type parameters a struct or an enum declares.
+	var fn typeGenericParams(
+		params: &[ast::GenericParam],
+	): Vec<GenericParamDef> = self.typeGenericParamsOf(&params, false)
+
+	/// The type parameters a struct, an enum or an interface declares. A
+	/// default is read once every type has a name; here it is only noted,
+	/// and the ones after it must have one too.
+	var fn typeGenericParamsOf(
+		params: &[ast::GenericParam],
+		isInterface: bool,
+	): Vec<GenericParamDef> = {
+		var defaulted: Option<Span> = .None
+		for param in params {
+			match (param.default, defaulted) {
+				(.Some(default), .None) =>
+					defaulted = .Some(param.name.span.to(self.ast.types[default].span))
+				(.None, .Some(first)) => {
+					val text = String::of(self.text(param.name.sym))
+					self.report(
+						Diagnostic::error(
+							TYPE_PARAMETER_DEFAULT,
+							"`\(text)` has no default, and follows a parameter that has one",
+							param.name.span,
+							String::of("needs a default"),
+						).withSecondary(first, String::of("a default here")).withNote(
+							String::of(
+								"a use leaves out type arguments from the end, so the parameters with defaults come last",
+							),
+						),
+					)
+				}
+				_ => {}
+			}
+		}
+		return self.paramsOf(&params, true, isInterface)
+	}
+
+	var fn paramsOf(
+		params: &[ast::GenericParam],
+		defaults: bool,
+		isInterface: bool,
+	): Vec<GenericParamDef> = {
+		var seen: Map<Symbol, Span> = Map()
+		var defs: Vec<GenericParamDef> = Vec()
+		for param in params {
+			match seen.get(&param.name.sym) {
+				.Some(first) => self.duplicate(param.name, first)
+				.None => seen.put(param.name.sym, param.name.span)
+			}
+			if self.builtin(param.name.sym).isSome() then
+				self.report(
+					Diagnostic::error(
+						BUILTIN_REDEFINED,
+						"`\(self.text(param.name.sym))` is a built-in type and cannot name a type parameter",
+						param.name.span,
+						String::of("built-in type name"),
+					),
+				)
+			// `copy` is read here; the interfaces wait until every parameter
+			// has a name, since a constraint may use one.
+			var copy = false
+			for bound in param.bounds {
+				if self.isCopy(&bound) then copy = true
+			}
+			// A type an implementation decides is an interface's alone.
+			if param.decided is .Some(span) && !isInterface then
+				self.report(
+					Diagnostic::error(
+						DECIDED_TYPE,
+						String::of(
+							"only an interface's type parameter is decided by its implementations",
+						),
+						span,
+						String::of("`type` here"),
+					).withNote(
+						String::of(
+							"`interface Iterator<type Item>` says each implementation decides `Item`; a struct's, an enum's and a function's parameters are given where they are used",
+						),
+					),
+				)
+			defs.push(GenericParamDef(
+				decided: isInterface && param.decided.isSome(),
+				name: param.name.sym,
+				written: param.name.sym,
+				interfaces: Vec(),
+				copy: copy,
+				default: if param.default.isSome() && defaults then ParamDefault::Pending
+				else ParamDefault::None,
+				span: param.name.span,
+			))
+		}
+		// With the names in scope, `C: Items<T>` can be read.
+		val outer = self.typeParams.len()
+		for def in defs {
+			self.typeParams.push(def.clone())
+		}
+		for i in 0..params.len() {
+			val param = &params[i]
+			var interfaces: Vec<Constraint> = Vec()
+			for bound in param.bounds {
+				if self.isCopy(&bound) {
+					if !bound.args.isEmpty() then
+						self.report(
+							Diagnostic::error(
+								UNKNOWN_CONSTRAINT,
+								String::of("`copy` takes no types"),
+								bound.span,
+								String::of("not an interface"),
+							).withNote(String::of("`copy` says a type owns no memory")),
+						)
+					continue
+				}
+				match self.interfaceAt(&bound.module, bound.name) {
+					.Found(id) => {
+						// `T: From<i64>`: the types the interface takes here,
+						// which say which implementation a call means.
+						val constrained = self.intern(
+							.Param(TyParam(
+								index: (outer + i) as u32,
+								name: defs[i].name,
+								copy: defs[i].copy,
+							)),
+						)
+						val args = self.constraintArgs(id, &bound, constrained)
+						interfaces.push(Constraint(interfaceId: id, args: args))
+					}
+					.Reported => {}
+					.NotFound => {
+						self.report(
+							Diagnostic::error(
+								UNKNOWN_CONSTRAINT,
+								"unknown constraint `\(self.text(bound.name.sym))`",
+								bound.span,
+								String::of("not a constraint"),
+							).withNote(String::of("a constraint is `copy` or an interface")),
+						)
+					}
+				}
+			}
+			// Seen by the parameters after it: `J: Iterator<I::Item>`.
+			self.typeParams[outer + i].interfaces = interfaces.clone()
+			defs[i].interfaces = move interfaces
+		}
+		self.typeParams.truncate(outer)
+		return move defs
+	}
+
+	/// The types a constraint's interface takes, checked against what it
+	/// declares: an interface that takes types must be given them, but for
+	/// those with defaults, which `constrained` — the type the constraint is
+	/// on — stands in for `Self` in.
+	var fn constraintArgs(id: InterfaceId, bound: &ast::Bound, constrained: Ty): TyList = {
+		val generics = self.program.interfaces[id].generics.clone()
+		if bound.args.len() < requiredConstraintArgs(&generics) ||
+			bound.args.len() > generics.len() {
+			val name = self.program.interfaces[id].name
+			for arg in bound.args {
+				self.resolveTy(arg)
+			}
+			self.typeArgCount(name, &generics, bound.args.len(), bound.span)
+			return TyList::empty()
+		}
+		var args: Vec<Ty> = Vec()
+		for i in 0..bound.args.len() {
+			val arg = bound.args[i]
+			val ty = self.typeArg(arg)
+			self.checkCopy(ty, &generics[i], self.ast.types[arg].span)
+			self.checkConstraints(ty, &generics[i], self.ast.types[arg].span)
+			args.push(ty)
+		}
+		val all = self.interfaceDefaults(id, move args, constrained)
+		return self.program.types.internList(&all)
+	}
+
+	/// An interface's arguments as written, and those left out from the end,
+	/// as their defaults say, with `implementing` in place of `Self`. A
+	/// default is written in the terms of an interface's methods: `Self`
+	/// first, then the interface's own parameters.
+	var fn interfaceDefaults(id: InterfaceId, written: Vec<Ty>, implementing: Ty): Vec<Ty> = {
+		val generics = self.program.interfaces[id].generics.clone()
+		var args = move written
+		while args.len() < generics.len() {
+			val index = args.len()
+			val ty = match generics[index].default {
+				.Ty(default) => {
+					var known = Vec::of(own [implementing])
+					for a in args {
+						known.push(a)
+					}
+					self.program.types.subst(default, &known)
+				}
+				// Left out of a constraint, a decided type is what the
+				// implementation decides: `I::Item`.
+				.None if generics[index].decided => self.program.types.assoc(
+					implementing,
+					id,
+					index as u32,
+				)
+				.Pending | .None => ERROR
+			}
+			args.push(ty)
+		}
+		return move args
+	}
+
+	/// The type parameters of an item, as types.
+	var fn paramTys(generics: &[GenericParamDef]): Vec<Ty> = {
+		var tys: Vec<Ty> = Vec()
+		for (index, param) in generics.forwards().enumerate() {
+			tys.push(
+				self.intern(
+					.Param(TyParam(index: index as u32, name: param.name, copy: param.copy)),
+				),
+			)
+		}
+		return move tys
+	}
+
+	/// The type parameter in scope under `sym`, if there is one.
+	var fn typeParam(sym: Symbol): Option<Ty> = {
+		for (index, param) in self.typeParams.forwards().enumerate() {
+			if param.written == sym {
+				val kind: TyKind = .Param(TyParam(
+					index: index as u32,
+					name: param.name,
+					copy: param.copy,
+				))
+				return .Some(self.intern(kind))
+			}
+		}
+		return .None
+	}
+
+	/// The type parameters of a struct or enum.
+	fn typeGenerics(def: TypeDef): Vec<GenericParamDef> = match def {
+		.Struct(id) => self.program.structs[id].generics.clone()
+		.Enum(id) => self.program.enums[id].generics.clone()
+		// The element of `extend [T]`, and nothing for the rest.
+		.Builtin(owner) => match self.program.builtins.get(&owner) {
+			.Some(built) => built.generics.clone()
+			.None => Vec()
+		}
+	}
+
+	/// A struct or enum named in a type, with the type arguments written
+	/// after it; `pointee` where it is what a `ptr` points at.
+	var fn appliedType(def: TypeDef, args: &[ast::TypeId], span: Span, pointee: bool): Ty = {
+		// `@opaque`: C knows how large one is and Wip does not, so a value may
+		// not have this type; a pointer to one may.
+		if def is .Struct(id) && self.program.structs[id].isOpaque && !pointee {
+			val text = String::of(self.text(self.program.structs[id].name))
+			val declared = self.program.structs[id].span
+			self.report(
+				Diagnostic::error(
+					OPAQUE_VALUE,
+					"`\(text)` is laid out by C, so a value cannot have its type",
+					span,
+					String::of("not a type a value can have"),
+				).withSecondary(declared, String::of("declared `@opaque` here")).
+					withNote(
+						String::of(
+							"`@opaque` says where the fields are is C's business, so how large one is, is too",
+						),
+					).
+					withHelp("a pointer to one is written `ptr<\(text)>`, and its fields are read through it"),
+			)
+			return ERROR
+		}
+		val generics = self.typeGenerics(def)
+		val name = match def {
+			.Struct(id) => self.program.structs[id].name
+			.Enum(id) => self.program.enums[id].name
+			// A built-in type is never named through this path: it is resolved
+			// by its own name.
+			.Builtin(..) => return ERROR
+		}
+		if args.len() < requiredTypeArgs(&generics) || args.len() > generics.len() {
+			for arg in args {
+				self.resolveTy(arg)
+			}
+			self.typeArgCount(name, &generics, args.len(), span)
+			return ERROR
+		}
+		var written: Vec<Ty> = Vec()
+		for i in 0..args.len() {
+			val ty = self.typeArg(args[i])
+			self.checkCopy(ty, &generics[i], self.ast.types[args[i]].span)
+			written.push(ty)
+		}
+		val tys = self.withDefaults(&generics, move written, span)
+		// Each written argument's constraints, read with every argument known:
+		// `J: Iterator<I::Item>` is about the `I` given beside it.
+		for i in 0..args.len() {
+			if tys.len() == generics.len() then
+				self.checkConstraintsIn(tys[i], &generics[i], self.ast.types[args[i]].span, &tys)
+			else self.checkConstraints(tys[i], &generics[i], self.ast.types[args[i]].span)
+		}
+		for t in tys {
+			if self.hasError(t) then return ERROR
+		}
+		val list = self.program.types.internList(&tys)
+		return match def {
+			.Struct(id) => self.intern(.Struct(id: id, args: list))
+			.Enum(id) => self.intern(.Enum(id: id, args: list))
+			.Builtin(..) => ERROR
+		}
+	}
+
+	/// A type argument written in the source. Like a field's type, it cannot
+	/// be a bare slice. It may be a `str`, a view or a `&` reference, which
+	/// makes the type given it a view, but not a `&var`.
+	var fn typeArg(id: ast::TypeId): Ty = {
+		val ty = self.resolveTy(id)
+		if self.noVarRef(ty, id, "a type argument") || self.bareSlice(ty, id, false) then
+			return ERROR
+		return ty
+	}
+
+	/// Reports the wrong number of type arguments for `name`.
+	var fn typeArgCount(name: Symbol, generics: &[GenericParamDef], given: i64, span: Span) = {
+		val text = self.text(name)
+		// Those with defaults may be left out, from the end.
+		val required = requiredTypeArgs(&generics)
+		val count = match generics.len() - required {
+			0 => plural(generics.len(), "type argument", "type arguments")
+			1 => "\(required) or \(generics.len()) type arguments"
+			_ => "\(required) to \(generics.len()) type arguments"
+		}
+		val message = if generics.isEmpty() {
+			"`\(text)` is not generic, and takes no type arguments"
+		} else {
+			var names: Vec<str> = Vec()
+			for p in generics {
+				names.push(self.text(p.name))
+			}
+			val was = if given == 1 then String::of("1 was") else "\(given) were"
+			"`\(text)` takes \(count) (`\(names.join("`, `"))`), but \(was) given"
+		}
+		self.report(Diagnostic::error(TYPE_ARGUMENT_COUNT, move message, span, "expected \(count)"))
+	}
+
+	/// Reports a type argument that owns memory where `param` requires
+	/// `copy`. While type bodies are still being resolved, whether a type
+	/// owns memory is not known yet, so the check waits until they are.
+	var fn checkCopy(ty: Ty, param: &GenericParamDef, span: Span) = {
+		if !param.copy || self.isPoisoned(ty) then return
+		if self.phase < .TypesResolved {
+			self.pendingCopy.push((ty, param.name, span))
+			return
+		}
+		if self.owns(ty) then
+			self.report(
+				Diagnostic::error(
+					NOT_COPY,
+					"\(self.tyName(ty)) owns memory, but `\(self.text(param.name))` must be `copy`",
+					span,
+					String::of("owns memory"),
+				).withNote(
+					String::of(
+						"a `copy` type is plain data, read without `move`: it holds no `own`, directly or in its fields",
+					),
+				),
+			)
+	}
+
+	/// Runs the `copy` checks that waited for every type body.
+	var fn flushCopyChecks() = {
+		self.phase = .TypesResolved
+		for (ty, name, span) in mem::replace(&var self.pendingCopy, Vec()) {
+			val param = GenericParamDef(
+				decided: false,
+				name: name,
+				written: name,
+				copy: true,
+				interfaces: Vec(),
+				default: .None,
+				span: span,
+			)
+			self.checkCopy(ty, &param, span)
+		}
+	}
+
+	/// Whether a value of type `ty` owns memory. The field types of the
+	/// instances inside it are interned first, since the program only looks
+	/// them up. A type whose instances never end is reported elsewhere, and
+	/// taken to own nothing.
+	var fn owns(ty: Ty): bool = completeType(&var self.program, ty) && self.program.ownsMemory(ty)
+
+	/// The types of every field of a struct or enum type, with its type
+	/// arguments substituted.
+	var fn children(ty: Ty): Vec<Ty> = children(&var self.program, ty)
+
+	/// The type of field `index` of a struct type.
+	var fn structFieldTy(ty: Ty, index: i64): Ty = {
+		val .Struct(id, args) = self.kind(ty) else {
+			return ERROR
+		}
+		val declared = self.program.structs[id].fields[index].ty
+		val list = self.program.types.list(args).toVec()
+		return self.program.types.subst(declared, &list)
+	}
+
+	/// The type of a field of a variant of an enum type.
+	var fn variantFieldTy(ty: Ty, variant: i64, field: i64): Ty = {
+		val .Enum(id, args) = self.kind(ty) else {
+			return ERROR
+		}
+		val declared = self.program.enums[id].variants[variant].fields[field].ty
+		val list = self.program.types.list(args).toVec()
+		return self.program.types.subst(declared, &list)
+	}
+
+	/// Type arguments written after `::` in an expression, for an item whose
+	/// name is segment `expectedAfter` of the path. Nothing in each slot the
+	/// caller must infer.
+	var fn explicitTypeArgs(
+		name: Symbol,
+		generics: &[GenericParamDef],
+		typeArgs: Option<&ast::TypeArgs>,
+		expectedAfter: i64,
+	): Vec<Option<Ty>> = {
+		var unknown: Vec<Option<Ty>> = Vec()
+		var broken: Vec<Option<Ty>> = Vec()
+		for _ in generics {
+			unknown.push(.None)
+			broken.push(.Some(ERROR))
+		}
+		val .Some(typeArgs) = typeArgs else {
+			return move unknown
+		}
+		if typeArgs.after != expectedAfter {
+			for arg in typeArgs.args {
+				self.resolveTy(arg)
+			}
+			self.report(
+				Diagnostic::error(
+					TYPE_ARGUMENT_COUNT,
+					"type arguments belong after the name of `\(self.text(name))`",
+					typeArgs.span,
+					String::of("not after the generic item"),
+				),
+			)
+			return move broken
+		}
+		val given = typeArgs.args.len()
+		if given < requiredTypeArgs(&generics) || given > generics.len() {
+			for arg in typeArgs.args {
+				self.resolveTy(arg)
+			}
+			self.typeArgCount(name, &generics, given, typeArgs.span)
+			return move broken
+		}
+		var written: Vec<Ty> = Vec()
+		for i in 0..given {
+			val arg = typeArgs.args[i]
+			val ty = self.typeArg(arg)
+			self.checkCopy(ty, &generics[i], self.ast.types[arg].span)
+			self.checkConstraints(ty, &generics[i], self.ast.types[arg].span)
+			written.push(ty)
+		}
+		var all: Vec<Option<Ty>> = Vec()
+		for t in self.withDefaults(&generics, move written, typeArgs.span) {
+			all.push(.Some(t))
+		}
+		return move all
+	}
+
+	/// The type arguments a use writes, followed by the defaults of the ones
+	/// it leaves out, each read in the arguments before it and checked as a
+	/// written one is. A default not read yet, while the defaults are read,
+	/// is waited for.
+	var fn withDefaults(generics: &[GenericParamDef], written: Vec<Ty>, span: Span): Vec<Ty> = {
+		var tys = move written
+		val count = if tys.len() < generics.len() then tys.len() else generics.len()
+		for i in count..generics.len() {
+			val ty = match generics[i].default {
+				.Ty(default) => self.program.types.subst(default, &tys)
+				.Pending => {
+					self.defaultWaits = true
+					ERROR
+				}
+				.None => ERROR
+			}
+			tys.push(ty)
+		}
+		// Checked with every argument known, since a constraint may name a
+		// parameter after its own.
+		for i in count..generics.len() {
+			self.checkCopy(tys[i], &generics[i], span)
+			self.checkConstraintsIn(tys[i], &generics[i], span, &tys)
+		}
+		return move tys
+	}
+
+	/// Learns type arguments by matching a declared type, which mentions the
+	/// item's type parameters, against the type found. Only unknown arguments
+	/// are set: a conflict is reported later, as a mismatch.
+	fn unify(declared: Ty, found: Ty, solution: &var Vec<Option<Ty>>) = {
+		if !self.program.types.isGeneric(declared) || self.isPoisoned(found) then return
+		val types = &self.program.types
+		match (types.kind(declared), types.kind(found)) {
+			(.Param(param), _) => {
+				if solution[param.index as i64].isNone() then
+					solution[param.index as i64] = .Some(found)
+			}
+			// A slice is matched by the elements of an array or buffer, as the
+			// coercions allow.
+			(.Own(inner: d), .Own(inner: f)) => {
+				if types.kind(d) is .Slice(elem) && types.kind(f) is .Array(elem: foundElem, ..) {
+					self.unify(elem, foundElem, &var solution)
+					return
+				}
+				self.unify(d, f, &var solution)
+			}
+			// An array where a list on the heap is declared is reported where
+			// it is checked, with `own` to write; its elements say what the
+			// list's are.
+			(.Own(inner: d), .Array(elem: foundElem, ..)) if types.kind(d) is .Slice(..) => {
+				if types.kind(d) is .Slice(elem) then self.unify(elem, foundElem, &var solution)
+			}
+			// A reference to an `own` stands for a reference to what it owns
+			// (the `&own<T>` to `&T` coercion), and an array or buffer for a
+			// slice of its elements.
+			(.Ref(inner: d, ..), .Ref(inner: f, ..)) => {
+				var under = f
+				while true {
+					val declaredOwn = types.kind(d) is .Own(..) | .Param(..)
+					match types.kind(under) {
+						.Own(inner) if !declaredOwn => under = inner
+						_ => break
+					}
+				}
+				if types.kind(d) is .Slice(elem) &&
+					types.kind(under) is .Array(elem: foundElem, ..) | .Slice(elem: foundElem) {
+					self.unify(elem, foundElem, &var solution)
+					return
+				}
+				// A container is lent as the elements it lends where a slice is
+				// declared.
+				if types.kind(d) is .Slice(elem) && self.itemsElement(under) is .Some(foundElem) {
+					self.unify(elem, foundElem, &var solution)
+					return
+				}
+				self.unify(d, under, &var solution)
+			}
+			// Elements given without the `&` a slice is declared with say what
+			// the elements are, so that what is reported is the borrow left
+			// out; and so does a container a reference parameter stands for,
+			// which is lent as them.
+			(
+				.Ref(inner: d, ..),
+				.Slice(elem: foundElem) | .Array(elem: foundElem, ..),
+			) if types.kind(d) is .Slice(..) => {
+				if types.kind(d) is .Slice(elem) then self.unify(elem, foundElem, &var solution)
+			}
+			(.Ref(inner: d, ..), _) if types.kind(d) is .Slice(..) => {
+				if types.kind(d) is .Slice(elem) && self.itemsElement(found) is .Some(foundElem) {
+					self.unify(elem, foundElem, &var solution)
+				}
+			}
+			// A temporary lent where `&[T]` is declared is matched against
+			// `[T]`, which an array's elements answer.
+			(.Array(elem: d, ..), .Array(elem: f, ..)) | (.Slice(elem: d), .Slice(elem: f))
+			| (.Slice(elem: d), .Array(elem: f, ..)) | (.Ptr(inner: d), .Ptr(inner: f))
+			| (.Slots(inner: d), .Slots(inner: f)) => self.unify(d, f, &var solution)
+			(.Struct(id: a, args: d), .Struct(id: b, args: f)) if a == b => self.unifyLists(
+				d,
+				f,
+				&var solution,
+			)
+			// A temporary container lent where `&[T]` is declared is matched
+			// against `[T]`, which the elements it lends answer.
+			(.Slice(elem: d), _) => {
+				if self.itemsElement(found) is .Some(foundElem) then
+					self.unify(d, foundElem, &var solution)
+			}
+			(.Enum(id: a, args: d), .Enum(id: b, args: f)) if a == b => self.unifyLists(
+				d,
+				f,
+				&var solution,
+			)
+			// A function value converts to a closure, lent for a call or owned,
+			// so a closure's types are learnt from one.
+			(.Ref(inner: d, ..) | .Own(inner: d), .Fn(..)) if types.kind(d) is .Fn(
+				..,
+			) => self.unify(d, found, &var solution)
+			(.Fn(params: d, ret: dRet), .Fn(params: f, ret: fRet)) => {
+				self.unifyLists(d, f, &var solution)
+				self.unify(dRet, fRet, &var solution)
+			}
+			_ => {}
+		}
+	}
+
+	fn unifyLists(declared: TyList, found: TyList, solution: &var Vec<Option<Ty>>) = {
+		val ds = self.program.types.list(declared)
+		val fs = self.program.types.list(found)
+		var i = 0
+		while i < ds.len() && i < fs.len() {
+			self.unify(ds[i], fs[i], &var solution)
+			i += 1
+		}
+	}
+
+	/// Whether every type parameter `ty` mentions has a type argument.
+	fn resolved(ty: Ty, solution: &[Option<Ty>]): bool =
+		!self.program.types.any(ty, (kind) =>
+			kind is .Param(param) && solution[param.index as i64].isNone())
+
+	/// A lambda, lent or owned.
+	fn isLambda(e: ast::ExprId): bool = match self.ast.exprs[e].kind {
+		.Lambda(..) => true
+		.Unary(op: .Own, operand, ..) => self.ast.exprs[operand].kind is .Lambda(..)
+		_ => false
+	}
+
+	/// Whether an expression's type is decided by what is expected of it: a
+	/// literal number, a `.Variant`, or an array of them. Such operands are
+	/// checked after the others, which may decide the type arguments.
+	fn takesExpectedType(e: ast::ExprId): bool = {
+		val file = self.ast
+		return match file.exprs[e].kind {
+			.Int(..) | .Float(..) => true
+			.Unary(op: .Neg, operand, ..) | .Paren(inner: operand) => self.takesExpectedType(
+				operand,
+			)
+			.Path(leadingDot, ..) => leadingDot
+			.Call(callee, ..) => file.exprs[callee].kind is .Path(leadingDot: true, ..)
+			.Array(elems) => {
+				for elem in elems {
+					if !self.takesExpectedType(elem) then return false
+				}
+				true
+			}
+			_ => false
+		}
+	}
+
+	/// Checks the operands of a use of a generic item, learning its type
+	/// arguments from them. Operands whose declared type is already known are
+	/// checked against it; the others are inferred first, and converted once
+	/// the type arguments are known. Returns the operands in order.
+	var fn genericOperands(
+		operands: &[GenericOperand],
+		solution: &var Vec<Option<Ty>>,
+	): Vec<ExprId> = {
+		var done: Vec<Option<ExprId>> = Vec()
+		for _ in operands {
+			done.push(.None)
+		}
+		// Inferred without knowing their declared type: converted at the end.
+		var unconverted: Vec<i64> = Vec()
+		for pass in 0..2 {
+			for i in 0..operands.len() {
+				if done[i].isSome() then continue
+				val operand = operands[i]
+				// A literal waits for what the others say its type is; so does a
+				// lambda, whose parameters take their types from it: in
+				// `fold(0, (sum, n) => …)` the `0` says what `sum` is.
+				val deferred =
+					pass == 0 &&
+					(self.takesExpectedType(operand.expr) || self.isLambda(operand.expr))
+				val known = self.resolved(operand.declared, &solution)
+				if deferred && !known then continue
+				// An argument may be written `&place`, and lent where nothing
+				// else may be.
+				val id = if known {
+					val args = solved(&solution)
+					val declared = self.program.types.subst(operand.declared, &args)
+					if operand.isArg then
+						self.checkArgument(operand.expr, declared, operand.context)
+					else self.checkIn(operand.expr, declared, operand.context)
+				} else {
+					// A lambda takes its parameters' types from what is expected,
+					// so it is given what is known of the declared type; what is
+					// not known is inferred from its body.
+					val hint: Option<Ty> = if self.isLambda(operand.expr) {
+						val args = solved(&solution)
+						.Some(self.program.types.subst(operand.declared, &args))
+					} else {
+						.None
+					}
+					val inferred =
+						if operand.isArg then self.inferArgument(operand.expr, hint)
+						else self.infer(operand.expr, hint)
+					// A value with no place of its own is lent where it is used,
+					// so a `&T` parameter is answered by a `T`.
+					var declared = operand.declared
+					if operand.isArg &&
+						self.kind(declared) is .Ref(inner, kind: .Shared) &&
+						!(self.kind(self.tyOf(inferred)) is .Ref(..)) &&
+						self.placeRoot(inferred) == .NotAPlace {
+						declared = inner
+					}
+					self.unify(declared, self.tyOf(inferred), &var solution)
+					unconverted.push(i)
+					inferred
+				}
+				done[i] = .Some(id)
+			}
+		}
+		val args = solved(&solution)
+		for i in unconverted {
+			val declared = self.program.types.subst(operands[i].declared, &args)
+			val .Some(id) = done[i] else {
+				panic("every operand was checked")
+			}
+			// Still the argument, though its type was worked out after it was
+			// lowered: a `&` and a `String` need to know.
+			done[i] = .Some(self.coerceTo(id, declared, operands[i].context, operands[i].isArg))
+		}
+		var all: Vec<ExprId> = Vec()
+		for d in done {
+			match d {
+				.Some(id) => all.push(id)
+				.None => panic("every operand was checked")
+			}
+		}
+		return move all
+	}
+
+	/// An array inferred for a parameter whose interfaces its slice implements
+	/// and it does not: the slice it lends, as an array's methods are its
+	/// slice's. `total(&numbers)` with `C: Sequence<i64>` passes the array as
+	/// `&[i64]`. Whether anything changed, so the caller converts its
+	/// arguments to match.
+	var fn arraysAsSlices(generics: &[GenericParamDef], solution: &var Vec<Option<Ty>>): bool = {
+		var changed = false
+		for i in 0..generics.len() {
+			val param = &generics[i]
+			if param.interfaces.isEmpty() then continue
+			if i >= solution.len() then continue
+			val .Some(ty) = solution[i] else {
+				continue
+			}
+			val .Array(elem, ..) = self.kind(ty) else {
+				continue
+			}
+			// The same question the constraint check asks, with the arguments
+			// known so far; one that is not known yet asks only whether the
+			// type implements the interface at all.
+			val args = solved(&solution)
+			var constraints: Vec<(Constraint, bool)> = Vec()
+			for c in param.interfaces {
+				val list = self.program.types.substList(c.args, &args)
+				var known = true
+				for a in self.program.types.list(list) {
+					if self.isPoisoned(a) then known = false
+				}
+				constraints.push((Constraint(interfaceId: c.interfaceId, args: list), known))
+			}
+			if self.allHold(&constraints, ty) then continue
+			val slice = self.intern(.Slice(elem))
+			if self.allHold(&constraints, slice) {
+				solution[i] = .Some(slice)
+				changed = true
+			}
+		}
+		return changed
+	}
+
+	/// Whether `t` meets each of `constraints`: those whose arguments are
+	/// known as they are, the others by implementing the interface at all.
+	fn allHold(constraints: &[(Constraint, bool)], t: Ty): bool = {
+		for (c, known) in constraints {
+			val holds =
+				if known then self.implementsWith(t, c) else self.implementsAny(t, c.interfaceId)
+			if !holds then return false
+		}
+		return true
+	}
+
+	/// The type arguments of a use of `name`, once its operands have been
+	/// checked: reports those that could not be inferred, and checks the
+	/// inferred ones. `written` shows where type arguments are written.
+	var fn finishTypeArgs(
+		name: str,
+		written: str,
+		generics: &[GenericParamDef],
+		inference: Inference,
+		span: Span,
+	): Vec<Ty> = {
+		var solution = move inference.tys
+		val given = move inference.given
+		// A constraint's argument may be a parameter of its own, and the
+		// implementation the type has says what it is: `C = Vec<i64>` with
+		// `C: Items<T>` makes `T` an `i64`.
+		self.solveThroughConstraints(&generics, &var solution, span)
+		// A parameter nothing decided is its default, where it has one and the
+		// parameters the default names are known: `Arena()` is an
+		// `Arena<T, T>`.
+		for i in 0..generics.len() {
+			if solution[i].isSome() then continue
+			if generics[i].default is .Ty(default) && self.resolved(default, &solution) {
+				val args = solved(&solution)
+				solution[i] = .Some(self.program.types.subst(default, &args))
+			}
+		}
+		var missing: Vec<str> = Vec()
+		for i in 0..generics.len() {
+			if solution[i].isNone() then missing.push(self.text(generics[i].name))
+		}
+		// An error inside the use, in an argument, is why nothing could be
+		// inferred from it, and has been said.
+		var explained = false
+		for d in self.diagnostics {
+			if d.isError() && d.primary.span.lo >= span.lo && d.primary.span.hi <= span.hi then
+				explained = true
+		}
+		if !missing.isEmpty() && !explained {
+			val names = missing.join("`, `")
+			val noun = if missing.len() == 1 then "argument" else "arguments"
+			self.report(
+				Diagnostic::error(
+					CANNOT_INFER,
+					"cannot infer the type \(noun) `\(names)` of `\(name)`",
+					span,
+					String::of("type arguments needed"),
+				).withHelp("write them: `\(written)`"),
+			)
+		}
+		val tys = solved(&solution)
+		for i in 0..tys.len() {
+			if given[i] then continue
+			val ty = tys[i]
+			if self.holdsVarRef(ty) {
+				self.report(
+					Diagnostic::error(
+						REF_OUTSIDE_PARAMETER,
+						"`\(self.text(generics[i].name))` would be \(self.tyName(ty)), but a type argument cannot hold a `&var` reference",
+						span,
+						String::of("infers a `&var` reference"),
+					).withNote(
+						String::of(
+							"a `&` reference may stand for a type parameter, as a view may, but a `&var` is a parameter's alone",
+						),
+					),
+				)
+			} else {
+				self.checkCopy(ty, &generics[i], span)
+				self.checkConstraintsIn(ty, &generics[i], span, &tys)
+			}
+		}
+		return move tys
+	}
+
+	/// What a constraint's arguments say about the parameters they name.
+	/// `C: Items<T>` with `C` known looks for the implementation `C` has,
+	/// reads its arguments in `C`'s own, and that is `T`.
+	var fn solveThroughConstraints(
+		generics: &[GenericParamDef],
+		solution: &var Vec<Option<Ty>>,
+		span: Span,
+	) = {
+		for i in 0..generics.len() {
+			val .Some(ty) = solution[i] else {
+				continue
+			}
+			if self.isPoisoned(ty) then continue
+			for constraint in generics[i].interfaces.clone() {
+				val declared = self.program.types.list(constraint.args).toVec()
+				// Only where something is still unknown.
+				var wanted = false
+				for arg in declared {
+					if self.kind(arg) is .Param(param: p) &&
+						(p.index as i64) < solution.len() &&
+						solution[p.index as i64].isNone() {
+						wanted = true
+					}
+				}
+				if !wanted then continue
+				val .Some(args) = self.implementedArgs(ty, constraint.interfaceId, span) else {
+					continue
+				}
+				var j = 0
+				while j < declared.len() && j < args.len() {
+					if self.kind(declared[j]) is .Param(param: p) &&
+						(p.index as i64) < solution.len() &&
+						solution[p.index as i64].isNone() {
+						solution[p.index as i64] = .Some(args[j])
+					}
+					j += 1
+				}
+			}
+		}
+	}
+
+	/// The types a concrete type implements an interface with, read in its
+	/// own parameters; nothing where it implements it once for none of them,
+	/// or more than once.
+	var fn implementedArgs(ty: Ty, interfaceId: InterfaceId, span: Span): Option<Vec<Ty>> = {
+		val owner = self.ownerOf(ty)?
+		val ownArgs: Vec<Ty> = match self.kind(ty) {
+			.Struct(args, ..) | .Enum(args, ..) => self.program.types.list(args).toVec()
+			.Slice(elem) => Vec::of(own [elem])
+			_ => Vec()
+		}
+		var found: Vec<TyList> = Vec()
+		for i in self.program.impls {
+			if i.interfaceId == interfaceId && i.ty == owner then found.push(i.args)
+		}
+		if found.len() > 1 {
+			var kinds: Vec<String> = Vec()
+			for args in found {
+				kinds.push(
+					self.constraintName(Constraint(interfaceId: interfaceId, args: args), ty),
+				)
+			}
+			val typeName = self.tyName(ty)
+			val interfaceName = String::of(self.text(self.program.interfaces[interfaceId].name))
+			self.report(
+				Diagnostic::error(
+					CANNOT_INFER,
+					"\(typeName) implements `\(interfaceName)` more than once",
+					span,
+					"\(kinds.join(" and ")) both apply",
+				).withHelp(
+					String::of("write the type arguments, or constrain it with the ones you mean"),
+				).withNote(
+					String::of("a constraint's arguments say which implementation a call means"),
+				),
+			)
+			return .None
+		}
+		if found.isEmpty() then return .None
+		val args = self.program.types.list(found[0]).toVec()
+		var substituted: Vec<Ty> = Vec()
+		for arg in args {
+			substituted.push(self.program.types.subst(arg, &ownArgs))
+		}
+		return .Some(move substituted)
+	}
+
+	/// The type arguments a generic struct or enum takes from the type
+	/// expected where it is written.
+	fn expectedArgs(def: TypeDef, expected: Option<Ty>): Vec<Option<Ty>> = {
+		val count = self.typeGenerics(def).len()
+		var unknown: Vec<Option<Ty>> = Vec()
+		for _ in 0..count {
+			unknown.push(.None)
+		}
+		val .Some(expected) = expected else {
+			return move unknown
+		}
+		val list: TyList = match (def, self.kind(expected)) {
+			(.Struct(a), .Struct(id: b, args)) if a == b => args
+			(.Enum(a), .Enum(id: b, args)) if a == b => args
+			_ => return move unknown
+		}
+		var args: Vec<Option<Ty>> = Vec()
+		for t in self.program.types.list(list) {
+			args.push(.Some(t))
+		}
+		return move args
+	}
+
+	/// Interns the field types of every instance interned since `from`, so
+	/// that later phases, which share the types read-only, can look them up.
+	var fn completeTypes(from: i64) = {
+		var diagnostics: Vec<Diagnostic> = Vec()
+		completeTypes(&var self.program, from, self.interner, &var diagnostics)
+		for d in move diagnostics {
+			self.diagnostics.push(move d)
+		}
+	}
+}
+
+/// How many type arguments a constraint must give an interface: those before
+/// the decided ones, but for those with defaults.
+fn requiredConstraintArgs(generics: &[GenericParamDef]): i64 = {
+	var i = generics.len()
+	while i > 0 {
+		i -= 1
+		if !generics[i].decided && generics[i].default == .None then return i + 1
+	}
+	return 0
+}
+
+/// How many type arguments a use must write: up to the last parameter with
+/// no default.
+fn requiredTypeArgs(generics: &[GenericParamDef]): i64 = {
+	var i = generics.len()
+	while i > 0 {
+		i -= 1
+		if generics[i].default == .None then return i + 1
+	}
+	return 0
+}

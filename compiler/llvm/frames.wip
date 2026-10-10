@@ -1,0 +1,706 @@
+// The table a panic reads to say the calls that led to it, made from the
+// DWARF LLVM wrote.
+//
+// What the table holds — each function's code, and where each run of it was
+// written — is known only once LLVM has compiled the program, and LLVM has
+// inlined much of it. The table names each function by its symbol, which
+// only the program's own object may do of a function it keeps to itself, so
+// the table goes into that object:
+//
+// - **ELF:** the object `clang` wrote is read, and the table, its relocations
+//   and its symbol are added after it (`withFrameTables`, through
+//   `elf.wip`).
+// - **Mach-O:** the program is compiled to assembly, assembled once to read
+//   its DWARF, and assembled again with the table after it
+//   (`frameTableAssembly`); the code is the same both times, since the table
+//   adds only data. Every symbol there begins with `_`, so none reads as a
+//   register, which on Linux's arm64 `v0` or `x1` would.
+// - **A debug build** hides its functions rather than keeping them to its
+//   objects, and is compiled in parts: the table is read from every part's
+//   DWARF, and is, on a Mac, the same assembly, an object of its own, and on
+//   ELF added to the first part's object, which names the others' functions
+//   for the linker to find.
+//
+// The table has the form the runtime reads (`std/prelude/runtime.wip`), with
+// what LLVM's inlining adds: a row may say that its code is a call inlined,
+// and the list of those says what was called, and from which line of what.
+
+import std::collections::{Map}
+
+/// The runtime's own file: its functions are how a panic is told, not where
+/// it happened.
+val RUNTIME: str = "std/prelude/runtime.wip"
+
+/// The sections of DWARF a reader of it loads, each with its relocations.
+val DEBUG_SECTIONS: [str; 16] = [
+	".debug_abbrev",
+	".debug_addr",
+	".debug_aranges",
+	".debug_info",
+	".debug_line",
+	".debug_line_str",
+	".debug_macinfo",
+	".debug_macro",
+	".debug_names",
+	".debug_str",
+	".debug_str_offsets",
+	".debug_types",
+	".debug_loc",
+	".debug_loclists",
+	".debug_ranges",
+	".debug_rnglists",
+]
+
+/// What a debug section's relocations put at each offset: an addend, and
+/// whether it adds to what is written there.
+fn relocationsOf(file: &Object, section: &ObjectSection): Result<Map<u64, (bool, u64)>, String> = {
+	var map: Map<u64, (bool, u64)> = Map()
+	for relocation in section.relocations {
+		if !relocation.absolute then return .Err("a relocation of \(relocation.kind) in DWARF")
+		val target: u64 = match relocation.target {
+			.Symbol(index) => {
+				if index >= file.symbols.len() then
+					return .Err(String::of("a relocation of a symbol that is not there"))
+				val .Some(symbol) = file.symbols[index] else {
+					return .Err(String::of("a relocation of a symbol that is not there"))
+				}
+				address(&file, symbol.section, symbol.address)
+			}
+			.Section(index) => address(&file, .Some(index), 0)
+			.Nothing => return .Err(String::of("a relocation in DWARF to nothing it names"))
+		}
+		map.put(relocation.offset, (relocation.implicit, target +% relocation.addend as u64))
+	}
+	return .Ok(move map)
+}
+
+/// An address in `section` of the object, where every section of code has a
+/// place of its own: a Mach-O object's sections have theirs, and an ELF
+/// object's each begin at 0, so each is given a base of its own — LLVM may put
+/// a cold function in a section other than the rest. An address in any other
+/// section is a distance into it, as DWARF reads one in its own sections;
+/// DWARF names no other code or data.
+fn address(file: &Object, section: Option<i64>, at: u64): u64 = {
+	val .Some(index) = section else {
+		return at
+	}
+	val .Some(found) = file.sectionAt(index) else {
+		return at
+	}
+	if !found.text then return at
+	return if file.format == Format::Elf then ((index as u64) << 32) + at else found.address + at
+}
+
+/// A function of the program as the DWARF describes it.
+struct DwarfFunction {
+	symbol: String
+	name: String
+	low: u64
+	high: u64
+	passOver: bool
+}
+
+/// A call inlined: what was called, and from where in what. Two calls inlined
+/// that say the same are one in the table.
+@derive(Eq, Hash, Clone)
+struct Inlined {
+	name: String
+	passOver: bool
+	file: u32
+	line: u32
+	/// The call inlined this one was inlined into, counting from 1; 0 for the
+	/// function itself.
+	parent: u32
+}
+
+/// A call inlined into the function being read: its record in the table, and
+/// the code it is.
+struct InlinedCall {
+	record: u32
+	ranges: Vec<(u64, u64)>
+}
+
+/// A row of a function's table: from `offset`, code written at `file` and
+/// `line`, in the call inlined `inlined` (from 1), or in the function.
+@derive(Eq, Clone)
+struct Row {
+	offset: u32
+	file: u32
+	line: u32
+	inlined: u32
+}
+
+/// The program's table and the list of tables, as assembly to follow the
+/// program's, or, in a debug build, to be an object of its own: read from
+/// their DWARF, which names files as `files` says a panic names them. For
+/// Mach-O.
+pub fn frameTableAssembly(
+	objects: &[Vec<u8>],
+	files: &Map<String, String>,
+): Result<String, String> = {
+	var table = Table::new()
+	var macho = false
+	for object in objects {
+		val file = readObject(&object)?
+		macho = file.format == Format::Macho
+		read(&file, &files, &var table)?
+	}
+	val items = table.layout()
+	return .Ok(assembly(&items, macho))
+}
+
+/// The first of `objects`, the program as `clang` compiled it, with the table
+/// of them all and the list of tables added: read from their DWARF, which
+/// names files as `files` says a panic names them. A function of another of
+/// them is named by a symbol the linker finds. For ELF.
+pub fn withFrameTables(
+	objects: &[Vec<u8>],
+	files: &Map<String, String>,
+): Result<Vec<u8>, String> = {
+	var table = Table::new()
+	for object in objects {
+		val file = readObject(&object)?
+		read(&file, &files, &var table)?
+	}
+	if objects.isEmpty() then return .Err(String::of("no object to add the table to"))
+	val items = table.layout()
+	return elfWith(&objects[0], &items)
+}
+
+/// What an object's DWARF and symbols describe, added to `table`.
+fn read(file: &Object, files: &Map<String, String>, table: &var Table): Result<void, String> = {
+	val macho = file.format == Format::Macho
+	var sections: Map<String, DebugSection> = Map()
+	for name in DEBUG_SECTIONS {
+		val .Some(section) = file.section(name) else {
+			continue
+		}
+		val relocations = relocationsOf(&file, &section)?
+		sections.put(
+			String::of(name),
+			DebugSection(data: file.data(&section).toVec(), relocations: move relocations),
+		)
+	}
+	val dwarf = Dwarf(
+		info: takeSection(&var sections, ".debug_info"),
+		abbrev: takeSection(&var sections, ".debug_abbrev"),
+		str: takeSection(&var sections, ".debug_str"),
+		line: takeSection(&var sections, ".debug_line"),
+		lineStr: takeSection(&var sections, ".debug_line_str"),
+		ranges: takeSection(&var sections, ".debug_ranges"),
+	)
+	// A function's symbol, by the address of its code: the program's own, not
+	// an assembler's label at the same place.
+	var symbols: Map<u64, String> = Map()
+	for found in file.symbols {
+		val .Some(symbol) = found else {
+			continue
+		}
+		if !symbol.text || symbol.undefined then continue
+		val name = symbol.name.toStr()
+		val temporary =
+			name.isEmpty() ||
+			name.startsWith(".L") ||
+			macho && (name.startsWith("l") || name.startsWith("L"))
+		if !temporary {
+			val at = address(&file, symbol.section, symbol.address)
+			if !symbols.contains(&at) then symbols.put(at, symbol.name.clone())
+		}
+	}
+	for unit in dwarf.units()? {
+		readUnit(&dwarf, &unit, &files, &symbols, &var table)?
+	}
+	return .Ok()
+}
+
+/// The section `name`, taken out of `sections`, or one with nothing in it.
+fn takeSection(sections: &var Map<String, DebugSection>, name: str): DebugSection = {
+	val key = String::of(name)
+	return match sections.remove(&key) {
+		.Some(section) => move section
+		.None => DebugSection::empty()
+	}
+}
+
+struct Table {
+	files: Vec<String>
+	fileIndex: Map<String, u32>
+	functions: Vec<(DwarfFunction, Vec<Row>)>
+	inlined: Vec<Inlined>
+	inlinedIndex: Map<Inlined, u32>
+}
+
+extend Table {
+	static fn new(): Table = Table(
+		files: Vec(),
+		fileIndex: Map(),
+		functions: Vec(),
+		inlined: Vec(),
+		inlinedIndex: Map(),
+	)
+
+	/// A call inlined's record, counting from 1.
+	var fn inline(call: Inlined): u32 = {
+		if self.inlinedIndex.get(&call) is .Some(index) then return index
+		self.inlined.push(call.clone())
+		val index = self.inlined.len() as u32
+		self.inlinedIndex.put(move call, index)
+		return index
+	}
+
+	var fn file(name: String): u32 = {
+		if self.fileIndex.get(&name) is .Some(index) then return index
+		self.files.push(name.clone())
+		val index = (self.files.len() - 1) as u32
+		self.fileIndex.put(move name, index)
+		return index
+	}
+}
+
+/// The table's place for the unit's file `index`, 0 where it has none.
+fn fileOf(unitFiles: &Map<u64, u32>, index: u64): u32 = match unitFiles.get(&index) {
+	.Some(at) => at
+	.None => 0
+}
+
+fn readUnit(
+	dwarf: &Dwarf,
+	unit: &Unit,
+	files: &Map<String, String>,
+	symbols: &Map<u64, String>,
+	table: &var Table,
+): Result<void, String> = {
+	// The unit's files, as a panic names them, in the table's list.
+	var unitFiles: Map<u64, u32> = Map()
+	var lines: Vec<(u64, u64, u32)> = Vec()
+	if unit.lineProgram is .Some(offset) {
+		val program = dwarf.lineProgram(&unit, offset)?
+		var index: u64 = 0
+		while true {
+			// DWARF 4 counts files from 1, and 5 from 0.
+			if program.file(index) is .Some(entry) {
+				val name = fileName(&dwarf, &unit, &program, &entry, &files)
+				val at = table.file(move name)
+				unitFiles.put(index, at)
+			} else if index > 0 {
+				break
+			}
+			index += 1
+		}
+		for (address, file, line, endSequence) in program.rows {
+			// The end of a sequence is the end of the code before it, and a row
+			// of no line is code the compiler wrote on its own: the row before
+			// it goes on.
+			if endSequence || line == 0 then continue
+			lines.push((address, file, line as u32))
+		}
+	}
+	lines.sortBy((a, b) => a.0 < b.0)
+
+	// The inlined calls open at each depth, by their index in the table's
+	// list, and the function open, if one is.
+	var open: Vec<(i64, u32)> = Vec()
+	var function: Option<(i64, DwarfFunction, Vec<InlinedCall>)> = .None
+	for entry in dwarf.entries(&unit)? {
+		val depth = entry.depth
+		var still: Vec<(i64, u32)> = Vec()
+		for o in open {
+			if o.0 < depth then still.push(o)
+		}
+		open = move still
+		val closing = match function {
+			.Some((at, _, _)) => at >= depth
+			.None => false
+		}
+		if closing {
+			val .Some((_, done, calls)) = function.take() else {
+				panic("a function is open")
+			}
+			finish(&var table, move done, &calls, &lines, &unitFiles)
+		}
+		if entry.tag == DW_TAG_subprogram {
+			val .Some((_, .Addr(..))) = entry.attr(DW_AT_low_pc) else {
+				continue
+			}
+			val ranges = dwarf.rangesOf(&unit, &entry)
+			if ranges.isEmpty() then continue
+			val (low, high) = ranges[0]
+			val .Some(symbol) = symbols.get(&low) else {
+				// No symbol at the code's start: not a function the program can
+				// name.
+				continue
+			}
+			val (name, passOver) = described(&dwarf, &unit, &entry, &unitFiles, &table)?
+			function = .Some(
+				(
+					depth,
+					DwarfFunction(
+						symbol: symbol.clone(),
+						name: move name,
+						low: low,
+						high: high,
+						passOver: passOver,
+					),
+					Vec(),
+				),
+			)
+		} else if entry.tag == DW_TAG_inlined_subroutine && function.isSome() {
+			val (name, passOver) = described(&dwarf, &unit, &entry, &unitFiles, &table)?
+			val ranges = dwarf.rangesOf(&unit, &entry)
+			val callFile = match fileIndex(&entry, DW_AT_call_file) {
+				.Some(index) => fileOf(&unitFiles, index)
+				.None => 0
+			}
+			val callLine = match entry.attr(DW_AT_call_line) {
+				.Some((_, value)) => udata(&value).unwrapOr(0) as u32
+				.None => 0
+			}
+			val parent: u32 = if open.isEmpty() then 0 else open[open.len() - 1].1
+			val record = table.inline(Inlined(
+				name: move name,
+				passOver: passOver,
+				file: callFile,
+				line: callLine,
+				parent: parent,
+			))
+			open.push((depth, record))
+			if function.take() is .Some((at, f, calls)) {
+				var more = move calls
+				more.push(InlinedCall(record: record, ranges: move ranges))
+				function = .Some((at, move f, move more))
+			}
+		}
+	}
+	if function.take() is .Some((_, done, calls)) then
+		finish(&var table, move done, &calls, &lines, &unitFiles)
+	return .Ok()
+}
+
+/// A file's name as a panic gives it, from the line program's entry.
+fn fileName(
+	dwarf: &Dwarf,
+	unit: &Unit,
+	program: &LineProgram,
+	entry: &FileEntry,
+	files: &Map<String, String>,
+): String = {
+	val name = dwarf.string(&entry.name)
+	if files.get(&name) is .Some(shown) then return shown.clone()
+	val directory = match program.directory(&entry, &unit) {
+		.Some(value) => dwarf.string(&value)
+		.None => String()
+	}
+	val path = "\(directory)/\(name)"
+	return match files.get(&path) {
+		.Some(shown) => shown.clone()
+		.None => move name
+	}
+}
+
+/// A subprogram's name, and whether a panic's calls pass over it: code the
+/// compiler wrote on its own, or the runtime's, which tells the panic. An
+/// entry that is a call inlined, or a function also inlined elsewhere, is
+/// described by the one it is an instance of.
+fn described(
+	dwarf: &Dwarf,
+	unit: &Unit,
+	given: &Die,
+	unitFiles: &Map<u64, u32>,
+	table: &Table,
+): Result<(String, bool), String> = {
+	var entry = Die(
+		offset: given.offset,
+		depth: given.depth,
+		tag: given.tag,
+		attrs: given.attrs.clone(),
+	)
+	while true {
+		val first = entry.attr(DW_AT_abstract_origin)
+		val origin = if first.isSome() then move first else entry.attr(DW_AT_specification)
+		match origin {
+			.Some((_, .UnitRef(offset))) => entry = dwarf.entryAt(&unit, offset)?
+			_ => break
+		}
+	}
+	val name = match entry.attr(DW_AT_name) {
+		.Some((_, value)) => dwarf.string(&value)
+		.None => String()
+	}
+	val artificial = entry.attr(DW_AT_artificial) is .Some((_, .Flag(true)))
+	val runtime = match fileIndex(&entry, DW_AT_decl_file) {
+		.Some(index) => table.files[fileOf(&unitFiles, index) as i64] == RUNTIME
+		.None => false
+	}
+	return .Ok((move name, artificial || runtime))
+}
+
+/// The line program's index of the file an attribute names.
+fn fileIndex(entry: &Die, at: u64): Option<u64> = match entry.attr(at) {
+	.Some((_, value)) => udata(&value)
+	.None => .None
+}
+
+/// A constant attribute's value, where it is one that is not negative.
+fn udata(value: &FormValue): Option<u64> = match value {
+	.Data(n) => .Some(n)
+	.Signed(n) if n >= 0 => .Some(n as u64)
+	_ => .None
+}
+
+/// The first of `lines` at or past `low`: how many are before it.
+fn partition(lines: &[(u64, u64, u32)], before: u64, inclusive: bool): i64 = {
+	var lo = 0
+	var hi = lines.len()
+	while lo < hi {
+		val mid = (lo + hi) / 2
+		val address = lines[mid].0
+		val goesBefore = if inclusive then address <= before else address < before
+		if goesBefore then lo = mid + 1 else hi = mid
+	}
+	return lo
+}
+
+/// A function's rows: where the line or the call inlined changes, the line,
+/// and the innermost call inlined there.
+fn finish(
+	table: &var Table,
+	function: DwarfFunction,
+	calls: &[InlinedCall],
+	lines: &[(u64, u64, u32)],
+	unitFiles: &Map<u64, u32>,
+) = {
+	val low = function.low
+	val high = function.high
+	var points: Vec<u64> = Vec::of(own [low])
+	val first = partition(&lines, low, false)
+	for i in first..lines.len() {
+		if lines[i].0 >= high then break
+		points.push(lines[i].0)
+	}
+	for call in calls {
+		for (begin, end) in call.ranges {
+			if begin >= low && begin < high then points.push(begin)
+			if end >= low && end < high then points.push(end)
+		}
+	}
+	points.sort()
+	points.dedup()
+	var rows: Vec<Row> = Vec()
+	for at in points {
+		val line = partition(&lines, at, true)
+		if line == 0 || lines[line - 1].0 < low then continue
+		val (_, file, number) = lines[line - 1]
+		// The innermost: a call inlined comes after the one it is in.
+		var inlined: u32 = 0
+		var c = calls.len()
+		while c > 0 {
+			c -= 1
+			var holds = false
+			for (begin, end) in calls[c].ranges {
+				if begin <= at && at < end then holds = true
+			}
+			if holds {
+				inlined = calls[c].record
+				break
+			}
+		}
+		val row = Row(
+			offset: (at - low) as u32,
+			file: fileOf(&unitFiles, file),
+			line: number,
+			inlined: inlined,
+		)
+		if !rows.isEmpty() {
+			val last = &rows[rows.len() - 1]
+			if last.file == row.file && last.line == row.line && last.inlined == row.inlined then
+				continue
+		}
+		rows.push(move row)
+	}
+	table.functions.push((move function, move rows))
+}
+
+/// The name of the list of the tables, which the runtime reads.
+val TABLES: str = "wip.frame_tables"
+
+/// What the list of tables and this table are, in order: words, addresses,
+/// rows' `u32`s and names' bytes.
+enum Item {
+	Word(word: u64)
+	Address(target: Target)
+	U32(word: u32)
+	Text(bytes: Vec<u8>)
+}
+
+/// What an address is of.
+@derive(Clone)
+enum Target {
+	/// A function, by its symbol.
+	Function(name: String)
+	/// A place in the list and the table, by its distance from their start.
+	Here(at: u64)
+}
+
+/// Each name once, however many say it: their bytes, and where each begins.
+struct TableNames {
+	at: u64
+	bytes: Vec<u8>
+	named: Map<String, u64>
+}
+
+extend TableNames {
+	var fn name(text: str): Item = {
+		val key = String::of(text)
+		val at = match self.named.get(&key) {
+			.Some(found) => found
+			.None => {
+				val found = self.at + self.bytes.len() as u64
+				for i in 0..text.len() {
+					self.bytes.push(text[i])
+				}
+				self.named.put(move key, found)
+				found
+			}
+		}
+		return .Address(.Here(at))
+	}
+}
+
+extend Table {
+	/// The list of tables, `wip.frame_tables`, which holds this one, then this
+	/// one: its functions, files, calls inlined, rows and names.
+	fn layout(): Vec<Item> = {
+		// Where each part begins: the list, two words; the table, three words
+		// and seven for each function; two words for each file, six for each
+		// call inlined, sixteen bytes for each row, and the names.
+		val table: u64 = 16
+		val files = table + 24 + 56 * self.functions.len() as u64
+		val inlined = files + 16 * self.files.len() as u64
+		val rows = inlined + 48 * self.inlined.len() as u64
+		var rowCount = 0
+		for (_, functionRows) in self.functions {
+			rowCount += functionRows.len()
+		}
+		var names = TableNames(at: rows + 16 * rowCount as u64, bytes: Vec(), named: Map())
+		var items: Vec<Item> = Vec::of(own [
+			Item::Word(1),
+			Item::Address(.Here(table)),
+			Item::Word(self.functions.len() as u64),
+			Item::Address(.Here(files)),
+			Item::Address(.Here(inlined)),
+		])
+		var rowAt: u64 = 0
+		for (function, functionRows) in self.functions {
+			items.push(.Address(.Function(function.symbol.clone())))
+			items.push(.Word(function.high - function.low))
+			items.push(names.name(function.name.toStr()))
+			items.push(.Word(function.name.len() as u64))
+			items.push(.Address(.Here(rows + rowAt * 16)))
+			items.push(.Word(functionRows.len() as u64))
+			items.push(.Word(if function.passOver then 1 else 0))
+			rowAt += functionRows.len() as u64
+		}
+		for file in self.files {
+			items.push(names.name(file.toStr()))
+			items.push(.Word(file.len() as u64))
+		}
+		// A call inlined: what was called, its name's length, the file and
+		// line of the call, the call it is in, and whether it is passed over.
+		for call in self.inlined {
+			items.push(names.name(call.name.toStr()))
+			items.push(.Word(call.name.len() as u64))
+			items.push(.Word(call.file as u64))
+			items.push(.Word(call.line as u64))
+			items.push(.Word(call.parent as u64))
+			items.push(.Word(if call.passOver then 1 else 0))
+		}
+		for (_, functionRows) in self.functions {
+			for row in functionRows {
+				items.push(.U32(row.offset))
+				items.push(.U32(row.file))
+				items.push(.U32(row.line))
+				items.push(.U32(row.inlined))
+			}
+		}
+		items.push(.Text(move names.bytes))
+		return move items
+	}
+}
+
+/// The table as assembly, in the program's data.
+fn assembly(items: &[Item], macho: bool): String = {
+	val tables = if macho then "\"_\(TABLES)\"" else "\"\(TABLES)\""
+	var out = String::of("\n")
+	if macho {
+		out.push("\t.section\t__DATA,__const\n")
+		out.push("\t.private_extern\t\(tables)\n")
+	} else {
+		out.push("\t.section\t.data.rel.ro,\"aw\",@progbits\n")
+		out.push("\t.hidden\t\(tables)\n")
+	}
+	out.push("\t.globl\t\(tables)\n\t.p2align\t3\n\(tables):\n")
+	for item in items {
+		match item {
+			.Word(word) => out.push("\t.quad\t\(word)\n")
+			// A function's symbol is as the object names it, `_` and all.
+			.Address(.Function(name)) => out.push("\t.quad\t\"\(name)\"\n")
+			.Address(.Here(at)) => out.push("\t.quad\t\(tables)+\(at)\n")
+			.U32(word) => out.push("\t.long\t\(word)\n")
+			.Text(bytes) => out.push("\t.ascii\t\"\(ascii(&bytes))\"\n")
+		}
+	}
+	return move out
+}
+
+/// The list and the table, added to an ELF object in a section of their own:
+/// their bytes, and an address of each function they name and of each place
+/// in them they point to.
+fn elfWith(object: &[u8], items: &[Item]): Result<Vec<u8>, String> = {
+	var bytes: Vec<u8> = Vec()
+	var addresses: Vec<(u64, Address)> = Vec()
+	for item in items {
+		match item {
+			.Word(word) => pushWord(&var bytes, word)
+			.Address(target) => {
+				val address: Address = match target {
+					.Function(name) => .Symbol(name.clone())
+					.Here(at) => .Here(at)
+				}
+				addresses.push((bytes.len() as u64, move address))
+				pushWord(&var bytes, 0)
+			}
+			.U32(word) => pushHalfWord(&var bytes, word)
+			.Text(text) => {
+				for b in text {
+					bytes.push(b)
+				}
+			}
+		}
+	}
+	val data = Data(
+		name: String::of(".data.rel.ro.wip.frames"),
+		bytes: move bytes,
+		symbol: String::of(TABLES),
+		addresses: move addresses,
+	)
+	return withData(&object, &data)
+}
+
+/// Bytes as an assembler's `.ascii` takes them.
+fn ascii(text: &[u8]): String = {
+	var out = String()
+	for byte in text {
+		if byte == b'"' || byte == b'\\' {
+			out.pushByte(b'\\')
+			out.pushByte(byte)
+		} else if byte >= 0x20 && byte <= 0x7e {
+			out.pushByte(byte)
+		} else {
+			out.pushByte(b'\\')
+			out.pushByte(b'0' + (byte >> 6))
+			out.pushByte(b'0' + ((byte >> 3) & 7))
+			out.pushByte(b'0' + (byte & 7))
+		}
+	}
+	return move out
+}

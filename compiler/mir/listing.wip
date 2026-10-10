@@ -1,0 +1,138 @@
+// The program as a build compiles it, as text, for `wip mir`: the program's
+// own constants, once the evaluator has worked them out; every function of its
+// own modules and every instance it made, as `functionBody` gives them to the
+// backend and the evaluator; and the drop functions those name, each once, in
+// the order they are first named, and the ones they name in turn. The
+// standard library's own functions are the same in every program, and are
+// written where they are asked for.
+
+import std::collections::{Set}
+import hir::{Program, Ty}
+import syntax::{Interner}
+
+/// The program as a build compiles it. `release` says which build: a release
+/// build's functions have their scalars split out, as the code generator
+/// splits them. How a struct is dropped, by a call or in place, is the
+/// program's `dropsByCall`, which the caller sets as the build does.
+/// `library` writes the standard library's own functions too.
+pub fn dumpProgram(
+	program: &Program,
+	interner: &Interner,
+	locate: &(at: u32) => (String, u32, u32),
+	release: bool,
+	library: bool,
+): String = {
+	var out = hir::dumpConstants(&program, &interner, locate)
+	var drops: Vec<(Ty, bool)> = Vec()
+	var named: Set<(Ty, bool)> = Set()
+	for id in program.fns.ids() {
+		val def = &program.fns[id]
+		val written = library || isOwnModule(&program, def.module) || def.instanceOf.isSome()
+		if !program.isCompiled(id) || !written then continue
+		val .Some(found) = functionBody(&program, &interner, id) else {
+			continue
+		}
+		var body = move found
+		if release then scalars(&program, &var body)
+		for drop in dropsNamed(&body) {
+			if named.add(drop) then drops.push(drop)
+		}
+		out.push(dump(&program, &interner, program.fnName(id, &interner).toStr(), &body))
+	}
+	// A drop function names the drop functions of what it holds.
+	var next = 0
+	while next < drops.len() {
+		val (ty, inPlace) = drops[next]
+		next += 1
+		val body =
+			if inPlace then lowerDropInPlaceFn(&program, &interner, ty)
+			else lowerDropFn(&program, &interner, ty)
+		val kind = if inPlace then "drop_in_place" else "drop_fn"
+		for drop in dropsNamed(&body) {
+			if named.add(drop) then drops.push(drop)
+		}
+		val title = "\(kind)<\(program.tyName(ty, &interner))>"
+		out.push(dump(&program, &interner, title.toStr(), &body))
+	}
+	return move out
+}
+
+/// Whether a module is the program's, rather than the standard library's.
+fn isOwnModule(program: &Program, module: u32): bool = {
+	val path = &program.modules[module as i64]
+	return path != "std" && !path.startsWith("std::")
+}
+
+/// Each drop function a body names, in order, with whether it drops in place:
+/// what a call drops, and the address an owned closure carries.
+fn dropsNamed(body: &Body): Vec<(Ty, bool)> = {
+	var named: Vec<(Ty, bool)> = Vec()
+	for block in body.blocks {
+		for statement in block.statements {
+			match statement {
+				.DropFn(ty, ptr) => {
+					carried(&ptr, &var named)
+					named.push((ty, false))
+				}
+				.DropInPlace(ty, ..) => named.push((ty, true))
+				_ => {
+					for operand in statementOperands(&statement) {
+						carried(&operand, &var named)
+					}
+				}
+			}
+		}
+		for operand in terminatorOperands(&block.terminator) {
+			carried(&operand, &var named)
+		}
+	}
+	return move named
+}
+
+/// The drop function an operand is the address of, where it is one.
+fn carried(operand: &Operand, named: &var Vec<(Ty, bool)>) = {
+	if operand is .Const(.DropFn(ty)) then named.push((ty, false))
+}
+
+/// Each operand a statement reads.
+fn statementOperands(statement: &Statement): Vec<Operand> = {
+	var operands: Vec<Operand> = Vec()
+	match statement {
+		.Assign(rvalue, ..) => {
+			for operand in eachOperand(&rvalue) {
+				operands.push(operand.clone())
+			}
+		}
+		.Call(callee, args, ..) => {
+			if callee is .Value(operand) then operands.push(operand.clone())
+			for arg in args {
+				operands.push(arg.clone())
+			}
+		}
+		.AllocBuffer(count, ..) => operands.push(count.clone())
+		.Free(operand) | .DropFn(ptr: operand, ..) => operands.push(operand.clone())
+		.Arith(lhs, rhs, ..) => {
+			operands.push(lhs.clone())
+			operands.push(rhs.clone())
+		}
+		.Atomic(address, value, expected, ..) => {
+			operands.push(address.clone())
+			if value is .Some(v) then operands.push(v.clone())
+			if expected is .Some(e) then operands.push(e.clone())
+		}
+		.Check(fails, kind, ..) => {
+			operands.push(fails.clone())
+			match kind {
+				.Bounds(index, length) => {
+					operands.push(index.clone())
+					operands.push(length.clone())
+				}
+				.Length(length) => operands.push(length.clone())
+				.Division | .Overflow(..) => {}
+			}
+		}
+		.SetVariant(..) | .Zero(..) | .Poison(..) | .CheckMoved(..) | .Alloc(..) | .DropInPlace(..)
+		| .At(..) => {}
+	}
+	return move operands
+}

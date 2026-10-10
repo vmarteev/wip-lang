@@ -1,0 +1,183 @@
+// Name resolution, the typed program and the type checker.
+//
+// The lowering resolves names and checks types in one pass over the syntax
+// tree and makes a `Program`: every expression has a type, every name
+// points at its definition, and the operations the surface syntax leaves
+// implicit — auto-deref and the `&own<T>` to `&T` coercion — are explicit
+// nodes.
+
+import syntax::{CANNOT_BE_GENERIC, Diagnostic, INVALID_MAIN, Interner, Span}
+
+/// The module whose `pub` items every file sees without an import.
+pub val PRELUDE: str = "std::prelude"
+
+/// The program's `main`, which the monomorphizer looks for as well.
+fn mainFn(program: &Program, interner: &Interner): Option<FnId> = {
+	for id in program.fns.ids() {
+		val f = &program.fns[id]
+		if !f.isExtern && f.module == 0 && interner.resolve(f.name) == "main" then return .Some(id)
+	}
+	return .None
+}
+
+/// The entry point, and what it hands back.
+@derive(Clone)
+pub struct Entry {
+	pub main: FnId
+	/// The error type, when `main` returns a `Result`. The exit code then
+	/// comes from the prelude rather than from `main` itself.
+	pub error: Option<Ty>
+	/// Whether the `Result`'s value is an `i64` rather than nothing.
+	pub hasCode: bool
+}
+
+/// Whether an implementation's type arguments, read in the type's own
+/// parameters, are the ones a constraint asks for: `extend Vec<T>:
+/// Items<T>` answers `Items<Card>` for a `Vec<Card>`. An argument that is a
+/// parameter is looked up; one that is written out must match exactly.
+pub fn argsMatch(
+	types: &Types,
+	declared: TyList,
+	owner: &[Ty],
+	wanted: TyList,
+): bool = argsMatchWith(&types, declared, &owner, &types.list(wanted))
+
+/// The same, where the wanted arguments are already a slice.
+pub fn argsMatchWith(
+	types: &Types,
+	declared: TyList,
+	owner: &[Ty],
+	wanted: &[Ty],
+): bool = argsMatchOpen(&types, declared, &owner, &wanted, &NONE_OPEN)
+
+/// No position left open.
+val NONE_OPEN: [bool; 0] = []
+
+/// The same, where the positions `open` marks match whatever is there: a
+/// type the implementation decides, which the one asking leaves to it.
+pub fn argsMatchOpen(
+	types: &Types,
+	declared: TyList,
+	owner: &[Ty],
+	wanted: &[Ty],
+	open: &[bool],
+): bool = {
+	val written = types.list(declared)
+	if written.len() != wanted.len() then return false
+	for at in 0..written.len() {
+		if at < open.len() && open[at] then continue
+		val d = written[at]
+		val w = wanted[at]
+		val matches = match types.kind(d) {
+			.Param(param: p) => (p.index as i64) < owner.len() && owner[p.index as i64] == w
+			// An argument written in the type's own parameters rather than
+			// being one — `extend Zipped<I, T, J, V>: Iterator<(T, V)>` — is
+			// read with them before it is compared.
+			_ if types.isGeneric(d) => types.trySubstFind(d, &owner) == .Some(w)
+			_ => d == w
+		}
+		if !matches then return false
+	}
+	return true
+}
+
+/// Finds the entry point: `fn main()` or `fn main(args: &[cstring])`,
+/// returning `i64` (the exit code), nothing, or a `Result` of either.
+pub fn checkMain(program: &Program, interner: &Interner): Result<Entry, Diagnostic> = {
+	val .Some(id) = mainFn(&program, &interner) else {
+		return .Err(
+			Diagnostic::error(
+				INVALID_MAIN,
+				String::of("no `main` function"),
+				Span::at(0),
+				String::of("the program starts at `main`"),
+			).withHelp(String::of("add `fn main(): i64 = 0`")),
+		)
+	}
+	val main = &program.fns[id]
+	if !main.generics.isEmpty() then
+		return .Err(
+			Diagnostic::error(
+				CANNOT_BE_GENERIC,
+				String::of("`main` cannot be generic"),
+				main.generics[0].span,
+				String::of("a type parameter"),
+			).withNote(
+				String::of("the program starts at `main`, and nothing gives it type arguments"),
+			),
+		)
+	// `main` takes nothing, or the program's arguments as C passes them.
+	val valid =
+		main.params.isEmpty() || (main.params.len() == 1 && isArgs(&program, main.params[0].ty))
+	if !valid {
+		val first = main.params[0].span
+		val last = main.params[main.params.len() - 1].span
+		return .Err(
+			Diagnostic::error(
+				INVALID_MAIN,
+				String::of("`main` takes no parameters, or the program's arguments"),
+				first.to(last),
+				String::of("not `args: &[cstring]`"),
+			).withHelp(
+				String::of(
+					"write `fn main(args: &[cstring])`; `args[0]` is the program's name, as in C",
+				),
+			).withNote(String::of("the arguments are the C strings the operating system passes")),
+		)
+	}
+	// A `Result` of nothing or of an exit code, whose error is reported and
+	// whose exit code is then 1.
+	if program.types.kind(main.ret) is .Enum(id: enumId, args) &&
+		program.preludeItems.enumeration(.Result) == .Some(enumId) {
+		val value = program.types.list(args)[0]
+		val error = program.types.list(args)[1]
+		val span = main.retSpan.unwrapOr(main.span)
+		if value != I64 && value != UNIT then
+			return .Err(
+				Diagnostic::error(
+					INVALID_MAIN,
+					String::of("`main` must return a `Result` of `i64` or of nothing"),
+					span,
+					"its value is `\(program.tyName(value, &interner))`",
+				).withNote(String::of("the value `main` returns is the process exit code")),
+			)
+		val .Some(text) = program.preludeItems.interfaceOf(.Text) else {
+			panic("the prelude declares `Text`")
+		}
+		if !program.implements(error, text) {
+			val name = program.tyName(error, &interner)
+			return .Err(
+				Diagnostic::error(
+					INVALID_MAIN,
+					"`main`'s error type, `\(name)`, cannot be written as text",
+					span,
+					String::of("does not implement `Text`"),
+				).withHelp("write `extend \(name): Text`, whose `appendTo` says what it reports").withNote(
+					String::of(
+						"a `main` that fails prints its error on standard error and exits 1",
+					),
+				),
+			)
+		}
+		return .Ok(Entry(main: id, error: .Some(error), hasCode: value == I64))
+	}
+	if main.ret != I64 && main.ret != UNIT then
+		return .Err(
+			Diagnostic::error(
+				INVALID_MAIN,
+				String::of("`main` must return `i64`, nothing, or a `Result` of either"),
+				main.retSpan.unwrapOr(main.span),
+				"returns `\(program.tyName(main.ret, &interner))`",
+			).withNote(
+				String::of(
+					"the value `main` returns is the process exit code, and a `Result`'s error is reported",
+				),
+			),
+		)
+	return .Ok(Entry(main: id, error: .None, hasCode: false))
+}
+
+/// Whether a parameter's type is the program's arguments, `&[cstring]`.
+fn isArgs(program: &Program, ty: Ty): bool =
+	program.types.kind(ty) is .Ref(inner, kind: .Shared) &&
+	program.types.kind(inner) == .Slice(CSTRING)

@@ -1,0 +1,439 @@
+// What `@derive` asks for, and the numbering an enum whose variants carry
+// nothing gets.
+//
+// What `@derive` writes is code of the module's own, expanded before the
+// module is checked; here each type that asked has its fields asked for the
+// interface, where the code is written, and a field that lacks it is
+// reported where it is written. `count` and `fromIndex` are declared here as
+// methods of the type, with `FnDef::generated` saying which body the code
+// generator is to write.
+
+import std::mem
+import syntax as ast
+import syntax::{Code, Diagnostic, NOT_CLONEABLE, NOT_COMPARABLE, Span, Symbol}
+
+/// How a field that lacks what `@derive` asks of it is reported: the code,
+/// what the field cannot do, the label, what `@derive` writes, and the rule.
+view struct Lacking {
+	code: Code
+	lacks: str
+	label: str
+	writes: str
+	note: str
+}
+
+extend Lowerer {
+	/// Where `@derive` names this interface on a declaration, if it does.
+	/// What it may name was checked when the type was collected; this only
+	/// asks what is there.
+	fn derives(written: &[ast::Annotation], wanted: Derived): Option<Span> = {
+		for a in written {
+			if self.text(a.name.sym) != "derive" then continue
+			for arg in a.args {
+				if arg.value is .Name(sym) && self.text(sym) == wanted.name() then
+					return .Some(arg.span)
+			}
+		}
+		return .None
+	}
+
+	/// Records which type each argument of `@derive` was written on, which
+	/// what it wrote is for.
+	var fn noteDerives(types: &[(Declared, TypeDef)]) = {
+		for (item, def) in types {
+			val annotations = item.annotationsOf()
+			for a in annotations {
+				if self.text(a.name.sym) != "derive" then continue
+				for arg in a.args {
+					self.deriveOwners.put(arg.span, def)
+				}
+			}
+		}
+	}
+
+	/// The types that asked for `@derive`, once every implementation is
+	/// declared: only then can a field's type be asked whether it compares.
+	var fn declareEquality(types: &[(Declared, TypeDef)]) = {
+		for (item, def) in types {
+			val annotations = item.annotationsOf()
+			if annotations.isEmpty() then continue
+			val eq = self.derives(&annotations, .Eq)
+			val ord = self.derives(&annotations, .Ord)
+			val hash = self.derives(&annotations, .Hash)
+			val text = self.derives(&annotations, .Text)
+			val clone = self.derives(&annotations, .Clone)
+			if eq.isNone() && ord.isNone() && hash.isNone() && text.isNone() && clone.isNone() then
+				continue
+			self.typeParams = self.typeGenerics(def)
+			if eq is .Some(at) then self.checkDerivedFields(def, at, .Eq)
+			if ord is .Some(at) then self.checkOrderable(def, at, eq.isSome())
+			if hash is .Some(at) then self.checkHashable(def, at, eq.isSome())
+			if text is .Some(at) then self.checkDerivedFields(def, at, .Text)
+			if clone is .Some(at) then self.checkDerivedFields(def, at, .Clone)
+		}
+		self.typeParams.clear()
+	}
+
+	/// What `@derive` wrote for `owner` — an `equals`, a `compare` or a
+	/// `clone`, as code of the module's own — asks each field for the
+	/// interface. This says which field keeps it from applying, where the
+	/// field is written rather than at the annotation the code is placed at,
+	/// and then leaves the code unchecked.
+	var fn checkDerivedFields(owner: TypeDef, at: Span, wanted: Derived) = {
+		val known: KnownInterface = match wanted {
+			.Eq => .Eq
+			.Ord => .Ord
+			.Hash => .Hash
+			.Text => .Text
+			.Clone => .Clone
+		}
+		val .Some(interfaceId) = self.program.preludeItems.interfaceOf(known) else {
+			return
+		}
+		// Nothing was written where the implementation was refused, as a
+		// second one of the type's, and reported.
+		val .Some(written) = self.derivedImpl(owner, interfaceId) else {
+			return
+		}
+		// Each field is asked where the method is written, whose type
+		// parameters are bound by the interface too: a `Vec<T>` field has it
+		// where `T` does.
+		val outer = mem::replace(
+			&var self.typeParams,
+			self.program.fns[written[0]].generics.clone(),
+		)
+		var applies = true
+		for (name, ty, span) in self.fieldsOf(owner) {
+			val kind = self.kind(ty)
+			// What an `own<T>` or a reference points at may have it, which a
+			// call looks through to; the field itself does not. A clone is
+			// asked of the field's own type, whose `clone` a `&T` has.
+			val pointer = wanted != .Clone && kind is .Own(..) | .Ref(..)
+			// Whether it is plain data is read from its fields' types.
+			completeType(&var self.program, ty)
+			// Two pointers compare by where they point.
+			val compared = wanted == .Eq && kind is .Ptr(..)
+			if self.isPoisoned(ty) || compared || (!pointer && self.implements(ty, interfaceId)) {
+				continue
+			}
+			applies = false
+			val diagnostic = self.fieldLacks(wanted, interfaceId, name, ty, span, at)
+			self.report(move diagnostic)
+		}
+		self.typeParams = move outer
+		if !applies {
+			for id in written {
+				self.withheld.add(id)
+			}
+		}
+	}
+
+	/// The report of a field whose type lacks what `@derive` asks of it.
+	fn fieldLacks(
+		wanted: Derived,
+		interfaceId: InterfaceId,
+		name: Symbol,
+		ty: Ty,
+		span: Span,
+		at: Span,
+	): Diagnostic = {
+		val field = String::of(self.text(name))
+		val typeName = self.tyName(ty)
+		val words: Lacking = match wanted {
+			.Eq => Lacking(
+				code: NOT_COMPARABLE,
+				lacks: "cannot be compared",
+				label: "not a comparable field",
+				writes: "`@derive(Eq)` writes the comparison field by field",
+				note: "a field is comparable when it is a number, a `bool`, a `str`, a `cstring`, a `ptr<T>`, an array of those, or a type that implements `Eq`",
+			)
+			.Ord => Lacking(
+				code: NOT_COMPARABLE,
+				lacks: "has no order",
+				label: "not an ordered field",
+				writes: "`@derive(Ord)` writes the comparison field by field",
+				note: "a field is ordered when it is a number, a `bool`, a `str`, an array of those, or a type that implements `Ord`",
+			)
+			.Text => Lacking(
+				code: NOT_COMPARABLE,
+				lacks: "cannot be written",
+				label: "not a writable field",
+				writes: "`@derive(Text)` writes the value field by field",
+				note: "a field is writable when it is a number, a `bool`, a `str`, a `cstring`, an array of those, or a type that implements `Text`",
+			)
+			.Hash => Lacking(
+				code: NOT_COMPARABLE,
+				lacks: "is not hashed",
+				label: "not a hashable field",
+				writes: "`@derive(Hash)` writes the hashing part by part",
+				note: "a field is hashed when it is an integer, a `bool`, a `str`, a `cstring`, an array of those, or a type that implements `Hash`; the floats are left out, since `0.0` and `-0.0` are equal and their bytes are not",
+			)
+			.Clone => Lacking(
+				code: NOT_CLONEABLE,
+				lacks: "cannot be cloned",
+				label: "not a field that clones",
+				writes: "`@derive(Clone)` writes the clone field by field",
+				note: "a field clones when its type implements `Clone`: plain data, which owns no memory, is its own clone, and so are a `String`, a `Vec`, an `Option` or a tuple of what clones, and a type that asks for `@derive(Clone)` or writes `extend …: Clone`",
+			)
+		}
+		var diagnostic = Diagnostic::error(
+			words.code,
+			"`\(field)` is \(typeName), which \(words.lacks)",
+			span,
+			String::of(words.label),
+		).withSecondary(at, String::of(words.writes)).withNote(String::of(words.note))
+		val named = wanted.name()
+		// A type that has it where its arguments do is told which does not:
+		// `Vec<T>` compares where `T` does.
+		val constraint = Constraint(interfaceId: interfaceId, args: TyList::empty())
+		val chain = self.unmetChain(ty, constraint)
+		if !chain.isEmpty() {
+			val arg = chain[chain.len() - 1].0
+			val inside = self.tyName(arg)
+			diagnostic = diagnostic.withHelp(self.unmetHelp(ty, constraint, &chain))
+			if self.declaresFields(arg) && self.stdModuleOf(arg).isNone() then
+				diagnostic = diagnostic.withHelp("write `@derive(\(named))` on \(inside) too, or an `extend` block that implements `\(named)` for it")
+		} else if self.declaresFields(ty) {
+			diagnostic = diagnostic.withHelp("write `@derive(\(named))` on \(typeName) too, or an `extend` block that implements `\(named)` for it")
+		}
+		return move diagnostic
+	}
+
+	/// Whether a type is a struct or an enum, which `@derive` may be written
+	/// on.
+	fn declaresFields(ty: Ty): bool = self.kind(ty) is .Struct(..) | .Enum(..)
+
+	/// Every field of a struct, or of each variant of an enum, with its type
+	/// and where it was written.
+	fn fieldsOf(owner: TypeDef): Vec<(Symbol, Ty, Span)> = {
+		var fields: Vec<(Symbol, Ty, Span)> = Vec()
+		match owner {
+			.Struct(id) => {
+				for f in self.program.structs[id].fields {
+					fields.push((f.name, f.ty, f.span))
+				}
+			}
+			.Enum(id) => {
+				for v in self.program.enums[id].variants {
+					for f in v.fields {
+						fields.push((f.name, f.ty, f.span))
+					}
+				}
+			}
+			.Builtin(_) => {}
+		}
+		return move fields
+	}
+
+	/// Leaves what `@derive` wrote for `owner`'s implementation of
+	/// `interfaceId` unchecked, where it has been refused and reported.
+	var fn withholdDerived(owner: TypeDef, interfaceId: Option<InterfaceId>) = {
+		val .Some(id) = interfaceId else {
+			return
+		}
+		val .Some(written) = self.derivedImpl(owner, id) else {
+			return
+		}
+		for m in written {
+			self.withheld.add(m)
+		}
+	}
+
+	/// The methods of `owner`'s implementation of `interfaceId` where
+	/// `@derive` wrote it: those it wrote first, then the interface's
+	/// defaults the implementation has with them.
+	fn derivedImpl(owner: TypeDef, interfaceId: InterfaceId): Option<Vec<FnId>> = {
+		val derived = &self.program.derived
+		// An interface's default methods are the implementation's too, and
+		// nothing derived them, as `Text`'s: the implementation is the derived
+		// one where `@derive` wrote any of it, and those come first.
+		for i in self.program.impls {
+			if i.ty != owner || i.interfaceId != interfaceId then continue
+			var any = false
+			for m in i.methods {
+				if derived.contains(&m) then any = true
+			}
+			if !any then continue
+			var methods: Vec<FnId> = Vec()
+			for m in i.methods {
+				if derived.contains(&m) then methods.push(m)
+			}
+			for m in i.methods {
+				if !derived.contains(&m) then methods.push(m)
+			}
+			return .Some(move methods)
+		}
+		return .None
+	}
+
+	/// An enum whose variants carry nothing gets `count` and `fromIndex`,
+	/// whose bodies the compiler writes, and `all`. A program that declares
+	/// a method of one of those names keeps its own.
+	var fn declareEnumNumbers(types: &[(Declared, TypeDef)]) = {
+		for (item, def) in types {
+			val .Some(e) = item.enumDecl() else {
+				continue
+			}
+			val .Enum(id) = def else {
+				continue
+			}
+			var carries = false
+			for v in self.program.enums[id].variants {
+				if !v.fields.isEmpty() then carries = true
+			}
+			if carries then continue
+			self.typeParams = self.typeGenerics(def)
+			val at = e.name.span
+			if !self.enumDeclares(id, "count") {
+				val none: Vec<(Symbol, Ty)> = Vec()
+				self.generatedStatic(def, Symbol::count(), move none, I64, .VariantCount, at)
+			}
+			if !self.enumDeclares(id, "fromIndex") &&
+				self.program.preludeItems.enumeration(.Option) is .Some(option) {
+				val selfTy = self.ownSelfTy(def)
+				val args = self.program.types.internList([selfTy])
+				val ret = self.intern(.Enum(id: option, args: args))
+				self.generatedStatic(
+					def,
+					Symbol::fromIndex(),
+					Vec::of(own [(Symbol::indexParam(), I64)]),
+					ret,
+					.FromIndex,
+					at,
+				)
+			}
+			if !self.enumDeclares(id, "all") {
+				val selfTy = self.ownSelfTy(def)
+				val count = self.program.enums[id].variants.len() as u64
+				val ret = self.intern(.Array(elem: selfTy, len: count))
+				val none: Vec<(Symbol, Ty)> = Vec()
+				self.generatedStatic(def, Symbol::all(), move none, ret, .AllVariants, at)
+			}
+			self.typeParams.clear()
+		}
+	}
+
+	/// Whether an enum declares a method of this name.
+	fn enumDeclares(id: EnumId, name: str): bool = {
+		for m in self.program.enums[id].methods {
+			if self.text(self.program.fns[m].name) == name then return true
+		}
+		return false
+	}
+
+	/// A static function whose body the compiler writes.
+	var fn generatedStatic(
+		owner: TypeDef,
+		name: Symbol,
+		params: Vec<(Symbol, Ty)>,
+		ret: Ty,
+		generated: Generated,
+		at: Span,
+	): FnId = {
+		val generics = self.typeGenerics(owner)
+		var defs: Vec<ParamDef> = Vec()
+		for (paramName, ty) in params {
+			defs.push(ParamDef(name: paramName, nameSpan: at, ty: ty, span: at, default: .None))
+		}
+		val id = self.program.fns.add(FnDef(
+			name: name,
+			nameSpan: at,
+			symbol: .None,
+			receiver: .Some(.Static),
+			owner: .Some(owner),
+			interfaceId: .None,
+			generics: move generics,
+			instanceOf: .None,
+			params: move defs,
+			ret: ret,
+			retSpan: .None,
+			isExtern: false,
+			exportsC: false,
+			header: .None,
+			accesses: .None,
+			isVariadic: false,
+			variadicOf: .None,
+			lendsFrom: .None,
+			keeps: Vec(),
+			keepsAt: .None,
+			isLambda: false,
+			generator: .None,
+			isTailrec: false,
+			isTest: false,
+			isInline: false,
+			generated: .Some(generated),
+			intrinsic: .None,
+			body: .None,
+			projects: .None,
+			compileTime: false,
+			module: self.current as u32,
+			isPub: true,
+			span: at,
+		))
+		match owner {
+			.Struct(s) => self.program.structs[s].methods.push(id)
+			.Enum(e) => self.program.enums[e].methods.push(id)
+			.Builtin(_) => {}
+		}
+		return id
+	}
+
+	/// `@derive(Ord)`: `Eq` beside it, and each field ordered.
+	var fn checkOrderable(owner: TypeDef, at: Span, hasEq: bool) = {
+		// Two values that compare `Same` and are not equal would make every
+		// algorithm that uses both wrong.
+		var equal = false
+		if self.program.preludeItems.interfaceOf(.Eq) is .Some(eq) {
+			for i in self.program.impls {
+				if i.interfaceId == eq && i.ty == owner then equal = true
+			}
+		}
+		if !hasEq && !equal {
+			val typeName = self.typeName(owner)
+			self.report(
+				Diagnostic::error(
+					NOT_COMPARABLE,
+					"`\(typeName)` is ordered and does not say when two of it are equal",
+					at,
+					String::of("`Ord` derived without `Eq`"),
+				).withHelp(String::of("name `Eq` in the `@derive` as well")).withNote(
+					String::of(
+						"two values that compare `Same` and are not equal would make every algorithm that uses both wrong",
+					),
+				),
+			)
+			self.withholdDerived(owner, self.program.preludeItems.interfaceOf(.Ord))
+			return
+		}
+		self.checkDerivedFields(owner, at, .Ord)
+	}
+
+	/// `@derive(Hash)`: `Eq` beside it, and each field hashed.
+	var fn checkHashable(owner: TypeDef, at: Span, hasEq: bool) = {
+		// A map is wrong the moment two equal values hash differently, and a
+		// hashing written from the fields only matches an equality written
+		// from the fields.
+		if !hasEq {
+			val typeName = self.typeName(owner)
+			self.report(
+				Diagnostic::error(
+					NOT_COMPARABLE,
+					"`\(typeName)` is hashed and does not say when two of it are equal",
+					at,
+					String::of("`Hash` derived without `Eq`"),
+				).withHelp(
+					String::of(
+						"name `Eq` in the `@derive` as well, or write `extend …: Hash` by hand",
+					),
+				).withNote(
+					String::of(
+						"a map is wrong the moment two equal values hash differently, and the compiler will not guess that a type whose equality is written by hand should be hashed the same way",
+					),
+				),
+			)
+			self.withholdDerived(owner, self.program.preludeItems.interfaceOf(.Hash))
+			return
+		}
+		self.checkDerivedFields(owner, at, .Hash)
+	}
+}

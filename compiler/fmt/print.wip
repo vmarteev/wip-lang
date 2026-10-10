@@ -1,0 +1,1864 @@
+// The syntax tree as a document: every construct, with
+// the line breaks it may take where Wip allows one — after `(`, `[`, `{`,
+// a comma, a binary operator, `=` and `=>` — and the comments found
+// between its tokens.
+
+import syntax::{
+	Annotation,
+	ArrayLen,
+	Ast,
+	BinaryOp,
+	Block,
+	Bound,
+	EnumDecl,
+	Expr,
+	ExprId,
+	ExprKind,
+	ExtendBlock,
+	ExternBlock,
+	ExternFn,
+	ExternGlobal,
+	ExternType,
+	Field,
+	FnDecl,
+	FnSig,
+	ForSource,
+	GenericParam,
+	ImportDecl,
+	InterfaceDecl,
+	Interner,
+	Item,
+	MAX_TUPLE,
+	MIN_TUPLE,
+	Name,
+	Pattern,
+	PatternKind,
+	RepeatCount,
+	SliceElement,
+	Span,
+	StmtId,
+	StmtKind,
+	StructDecl,
+	Symbol,
+	TypeArgs,
+	TypeId,
+	TypeKind,
+	UnaryOp
+}
+
+pub view struct Printer {
+	src: str
+	ast: &Ast
+	interner: &Interner
+	comments: Vec<Comment>
+	/// The first comment not written yet.
+	next: i64
+}
+
+/// A member of an extern block, by where it is among the block's, which
+/// the tree keeps by kind.
+enum ExternMember {
+	Fn(at: i64)
+	Type(at: i64)
+	Global(at: i64)
+	Struct(at: i64)
+}
+
+/// Whether a document is nothing at all.
+fn isEmptyDoc(doc: &Doc): bool = doc is .Concat(parts) && parts.isEmpty()
+
+/// No document: what is written where there is nothing to write.
+fn nothing(): Doc = .Concat(parts: Vec())
+
+extend Printer {
+	pub static fn new(
+		src: str,
+		ast: &Ast,
+		interner: &Interner,
+		comments: Vec<Comment>,
+	): Printer = Printer(src: src, ast: &ast, interner: &interner, comments: move comments, next: 0)
+
+	fn sym(symbol: Symbol): str from self.interner = self.interner.resolve(symbol)
+
+	/// What was written at `span`: a literal is printed as it was.
+	fn source(span: Span): str from self.src = self.src[span.lo as i64..span.hi as i64]
+
+	// ---- Comments and blank lines --------------------------------------
+
+	/// Where the next thing really begins: at its first comment on a line
+	/// of its own, if one comes before it.
+	fn startOf(at: u32): u32 = {
+		if self.next < self.comments.len() {
+			val c = &self.comments[self.next]
+			if c.at < at && c.ownLine then return c.at
+		}
+		return at
+	}
+
+	/// What goes between two things of a list of declarations or
+	/// statements: a line break, or a blank line where the file had one.
+	fn between(prevEnd: u32, nextStart: u32): Doc = {
+		val start = self.startOf(nextStart)
+		return if blankBetween(self.src, prevEnd as i64, start as i64) then .Blank else .Hard
+	}
+
+	/// The comments before `at`: one that ended a line is put back at the
+	/// end of its line, and one on a line of its own is written on one,
+	/// before what follows.
+	var fn leading(at: u32): Doc = {
+		var parts: Vec<Doc> = Vec()
+		var lastEnd: Option<u32> = .None
+		while self.next < self.comments.len() {
+			val c = self.comments[self.next].clone()
+			if c.at >= at then break
+			self.next += 1
+			if !c.ownLine {
+				parts.push(.LineEnd(text: " \(c.text)"))
+				continue
+			}
+			match lastEnd {
+				.Some(end) => parts.push(
+					if blankBetween(self.src, end as i64, c.at as i64) then .Blank else .Hard,
+				)
+				.None => {}
+			}
+			parts.push(text(c.text.toStr()))
+			lastEnd = .Some(c.at + c.text.len() as u32)
+		}
+		if lastEnd is .Some(end) then
+			parts.push(if blankBetween(self.src, end as i64, at as i64) then .Blank else .Hard)
+		return concat(move parts)
+	}
+
+	/// The comments left before `end`, inside something that is closing:
+	/// each on a line of its own, after what came before, or at the end of
+	/// the last line.
+	var fn trailing(end: u32): Doc = {
+		var parts: Vec<Doc> = Vec()
+		var lastEnd: Option<u32> = .None
+		while self.next < self.comments.len() {
+			val c = self.comments[self.next].clone()
+			if c.at >= end then break
+			self.next += 1
+			if !c.ownLine {
+				parts.push(.LineEnd(text: " \(c.text)"))
+				continue
+			}
+			val blank = match lastEnd {
+				.Some(e) => blankBetween(self.src, e as i64, c.at as i64)
+				.None => c.blankBefore
+			}
+			parts.push(if blank then .Blank else .Hard)
+			parts.push(text(c.text.toStr()))
+			lastEnd = .Some(c.at + c.text.len() as u32)
+		}
+		return concat(move parts)
+	}
+
+	// ---- A file --------------------------------------------------------
+
+	pub var fn file(): Doc = {
+		var parts: Vec<Doc> = Vec()
+		var prevEnd: Option<u32> = .None
+		for item in self.ast.items {
+			val span = itemSpan(&item)
+			if prevEnd is .Some(end) then parts.push(self.between(end, span.lo))
+			parts.push(self.leading(span.lo))
+			parts.push(self.item(&item))
+			prevEnd = .Some(span.hi)
+		}
+		val rest = self.trailing(4294967295)
+		// Nothing but comments.
+		if prevEnd.isNone() then return stripLeadingBreak(move rest)
+		parts.push(move rest)
+		return concat(move parts)
+	}
+
+	/// A `package.wip`: its annotations, and `package NAME`.
+	pub var fn package(annotations: &[Annotation], name: Option<Name>): Doc = {
+		var parts: Vec<Doc> = Vec()
+		for annotation in annotations {
+			parts.push(self.leading(annotation.span.lo))
+			parts.push(self.annotation(&annotation))
+			parts.push(.Hard)
+		}
+		if name is .Some(name) {
+			parts.push(self.leading(name.span.lo))
+			parts.push(text("package \(self.sym(name.sym))"))
+		}
+		parts.push(self.trailing(4294967295))
+		return concat(move parts)
+	}
+
+	// ---- Items ---------------------------------------------------------
+
+	fn annotation(annotation: &Annotation): Doc = {
+		val name = self.sym(annotation.name.sym)
+		if annotation.parens.isNone() then return text("@\(name)")
+		var args = String()
+		for (i, arg) in annotation.args.forwards().enumerate() {
+			if i > 0 then args.push(", ")
+			val written = self.source(arg.span)
+			match arg.name {
+				.Some(key) => {
+					val value = match written.splitOnce("=") {
+						.Some((_, value)) => value
+						.None => written
+					}
+					args.push("\(self.sym(key.sym)) = \(trimSpace(value))")
+				}
+				.None => args.push(trimSpace(written))
+			}
+		}
+		return text("@\(name)(\(args))")
+	}
+
+	/// Annotations, each on a line of its own, before what they are on.
+	var fn annotations(annotations: &[Annotation]): Doc = {
+		var parts: Vec<Doc> = Vec()
+		for annotation in annotations {
+			parts.push(self.leading(annotation.span.lo))
+			parts.push(self.annotation(&annotation))
+			parts.push(.Hard)
+		}
+		return concat(move parts)
+	}
+
+	var fn item(item: &Item): Doc = match item {
+		.Import(decl) => self.importDecl(&decl)
+		.Val(decl) => {
+			val head = concat(
+				Vec::of(own [
+					self.annotations(&decl.annotations),
+					text("\(pubWord(decl.isPub))val \(self.sym(decl.name.sym))"),
+					self.typeAnnotation(decl.ty),
+				]),
+			)
+			val value = self.assigned(decl.value)
+			return concat(Vec::of(own [move head, move value]))
+		}
+		.Assert(decl) => concat(
+			Vec::of(own [self.annotations(&decl.annotations), self.expr(decl.assertion)]),
+		)
+		.Struct(decl) => self.structDecl(&decl, false)
+		.Enum(decl) => self.enumDecl(&decl)
+		.Fn(decl) => self.fnDecl(&decl)
+		.Extern(block) => self.externBlock(&block)
+		.Extend(block) => self.extendBlock(&block)
+		.Interface(decl) => self.interfaceDecl(&decl)
+		.Type(alias) => concat(
+			Vec::of(own [
+				text("\(pubWord(alias.isPub))type \(self.sym(alias.name.sym))\(self.generics(&alias.generics)) = "),
+				self.ty(alias.ty),
+			]),
+		)
+	}
+
+	/// `import a::b::{c, d}` on one line where it fits, and otherwise the
+	/// names one to a line, one deeper, with no comma after the last.
+	var fn importDecl(decl: &ImportDecl): Doc = {
+		var path = String()
+		for (i, name) in decl.path.forwards().enumerate() {
+			if i > 0 then path.push("::")
+			path.push(self.sym(name.sym))
+		}
+		var parts = Vec::of(own [text("import \(path)")])
+		if decl.items is .Some(items) {
+			var names: Vec<Doc> = Vec()
+			for imported in items {
+				val name = match imported.name {
+					.Some(n) => self.sym(n.sym)
+					.None => "self"
+				}
+				names.push(
+					match imported.alias {
+						.Some(alias) => text("\(name) as \(self.sym(alias.sym))")
+						.None => text(name)
+					},
+				)
+			}
+			parts.push(text("::"))
+			parts.push(self.listEnding("{", move names, "}", false))
+		}
+		if decl.alias is .Some(alias) then parts.push(text(" as \(self.sym(alias.sym))"))
+		return concat(move parts)
+	}
+
+	fn generics(generics: &[GenericParam]): String = {
+		if generics.isEmpty() then return String()
+		var out = String::of("<")
+		for (i, g) in generics.forwards().enumerate() {
+			if i > 0 then out.push(", ")
+			// `type Item`: a type each implementation decides.
+			if g.decided.isSome() then out.push("type ")
+			out.push(self.sym(g.name.sym))
+			if !g.bounds.isEmpty() {
+				out.push(": ")
+				for (j, b) in g.bounds.forwards().enumerate() {
+					if j > 0 then out.push(" + ")
+					out.push(self.bound(&b))
+				}
+			}
+			// `K = T`.
+			if g.default is .Some(default) then out.push(" = \(self.tyText(default))")
+		}
+		out.push(">")
+		return move out
+	}
+
+	/// An interface as it was named: `Area`, or `shapes::Area`.
+	fn interfacePath(module: &[Name], name: Name): String = {
+		var path = String()
+		for m in module {
+			path.push(self.sym(m.sym))
+			path.push("::")
+		}
+		path.push(self.sym(name.sym))
+		return move path
+	}
+
+	fn bound(b: &Bound): String = {
+		val name = self.interfacePath(&b.module, b.name)
+		if b.args.isEmpty() then return move name
+		return "\(name)<\(self.tyList(&b.args))>"
+	}
+
+	/// Types, written and separated by `, `.
+	fn tyList(types: &[TypeId]): String = {
+		var out = String()
+		for (i, t) in types.forwards().enumerate() {
+			if i > 0 then out.push(", ")
+			out.push(self.tyText(t))
+		}
+		return move out
+	}
+
+	fn typeAnnotation(ty: Option<TypeId>): Doc = match ty {
+		.Some(ty) => concat(Vec::of(own [text(": "), self.ty(ty)]))
+		.None => nothing()
+	}
+
+	var fn structDecl(decl: &StructDecl, inBlock: bool): Doc = {
+		var head = String::of(pubWord(decl.isPub))
+		if decl.isView then head.push("view ")
+		if decl.isExtern && !inBlock then head.push("extern ")
+		head.push(if decl.isUnion then "union " else "struct ")
+		head.push(self.sym(decl.name.sym))
+		head.push(self.generics(&decl.generics))
+		var body: Vec<(Span, Doc)> = Vec()
+		for field in decl.fields {
+			val lead = self.leading(field.span.lo)
+			// A line break separates declarations, so a
+			// field, as a variant or an arm, needs no comma.
+			body.push((field.span, concat(Vec::of(own [move lead, self.field(&field)]))))
+		}
+		val methodsStart = body.len()
+		for method in decl.methods {
+			val lead = self.leading(method.span.lo)
+			body.push((method.span, concat(Vec::of(own [move lead, self.fnDecl(&method)]))))
+		}
+		val annotations = self.annotations(&decl.annotations)
+		// A struct with no fields and no methods is its name alone, unless
+		// its braces hold a comment, which keeps them. A `view` or `extern`
+		// one keeps its braces: it is refused without them.
+		if body.isEmpty() && !decl.isView && !decl.isExtern {
+			val braced = decl.span.hi > 0 && self.src[decl.span.hi as i64 - 1] == b'}'
+			val inside = if braced then self.trailing(decl.span.hi - 1) else nothing()
+			if isEmptyDoc(&inside) then
+				return concat(Vec::of(own [move annotations, text(head.toStr())]))
+			return concat(
+				Vec::of(own [
+					move annotations,
+					text(head.toStr()),
+					text(" {"),
+					indent(move inside),
+					.Hard,
+					text("}"),
+				]),
+			)
+		}
+		val total = decl.fields.len() + decl.methods.len()
+		val force: Option<i64> =
+			if methodsStart > 0 && methodsStart < total then .Some(methodsStart) else .None
+		val braces = self.braced(move body, decl.span.hi, force)
+		return concat(Vec::of(own [move annotations, text(head.toStr()), text(" "), move braces]))
+	}
+
+	/// `{ … }` around declarations, one per line, with the blank lines the
+	/// file had between them; `forceBlankAt` puts a blank line before
+	/// that one, as between a struct's fields and its methods.
+	var fn braced(body: Vec<(Span, Doc)>, close: u32, forceBlankAt: Option<i64>): Doc = {
+		val last = if close > 0 then close - 1 else 0
+		if body.isEmpty() {
+			val inside = self.trailing(last)
+			if isEmptyDoc(&inside) then return text("{}")
+			return concat(Vec::of(own [text("{"), indent(move inside), .Hard, text("}")]))
+		}
+		var inner: Vec<Doc> = Vec()
+		var prev: Option<u32> = .None
+		var i = 0
+		for (span, doc) in move body {
+			match prev {
+				.None => inner.push(.Hard)
+				.Some(_) if forceBlankAt == .Some(i) => inner.push(.Blank)
+				.Some(end) => inner.push(self.between(end, span.lo))
+			}
+			inner.push(move doc)
+			prev = .Some(span.hi)
+			i += 1
+		}
+		inner.push(self.trailing(last))
+		return concat(Vec::of(own [text("{"), indent(concat(move inner)), .Hard, text("}")]))
+	}
+
+	var fn field(f: &Field): Doc = {
+		var parts = Vec::of(own [
+			text("\(pubWord(f.isPub))\(if f.isVar then "var " else "")\(self.sym(f.name.sym)): "),
+		])
+		parts.push(self.ty(f.ty))
+		if f.default is .Some(default) {
+			parts.push(text(" = "))
+			parts.push(self.expr(default))
+		}
+		return concat(move parts)
+	}
+
+	var fn enumDecl(decl: &EnumDecl): Doc = {
+		val head = "\(pubWord(decl.isPub))\(if decl.isView then "view " else "")enum \(self.sym(decl.name.sym))\(self.generics(&decl.generics))"
+		var body: Vec<(Span, Doc)> = Vec()
+		for variant in decl.variants {
+			val lead = self.leading(variant.span.lo)
+			var doc = Vec::of(own [move lead, text(self.sym(variant.name.sym))])
+			if !variant.fields.isEmpty() {
+				var fields: Vec<Doc> = Vec()
+				for f in variant.fields {
+					fields.push(self.field(&f))
+				}
+				doc.push(self.list("(", move fields, ")"))
+			}
+			body.push((variant.span, concat(move doc)))
+		}
+		val methodsStart = body.len()
+		for method in decl.methods {
+			val lead = self.leading(method.span.lo)
+			body.push((method.span, concat(Vec::of(own [move lead, self.fnDecl(&method)]))))
+		}
+		val annotations = self.annotations(&decl.annotations)
+		val force: Option<i64> =
+			if methodsStart > 0 && !decl.methods.isEmpty() then .Some(methodsStart) else .None
+		val braces = self.braced(move body, decl.span.hi, force)
+		return concat(Vec::of(own [move annotations, text(head.toStr()), text(" "), move braces]))
+	}
+
+	var fn fnSig(keyword: str, isPub: bool, sig: &FnSig): Doc = {
+		var params: Vec<Doc> = Vec()
+		for p in sig.params {
+			val lead = self.leading(p.span.lo)
+			params.push(concat(Vec::of(own [move lead, self.field(&p)])))
+		}
+		if sig.variadic.isSome() then params.push(text("..."))
+		var parts = Vec::of(own [
+			text("\(pubWord(isPub))\(keyword) \(self.sym(sig.name.sym))\(self.generics(&sig.generics))"),
+			self.listEnding("(", move params, ")", sig.variadic.isNone()),
+		])
+		if sig.ret is .Some(ret) {
+			parts.push(text(": "))
+			parts.push(self.ty(ret))
+		}
+		// What the result borrows: `from a, self.ast`.
+		if !sig.lendsFrom.isEmpty() {
+			var paths = String()
+			for (i, path) in sig.lendsFrom.forwards().enumerate() {
+				if i > 0 then paths.push(", ")
+				match path.root {
+					.Some(name) => paths.push(self.sym(name.sym))
+					.None => paths.push("self")
+				}
+				for field in path.fields {
+					paths.push(".")
+					paths.push(self.sym(field.sym))
+				}
+			}
+			parts.push(text(" from \(paths)"))
+		}
+		// What a call keeps: `keeps value`.
+		if !sig.keeps.isEmpty() {
+			var names = String()
+			for (i, name) in sig.keeps.forwards().enumerate() {
+				if i > 0 then names.push(", ")
+				names.push(self.sym(name.sym))
+			}
+			parts.push(text(" keeps \(names)"))
+		}
+		return concat(move parts)
+	}
+
+	var fn fnDecl(decl: &FnDecl): Doc = {
+		val annotations = self.annotations(&decl.annotations)
+		val keyword = match decl.receiver {
+			.Some((receiver, _)) => receiver.text()
+			.None => "fn"
+		}
+		val sig = self.fnSig(keyword, decl.isPub, &decl.sig)
+		val body = match decl.body {
+			.Some(body) => self.body(body)
+			.None => nothing()
+		}
+		return concat(
+			Vec::of(own [move annotations, group(concat(Vec::of(own [move sig, move body])))]),
+		)
+	}
+
+	var fn externBlock(block: &ExternBlock): Doc = {
+		val annotations = self.annotations(&block.annotations)
+		val head = "extern \(self.source(block.abi))"
+		// Its members in the order they were written: the tree keeps them
+		// by kind.
+		var members: Vec<(Span, ExternMember)> = Vec()
+		for (i, f) in block.fns.forwards().enumerate() {
+			val start =
+				if f.annotations.isEmpty() then f.sig.span else f.annotations[0].span.to(f.sig.span)
+			members.push((start, .Fn(at: i)))
+		}
+		for (i, t) in block.types.forwards().enumerate() {
+			val start =
+				if t.annotations.isEmpty() then t.name.span
+				else t.annotations[0].span.to(t.name.span)
+			members.push((start, .Type(at: i)))
+		}
+		for (i, g) in block.globals.forwards().enumerate() {
+			val start = if g.annotations.isEmpty() then g.span else g.annotations[0].span.to(g.span)
+			members.push((start, .Global(at: i)))
+		}
+		for (i, s) in block.structs.forwards().enumerate() {
+			members.push((s.span, .Struct(at: i)))
+		}
+		members.sortByKey((member) => member.0.lo)
+		var body: Vec<(Span, Doc)> = Vec()
+		for (span, member) in members {
+			val lead = self.leading(span.lo)
+			val doc = match member {
+				.Fn(at) => {
+					val f = &block.fns[at]
+					val annotations = self.annotations(&f.annotations)
+					val sig = self.fnSig("fn", f.isPub, &f.sig)
+					concat(Vec::of(own [move annotations, group(move sig)]))
+				}
+				.Type(at) => {
+					val t = &block.types[at]
+					val annotations = self.annotations(&t.annotations)
+					concat(
+						Vec::of(own [
+							move annotations,
+							text("\(pubWord(t.isPub))type \(self.sym(t.name.sym))"),
+						]),
+					)
+				}
+				.Global(at) => {
+					val g = &block.globals[at]
+					val annotations = self.annotations(&g.annotations)
+					val keyword = if g.isMut then "var" else "val"
+					concat(
+						Vec::of(own [
+							move annotations,
+							text("\(pubWord(g.isPub))\(keyword) \(self.sym(g.name.sym)): "),
+							self.ty(g.ty),
+						]),
+					)
+				}
+				.Struct(at) => self.structDecl(&block.structs[at], true)
+			}
+			body.push((span, concat(Vec::of(own [move lead, move doc]))))
+		}
+		val braces = self.braced(move body, block.span.hi, .None)
+		return concat(Vec::of(own [move annotations, text(head.toStr()), text(" "), move braces]))
+	}
+
+	var fn extendBlock(block: &ExtendBlock): Doc = {
+		val annotations = self.annotations(&block.annotations)
+		var head = String::of("extend ")
+		match block.sliceOf {
+			.Some(element) => {
+				// `extend [T: Ord] { … }`.
+				head.push("[")
+				head.push(self.sym(element.sym))
+				for g in block.generics {
+					if g.name.sym == element.sym && !g.bounds.isEmpty() {
+						head.push(": ")
+						for (j, b) in g.bounds.forwards().enumerate() {
+							if j > 0 then head.push(" + ")
+							head.push(self.bound(&b))
+						}
+						break
+					}
+				}
+				head.push("]")
+			}
+			.None => {
+				for (i, name) in block.path.forwards().enumerate() {
+					if i > 0 then head.push("::")
+					head.push(self.sym(name.sym))
+				}
+				head.push(self.generics(&block.generics))
+			}
+		}
+		if block.interfaceName is .Some(name) {
+			head.push(": ")
+			head.push(self.interfacePath(&block.interfaceModule, name))
+			if block.interfaceArgs is .Some(args) then head.push("<\(self.tyList(&args.args))>")
+		}
+		var body: Vec<(Span, Doc)> = Vec()
+		for method in block.methods {
+			val lead = self.leading(method.span.lo)
+			body.push((method.span, concat(Vec::of(own [move lead, self.fnDecl(&method)]))))
+		}
+		val braces = self.braced(move body, block.span.hi, .None)
+		return concat(Vec::of(own [move annotations, text(head.toStr()), text(" "), move braces]))
+	}
+
+	var fn interfaceDecl(decl: &InterfaceDecl): Doc = {
+		val annotations = self.annotations(&decl.annotations)
+		val head = "\(pubWord(decl.isPub))interface \(self.sym(decl.name.sym))\(self.generics(&decl.generics))"
+		var body: Vec<(Span, Doc)> = Vec()
+		for m in decl.methods {
+			val lead = self.leading(m.span.lo)
+			val sig = self.fnSig(m.receiver.0.text(), false, &m.sig)
+			val default = match m.default {
+				.Some(body) => self.body(body)
+				.None => nothing()
+			}
+			body.push(
+				(
+					m.span,
+					concat(
+						Vec::of(own [
+							move lead,
+							group(concat(Vec::of(own [move sig, move default]))),
+						]),
+					),
+				),
+			)
+		}
+		val braces = self.braced(move body, decl.span.hi, .None)
+		return concat(Vec::of(own [move annotations, text(head.toStr()), text(" "), move braces]))
+	}
+
+	// ---- Lists ---------------------------------------------------------
+
+	/// `open a, b close` on one line if it fits, and otherwise each on a
+	/// line of its own, one deeper, with a trailing comma.
+	fn list(open: str, items: Vec<Doc>, close: str): Doc = self.listEnding(
+		open,
+		move items,
+		close,
+		true,
+	)
+
+	/// The same, with a comma after the last item where it is broken or
+	/// none: none after `...`, which ends a C function's parameters, and
+	/// none after an import's last name.
+	fn listEnding(open: str, items: Vec<Doc>, close: str, comma: bool): Doc = {
+		if items.isEmpty() then return text("\(open)\(close)")
+		val trailing = if comma then ifBreak(text(","), text("")) else text("")
+		return group(
+			concat(
+				Vec::of(own [
+					text(open),
+					indent(
+						concat(
+							Vec::of(own [
+								.Soft,
+								join(move items, concat(Vec::of(own [text(","), .Line]))),
+							]),
+						),
+					),
+					move trailing,
+					.Soft,
+					text(close),
+				]),
+			),
+		)
+	}
+
+	// ---- Types ---------------------------------------------------------
+
+	fn ty(id: TypeId): Doc = text(self.tyText(id).toStr())
+
+	fn tyText(id: TypeId): String = {
+		val ty = &self.ast.types[id]
+		return match ty.kind {
+			.Named(name, args) => {
+				if tupleArity(name).isSome() then return "(\(self.tyList(&args)))"
+				val written = self.sym(name)
+				if args.isEmpty() then String::of(written) else "\(written)<\(self.tyList(&args))>"
+			}
+			.Path(segments, args) => {
+				var path = String()
+				for (i, segment) in segments.forwards().enumerate() {
+					if i > 0 then path.push("::")
+					path.push(self.sym(segment.sym))
+				}
+				if args.isEmpty() then move path else "\(path)<\(self.tyList(&args))>"
+			}
+			.Own(inner) => "own<\(self.tyText(inner))>"
+			.Ref(isVar, inner) => {
+				val written = self.tyText(inner)
+				// `& &i64`: two borrows, which written together are `&&`.
+				val space = if !isVar && written.toStr().startsWith("&") then " " else ""
+				"&\(if isVar then "var " else "")\(space)\(written)"
+			}
+			.Array(elem, len) => {
+				val length = match len {
+					.Int(value) => "\(value)"
+					.Name(name) => String::of(self.sym(name.sym))
+				}
+				"[\(self.tyText(elem)); \(length)]"
+			}
+			.Slice(elem) => "[\(self.tyText(elem))]"
+			.Dyn(module, name, args) => {
+				val written = self.interfacePath(&module, name)
+				if args.isEmpty() then "dyn \(written)" else "dyn \(written)<\(self.tyList(&args))>"
+			}
+			.Fn(params, ret) => {
+				var written = String()
+				for (i, p) in params.forwards().enumerate() {
+					if i > 0 then written.push(", ")
+					written.push("\(self.sym(p.name.sym)): \(self.tyText(p.ty))")
+				}
+				"(\(written)) => \(self.tyText(ret))"
+			}
+			.Error => String::of(self.source(ty.span))
+		}
+	}
+
+	// ---- Statements and blocks -----------------------------------------
+
+	/// A block. `flat` says it may be written on one line where it is one
+	/// expression that fits: a value, as a branch of an `if` that answers
+	/// one or a lambda's body is; a function's body, a loop's and a
+	/// statement's are always broken.
+	var fn block(b: &Block): Doc = self.blockAs(&b, true)
+
+	var fn blockAs(b: &Block, flat: bool): Doc = {
+		val close = if b.span.hi > 0 then b.span.hi - 1 else 0
+		if b.stmts.isEmpty() {
+			val inside = self.trailing(close)
+			if isEmptyDoc(&inside) then return text("{}")
+			return concat(Vec::of(own [text("{"), indent(move inside), .Hard, text("}")]))
+		}
+		// One expression, and nothing said about it: on one line if it
+		// fits, as `if a < b { a } else { b }` is written.
+		// A `break`, `continue` or `return` alone is as short as a value.
+		if b.stmts.len() == 1 && flat && !self.commentBefore(close) {
+			val only = b.stmts[0]
+			val oneLine = match self.ast.stmts[only].kind {
+				.Break(..) | .Continue(..) | .Return(..) | .Yield(..) => true
+				.Expr(value) => !isBlockLike(&self.ast.exprs[value].kind)
+				_ => false
+			}
+			if oneLine {
+				val e = match self.ast.stmts[only].kind {
+					.Expr(value) => self.expr(value)
+					_ => self.stmt(only)
+				}
+				return group(
+					concat(
+						Vec::of(own [
+							text("{"),
+							indent(concat(Vec::of(own [.Line, move e]))),
+							.Line,
+							text("}"),
+						]),
+					),
+				)
+			}
+		}
+		var inner: Vec<Doc> = Vec()
+		var prev: Option<u32> = .None
+		for stmt in b.stmts {
+			val span = self.ast.stmts[stmt].span
+			match prev {
+				.None => inner.push(.Hard)
+				.Some(end) => inner.push(self.between(end, span.lo))
+			}
+			inner.push(self.leading(span.lo))
+			inner.push(self.stmt(stmt))
+			prev = .Some(span.hi)
+		}
+		inner.push(self.trailing(close))
+		return concat(Vec::of(own [text("{"), indent(concat(move inner)), .Hard, text("}")]))
+	}
+
+	/// Whether a comment comes before `end` that has not been written.
+	fn commentBefore(end: u32): bool =
+		self.next < self.comments.len() && self.comments[self.next].at < end
+
+	/// What a `for` walks, written.
+	var fn forSource(source: &ForSource): Doc = match source {
+		.Elements(source) => self.expr(source)
+		.Range(lo, hi, inclusive) => concat(
+			Vec::of(own [self.expr(lo), text(if inclusive then "..=" else ".."), self.expr(hi)]),
+		)
+	}
+
+	var fn stmt(id: StmtId): Doc = {
+		val stmt = &self.ast.stmts[id]
+		return match stmt.kind {
+			.Let(mutable, name, ty, init) => concat(
+				Vec::of(own [
+					text("\(if mutable then "var" else "val") \(self.sym(name.sym))"),
+					self.typeAnnotation(ty),
+					self.assigned(init),
+				]),
+			)
+			.Guard(mutable, pattern, value, elseBlock) => {
+				var parts = Vec::of(own [
+					text(if mutable then "var " else "val "),
+					self.pattern(&pattern),
+					self.assigned(value),
+				])
+				if elseBlock is .Some(block) {
+					parts.push(text(" else "))
+					parts.push(self.blockAs(&block, false))
+				}
+				concat(move parts)
+			}
+			.Defer(value) => concat(Vec::of(own [text("defer "), self.expr(value)]))
+			.Return(value) => match value {
+				.None => text("return")
+				.Some(value) => concat(Vec::of(own [text("return "), self.expr(value)]))
+			}
+			.Yield(value) => concat(Vec::of(own [text("yield "), self.expr(value)]))
+			.While(label, cond, body) => concat(
+				Vec::of(own [
+					text(self.label(label).toStr()),
+					text("while "),
+					self.expr(cond),
+					text(" "),
+					self.blockAs(&body, false),
+				]),
+			)
+			.For(label, binding, source, body) => {
+				val walked = self.forSource(&source)
+				concat(
+					Vec::of(own [
+						text(self.label(label).toStr()),
+						text("for "),
+						self.pattern(&binding),
+						text(" in "),
+						move walked,
+						text(" "),
+						self.blockAs(&body, false),
+					]),
+				)
+			}
+			.Break(label) => match label {
+				.Some(l) => text("break \(self.sym(l.sym))")
+				.None => text("break")
+			}
+			.Continue(label) => match label {
+				.Some(l) => text("continue \(self.sym(l.sym))")
+				.None => text("continue")
+			}
+			// An `if` without an `else` is a statement, and broken as one;
+			// with one, it answers a value, as the last of a block does.
+			.Expr(value) if self.ast.exprs[value].kind is .If(
+				elseBranch: .None,
+				..,
+			) => self.ifChain(value, true)
+			.Expr(value) => self.expr(value)
+		}
+	}
+
+	/// `if … { } else if … { } else { }`, as one: flat only where it is one
+	/// `if` and one `else`, each a single expression, that fit on the line
+	/// together, and broken otherwise, every branch alike.
+	var fn ifChain(id: ExprId, statement: bool): Doc = {
+		val (thenForm, braced) = self.ifForms(id, statement)
+		return match move thenForm {
+			.Some(thenForm) => choice(move thenForm, move braced)
+			.None => move braced
+		}
+	}
+
+	/// An `if` as the `then` form, where every branch is one expression or
+	/// one jump, and with braces. The `then` form is written where each
+	/// condition fits on its line with its `then`, on a line where the
+	/// whole fits and broken before each `else` where it does not; braces
+	/// where a condition must be broken.
+	var fn ifForms(id: ExprId, statement: bool): (Option<Doc>, Doc) = {
+		val branches = self.branches(id)
+		var all = true
+		for (_, b) in branches {
+			if !self.thenBranch(&b) then all = false
+		}
+		if !all then return (.None, self.bracedChain(&branches, statement))
+		// Each is printed from the same comment on.
+		val next = self.next
+		val thenForm = self.thenChain(&branches)
+		self.next = next
+		val braced = self.bracedChain(&branches, statement)
+		return (.Some(move thenForm), move braced)
+	}
+
+	var fn bracedChain(branches: &[(Option<ExprId>, Block)], statement: bool): Doc = {
+		// One `if` and one `else`, each a single expression — or, among a
+		// list's elements, one `if` that yields one value.
+		// An `if` alone that does anything else is a statement, and broken
+		// as one wherever it stands.
+		var allOne = true
+		for (_, b) in branches {
+			if !self.oneExpression(&b) then allOne = false
+		}
+		val oneYield =
+			branches.len() == 1 &&
+			branches[0].1.stmts.len() == 1 &&
+			self.ast.stmts[branches[0].1.stmts[0]].kind is .Yield(..)
+		val simple =
+			!statement && ((branches.len() == 2 && branches[1].0.isNone()) || oneYield) && allOne
+		var parts: Vec<Doc> = Vec()
+		for (i, (cond, b)) in branches.forwards().enumerate() {
+			if i > 0 then parts.push(text(" else "))
+			if cond is .Some(cond) {
+				parts.push(text("if "))
+				parts.push(self.expr(cond))
+				parts.push(text(" "))
+			}
+			parts.push(if simple then self.openBlock(&b) else self.blockAs(&b, false))
+		}
+		return if simple then group(concat(move parts)) else concat(move parts)
+	}
+
+	/// The branches of an `if` and the `else if`s after it, each with its
+	/// condition, and the last `else`'s without one.
+	fn branches(id: ExprId): Vec<(Option<ExprId>, Block)> = {
+		var branches: Vec<(Option<ExprId>, Block)> = Vec()
+		var at = id
+		while true {
+			match self.ast.exprs[at].kind {
+				.If(cond, thenBlock, elseBranch) => {
+					branches.push((.Some(cond), thenBlock.clone()))
+					match elseBranch {
+						.Some(next) => at = next
+						.None => break
+					}
+				}
+				.Block(block) => {
+					branches.push((.None, block.clone()))
+					break
+				}
+				_ => panic("an `else` is a block or an `if`")
+			}
+		}
+		return move branches
+	}
+
+	/// Whether a branch is what a `then` form holds: one
+	/// expression — not a block, a `match` or another `if`, which keep
+	/// their braces — or one `return`, `break` or `continue`, with no
+	/// comment in it.
+	fn thenBranch(b: &Block): bool = {
+		if b.stmts.len() != 1 then return false
+		val fits = match self.ast.stmts[b.stmts[0]].kind {
+			.Expr(e) =>
+				!(self.ast.exprs[e].kind is .Match(..) | .Block(..) | .If(..)) || self.isText(e)
+			.Return(..) | .Break(..) | .Continue(..) => true
+			_ => false
+		}
+		return fits && !self.commentInside(b.span)
+	}
+
+	/// Whether a comment not written yet lies inside `span`.
+	fn commentInside(span: Span): bool = {
+		for i in self.next..self.comments.len() {
+			val at = self.comments[i].at
+			if at > span.lo && at < span.hi then return true
+		}
+		return false
+	}
+
+	/// `if c then a else if d then b else e`: flat where it fits, and
+	/// otherwise each `else` at the start of a line of its own, under the
+	/// `if`, as a `when` is laid out. A branch too long for
+	/// its line goes on the next, one deeper.
+	var fn thenChain(branches: &[(Option<ExprId>, Block)]): Doc = {
+		var parts: Vec<Doc> = Vec()
+		for (i, (cond, b)) in branches.forwards().enumerate() {
+			if i > 0 {
+				parts.push(.Line)
+				parts.push(text("else "))
+			}
+			if b.stmts.len() != 1 then panic("one expression")
+			val only = b.stmts[0]
+			val branch = match self.ast.stmts[only].kind {
+				.Expr(e) => self.expr(e)
+				_ => self.stmt(only)
+			}
+			match cond {
+				.Some(cond) => {
+					parts.push(
+						rigid(concat(Vec::of(own [text("if "), self.expr(cond), text(" then")]))),
+					)
+					parts.push(group(indent(concat(Vec::of(own [.Line, move branch])))))
+				}
+				.None => parts.push(move branch)
+			}
+		}
+		return group(concat(move parts))
+	}
+
+	/// Whether a block is one expression, or one `yield`,
+	/// with no comment in it.
+	fn oneExpression(b: &Block): bool = {
+		if b.stmts.len() != 1 then return false
+		val one = match self.ast.stmts[b.stmts[0]].kind {
+			.Expr(e) => !isBlockLike(&self.ast.exprs[e].kind)
+			.Yield(..) => true
+			_ => false
+		}
+		return one && !self.commentInside(b.span)
+	}
+
+	/// `{ x }` whose line breaks are the enclosing group's: flat with it, or
+	/// broken with it.
+	var fn openBlock(b: &Block): Doc = {
+		if b.stmts.len() != 1 then panic("one expression")
+		val only = b.stmts[0]
+		val e = match self.ast.stmts[only].kind {
+			.Expr(value) => self.expr(value)
+			.Yield(..) => self.stmt(only)
+			_ => panic("an expression or a `yield`")
+		}
+		return concat(
+			Vec::of(own [
+				text("{"),
+				indent(concat(Vec::of(own [.Line, move e]))),
+				.Line,
+				text("}"),
+			]),
+		)
+	}
+
+	fn label(label: Option<Name>): String = match label {
+		.Some(l) => "\(self.sym(l.sym)): "
+		.None => String()
+	}
+
+	/// A function's ` = body`: a block is always broken, as a function's
+	/// body is; anything else is laid out as a value is.
+	var fn body(body: ExprId): Doc = {
+		if self.ast.exprs[body].kind is .Block(block) && !self.isInterpolated(body) then
+			return concat(Vec::of(own [text(" = "), self.blockAs(&block, false)]))
+		return self.assigned(body)
+	}
+
+	/// ` = value`: on the same line when the value breaks well there — a
+	/// block, a call, a literal of several parts — and otherwise tried on
+	/// the next line, one deeper, before the value itself is broken.
+	var fn assigned(value: ExprId): Doc = {
+		val hugging = hugs(&self.ast.exprs[value].kind) || self.isText(value)
+		// An `if` is asked for its forms once: printing it writes the
+		// comments inside it, and a second print would find none.
+		var doc = nothing()
+		if self.ast.exprs[value].kind is .If(..) {
+			val (thenForm, braced) = self.ifForms(value, false)
+			match move thenForm {
+				.Some(thenForm) => return choice(
+					concat(
+						Vec::of(own [
+							text(" ="),
+							group(indent(concat(Vec::of(own [.Line, move thenForm])))),
+						]),
+					),
+					concat(Vec::of(own [text(" = "), move braced])),
+				)
+				.None => doc = move braced
+			}
+		} else if self.ast.exprs[value].kind is .Binary(..) {
+			doc = self.binaryAs(value, false)
+		} else {
+			doc = self.expr(value)
+		}
+		if hugging then return concat(Vec::of(own [text(" = "), move doc]))
+		return concat(
+			Vec::of(own [text(" ="), group(indent(concat(Vec::of(own [.Line, move doc]))))]),
+		)
+	}
+
+	// ---- Expressions ---------------------------------------------------
+
+	/// An array of number literals, `-1` among them, with no comment
+	/// inside it.
+	fn isTable(elems: &[ExprId], span: Span): bool = {
+		val commented =
+			self.next < self.comments.len() &&
+			self.comments[self.next].at >= span.lo &&
+			self.comments[self.next].at < span.hi
+		if commented then return false
+		for el in elems {
+			val number = match self.ast.exprs[el].kind {
+				.Int(..) | .Float(..) => true
+				.Unary(op: .Neg, operand, ..) =>
+					self.ast.exprs[operand].kind is .Int(..) | .Float(..)
+				_ => false
+			}
+			if !number then return false
+		}
+		return true
+	}
+
+	fn isInterpolated(id: ExprId): bool = {
+		val e = &self.ast.exprs[id]
+		return e.kind is .Block(..) && self.source(e.span).startsWith("\"")
+	}
+
+	/// A string laid out as it was written, which stays on the line it
+	/// starts on: one with `\(…)` in it, or a text block.
+	fn isText(id: ExprId): bool = {
+		val e = &self.ast.exprs[id]
+		return self.isInterpolated(id) ||
+			e.kind is .Str(..) && self.source(e.span).startsWith("\"\"\"")
+	}
+
+	/// A text block, plain or interpolated: what is written
+	/// between two `"""`s.
+	fn isTextBlock(id: ExprId): bool =
+		self.isText(id) && self.source(self.ast.exprs[id].span).startsWith("\"\"\"")
+
+	/// A text block, its lines one deeper than the line it
+	/// starts on, and the closing `"""` with them: what each line has
+	/// past the old closing `"""`'s indentation is kept, which is what
+	/// keeps the text the same.
+	fn textBlock(source: str): Doc = {
+		var lines: Vec<str> = Vec()
+		for line in source.split("\n") {
+			lines.push(line)
+		}
+		val closing = if lines.isEmpty() then "" else lines[lines.len() - 1]
+		val old = closing[0..closing.len() - trimStartIndent(closing).len()]
+		var parts = Vec::of(own [text("\"\"\"")])
+		val last = if lines.len() > 1 then lines.len() - 1 else 1
+		for i in 1..last {
+			val line = lines[i]
+			val rest = match line.stripPrefix(old) {
+				.Some(rest) => rest
+				.None => trimStartIndent(line)
+			}
+			parts.push(.Hard)
+			parts.push(text(trimEndLine(rest)))
+		}
+		parts.push(.Hard)
+		parts.push(text(trimStartIndent(closing)))
+		return indent(concat(move parts))
+	}
+
+	pub var fn expr(id: ExprId): Doc = {
+		val e = &self.ast.exprs[id]
+		return match e.kind {
+			.Str(..) if self.isText(id) => self.textBlock(self.source(e.span))
+			.Int(..) | .Float(..) | .Str(..) | .Char(..) | .Byte(..) => text(self.source(e.span))
+			// `for x in xs { value }`, an element of a list literal:
+			// its body is a value, so it may be one line.
+			.ForElement(binding, source, body) => {
+				val walked = self.forSource(&source)
+				concat(
+					Vec::of(own [
+						text("for "),
+						self.pattern(&binding),
+						text(" in "),
+						move walked,
+						text(" "),
+						self.block(&body),
+					]),
+				)
+			}
+			// `"read \(rows) rows"`, which the parser rewrote into the
+			// calls it means: as it was written.
+			.Block(..) if self.isInterpolated(id) => {
+				self.skipCommentsIn(e.span)
+				val written = self.source(e.span)
+				if written.startsWith("\"\"\"") then self.textBlock(written) else text(written)
+			}
+			.Bool(value) => text(if value then "true" else "false")
+			.Null => text("null")
+			.Name(symbol) => text(self.sym(symbol))
+			.SelfRef => text("self")
+			.Paren(inner) => concat(Vec::of(own [text("("), self.expr(inner), text(")")]))
+			.Block(block) => self.block(&block)
+			.If(..) => self.ifChain(id, false)
+			.Path(leadingDot, segments, typeArgs) => {
+				val dot = if leadingDot then "." else ""
+				text("\(dot)\(self.pathText(&segments, &typeArgs))")
+			}
+			.Assert(cond, note, ..) => {
+				var args = Vec::of(own [self.expr(cond)])
+				if note is .Some(note) then args.push(self.expr(note))
+				concat(Vec::of(own [text("assert"), self.list("(", move args, ")")]))
+			}
+			.Lend(inner) => concat(Vec::of(own [text("lend "), self.expr(inner)]))
+			// A table of numbers fills its lines, as Prettier fills one:
+			// a line for each number would be most of the file.
+			.Array(elems) if elems.len() > 1 && self.isTable(&elems, e.span) => {
+				var words: Vec<String> = Vec()
+				for el in elems {
+					match self.ast.exprs[el].kind {
+						.Unary(
+							operand,
+							..,
+						) => words.push("-\(self.source(self.ast.exprs[operand].span)),")
+						_ => words.push("\(self.source(self.ast.exprs[el].span)),")
+					}
+				}
+				val lastAt = words.len() - 1
+				words[lastAt].popChar()
+				group(
+					concat(
+						Vec::of(own [
+							text("["),
+							indent(concat(Vec::of(own [.Soft, .Fill(words: move words)]))),
+							ifBreak(text(","), text("")),
+							.Soft,
+							text("]"),
+						]),
+					),
+				)
+			}
+			.Array(elems) => {
+				var docs: Vec<Doc> = Vec()
+				for el in elems {
+					val lead = self.leading(self.ast.exprs[el].span.lo)
+					docs.push(concat(Vec::of(own [move lead, self.expr(el)])))
+				}
+				self.list("[", move docs, "]")
+			}
+			.ArrayRepeat(elem, count) => {
+				val counted = match count {
+					.Literal(n) => text("\(n)")
+					.Expr(n) => self.expr(n)
+				}
+				concat(
+					Vec::of(own [text("["), self.expr(elem), text("; "), move counted, text("]")]),
+				)
+			}
+			.Match(scrutinee, arms) => {
+				val head = concat(Vec::of(own [text("match "), self.expr(scrutinee), text(" ")]))
+				var body: Vec<(Span, Doc)> = Vec()
+				for arm in arms {
+					val lead = self.leading(arm.span.lo)
+					var parts = Vec::of(own [move lead, self.pattern(&arm.pattern)])
+					if arm.guard is .Some(guard) {
+						parts.push(text(" if "))
+						parts.push(self.expr(guard))
+					}
+					match self.loneJump(arm.body) {
+						// A block that only leaves is written as the jump.
+						.Some(jump) => {
+							parts.push(text(" => "))
+							parts.push(self.stmt(jump))
+						}
+						.None => parts.push(self.arrowBody(arm.body))
+					}
+					body.push((arm.span, group(concat(move parts))))
+				}
+				val braces = self.braced(move body, e.span.hi, .None)
+				concat(Vec::of(own [move head, move braces]))
+			}
+			.Unary(op, operand, ..) => {
+				// `& &x`: two borrows, which written together are `&&`.
+				val borrowsABorrow =
+					op == .Ref && self.ast.exprs[operand].kind is .Unary(op: .Ref | .RefVar, ..)
+				val space = borrowsABorrow || op is .RefVar | .Move | .Own
+				concat(
+					Vec::of(own [
+						text("\(op.text())\(if space then " " else "")"),
+						self.expr(operand),
+					]),
+				)
+			}
+			.Binary(..) => self.binary(id)
+			.Is(scrutinee, pattern, negated) => concat(
+				Vec::of(own [
+					self.expr(scrutinee),
+					text(if negated then " !is " else " is "),
+					self.pattern(&pattern),
+				]),
+			)
+			.Try(inner) => concat(Vec::of(own [self.expr(inner), text("?")]))
+			.Lambda(params, ret, body) => {
+				var docs: Vec<Doc> = Vec()
+				for p in params {
+					docs.push(
+						match p.ty {
+							.Some(ty) => concat(
+								Vec::of(own [text("\(self.sym(p.name.sym)): "), self.ty(ty)]),
+							)
+							.None => text(self.sym(p.name.sym))
+						},
+					)
+				}
+				var parts = Vec::of(own [self.list("(", move docs, ")")])
+				if ret is .Some(ret) {
+					parts.push(text(": "))
+					parts.push(self.ty(ret))
+				}
+				parts.push(self.arrowBody(body))
+				concat(move parts)
+			}
+			.Cast(expr: value, ty) => concat(
+				Vec::of(own [self.expr(value), text(" as "), self.ty(ty)]),
+			)
+			.Assign(target, op, wrapping, value) => {
+				val wraps = if wrapping then "%" else ""
+				val written = match op {
+					.Some((op, _)) => "\(op.text())\(wraps)"
+					.None => String()
+				}
+				val targetDoc = self.expr(target)
+				val hugging = hugs(&self.ast.exprs[value].kind) || self.isText(value)
+				val valueDoc = self.expr(value)
+				if hugging then
+					concat(Vec::of(own [move targetDoc, text(" \(written)= "), move valueDoc]))
+				else concat(
+					Vec::of(own [
+						move targetDoc,
+						text(" \(written)="),
+						group(indent(concat(Vec::of(own [.Line, move valueDoc])))),
+					]),
+				)
+			}
+			.Field(base, name) => {
+				if self.chain(id) is .Some(chained) then return move chained
+				val written = match tupleFieldIndex(name.sym) {
+					.Some(i) => "\(i)"
+					.None => String::of(self.sym(name.sym))
+				}
+				concat(Vec::of(own [self.expr(base), text(".\(written)")]))
+			}
+			.Call(callee, args, names, rest) => {
+				// `(a, b)`: the prelude's `Tuple2(a, b)`, written as the
+				// sugar it was.
+				if self.isTupleCall(callee, &args, &names, rest) {
+					var elems: Vec<Doc> = Vec()
+					for arg in args {
+						val lead = self.leading(self.ast.exprs[arg].span.lo)
+						elems.push(concat(Vec::of(own [move lead, self.expr(arg)])))
+					}
+					return self.list("(", move elems, ")")
+				}
+				if self.chain(id) is .Some(chained) then return move chained
+				val calleeDoc = self.expr(callee)
+				self.callRest(e.span, move calleeDoc, &args, &names, rest)
+			}
+			.Index(base, index) => concat(
+				Vec::of(own [self.expr(base), text("["), self.expr(index), text("]")]),
+			)
+			.SubSlice(base, lo, hi, inclusive) => {
+				val from = match lo {
+					.Some(lo) => self.expr(lo)
+					.None => nothing()
+				}
+				val to = match hi {
+					.Some(hi) => self.expr(hi)
+					.None => nothing()
+				}
+				concat(
+					Vec::of(own [
+						self.expr(base),
+						text("["),
+						move from,
+						text(if inclusive then "..=" else ".."),
+						move to,
+						text("]"),
+					]),
+				)
+			}
+			.Error => text(self.source(e.span))
+		}
+	}
+
+	/// Whether a call is a tuple written as its sugar, `(a, b)`.
+	fn isTupleCall(
+		callee: ExprId,
+		args: &[ExprId],
+		names: &[Option<Name>],
+		rest: Option<ExprId>,
+	): bool = {
+		val .Name(symbol) = self.ast.exprs[callee].kind else {
+			return false
+		}
+		if tupleArity(symbol) != .Some(args.len()) || rest.isSome() then return false
+		for name in names {
+			if name.isSome() then return false
+		}
+		return true
+	}
+
+	/// A call's arguments, after what is called: `calleeDoc` is the
+	/// callee as written, or a chain's `.name`.
+	var fn callRest(
+		span: Span,
+		calleeDoc: Doc,
+		args: &[ExprId],
+		names: &[Option<Name>],
+		rest: Option<ExprId>,
+	): Doc = {
+		// The last argument hugs the parentheses where it is a
+		// literal of several parts or a lambda, and the others are
+		// short: `push(Entry {` … `})`, as Prettier writes it.
+		// Named or not: `.Column(children: own [` … `])`. A text
+		// block does too: `println("""` … `""")`.
+		if !args.isEmpty() && rest.isNone() {
+			val last = args[args.len() - 1]
+			var othersShort = true
+			for i in 0..args.len() - 1 {
+				if !isShort(&self.ast.exprs[args[i]].kind) then othersShort = false
+			}
+			val hugging = hugsAsArgument(&self.ast.exprs[last].kind) || self.isText(last)
+			if hugging && othersShort && !self.commentBefore(span.hi) {
+				var parts = Vec::of(own [move calleeDoc, text("(")])
+				for i in 0..args.len() - 1 {
+					if names[i] is .Some(name) then parts.push(text("\(self.sym(name.sym)): "))
+					parts.push(self.expr(args[i]))
+					parts.push(text(", "))
+				}
+				if names[names.len() - 1] is .Some(name) then
+					parts.push(text("\(self.sym(name.sym)): "))
+				parts.push(self.expr(last))
+				parts.push(text(")"))
+				return concat(move parts)
+			}
+		}
+		var docs: Vec<Doc> = Vec()
+		for (i, arg) in args.forwards().enumerate() {
+			val lead = self.leading(self.ast.exprs[arg].span.lo)
+			match names[i] {
+				.Some(name) => docs.push(
+					concat(
+						Vec::of(own [move lead, text("\(self.sym(name.sym)): "), self.expr(arg)]),
+					),
+				)
+				.None => docs.push(concat(Vec::of(own [move lead, self.expr(arg)])))
+			}
+		}
+		// `..base` comes last.
+		if rest is .Some(rest) {
+			val lead = self.leading(self.ast.exprs[rest].span.lo)
+			docs.push(concat(Vec::of(own [move lead, text(".."), self.expr(rest)])))
+		}
+		return concat(Vec::of(own [move calleeDoc, self.list("(", move docs, ")")]))
+	}
+
+	/// A chain of three calls or more on a value,
+	/// `xs.walk().filter(…).count()`: on one line where it fits, and
+	/// otherwise broken after each `.` that a call follows, but the first,
+	/// the rest one deeper. A field stays with the call after it,
+	/// `self.row.entries.items()`, and a shorter chain is laid out as any
+	/// call is, its last argument hugging the parentheses. A line that ends
+	/// in `.` goes on, where one that starts with `.` would begin a variant.
+	var fn chain(id: ExprId): Option<Doc> = {
+		// Each `.name`, innermost last: the field, and the call it is the
+		// callee of.
+		var segments: Vec<(ExprId, Option<ExprId>)> = Vec()
+		var at = id
+		var calls = 0
+		while true {
+			match self.ast.exprs[at].kind {
+				.Call(callee, ..) if self.ast.exprs[callee].kind is .Field(..) => {
+					segments.push((callee, .Some(at)))
+					calls += 1
+					val .Field(base, ..) = self.ast.exprs[callee].kind else {
+						panic("a field")
+					}
+					at = base
+				}
+				.Field(base, ..) => {
+					segments.push((at, .None))
+					at = base
+				}
+				_ => break
+			}
+		}
+		if calls < 3 then return .None
+		segments.reverse()
+		val head = self.expr(at)
+		var first: Vec<Doc> = Vec()
+		var later: Vec<Doc> = Vec()
+		// The fields since the last call, which go with the next one.
+		var fields: Vec<String> = Vec()
+		var written = 0
+		for (field, call) in segments {
+			val .Field(name, ..) = self.ast.exprs[field].kind else {
+				panic("a segment is a field")
+			}
+			fields.push(
+				match tupleFieldIndex(name.sym) {
+					.Some(index) => "\(index)"
+					.None => String::of(self.sym(name.sym))
+				},
+			)
+			val .Some(call) = call else {
+				continue
+			}
+			val named = text(fields.join(".").toStr())
+			fields.clear()
+			val callSpan = self.ast.exprs[call].span
+			val .Call(args, names, rest, ..) = self.ast.exprs[call].kind else {
+				panic("a call")
+			}
+			val segment = self.callRest(callSpan, move named, &args, &names, rest)
+			if written == 0 {
+				first.push(text("."))
+				first.push(move segment)
+			} else {
+				later.push(text("."))
+				later.push(.Soft)
+				later.push(move segment)
+			}
+			written += 1
+		}
+		// Fields after the last call stay on its line.
+		for name in fields {
+			later.push(text(".\(name)"))
+		}
+		return .Some(
+			group(concat(Vec::of(own [move head, concat(move first), indent(concat(move later))]))),
+		)
+	}
+
+	/// The `return`, `break` or `continue` an arm's block holds and
+	/// nothing else — no comment either, which the bare jump would lose.
+	fn loneJump(body: ExprId): Option<StmtId> = {
+		val .Block(block) = self.ast.exprs[body].kind else {
+			return .None
+		}
+		if block.stmts.len() != 1 then return .None
+		val only = block.stmts[0]
+		val jumps = self.ast.stmts[only].kind is .Return(..) | .Break(..) | .Continue(..)
+		return if jumps && !self.commentBefore(block.span.hi) then .Some(only) else .None
+	}
+
+	/// ` => body`: on the same line when the body is a block or breaks well
+	/// there, and otherwise tried on the next line, one deeper.
+	var fn arrowBody(body: ExprId): Doc = {
+		// A text block opens on the arrow's line, as a block does; a string
+		// of one line moves to the next where the arm is too long, rather
+		// than the pattern being broken to make room for it.
+		// An interpolated string is a block to the parser, and is asked
+		// about as text first.
+		val hugging =
+			if self.isText(body) then self.isTextBlock(body) else hugs(&self.ast.exprs[body].kind)
+		// An `if` is asked for its forms once, as in `assigned`.
+		var doc = nothing()
+		if self.ast.exprs[body].kind is .If(..) {
+			val (thenForm, braced) = self.ifForms(body, false)
+			match move thenForm {
+				.Some(thenForm) => return choice(
+					concat(
+						Vec::of(own [
+							text(" =>"),
+							group(indent(concat(Vec::of(own [.Line, move thenForm])))),
+						]),
+					),
+					concat(Vec::of(own [text(" => "), move braced])),
+				)
+				.None => doc = move braced
+			}
+		} else {
+			doc = self.expr(body)
+		}
+		if hugging then return concat(Vec::of(own [text(" => "), move doc]))
+		return concat(
+			Vec::of(own [text(" =>"), group(indent(concat(Vec::of(own [.Line, move doc]))))]),
+		)
+	}
+
+	/// A chain of one precedence, `a + b - c`, broken after its operators,
+	/// each operand after the first one deeper.
+	var fn binary(id: ExprId): Doc = self.binaryAs(id, true)
+
+	/// The same, where `deeper` says whether the operands after the first
+	/// go one deeper: not where the chain is a whole value that an `=` has
+	/// moved to its own line, one deeper already.
+	var fn binaryAs(id: ExprId, deeper: bool): Doc = {
+		val .Binary(op, ..) = self.ast.exprs[id].kind else {
+			panic("a binary expression")
+		}
+		val level = precedence(op)
+		var operands: Vec<ExprId> = Vec()
+		var ops: Vec<String> = Vec()
+		var at = id
+		// Left-nested operators of the same precedence are one chain.
+		while true {
+			match self.ast.exprs[at].kind {
+				.Binary(op, lhs, rhs, wrapping, ..) if precedence(op) == level => {
+					operands.push(rhs)
+					ops.push("\(op.text())\(if wrapping then "%" else "")")
+					at = lhs
+				}
+				_ => {
+					operands.push(at)
+					break
+				}
+			}
+		}
+		operands.reverse()
+		ops.reverse()
+		val first = self.expr(operands[0])
+		var rest: Vec<Doc> = Vec()
+		for (i, op) in ops.forwards().enumerate() {
+			rest.push(text(" \(op)"))
+			rest.push(.Line)
+			rest.push(self.expr(operands[i + 1]))
+		}
+		val tail = concat(move rest)
+		return group(
+			concat(Vec::of(own [move first, if deeper then indent(move tail) else move tail])),
+		)
+	}
+
+	/// Passes over the comments inside something printed as it was
+	/// written, which carries them already.
+	var fn skipCommentsIn(span: Span) = {
+		while self.next < self.comments.len() &&
+			self.comments[self.next].at >= span.lo &&
+			self.comments[self.next].at < span.hi {
+			self.next += 1
+		}
+	}
+
+	fn pathText(segments: &[Name], typeArgs: &Option<TypeArgs>): String = {
+		var out = String()
+		for (i, segment) in segments.forwards().enumerate() {
+			if i > 0 then out.push("::")
+			out.push(self.sym(segment.sym))
+			// `after` counts segments from zero: `Vec<i64>::new` has its
+			// arguments after segment 0.
+			if typeArgs is .Some(args) && args.after == i then
+				out.push("<\(self.tyList(&args.args))>")
+		}
+		return move out
+	}
+
+	// ---- Patterns ------------------------------------------------------
+
+	var fn pattern(p: &Pattern): Doc = match p.kind {
+		.Wildcard => text("_")
+		.Binding(symbol) => text(self.sym(symbol))
+		.Int(..) | .Str(..) | .Char(..) | .Byte(..) => text(self.source(p.span))
+		.Bool(value) => text(if value then "true" else "false")
+		// `'a'..='z'`, `..0`, `10..`: its ends as written, with nothing
+		// between them and the dots.
+		.Range(lo, hi, inclusive) => {
+			val from = match lo {
+				.Some(bound) => self.source(bound.span)
+				.None => ""
+			}
+			val to = match hi {
+				.Some(bound) => self.source(bound.span)
+				.None => ""
+			}
+			val dots = if inclusive then "..=" else ".."
+			return text("\(from)\(dots)\(to)")
+		}
+		// On one line where they fit, and otherwise as many to a line
+		// as fit, broken before a `|`; one to a line where one cannot
+		// be laid out on a line of its own.
+		.Any(alternatives) => {
+			var parts: Vec<Doc> = Vec()
+			for alternative in alternatives {
+				parts.push(self.pattern(&alternative))
+			}
+			var words: Vec<String> = Vec()
+			var allFlat = true
+			for (i, part) in parts.forwards().enumerate() {
+				match flat(&part) {
+					.Some(word) => words.push(if i == 0 then move word else "| \(word)")
+					.None => allFlat = false
+				}
+			}
+			if allFlat then return .Fill(words: move words)
+			return group(join(move parts, concat(Vec::of(own [.Line, text("| ")]))))
+		}
+		.Variant(leadingDot, segments, binders, rest) => {
+			if !leadingDot &&
+				segments.len() == 1 &&
+				binders is .Some(listed) &&
+				tupleArity(segments[0].sym) == .Some(listed.len()) {
+				var parts: Vec<Doc> = Vec()
+				for b in listed {
+					parts.push(
+						match b.pattern {
+							.Some(inner) => self.pattern(&inner)
+							.None => text(self.sym(b.field.sym))
+						},
+					)
+				}
+				return self.list("(", move parts, ")")
+			}
+			var path = String::of(if leadingDot then "." else "")
+			for (i, segment) in segments.forwards().enumerate() {
+				if i > 0 then path.push("::")
+				path.push(self.sym(segment.sym))
+			}
+			val head = text(path.toStr())
+			val .Some(listed) = binders else {
+				return move head
+			}
+			var parts: Vec<Doc> = Vec()
+			for b in listed {
+				parts.push(
+					match b.pattern {
+						// A pattern where the variant's one field is: by
+						// position.
+						.Some(inner) if b.field.sym == Symbol::positional() => self.pattern(&inner)
+						// `field: pattern`, or the field's name on its own
+						// where it binds that name.
+						.Some(inner) if !(inner.kind is .Binding(symbol) &&
+							symbol == b.field.sym &&
+							inner.span == b.field.span) => concat(
+							Vec::of(own [text("\(self.sym(b.field.sym)): "), self.pattern(&inner)]),
+						)
+						_ => text(self.sym(b.field.sym))
+					},
+				)
+			}
+			if rest then parts.push(text(".."))
+			return concat(Vec::of(own [move head, self.list("(", move parts, ")")]))
+		}
+		// `[first, ..rest]`.
+		.Slice(elements) => {
+			var parts: Vec<Doc> = Vec()
+			for element in elements {
+				parts.push(
+					match element {
+						.Pattern(inner) => self.pattern(&inner)
+						.Rest(name, ..) => match name {
+							.Some(n) => text("..\(self.sym(n.sym))")
+							.None => text("..")
+						}
+					},
+				)
+			}
+			return self.list("[", move parts, "]")
+		}
+		.Error => text(self.source(p.span))
+	}
+}
+
+fn pubWord(isPub: bool): str = if isPub then "pub " else ""
+
+/// A tuple's arity, where the name is the prelude's `TupleN`.
+fn tupleArity(symbol: Symbol): Option<i64> = {
+	for n in MIN_TUPLE..MAX_TUPLE + 1 {
+		if Symbol::tuple(n) == symbol then return .Some(n)
+	}
+	return .None
+}
+
+/// A tuple's element, where the name is `_0` and the rest.
+fn tupleFieldIndex(symbol: Symbol): Option<i64> = {
+	for i in 0..MAX_TUPLE {
+		if Symbol::tupleField(i) == symbol then return .Some(i)
+	}
+	return .None
+}
+
+/// Whether a value breaks well where it starts, so that ` = ` and ` => `
+/// keep it on their line rather than moving it to the next.
+fn hugs(kind: &ExprKind): bool =
+	kind is .Block(..) | .Match(..) | .If(..) | .Call(..) | .Array(..) | .Lambda(..) | .Assert(..)
+	| .Unary(op: .Own, ..) | .ForElement(..)
+// `own [ … ]` and `own Point { … }` break inside as what they
+// hold does.
+// A loop that is a generator breaks inside its body, as a
+// block does.
+
+/// Whether a call's last argument may hug its parentheses: something
+/// that breaks inside its own brackets.
+fn hugsAsArgument(kind: &ExprKind): bool = {
+	// A call that names its arguments, or takes `..base`, builds a struct
+	// or a variant, and is a literal of several parts as braces were.
+	if kind is .Call(names, rest, ..) {
+		if rest.isSome() then return true
+		for name in names {
+			if name.isSome() then return true
+		}
+	}
+	return kind is .Lambda(..) | .Array(..) | .Block(..) | .Unary(op: .Own, ..)
+}
+
+/// Whether an argument is short enough to stand before a hugging one: a
+/// name, a literal, a path or a field.
+fn isShort(kind: &ExprKind): bool =
+	kind is .Name(..) | .Int(..) | .Float(..) | .Str(..) | .Char(..) | .Byte(..) | .Bool(..)
+	| .Path(..) | .SelfRef | .Field(..) | .Unary(op: .Ref | .RefVar | .Neg, ..)
+
+/// Whether an expression is itself a block of statements, which a block
+/// around it does not put on one line.
+fn isBlockLike(kind: &ExprKind): bool = kind is .Match(..) | .Block(..)
+
+/// How tightly a binary operator binds, as the parser has it.
+fn precedence(op: BinaryOp): i64 = match op {
+	.Or => 1
+	.And => 2
+	.Eq | .Ne => 3
+	.Lt | .Le | .Gt | .Ge => 4
+	.BitOr => 5
+	.BitXor => 6
+	.BitAnd => 7
+	.Shl | .Shr => 8
+	.Add | .Sub => 9
+	.Mul | .Div | .Rem => 10
+}
+
+fn itemSpan(item: &Item): Span = {
+	val found: (Option<Span>, Span) = match item {
+		.Import(decl) => (.None, decl.span)
+		.Val(decl) => (firstAnnotation(&decl.annotations), decl.span)
+		.Assert(decl) => (firstAnnotation(&decl.annotations), decl.span)
+		.Struct(decl) => (firstAnnotation(&decl.annotations), decl.span)
+		.Enum(decl) => (firstAnnotation(&decl.annotations), decl.span)
+		.Fn(decl) => (firstAnnotation(&decl.annotations), decl.span)
+		.Extern(block) => (firstAnnotation(&block.annotations), block.span)
+		.Extend(block) => (firstAnnotation(&block.annotations), block.span)
+		.Interface(decl) => (firstAnnotation(&decl.annotations), decl.span)
+		.Type(alias) => (.None, alias.span)
+	}
+	val (first, span) = found
+	return match first {
+		.Some(at) if at.lo < span.lo => at.to(span)
+		_ => span
+	}
+}
+
+/// Where the first of some annotations is, if there is one.
+fn firstAnnotation(annotations: &[Annotation]): Option<Span> =
+	if annotations.isEmpty() then .None else .Some(annotations[0].span)
+
+/// A file of comments alone starts with them, not with a line break.
+fn stripLeadingBreak(doc: Doc): Doc = match move doc {
+	.Concat(parts) => {
+		var rest = move parts
+		if !rest.isEmpty() && rest[0] is .Hard | .Blank then rest.remove(0)
+		return .Concat(parts: move rest)
+	}
+	other => move other
+}
+
+/// The line without the spaces and tabs it starts with.
+fn trimStartIndent(line: str): str = {
+	var at = 0
+	while at < line.len() && line[at] is b' ' | b'\t' {
+		at += 1
+	}
+	return line[at..line.len()]
+}
+
+/// The line without the spaces, tabs and carriage return it ends with.
+fn trimEndLine(line: str): str = {
+	var end = line.len()
+	while end > 0 && line[end - 1] is b' ' | b'\t' | b'\r' {
+		end -= 1
+	}
+	return line[0..end]
+}

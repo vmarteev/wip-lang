@@ -47,34 +47,15 @@ extern "C" {
 	pub val stderr: ptr<FILE>
 }
 
-// glibc's `snprintf` for one double, with no `...`: C23's, there since
-// glibc 2.25. A Mac's libc has none.
-@target(os = "linux")
-extern "C" {
-	pub fn strfromd(out: &var [u8], format: cstring, value: f64): c_int
-}
-
-/// A double as `format` writes it — one conversion, `%.17g`, which is
-/// what `strfromd` takes — into `out`, with a NUL after it: how many bytes
-/// of `out` the text is, which is at most one less than there is room for.
+/// A double as `format` writes it — one conversion, as `%.17g` — into
+/// `out`, with a NUL after it: how many bytes of `out` the text is, which
+/// is at most one less than there is room for.
 pub fn formatDouble(value: f64, format: cstring, out: &var [u8]): i64 = {
 	// How long the whole would have been, as `snprintf` answers.
-	val wanted = formatted(value, format, &var out) as i64
+	val wanted = snprintf(&var out, format, value) as i64
 	if wanted < 0 then return 0
 	return wanted.min(out.len() - 1)
 }
-
-// On Linux it is `strfromd`, which takes the double as a named argument: a
-// variadic call that passes a double is the one x86-64 cannot make without
-// C of the compiler's writing, since the callee reads `%al`, which
-// Cranelift cannot set. Elsewhere every variadic call is
-// made directly.
-@target(os = "linux")
-fn formatted(value: f64, format: cstring, out: &var [u8]): c_int = strfromd(&var out, format, value)
-
-@target(vendor = "apple")
-@target(os = "windows")
-fn formatted(value: f64, format: cstring, out: &var [u8]): c_int = snprintf(&var out, format, value)
 
 // Numbers read from text, the nearest one to what is written. Where the
 // number ends is written through `end`, which may be null.
@@ -96,7 +77,7 @@ extern "C" {
 	pub fn writeText(fd: c_int, text: str): ssize_t
 	pub fn open(path: cstring, flags: c_int, ...): c_int
 	pub fn close(fd: c_int): c_int
-	/// `fcntl` with `F_SETFL` and the flags, as the processes use it.
+	/// `fcntl` with `F_SETFL` or `F_SETFD` and the flags.
 	pub fn fcntl(fd: c_int, command: c_int, ...): c_int
 	/// `mode_t` is 16 bits on a Mac and 32 on Linux; an argument narrower
 	/// than 32 bits arrives extended to 32 either way.
@@ -119,6 +100,19 @@ pub val O_RDONLY: c_int = 0
 pub val O_WRONLY: c_int = 1
 /// `fcntl`: set a descriptor's flags.
 pub val F_SETFL: c_int = 4
+/// `fcntl`: set what becomes of a descriptor when a program is started.
+pub val F_SETFD: c_int = 2
+/// `F_SETFD`'s flag: closed in the program started.
+pub val FD_CLOEXEC: c_int = 1
+
+/// Marks a descriptor closed in any program this one starts, as every
+/// descriptor the library opens is: a program started is given its
+/// standard streams and what its command says, not whatever this one has
+/// open — a file it would keep from being removed, or the end of a pipe
+/// another program waits to see closed.
+pub fn closeOnExec(fd: c_int) = {
+	fcntl(fd, F_SETFD, FD_CLOEXEC)
+}
 
 /// `sysconf`: how many processors are working.
 @target(vendor = "apple")
@@ -143,6 +137,9 @@ pub val O_EXCL: c_int = 2048
 /// `open` and `fcntl`: a read or a write that would wait answers `EAGAIN`.
 @target(vendor = "apple")
 pub val O_NONBLOCK: c_int = 4
+/// `open`: closed in a program started, as `closeOnExec` makes it.
+@target(vendor = "apple")
+pub val O_CLOEXEC: c_int = 16777216
 
 /// `open`: every write goes at the end.
 @target(os = "linux")
@@ -159,6 +156,9 @@ pub val O_EXCL: c_int = 128
 /// `open` and `fcntl`: a read or a write that would wait answers `EAGAIN`.
 @target(os = "linux")
 pub val O_NONBLOCK: c_int = 2048
+/// `open`: closed in a program started, as `closeOnExec` makes it.
+@target(os = "linux")
+pub val O_CLOEXEC: c_int = 524288
 
 // Errors: `errno`, which is a macro over a function each C library names
 // its own way, and the numbers `std::io` tells apart, which are the same
@@ -364,6 +364,43 @@ extern "C" {
 	/// The files, and how many: what a slice crosses as. `nfds_t` is 32
 	/// bits on a Mac and 64 on Linux; a Mac reads the low 32.
 	pub fn poll(watched: &var [PollFd], timeout: c_int): c_int
+}
+
+// What keeps a program started from being given a descriptor this one
+// opened, without a moment between making one and marking it in which
+// another thread could start a program that takes it. A Mac starts a
+// program with every descriptor closed but those its file actions name;
+// Linux makes a pipe already marked.
+
+@target(vendor = "apple")
+extern "C" {
+	/// `posix_spawnp` with its attributes, a pointer on a Mac, which a
+	/// `Hidden` has room for.
+	@symbol("posix_spawnp")
+	pub fn posix_spawnpWith(
+		pid: &var c_int,
+		program: cstring,
+		actions: &Hidden,
+		attributes: &Hidden,
+		arguments: ptr<cstring>,
+		environment: ptr<cstring>,
+	): c_int
+	pub fn posix_spawnattr_init(attributes: &var Hidden): c_int
+	pub fn posix_spawnattr_setflags(attributes: &var Hidden, flags: i16): c_int
+	pub fn posix_spawnattr_destroy(attributes: &var Hidden): c_int
+	/// A descriptor kept open in the program started, as it is in this one.
+	pub fn posix_spawn_file_actions_addinherit_np(actions: &var Hidden, fd: c_int): c_int
+}
+
+/// `posix_spawnattr_setflags`: every descriptor closed in the program
+/// started but those its file actions name.
+@target(vendor = "apple")
+pub val POSIX_SPAWN_CLOEXEC_DEFAULT: i16 = 16384
+
+@target(os = "linux")
+extern "C" {
+	/// `pipe`, with flags: `O_CLOEXEC` makes both ends already marked.
+	pub fn pipe2(ends: &var Pipe, flags: c_int): c_int
 }
 
 /// The two ends of a pipe, as `pipe` fills them in.

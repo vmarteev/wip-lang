@@ -1,0 +1,1435 @@
+// Blocks, statements, `if`, `match`, `&&` and `||`.
+
+import hir as hir
+import hir::{BOOL, ERROR, ExprId, I32, I64, LocalId, PTR_U8, STR, StmtId, Ty}
+import syntax::{BinaryOp, Span}
+
+/// Where a `for` over numbers stops: before its end, or after it.
+enum End {
+	Before(end: Operand)
+	Through(end: Operand)
+}
+
+/// What a `match` tests: one place, or the places of a tuple matched in
+/// place, each with its type.
+@derive(Clone)
+enum Tested {
+	One(place: Place, ty: Ty)
+	Many(places: Vec<(Place, Ty)>)
+}
+
+/// What a loop binds at the start of each pass, before its body.
+enum LoopBind {
+	Nothing
+	/// A `for` over elements: its pattern, bound to the element at the
+	/// counter.
+	Element(binding: hir::Pattern, elements: Place, counter: Local, elemTy: Ty)
+	/// A `for` over numbers: its binding, where it names one, given the
+	/// counter.
+	Range(binding: Option<LocalId>, counter: Local)
+}
+
+extend Builder {
+	/// Marks what follows as written at `span`, for debug information; nothing
+	/// where the path has ended.
+	var fn at(span: Span) = {
+		if !self.dead then self.push(.At(span))
+	}
+
+	/// A block: its statements, then its value (into `dest` if given), then
+	/// its cleanups. A block whose path ended produces no value.
+	var fn blockExpr(block: &hir::Block, dest: Option<Place>): Value = {
+		self.scopes.push(Vec())
+		self.seenUntil.push(block.span.hi)
+		for stmt in block.stmts {
+			self.stmt(stmt)
+		}
+		if block.value is .Some(value) && !self.dead then self.at(self.hir.exprs[value].span)
+		val value = match block.value {
+			.Some(value) if !self.dead => match move dest {
+				.Some(place) => {
+					self.storeExpr(value, place.clone())
+					Value::Place(move place)
+				}
+				.None => self.expr(value)
+			}
+			_ => Value::Unit
+		}
+		if self.dead then self.scopes.pop() else self.dropScope()
+		self.seenUntil.pop()
+		return move value
+	}
+
+	var fn stmt(id: StmtId) = {
+		self.revive()
+		self.at(self.hir.stmts[id].span)
+		// Statements can nest inside expressions (`f(x, { … })`), so the
+		// temporaries of enclosing statements may still be pending.
+		val mark = self.temps.len()
+		val hir = self.hir
+		match hir.stmts[id].kind {
+			.Let(local, init) => {
+				val variable = self.sourceLocal(local, .Var)
+				self.storeExpr(init, Place::of(variable))
+				self.dropTemps(mark)
+				self.vars.put(local, variable)
+				// It holds a value from here until something moves it away.
+				self.setFlag(local, true)
+				if !self.scopes.isEmpty() {
+					val last = self.scopes.len() - 1
+					self.scopes[last].push(.Drop(local))
+				}
+			}
+			.Return(value: .None) if self.generatorState.isSome() => self.generatorReturn()
+			.Yield(value) => self.yieldStmt(value, mark)
+			.Return(value) => {
+				match value {
+					.Some(v) if self.ret is .Some(ret) && self.isAggregate(self.localTy(ret)) => {
+						val .Some(r) = self.ret else {
+							panic("asked above")
+						}
+						self.storeExpr(v, Place::of(r))
+						self.dropTemps(mark)
+						self.dropPendingTemps()
+						self.dropAllScopes()
+					}
+					.Some(v) => {
+						val result = self.expr(v)
+						self.dropTemps(mark)
+						self.dropPendingTemps()
+						self.dropAllScopes()
+						if result is .Scalar(operand) {
+							if self.ret is .Some(ret) then
+								self.assign(Place::of(ret), .Use(operand.clone()))
+						}
+					}
+					.None => {
+						self.dropPendingTemps()
+						self.dropAllScopes()
+					}
+				}
+				// A `@tailrec` function's `return f(x)` has already jumped back to
+				// the top.
+				if !self.dead {
+					self.terminate(.Return)
+					self.dead = true
+				}
+			}
+			.While(cond, body) => {
+				val forever = hir.exprs[cond].kind is .Bool(value: true)
+				val header = self.newBlock()
+				val bodyBlock = self.newBlock()
+				val exit = self.newBlock()
+				self.terminate(.Goto(header))
+				self.switchTo(header)
+				val bindings = self.conditionBindings(cond)
+				val test = self.scalar(cond)
+				self.dropTemps(mark)
+				val breaks = if bindings {
+					// The bindings of `is` tests in the condition are dropped at the
+					// end of each pass, and when the loop ends, by latches that
+					// `continue` and `break` go through too.
+					val next = self.newBlock()
+					val leave = self.newBlock()
+					self.terminate(.Branch(cond: move test, thenBlock: bodyBlock, otherwise: leave))
+					val breaks = self.loopBody(bodyBlock, &body, next, leave, .Nothing)
+					val scope = match self.scopes.pop() {
+						.Some(s) => move s
+						.None => panic("pushed for the bindings")
+					}
+					self.switchTo(next)
+					self.unwind(scope.clone())
+					self.terminate(.Goto(header))
+					self.switchTo(leave)
+					self.unwind(move scope)
+					self.terminate(.Goto(exit))
+					breaks
+				} else {
+					self.terminate(.Branch(cond: move test, thenBlock: bodyBlock, otherwise: exit))
+					self.loopBody(bodyBlock, &body, header, exit, .Nothing)
+				}
+				self.switchTo(exit)
+				// `while true` with no `break` never gets here.
+				if forever && !breaks then self.dead = true
+			}
+			// A counter over the elements, whose number is read once; the
+			// binding holds each element's address.
+			.ForElements(binding, elements, body) => {
+				val (place, len) = self.elements(elements)
+				val i = self.temp(I64)
+				self.assign(Place::of(i), .Use(Builder::int(0, I64)))
+				val elemTy = match self.kind(self.ty(elements)) {
+					.Array(elem: e, ..) | .Slice(elem: e) => e
+					_ => ERROR
+				}
+				// The binding is seen by the loop's body.
+				self.seenUntil.push(hir.stmts[id].span.hi)
+				val bind = LoopBind::Element(
+					binding: binding.clone(),
+					elements: move place,
+					counter: i,
+					elemTy: elemTy,
+				)
+				self.countedLoop(i, .Before(move len), I64, &body, mark, move bind)
+				self.seenUntil.pop()
+			}
+			.ForRange(binding, lo, hi, inclusive, body) => {
+				val ty = self.ty(lo)
+				val low = self.scalar(lo)
+				val high = self.scalar(hi)
+				val i = self.temp(ty)
+				self.assign(Place::of(i), .Use(move low))
+				val end = if inclusive then End::Through(move high) else End::Before(move high)
+				self.seenUntil.push(hir.stmts[id].span.hi)
+				self.countedLoop(i, move end, ty, &body, mark, .Range(binding: binding, counter: i))
+				self.seenUntil.pop()
+			}
+			// A jump unwinds what the loop's body opened: the temporaries of the
+			// statements around it, then its blocks, innermost first.
+			.Break(depth) | .Continue(depth) => {
+				val isBreak = hir.stmts[id].kind is .Break(..)
+				// Which loop it leaves, counted from the innermost.
+				val target = self.loops.len() - 1 - depth as i64
+				if target < 0 then
+					panic("the type checker allows `break` and `continue` only in loops")
+				val frame = self.loops[target].clone()
+				// What a `match` arm took out of a temporary is the arm's, and its
+				// flag says so, as on `return`.
+				var temps: Vec<(Place, Ty)> = Vec()
+				for at in frame.temps..self.temps.len() {
+					temps.push(self.temps[at].clone())
+				}
+				for (place, ty) in temps.backwards() {
+					self.dropTemp(&place, ty)
+				}
+				var scopes: Vec<Vec<Cleanup>> = Vec()
+				for at in frame.scopes..self.scopes.len() {
+					scopes.push(self.scopes[at].clone())
+				}
+				for scope in scopes.backwards() {
+					self.unwind(scope.clone())
+				}
+				val goesTo = if isBreak {
+					self.loops[target].breaks = true
+					frame.exit
+				} else {
+					frame.next
+				}
+				self.terminate(.Goto(goesTo))
+				self.dead = true
+			}
+			.Guard(scrutinee, pattern, elseBlock) => {
+				self.guard(scrutinee, &pattern, &elseBlock)
+				self.dropTemps(mark)
+			}
+			.Expr(value) => self.exprStmt(value, mark)
+			// Nothing is evaluated here: the expression runs, whole, at each exit
+			// of the block.
+			.Defer(value) => {
+				if !self.scopes.isEmpty() {
+					val last = self.scopes.len() - 1
+					self.scopes[last].push(.Defer(value))
+				}
+			}
+		}
+	}
+
+	fn localTy(local: Local): Ty = self.locals[local.index as i64].ty
+
+	/// An expression whose value is not used. A result that owns memory and
+	/// that nothing takes, such as `make()`, is dropped with the statement's
+	/// other temporaries.
+	var fn exprStmt(id: ExprId, mark: i64) = {
+		val ty = self.ty(id)
+		val value = self.expr(id)
+		if value is .Scalar(.Copy(place)) && self.kind(ty) is .Own(..) then
+			self.ownTemp(place.clone(), ty)
+		else if value is .Place(place) && !self.isPlaceKind(id) then self.ownTemp(place.clone(), ty)
+		self.dropTemps(mark)
+	}
+
+	/// What a loop binds at the start of each pass.
+	var fn bindLoop(bind: &LoopBind) = match bind {
+		.Nothing => {}
+		.Element(binding, elements, counter, elemTy) => {
+			val element = elements.project(.Index(counter))
+			self.bind(&binding, &element, elemTy)
+		}
+		.Range(binding, counter) => {
+			if binding is .Some(local) {
+				val variable = self.sourceLocal(local, .Var)
+				self.assign(Place::of(variable), .Use(.Copy(Place::of(counter))))
+				self.vars.put(local, variable)
+			}
+		}
+	}
+
+	/// A loop's body, lowered into `start` after what the loop binds. It goes
+	/// to `next` when it ends or continues, and to `exit` when it breaks.
+	/// Returns whether a `break` leaves it.
+	var fn loopBody(
+		start: BlockId,
+		body: &hir::Block,
+		next: BlockId,
+		exit: BlockId,
+		bind: LoopBind,
+	): bool = {
+		self.loops.push(LoopFrame(
+			exit: exit,
+			next: next,
+			scopes: self.scopes.len(),
+			temps: self.temps.len(),
+			breaks: false,
+		))
+		self.switchTo(start)
+		self.dead = false
+		self.bindLoop(&bind)
+		self.blockExpr(&body, .None)
+		if !self.dead then self.terminate(.Goto(next))
+		self.dead = false
+		return match self.loops.pop() {
+			.Some(frame) => frame.breaks
+			.None => panic("pushed above")
+		}
+	}
+
+	/// A `for`: the counter `i`, of type `ty`, runs up to `end`, and the body
+	/// runs after what the loop binds on each pass. The statement's
+	/// temporaries, such as a walked temporary, are dropped after the loop.
+	var fn countedLoop(i: Local, end: End, ty: Ty, body: &hir::Block, mark: i64, bind: LoopBind) = {
+		val header = self.newBlock()
+		val bodyBlock = self.newBlock()
+		val step = self.newBlock()
+		val exit = self.newBlock()
+		self.terminate(.Goto(header))
+		self.switchTo(header)
+		val (past, last) = match move end {
+			.Before(e) => (BinaryOp::Ge, move e)
+			.Through(e) => (.Gt, move e)
+		}
+		val done = self.value(BOOL, .Binary(op: past, lhs: .Copy(Place::of(i)), rhs: last.clone()))
+		self.terminate(.Branch(cond: move done, thenBlock: exit, otherwise: bodyBlock))
+		self.loopBody(bodyBlock, &body, step, exit, move bind)
+		self.switchTo(step)
+		// Through the end, the loop stops at it rather than step past it, which
+		// the type may not hold: `0..=255` of a `u8`.
+		if past == .Gt {
+			val atLast = self.value(BOOL, .Binary(
+				op: .Eq,
+				lhs: .Copy(Place::of(i)),
+				rhs: move last,
+			))
+			val increment = self.newBlock()
+			self.terminate(.Branch(cond: move atLast, thenBlock: exit, otherwise: increment))
+			self.switchTo(increment)
+		}
+		val next = self.value(ty, .Binary(
+			op: .Add,
+			lhs: .Copy(Place::of(i)),
+			rhs: Builder::int(1, ty),
+		))
+		self.assign(Place::of(i), .Use(move next))
+		self.terminate(.Goto(header))
+		self.switchTo(exit)
+		self.dropTemps(mark)
+	}
+
+	/// The place the value of a branching expression is built in: `dest`, or
+	/// a temporary, where the value is an aggregate.
+	var fn branchDest(ty: Ty, dest: Option<Place>): Option<Place> = {
+		if !self.isAggregate(ty) then return .None
+		return match move dest {
+			.Some(place) => Option::Some(move place)
+			.None => Option::Some(Place::of(self.temp(ty)))
+		}
+	}
+
+	/// `if`/`else`: each branch assigns a scalar result to a temporary, or
+	/// writes an aggregate one to `dest` (or a temporary).
+	var fn ifExpr(
+		cond: ExprId,
+		thenBlock: &hir::Block,
+		elseBlock: &Option<hir::Block>,
+		ty: Ty,
+		dest: Option<Place>,
+	): Value = {
+		val bindings = self.conditionBindings(cond)
+		val test = self.scalar(cond)
+		val target = self.branchDest(ty, move dest)
+		val result: Option<Local> =
+			if target.isNone() && self.isScalar(ty) then .Some(self.temp(ty)) else .None
+		val thenStart = self.newBlock()
+		val elseStart = self.newBlock()
+		val join = self.newBlock()
+		self.terminate(.Branch(cond: move test, thenBlock: thenStart, otherwise: elseStart))
+		var joined = false
+		for which in 0..2 {
+			self.switchTo(if which == 0 then thenStart else elseStart)
+			self.dead = false
+			// Temporaries made in a branch exist on that path only, so they are
+			// dropped before the paths join.
+			val mark = self.temps.len()
+			val value = if which == 0 {
+				self.blockExpr(&thenBlock, target.clone())
+			} else {
+				match elseBlock {
+					.Some(b) => self.blockExpr(&b, target.clone())
+					.None => Value::Unit
+				}
+			}
+			if self.dead {
+				self.temps.truncate(mark)
+				continue
+			}
+			self.dropTemps(mark)
+			if result is .Some(r) {
+				match move value {
+					.Scalar(operand) => self.assign(Place::of(r), .Use(move operand))
+					_ => panic("a branch of a scalar `if` produced no scalar")
+				}
+			}
+			self.terminate(.Goto(join))
+			joined = true
+		}
+		// Both branches returned: nothing follows the `if`.
+		if !joined {
+			if bindings then self.scopes.pop()
+			self.dead = true
+			return .Unit
+		}
+		self.dead = false
+		self.switchTo(join)
+		if bindings then self.dropScope()
+		return match (result, move target) {
+			(.Some(r), _) => Value::Scalar(.Copy(Place::of(r)))
+			(.None, .Some(place)) => Value::Place(move place)
+			(.None, .None) => Value::Unit
+		}
+	}
+
+	/// A `match`: a switch on the variant goes to the first arm that matches
+	/// it. A scrutinee that is not a place is moved into a temporary, which
+	/// the statement drops afterwards, minus whatever the arms take out of it.
+	var fn matchExpr(scrutinee: ExprId, arms: &[hir::Arm], ty: Ty, dest: Option<Place>): Value = {
+		val scrutineeTy = self.ty(scrutinee)
+		// A tuple matched in place is a place for each element, each tested as
+		// a `match` on it alone would test it.
+		val tested = match self.hir.exprs[scrutinee].kind {
+			.Places(elements) => {
+				var places: Vec<(Place, Ty)> = Vec()
+				for e in elements {
+					places.push(self.testedPlace(e))
+				}
+				Tested::Many(move places)
+			}
+			_ => {
+				val (place, placeTy) = self.testedPlace(scrutinee)
+				Tested::One(place: move place, ty: placeTy)
+			}
+		}
+		// What one place the switches below read; a tuple matched in place is
+		// neither an enum nor a number, and they leave it be.
+		val place = match tested {
+			.One(place, ..) => place.clone()
+			.Many(..) => Place::of(self.temp(BOOL))
+		}
+		val variant: Option<Operand> =
+			if self.kind(scrutineeTy) is .Enum(..) then
+				.Some(self.value(I32, .Variant(place.clone())))
+			else .None
+		val target = self.branchDest(ty, move dest)
+		val result: Option<Local> =
+			if target.isNone() && self.isScalar(ty) then .Some(self.temp(ty)) else .None
+		val join = self.newBlock()
+		var armBlocks: Vec<BlockId> = Vec()
+		for _ in arms {
+			armBlocks.push(self.newBlock())
+		}
+		// Exhaustiveness is checked, so no value gets past the last arm.
+		val unmatched = self.newBlock()
+		// An arm that tests one variant and nothing else is a case of one
+		// switch, which is what a `match` on an enum has always been. Anything
+		// else — a value to equal, alternatives, a guard — is a test of its
+		// own, tried in order. A pattern that tests what a field holds is a
+		// test of its own, whatever its head is.
+		var switchable = variant.isSome()
+		for arm in arms {
+			if arm.guard.isSome() ||
+				testsWithin(&arm.pattern) ||
+				!(arm.pattern is .Variant(..) | .Wildcard | .Binding(..) | .Fields(..)) {
+				switchable = false
+			}
+		}
+		// A `match` on a number whose arms are numbers — an interpreter's
+		// opcodes, a byte, a character — is one switch too, where every number
+		// fits a case and nothing is guarded; an arm that takes the rest ends
+		// it. Tried in order, they were a comparison each.
+		val numbers = self.numbersSwitch(scrutineeTy, &arms, &armBlocks, unmatched)
+		var tests: Vec<BlockId> = Vec()
+		val hasVariant = variant.isSome()
+		if !hasVariant && numbers.isSome() {
+			val .Some((cases, otherwise)) = numbers else {
+				panic("just asked")
+			}
+			self.terminate(.Switch(
+				value: .Copy(place.clone()),
+				cases: cases.clone(),
+				otherwise: otherwise,
+			))
+		} else if hasVariant && switchable {
+			val .Some(which) = move variant else {
+				panic("just asked")
+			}
+			var cases: Vec<(u32, BlockId)> = Vec()
+			var otherwise = unmatched
+			for (i, arm) in arms.forwards().enumerate() {
+				val block = armBlocks[i]
+				match arm.pattern {
+					.Variant(variant, ..) => {
+						var seen = false
+						for (case, _) in cases {
+							if case == variant then seen = true
+						}
+						if !seen then cases.push((variant, block))
+					}
+					_ => {
+						otherwise = block
+						break
+					}
+				}
+			}
+			self.terminate(.Switch(value: move which, cases: move cases, otherwise: otherwise))
+		} else if !switchable || !hasVariant {
+			// One block per arm's test, each falling to the next.
+			for _ in arms {
+				tests.push(self.newBlock())
+			}
+			val first = if tests.isEmpty() then unmatched else tests[0]
+			self.terminate(.Goto(first))
+			for (i, arm) in arms.forwards().enumerate() {
+				val next = if i + 1 < tests.len() then tests[i + 1] else unmatched
+				self.switchTo(tests[i])
+				self.testTested(&arm.pattern, &tested, armBlocks[i], next)
+			}
+		} else {
+			val first = if armBlocks.isEmpty() then unmatched else armBlocks[0]
+			self.terminate(.Goto(first))
+		}
+		var joined = false
+		for (i, arm) in arms.forwards().enumerate() {
+			self.switchTo(armBlocks[i])
+			self.dead = false
+			self.scopes.push(Vec())
+			// What the pattern binds is seen by the arm.
+			self.seenUntil.push(self.hir.exprs[arm.body].span.hi)
+			self.bindTested(&arm.pattern, &tested)
+			// `if …` after the pattern: the arm matches only where it is true,
+			// and where it is not the next arm is tried. The bindings are made
+			// first, since the guard reads them; they alias, so there is nothing
+			// to undo.
+			if arm.guard is .Some(guard) {
+				// What the guard makes exists only where its pattern matched,
+				// so it is dropped here, before either way on, and not where
+				// the `match` ends, which other paths reach too. The guard's
+				// answer is read out of it first.
+				val mark = self.temps.len()
+				val answer = self.scalar(guard)
+				val test = self.value(BOOL, .Use(move answer))
+				self.dropTemps(mark)
+				val body = self.newBlock()
+				val next = if i + 1 < tests.len() then tests[i + 1] else unmatched
+				self.terminate(.Branch(cond: move test, thenBlock: body, otherwise: next))
+				self.switchTo(body)
+			}
+			self.dropUntakenTested(&arm.pattern, &tested)
+			// An arm that is one expression is written where it is; a block
+			// marks its own statements.
+			if !(self.hir.exprs[arm.body].kind is .Block(..)) then
+				self.at(self.hir.exprs[arm.body].span)
+			// Temporaries made in an arm exist on that path only.
+			val mark = self.temps.len()
+			val value = match target {
+				.Some(place) => {
+					self.storeExpr(arm.body, place.clone())
+					Value::Place(place.clone())
+				}
+				.None => self.expr(arm.body)
+			}
+			self.seenUntil.pop()
+			if self.dead {
+				self.temps.truncate(mark)
+				self.scopes.pop()
+				continue
+			}
+			self.dropTemps(mark)
+			self.dropScope()
+			if result is .Some(r) {
+				match move value {
+					.Scalar(operand) => self.assign(Place::of(r), .Use(move operand))
+					_ => panic("an arm of a scalar `match` produced no scalar")
+				}
+			}
+			self.terminate(.Goto(join))
+			joined = true
+		}
+		self.switchTo(unmatched)
+		self.terminate(.Unreachable)
+		if !joined {
+			self.dead = true
+			return .Unit
+		}
+		self.dead = false
+		self.switchTo(join)
+		return match (result, move target) {
+			(.Some(r), _) => Value::Scalar(.Copy(Place::of(r)))
+			(.None, .Some(place)) => Value::Place(move place)
+			(.None, .None) => Value::Unit
+		}
+	}
+
+	/// The variables of the bindings of `is` tests in a condition, made before
+	/// the condition is evaluated. A test binds only on the path where it
+	/// succeeds, so each starts as zeros, which dropping leaves alone. The
+	/// scope this pushes drops them; it is pushed only if there are bindings,
+	/// and the result says whether it was.
+	var fn conditionBindings(cond: ExprId): bool = {
+		var locals: Vec<LocalId> = Vec()
+		collectTested(self.hir, cond, &var locals)
+		if locals.isEmpty() then return false
+		var scope: Vec<Cleanup> = Vec()
+		for local in locals {
+			val variable = self.sourceLocal(local, .Var)
+			self.push(.Zero(Place::of(variable)))
+			self.vars.put(local, variable)
+			scope.push(.Drop(local))
+		}
+		self.scopes.push(move scope)
+		return true
+	}
+
+	/// `val pattern = value else { … }`: on the path where the value does not
+	/// match, the `else` block, which leaves; on the other, the bindings, which
+	/// the enclosing block drops.
+	var fn guard(scrutinee: ExprId, pattern: &hir::Pattern, elseBlock: &Option<hir::Block>) = {
+		// A struct pattern always matches: it tests nothing and only binds.
+		val .Some(otherwise) = elseBlock else {
+			val (place, scrutineeTy) = self.testedPlace(scrutinee)
+			self.bind(&pattern, &place, scrutineeTy)
+			self.dropUntaken(&pattern, &place, scrutineeTy)
+			return
+		}
+		val (place, scrutineeTy) = self.testedPlace(scrutinee)
+		val matched = self.newBlock()
+		val unmatched = self.newBlock()
+		self.testPattern(&pattern, &place, scrutineeTy, matched, unmatched)
+		self.switchTo(unmatched)
+		self.blockExpr(&otherwise, .None)
+		// The type checker requires the block to leave.
+		if !self.dead then self.terminate(.Unreachable)
+		self.switchTo(matched)
+		self.dead = false
+		self.bind(&pattern, &place, scrutineeTy)
+		self.dropUntaken(&pattern, &place, scrutineeTy)
+	}
+
+	/// An arm's test of what a `match` tests: its place, or each element of a
+	/// tuple matched in place in turn, going to `matched` where every one
+	/// matches.
+	var fn testTested(pattern: &hir::Pattern, tested: &Tested, matched: BlockId, next: BlockId) = {
+		match tested {
+			.One(place, ty) => self.testPattern(&pattern, &place, ty, matched, next)
+			// Tuples of which any one may match: each is tried on the places, as
+			// one value's alternatives are tried on it.
+			.Many(..) if pattern is .Any(..) => {
+				val .Any(alternatives, binding) = pattern else {
+					panic("asked above")
+				}
+				val which: Option<Local> = match binding {
+					.Some(number) => .Some(self.alternativeMatched(number))
+					.None => .None
+				}
+				for (i, alternative) in alternatives.forwards().enumerate() {
+					val otherwise = if i + 1 == alternatives.len() then next else self.newBlock()
+					val pass = if which.isSome() then self.newBlock() else matched
+					self.testTested(&alternative, &tested, pass, otherwise)
+					if which is .Some(w) {
+						self.switchTo(pass)
+						self.assign(Place::of(w), .Use(Builder::int(i as u128, I32)))
+						self.terminate(.Goto(matched))
+					}
+					if i + 1 < alternatives.len() then self.switchTo(otherwise)
+				}
+			}
+			.Many(places) => {
+				val patterns = pattern.elements(places.len())
+				for (i, (place, ty)) in places.forwards().enumerate() {
+					if i >= patterns.len() then break
+					val pass = if i + 1 == places.len() then matched else self.newBlock()
+					self.testPattern(&patterns[i], &place, ty, pass, next)
+					if pass != matched then self.switchTo(pass)
+				}
+			}
+		}
+	}
+
+	/// What an arm binds of what a `match` tests.
+	var fn bindTested(pattern: &hir::Pattern, tested: &Tested) = match tested {
+		.One(place, ty) => self.bind(&pattern, &place, ty)
+		// From whichever alternative matched.
+		.Many(..) if pattern is .Any(binding: .Some(..), ..) => {
+			val .Any(alternatives, binding: .Some(number)) = pattern else {
+				panic("asked above")
+			}
+			val which = self.alternativeMatched(number)
+			self.eachAlternative(&alternatives, which, EachAlternative::BindTested(tested.clone()))
+		}
+		.Many(..) if pattern is .Any(binding: .None, ..) => {}
+		.Many(places) => {
+			val patterns = pattern.elements(places.len())
+			for (i, (place, ty)) in places.forwards().enumerate() {
+				if i < patterns.len() then self.bind(&patterns[i], &place, ty)
+			}
+		}
+	}
+
+	/// What an arm leaves of a value it matched, dropped.
+	var fn dropUntakenTested(pattern: &hir::Pattern, tested: &Tested) = match tested {
+		.One(place, ty) => self.dropUntaken(&pattern, &place, ty)
+		// What the alternative that matched left.
+		.Many(..) if pattern is .Any(binding: .Some(..), ..) => {
+			val .Any(alternatives, binding: .Some(number)) = pattern else {
+				panic("asked above")
+			}
+			val which = self.alternativeMatched(number)
+			self.eachAlternative(
+				&alternatives,
+				which,
+				EachAlternative::DropUntakenTested(tested.clone()),
+			)
+		}
+		.Many(..) if pattern is .Any(binding: .None, ..) => {}
+		.Many(places) => {
+			val patterns = pattern.elements(places.len())
+			for (i, (place, ty)) in places.forwards().enumerate() {
+				if i < patterns.len() then self.dropUntaken(&patterns[i], &place, ty)
+			}
+		}
+	}
+
+	/// The place of a tested value, and its type. A value that is not a place
+	/// is moved into a temporary, which the statement drops.
+	var fn testedPlace(scrutinee: ExprId): (Place, Ty) = {
+		val scrutineeTy = self.ty(scrutinee)
+		val place = if self.isPlaceKind(scrutinee) {
+			self.place(scrutinee)
+		} else {
+			val temp = Place::of(self.temp(scrutineeTy))
+			self.storeExpr(scrutinee, temp.clone())
+			self.ownTemp(temp.clone(), scrutineeTy)
+			move temp
+		}
+		return (move place, scrutineeTy)
+	}
+
+	/// The cases of a switch on a number, and where the rest go, where every
+	/// arm of a `match` is numbers that fit a case, with no guard, or takes
+	/// every value. Nothing where an arm is anything else.
+	fn numbersSwitch(
+		ty: Ty,
+		arms: &[hir::Arm],
+		blocks: &[BlockId],
+		unmatched: BlockId,
+	): Option<(Vec<(u32, BlockId)>, BlockId)> = {
+		// A case is the value's bits, read without a sign; a negative number of
+		// a signed type is not one.
+		val limit: u128 = match self.kind(ty) {
+			.Int(int) if int.signed() => 1 << (int.bits().min(33) - 1) as u128
+			.Int(..) | .Char => 1 << 32
+			_ => return .None
+		}
+		var cases: Vec<(u32, BlockId)> = Vec()
+		for (i, arm) in arms.forwards().enumerate() {
+			val block = blocks[i]
+			if arm.guard.isSome() then return .None
+			match arm.pattern {
+				.Int(value) => { if !addCase(value, block, limit, &var cases) then return .None }
+				.Any(alternatives, ..) => {
+					for alternative in alternatives {
+						val .Int(value) = alternative else {
+							return .None
+						}
+						if !addCase(value, block, limit, &var cases) then return .None
+					}
+				}
+				.Wildcard | .Binding(..) => return .Some((move cases, block))
+				_ => return .None
+			}
+		}
+		return .Some((move cases, unmatched))
+	}
+}
+
+/// A case of a switch on a number, where its bits are below `limit`; an
+/// earlier arm that has it takes it. Whether it fit.
+fn addCase(bits: u128, block: BlockId, limit: u128, cases: &var Vec<(u32, BlockId)>): bool = {
+	if bits >= limit then return false
+	val case = bits as u32
+	for (earlier, _) in cases {
+		if earlier == case then return true
+	}
+	cases.push((case, block))
+	return true
+}
+
+/// The locals the `is` tests of a condition bind, through its `&&`s.
+fn collectTested(
+	body: &hir::Body,
+	e: ExprId,
+	locals: &var Vec<LocalId>,
+) = match body.exprs[e].kind {
+	.Binary(op: .And, lhs, rhs, ..) => {
+		collectTested(&body, lhs, &var locals)
+		collectTested(&body, rhs, &var locals)
+	}
+	.Is(pattern, ..) => pattern.locals(&var locals)
+	_ => {}
+}
+
+/// What is done for the alternative of a `|` that matched, on its own path.
+enum EachAlternative {
+	BindTested(tested: Tested)
+	DropUntakenTested(tested: Tested)
+	Bind(place: Place, ty: Ty)
+	DropUntakenParts(place: Place, ty: Ty)
+}
+
+extend Builder {
+	/// `value is pattern`: a `bool`, and on the path where the value is the
+	/// pattern's variant, its bindings.
+	var fn isTest(scrutinee: ExprId, pattern: &hir::Pattern): Operand = {
+		val (place, scrutineeTy) = self.testedPlace(scrutinee)
+		val result = self.temp(BOOL)
+		val matched = self.newBlock()
+		val unmatched = self.newBlock()
+		val join = self.newBlock()
+		// What a nested pattern tests is tested too.
+		self.testPattern(&pattern, &place, scrutineeTy, matched, unmatched)
+		self.switchTo(matched)
+		self.bind(&pattern, &place, scrutineeTy)
+		self.dropUntaken(&pattern, &place, scrutineeTy)
+		self.assign(Place::of(result), .Use(.Const(.Bool(true))))
+		self.terminate(.Goto(join))
+		self.switchTo(unmatched)
+		self.assign(Place::of(result), .Use(.Const(.Bool(false))))
+		self.terminate(.Goto(join))
+		self.switchTo(join)
+		return .Copy(Place::of(result))
+	}
+
+	/// The fields a pattern's binders test, with their patterns: those whose
+	/// binder is a pattern that can fail.
+	fn testedFields(binders: &[hir::Binder]): Vec<(u32, hir::Pattern)> = {
+		var fields: Vec<(u32, hir::Pattern)> = Vec()
+		for (i, binder) in binders.forwards().enumerate() {
+			if binder is .Nested(pattern) && tests(&pattern) then
+				fields.push((i as u32, pattern.clone()))
+		}
+		return move fields
+	}
+
+	/// Emits the test a pattern makes, going to `matched` where the value
+	/// matches and to `next` where it does not.
+	var fn testPattern(
+		pattern: &hir::Pattern,
+		place: &Place,
+		scrutineeTy: Ty,
+		matched: BlockId,
+		next: BlockId,
+	) = {
+		match pattern {
+			// These match every value of their type: the arm is taken.
+			.Wildcard | .Binding(..) => self.terminate(.Goto(matched))
+			// A struct tests nothing itself; what its fields hold may.
+			.Fields(binders) => {
+				val fields = self.testedFields(&binders)
+				self.testFields(&fields, &place, scrutineeTy, .None, matched, next)
+			}
+			.Variant(variant, binders) => {
+				val tag = self.value(I32, .Variant(place.clone()))
+				// The fields a nested pattern tests are tested once the variant
+				// is known, each failure going on to the next arm.
+				val nested = self.newBlock()
+				self.terminate(.Switch(
+					value: move tag,
+					cases: Vec::of(own [(variant, nested)]),
+					otherwise: next,
+				))
+				self.switchTo(nested)
+				val fields = self.testedFields(&binders)
+				self.testFields(&fields, &place, scrutineeTy, .Some(variant), matched, next)
+			}
+			.Int(value) => {
+				val constant = Operand::Const(.Int(bits: value, ty: scrutineeTy))
+				val same = self.value(BOOL, .Binary(
+					op: .Eq,
+					lhs: .Copy(place.clone()),
+					rhs: move constant,
+				))
+				self.terminate(.Branch(cond: move same, thenBlock: matched, otherwise: next))
+			}
+			// `lo..=hi`: at least `lo`, then at most `hi`, an end left off not
+			// tested.
+			.Range(lo, hi) => {
+				var tested: Vec<(BinaryOp, u128)> = Vec()
+				if lo is .Some(bits) then tested.push((.Ge, bits))
+				if hi is .Some(bits) then tested.push((.Le, bits))
+				for (i, (op, bits)) in tested.forwards().enumerate() {
+					val end = Operand::Const(.Int(bits: bits, ty: scrutineeTy))
+					val within = self.value(BOOL, .Binary(
+						op: op,
+						lhs: .Copy(place.clone()),
+						rhs: move end,
+					))
+					val last = i + 1 == tested.len()
+					val pass = if last then matched else self.newBlock()
+					self.terminate(.Branch(cond: move within, thenBlock: pass, otherwise: next))
+					if !last then self.switchTo(pass)
+				}
+				if tested.isEmpty() then self.terminate(.Goto(matched))
+			}
+			.Bool(wanted) => {
+				val same = self.value(BOOL, .Binary(
+					op: .Eq,
+					lhs: .Copy(place.clone()),
+					rhs: .Const(.Bool(wanted)),
+				))
+				self.terminate(.Branch(cond: move same, thenBlock: matched, otherwise: next))
+			}
+			// Text is compared by its bytes, wherever they are: a `String` by
+			// the text it lends, `toStr()`.
+			.Str(text) => {
+				val held = if self.program.isString(scrutineeTy) {
+					val .Some(toStr) = self.program.preludeItems.function(.StringToStr) else {
+						panic("the prelude declares `String.toStr`")
+					}
+					val receiverTy = self.program.fns[toStr].params[0].ty
+					val receiver = self.value(receiverTy, .AddressOf(place.clone()))
+					val lent = Place::of(self.temp(STR))
+					self.push(.Call(
+						callee: .Fn(toStr),
+						args: Vec::of(own [move receiver]),
+						dest: .Some(lent.clone()),
+					))
+					move lent
+				} else {
+					place.clone()
+				}
+				val literal = Place::of(self.temp(STR))
+				val len = self.interner.resolve(text).len() as u128
+				self.assign(literal.project(.Field(0)), .Use(.Const(.CStr(text))))
+				self.assign(literal.project(.Field(1)), .Use(Builder::int(len, I64)))
+				val order = Place::of(self.temp(I64))
+				self.push(.Call(
+					callee: .StrCmp,
+					args: Vec::of(own [
+						Operand::Copy(held.project(.Field(0))),
+						Operand::Copy(held.project(.Field(1))),
+						Operand::Copy(literal.project(.Field(0))),
+						Operand::Copy(literal.project(.Field(1))),
+					]),
+					dest: .Some(order.clone()),
+				))
+				val same = self.value(BOOL, .Binary(
+					op: .Eq,
+					lhs: .Copy(move order),
+					rhs: Builder::int(0, I64),
+				))
+				self.terminate(.Branch(cond: move same, thenBlock: matched, otherwise: next))
+			}
+			// Any one of several: each is tried, and the last one that fails
+			// goes on to the next arm. Where they bind, which one matched is
+			// kept, for the arm to bind from once all of its pattern has
+			// matched.
+			.Any(alternatives, binding) => {
+				val which: Option<Local> = match binding {
+					.Some(number) => .Some(self.alternativeMatched(number))
+					.None => .None
+				}
+				for (i, alternative) in alternatives.forwards().enumerate() {
+					val otherwise = if i + 1 == alternatives.len() then next else self.newBlock()
+					val pass = if which.isSome() then self.newBlock() else matched
+					self.testPattern(&alternative, &place, scrutineeTy, pass, otherwise)
+					if which is .Some(w) {
+						self.switchTo(pass)
+						self.assign(Place::of(w), .Use(Builder::int(i as u128, I32)))
+						self.terminate(.Goto(matched))
+					}
+					if i + 1 < alternatives.len() then self.switchTo(otherwise)
+				}
+			}
+			// A slice's length, where it may be another, then what the elements
+			// hold.
+			.Slice(prefix, rest, suffix) => {
+				val (elements, len) = self.patternElements(&place, scrutineeTy)
+				if self.kind(scrutineeTy) is .Slice(..) {
+					val named = (prefix.len() + suffix.len()) as u128
+					val op: BinaryOp = if rest.isSome() then .Ge else .Eq
+					val fits = self.value(BOOL, .Binary(
+						op: op,
+						lhs: len.clone(),
+						rhs: Builder::int(named, I64),
+					))
+					val pass = self.newBlock()
+					self.terminate(.Branch(cond: move fits, thenBlock: pass, otherwise: next))
+					self.switchTo(pass)
+				}
+				val elem = self.program.elementTy(scrutineeTy)
+				val parts = self.sliceParts(&prefix, &suffix, &elements, scrutineeTy, &len)
+				var tested: Vec<(Place, hir::Pattern)> = Vec()
+				for (k, part) in parts.forwards().enumerate() {
+					val binder = binderAt(&prefix, &suffix, k)
+					if binder is .Nested(pattern) && tests(&pattern) then
+						tested.push((part.clone(), pattern.clone()))
+				}
+				for (i, (part, pattern)) in tested.forwards().enumerate() {
+					// The last one that matches takes the arm.
+					val ok = if i + 1 == tested.len() then matched else self.newBlock()
+					self.testPattern(&pattern, &part, elem, ok, next)
+					self.switchTo(ok)
+				}
+				if tested.isEmpty() then self.terminate(.Goto(matched))
+			}
+			// What the reference refers to is tested.
+			.Deref(inner) => {
+				val (referent, ty) = self.referent(&place, scrutineeTy)
+				self.testPattern(&inner, &referent, ty, matched, next)
+			}
+			// Reported already; nothing reaches the arm.
+			.Error => self.terminate(.Goto(next))
+		}
+	}
+
+	/// The place a reference at `place` refers to, and its type: through the
+	/// pointer, or the reference itself where it is a slice's, whose pointer
+	/// and length are the slice's place.
+	fn referent(place: &Place, ty: Ty): (Place, Ty) = {
+		val .Ref(inner: pointee, ..) = self.kind(ty) else {
+			panic("a pattern tests through a value that is not a reference")
+		}
+		if isSlicePointer(self.program, ty) then return (place.clone(), pointee)
+		return (place.project(.Deref), pointee)
+	}
+
+	/// The place of an array's or a slice's elements, and how many there are,
+	/// for a slice pattern. A slice's place is its pointer and length.
+	var fn patternElements(place: &Place, ty: Ty): (Place, Operand) = match self.kind(ty) {
+		.Array(len, ..) => (place.clone(), Builder::int(len as u128, I64))
+		_ => {
+			val len = self.value(I64, .Use(.Copy(place.project(.Field(1)))))
+			(place.clone(), move len)
+		}
+	}
+
+	/// The elements a slice pattern names, in the order of its binders:
+	/// `prefix` from the start, `suffix` from the end. The length was tested,
+	/// so none is checked.
+	var fn sliceParts(
+		prefix: &[hir::Binder],
+		suffix: &[hir::Binder],
+		elements: &Place,
+		ty: Ty,
+		len: &Operand,
+	): Vec<Place> = {
+		var parts: Vec<Place> = Vec()
+		for i in 0..prefix.len() {
+			parts.push(self.sliceElement(&elements, ty, &len, i as u64, false))
+		}
+		for j in 0..suffix.len() {
+			val back = (suffix.len() - j) as u64
+			parts.push(self.sliceElement(&elements, ty, &len, back, true))
+		}
+		return move parts
+	}
+
+	/// The element `index` from the start, or `index` back from the end, of an
+	/// array's or a slice's elements.
+	var fn sliceElement(
+		elements: &Place,
+		ty: Ty,
+		len: &Operand,
+		index: u64,
+		fromEnd: bool,
+	): Place = {
+		if self.kind(ty) is .Array(len: n, ..) {
+			val at = if fromEnd then n - index else index
+			return elements.project(.ConstIndex(at))
+		}
+		val at =
+			if fromEnd then
+				self.value(I64, .Binary(
+					op: .Sub,
+					lhs: len.clone(),
+					rhs: Builder::int(index as u128, I64),
+				))
+			else Builder::int(index as u128, I64)
+		val local = self.localOf(move at, I64)
+		return elements.project(.Index(local))
+	}
+
+	/// `..rest`: the elements between those a slice pattern names, as a
+	/// slice's pointer and length.
+	var fn bindRest(local: LocalId, elements: &Place, len: Operand, prefix: u64, suffix: u64) = {
+		val made = self.vars.contains(&local)
+		val variable = if made then self.varOf(local) else self.sourceLocal(local, .Var)
+		val first = self.localOf(Builder::int(prefix as u128, I64), I64)
+		val start = self.value(PTR_U8, .AddressOf(elements.project(.Index(first))))
+		val count = self.value(I64, .Binary(
+			op: .Sub,
+			lhs: move len,
+			rhs: Builder::int((prefix + suffix) as u128, I64),
+		))
+		val slice = Place::of(variable)
+		self.assign(slice.project(.Field(0)), .Use(move start))
+		self.assign(slice.project(.Field(1)), .Use(move count))
+		if made then return
+		self.vars.put(local, variable)
+		if !self.scopes.isEmpty() {
+			val last = self.scopes.len() - 1
+			self.scopes[last].push(.Drop(local))
+		}
+	}
+
+	/// Tests what the fields of a value hold, in turn: the value matches where
+	/// every one of them does, and the first that does not goes on to the next
+	/// arm. `variant` says which variant's fields they are, where the value is
+	/// an enum's.
+	var fn testFields(
+		fields: &[(u32, hir::Pattern)],
+		place: &Place,
+		scrutineeTy: Ty,
+		variant: Option<u32>,
+		matched: BlockId,
+		next: BlockId,
+	) = {
+		for (i, (field, pattern)) in fields.forwards().enumerate() {
+			val (inner, ty) = match variant {
+				.Some(v) => (
+					place.project(.VariantField(variant: v, field: field)),
+					self.program.variantFieldTy(scrutineeTy, v, field),
+				)
+				.None => (place.project(.Field(field)), self.program.fieldTy(scrutineeTy, field))
+			}
+			// The last one that matches takes the arm.
+			val ok = if i + 1 == fields.len() then matched else self.newBlock()
+			self.testPattern(&pattern, &inner, ty, ok, next)
+			self.switchTo(ok)
+		}
+		if fields.isEmpty() then self.terminate(.Goto(matched))
+	}
+
+	/// Gives a pattern's bindings the fields of the value at `place`.
+	var fn bind(pattern: &hir::Pattern, place: &Place, scrutineeTy: Ty) = match pattern {
+		.Binding(local) => self.bindLocal(local, place.clone(), scrutineeTy)
+		.Variant(variant, binders) => {
+			for (i, binder) in binders.forwards().enumerate() {
+				if binder is .Ignored then continue
+				val field = place.project(.VariantField(variant: variant, field: i as u32))
+				val fieldTy = self.program.variantFieldTy(scrutineeTy, variant, i as u32)
+				self.binder(&binder, move field, fieldTy)
+			}
+		}
+		// A struct's fields, bound where they lie.
+		.Fields(binders) => {
+			for (i, binder) in binders.forwards().enumerate() {
+				if binder is .Ignored then continue
+				val field = place.project(.Field(i as u32))
+				val fieldTy = self.program.fieldTy(scrutineeTy, i as u32)
+				self.binder(&binder, move field, fieldTy)
+			}
+		}
+		// The elements it names, and the slice of those between.
+		.Slice(prefix, rest, suffix) => {
+			val (elements, len) = self.patternElements(&place, scrutineeTy)
+			val elem = self.program.elementTy(scrutineeTy)
+			val parts = self.sliceParts(&prefix, &suffix, &elements, scrutineeTy, &len)
+			for (k, part) in parts.forwards().enumerate() {
+				val binder = binderAt(&prefix, &suffix, k)
+				self.binder(&binder, part.clone(), elem)
+			}
+			if rest is .Some(.Bind(local)) then
+				self.bindRest(local, &elements, move len, prefix.len() as u64, suffix.len() as u64)
+		}
+		// A value the scrutinee must equal binds nothing; the test is made
+		// where the arm is chosen.
+		.Wildcard | .Error | .Int(..) | .Range(..) | .Bool(..) | .Str(..) => {}
+		// From whichever alternative matched.
+		.Any(alternatives, binding: .Some(number)) => {
+			val which = self.alternativeMatched(number)
+			self.eachAlternative(&alternatives, which, EachAlternative::Bind(
+				place: place.clone(),
+				ty: scrutineeTy,
+			))
+		}
+		.Any(binding: .None, ..) => {}
+		// Aliases of what the reference refers to.
+		.Deref(inner) => {
+			val (referent, ty) = self.referent(&place, scrutineeTy)
+			self.bind(&inner, &referent, ty)
+		}
+	}
+
+	/// The local that says which alternative of the `|` numbered `number`
+	/// matched.
+	var fn alternativeMatched(number: u32): Local = {
+		if self.alternativesMatched.get(&number) is .Some(which) then return which
+		val which = self.temp(I32)
+		self.alternativesMatched.put(number, which)
+		return which
+	}
+
+	/// Does `each` for the alternative `which` says matched, on its own path,
+	/// the paths joining after.
+	var fn eachAlternative(alternatives: &[hir::Pattern], which: Local, each: EachAlternative) = {
+		val join = self.newBlock()
+		var blocks: Vec<BlockId> = Vec()
+		for _ in alternatives {
+			blocks.push(self.newBlock())
+		}
+		if blocks.isEmpty() {
+			self.terminate(.Goto(join))
+			self.switchTo(join)
+			return
+		}
+		val last = blocks[blocks.len() - 1]
+		var cases: Vec<(u32, BlockId)> = Vec()
+		for i in 0..(blocks.len() - 1) {
+			cases.push((i as u32, blocks[i]))
+		}
+		self.terminate(.Switch(value: .Copy(Place::of(which)), cases: move cases, otherwise: last))
+		for (i, alternative) in alternatives.forwards().enumerate() {
+			self.switchTo(blocks[i])
+			match each {
+				.BindTested(tested) => self.bindTested(&alternative, &tested)
+				.DropUntakenTested(tested) => self.dropUntakenTested(&alternative, &tested)
+				.Bind(place, ty) => self.bind(&alternative, &place, ty)
+				.DropUntakenParts(place, ty) => self.dropUntakenParts(&alternative, &place, ty)
+			}
+			self.terminate(.Goto(join))
+		}
+		self.switchTo(join)
+	}
+
+	/// What a binder does with the field it took: bind it, or take it apart in
+	/// turn.
+	var fn binder(binder: &hir::Binder, field: Place, fieldTy: Ty) = match binder {
+		.Ignored => {}
+		.Bind(local) => self.bindLocal(local, move field, fieldTy)
+		.Nested(pattern) => self.bind(&pattern, &field, fieldTy)
+	}
+
+	/// Where a pattern took part of a temporary it moved out of — a field bound
+	/// by value — the temporary is no longer dropped whole, so the fields
+	/// nothing took are dropped here, where the pattern binds:
+	/// `.Edits(changes, ..)` drops the listing `..` leaves. A temporary the
+	/// pattern took nothing from is still dropped whole, where its statement
+	/// ends.
+	var fn dropUntaken(pattern: &hir::Pattern, place: &Place, ty: Ty) = {
+		if !self.tempFlags.contains(&place.local) || !self.takes(&pattern, ty) then return
+		self.dropUntakenParts(&pattern, &place, ty)
+	}
+
+	var fn dropUntakenParts(pattern: &hir::Pattern, place: &Place, ty: Ty) = {
+		// What the alternative that matched left.
+		if pattern is .Any(alternatives, binding: .Some(number)) {
+			val which = self.alternativeMatched(number)
+			self.eachAlternative(&alternatives, which, EachAlternative::DropUntakenParts(
+				place: place.clone(),
+				ty: ty,
+			))
+			return
+		}
+		var parts: Vec<(Place, Ty, hir::Binder)> = Vec()
+		match pattern {
+			.Variant(variant, binders) => {
+				for (i, binder) in binders.forwards().enumerate() {
+					val field = place.project(.VariantField(variant: variant, field: i as u32))
+					parts.push(
+						(
+							move field,
+							self.program.variantFieldTy(ty, variant, i as u32),
+							binder.clone(),
+						),
+					)
+				}
+			}
+			.Fields(binders) => {
+				for (i, binder) in binders.forwards().enumerate() {
+					parts.push(
+						(
+							place.project(.Field(i as u32)),
+							self.program.fieldTy(ty, i as u32),
+							binder.clone(),
+						),
+					)
+				}
+			}
+			// An array taken apart: what it names, and what `..` passes over. A
+			// slice is only ever lent.
+			.Slice(prefix, rest, suffix) => {
+				val .Array(elem, len: n) = self.kind(ty) else {
+					return
+				}
+				if rest.isSome() {
+					for i in (prefix.len() as u64)..(n - suffix.len() as u64) {
+						val reached = place.project(.ConstIndex(i))
+						self.dropPlace(&reached, elem)
+					}
+				}
+				val len = Builder::int(n as u128, I64)
+				val elements = self.sliceParts(&prefix, &suffix, &place, ty, &len)
+				for (k, part) in elements.forwards().enumerate() {
+					val binder = binderAt(&prefix, &suffix, k)
+					parts.push((part.clone(), elem, binder.clone()))
+				}
+			}
+			_ => return
+		}
+		for (field, fieldTy, binder) in parts {
+			match binder {
+				.Ignored => self.dropPlace(&field, fieldTy)
+				.Nested(inner) => self.dropUntakenParts(&inner, &field, fieldTy)
+				.Bind(..) => {}
+			}
+		}
+	}
+
+	/// Whether a pattern takes anything that owns memory by value.
+	var fn takes(pattern: &hir::Pattern, ty: Ty): bool = {
+		var fields: Vec<(Ty, hir::Binder)> = Vec()
+		match pattern {
+			.Variant(variant, binders) => {
+				for (i, binder) in binders.forwards().enumerate() {
+					fields.push(
+						(self.program.variantFieldTy(ty, variant, i as u32), binder.clone()),
+					)
+				}
+			}
+			.Fields(binders) => {
+				for (i, binder) in binders.forwards().enumerate() {
+					fields.push((self.program.fieldTy(ty, i as u32), binder.clone()))
+				}
+			}
+			.Slice(prefix, suffix, ..) => {
+				for binder in prefix {
+					fields.push((self.program.elementTy(ty), binder.clone()))
+				}
+				for binder in suffix {
+					fields.push((self.program.elementTy(ty), binder.clone()))
+				}
+			}
+			.Any(alternatives, binding: .Some(..)) => {
+				for alternative in alternatives {
+					if self.takes(&alternative, ty) then return true
+				}
+				return false
+			}
+			_ => return false
+		}
+		for (fieldTy, binder) in fields {
+			val took = match binder {
+				.Ignored => false
+				.Bind(local) => !self.hir.aliasBindings.contains(&local) && self.needsDrop(fieldTy)
+				.Nested(inner) => self.takes(&inner, fieldTy)
+			}
+			if took then return true
+		}
+		return false
+	}
+
+	/// An alias binding holds the address of its field. Any other binding
+	/// takes the field, a reference included, leaving zeros behind so that it
+	/// is not dropped twice.
+	var fn bindLocal(local: LocalId, field: Place, ty: Ty) = {
+		// The binding of an `is` test already has its variable, and its
+		// cleanup.
+		val made = self.vars.contains(&local)
+		val variable = if made then self.varOf(local) else self.sourceLocal(local, .Var)
+		if self.hir.aliasBindings.contains(&local) {
+			self.assign(Place::of(variable), .AddressOf(move field))
+		} else {
+			self.assign(Place::of(variable), .Use(.Copy(field.clone())))
+			if self.needsDrop(ty) {
+				// What the binding took is no longer the value's to drop. Zeros
+				// say so for an `own`; a type that cleans up after itself needs
+				// the temporary's flag.
+				self.takenFromTemp(&field)
+				self.vacate(move field, ty)
+			}
+			// It holds a value now: a binding moved away on one path only is
+			// dropped on the others, which its flag says. Without this the flag
+			// was only ever false.
+			self.setFlag(local, true)
+		}
+		if made then return
+		self.vars.put(local, variable)
+		if !self.scopes.isEmpty() {
+			val last = self.scopes.len() - 1
+			self.scopes[last].push(.Drop(local))
+		}
+	}
+
+	/// `&&` and `||` evaluate the right operand only when needed.
+	var fn shortCircuit(op: BinaryOp, lhs: ExprId, rhs: ExprId): Operand = {
+		val left = self.scalar(lhs)
+		val result = self.temp(BOOL)
+		self.assign(Place::of(result), .Use(left.clone()))
+		val rhsBlock = self.newBlock()
+		val merge = self.newBlock()
+		val (whenTrue, whenFalse) = if op == .And then (rhsBlock, merge) else (merge, rhsBlock)
+		self.terminate(.Branch(cond: move left, thenBlock: whenTrue, otherwise: whenFalse))
+		self.switchTo(rhsBlock)
+		// Temporaries made on the right only exist on this path, so they are
+		// dropped before the paths join.
+		val mark = self.temps.len()
+		val right = self.scalar(rhs)
+		self.dropTemps(mark)
+		self.assign(Place::of(result), .Use(move right))
+		self.terminate(.Goto(merge))
+		self.switchTo(merge)
+		return .Copy(Place::of(result))
+	}
+}
+
+/// The binder of the `k`th element a slice pattern names: its prefix's, then
+/// its suffix's.
+fn binderAt(prefix: &[hir::Binder], suffix: &[hir::Binder], k: i64): hir::Binder =
+	if k < prefix.len() then prefix[k].clone() else suffix[k - prefix.len()].clone()
+
+/// Whether a pattern can fail: what always matches needs no test.
+fn tests(pattern: &hir::Pattern): bool = match pattern {
+	.Wildcard | .Binding(..) => false
+	.Fields(binders) => {
+		for binder in binders {
+			if binder is .Nested(nested) && tests(&nested) then return true
+		}
+		false
+	}
+	.Deref(inner) => tests(&inner)
+	_ => true
+}
+
+/// Whether anything inside a pattern tests a value: the head of the pattern
+/// aside, a nested pattern may fail.
+fn testsWithin(pattern: &hir::Pattern): bool = match pattern {
+	.Variant(binders, ..) | .Fields(binders) => anyTests(&binders)
+	.Slice(prefix, suffix, ..) => anyTests(&prefix) || anyTests(&suffix)
+	_ => false
+}
+
+/// Whether any of `binders` is a pattern that can fail.
+fn anyTests(binders: &[hir::Binder]): bool = {
+	for binder in binders {
+		if binder is .Nested(nested) && tests(&nested) then return true
+	}
+	return false
+}

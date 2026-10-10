@@ -1,0 +1,702 @@
+// Types, as a program writes them: what a name in a signature or a field
+// means, what an array's length is, and the two shapes a type may not have —
+// one that holds itself, and an `@inline` that calls itself.
+
+import std::collections::{Map, Set}
+import syntax as ast
+import syntax::{
+	CANNOT_INLINE,
+	DECIDED_TYPE,
+	Diagnostic,
+	Edit,
+	IMPL_TARGET,
+	OPAQUE_VALUE,
+	RECURSIVE_TYPE,
+	REF_OUTSIDE_PARAMETER,
+	SELF_OUTSIDE_METHOD,
+	Span,
+	Symbol,
+	TYPE_ARGUMENT_COUNT,
+	UNKNOWN_INTERFACE,
+	UNKNOWN_NAME,
+	UNKNOWN_TYPE
+}
+
+extend Lowerer {
+	/// The type `id` writes. Where it names one, the name is recorded with
+	/// what it named, for an editor.
+	var fn resolveTy(id: ast::TypeId): Ty = self.resolveAs(id, false)
+
+	/// The type `ptr<…>` points at, which may be an opaque C type: that type
+	/// itself, and nothing inside it, since a value of an opaque type cannot
+	/// be held anywhere.
+	var fn resolvePointee(id: ast::TypeId): Ty = self.resolveAs(id, true)
+
+	var fn resolveAs(id: ast::TypeId, pointee: bool): Ty = {
+		val resolved = self.resolveWritten(id, pointee)
+		val ty = &self.ast.types[id]
+		val name: Option<Span> = match ty.kind {
+			.Named(name, ..) => {
+				val len = self.text(name).len() as u32
+				.Some(Span::new(ty.span.lo, ty.span.lo + len))
+			}
+			.Path(segments, ..) =>
+				if segments.isEmpty() then .None else .Some(segments[segments.len() - 1].span)
+			_ => .None
+		}
+		if name is .Some(span) && resolved != ERROR && !self.derived then
+			self.program.names.push((span, .Type(resolved)))
+		return resolved
+	}
+
+	/// `base::name`: the type an implementation decides under `name`, for
+	/// `base` a type parameter in scope — through its constraints, which pin
+	/// it or leave it to be decided — or a type this file names, through its
+	/// implementation. Nothing where `base` is neither, and the path is a
+	/// module's.
+	var fn decidedType(base: ast::Name, name: ast::Name): Option<Ty> = {
+		var at: Option<i64> = .None
+		for (i, p) in self.typeParams.forwards().enumerate() {
+			if at.isNone() && p.written == base.sym then at = .Some(i)
+		}
+		var candidates: Vec<(InterfaceId, Ty)> = Vec()
+		var baseTy = ERROR
+		if at is .Some(at) {
+			baseTy = self.typeParam(base.sym)?
+			for constraint in self.typeParams[at].interfaces.clone() {
+				val generics = &self.program.interfaces[constraint.interfaceId].generics
+				for (index, p) in generics.forwards().enumerate() {
+					if p.decided && p.name == name.sym {
+						val args = self.program.types.list(constraint.args)
+						candidates.push(
+							(
+								constraint.interfaceId,
+								if index < args.len() then args[index] else ERROR,
+							),
+						)
+						break
+					}
+				}
+			}
+		} else {
+			baseTy = match self.builtin(base.sym) {
+				.Some(ty) => ty
+				.None => {
+					var def: Option<TypeDef> = match self.types().get(&base.sym) {
+						.Some((def, _)) => .Some(def)
+						.None => .None
+					}
+					if def.isNone() then def = self.importedType(base)
+					if def.isNone() then def = self.preludeType(base.sym)
+					val .Some(def) = def else {
+						return .None
+					}
+					if !self.typeGenerics(def).isEmpty() then return .None
+					match def {
+						.Struct(id) => self.intern(.Struct(id: id, args: TyList::empty()))
+						.Enum(id) => self.intern(.Enum(id: id, args: TyList::empty()))
+						.Builtin(..) => return .None
+					}
+				}
+			}
+			for interfaceId in self.program.interfaces.ids() {
+				val generics = &self.program.interfaces[interfaceId].generics
+				var index: Option<i64> = .None
+				for (i, p) in generics.forwards().enumerate() {
+					if index.isNone() && p.decided && p.name == name.sym then index = .Some(i)
+				}
+				if index is .Some(index) {
+					val decided = self.program.types.assoc(baseTy, interfaceId, index as u32)
+					if !(self.kind(decided) is .Assoc(..)) then
+						candidates.push((interfaceId, decided))
+				}
+			}
+		}
+		val text = "\(self.text(base.sym))::\(self.text(name.sym))"
+		if candidates.len() == 1 then return .Some(candidates[0].1)
+		if candidates.isEmpty() {
+			self.report(
+				Diagnostic::error(
+					UNKNOWN_TYPE,
+					"`\(text)` is not a type",
+					base.span.to(name.span),
+					"nothing decides `\(self.text(name.sym))` for \(self.tyName(baseTy))",
+				).withNote(
+					String::of(
+						"`I::Item` is the type an implementation decides, where an interface declares it `type Item` and `I` implements it",
+					),
+				),
+			)
+			return .Some(ERROR)
+		}
+		var names: Vec<String> = Vec()
+		for (interfaceId, _) in candidates {
+			names.push("`\(self.text(self.program.interfaces[interfaceId].name))`")
+		}
+		self.report(
+			Diagnostic::error(
+				DECIDED_TYPE,
+				"`\(text)` is in question",
+				base.span.to(name.span),
+				"\(names.join(" and ")) each decide one",
+			).withHelp(
+				String::of(
+					"name it a parameter of its own where the interface is written: `I: Iterator<T>`, and write `T`",
+				),
+			),
+		)
+		return .Some(ERROR)
+	}
+
+	var fn resolveWritten(id: ast::TypeId, pointee: bool): Ty = {
+		val file = self.ast
+		val ty = &file.types[id]
+		return match ty.kind {
+			// A type from another module. `I::Item`: what an implementation
+			// decides, for a type parameter or a type.
+			.Path(segments, args) => {
+				if segments.len() == 2 &&
+					args.isEmpty() &&
+					self.decidedType(segments[0], segments[1]) is .Some(decided) {
+					return decided
+				}
+				match self.resolvePath(&segments, false, MODULE_NOTE) {
+					.Item(module, name) => self.namedType(module, name, &args, ty.span, pointee)
+					_ => ERROR
+				}
+			}
+			// `dyn Interface`: a value of some type that implements it, known
+			// only behind a reference.
+			.Dyn(module, name, args: dynArgs) => {
+				val interfaceId = match self.interfaceAt(&module, name) {
+					.Found(id) => id
+					.Reported => return ERROR
+					.NotFound => {
+						val text = String::of(self.text(name.sym))
+						self.report(
+							Diagnostic::error(
+								UNKNOWN_INTERFACE,
+								"cannot find interface `\(text)`",
+								name.span,
+								String::of("unknown interface"),
+							).withNote(String::of("`dyn` takes an interface: `&dyn Shape`")),
+						)
+						return ERROR
+					}
+				}
+				if self.notDispatchable(interfaceId, name.span) is .Some(diagnostic) {
+					self.report(move diagnostic)
+					return ERROR
+				}
+				// `&dyn Items<Card>`: the types the interface takes, which say
+				// which implementation the table holds.
+				val generics = self.program.interfaces[interfaceId].generics.clone()
+				if dynArgs.len() != generics.len() {
+					val interfaceName = self.program.interfaces[interfaceId].name
+					for arg in dynArgs {
+						self.resolveTy(arg)
+					}
+					self.typeArgCount(interfaceName, &generics, dynArgs.len(), ty.span)
+					return ERROR
+				}
+				var args: Vec<Ty> = Vec()
+				for i in 0..dynArgs.len() {
+					val arg = dynArgs[i]
+					val argTy = self.typeArg(arg)
+					self.checkCopy(argTy, &generics[i], self.ast.types[arg].span)
+					self.checkConstraints(argTy, &generics[i], self.ast.types[arg].span)
+					args.push(argTy)
+				}
+				val list = self.program.types.internList(&args)
+				self.intern(.Dyn(interfaceId: interfaceId, args: list))
+			}
+			.Named(name: sym, args) => {
+				// `Self` is the type the method belongs to.
+				var selfTy: Option<Ty> = .None
+				if self.text(sym) == "Self" then
+					selfTy = match self.selfTy {
+						.Some(ty) => .Some(ty)
+						.None => {
+							self.report(
+								Diagnostic::error(
+									SELF_OUTSIDE_METHOD,
+									String::of("`Self` is only available in a method"),
+									ty.span,
+									String::of("no type here"),
+								).withNote(String::of("`Self` is the type a method belongs to")),
+							)
+							Option::Some(ERROR)
+						}
+					}
+				// `ptr<T>`: a C pointer, which takes one type argument.
+				if self.text(sym) == "ptr" then return self.pointerType(&args, ty.span)
+				// `Slots<T>`: uninitialized storage, the standard library's
+				// alone.
+				if self.text(sym) == "Slots" then return self.slotsType(&args, ty.span)
+				// A type parameter, or a built-in type, takes no type arguments.
+				var simple = selfTy
+				if simple.isNone() then simple = self.typeParam(sym)
+				if simple.isNone() then simple = self.builtin(sym)
+				if simple is .Some(simple) {
+					if !args.isEmpty() {
+						for arg in args {
+							self.resolveTy(arg)
+						}
+						val none: Vec<GenericParamDef> = Vec()
+						self.typeArgCount(sym, &none, args.len(), ty.span)
+						return ERROR
+					}
+					return simple
+				}
+				if self.opaques().get(&sym) is .Some(opaqueId) {
+					if !pointee {
+						self.opaqueAsValue(sym, ty.span)
+						return ERROR
+					}
+					if !args.isEmpty() {
+						for arg in args {
+							self.resolveTy(arg)
+						}
+						val none: Vec<GenericParamDef> = Vec()
+						self.typeArgCount(sym, &none, args.len(), ty.span)
+						return ERROR
+					}
+					return self.intern(.Opaque(opaqueId))
+				}
+				// `type Id = i64`: another name for a type, which stands for
+				// what it names.
+				if self.aliases().contains(&sym) then
+					return match self.aliasType(sym, &args, ty.span) {
+						.Some(aliased) => aliased
+						.None => panic("just looked it up")
+					}
+				match self.types().get(&sym) {
+					.Some((def, _)) => self.appliedType(def, &args, ty.span, pointee)
+					.None => {
+						// A type of another module, imported by name.
+						match self.imported(ast::Name(sym: sym, span: ty.span)) {
+							.Some(.Item(module, name: item)) => return self.namedType(
+								module,
+								item,
+								&args,
+								ty.span,
+								pointee,
+							)
+							.Some(.Broken) => return ERROR
+							.None => {}
+						}
+						// A type of the prelude, which every file sees.
+						if self.preludeType(sym) is .Some(prelude) then
+							return self.appliedType(prelude, &args, ty.span, pointee)
+						val text = self.text(sym)
+						var candidates: Vec<str> = Vec()
+						val types = &self.types()
+						for i in 0..types.len() {
+							candidates.push(self.text(types.keyAt(i).clone()))
+						}
+						for (n, _) in BUILTIN_TYPES {
+							candidates.push(n)
+						}
+						var diagnostic = Diagnostic::error(
+							UNKNOWN_TYPE,
+							"cannot find type `\(text)`",
+							ty.span,
+							String::of("unknown type"),
+						)
+						if leftThePrelude(text) is .Some(help) then
+							diagnostic = diagnostic.withHelp(move help)
+						else if suggest(text, &candidates) is .Some(similar) then
+							diagnostic = diagnostic.withFix(
+								"a type with a similar name exists: `\(similar)`",
+								own [Edit::replace(ty.span, String::of(similar))],
+							)
+						self.report(move diagnostic)
+						ERROR
+					}
+				}
+			}
+			// `own` of a view is a view, kept where a view is, as a `Vec` of
+			// one is: a tree of views holds one child in it.
+			.Own(inner) => {
+				val innerTy = self.resolveTy(inner)
+				self.intern(.Own(innerTy))
+			}
+			// `&(…) => R` and `&var (…) => R` are closures lent for one call.
+			.Ref(isVar, inner) => {
+				val innerTy = self.resolveTy(inner)
+				self.intern(.Ref(
+					inner: innerTy,
+					kind: if isVar then RefKind::Var else RefKind::Shared,
+				))
+			}
+			// `(a: A, b: B) => R`. Its parameters follow the rules for a
+			// function's parameters; its result cannot lend a place. The
+			// names only document it.
+			.Fn(params, ret) => {
+				var seen: Map<Symbol, Span> = Map()
+				var tys: Vec<Ty> = Vec()
+				for param in params {
+					match seen.get(&param.name.sym) {
+						.Some(first) => self.duplicate(param.name, first)
+						.None => seen.put(param.name.sym, param.name.span)
+					}
+					val paramTy = self.resolveTy(param.ty)
+					tys.push(self.paramTy(paramTy, param.ty))
+				}
+				val retTy = self.resolveTy(ret)
+				val whole = self.kind(retTy) is .Ref(..)
+				val refused =
+					(whole &&
+						self.noRef(
+							retTy,
+							ret,
+							"a function value's result cannot be a reference",
+							.Some("a projection lends a place, and cannot be a value yet"),
+						)) ||
+					self.noVarRef(retTy, ret, "a function value's result") ||
+					self.bareSlice(retTy, ret, false)
+				val result = if refused then ERROR else retTy
+				var broken = self.hasError(result)
+				for t in tys {
+					if self.hasError(t) then broken = true
+				}
+				if broken then return ERROR
+				val list = self.program.types.internList(&tys)
+				self.intern(.Fn(params: list, ret: result))
+			}
+			.Array(elem, len) => {
+				val elemTy = self.resolveTy(elem)
+				match self.arrayLen(len) {
+					.Some(n) => self.intern(.Array(elem: elemTy, len: n))
+					.None => ERROR
+				}
+			}
+			.Slice(elem) => {
+				val elemTy = self.resolveTy(elem)
+				self.intern(.Slice(elemTy))
+			}
+			.Error => ERROR
+		}
+	}
+
+	/// A field that borrows, in a struct that is not a view, or a variant's.
+	/// `payload` is for a variant's, which has no view of its own.
+	var fn storedField(ty: Ty, typeId: ast::TypeId, payload: bool): bool = {
+		val span = self.ast.types[typeId].span
+		val help =
+			if payload then
+				String::of(
+					"write `view enum`, for an enum whose variants borrow, or hold a `String`, which owns its bytes",
+				)
+			else String::of("write `view struct`, for a struct that borrows")
+		return self.storedViewAt(ty, span, "a field", .Some(move help))
+	}
+
+	/// `&var` in a view: two views could then write one place.
+	var fn varInView(typeId: ast::TypeId): bool = {
+		val span = self.ast.types[typeId].span
+		self.report(
+			Diagnostic::error(
+				REF_OUTSIDE_PARAMETER,
+				String::of("a view holds `&`, not `&var`"),
+				span,
+				String::of("a `&var` reference"),
+			).withNote(
+				String::of(
+					"a view may be copied, and two copies of a `&var` would write one place; what a view changes, it is given as a parameter",
+				),
+			).withHelp(String::of("hold `&`, and take `&var` where the change is made")),
+		)
+		return true
+	}
+
+	/// `Slots<T>`: a block of slots, none of them initialized. Only the
+	/// standard library may name it, since nothing else may hold memory that
+	/// holds nothing.
+	var fn slotsType(args: &[ast::TypeId], span: Span): Ty = {
+		if !self.inStd() {
+			self.report(
+				Diagnostic::error(
+					IMPL_TARGET,
+					String::of("`Slots` is the standard library's"),
+					span,
+					String::of("not a type this module may name"),
+				).withNote(
+					String::of(
+						"a block of slots holds memory that holds nothing, which nothing else in Wip may; `Vec<T>` is what it is for",
+					),
+				).withHelp(String::of("use `Vec<T>`")),
+			)
+			return ERROR
+		}
+		if args.len() != 1 {
+			self.report(
+				Diagnostic::error(
+					TYPE_ARGUMENT_COUNT,
+					"`Slots` takes one type argument, and \(plural(args.len(), "was", "were")) given",
+					span,
+					String::of("a block of slots"),
+				),
+			)
+			return ERROR
+		}
+		val inner = self.resolveTy(args[0])
+		return self.intern(.Slots(inner))
+	}
+
+	/// An opaque C type named where a value would have it: it says only that
+	/// the type exists.
+	var fn opaqueAsValue(sym: Symbol, span: Span) = {
+		val text = String::of(self.text(sym))
+		self.report(
+			Diagnostic::error(
+				OPAQUE_VALUE,
+				"`\(text)` is a C type whose contents are not known",
+				span,
+				String::of("not a type a value can have"),
+			).withNote(
+				String::of(
+					"an opaque C type says only that the type exists; how large one is, and what is in it, are C's business",
+				),
+			).withHelp("a pointer to one is written `ptr<\(text)>`"),
+		)
+	}
+
+	/// `ptr<T>`: a C pointer. Its pointee may be anything with a size, an
+	/// opaque C type, or `void` for `void *`.
+	var fn pointerType(args: &[ast::TypeId], span: Span): Ty = {
+		if args.len() != 1 {
+			val verb = if args.len() == 1 then "was" else "were"
+			self.report(
+				Diagnostic::error(
+					TYPE_ARGUMENT_COUNT,
+					"`ptr` takes one type argument, and \(args.len()) \(verb) given",
+					span,
+					String::of("a C pointer"),
+				).withNote(
+					String::of("a C pointer is written `ptr<T>`; `ptr<void>` is C's `void *`"),
+				),
+			)
+			// A C type may stand in any of them, wrong as their number is.
+			for arg in args {
+				self.resolvePointee(arg)
+			}
+			return ERROR
+		}
+		val inner = self.resolvePointee(args[0])
+		// A reference is second-class, so it cannot be behind a pointer that
+		// is stored anywhere.
+		if self.noRef(inner, args[0], "a C pointer cannot point at a reference", .None) then
+			return ERROR
+		return self.intern(.Ptr(inner))
+	}
+
+	/// The constant `name` stands for: this module's, one imported by name,
+	/// or the prelude's.
+	fn constNamed(name: ast::Name): Option<ConstId> = {
+		if self.consts().get(&name.sym) is .Some(id) then return .Some(id)
+		if self.imported(name) is .Some(.Item(module, name: item)) &&
+			self.modules[module].consts.get(&item.sym) is .Some(id) &&
+			self.program.consts[id].isPub {
+			return .Some(id)
+		}
+		return self.preludeConst(name.sym)
+	}
+
+	/// An array's length, where it is one; nothing where it is not, which was
+	/// reported, so that what uses the array says nothing more of it.
+	var fn arrayLen(len: ast::ArrayLen): Option<u64> = {
+		val name = match len {
+			.Int(n) => return .Some(n)
+			.Name(name) => name
+		}
+		val text = String::of(self.text(name.sym))
+		val .Some(id) = self.constNamed(name) else {
+			self.report(
+				Diagnostic::error(
+					UNKNOWN_NAME,
+					"cannot find the constant `\(text)`",
+					name.span,
+					String::of("unknown name"),
+				).withNote(
+					String::of(
+						"an array's length is a literal or a top-level `val`, which is known where it is written",
+					),
+				),
+			)
+			return .None
+		}
+		self.constValue(id)
+		if !self.knownNow(id, name.span, "an array's length") then return .None
+		val value = self.program.consts[id].value.clone()
+		val ty = self.program.consts[id].ty
+		return match value {
+			.Some(.Int(n)) => {
+				// A signed constant holds the low bits of its value, so the
+				// sign comes from its own width.
+				val written: i128 = match self.kind(ty) {
+					.Int(int: t) if t.signed() => asSigned(n, t.bits())
+					_ => n as i128
+				}
+				if written < 0 {
+					self.report(
+						Diagnostic::error(
+							UNKNOWN_NAME,
+							"`\(text)` is negative, so it is not a length",
+							name.span,
+							String::of("a negative length"),
+						),
+					)
+					Option::None
+				} else if written > 0xFFFF_FFFF_FFFF_FFFF {
+					self.report(
+						Diagnostic::error(
+							UNKNOWN_NAME,
+							"`\(text)` is too large for an array's length",
+							name.span,
+							String::of("a length that does not fit"),
+						),
+					)
+					Option::None
+				} else {
+					.Some(written as u64)
+				}
+			}
+			.Some(_) => {
+				self.report(
+					Diagnostic::error(
+						UNKNOWN_NAME,
+						"`\(text)` is \(self.tyName(ty)), not a whole number",
+						name.span,
+						String::of("not a length"),
+					),
+				)
+				Option::None
+			}
+			// Its own error was reported where it was written.
+			.None => .None
+		}
+	}
+
+	/// An `@inline` function that reaches itself, directly or through other
+	/// `@inline` functions: splicing it would never end. A `@tailrec`
+	/// function is a loop before inlining sees it, so its call to itself is
+	/// not one of these.
+	var fn checkInlineCycles() = {
+		var inline: Vec<FnId> = Vec()
+		for id in self.program.fns.ids() {
+			val def = &self.program.fns[id]
+			if def.isInline && def.body.isSome() then inline.push(id)
+		}
+		// Who each one calls, keeping only the calls that would be spliced.
+		var calls: Map<FnId, Vec<(FnId, Span)>> = Map()
+		for id in inline {
+			val .Some(body) = self.program.fns[id].body else {
+				continue
+			}
+			var called: Vec<(FnId, Span)> = Vec()
+			for expr in body.exprs {
+				val .Call(callee: direct, ..) = expr.kind else {
+					continue
+				}
+				val callee = match self.program.fns[direct].instanceOf {
+					.Some((generic, _)) => generic
+					.None => direct
+				}
+				if self.program.fns[callee].isInline &&
+					!(callee == id && self.program.fns[id].isTailrec) {
+					called.push((callee, expr.span))
+				}
+			}
+			calls.put(id, move called)
+		}
+		// The first cycle each one is in, if it is in any.
+		var reported: Set<FnId> = Set()
+		for start in inline {
+			if reported.contains(&start) then continue
+			var stack: Vec<(FnId, FnId, Span)> = Vec::of(own [(start, start, Span::at(0))])
+			var seen: Set<FnId> = Set()
+			while stack.pop() is .Some((id, _, at)) {
+				if id == start && !seen.isEmpty() {
+					val text = String::of(self.text(self.program.fns[start].name))
+					val declared = self.program.fns[start].span
+					self.report(
+						Diagnostic::error(
+							CANNOT_INLINE,
+							"`\(text)` is `@inline` and calls itself",
+							at,
+							String::of("the call that comes back here"),
+						).withSecondary(declared, String::of("declared `@inline` here")).withNote(
+							String::of(
+								"splicing a body into itself never ends; `@tailrec` makes a function's calls to itself a loop, which inlining sees as one body",
+							),
+						),
+					)
+					reported.add(start)
+					break
+				}
+				if !seen.add(id) then continue
+				if calls.get(&id) is .Some(callees) {
+					for (callee, span) in callees {
+						stack.push((callee, id, span))
+					}
+				}
+			}
+		}
+	}
+
+	/// A struct or enum that contains itself by value (not behind `own` or
+	/// `&`) would be infinitely large.
+	var fn checkRecursiveTypes() = {
+		var defs: Vec<(TypeDef, Symbol, Span)> = Vec()
+		for id in self.program.structs.ids() {
+			defs.push((.Struct(id), self.program.structs[id].name, self.program.structs[id].span))
+		}
+		for id in self.program.enums.ids() {
+			defs.push((.Enum(id), self.program.enums[id].name, self.program.enums[id].span))
+		}
+		for (def, name, span) in defs {
+			// A generic type is checked with its own parameters as arguments.
+			val generics = self.typeGenerics(def)
+			val params = self.paramTys(&generics)
+			val list = self.program.types.internList(&params)
+			val ty = match def {
+				.Struct(id) => self.intern(.Struct(id: id, args: list))
+				.Enum(id) => self.intern(.Enum(id: id, args: list))
+				.Builtin(..) => continue
+			}
+			var visited: Set<Ty> = Set()
+			if self.containsByValue(ty, ty, &var visited, 0) {
+				val text = self.text(name)
+				self.report(
+					Diagnostic::error(
+						RECURSIVE_TYPE,
+						"recursive type `\(text)` has infinite size",
+						span,
+						String::of("contains itself without indirection"),
+					).withHelp("put the recursive field behind `own`: `own<\(text)>`"),
+				)
+			}
+		}
+	}
+
+	/// Whether `ty` holds `target` by value. A generic type that holds ever
+	/// larger instances of itself, as `S<T>` holding `S<Pair<T, T>>`, has no
+	/// size either: past a depth it is taken to hold itself.
+	var fn containsByValue(ty: Ty, target: Ty, visited: &var Set<Ty>, depth: u32): bool = {
+		if depth > MAX_TYPE_DEPTH then return true
+		val children: Vec<Ty> = match self.kind(ty) {
+			.Struct(..) | .Enum(..) => self.children(ty)
+			.Array(elem, ..) => Vec::of(own [elem])
+			_ => Vec()
+		}
+		for child in children {
+			if child == target ||
+				(visited.add(child) &&
+					self.containsByValue(child, target, &var visited, depth + 1)) {
+				return true
+			}
+		}
+		return false
+	}
+}

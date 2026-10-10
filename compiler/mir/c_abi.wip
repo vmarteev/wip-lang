@@ -1,0 +1,556 @@
+// How C passes a value, for the calls the compiler makes itself.
+//
+// Wip passes an aggregate by its address; C passes a struct in registers, by
+// rules that differ per target. This module says, for one C function, how
+// each struct parameter and the result travel, on the three targets Wip
+// supports. It covers what Wip can write at the boundary — scalars, pointers,
+// and structs of those — and answers nothing for anything else, which then
+// goes through a wrapper in C as it always did.
+//
+// Apple arm64 and Linux arm64 follow AAPCS64, and for this subset they agree:
+// Apple's divergences are about variadic arguments and about small arguments
+// on the stack. x86-64 is the System V ABI.
+
+import std::collections::{Set}
+import std::io
+import hir::{Access, FnDef, FnId, Program, Ty, UNIT}
+import syntax::{Diagnostic, Interner, UNSUPPORTED}
+
+/// The processor, which is what decides how C passes a struct. Windows would
+/// be a third set of rules, and is not written.
+@derive(Eq, Clone, Text)
+pub enum Arch {
+	/// Linux arm64: AAPCS64 as written.
+	Arm64
+	/// Apple arm64: AAPCS64, but with arguments on the stack packed at their
+	/// natural alignment rather than in eight-byte slots.
+	AppleArm64
+	X86_64
+}
+
+extend Arch {
+	/// Whether this is AAPCS64, Apple's or Linux's: the two agree on
+	/// registers and differ only on the stack.
+	pub fn isArm64(): bool = self is .Arm64 | .AppleArm64
+
+	/// The machine the compiler is running on, which is the machine it
+	/// compiles for. Nothing where the rules are not written.
+	pub static fn host(): Option<Arch> = {
+		if TARGET_OS == "windows" then return .None
+		if TARGET_ARCH == "arm64" then
+			return .Some(if TARGET_VENDOR == "apple" then .AppleArm64 else .Arm64)
+		if TARGET_ARCH == "x86_64" then return .Some(.X86_64)
+		return .None
+	}
+}
+
+/// A register-sized piece of a struct: where it starts in the struct's bytes,
+/// and the register it travels in.
+@derive(Eq, Clone, Text)
+pub struct Part {
+	pub offset: u32
+	pub reg: Reg
+}
+
+/// What a piece is loaded as. An `F64` on x86-64 may be two `f32`s side by
+/// side, which is how System V puts them in one SSE register.
+@derive(Eq, Clone, Text)
+pub enum Reg {
+	I64
+	F32
+	F64
+}
+
+/// How one parameter travels.
+@derive(Eq, Clone)
+pub enum Pass {
+	/// As Wip passes it already: a scalar, or a `str` or `&[T]` as a pointer
+	/// and a length.
+	Plain
+	/// In registers, each piece loaded from the struct's bytes.
+	Parts(parts: Vec<Part>)
+	/// A pointer to a copy the caller makes (arm64, over sixteen bytes).
+	Copy
+	/// The bytes themselves, on the stack, rounded up to eight (x86-64's
+	/// MEMORY class).
+	Stack(size: u32)
+	/// On arm64, a struct the registers left cannot hold: zeros that fill the
+	/// rest of its class's registers, and then its pieces, which go on the
+	/// stack where C puts the struct (AAPCS64 C.3 and C.11).
+	Spilled(pad: Pad, parts: Vec<Part>)
+}
+
+/// Registers filled with zeros, so that what follows goes on the stack.
+@derive(Eq, Clone)
+pub struct Pad {
+	pub ints: u32
+	pub floats: u32
+}
+
+/// How the result comes back.
+@derive(Eq, Clone)
+pub enum Answer {
+	/// A scalar, or nothing.
+	Plain
+	/// In registers, each piece stored to the struct's bytes.
+	Parts(parts: Vec<Part>)
+	/// Through an address the caller gives: x8 on arm64, the first argument
+	/// on x86-64.
+	Hidden
+}
+
+/// How a C function's parameters and result travel.
+@derive(Eq, Clone)
+pub struct CCall {
+	pub params: Vec<Pass>
+	pub ret: Answer
+}
+
+extend CCall {
+	/// Whether anything travels differently from how Wip passes it.
+	pub fn isPlain(): bool = {
+		if self.ret != Answer::Plain then return false
+		for p in self.params {
+			if p != Pass::Plain then return false
+		}
+		return true
+	}
+}
+
+/// Whether `WIP_FORCE_SHIMS` asks for every call into C to go through a
+/// wrapper, which is how the direct path is checked against the one that
+/// came before it. A Wip function C calls has no wrapper to go through, so it
+/// is unaffected.
+fn forced(): bool = match io::env("WIP_FORCE_SHIMS") {
+	.Some(value) => !value.isEmpty() && value != "0"
+	.None => false
+}
+
+/// The extern functions whose calls still go through C the compiler writes:
+/// a variadic call, what a header defines rather than declares, an accessor
+/// of C's variables, and a struct by value this module does not classify. A
+/// function used as a value keeps its wrapper too, since a Wip function value
+/// is called the way Wip calls.
+pub fn shimmed(program: &Program, given: Option<Arch>): Set<FnId> = {
+	val arch: Option<Arch> = if forced() then .None else given
+	var layouts = Layouts::new()
+	var shimmed: Set<FnId> = Set()
+	for id in program.fns.ids() {
+		val def = &program.fns[id]
+		if !def.isExtern then continue
+		val wrapped =
+			def.variadicOf.isSome() && !(arch.isSome() && variadicDirect(&program, &def)) ||
+			def.header.isSome() ||
+			match def.accesses {
+				// A variable C owns is a symbol, loaded and stored directly,
+				// unless a header may make it a macro. A field of a struct only
+				// C lays out is always C's to reach.
+				.Some(.Global(global)) => arch.isNone() || program.globals[global].header.isSome()
+				.Some(.Field(..)) => true
+				.None => false
+			} ||
+			byValue(&program, &def) && classifiedOn(&program, &var layouts, &def, arch).isNone()
+		if wrapped then shimmed.add(id)
+	}
+	for id in program.fns.ids() {
+		val .Some(body) = program.fns[id].body else {
+			continue
+		}
+		for e in body.exprs.ids() {
+			if body.exprs[e].kind is .FnRef(id: referenced, ..) &&
+				program.fns[referenced].isExtern &&
+				byValue(&program, &program.fns[referenced]) {
+				shimmed.add(referenced)
+			}
+		}
+	}
+	return move shimmed
+}
+
+/// How `def` travels on `arch`, where there is one.
+fn classifiedOn(
+	program: &Program,
+	layouts: &var Layouts,
+	def: &FnDef,
+	arch: Option<Arch>,
+): Option<CCall> = match arch {
+	.Some(on) => classify(&program, &var layouts, &def, on)
+	.None => .None
+}
+
+/// The pieces a struct is passed in once it is on the stack, laid out so that
+/// the arguments' stack slots hold its bytes where C's would. Integer pieces
+/// are eight bytes on every target. A floating aggregate is its members on
+/// Apple, which packs stack arguments at their natural alignment as it packs
+/// the members; on Linux every stack argument is eight-byte aligned and
+/// rounded up to eight, so it is eight-byte pieces of its bytes, carried as
+/// `f64` so that no general register left takes one.
+fn spilled(arch: Arch, size: u32, parts: Vec<Part>): Vec<Part> = {
+	var floating = true
+	for part in parts {
+		if part.reg == Reg::I64 then floating = false
+	}
+	if !floating || arch == Arch::AppleArm64 then return move parts
+	var pieces: Vec<Part> = Vec()
+	for i in 0..((size + 7) / 8) {
+		pieces.push(Part(offset: i * 8, reg: .F64))
+	}
+	return move pieces
+}
+
+/// Whether a call that passes more than its declaration names — one of the
+/// declarations made for each set of types a variadic function is called
+/// with — is made directly. Its extra arguments are scalars; a struct among
+/// its named ones, or a header that may make it a macro, keeps the wrapper.
+/// LLVM sets what x86-64's callee reads in `%al`, how many vector registers
+/// the call uses, so a floating extra argument is made directly there too.
+pub fn variadicDirect(program: &Program, def: &FnDef): bool = {
+	val .Some(original) = def.variadicOf else {
+		return false
+	}
+	val named = program.fns[original].params.len()
+	if def.header.isSome() || program.fns[original].header.isSome() || byValue(&program, &def) then
+		return false
+	for i in named..def.params.len() {
+		if promoted(&program, def.params[i].ty).isNone() then return false
+	}
+	return true
+}
+
+/// What C's default argument promotions make of an extra argument of a
+/// variadic call: a `float` becomes a `double`, and an integer narrower than
+/// `int` becomes an `int`, extended by its own sign (C11 6.5.2.2). Nothing
+/// for what cannot be an extra argument at all.
+pub fn promoted(program: &Program, ty: Ty): Option<Promoted> = match program.types.kind(ty) {
+	.Float(..) => .Some(.Double)
+	.Bool | .Char => .Some(.Int(bits: 32, signed: false))
+	.Int(int) if int.bits() < 32 => .Some(.Int(bits: 32, signed: int.signed()))
+	.Int(int) if int.bits() <= 64 => .Some(.Int(bits: int.bits(), signed: int.signed()))
+	.Cstring | .Ptr(..) | .Fn(..) => .Some(.Int(bits: 64, signed: false))
+	.Ref(inner, ..) if !(program.types.kind(inner) is .Slice(..)) => .Some(.Int(
+		bits: 64,
+		signed: false,
+	))
+	_ => .None
+}
+
+/// An extra argument of a variadic call, as C's promotions leave it.
+@derive(Eq, Clone)
+pub enum Promoted {
+	Int(bits: u32, signed: bool)
+	Double
+}
+
+/// Whether a struct crosses by value, in either direction.
+pub fn byValue(program: &Program, def: &FnDef): bool = {
+	if crossesAsStruct(&program, def.ret) then return true
+	for p in def.params {
+		if crossesAsStruct(&program, p.ty) then return true
+	}
+	return false
+}
+
+/// Whether a value of `ty` crosses to C as a struct does, from memory: a
+/// struct, and a function pointer that may be null, `Option<(…) => R>`, which
+/// Wip keeps as an enum and lays out as the pointer alone. C passes and
+/// answers that as the one word it is, which is what a struct of one pointer
+/// comes to.
+pub fn crossesAsStruct(program: &Program, ty: Ty): bool = match program.types.kind(ty) {
+	.Struct(..) => true
+	.Enum(..) => program.nullableFunction(ty)
+	_ => false
+}
+
+/// How `def`'s parameters and result travel on `arch`, or nothing where a
+/// wrapper in C has to decide: a struct of no size.
+pub fn classify(
+	program: &Program,
+	layouts: &var Layouts,
+	def: &FnDef,
+	arch: Arch,
+): Option<CCall> = {
+	var regs = Registers::of(arch)
+	var ret = Answer::Plain
+	if crossesAsStruct(&program, def.ret) {
+		val layout = layouts.of(&program, def.ret)
+		val leaves = leavesOf(&program, &var layouts, def.ret)?
+		if layout.size == 0 then return .None
+		ret = match pieces(arch, layout.size, &leaves) {
+			.Some(parts) => .Parts(move parts)
+			.None => {
+				// x86-64's hidden pointer is the first argument; arm64's is x8,
+				// which no argument uses.
+				if arch == Arch::X86_64 then regs.ints -= 1
+				.Hidden
+			}
+		}
+	}
+	var params: Vec<Pass> = Vec()
+	for param in def.params {
+		val ty = param.ty
+		val pass: Pass = if crossesAsStruct(&program, ty) {
+			val layout = layouts.of(&program, ty)
+			val leaves = leavesOf(&program, &var layouts, ty)?
+			if layout.size == 0 then return .None
+			match pieces(arch, layout.size, &leaves) {
+				.Some(parts) => {
+					var ints: u32 = 0
+					for p in parts {
+						if p.reg == Reg::I64 then ints += 1
+					}
+					val floats = parts.len() as u32 - ints
+					if regs.ints >= ints && regs.floats >= floats {
+						regs.ints -= ints
+						regs.floats -= floats
+						Pass::Parts(move parts)
+					} else if arch.isArm64() {
+						// C.3 and C.11: the struct goes on the stack whole, and
+						// the registers of its class are spent, so no later
+						// argument of that class is in one either. Filling them
+						// with zeros says so to the code generator, which gives
+						// each argument the next register of its class.
+						val pad = if floats > 0 {
+							val spent = Pad(ints: 0, floats: regs.floats)
+							regs.floats = 0
+							spent
+						} else {
+							val spent = Pad(ints: regs.ints, floats: 0)
+							regs.ints = 0
+							spent
+						}
+						Pass::Spilled(pad: move pad, parts: spilled(arch, layout.size, move parts))
+					} else {
+						// "If there are no registers available for any eightbyte
+						// of an argument, the whole argument is passed on the
+						// stack", which is MEMORY, and uses no register.
+						Pass::Stack(nextMultiple(layout.size, 8))
+					}
+				}
+				.None if arch.isArm64() => {
+					regs.takeInt()
+					Pass::Copy
+				}
+				.None => Pass::Stack(nextMultiple(layout.size, 8))
+			}
+		} else if program.types.kind(ty) is .Float(..) {
+			regs.takeFloat()
+			Pass::Plain
+		} else if isPair(&program, ty) {
+			// A `str` and a `&[T]` are a pointer and a length.
+			regs.takeInt()
+			regs.takeInt()
+			Pass::Plain
+		} else {
+			regs.takeInt()
+			Pass::Plain
+		}
+		params.push(move pass)
+	}
+	return .Some(CCall(params: move params, ret: move ret))
+}
+
+/// Whether a type reaches C as a pointer and a length.
+fn isPair(program: &Program, ty: Ty): bool = match program.types.kind(ty) {
+	.Str | .Slice(..) => true
+	.Ref(inner, ..) => program.types.kind(inner) is .Slice(..)
+	_ => false
+}
+
+/// The argument registers left, counted as C counts them.
+struct Registers {
+	ints: u32
+	floats: u32
+}
+
+extend Registers {
+	static fn of(arch: Arch): Registers = match arch {
+		// x0–x7 and v0–v7.
+		.Arm64 | .AppleArm64 => Registers(ints: 8, floats: 8)
+		// rdi, rsi, rdx, rcx, r8, r9; xmm0–xmm7.
+		.X86_64 => Registers(ints: 6, floats: 8)
+	}
+
+	var fn takeInt() = {
+		if self.ints > 0 then self.ints -= 1
+	}
+
+	var fn takeFloat() = {
+		if self.floats > 0 then self.floats -= 1
+	}
+}
+
+/// A scalar inside a struct, at its offset from the struct's start.
+@derive(Eq, Clone)
+enum Leaf {
+	Int
+	F32
+	F64
+}
+
+/// Every scalar of a struct or a union, nested ones and arrays opened, each
+/// at its offset, its size and its kind; a union's overlap.
+fn leavesOf(program: &Program, layouts: &var Layouts, ty: Ty): Option<Vec<(u32, u32, Leaf)>> = {
+	var out: Vec<(u32, u32, Leaf)> = Vec()
+	if !collect(&program, &var layouts, ty, 0, &var out) then return .None
+	return .Some(move out)
+}
+
+/// Adds `ty`'s scalars at `base`, each as its offset, its size and its kind;
+/// false where one has no size.
+fn collect(
+	program: &Program,
+	layouts: &var Layouts,
+	ty: Ty,
+	base: u32,
+	out: &var Vec<(u32, u32, Leaf)>,
+): bool = {
+	match program.types.kind(ty) {
+		// A union's fields are all at 0, over the same bytes, so its scalars
+		// overlap, which is what both ABIs classify: System V merges what
+		// shares an eightbyte, and AAPCS64 asks whether every member is of one
+		// floating type.
+		.Struct(..) => {
+			val fields = program.fieldTys(ty)
+			for (i, field) in fields.forwards().enumerate() {
+				val offset = layouts.fieldOffset(&program, ty, i as u32)
+				if !collect(&program, &var layouts, field, base + offset, &var out) then
+					return false
+			}
+		}
+		.Array(elem, len) => {
+			val stride = layouts.of(&program, elem).stride()
+			for i in 0..(len as u32) {
+				if !collect(&program, &var layouts, elem, base + i * stride, &var out) then
+					return false
+			}
+		}
+		.Float(float: .F32) => out.push((base, 4, .F32))
+		.Float(..) => out.push((base, 8, .F64))
+		.Unit => {}
+		_ => {
+			val size = layouts.of(&program, ty).size
+			if size == 0 && ty != UNIT then return false
+			out.push((base, size, .Int))
+		}
+	}
+	return true
+}
+
+/// The registers a struct of `size` bytes travels in, or nothing where it
+/// goes through memory: over sixteen bytes on either processor, unless on
+/// arm64 it is a homogeneous floating aggregate.
+fn pieces(arch: Arch, size: u32, leaves: &[(u32, u32, Leaf)]): Option<Vec<Part>> = {
+	if arch.isArm64() {
+		// A homogeneous floating aggregate: every scalar in it `f32`, or every
+		// one `f64`, and one to four of that type in its size, each in a
+		// floating register of its own (AAPCS64 B.3 and C.2). It is counted by
+		// size rather than by member, which for a struct is the same thing —
+		// one of a single floating type has no padding — and for a union is
+		// the rule: its members overlap, and it holds as many as fit.
+		if leaves.isEmpty() then return .None
+		val first = leaves[0].2.clone()
+		val (reg, unit) = match first {
+			.F32 => (Reg::F32, 4 as u32)
+			.F64 => (Reg::F64, 8 as u32)
+			.Int => (Reg::I64, 0 as u32)
+		}
+		var homogeneous = unit != 0 && size % unit == 0 && size / unit >= 1 && size / unit <= 4
+		for (_, _, leaf) in leaves {
+			if leaf != first then homogeneous = false
+		}
+		var parts: Vec<Part> = Vec()
+		if homogeneous {
+			for i in 0..(size / unit) {
+				parts.push(Part(offset: i * unit, reg: reg.clone()))
+			}
+			return .Some(move parts)
+		}
+		// Anything else of sixteen bytes or fewer is its bytes, in one or two
+		// general registers (C.10).
+		if size > 16 then return .None
+		for i in 0..((size + 7) / 8) {
+			parts.push(Part(offset: i * 8, reg: .I64))
+		}
+		return .Some(move parts)
+	}
+	// Over sixteen bytes is MEMORY (System V 3.2.3, rule 1).
+	if size > 16 then return .None
+	// Each eightbyte is INTEGER if anything in it is, and SSE if everything in
+	// it is floating.
+	var parts: Vec<Part> = Vec()
+	for i in 0..((size + 7) / 8) {
+		val start = i * 8
+		val end = start + 8
+		var integer = false
+		var used: u32 = 0
+		for (offset, length, leaf) in leaves {
+			if offset < start || offset >= end then continue
+			if leaf == Leaf::Int then integer = true
+			used = used.max(offset + length - start)
+		}
+		// An SSE eightbyte whose data ends in its low half is a `float`;
+		// otherwise the register's low 64 bits carry it — a `double`, or two
+		// `float`s side by side.
+		val reg: Reg = if integer then .I64 else if used <= 4 then .F32 else .F64
+		parts.push(Part(offset: start, reg: move reg))
+	}
+	return .Some(move parts)
+}
+
+/// The `@export("C")` functions this target cannot give C's signature: a
+/// struct by value on a target whose rules are not written here, and one
+/// taken as a value, which Wip would call the way Wip calls. A call *into* C
+/// has a wrapper to fall back on; a call from C has none.
+pub fn refusedExports(
+	program: &Program,
+	interner: &Interner,
+	arch: Option<Arch>,
+): Vec<Diagnostic> = {
+	var layouts = Layouts::new()
+	var refused: Vec<Diagnostic> = Vec()
+	var asValues: Set<FnId> = Set()
+	for id in program.fns.ids() {
+		val .Some(body) = program.fns[id].body else {
+			continue
+		}
+		for e in body.exprs.ids() {
+			if body.exprs[e].kind is .FnRef(id: referenced, ..) then asValues.add(referenced)
+		}
+	}
+	for id in program.fns.ids() {
+		val def = &program.fns[id]
+		if !def.exportsC || !byValue(&program, &def) then continue
+		val name = interner.resolve(def.name)
+		if classifiedOn(&program, &var layouts, &def, arch).isNone() then
+			refused.push(
+				Diagnostic::error(
+					UNSUPPORTED,
+					"C cannot call `\(name)` on this target",
+					def.nameSpan,
+					String::of("a struct by value the compiler cannot pass as C does here"),
+				).withNote(
+					String::of(
+						"how C passes a struct by value is written for Apple arm64, Linux arm64 and Linux x86-64 only; a call into C goes through a wrapper in C elsewhere, but a call from C has none",
+					),
+				).withHelp(
+					String::of("take the struct by reference, `&T`, which C sees as a pointer"),
+				),
+			)
+		else if asValues.contains(&id) then
+			refused.push(
+				Diagnostic::error(
+					UNSUPPORTED,
+					"`\(name)` is called by C, and cannot also be a Wip function value",
+					def.nameSpan,
+					String::of("takes or answers a struct by value"),
+				).withNote(
+					String::of(
+						"C passes the struct in registers and Wip passes its address, so one function cannot be both",
+					),
+				).withHelp(
+					String::of("wrap it in a function of Wip's own, and take that as the value"),
+				),
+			)
+	}
+	return move refused
+}

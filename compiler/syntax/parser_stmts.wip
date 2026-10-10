@@ -1,0 +1,327 @@
+// Blocks and statements.
+
+extend Parser {
+	var fn block(): Block = {
+		if !self.at(.LBrace) {
+			val diagnostic = self.expected("`{`")
+			self.report(move diagnostic)
+			return Block(stmts: Vec(), span: Span::at(self.prevSpan().hi))
+		}
+		val open = self.bump()
+		return self.inBraces((p) => p.blockBody(open))
+	}
+
+	var fn blockBody(open: Span): Block = {
+		var stmts: Vec<StmtId> = Vec()
+		while true {
+			while self.eat(.Semi) {}
+			val kind = self.peek()
+			if kind == .RBrace {
+				val close = self.bump()
+				self.bracePairs.push((open, close))
+				return Block(stmts: move stmts, span: open.to(close))
+			}
+			if kind == .Eof || isItemStart(kind) {
+				self.unclosedBrace(open)
+				return Block(stmts: move stmts, span: open.to(self.prevSpan()))
+			}
+			self.beginRegion()
+			if self.leadingOperator() then continue
+			val before = self.pos
+			if self.stmt() is .Some(stmt) then stmts.push(stmt)
+			if self.pos == before {
+				self.bump()
+				continue
+			}
+			if stmts.len() >= 2 then
+				self.variantUnderExpression(stmts[stmts.len() - 2], stmts[stmts.len() - 1])
+			self.stmtSeparator()
+		}
+		return Block(stmts: move stmts, span: open.to(self.prevSpan()))
+	}
+
+	/// A variant at the start of a line, directly under a statement that a `.`
+	/// could have continued: `io::println(…)` and then `.Ok(value)` reads as a
+	/// method call on the line above, though a line break ends the expression
+	/// there. It means what it says, so this is a warning and not an error
+	/// (E0126).
+	var fn variantUnderExpression(previous: StmtId, last: StmtId) = {
+		val .Expr(value) = self.ast.stmts[last].kind else {
+			return
+		}
+		val .Some(name) = self.dotName(value) else {
+			return
+		}
+		// A name in lower case is a method's or a field's:
+		// a chain meant to go on, which a `val`'s value can be too.
+		val text = self.text(name.span)
+		val first = if text.isEmpty() then 'A' else text.charAt(0).0
+		if first.isLowercase() {
+			val above = match self.ast.stmts[previous].kind {
+				.Expr(value: above) | .Let(init: above, ..) => above
+				_ => return
+			}
+			self.chainUnderExpression(above, last, name)
+			return
+		}
+		// Only what a `.` could have carried on: a binding, a loop, an
+		// assignment and an `if` without `else` have no value to take one,
+		// so nothing there can be misread.
+		val .Expr(value: above) = self.ast.stmts[previous].kind else {
+			return
+		}
+		if self.ast.exprs[above].kind is .Assign(..) | .If(elseBranch: .None, ..) then return
+		val (aboveSpan, below) = (self.ast.stmts[previous].span, self.ast.stmts[last].span)
+		if !self.src[self.local(aboveSpan.hi)..self.local(below.lo)].contains("\n") then return
+		val diagnostic = Diagnostic::warning(
+			VARIANT_UNDER_EXPRESSION,
+			"this reads as a method call on the line above",
+			below,
+			"a variant, on a line of its own",
+		).withSecondary(aboveSpan, "the expression this seems to continue").
+			withNote(
+				"a line break ends an expression, and a `.` that starts a line begins a variant of the expected type, so these are two statements",
+			).
+			withFix("say so with `return`", own [Edit::insert(below.lo, "return ")])
+		self.report(move diagnostic)
+	}
+
+	/// A chain continued with a `.` at the start of a line: `xs` and then
+	/// `.walk()` under it, which a line break ended, so
+	/// that `.walk` names a variant. A line that starts with `.` begins a
+	/// variant; a chain goes on with the `.` at the end of the line above,
+	/// or inside parentheses.
+	var fn chainUnderExpression(above: ExprId, last: StmtId, name: Name) = {
+		val aboveSpan = self.exprSpan(above)
+		val below = self.ast.stmts[last].span
+		if !self.src[self.local(aboveSpan.hi)..self.local(below.lo)].contains("\n") then return
+		val method = self.text(name.span)
+		val dot = Span::new(name.span.lo - 1, name.span.lo)
+		val diagnostic = Diagnostic::warning(
+			VARIANT_UNDER_EXPRESSION,
+			"`.\(method)` starts a line, so it does not continue the line above",
+			below,
+			"a variant of its own, not a call on the line above",
+		).withSecondary(aboveSpan, "the expression it seems to continue").
+			withNote(
+				"a line break ends an expression, and a `.` that starts a line begins a variant; a chain goes on with the `.` at the end of the line above, or inside parentheses",
+			).
+			withFix("end the line above with the `.`", own [
+				Edit::replace(dot, ""),
+				Edit::insert(aboveSpan.hi, "."),
+			])
+		self.report(move diagnostic)
+	}
+
+	/// The name after the `.` an expression begins with, through the
+	/// postfix forms that keep their value on the left; nothing where it
+	/// does not begin with one.
+	fn dotName(id: ExprId): Option<Name> = match self.ast.exprs[id].kind {
+		.Path(leadingDot: true, segments, ..) =>
+			if segments.isEmpty() then .None else .Some(segments[0])
+		.Call(callee, ..) => self.dotName(callee)
+		.Field(base, ..) => self.dotName(base)
+		.Index(base, ..) | .SubSlice(base, ..) => self.dotName(base)
+		.Try(inner) => self.dotName(inner)
+		.Binary(lhs, ..) => self.dotName(lhs)
+		.Cast(expr, ..) => self.dotName(expr)
+		_ => .None
+	}
+
+	/// After a statement: `;`, a line break or `}` must follow (E0112).
+	var fn stmtSeparator() = {
+		val kind = self.peek()
+		if kind is .Semi | .RBrace | .Eof || isItemStart(kind) || self.lineBreak() then return
+		val diagnostic = Diagnostic::error(
+			SEPARATOR,
+			"missing `;` between statements on one line",
+			self.span(),
+			"starts another statement on the same line",
+		).withNote("statements on one line are separated by `;`").withFix("add `;`", own [
+			Edit::insert(self.prevSpan().hi, ";"),
+		])
+		self.report(move diagnostic)
+	}
+
+	/// `val pattern = value else { … }`, after the keyword,
+	/// or `var`, whose names are variables.
+	var fn guardStmt(mutable: bool, start: Span, refutable: bool): StmtId = {
+		val pattern = self.pattern()
+		val value = if self.expect(.Eq) then self.expr() else self.errorExpr()
+		var elseBlock: Option<Block> = .None
+		if self.eat(.Else) {
+			elseBlock = .Some(self.block())
+		} else if refutable {
+			val diagnostic = Diagnostic::error(
+				GUARD_SYNTAX,
+				if mutable then "a pattern in `var` needs `else`"
+				else "a pattern in `val` needs `else`",
+				Span::at(self.prevSpan().hi),
+				"expected `else { … }` here",
+			).withNote(
+				"`val pattern = value else { … }` runs the `else` block when the value does not match; the block must leave",
+			).withHelp("to test without leaving, write `if value is pattern { … }`")
+			self.report(move diagnostic)
+		}
+		val kind = StmtKind::Guard(
+			mutable: mutable,
+			pattern: move pattern,
+			value: value,
+			elseBlock: move elseBlock,
+		)
+		val span = start.to(self.prevSpan())
+		return self.allocStmt(move kind, span)
+	}
+
+	/// `break outer`: which loop the jump leaves, where it is not the
+	/// innermost. It is on the same line as the keyword.
+	var fn jumpLabel(): Option<Name> = {
+		if !isIdent(self.peek()) || self.lineBreak() then return .None
+		return self.name("a loop's name")
+	}
+
+	var fn stmt(): Option<StmtId> = {
+		val start = self.span()
+		val kind: StmtKind = match self.peek() {
+			.Let | .Val | .Var => {
+				if self.at(.Let) {
+					val span = self.span()
+					val diagnostic = Diagnostic::error(
+						LET,
+						"immutable variables are declared with `val`",
+						span,
+						"`let` is not used in Wip",
+					).withFix("write `val`", own [Edit::replace(span, "val")])
+					self.report(move diagnostic)
+				}
+				val mutable = self.at(.Var)
+				self.bump()
+				// `val .Some(x) = value else { … }`, and
+				// `val Point(x, y) = value` or `val (x, y) = value`, which
+				// cannot fail; `var` for each.
+				val refutable =
+					self.at(.Dot) || (isIdent(self.peek()) && self.nth(1) == .ColonColon)
+				// `val [a, b] = pair`, or `val [first, ..] = xs else { … }`,
+				// which the checker says needs `else`.
+				val takesApart =
+					self.at(.LParen) ||
+					self.at(.LBracket) ||
+					(isIdent(self.peek()) && self.nth(1) == .LParen)
+				if refutable || takesApart then
+					return .Some(self.guardStmt(mutable, start, refutable))
+				val .Some(name) = self.name("a variable name") else {
+					self.skipStmt()
+					return .None
+				}
+				val ty: Option<TypeId> = if self.eat(.Colon) then .Some(self.ty()) else .None
+				val init = if self.expect(.Eq) then self.expr() else self.errorExpr()
+				.Let(mutable: mutable, name: name, ty: ty, init: init)
+			}
+			.Defer => {
+				self.bump()
+				StmtKind::Defer(value: self.expr())
+			}
+			.Return => {
+				self.bump()
+				// A line break after `return` means it returns nothing.
+				val value: Option<ExprId> =
+					if canStartExpr(self.peek()) && !self.lineBreak() then .Some(self.expr())
+					else .None
+				.Return(value: value)
+			}
+			// `yield value`: to the list being built.
+			.Yield => {
+				self.bump()
+				StmtKind::Yield(value: self.expr())
+			}
+			.While => {
+				self.bump()
+				val cond = self.cond()
+				val body = self.block()
+				.While(label: .None, cond: cond, body: move body)
+			}
+			// `outer: while …`, `outer: for …`: a loop with a name, which
+			// `break outer` leaves.
+			.Ident(..) if self.nth(1) == .Colon && self.nth(2) is .While | .For => {
+				val label = self.name("a name for the loop")?
+				self.bump()
+				val id = self.stmt()?
+				val labelled = match self.ast.stmts[id].kind {
+					.While(cond, body, ..) => StmtKind::While(
+						label: .Some(label),
+						cond: cond,
+						body: body.clone(),
+					)
+					.For(binding, source, body, ..) => StmtKind::For(
+						label: .Some(label),
+						binding: binding.clone(),
+						source: source.clone(),
+						body: body.clone(),
+					)
+					_ => panic("a label is followed by a loop")
+				}
+				self.ast.stmts[id] = Stmt(kind: move labelled, span: start.to(self.prevSpan()))
+				return .Some(id)
+			}
+			// `for x in xs { … }` or `for i in lo..hi { … }`.
+			.For => {
+				self.bump()
+				val .Some((binding, source)) = self.forHeader() else {
+					self.skipStmt()
+					return .None
+				}
+				val body = self.block()
+				.For(label: .None, binding: move binding, source: move source, body: move body)
+			}
+			// `break`, or `break outer`: the loop of that name.
+			.Break => {
+				self.bump()
+				StmtKind::Break(label: self.jumpLabel())
+			}
+			.Continue => {
+				self.bump()
+				StmtKind::Continue(label: self.jumpLabel())
+			}
+			kind if canStartExpr(kind) => .Expr(value: self.expr())
+			_ => {
+				val diagnostic = self.expected("a statement")
+				self.report(move diagnostic)
+				self.bump()
+				self.skipStmt()
+				return .None
+			}
+		}
+		val span = start.to(self.prevSpan())
+		return .Some(self.allocStmt(move kind, span))
+	}
+
+	/// What follows `for`: what each element is bound to, `in`, and what
+	/// is walked — a statement's and a list literal's element's alike.
+	/// `None` where there is no binding.
+	var fn forHeader(): Option<(Pattern, ForSource)> = {
+		// `for x in …`, `for _ in …`, or a value taken apart,
+		// `for MapEntry(key, value) in …` and `for (a, b) in …`.
+		// An array's elements too, `for [a, b] in pairs`.
+		var binding = Pattern(kind: .Wildcard, span: self.span())
+		if self.at(.LParen) ||
+			self.at(.LBracket) ||
+			(isIdent(self.peek()) && self.nth(1) == .LParen) {
+			binding = self.pattern()
+		} else if self.at(.Underscore) {
+			val span = self.bump()
+			binding = Pattern(kind: .Wildcard, span: span)
+		} else {
+			val name = self.name("a name for each element")?
+			binding = Pattern(kind: .Binding(symbol: name.sym), span: name.span)
+		}
+		self.expect(.In)
+		val first = self.cond()
+		var source = ForSource::Elements(source: first)
+		if self.at(.DotDot) || self.at(.DotDotEq) {
+			val inclusive = self.at(.DotDotEq)
+			self.bump()
+			source = .Range(lo: first, hi: self.cond(), inclusive: inclusive)
+		}
+		return .Some((move binding, move source))
+	}
+}

@@ -307,6 +307,38 @@ fn main() = {
 }
 ```
 
+A variable that holds a function value is captured as any variable is: a
+closure reads it where it is, and one that writes may assign it.
+
+```wip,run
+fn each(n: i64, visit: &var (x: i64) => void) = {
+    for i in 1..n + 1 {
+        visit(i)
+    }
+}
+
+fn main() = {
+    val scale = (x: i64) => x * 2
+    var total = 0
+    each(3, (x) => total += scale(x))
+    assert(total == 12)
+}
+```
+
+A function value is passed as it is, and `&` of one is refused: it would
+have a closure's type, `&(…) => R`, and a closure is an environment and its
+code where a function value is code alone. Where a closure is expected, a
+lambda that calls it is one:
+
+```wip,error=E0450
+fn apply(f: &(x: i64) => i64, x: i64): i64 = f(x)
+
+fn main() = {
+    val double = (x: i64) => x * 2
+    assert(apply(&double, 4) == 8)
+}
+```
+
 ## Generic functions
 
 A function may take type parameters, constrained by the interfaces its

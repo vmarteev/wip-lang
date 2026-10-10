@@ -1,0 +1,125 @@
+// Sizes, alignments and offsets of the types small programs declare.
+
+import hir::{Program, Ty, TyList}
+import syntax::{Interner}
+
+/// The type of the struct or enum `name`.
+fn typeNamed(program: &Program, interner: &Interner, name: str): Ty = {
+	for id in program.structs.ids() {
+		if interner.resolve(program.structs[id].name) == name then
+			return program.types.find(.Struct(id: id, args: TyList::empty())).unwrap()
+	}
+	for id in program.enums.ids() {
+		if interner.resolve(program.enums[id].name) == name then
+			return program.types.find(.Enum(id: id, args: TyList::empty())).unwrap()
+	}
+	panic("`\(name)` is declared")
+}
+
+/// The size of each enum `text` declares, by name.
+fn enumSizes(text: str): Vec<(String, u32)> = {
+	val (program, interner) = lowered(text)
+	var layouts = Layouts::new()
+	var sizes: Vec<(String, u32)> = Vec()
+	for id in program.enums.ids() {
+		val ty = program.types.find(.Enum(id: id, args: TyList::empty())).unwrap()
+		sizes.push(
+			(
+				String::of(interner.resolve(program.enums[id].name)),
+				layouts.enumLayout(&program, ty).size,
+			),
+		)
+	}
+	return move sizes
+}
+
+/// An optional `own` costs one pointer.
+@test
+fn aNullOwnStandsForTheEmptyVariant() = {
+	val sizes = enumSizes(
+		"struct Node { value: i64 }\nenum Link { Some(node: own<Node>), None }\nenum Cell { Full(value: i64, next: own<Node>), Empty }\nenum Light { Red, Yellow, Green }\nenum Shape { Circle(r: f64), Rect(w: f64, h: f64), Dot }\nenum Pair { Both(left: own<Node>, right: own<Node>), Neither }",
+	)
+	// `Pair` keeps its tag: taking `left` out must not make the value read as
+	// `Neither` while `right` still needs dropping.
+	val expected = [("Link", 8), ("Cell", 16), ("Light", 1), ("Shape", 24), ("Pair", 24)]
+	assert(sizes.len() == expected.len())
+	for (i, (name, size)) in expected.forwards().enumerate() {
+		assert(sizes[i].0 == name && sizes[i].1 == size as u32, name)
+	}
+}
+
+/// An instance of a generic enum has a layout of its own: with an `own`
+/// payload, a null pointer stands for the empty variant, as for an enum
+/// written out by hand.
+@test
+fn instancesHaveLayoutsOfTheirOwn() = {
+	val (program, interner) = lowered(
+		"struct Node { value: i64 }\nenum Maybe<T> { Some(value: T), None }\nstruct Holder { owned: Maybe<own<Node>>, plain: Maybe<i64> }",
+	)
+	val holder = typeNamed(&program, &interner, "Holder")
+	var layouts = Layouts::new()
+	val fields = program.fieldTys(holder)
+	assert(fields.len() == 2)
+	assert(layouts.of(&program, fields[0]).size == 8)
+	assert(layouts.of(&program, fields[1]).size == 16)
+	assert(layouts.of(&program, holder).size == 24)
+}
+
+/// A struct is laid out as C lays it out: each field at the next offset its
+/// alignment allows, and the whole rounded up to the largest alignment, so an
+/// array of them keeps each aligned.
+@test
+fn aStructIsLaidOutAsCLaysItOut() = {
+	val (program, interner) = lowered("struct Mixed { small: u8, big: i64, middle: u16 }")
+	val mixed = typeNamed(&program, &interner, "Mixed")
+	var layouts = Layouts::new()
+	assert(layouts.fieldOffset(&program, mixed, 0) == 0)
+	assert(layouts.fieldOffset(&program, mixed, 1) == 8)
+	assert(layouts.fieldOffset(&program, mixed, 2) == 16)
+	val layout = layouts.of(&program, mixed)
+	assert(layout.size == 24 && layout.align == 8)
+	assert(layout.stride() == 24)
+}
+
+/// A union's fields all start at 0, over the same bytes, and it is as large as
+/// the largest of them.
+@test
+fn aUnionIsAsLargeAsItsLargestField() = {
+	val (program, interner) = lowered(
+		"extern \"C\" {\n    union Either {\n        small: u8\n        big: i64\n    }\n}\n",
+	)
+	val either = typeNamed(&program, &interner, "Either")
+	var layouts = Layouts::new()
+	assert(layouts.fieldOffset(&program, either, 0) == 0)
+	assert(layouts.fieldOffset(&program, either, 1) == 0)
+	val layout = layouts.of(&program, either)
+	assert(layout.size == 8 && layout.align == 8)
+}
+
+/// A variant's fields start after the tag, where the largest alignment of any
+/// variant's fields allows, so every variant's are aligned.
+@test
+fn aVariantsFieldsStartAfterTheTag() = {
+	val (program, interner) = lowered("enum Shape { Dot, Small(b: u8), Circle(r: f64) }")
+	val shape = typeNamed(&program, &interner, "Shape")
+	var layouts = Layouts::new()
+	assert(layouts.enumTag(&program, shape) == Tag::Byte(1))
+	assert(layouts.variantOffset(&program, shape, 1, 0) == 8)
+	assert(layouts.variantOffset(&program, shape, 2, 0) == 8)
+	assert(layouts.of(&program, shape).size == 16)
+}
+
+/// More than 256 variants do not fit a byte, and the tag takes four.
+@test
+fn aTagGrowsPastAByteOfVariants() = {
+	var variants: Vec<String> = Vec()
+	for i in 0..300 {
+		variants.push("V\(i)")
+	}
+	val text = "enum Many { \(variants.join(", ")) }"
+	val (program, interner) = lowered(text.toStr())
+	val many = typeNamed(&program, &interner, "Many")
+	var layouts = Layouts::new()
+	assert(layouts.enumTag(&program, many) == Tag::Byte(4))
+	assert(layouts.of(&program, many).size == 4)
+}

@@ -1,0 +1,366 @@
+// Small aggregates as scalars.
+//
+// A struct, a tuple or an enum lives in a stack slot, written and read field
+// by field through memory, even where it is only ever taken apart: the
+// `Option<i64>` an inlined lookup answers, the pair of numbers a helper hands
+// back. A value is kept in a register most surely where the MIR made it a
+// local of its own, so this pass makes one: each field of such a local
+// becomes a local, and an enum's tag one more. A field that is an aggregate
+// itself becomes a local that a later round may split again.
+//
+// A local is split only where nothing needs it whole in memory: its address
+// is never taken, it is not handed to a call or taken back from one, and it
+// owns nothing that would be dropped through its address. A struct may be
+// copied whole, to or from another place, which becomes a copy of each field;
+// an enum may not, since writing it back would write its tag from a value
+// rather than a constant. What it does is otherwise exactly what it did: the
+// same fields, written and read in the same order.
+//
+// It runs on a release build's bodies alone. A debug build keeps each
+// variable whole, where the debugger looks for it.
+
+import std::collections::{Map}
+import std::mem
+import hir::{I32, Program, Ty, UNIT}
+
+/// The most fields a local may have to be split: a value larger than that is
+/// cheaper copied as the block of memory it is.
+val MOST_FIELDS: i64 = 8
+
+/// How many times a split is tried again, for the aggregates the last one made
+/// locals of.
+val ROUNDS: i64 = 4
+
+/// Splits the small aggregate locals of `body` into one local per field.
+pub fn scalars(program: &Program, body: &var Body) = {
+	for _ in 0..ROUNDS {
+		val splits = candidates(&program, &body)
+		if splits.isEmpty() then return
+		var remap = Remap(parts: splitLocals(&program, &var body, &splits))
+		for b in 0..body.blocks.len() {
+			var expanded: Vec<Statement> = Vec()
+			for statement in mem::replace(&var body.blocks[b].statements, Vec()) {
+				expand(statement.clone(), &remap.parts, &var expanded)
+			}
+			var statements: Vec<Statement> = Vec()
+			for statement in move expanded {
+				statements.push(rewriteStatement(move statement, &var remap))
+			}
+			body.blocks[b].statements = move statements
+			val terminator = mem::replace(&var body.blocks[b].terminator, .Unreachable)
+			body.blocks[b].terminator = rewriteTerminator(move terminator, &var remap)
+		}
+	}
+}
+
+/// What a split local became.
+@derive(Clone)
+enum Parts {
+	/// A struct's: a local for each field.
+	Fields(fields: Vec<Local>)
+	/// An enum's: a local for its tag, an `i32`, and one for each field of each
+	/// variant.
+	Variants(tag: Local, fields: Vec<Vec<Local>>)
+}
+
+extend Parts {
+	fn place(projection: &Projection): Option<Local> = match self {
+		.Fields(fields) => match projection {
+			.Field(i) if (i as i64) < fields.len() => .Some(fields[i as i64])
+			_ => .None
+		}
+		.Variants(fields, ..) => match projection {
+			.VariantField(variant, field) if (variant as i64) < fields.len() &&
+				(field as i64) < fields[variant as i64].len() => .Some(
+				fields[variant as i64][field as i64],
+			)
+			_ => .None
+		}
+	}
+}
+
+/// What kind of aggregate a local is, where it is one that may be split.
+@derive(Eq, Clone)
+enum Shape {
+	Struct
+	Enum
+}
+
+fn shape(program: &Program, ty: Ty): Option<Shape> = {
+	if program.ownsMemory(ty) then return .None
+	return match program.types.kind(ty) {
+		.Struct(id, ..) => {
+			val def = &program.structs[id]
+			// A union's fields share their bytes, an opaque struct's are C's, a
+			// generator's frame has fields beyond its declared ones, and an
+			// `@intrinsic` type is reached only through its address.
+			val plain =
+				!def.isUnion &&
+				!def.isOpaque &&
+				!def.isIntrinsic &&
+				!def.isEnv &&
+				def.generator.isNone()
+			if plain && program.fieldTys(ty).len() <= MOST_FIELDS then .Some(.Struct) else .None
+		}
+		.Enum(..) => {
+			var fields = 0
+			for variant in program.variantFieldTys(ty) {
+				fields += variant.len()
+			}
+			if fields <= MOST_FIELDS then .Some(.Enum) else .None
+		}
+		_ => .None
+	}
+}
+
+/// The locals of `body` that may be split, with what kind each is.
+fn candidates(program: &Program, body: &Body): Map<Local, Shape> = {
+	var seen = Seen(found: Map(), ruledOut: Vec())
+	for (i, decl) in body.locals.forwards().enumerate() {
+		if !(decl.kind is .Var | .Temp) then continue
+		if shape(&program, decl.ty) is .Some(s) then seen.found.put(Local(i as u32), s.clone())
+	}
+	// Every place a candidate is named, which may rule it out.
+	for block in body.blocks {
+		for statement in block.statements {
+			match statement {
+				// A whole copy of a struct, in or out, is a copy of each field;
+				// anything else assigned to a whole local is not.
+				.Assign(place: dest, rvalue: .Use(.Copy(source))) => {
+					seen.see(&dest, seen.isWhole(&dest, .Struct))
+					seen.see(&source, seen.isWhole(&source, .Struct))
+				}
+				.Assign(place: dest, rvalue) => {
+					seen.see(&dest, false)
+					match rvalue {
+						// The tag of a whole enum is the tag's local.
+						.Variant(place) => seen.see(&place, seen.isWhole(&place, .Enum))
+						// An address taken of anything a candidate holds is an
+						// address of a field of it, which stays a place of its
+						// own: allowed, but not of the whole.
+						.AddressOf(place) => seen.see(&place, false)
+						_ => {
+							for operand in eachOperand(&rvalue) {
+								if operand is .Copy(place) then seen.see(&place, false)
+							}
+						}
+					}
+				}
+				.SetVariant(place, ..) => seen.see(&place, seen.isWhole(&place, .Enum))
+				.Zero(place) => seen.see(&place, true)
+				other => { rewriteStatement(other.clone(), &var seen) }
+			}
+		}
+		for operand in terminatorOperands(&block.terminator) {
+			if operand is .Copy(place) then seen.see(&place, false)
+		}
+	}
+	// An index local inside a projection is a local read, and a candidate is
+	// never one: indices are integers.
+	for local in seen.ruledOut {
+		seen.found.remove(&local)
+	}
+	return move seen.found
+}
+
+/// The candidates, and those a place they are named at has ruled out.
+struct Seen {
+	found: Map<Local, Shape>
+	ruledOut: Vec<Local>
+}
+
+extend Seen {
+	/// Whether `place` is the whole of a candidate of the shape.
+	fn isWhole(place: &Place, shape: Shape): bool =
+		place.projections.isEmpty() && self.found.get(&place.local) is .Some(s) && s == shape
+
+	var fn see(place: &Place, wholeAllowed: bool) = {
+		val .Some(shape) = self.found.get(&place.local) else {
+			return
+		}
+		val fits = if place.projections.isEmpty() {
+			wholeAllowed
+		} else {
+			match place.projections[0] {
+				.Field(..) => shape == Shape::Struct
+				.VariantField(..) => shape == Shape::Enum
+				_ => false
+			}
+		}
+		if !fits then self.ruledOut.push(place.local)
+		// An index into a candidate's field names another local, which is only
+		// read: it is seen where it is written.
+	}
+}
+
+extend Seen: Rewrite {
+	var fn read(place: Place): Place = {
+		self.see(&place, false)
+		return move place
+	}
+
+	var fn written(place: Place): Place = {
+		self.see(&place, false)
+		return move place
+	}
+
+	fn rewritesCallee(): bool = true
+}
+
+/// Makes the locals each split local becomes.
+fn splitLocals(
+	program: &Program,
+	body: &var Body,
+	splits: &Map<Local, Shape>,
+): Map<Local, Parts> = {
+	var parts: Map<Local, Parts> = Map()
+	var ordered: Vec<Local> = Vec()
+	for entry in splits {
+		ordered.push(entry.key)
+	}
+	ordered.sort()
+	for local in ordered {
+		val ty = body.locals[local.index as i64].ty
+		val made: Parts = match splits.at(&local) {
+			.Struct => {
+				var fields: Vec<Local> = Vec()
+				for field in program.fieldTys(ty) {
+					fields.push(newLocal(&var body, field))
+				}
+				.Fields(move fields)
+			}
+			.Enum => {
+				val tag = newLocal(&var body, I32)
+				var fields: Vec<Vec<Local>> = Vec()
+				for variant in program.variantFieldTys(ty) {
+					var locals: Vec<Local> = Vec()
+					for f in variant {
+						locals.push(newLocal(&var body, f))
+					}
+					fields.push(move locals)
+				}
+				.Variants(tag: tag, fields: move fields)
+			}
+		}
+		parts.put(local, move made)
+		// Nothing names the whole any more: it needs no storage.
+		body.locals[local.index as i64].ty = UNIT
+	}
+	return move parts
+}
+
+fn newLocal(body: &var Body, ty: Ty): Local = {
+	body.locals.push(LocalDecl::unnamed(ty, .Temp))
+	return Local((body.locals.len() - 1) as u32)
+}
+
+/// Writes `statement` as what it is once its split locals are fields: a whole
+/// copy becomes a copy of each field, a tag written or read becomes the tag's
+/// local, and zeros become zeros in each part.
+fn expand(statement: Statement, parts: &Map<Local, Parts>, out: &var Vec<Statement>) = {
+	match statement {
+		.Assign(place: dest, rvalue: .Use(.Copy(source))) if isWhole(&dest, &parts) ||
+			isWhole(&source, &parts) => {
+			val split = if isWhole(&dest, &parts) then dest.local else source.local
+			val .Fields(fields) = parts.at(&split) else {
+				panic("an enum copied whole is not split")
+			}
+			for i in 0..(fields.len() as u32) {
+				out.push(.Assign(
+					place: dest.project(.Field(i)),
+					rvalue: .Use(.Copy(source.project(.Field(i)))),
+				))
+			}
+			return
+		}
+		.SetVariant(place, variant) if isWhole(&place, &parts) => {
+			val .Variants(tag, ..) = parts.at(&place.local) else {
+				panic("only an enum has a variant")
+			}
+			out.push(.Assign(
+				place: Place::of(tag),
+				rvalue: .Use(.Const(.Int(bits: variant as u128, ty: I32))),
+			))
+			return
+		}
+		.Assign(place: dest, rvalue: .Variant(place)) if isWhole(&place, &parts) => {
+			val .Variants(tag, ..) = parts.at(&place.local) else {
+				panic("only an enum has a variant")
+			}
+			out.push(.Assign(place: dest.clone(), rvalue: .Use(.Copy(Place::of(tag)))))
+			return
+		}
+		.Zero(place) if isWhole(&place, &parts) => {
+			match parts.at(&place.local) {
+				.Fields(fields) => {
+					for f in fields {
+						out.push(.Zero(Place::of(f)))
+					}
+				}
+				.Variants(tag, fields) => {
+					out.push(.Zero(Place::of(tag)))
+					for variant in fields {
+						for f in variant {
+							out.push(.Zero(Place::of(f)))
+						}
+					}
+				}
+			}
+			return
+		}
+		_ => {}
+	}
+	out.push(move statement)
+}
+
+/// Whether `place` is the whole of a split local.
+fn isWhole(place: &Place, parts: &Map<Local, Parts>): bool =
+	place.projections.isEmpty() && parts.contains(&place.local)
+
+/// What each split local became, as a rewrite of the places that name it.
+struct Remap {
+	parts: Map<Local, Parts>
+}
+
+extend Remap {
+	/// A place whose first projection is a field of a split local, as the
+	/// field's own local.
+	fn remap(place: Place): Place = {
+		if place.projections.isEmpty() then return move place
+		val .Some(split) = self.parts.get(&place.local) else {
+			return move place
+		}
+		val .Some(local) = split.place(&place.projections[0]) else {
+			return move place
+		}
+		return Place(local: local, projections: place.projections[1..].toVec())
+	}
+}
+
+extend Remap: Rewrite {
+	var fn read(place: Place): Place = self.remap(move place)
+
+	var fn written(place: Place): Place = self.remap(move place)
+
+	fn rewritesCallee(): bool = true
+}
+
+/// Each operand an rvalue reads.
+pub fn eachOperand(rvalue: &Rvalue): Vec<Operand> = match rvalue {
+	.Use(o) | .Unary(operand: o, ..) | .Cast(operand: o, ..) | .CstrLen(o) | .Float(operand: o, ..)
+	| .Integer(operand: o, ..) | .Bits(o) | .VTableFn(table: o, ..) => Vec::of(own [o.clone()])
+	.Binary(lhs, rhs, ..) | .Rotate(lhs, rhs, ..) | .Overflows(lhs, rhs, ..) => Vec::of(own [
+		lhs.clone(),
+		rhs.clone(),
+	])
+	.MulAdd(first, second, third) => Vec::of(own [first.clone(), second.clone(), third.clone()])
+	.AddressOf(..) | .Variant(..) => Vec()
+}
+
+/// Each operand a terminator reads.
+pub fn terminatorOperands(terminator: &Terminator): Vec<Operand> = match terminator {
+	.Branch(cond, ..) => Vec::of(own [cond.clone()])
+	.Switch(value, ..) => Vec::of(own [value.clone()])
+	.Panic(note: .Some(note), ..) => Vec::of(own [note.clone()])
+	_ => Vec()
+}

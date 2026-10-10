@@ -1,0 +1,206 @@
+// The Language Server Protocol's framing, and its way of naming places:
+// JSON-RPC messages behind a `Content-Length` header, files by `file://`
+// URI, and positions by line and UTF-16 column. And what the server builds
+// its messages with: an object of pairs, and a field looked up by its path.
+
+import std::io
+import std::json::{Json, parse as parseJson}
+
+/// The next message, or nothing at the end of the input.
+pub fn readMessage(input: &var io::Reader): Result<Option<Json>, String> = {
+	var length: Option<i64> = .None
+	while true {
+		var line = String()
+		match input.readLine(&var line) {
+			.Ok(true) => {}
+			.Ok(false) => return .Ok(.None)
+			.Err(error) => return .Err("\(error)")
+		}
+		val header = line.toStr().trimEnd()
+		if header.isEmpty() then break
+		if header.stripPrefix("Content-Length:") is .Some(n) then
+			length = if n.trim().toInt() is .Ok(count) then .Some(count) else .None
+	}
+	val .Some(count) = length else {
+		return .Err(String::of("a message with no Content-Length"))
+	}
+	var body = String()
+	if input.readExact(count, &var body) is .Err(error) then return .Err("\(error)")
+	return match parseJson(body.toStr()) {
+		.Ok(message) => .Ok(.Some(move message))
+		.Err(error) => .Err("\(error)")
+	}
+}
+
+/// `message`, framed, on standard output.
+pub fn writeMessage(message: &Json) = {
+	val body = message.toString()
+	io::print("Content-Length: \(body.len())\r\n\r\n\(body)")
+	// Standard output is the editor's; if it has gone, so will the server.
+	io::flush()
+}
+
+/// An object of `fields`, in their order.
+pub fn object(fields: &[(str, Json)]): Json = {
+	var pairs: Vec<(String, Json)> = Vec()
+	for (name, value) in fields {
+		pairs.push((String::of(name), value.clone()))
+	}
+	return .Object(move pairs)
+}
+
+/// `value` with `name` set to `field`, added where it has no such field.
+pub fn withField(value: Json, name: str, field: Json): Json = match move value {
+	.Object(fields) => {
+		var all = move fields
+		var found = false
+		for pair in all {
+			if pair.0 == name {
+				pair.1 = field.clone()
+				found = true
+			}
+		}
+		if !found then all.push((String::of(name), move field))
+		return .Object(move all)
+	}
+	other => move other
+}
+
+/// What `value` holds at `path`, a field of a field: `Null` where any of it
+/// is missing, as an editor's message leaves out what it need not say.
+pub fn fieldAt(value: &Json, path: &[str]): Json = {
+	var here = value.clone()
+	for name in path {
+		here = match here.get(name) {
+			.Some(found) => found.clone()
+			.None => Json::Null
+		}
+	}
+	return move here
+}
+
+/// The text `value` holds at `path`, or the empty text.
+pub fn textAt(value: &Json, path: &[str]): String = match fieldAt(&value, &path) {
+	.Text(text) => move text
+	_ => String()
+}
+
+/// The number `value` holds at `path`, or none.
+fn intAt(value: &Json, path: &[str]): Option<i64> = match fieldAt(&value, &path) {
+	.Int(n) => .Some(n)
+	_ => .None
+}
+
+/// Text as JSON.
+pub fn jsonText(text: str): Json = .Text(String::of(text))
+
+/// Where each line of a text begins, to turn byte offsets into the
+/// protocol's positions and back.
+pub view struct Lines {
+	text: str
+	starts: Vec<i64>
+}
+
+extend Lines {
+	pub static fn of(text: str): Lines = {
+		var starts = Vec::of(own [0])
+		for i in 0..text.len() {
+			if text[i] == '\n' as u8 then starts.push(i + 1)
+		}
+		return Lines(text: text, starts: move starts)
+	}
+
+	/// `{ line, character }` of a byte offset, the column counted in UTF-16
+	/// code units as the protocol counts it.
+	pub fn position(at: i64): Json = {
+		var offset = if at < self.text.len() then at else self.text.len()
+		while offset > 0 && offset < self.text.len() && (self.text[offset] & 0xC0) == 0x80 {
+			offset -= 1
+		}
+		var line = 0
+		while line + 1 < self.starts.len() && self.starts[line + 1] <= offset {
+			line += 1
+		}
+		var character = 0
+		var i = self.starts[line]
+		while i < offset {
+			val (c, width) = self.text.charAt(i)
+			character += utf16Len(c)
+			i += width
+		}
+		return object([("line", Json::Int(line)), ("character", .Int(character))])
+	}
+
+	pub fn range(lo: i64, hi: i64): Json = object([
+		("start", self.position(lo)),
+		("end", self.position(hi)),
+	])
+
+	/// The byte offset of a `{ line, character }`; past the end of a line is
+	/// its end, and past the last line is the end of the text.
+	pub fn offset(position: &Json): i64 = {
+		val line = match intAt(&position, ["line"]) {
+			.Some(n) => n
+			.None => 0
+		}
+		val character = match intAt(&position, ["character"]) {
+			.Some(n) => n
+			.None => 0
+		}
+		if line < 0 || line >= self.starts.len() then return self.text.len()
+		val start = self.starts[line]
+		var units = 0
+		var i = start
+		while i < self.text.len() {
+			val (c, width) = self.text.charAt(i)
+			if units >= character || c == '\n' then return i
+			units += utf16Len(c)
+			i += width
+		}
+		return self.text.len()
+	}
+
+	/// The range of the whole text.
+	pub fn whole(): Json = self.range(0, self.text.len())
+}
+
+/// How many UTF-16 code units a character takes.
+fn utf16Len(c: char): i64 = if (c as u32) >= 0x10000 then 2 else 1
+
+/// The file a `file://` URI names.
+pub fn pathOf(uri: str): Option<String> = {
+	val .Some(rest) = uri.stripPrefix("file://") else {
+		return .None
+	}
+	var decoded = String()
+	var i = 0
+	while i < rest.len() {
+		if rest[i] == '%' as u8 &&
+			i + 3 <= rest.len() &&
+			rest[i + 1..i + 3].toInt(radix: 16) is .Ok(byte) {
+			decoded.pushByte(byte as u8)
+			i += 3
+			continue
+		}
+		decoded.pushByte(rest[i])
+		i += 1
+	}
+	return if decoded.isValidUtf8() then .Some(move decoded) else .None
+}
+
+/// The `file://` URI of a path, with what a URI may not hold escaped.
+pub fn uriOf(path: str): String = {
+	var uri = String::of("file://")
+	val digits = "0123456789ABCDEF"
+	for i in 0..path.len() {
+		val byte = path[i]
+		if (byte as char).isAsciiAlphanumeric() || byte is b'-' | b'.' | b'_' | b'~' | b'/' {
+			uri.pushByte(byte)
+		} else {
+			uri.push("%")
+			uri.pushByte(digits[(byte >> 4) as i64])
+			uri.pushByte(digits[(byte & 15) as i64])
+		}
+	}
+	return move uri
+}

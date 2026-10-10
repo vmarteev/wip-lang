@@ -1,0 +1,815 @@
+// Instances of generic functions.
+//
+// A generic function's body is checked once, with its type parameters as
+// types. Before code is generated, each use of it with new type arguments
+// makes an instance: a copy of the function whose types have the arguments in
+// place of the parameters. Calls are pointed at their instances, so the MIR
+// and the backends never see a type parameter.
+
+import std::collections::{Map, Set}
+import syntax::{Diagnostic, INSTANTIATION_DEPTH, Interner, Span, Symbol}
+
+/// How deeply instances may be made from instances before they are taken to
+/// be an endless series, as with `f<T>` calling `f<Pair<T, T>>`.
+val MAX_INSTANCE_DEPTH: u32 = 64
+
+/// How deeply types may nest, likewise: `S<T>` holding `own<S<own<T>>>`.
+val MAX_TYPE_DEPTH: u32 = 64
+
+/// Makes every instance a program needs, starting from its functions that
+/// are not generic, and points every call and function value at its
+/// instance. A module makes the instances it uses. Instances are made in the
+/// order they are found.
+pub fn instantiate(program: &var Program, interner: &Interner): Vec<Diagnostic> = {
+	val diagnostics = makeInstances(&var program, &interner)
+	program.fnValues = fnValues(&program)
+	return move diagnostics
+}
+
+/// The functions some body uses as a value, by the instance it names.
+fn fnValues(program: &Program): Set<FnId> = {
+	var values: Set<FnId> = Set()
+	for def in program.fns {
+		val .Some(body) = def.body else {
+			continue
+		}
+		for expr in body.exprs {
+			if expr.kind is .FnRef(id, ..) then values.add(id)
+		}
+	}
+	return move values
+}
+
+/// The instances made so far, by the generic function, its type arguments
+/// and the module that made them; and the bodies still to walk, with how
+/// deep in instances each is.
+struct Instances {
+	made: Map<(FnId, TyList, u32), FnId> = Map()
+	work: Vec<(FnId, u32)> = Vec()
+}
+
+extend Instances {
+	/// The instance of `generic` for `args` in `module`, made where it is new,
+	/// and then walked in its turn.
+	var fn of(program: &var Program, generic: FnId, args: TyList, module: u32, depth: u32): FnId = {
+		val key = (generic, args, module)
+		if self.made.get(&key) is .Some(instance) then return instance
+		val instance = makeInstance(&var program, generic, args, module)
+		self.made.put(key, instance)
+		self.work.push((instance, depth + 1))
+		return instance
+	}
+}
+
+fn makeInstances(program: &var Program, interner: &Interner): Vec<Diagnostic> = {
+	var diagnostics: Vec<Diagnostic> = Vec()
+	// Nothing to make: no generic function, and no interface to build a table
+	// of methods for.
+	var anyGeneric = false
+	for f in program.fns {
+		if !f.generics.isEmpty() then anyGeneric = true
+	}
+	if !anyGeneric && program.impls.isEmpty() then return move diagnostics
+	val start = program.types.len()
+	var instances = Instances()
+	for id in program.fns.ids() {
+		if program.fns[id].generics.isEmpty() && program.fns[id].body.isSome() then
+			instances.work.push((id, 0))
+	}
+	// A `main` that returns a `Result` hands it to the prelude, which reports
+	// the error and answers with the exit code. Nothing calls that function,
+	// so nothing else would make its instance.
+	if entryReport(&program, &interner) is .Some((generic, error)) {
+		val list = program.types.internList([error])
+		val instance = makeInstance(&var program, generic, list, 0)
+		instances.made.put((generic, list, 0), instance)
+		instances.work.push((instance, 1))
+		program.entryReport = .Some(instance)
+	}
+	var reported: Set<FnId> = Set()
+	var next = 0
+	while next < instances.work.len() {
+		val (id, depth) = instances.work[next]
+		next += 1
+		val module = program.fns[id].module
+		val args: Vec<Ty> = match program.fns[id].instanceOf {
+			.Some((_, list)) => program.types.list(list).toVec()
+			.None => Vec()
+		}
+		// An `@intrinsic` has no body to walk: the compiler writes it where it
+		// is called.
+		val .Some(taken) = program.fns[id].body.take() else {
+			continue
+		}
+		var body = move taken
+		// The tables of methods this body needs, with every method concrete.
+		var dynRefs: Vec<(InterfaceId, Ty)> = Vec()
+		for expr in body.exprs {
+			val .DynRef(value, interfaceId) = expr.kind else {
+				continue
+			}
+			val .Ref(inner: pointee, ..) = program.types.kind(body.exprs[value].ty) else {
+				continue
+			}
+			dynRefs.push((interfaceId, program.types.subst(pointee, &args)))
+		}
+		// The drop of every type this body ends a value of, made concrete. A
+		// drop is called from the code generator rather than from an
+		// expression, so nothing else would instantiate it.
+		var dropped: Vec<Ty> = Vec()
+		for local in body.locals {
+			val ty = program.types.subst(local.ty, &args)
+			collectDrops(&program, ty, &var dropped)
+		}
+		for expr in body.exprs {
+			val ty = program.types.subst(expr.ty, &args)
+			collectDrops(&program, ty, &var dropped)
+		}
+		for ty in dropped {
+			instanceDrop(&var program, &var instances, ty, module, depth)
+		}
+		for (interfaceId, ty) in dynRefs {
+			var known = false
+			for table in program.vtables {
+				if table.interfaceId == interfaceId && table.ty == ty then known = true
+			}
+			if known then continue
+			val methods = program.interfaces[interfaceId].methods.clone()
+			var concrete: Vec<FnId> = Vec()
+			for method in methods {
+				val .Some(
+					(implementation, methodArgs),
+				) = implementationOf(&program, interfaceId, method.id, [ty]) else {
+					continue
+				}
+				if methodArgs.isEmpty() {
+					concrete.push(implementation)
+					continue
+				}
+				val list = program.types.internList(&methodArgs)
+				concrete.push(instances.of(&var program, implementation, list, module, depth))
+			}
+			program.vtables.push(VTableDef(
+				interfaceId: interfaceId,
+				ty: ty,
+				methods: move concrete,
+			))
+		}
+		// Calls whose `Self` is an array, which the slice's implementation
+		// answers: the call, and the element.
+		var lentAsSlices: Vec<(ExprId, FnId, Ty)> = Vec()
+		// Calls whose `Self` is a `&T`, which `T`'s implementation answers: the
+		// call, the interface's method, and how many references.
+		var readThrough: Vec<(ExprId, FnId, u32)> = Vec()
+		// Calls of `clone` on a `&T`, which copy the reference.
+		var copiedReferences: Vec<ExprId> = Vec()
+		for at in body.exprs.ids() {
+			val kind = body.exprs[at].kind.clone()
+			// A lambda inside a generic function is generic in the same way, and
+			// its instance comes with the enclosing one: nothing calls it by
+			// name, so nothing else would make it.
+			if kind is .Closure(id: code, env) {
+				if !program.fns[code].generics.isEmpty() && !args.isEmpty() {
+					val concrete = program.types.internList(&args)
+					val instance = instances.of(&var program, code, concrete, module, depth)
+					body.exprs[at].kind = .Closure(id: instance, env: env)
+				}
+				continue
+			}
+			// A call, or a function named as a value.
+			var callee: FnId = Id::of(0)
+			var typeArgs = TyList::empty()
+			match kind {
+				.Call(callee: c, typeArgs: t, ..) | .FnRef(id: c, typeArgs: t) => {
+					callee = c
+					typeArgs = t
+				}
+				_ => continue
+			}
+			if typeArgs == TyList::empty() then continue
+			var concrete = program.types.substList(typeArgs, &args)
+			// A call of an interface's method goes to the implementation for the
+			// type `Self` turned out to be. An extension's is the same for every
+			// implementer, and is made for `Self` as it is.
+			if program.fns[callee].interfaceId is .Some(interfaceId) &&
+				!program.interfaces[interfaceId].extensions.contains(&callee) {
+				var tys = program.types.list(concrete).toVec()
+				// A `&T` is answered by `T`'s implementation, given what the
+				// references point to, and is copied as a view is.
+				val (base, refs) = throughReferences(&program, tys[0])
+				if refs > 0 && program.isClone(interfaceId) {
+					copiedReferences.push(at)
+					continue
+				}
+				tys[0] = base
+				val .Some((implementation, rest)) = implementationOf(
+					&program,
+					interfaceId,
+					callee,
+					&tys,
+				) else {
+					// Plain data with no `clone` of its own is copied.
+					if program.isClone(interfaceId) && program.clonesByCopy(base) then
+						copiedReferences.push(at)
+					continue
+				}
+				if refs > 0 then readThrough.push((at, callee, refs))
+				if program.types.kind(tys[0]) is .Array(elem, ..) then
+					lentAsSlices.push((at, callee, elem))
+				callee = implementation
+				concrete = program.types.internList(&rest)
+				if concrete == TyList::empty() {
+					body.exprs[at].kind = withCallee(move kind, callee, TyList::empty())
+					continue
+				}
+			}
+			val key = (callee, concrete, module)
+			var instance: FnId = callee
+			if instances.made.get(&key) is .Some(found) {
+				instance = found
+			} else if depth >= MAX_INSTANCE_DEPTH {
+				if reported.add(callee) {
+					val generic = &program.fns[callee]
+					val name = interner.resolve(generic.name)
+					diagnostics.push(
+						Diagnostic::error(
+							INSTANTIATION_DEPTH,
+							"the instances of `\(name)` never end",
+							generic.nameSpan,
+							"each instance calls a larger one",
+						).withNote("instances made from instances more than \(MAX_INSTANCE_DEPTH) deep are taken to be an endless series"),
+					)
+				}
+				body.exprs[at].kind = withCallee(move kind, callee, typeArgs)
+				continue
+			} else {
+				instance = instances.of(&var program, callee, concrete, module, depth)
+			}
+			body.exprs[at].kind = withCallee(move kind, instance, TyList::empty())
+		}
+		for (call, method, elem) in lentAsSlices {
+			lendAsSlices(&var program, &var body, &args, call, method, elem)
+		}
+		for (call, method, refs) in readThrough {
+			readThroughReferences(&var program, &var body, &args, call, method, refs)
+		}
+		for call in copiedReferences {
+			copyReference(&var program, &var body, &args, call)
+		}
+		program.fns[id].body = .Some(move body)
+	}
+	// Runaway instances leave runaway types behind, which say nothing more.
+	if diagnostics.isEmpty() then completeTypes(&var program, start, &interner, &var diagnostics)
+	return move diagnostics
+}
+
+/// A call or a function value, pointed at another function with these type
+/// arguments.
+fn withCallee(kind: ExprKind, callee: FnId, typeArgs: TyList): ExprKind = match move kind {
+	.Call(args, order, ..) => .Call(
+		callee: callee,
+		args: move args,
+		typeArgs: typeArgs,
+		order: move order,
+	)
+	.FnRef(..) => .FnRef(id: callee, typeArgs: typeArgs)
+	other => move other
+}
+
+/// The drop of a type a body ends a value of, made concrete, or a
+/// generator's `next`, which drops one.
+fn instanceDrop(
+	program: &var Program,
+	instances: &var Instances,
+	ty: Ty,
+	module: u32,
+	depth: u32,
+) = {
+	// A generator is dropped by its `next`, told to drop what it holds rather
+	// than go on, and that `next` is the one of its type.
+	if program.types.kind(ty) is .Struct(id, args: list) &&
+		program.structs[id].generator is .Some(generator) {
+		if program.generatorNext.contains(&ty) then return
+		val next =
+			if list == TyList::empty() then generator.next
+			else instances.of(&var program, generator.next, list, module, depth)
+		program.generatorNext.put(ty, next)
+		return
+	}
+	if program.dropFns.contains(&ty) then return
+	val .Some(interfaceId) = program.preludeItems.interfaceOf(.Destroy) else {
+		panic("a drop needs its interface")
+	}
+	val method = program.interfaces[interfaceId].methods[0].id
+	val .Some((implementation, methodArgs)) = implementationOf(&program, interfaceId, method, [
+		ty,
+	]) else {
+		return
+	}
+	val concrete = if methodArgs.isEmpty() {
+		implementation
+	} else {
+		val list = program.types.internList(&methodArgs)
+		instances.of(&var program, implementation, list, module, depth)
+	}
+	program.dropFns.put(ty, concrete)
+}
+
+/// Every type inside `ty` that cleans up after itself, including `ty`. A
+/// drop is reached through whatever holds the value, so the parts are walked
+/// as the drop glue walks them.
+fn collectDrops(program: &Program, ty: Ty, out: &var Vec<Ty>) = {
+	var seen: Set<Ty> = Set()
+	dropsWalk(&program, ty, &var out, &var seen)
+}
+
+fn dropsWalk(program: &Program, ty: Ty, out: &var Vec<Ty>, seen: &var Set<Ty>) = {
+	if !seen.add(ty) then return
+	if program.hasDrop(ty) && !out.contains(&ty) then out.push(ty)
+	match program.types.kind(ty) {
+		.Own(inner) | .Array(elem: inner, ..) | .Slice(elem: inner) => dropsWalk(
+			&program,
+			inner,
+			&var out,
+			&var seen,
+		)
+		.Struct(..) => {
+			for field in program.fieldTys(ty) {
+				dropsWalk(&program, field, &var out, &var seen)
+			}
+		}
+		.Enum(..) => {
+			for fields in program.variantFieldTys(ty) {
+				for field in fields {
+					dropsWalk(&program, field, &var out, &var seen)
+				}
+			}
+		}
+		_ => {}
+	}
+}
+
+/// Whether a parameter is `&Self`, which `Self` the method's first type
+/// parameter is.
+fn takesSelf(program: &Program, param: &ParamDef): Option<RefKind> = {
+	val .Ref(inner: target, kind) = program.types.kind(param.ty) else {
+		return .None
+	}
+	return if program.types.kind(target) is .Param(param: p) && p.index == 0 then .Some(kind)
+	else .None
+}
+
+/// A call of an interface's method whose `Self` is an array, gone to the
+/// slice's implementation: each argument the method takes as `&Self` is
+/// lent as the slice of all of the array, which is what that implementation
+/// takes.
+fn lendAsSlices(
+	program: &var Program,
+	body: &var Body,
+	args: &[Ty],
+	call: ExprId,
+	method: FnId,
+	elem: Ty,
+) = {
+	val .Call(args: callArgs, ..) = body.exprs[call].kind.clone() else {
+		return
+	}
+	val slice = program.types.intern(.Slice(elem))
+	var lent = callArgs.clone()
+	val params = program.fns[method].params.clone()
+	for (i, param) in params.forwards().enumerate() {
+		// `Self` is the method's first type parameter.
+		val .Some(kind) = takesSelf(&program, &param) else {
+			continue
+		}
+		if i >= callArgs.len() then continue
+		val arg = callArgs[i]
+		val span = body.exprs[arg].span
+		val argTy = program.types.subst(body.exprs[arg].ty, &args)
+		val .Ref(inner: array, ..) = program.types.kind(argTy) else {
+			continue
+		}
+		// `&place` lends the place itself; any other reference is followed.
+		val place = match body.exprs[arg].kind {
+			.Ref(p) => p
+			_ => body.exprs.add(Expr(kind: .Deref(arg), ty: array, span: span))
+		}
+		val whole = body.exprs.add(Expr(
+			kind: .SubSlice(base: place, lo: .None, hi: .None),
+			ty: slice,
+			span: span,
+		))
+		val reference = program.types.intern(.Ref(inner: slice, kind: kind))
+		lent[i] = body.exprs.add(Expr(kind: .Ref(whole), ty: reference, span: span))
+	}
+	if body.exprs[call].kind.clone() is .Call(callee, typeArgs, order, ..) then
+		body.exprs[call].kind = .Call(
+			callee: callee,
+			args: move lent,
+			typeArgs: typeArgs,
+			order: move order,
+		)
+}
+
+/// `ty` without the `&` references around it, and how many there were: a
+/// `&&Node` is answered by `Node`'s implementations.
+fn throughReferences(program: &Program, start: Ty): (Ty, u32) = {
+	var ty = start
+	var depth: u32 = 0
+	while program.referred(ty) is .Some(inner) {
+		ty = inner
+		depth += 1
+	}
+	return (ty, depth)
+}
+
+/// A call of an interface's method whose `Self` is a `&T`, gone to `T`'s
+/// implementation: each argument the method takes as `&Self` is read through
+/// `depth` references, to the `&T` that implementation takes.
+fn readThroughReferences(
+	program: &var Program,
+	body: &var Body,
+	args: &[Ty],
+	call: ExprId,
+	method: FnId,
+	depth: u32,
+) = {
+	val .Call(args: callArgs, ..) = body.exprs[call].kind.clone() else {
+		return
+	}
+	var read = callArgs.clone()
+	val params = program.fns[method].params.clone()
+	for (i, param) in params.forwards().enumerate() {
+		// `Self` is the method's first type parameter.
+		if takesSelf(&program, &param).isNone() then continue
+		if i >= read.len() then continue
+		val arg = read[i]
+		val span = body.exprs[arg].span
+		var ty = program.types.subst(body.exprs[arg].ty, &args)
+		var e = arg
+		for _ in 0..depth as i64 {
+			val .Ref(inner, ..) = program.types.kind(ty) else {
+				break
+			}
+			e = body.exprs.add(Expr(kind: .Deref(e), ty: inner, span: span))
+			ty = inner
+		}
+		read[i] = e
+	}
+	if body.exprs[call].kind.clone() is .Call(callee, typeArgs, order, ..) then
+		body.exprs[call].kind = .Call(
+			callee: callee,
+			args: move read,
+			typeArgs: typeArgs,
+			order: move order,
+		)
+}
+
+/// `clone` of plain data: what the receiver refers to, copied — a `&T` as a
+/// view is, and a value that owns no memory.
+fn copyReference(program: &var Program, body: &var Body, args: &[Ty], call: ExprId) = {
+	val .Call(args: callArgs, ..) = body.exprs[call].kind.clone() else {
+		return
+	}
+	if callArgs.isEmpty() then return
+	val receiver = callArgs[0]
+	val ty = program.types.subst(body.exprs[call].ty, &args)
+	body.exprs[call].kind = .Deref(receiver)
+	body.exprs[call].ty = ty
+}
+
+/// The function that implements `method` for the type `Self` stands for, and
+/// the type arguments left for it: the method's own.
+fn implementationOf(
+	program: &Program,
+	interfaceId: InterfaceId,
+	method: FnId,
+	args: &[Ty],
+): Option<(FnId, Vec<Ty>)> = {
+	if args.isEmpty() then return .None
+	val selfTy = args[0]
+	var rest: Vec<Ty> = Vec()
+	for i in 1..args.len() {
+		rest.push(args[i])
+	}
+	var index: Option<i64> = .None
+	for (i, m) in program.interfaces[interfaceId].methods.forwards().enumerate() {
+		if index.isNone() && m.id == method then index = .Some(i)
+	}
+	val at = index?
+	var owner: TypeDef = .Builtin(.Slice)
+	var ownerArgs = TyList::empty()
+	match program.types.kind(selfTy) {
+		.Struct(id, args: list) => {
+			owner = .Struct(id)
+			ownerArgs = list
+		}
+		.Enum(id, args: list) => {
+			owner = .Enum(id)
+			ownerArgs = list
+		}
+		// A built-in type the prelude, or a module's own interface, gave
+		// methods to. A slice's element is its argument. An array has its
+		// slice's.
+		.Slice(elem) | .Array(elem, ..) => {
+			owner = .Builtin(.Slice)
+			ownerArgs = program.types.findList([elem])?
+		}
+		kind => owner = .Builtin(BuiltinOwner::of(kind)?)
+	}
+	// An interface that takes types is implemented once per set of them, and
+	// the call's type arguments say which.
+	val takes = program.interfaces[interfaceId].generics.len()
+	var wanted: Vec<Ty> = Vec()
+	if takes <= rest.len() {
+		for i in 0..takes {
+			wanted.push(rest[i])
+		}
+	}
+	val ownerList = program.types.list(ownerArgs).toVec()
+	var implementation: Option<FnId> = .None
+	for i in program.impls {
+		if i.interfaceId == interfaceId &&
+			i.ty == owner &&
+			(takes == 0 || argsMatchWith(&program.types, i.args, &ownerList, &wanted)) {
+			if at < i.methods.len() then implementation = .Some(i.methods[at])
+			break
+		}
+	}
+	val found = implementation?
+	// A method left to its default is the interface's own, which is generic
+	// in `Self`; the type's own method is generic in the type's parameters.
+	// The interface's own types follow `Self` in the call's arguments. A
+	// default body is generic in them too; the type's own method has them
+	// written in its type's parameters already, so it takes only the method's
+	// own after them — `Chars.next` is no instance of anything.
+	var methodArgs: Vec<Ty> = Vec()
+	if program.fns[found].interfaceId.isSome() {
+		methodArgs.push(selfTy)
+		for t in rest {
+			methodArgs.push(t)
+		}
+	} else {
+		methodArgs = program.types.list(ownerArgs).toVec()
+		if takes <= rest.len() {
+			for i in takes..rest.len() {
+				methodArgs.push(rest[i])
+			}
+		}
+	}
+	return .Some((found, move methodArgs))
+}
+
+/// The prelude's `exitCode` or `exitVoid`, and the error type to make it for,
+/// when `main` returns a `Result` whose error can be written as text. A
+/// `main` that is wrong in some other way is reported by `checkMain`, which
+/// runs later; here it is simply left alone.
+fn entryReport(program: &Program, interner: &Interner): Option<(FnId, Ty)> = {
+	val main = mainFn(&program, &interner)?
+	val .Enum(id, args) = program.types.kind(program.fns[main].ret) else {
+		return .None
+	}
+	if program.preludeItems.enumeration(.Result) != .Some(id) then return .None
+	val list = program.types.list(args)
+	val value = list[0]
+	val error = list[1]
+	val text = program.preludeItems.interfaceOf(.Text)?
+	if !program.implements(error, text) then return .None
+	if value == I64 {
+		val f = program.preludeItems.function(.ExitCode)?
+		return .Some((f, error))
+	}
+	if value == UNIT {
+		val f = program.preludeItems.function(.ExitVoid)?
+		return .Some((f, error))
+	}
+	return .None
+}
+
+/// A copy of `generic` for the type arguments `args`, in `module`.
+fn makeInstance(program: &var Program, generic: FnId, args: TyList, module: u32): FnId = {
+	val tys = program.types.list(args).toVec()
+	var def = program.fns[generic].clone()
+	def.generics = Vec()
+	def.instanceOf = .Some((generic, args))
+	def.module = module
+	def.isPub = false
+	for i in 0..def.params.len() {
+		def.params[i].ty = program.types.subst(def.params[i].ty, &tys)
+	}
+	def.ret = program.types.subst(def.ret, &tys)
+	if def.body.take() is .Some(taken) {
+		var body = move taken
+		for id in body.locals.ids() {
+			body.locals[id].ty = program.types.subst(body.locals[id].ty, &tys)
+		}
+		for id in body.exprs.ids() {
+			body.exprs[id].ty = program.types.subst(body.exprs[id].ty, &tys)
+			// The types an expression holds besides its own: the code a closure
+			// is called through, a `dyn` method's type, and the environment a
+			// drop function belongs to. Left generic, a closure that answers a
+			// type parameter was called with the wrong signature.
+			match body.exprs[id].kind.clone() {
+				.CallClosure(callee, args: callArgs, codeTy) => {
+					body.exprs[id].kind = .CallClosure(
+						callee: callee,
+						args: move callArgs,
+						codeTy: program.types.subst(codeTy, &tys),
+					)
+				}
+				.DynCall(interfaceId, index, fnTy, args: callArgs, order) => {
+					body.exprs[id].kind = .DynCall(
+						interfaceId: interfaceId,
+						index: index,
+						fnTy: program.types.subst(fnTy, &tys),
+						args: move callArgs,
+						order: move order,
+					)
+				}
+				.DropRef(ty) => body.exprs[id].kind = .DropRef(program.types.subst(ty, &tys))
+				_ => {}
+			}
+		}
+		def.body = .Some(move body)
+	}
+	return program.fns.add(move def)
+}
+
+/// The types of every field of a struct or enum type, with its type
+/// arguments substituted, interned.
+fn children(program: &var Program, ty: Ty): Vec<Ty> = {
+	var declared: Vec<Ty> = Vec()
+	var args = TyList::empty()
+	match program.types.kind(ty) {
+		.Struct(id, args: list) => {
+			for f in program.structs[id].fields {
+				declared.push(f.ty)
+			}
+			args = list
+		}
+		.Enum(id, args: list) => {
+			for v in program.enums[id].variants {
+				for f in v.fields {
+					declared.push(f.ty)
+				}
+			}
+			args = list
+		}
+		_ => return Vec()
+	}
+	val tys = program.types.list(args).toVec()
+	var out: Vec<Ty> = Vec()
+	for t in declared {
+		out.push(program.types.subst(t, &tys))
+	}
+	return move out
+}
+
+/// Interns the field types of the instances inside `ty`, and of those inside
+/// them. Returns false if that ran into types nested too deeply to be real,
+/// whose instances never end.
+fn completeType(program: &var Program, ty: Ty): bool = {
+	var seen: Set<Ty> = Set()
+	var work = Vec::of(own [ty])
+	while work.pop() is .Some(t) {
+		if program.types.depth(t) > MAX_TYPE_DEPTH then return false
+		if !seen.add(t) then continue
+		match program.types.kind(t) {
+			.Own(inner) | .Array(elem: inner, ..) | .Slice(elem: inner) | .Ref(inner, ..) => work.push(
+				inner,
+			)
+			.Struct(..) | .Enum(..) => {
+				for child in children(&var program, t) {
+					work.push(child)
+				}
+			}
+			_ => {}
+		}
+	}
+	return true
+}
+
+/// Interns the field types of every instance interned since `from`, so that
+/// later phases, which share the types read-only, can look them up.
+fn completeTypes(
+	program: &var Program,
+	from: i64,
+	interner: &Interner,
+	diagnostics: &var Vec<Diagnostic>,
+) = {
+	var reported: Set<Span> = Set()
+	var i = from
+	while i < program.types.len() {
+		val ty = Ty::nth(i)
+		i += 1
+		val args = match program.types.kind(ty) {
+			.Struct(args: list, ..) | .Enum(args: list, ..) => list
+			_ => continue
+		}
+		if args == TyList::empty() then continue
+		if program.types.depth(ty) > MAX_TYPE_DEPTH {
+			val (name, span) = match program.types.kind(ty) {
+				.Struct(id, ..) => (program.structs[id].name, program.structs[id].span)
+				.Enum(id, ..) => (program.enums[id].name, program.enums[id].span)
+				_ => panic("matched above")
+			}
+			if reported.add(span) {
+				val text = interner.resolve(name)
+				diagnostics.push(
+					Diagnostic::error(
+						INSTANTIATION_DEPTH,
+						"the instances of `\(text)` never end",
+						span,
+						"each instance holds a larger one",
+					).withNote("types nested more than \(MAX_TYPE_DEPTH) deep are taken to be an endless series"),
+				)
+			}
+			continue
+		}
+		children(&var program, ty)
+	}
+}
+
+extend Program {
+	/// What `wip test` calls a test: its name, and the module it belongs to
+	/// where that is not the program's own, as `board::placesABall`. It is
+	/// what the runner prints and what a filter is matched against.
+	pub fn testName(id: FnId, interner: &Interner): String = {
+		val def = &self.fns[id]
+		val name = interner.resolve(def.name)
+		val at = def.module as i64
+		if at < self.modules.len() && !self.modules[at].isEmpty() then
+			return "\(self.modules[at])::\(name)"
+		return String::of(name)
+	}
+
+	/// A function's name for messages and listings: its module path, its
+	/// name, and an instance's type arguments, as `list::push<i64>`.
+	pub fn fnName(id: FnId, interner: &Interner): String = {
+		val def = &self.fns[id]
+		val (module, args) = match def.instanceOf {
+			.Some((generic, list)) => (self.fns[generic].module, list)
+			.None => (def.module, TyList::empty())
+		}
+		val plain = self.withArgs(interner.resolve(def.name), args, &interner)
+		// A method is named after the type it belongs to.
+		val name = match self.ownerOfFn(id) {
+			.Some(owner) => "\(self.ownerName(owner, &interner)).\(plain)"
+			.None => move plain
+		}
+		val path = &self.modules[module as i64]
+		return if path.isEmpty() then move name else "\(path)::\(name)"
+	}
+
+	/// The type a function belongs to, for an instance the type its generic
+	/// function belongs to.
+	pub fn ownerOfFn(id: FnId): Option<TypeDef> = match self.fns[id].instanceOf {
+		.Some((generic, _)) => self.fns[generic].owner
+		.None => self.fns[id].owner
+	}
+
+	/// The type a definition and its arguments name: `Vec<i64>` from `Vec`
+	/// and `[i64]`. It is looked up rather than made, since anything that has
+	/// a method of that type has the type already.
+	pub fn typeOf(owner: TypeDef, args: TyList): Option<Ty> = match owner {
+		.Struct(id) => self.types.find(.Struct(id: id, args: args))
+		.Enum(id) => self.types.find(.Enum(id: id, args: args))
+		.Builtin(_) => .None
+	}
+
+	/// Every method a type declares, whichever kind of type it is.
+	pub fn methodsOf(owner: TypeDef): Vec<FnId> = match owner {
+		.Struct(id) => self.structs[id].methods.clone()
+		.Enum(id) => self.enums[id].methods.clone()
+		.Builtin(builtin) => match self.builtins.get(&builtin) {
+			.Some(built) => built.methods.clone()
+			.None => Vec()
+		}
+	}
+
+	/// The name of a struct or an enum, as a symbol. A built-in type has no
+	/// declaration to take a name from; `ownerName` answers for every kind.
+	pub fn typeNameSym(owner: TypeDef): Symbol = match owner {
+		.Struct(id) => self.structs[id].name
+		.Enum(id) => self.enums[id].name
+		.Builtin(_) => panic("a built-in type has no name of its own")
+	}
+
+	/// The name of the type a method belongs to, for messages and symbols.
+	pub fn ownerName(owner: TypeDef, interner: &Interner): String = match owner {
+		.Struct(id) => String::of(interner.resolve(self.structs[id].name))
+		.Enum(id) => String::of(interner.resolve(self.enums[id].name))
+		.Builtin(builtin) => builtin.text()
+	}
+
+	/// Whether code is generated for a function: it has a body, and is not
+	/// generic, and is not a constant's, which the compiler runs instead.
+	pub fn isCompiled(id: FnId): bool = {
+		val def = &self.fns[id]
+		// A method the compiler writes has no body of a program's, and is
+		// compiled all the same.
+		return (def.body.isSome() || def.generated.isSome()) &&
+			def.generics.isEmpty() &&
+			!def.compileTime
+	}
+}

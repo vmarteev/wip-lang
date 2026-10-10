@@ -1,0 +1,152 @@
+// Comma-separated lists in parentheses and brackets, and brace lists
+// separated by line breaks or `,`.
+
+extend Parser {
+	/// Parses `elem ("," elem)* ","?` followed by `close`, after `open` has been
+	/// consumed. Line breaks are whitespace inside. Returns the elements and
+	/// the span of the closing delimiter (empty, where it should have been, if
+	/// it is missing).
+	var fn list<E>(
+		open: Span,
+		close: TokenKind,
+		what: str,
+		startsElem: &(kind: TokenKind) => bool,
+		elem: &var (p: &var Parser) => Option<E>,
+	): (Vec<E>, Span) = self.listAfter(open, .None, close, what, startsElem, elem)
+
+	/// Like `list`, when the first element has already been parsed.
+	var fn listAfter<E>(
+		open: Span,
+		first: Option<E>,
+		close: TokenKind,
+		what: str,
+		startsElem: &(kind: TokenKind) => bool,
+		elem: &var (p: &var Parser) => Option<E>,
+	): (Vec<E>, Span) = {
+		val saved = self.newlines
+		self.newlines = false
+		val errorsBefore = self.diagnostics.len()
+		var needElem = first.isNone()
+		var elems: Vec<E> = Vec()
+		match move first {
+			.Some(element) => elems.push(move element)
+			.None => {}
+		}
+		while true {
+			val kind = self.peek()
+			if kind == close then break
+			if needElem {
+				if !startsElem(kind) {
+					if endsList(kind) || kind is .RParen | .RBracket | .RBrace then break
+					val diagnostic = self.expected(what)
+					self.report(move diagnostic)
+					self.skipUntil((k, _) => k == .Comma || k == close || endsList(k))
+					if !self.eat(.Comma) then break
+					continue
+				}
+				val before = self.pos
+				if elem(&var self) is .Some(element) then elems.push(move element)
+				if self.pos == before then self.bump()
+				needElem = false
+				continue
+			}
+			if self.eat(.Comma) {
+				needElem = true
+				continue
+			}
+			val closeText = close.text().unwrapOr("")
+			if startsElem(kind) {
+				val diagnostic = self.expected("`,` or `\(closeText)`").withFix("add `,`", own [
+					Edit::insert(self.prevSpan().hi, ","),
+				])
+				self.report(move diagnostic)
+				needElem = true
+				continue
+			}
+			val diagnostic = self.expected("`,` or `\(closeText)`")
+			self.report(move diagnostic)
+			if endsList(kind) then break
+			self.skipUntil((k, _) => k == .Comma || k == close || endsList(k))
+			if !self.eat(.Comma) then break
+			needElem = true
+		}
+		self.newlines = saved
+
+		if self.at(close) {
+			val closeSpan = self.bump()
+			return (move elems, closeSpan)
+		}
+		if self.diagnostics.len() == errorsBefore then self.expectClosing(close, open)
+		return (move elems, Span::at(self.prevSpan().hi))
+	}
+
+	/// Parses the items of a brace list after its `{`, up to and including
+	/// the `}`. Items are separated by `list.sep` or by line breaks (grammar
+	/// §1.1). Returns the items and the span of the `}`.
+	var fn braceList<E>(
+		open: Span,
+		list: BraceList,
+		startsElem: &(kind: TokenKind) => bool,
+		elem: &var (p: &var Parser) => Option<E>,
+	): (Vec<E>, Span) = self.inBraces((p) => p.braceListItems(open, list, startsElem, elem))
+
+	var fn braceListItems<E>(
+		open: Span,
+		list: BraceList,
+		startsElem: &(kind: TokenKind) => bool,
+		elem: &var (p: &var Parser) => Option<E>,
+	): (Vec<E>, Span) = {
+		val .Some(sepText) = list.sep.text() else {
+			panic("separators are fixed tokens")
+		}
+		var elems: Vec<E> = Vec()
+		while true {
+			val kind = self.peek()
+			if kind == .RBrace {
+				val close = self.bump()
+				self.bracePairs.push((open, close))
+				return (move elems, close)
+			}
+			if kind == .Eof || isItemStart(kind) && !startsElem(kind) {
+				self.unclosedBrace(open)
+				return (move elems, Span::at(self.prevSpan().hi))
+			}
+			self.beginRegion()
+			if self.leadingOperator() then continue
+			val before = self.pos
+			if startsElem(kind) {
+				if elem(&var self) is .Some(element) then elems.push(move element)
+			} else {
+				val diagnostic = self.expected(list.what)
+				self.report(move diagnostic)
+				self.skipUntil((k, lineBreak) => k == list.sep || lineBreak)
+			}
+			if self.pos == before {
+				self.bump()
+				continue
+			}
+
+			// The separator after an item.
+			if self.eat(list.sep) || self.at(.RBrace) || self.lineBreak() then continue
+			if startsElem(self.peek()) {
+				val one = list.what.stripPrefix("a ").unwrapOr(list.what)
+				val diagnostic = Diagnostic::error(
+					list.code,
+					"missing `\(sepText)` between \(list.items) on one line",
+					self.span(),
+					"starts another \(one) on the same line",
+				).withNote("\(list.items) on one line are separated by `\(sepText)`").withFix(
+					"add `\(sepText)`",
+					own [Edit::insert(self.prevSpan().hi, sepText)],
+				)
+				self.report(move diagnostic)
+				continue
+			}
+			val diagnostic = self.expected("`\(sepText)`, a line break or `}`")
+			self.report(move diagnostic)
+			self.skipUntil((k, lineBreak) => k == list.sep || lineBreak)
+			self.eat(list.sep)
+		}
+		return (move elems, Span::at(self.prevSpan().hi))
+	}
+}

@@ -1,0 +1,413 @@
+// `match` arms and patterns.
+
+/// One element inside a variant pattern's parentheses.
+enum BinderElem {
+	Field(binder: Binder)
+	/// `..`: the fields the pattern does not name are ignored.
+	Rest(span: Span)
+}
+
+fn startsBinder(kind: TokenKind): bool =
+	kind is .Ident(..) | .DotDot | .Underscore || canStartPattern(kind)
+
+extend Parser {
+	var fn arm(): Arm = {
+		val pattern = self.pattern()
+		// `if …` between the pattern and `=>`: a guard.
+		// The condition holds no struct literal, since a `{` there would
+		// read as the arm's body (grammar R1), and no lambda, since its
+		// `=>` is the arm's.
+		val guard: Option<ExprId> = if self.eat(.If) then .Some(self.guardCond()) else .None
+		if !self.eat(.FatArrow) {
+			val diagnostic = self.expected("`=>`")
+			self.report(move diagnostic)
+			// `->` and `=` are the likely typos; treat them as `=>`.
+			if self.peek() is .Arrow | .Eq then self.bump()
+		}
+		// `=> return x`, `=> break`, `=> continue`: the arm ends the
+		// function or the loop, and is a block of that one statement.
+		val body = if self.peek() is .Return | .Break | .Continue {
+			val start = self.span()
+			var stmts: Vec<StmtId> = Vec()
+			if self.stmt() is .Some(stmt) then stmts.push(stmt)
+			val span = start.to(self.prevSpan())
+			self.allocExpr(.Block(block: Block(stmts: move stmts, span: span)), span)
+		} else {
+			self.expr()
+		}
+		return Arm(
+			span: pattern.span.to(self.exprSpan(body)),
+			pattern: move pattern,
+			guard: guard,
+			body: body,
+		)
+	}
+
+	/// A pattern, or several separated by `|`: the value matches where it
+	/// matches any one of them.
+	var fn pattern(): Pattern = {
+		val first = self.onePattern()
+		if !self.at(.Pipe) then return move first
+		val start = first.span
+		var alternatives = Vec::of(own [move first])
+		while self.eat(.Pipe) {
+			alternatives.push(self.onePattern())
+		}
+		return Pattern(kind: .Any(alternatives: move alternatives), span: start.to(self.prevSpan()))
+	}
+
+	var fn onePattern(): Pattern = {
+		val start = self.span()
+		// `..0`, `'a'..='z'`, `MIN..`: a range.
+		if self.peek() is .DotDot | .DotDotEq || self.startsRange() {
+			val lo: Option<RangeBound> =
+				if self.peek() is .DotDot | .DotDotEq then .None else self.rangeBound()
+			val kind = self.rangeRest(move lo)
+			return Pattern(kind: move kind, span: start.to(self.prevSpan()))
+		}
+		val kind: PatternKind = match self.peek() {
+			// A number, a `bool` or text the value must equal.
+			.Int | .Float | .Minus => self.numberPattern()
+			.True => {
+				self.bump()
+				PatternKind::Bool(value: true)
+			}
+			.False => {
+				self.bump()
+				PatternKind::Bool(value: false)
+			}
+			.Str(symbol) => {
+				self.bump()
+				PatternKind::Str(symbol: symbol)
+			}
+			// A character the value must equal.
+			.Char(value) => {
+				self.bump()
+				PatternKind::Char(value: value)
+			}
+			// A byte the value must equal.
+			.Byte(value) => {
+				self.bump()
+				PatternKind::Byte(value: value)
+			}
+			.Underscore => {
+				self.bump()
+				PatternKind::Wildcard
+			}
+			// `.Variant`, whose enum is the type being matched.
+			.Dot => {
+				self.bump()
+				match self.name("a variant name") {
+					.Some(variant) => self.variantPattern(true, Vec::of(own [variant]))
+					.None => .Error
+				}
+			}
+			.Ident(symbol) => match self.nth(1) {
+				.ColonColon => {
+					var segments = Vec::of(own [Name(sym: symbol, span: self.bump())])
+					var broken = false
+					while self.eat(.ColonColon) {
+						match self.name("a name after `::`") {
+							.Some(name) => segments.push(name)
+							.None => {
+								broken = true
+								break
+							}
+						}
+					}
+					if broken then PatternKind::Error else self.variantPattern(false, move segments)
+				}
+				// `Point(x, y)`: a struct taken apart, or a variant whose
+				// enum was left out — which one is a question for the
+				// checker.
+				.LParen => {
+					val name = Name(sym: symbol, span: self.bump())
+					self.variantPattern(false, Vec::of(own [name]))
+				}
+				_ => {
+					self.bump()
+					PatternKind::Binding(symbol: symbol)
+				}
+			}
+			// `(x, y)`: a tuple taken apart, which is the prelude's
+			// `Tuple2(_0: x, _1: y)`.
+			.LParen => {
+				val open = self.bump()
+				val (elems, _) = self.list(
+					open,
+					.RParen,
+					"a pattern",
+					(kind) => canStartPattern(kind),
+					(p) => .Some(p.pattern()),
+				)
+				val span = start.to(self.prevSpan())
+				match self.tupleName(elems.len(), span, "pattern") {
+					.Some(name) => {
+						var binders: Vec<Binder> = Vec()
+						var i = 0
+						for pattern in move elems {
+							val at = pattern.span
+							binders.push(Binder(
+								field: Name(sym: Symbol::tupleField(i), span: at),
+								pattern: .Some(move pattern),
+								span: at,
+							))
+							i += 1
+						}
+						.Variant(
+							leadingDot: false,
+							segments: Vec::of(own [Name(sym: name, span: span)]),
+							binders: .Some(move binders),
+							rest: false,
+						)
+					}
+					.None => .Error
+				}
+			}
+			// `[first, ..rest]`: the elements of an array or a slice.
+			.LBracket => self.slicePattern()
+			_ => {
+				val diagnostic = self.expected("a pattern").withNote(
+					"a pattern is `_`, a name, `(x, y)`, `[a, ..]`, or `.Variant(…)`",
+				)
+				self.report(move diagnostic)
+				return Pattern(kind: .Error, span: Span::at(self.prevSpan().hi))
+			}
+		}
+		return Pattern(kind: move kind, span: start.to(self.prevSpan()))
+	}
+
+	/// `[a, b]`, `[first, ..rest]`, `[.., last]`, at the `[`. `..` with a name
+	/// after it binds the elements between; with a number, a character or a
+	/// path after it, it is a range, as anywhere else. A name that is a
+	/// constant is a range too, which the checker decides, as it decides any
+	/// name in a pattern.
+	var fn slicePattern(): PatternKind = {
+		val open = self.bump()
+		val (elements, _) = self.list(
+			open,
+			.RBracket,
+			"a pattern or `..`",
+			(kind) => canStartPattern(kind),
+			(p) => {
+				val restHere =
+					p.at(.DotDot) &&
+					match p.nth(1) {
+						.Ident(..) => p.nth(2) != .ColonColon
+						next => !canStartBound(next)
+					}
+				if !restHere then return .Some(SliceElement::Pattern(pattern: p.pattern()))
+				val dots = p.bump()
+				var name: Option<Name> = .None
+				if p.peek() is .Ident(symbol) then name = .Some(Name(sym: symbol, span: p.bump()))
+				return .Some(SliceElement::Rest(name: name, span: dots.to(p.prevSpan())))
+			},
+		)
+		return .Slice(elements: move elements)
+	}
+
+	/// Whether a range starts here: a bound, then `..` or `..=`.
+	var fn startsRange(): bool = {
+		var i = 0
+		match self.nth(i) {
+			.Minus => {
+				if self.nth(1) != .Int then return false
+				i = 2
+			}
+			.Int | .Char(..) | .Byte(..) => i = 1
+			.Ident(..) => {
+				i = 1
+				while self.nth(i) == .ColonColon && isIdent(self.nth(i + 1)) {
+					i += 2
+				}
+			}
+			_ => return false
+		}
+		return self.nth(i) is .DotDot | .DotDotEq
+	}
+
+	/// One end of a range: a number, a character, a byte, or a constant.
+	var fn rangeBound(): Option<RangeBound> = {
+		val start = self.span()
+		val kind: RangeBoundKind = match self.peek() {
+			.Int | .Minus => match self.numberPattern() {
+				.Int(negative, magnitude) => .Int(negative: negative, magnitude: magnitude)
+				_ => return .None
+			}
+			.Char(value) => {
+				self.bump()
+				RangeBoundKind::Char(value: value)
+			}
+			.Byte(value) => {
+				self.bump()
+				RangeBoundKind::Byte(value: value)
+			}
+			.Ident(..) => {
+				var path = Vec::of(own [self.name("a constant")?])
+				while self.eat(.ColonColon) {
+					path.push(self.name("a name after `::`")?)
+				}
+				.Const(path: move path)
+			}
+			_ => {
+				val diagnostic = self.expected("a number, a character or a constant")
+				self.report(move diagnostic)
+				return .None
+			}
+		}
+		return .Some(RangeBound(kind: move kind, span: start.to(self.prevSpan())))
+	}
+
+	/// A range from `lo`, at its `..` or `..=`: the end after it, which
+	/// `..=` must have and `..` may leave off, as `..` must where `lo` is
+	/// off too.
+	var fn rangeRest(lo: Option<RangeBound>): PatternKind = {
+		val inclusive = self.at(.DotDotEq)
+		self.bump()
+		val hi: Option<RangeBound> = if canStartBound(self.peek()) then self.rangeBound() else .None
+		if hi.isNone() && (inclusive || lo.isNone()) {
+			val diagnostic = self.expected("the end of the range").withNote(
+				"`lo..=hi` takes its end and must have one; `lo..` has none, and runs to the type's greatest value",
+			)
+			self.report(move diagnostic)
+			return .Error
+		}
+		return .Range(lo: move lo, hi: move hi, inclusive: inclusive)
+	}
+
+	/// A number in a pattern, with the `-` before it where it has one.
+	/// A float is reported: two of them may be equal and
+	/// have different bytes, and a pattern is an equality.
+	var fn numberPattern(): PatternKind = {
+		val negative = self.at(.Minus)
+		val minus: Option<Span> = if negative then .Some(self.bump()) else .None
+		val span = self.span()
+		if self.at(.Float) {
+			val text = String::of(self.text(span))
+			self.bump()
+			val diagnostic = Diagnostic::error(
+				FLOAT_PATTERN,
+				"a pattern cannot be a float",
+				match minus {
+					.Some(m) => m.to(span)
+					.None => span
+				},
+				"not a pattern",
+			).withHelp("test it with `==` or a range: `if x == \(text)`").withNote(
+				"two floats may be equal and hold different bytes, and a pattern asks whether a value is one thing",
+			)
+			self.report(move diagnostic)
+			return .Error
+		}
+		return match self.intLiteral("a number") {
+			.Some(magnitude) => .Int(negative: negative, magnitude: magnitude as u128)
+			.None => .Error
+		}
+	}
+
+	/// A variant pattern after its name: its binders, if it has parentheses.
+	var fn variantPattern(leadingDot: bool, segments: Vec<Name>): PatternKind = {
+		if !self.at(.LParen) then
+			return .Variant(
+				leadingDot: leadingDot,
+				segments: move segments,
+				binders: .None,
+				rest: false,
+			)
+		val open = self.bump()
+		val (elems, _) = self.list(
+			open,
+			.RParen,
+			"a field name or `..`",
+			(kind) => startsBinder(kind),
+			(p) => p.binderElem(),
+		)
+		var binders: Vec<Binder> = Vec()
+		var rest: Option<Span> = .None
+		var misplaced = false
+		for elem in move elems {
+			match move elem {
+				.Field(binder) => {
+					if rest is .Some(dots) && !misplaced {
+						misplaced = true
+						val diagnostic = Diagnostic::error(
+							BINDER_AFTER_REST,
+							"`..` must come last in a pattern",
+							binder.span,
+							"named after `..`",
+						).withSecondary(dots, "the remaining fields").withHelp(
+							"`..` stands for every field the pattern does not name",
+						)
+						self.report(move diagnostic)
+					}
+					binders.push(move binder)
+				}
+				.Rest(span) => if rest.isNone() then rest = .Some(span)
+			}
+		}
+		return .Variant(
+			leadingDot: leadingDot,
+			segments: move segments,
+			binders: .Some(move binders),
+			rest: rest.isSome(),
+		)
+	}
+
+	/// A field name, `field: name`, or `..`.
+	var fn binderElem(): Option<BinderElem> = match self.peek() {
+		.DotDot if !canStartBound(self.nth(1)) => .Some(.Rest(span: self.bump()))
+		// `_` alone stands for the one field, as any pattern there does;
+		// the checker refuses it where the variant has more.
+		.Underscore if self.nth(1) is .Comma | .RParen => {
+			val span = self.bump()
+			return .Some(.Field(binder: Binder(
+				field: Name(sym: Symbol::positional(), span: span),
+				pattern: .Some(Pattern(kind: .Wildcard, span: span)),
+				span: span,
+			)))
+		}
+		.Underscore => {
+			val span = self.bump()
+			val diagnostic = Diagnostic::error(
+				UNDERSCORE_BINDER,
+				"`_` is not a binder",
+				span,
+				"a field name is expected here",
+			).withHelp(
+				"binders name their fields: leave a field out, and end the pattern with `..`",
+			)
+			self.report(move diagnostic)
+			return .None
+		}
+		// A name followed by `(` or `::` begins a pattern, a struct
+		// taken apart or a variant by its path, and is not a field's.
+		.Ident(symbol) if !(self.nth(1) is .LParen | .ColonColon) => {
+			val field = Name(sym: symbol, span: self.bump())
+			// `field: name` binds it under that name, and a bare name
+			// in a pattern is a binding, so one rule covers both.
+			val pattern: Option<Pattern> = if self.eat(.Colon) then .Some(self.pattern()) else .None
+			return .Some(.Field(binder: Binder(
+				field: field,
+				pattern: move pattern,
+				span: field.span.to(self.prevSpan()),
+			)))
+		}
+		// A pattern where a field name could stand: the one field the
+		// variant has is the one it tests, as a bare name binds it.
+		kind if canStartPattern(kind) => {
+			val start = self.span()
+			val pattern = self.pattern()
+			val span = pattern.span
+			return .Some(.Field(binder: Binder(
+				field: Name(sym: Symbol::positional(), span: start),
+				pattern: .Some(move pattern),
+				span: span,
+			)))
+		}
+		_ => {
+			val diagnostic = self.expected("a field name or `..`")
+			self.report(move diagnostic)
+			return .None
+		}
+	}
+}

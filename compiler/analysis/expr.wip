@@ -1,0 +1,767 @@
+// Expressions, and how each use of a place is checked.
+
+import std::collections::{Map}
+import hir::{ExprId, LocalId, NEVER, Pattern, evaluationOrder}
+import syntax::{
+	CANNOT_COPY_OWN,
+	CANNOT_MOVE_OUT_OF_ARRAY,
+	CANNOT_MOVE_OUT_OF_BORROW,
+	CANNOT_MOVE_OUT_OF_TEMPORARY,
+	CANNOT_REPEAT_OWN,
+	Diagnostic,
+	Edit,
+	Span,
+	TAIL_CALL_LEAVES_WORK
+}
+
+/// The order of a call whose arguments are evaluated as they are stored.
+val NO_ORDER: [u32; 0] = []
+
+extend Checker {
+	var fn expr(id: ExprId, ctx: Ctx, state: &var State) = {
+		val body = self.body
+		val expr = &body.exprs[id]
+		match expr.kind {
+			.Local(..) | .Field(..) | .Deref(..) | .Index(..) => self.usePlace(id, ctx, &var state)
+			.Move(inner) => {
+				// The type checker has already rejected `move` of a non-place.
+				val innerCtx =
+					if self.place(inner).isSome() then Ctx::Move(expr.span) else Ctx::Value
+				self.expr(inner, innerCtx, &var state)
+			}
+			.Ref(inner) => self.expr(inner, self.lookedAt(inner), &var state)
+			// A `String` over a `str`'s bytes, made for the call it is lent
+			// to: the text is read, and the `String` is a temporary.
+			.Undropped(inner) => self.expr(inner, .Value, &var state)
+			.Assign(place, op, value, ..) => self.assignment(place, op.isSome(), value, &var state)
+			.Binary(op, lhs, rhs, ..) if op is .And | .Or => {
+				// The right operand may not run, so its moves are only
+				// possible ones.
+				self.expr(lhs, .Value, &var state)
+				var rhsState = state.clone()
+				self.expr(rhs, .Value, &var rhsState)
+				state = state.merge(&rhsState)
+				// What an `is` on the right binds is named only where the right
+				// operand ran and matched, which bound it afresh: where it did
+				// not run, what the binding held on an earlier pass of a loop is
+				// no value anything reads.
+				var bound: Vec<LocalId> = Vec()
+				self.boundByTests(rhs, &var bound)
+				for local in bound {
+					val whole = Path(local: local, projs: Vec())
+					state.reinit(&whole)
+				}
+			}
+			.Binary(lhs, rhs, ..) | .StrCmp(lhs, rhs) => {
+				self.expr(lhs, .Value, &var state)
+				self.expr(rhs, .Value, &var state)
+			}
+			.Unary(operand: e, ..) | .Own(e) => self.expr(e, .Value, &var state)
+			// In the order written.
+			.Call(callee, args, order, ..) => {
+				self.callArgs(&args, &order, .Some(callee), &var state)
+				self.recordCopy(id, callee, &args, &var state)
+				// A call that is a jump leaves this frame in place, so nothing
+				// of it may still need cleaning up.
+				if body.tailCalls.contains(&id) then self.checkTailCall(expr.span, &state)
+			}
+			// The function value is read first: it is plain data.
+			.CallValue(callee, args) => {
+				self.expr(callee, .Value, &var state)
+				self.callArgs(&args, &NO_ORDER, .None, &var state)
+			}
+			// Lending a place reads it; it belongs to a parameter, so nothing
+			// moves.
+			.Lend(place) => self.expr(place, .Inspect, &var state)
+			// A union holds one field's value over zeroed bytes.
+			.Union(field, ..) => {
+				if field is .Some((_, value)) then self.expr(value, .Value, &var state)
+			}
+			.Variant(args: elems, order, ..) | .Struct(fields: elems, order, ..) => {
+				for i in evaluationOrder(&order, elems.len()) {
+					self.expr(elems[i], .Value, &var state)
+				}
+			}
+			.Array(elems) => {
+				for elem in elems {
+					self.expr(elem, .Value, &var state)
+				}
+			}
+			.ArrayRepeat(elem, count) => {
+				self.expr(elem, .Value, &var state)
+				if count > 1 && self.owns(self.ty(elem)) {
+					val diagnostic = Diagnostic::error(CANNOT_REPEAT_OWN, "cannot repeat a value that contains `own`", body.exprs[elem].span, "would give \(count) owners to one allocation").withHelp(
+						"write each element out, so each gets its own allocation",
+					)
+					self.report(move diagnostic)
+				}
+			}
+			.OwnRepeat(elem, count) => {
+				self.expr(elem, .Value, &var state)
+				self.expr(count, .Value, &var state)
+				// The count is known only at run time, so the element's type
+				// decides.
+				if self.owns(self.ty(elem)) {
+					val diagnostic = Diagnostic::error(
+						CANNOT_REPEAT_OWN,
+						"cannot repeat a value that contains `own`",
+						body.exprs[elem].span,
+						"would give every element of the buffer the same allocation",
+					).withHelp("fill the buffer with a value that owns nothing")
+					self.report(move diagnostic)
+				}
+			}
+			.Unsize(inner) => self.expr(inner, .Value, &var state)
+			// The reference is borrowed as any other is; the table beside it
+			// is the type's own.
+			.DynRef(value, ..) => self.expr(value, .Value, &var state)
+			// What a closure captured is borrowed where it is made.
+			.Closure(env, ..) => self.expr(env, .Value, &var state)
+			// An owned closure lent for a call is read where it is lent, as
+			// any reference to it would be.
+			.LendClosure(inner) => self.expr(inner, .Inspect, &var state)
+			// The address of a drop function: plain data.
+			.DropRef(..) => {}
+			.CallClosure(callee, args, ..) => {
+				// A call reads the closure where it is: an owned one stays with
+				// its owner.
+				self.expr(callee, self.lookedAt(callee), &var state)
+				self.callArgs(&args, &NO_ORDER, .None, &var state)
+			}
+			// The receiver is the first argument.
+			.DynCall(interfaceId, index, args, order, ..) => {
+				val method = self.program.interfaces[interfaceId].methods[index as i64].id
+				self.callArgs(&args, &order, .Some(method), &var state)
+			}
+			.Cast(e) | .VariantIndex(e) | .IsNull(e) | .CstrToStr(e) => self.expr(
+				e,
+				.Value,
+				&var state,
+			)
+			.Len(base) => self.expr(base, self.lookedAt(base), &var state)
+			// A range of elements is always borrowed: its base is looked at,
+			// not taken.
+			.SubSlice(base, lo, hi) => {
+				self.expr(base, self.lookedAt(base), &var state)
+				if lo is .Some(bound) then self.expr(bound, .Value, &var state)
+				if hi is .Some(bound) then self.expr(bound, .Value, &var state)
+			}
+			.Block(block) => { self.block(&block, &var state) }
+			.If(cond, thenBlock, elseBlock) => self.ifExpr(cond, &thenBlock, &elseBlock, &var state)
+			// `value is pattern`: its bindings are made here, and the borrow
+			// they hold lasts until the `if` or `while` that tests it ends its
+			// block, which releases it.
+			.Is(scrutinee, pattern) => {
+				self.expr(scrutinee, self.lookedAt(scrutinee), &var state)
+				self.bindPattern(&pattern, scrutinee, .Test, &var state)
+				self.bindViews(&pattern, scrutinee, &var state)
+			}
+			// A step of a walk one place at a time: the binding refers into
+			// the container, which may not change while the body runs, as
+			// for a `for` over a slice.
+			.Match(scrutinee, arms) if body.sequenceWalks.contains(&id) => {
+				self.expr(scrutinee, .Inspect, &var state)
+				val walked = self.accessPath(scrutinee)
+				val span = body.exprs[scrutinee].span
+				for arm in arms {
+					val mark = self.borrows.len()
+					if walked is .Some(path) {
+						var element = path.clone()
+						element.projs.push(.Element)
+						var binders: Vec<(LocalId, Option<Path>)> = Vec()
+						bindingsOf(&arm.pattern, .Some(move element), &var binders)
+						for (local, place) in move binders {
+							match move place {
+								.Some(found) => self.aliases.put(local, move found)
+								.None => {}
+							}
+						}
+						self.borrows.push(Borrow(
+							path: path.clone(),
+							span: span,
+							writes: false,
+							holder: .Loop,
+							heap: false,
+						))
+					}
+					self.expr(arm.body, .Value, &var state)
+					self.borrows.truncate(mark)
+				}
+			}
+			// A tuple matched in place: each element is a scrutinee of its
+			// own, and binds as a `match` on it alone would.
+			.Match(scrutinee, arms) if body.exprs[scrutinee].kind is .Places(..) => {
+				val .Places(elements) = body.exprs[scrutinee].kind else {
+					return
+				}
+				for element in elements {
+					self.expr(element, self.lookedAt(element), &var state)
+				}
+				var joined: Option<State> = .None
+				for arm in arms {
+					val mark = self.borrows.len()
+					var armState = self.bindPlaces(&arm.pattern, &elements, &state)
+					self.expr(arm.body, .Value, &var armState)
+					self.armEnds(&arm.pattern, arm.body, &var armState)
+					self.borrows.truncate(mark)
+					val returns = self.ty(arm.body) == NEVER
+					if !returns then joined = .Some(joinStates(&joined, move armState))
+				}
+				if joined is .Some(j) then state = j.clone()
+			}
+			// Read only by the `match` above.
+			.Places(elements) => {
+				for element in elements {
+					self.expr(element, .Value, &var state)
+				}
+			}
+			.Match(scrutinee, arms) => {
+				self.expr(scrutinee, self.lookedAt(scrutinee), &var state)
+				var joined: Option<State> = .None
+				for arm in arms {
+					var armState = state.clone()
+					val mark = self.borrows.len()
+					self.bindPattern(&arm.pattern, scrutinee, .Match, &var armState)
+					self.bindViews(&arm.pattern, scrutinee, &var armState)
+					self.expr(arm.body, .Value, &var armState)
+					self.armEnds(&arm.pattern, arm.body, &var armState)
+					self.borrows.truncate(mark)
+					val returns = self.ty(arm.body) == NEVER
+					if !returns then joined = .Some(joinStates(&joined, move armState))
+				}
+				if joined is .Some(j) then state = j.clone()
+			}
+			// A constant table is kept once and never written, and what is
+			// read from it is copied. A C pointer is plain data: it is copied,
+			// never dropped, and the move checker leaves it alone.
+			.Int(..) | .Float(..) | .Bool(..) | .Str(..) | .Table(..) | .Null | .Zeroed | .FnRef(..)
+			| .Error => {}
+			// A panic ends the program: nothing after it runs, and nothing is
+			// dropped. A note built for it is read there.
+			.Panic(note, ..) => { if note is .Some(n) then self.expr(n, .Value, &var state) }
+		}
+	}
+
+	/// How an operand is used that is looked at where it is a place, and
+	/// whose value is taken where it is not.
+	fn lookedAt(id: ExprId): Ctx = if self.place(id).isSome() then Ctx::Inspect else Ctx::Value
+
+	/// What an arm's pattern binds of a tuple matched in place, each element
+	/// as a `match` on it alone would bind it, from `state`. Alternatives are
+	/// bound each from `state`, and the arm begins where any of them leaves
+	/// it, as it would after a `match` of its own; a binding that aliases a
+	/// place in each refers to what their places share, as alternatives on
+	/// one value do. Every borrow they make stays until the arm ends.
+	var fn bindPlaces(pattern: &Pattern, elements: &[ExprId], state: &State): State = {
+		val .Any(alternatives, ..) = pattern else {
+			var bound = state.clone()
+			val patterns = pattern.elements(elements.len())
+			for (i, element) in elements.forwards().enumerate() {
+				if i >= patterns.len() then break
+				self.bindPattern(&patterns[i], element, .Match, &var bound)
+				self.bindViews(&patterns[i], element, &var bound)
+			}
+			return move bound
+		}
+		var locals: Vec<LocalId> = Vec()
+		pattern.locals(&var locals)
+		var joined: Option<State> = .None
+		var places: Map<LocalId, Option<Path>> = Map()
+		for alternative in alternatives {
+			for local in locals {
+				self.aliases.remove(&local)
+			}
+			val bound = self.bindPlaces(&alternative, &elements, &state)
+			for local in locals {
+				if !self.body.aliasBindings.contains(&local) then continue
+				val place = match self.aliases.get(&local) {
+					.Some(path) => Option::Some(path.clone())
+					.None => Option::None
+				}
+				val shared = match places.remove(&local) {
+					.Some(earlier) => commonPath(move earlier, move place)
+					.None => move place
+				}
+				places.put(local, move shared)
+			}
+			joined = .Some(joinStates(&joined, move bound))
+		}
+		for entry in places {
+			match entry.value {
+				.Some(path) => self.aliases.put(entry.key, path.clone())
+				.None => { self.aliases.remove(&entry.key) }
+			}
+		}
+		return match move joined {
+			.Some(j) => move j
+			.None => state.clone()
+		}
+	}
+
+	/// What an arm's pattern bound as a value of its own is dropped where
+	/// the arm ends: the arm's value may not borrow it.
+	var fn armEnds(pattern: &Pattern, value: ExprId, state: &var State) = {
+		var locals: Vec<LocalId> = Vec()
+		pattern.locals(&var locals)
+		var owned: Vec<LocalId> = Vec()
+		for local in locals {
+			if !self.body.aliasBindings.contains(&local) then owned.push(local)
+		}
+		if self.ty(value) != NEVER then self.checkBlockValue(value, &owned, "arm", &state)
+		val span = self.body.exprs[value].span
+		val end = Span::new(lo: span.hi.saturatingSub(1), hi: span.hi)
+		for local in owned {
+			val whole = Path(local: local, projs: Vec())
+			self.changed(&whole, end, .Dropped, &var state)
+		}
+	}
+
+	/// `place = value` and `place op= value`, in the order they run. What the
+	/// place's expression computes comes first; then, for `op=`, the place is
+	/// found and its old value read, and the value may not change what it is
+	/// in (E0414). For `=` the value comes next, and the place is found where
+	/// it is written, in what the value left: the value may change what it is
+	/// in, but not what its expression lends (E0414), nor move what it is
+	/// found from (E0408).
+	var fn assignment(place: ExprId, compound: bool, value: ExprId, state: &var State) = {
+		val body = self.body
+		self.placeParts(place, &var state)
+		val found = match self.place(place) {
+			.Some(found) => move found
+			.None => panic("an assignment's target is a place")
+		}
+		if compound {
+			if found is .Path(path) {
+				val name = self.display(place)
+				self.checkLive(&path, &name, body.exprs[place].span, &state)
+				self.readAfterCopy(path.local, false, &var state)
+			}
+		}
+		val mark = self.borrows.len()
+		if compound {
+			match self.accessPath(place) {
+				.Some(path) => self.borrows.push(Borrow(
+					path: move path,
+					span: body.exprs[place].span,
+					writes: true,
+					holder: .Assign(place),
+					heap: false,
+				))
+				.None => {}
+			}
+		} else {
+			val held = self.operandBorrows(place, &state)
+			for (path, span, writes) in move held {
+				self.borrows.push(Borrow(
+					path: move path,
+					span: span,
+					writes: writes,
+					holder: .Operand(place),
+					heap: false,
+				))
+			}
+		}
+		self.expr(value, .Value, &var state)
+		self.borrows.truncate(mark)
+		// The place is found now: what it is found from must still be there.
+		// A variable's own fields are checked as it is assigned.
+		if !compound && !(found is .Path(..)) {
+			match self.accessPath(place) {
+				.Some(path) => {
+					val name = self.rootName(&path)
+					self.checkLive(&path, &name, body.exprs[place].span, &state)
+				}
+				.None => {}
+			}
+		}
+		self.usePlace(place, .Assign, &var state)
+		// A `str` variable borrows what its new value borrows, and so does one
+		// holding a `&` reference; one assigned through a `&var` parameter
+		// goes to the caller.
+		if self.borrowsAsView(self.ty(place)) {
+			match self.accessPath(place) {
+				.Some(path) => {
+					val whole = body.exprs[place].kind is .Local(..)
+					val isParam = body.locals[path.local].kind == .Param
+					if whole && !isParam then self.bindStr(path.local, value, &var state)
+					else if !isParam then self.addStr(path.local, value, &var state)
+					else self.checkLeaving(value, .Param(path.local), &state)
+				}
+				.None => {}
+			}
+		}
+	}
+
+	/// A `@tailrec` function's call to itself is compiled as a jump back to
+	/// the top, so what the frame would have dropped or deferred at its exit
+	/// never runs. Both are errors here rather than silent leaks: drops are
+	/// not reordered to make a call fit.
+	var fn checkTailCall(span: Span, state: &State) = {
+		var live = self.body.params.clone()
+		for scope in self.scopes {
+			for local in scope {
+				live.push(local)
+			}
+		}
+		for local in live {
+			val ty = self.body.locals[local].ty
+			if !self.owns(ty) then continue
+			val path = Path(local: local, projs: Vec())
+			// Gone already: moved out on every path to here.
+			if state.conflict(&path) is .Some(at) {
+				if state.moved.keys()[at] == path && state.moved.values()[at].definite then continue
+			}
+			val name = self.interner.resolve(self.body.locals[local].name)
+			val diagnostic = Diagnostic::error(
+				TAIL_CALL_LEAVES_WORK,
+				"`\(name)` is still owned here, so this call cannot be a jump",
+				span,
+				"`\(name)` would be freed after this call returns",
+			).withSecondary(self.body.locals[local].span, "`\(name)` declared here").
+				withNote(
+					"a `@tailrec` function's call to itself reuses its frame, so nothing of the frame may be left to drop",
+				).
+				withHelp("move `\(name)` into the call, or end its scope before it")
+			self.report(move diagnostic)
+			return
+		}
+		if self.deferred.items().any((defers) => !defers.isEmpty()) {
+			val diagnostic = Diagnostic::error(
+				TAIL_CALL_LEAVES_WORK,
+				"a `defer` is waiting here, so this call cannot be a jump",
+				span,
+				"the `defer` would run after this call returns",
+			).withNote(
+				"a `@tailrec` function's call to itself reuses its frame, and a `defer` runs where the frame exits",
+			)
+			self.report(move diagnostic)
+		}
+	}
+
+	/// Evaluates the parts of a place that are not a path: the reference it
+	/// is behind, an array and its index, or a temporary.
+	var fn placeParts(id: ExprId, state: &var State) = match self.place(id) {
+		.Some(.Path(..)) => {}
+		.Some(.ThroughRef(reference)) => self.expr(reference, .Inspect, &var state)
+		.Some(.Element(array, index)) => {
+			self.expr(array, .Inspect, &var state)
+			self.expr(index, .Value, &var state)
+		}
+		.Some(.Temporary(base)) => self.expr(base, .Value, &var state)
+		.None => panic("placeParts is called on places")
+	}
+
+	/// What a place's expression lends, held from where it is written to
+	/// where the place is used: each `&` argument of a projection the place
+	/// is found through, and what a view argument borrows, but the place the
+	/// projection lends from, which is lent where the place is used. Each
+	/// with whether it is lent `&var`.
+	fn operandBorrows(id: ExprId, state: &State): Vec<(Path, Span, bool)> = {
+		val body = self.body
+		var held: Vec<(Path, Span, bool)> = Vec()
+		match body.exprs[id].kind {
+			.Field(base, ..) | .Index(base, ..) | .SubSlice(base, ..) => {
+				for borrow in self.operandBorrows(base, &state) {
+					held.push(borrow.clone())
+				}
+			}
+			.Deref(pointer) => match body.exprs[pointer].kind {
+				.Call(callee, args, ..) => {
+					val from: Option<i64> = match self.program.fns[callee].projects {
+						.Some(.Param(index)) => .Some(index as i64)
+						_ => .None
+					}
+					for (i, arg) in args.forwards().enumerate() {
+						val writes = self.isVarRef(body.exprs[arg].ty)
+						match body.exprs[arg].kind {
+							.Ref(inner) if from == .Some(i) => {
+								for borrow in self.operandBorrows(inner, &state) {
+									held.push(borrow.clone())
+								}
+							}
+							.Ref(inner) => match self.accessPath(inner) {
+								.Some(path) => held.push((move path, body.exprs[arg].span, writes))
+								.None => {}
+							}
+							_ if self.borrowsAsView(body.exprs[arg].ty) => {
+								for path in self.lentRoots(arg, Lends::all(), &state).paths {
+									held.push((path.clone(), body.exprs[arg].span, false))
+								}
+							}
+							_ => {}
+						}
+					}
+				}
+				_ => {
+					for borrow in self.operandBorrows(pointer, &state) {
+						held.push(borrow.clone())
+					}
+				}
+			}
+			_ => {}
+		}
+		return move held
+	}
+
+	/// Checks a use of a place. The parts of an assignment's target were
+	/// evaluated before its value, so they are not evaluated again.
+	var fn usePlace(id: ExprId, ctx: Ctx, state: &var State) = {
+		if ctx is .Move(..) | .Assign then self.checkNotBorrowed(id, ctx)
+		if ctx != .Assign then self.placeParts(id, &var state)
+		self.useFound(id, ctx, &var state)
+	}
+
+	/// Checks a use of a place whose parts are checked already: where it is
+	/// lent to a call, after the arguments its expression was written
+	/// before.
+	var fn useFound(id: ExprId, ctx: Ctx, state: &var State) = {
+		val body = self.body
+		val span = body.exprs[id].span
+		val ty = body.exprs[id].ty
+		val name = self.display(id)
+		val found = match self.place(id) {
+			.Some(found) => move found
+			.None => panic("usePlace is called on places")
+		}
+		if found is .Path(path) then self.readAfterCopy(path.local, ctx == .Assign, &var state)
+		// A `str` is read wherever it is used, and so is the reference a place
+		// lies behind, where it is kept.
+		if ctx != .Assign {
+			val holder = if self.isView(ty) || self.isKeptClosure(ty) {
+				self.accessPath(id)
+			} else {
+				match self.keptReferenceBehind(id) {
+					.Some(reference) => self.accessPath(reference)
+					.None => Option::None
+				}
+			}
+			if holder is .Some(path) then self.checkStale(path.local, &name, span, &state)
+		}
+		match ctx {
+			.Move(moveSpan) => {
+				if found is .Path(path) then self.changed(&path, moveSpan, .Moved, &var state)
+			}
+			.Assign => match self.accessPath(id) {
+				.Some(path) => self.changed(&path, span, .Assigned, &var state)
+				.None => {}
+			}
+			.Value | .Inspect => {}
+		}
+		match move found {
+			.Path(path) => match ctx {
+				.Inspect => { self.checkLive(&path, &name, span, &state) }
+				.Value => {
+					if self.checkLive(&path, &name, span, &state) && self.owns(ty) {
+						// An atomic holds no memory, and is moved all the same.
+						val note =
+							if self.program.isIntrinsicType(ty) then
+								"`\(self.tyName(ty))` is moved, never copied: a copy would read it in more than one step, which another thread could see half of"
+							else String::of(
+								"a value that contains `own` has exactly one owner, so it is never copied",
+							)
+						val diagnostic = Diagnostic::error(
+							CANNOT_COPY_OWN,
+							"cannot copy `\(name)`",
+							span,
+							"`\(name)` has type `\(self.tyName(ty))`",
+						).withNote(move note).withFix(
+							"to transfer ownership, write `move \(name)`",
+							own [Edit::insert(span.lo, "move ")],
+						)
+						self.report(move diagnostic)
+					}
+				}
+				.Move(moveSpan) => {
+					if self.checkLive(&path, &name, span, &state) then
+						state.recordMove(move path, moveSpan, name.clone(), self.exit.isSome())
+				}
+				.Assign => self.assign(move path, &name, span, &var state)
+			}
+			.ThroughRef(reference) => {
+				val taken: Option<str> = match ctx {
+					.Move(..) => .Some("move")
+					.Value if self.owns(ty) => .Some("copy")
+					_ => .None
+				}
+				val .Some(verb) = taken else {
+					return
+				}
+				val binding = self.isBindingLocal(reference)
+				// A `for` binding refers to an element.
+				val element = match body.exprs[reference].kind {
+					.Local(l) => self.refersToElement(l) || self.keptElements.contains(&l)
+					_ => false
+				}
+				val lent = body.exprs[reference].kind is .Call(..)
+				// A binding behind a reference the pattern tested through, or
+				// the matched value was behind: `match move` takes nothing from
+				// there either.
+				val kept = match body.exprs[reference].kind {
+					.Local(l) => binding && self.keptBindings.contains(&l)
+					_ => false
+				}
+				// What a closure captured: its own, and kept, since it may be
+				// called again.
+				if self.isCapture(id) {
+					val diagnostic = Diagnostic::error(
+						CANNOT_MOVE_OUT_OF_BORROW,
+						"cannot \(verb) `\(name)`, which this closure captured",
+						span,
+						"captured, and kept while the closure lives",
+					).withNote(
+						"a closure may be called again, so what it captured stays where it is",
+					).withHelp("take what is used up as a parameter of the closure")
+					self.report(move diagnostic)
+					return
+				}
+				val message =
+					if lent then "cannot \(verb) what a projection lends"
+					else "cannot \(verb) `\(name)`, which is behind a reference"
+				val label =
+					if element then "a `for` binding, which refers to an element"
+					else if binding then
+						"a `match` binding, which refers to part of the matched value"
+					else if lent then "lent by a projection, and owned by the caller"
+					else "behind a `&` reference"
+				var diagnostic = Diagnostic::error(
+					CANNOT_MOVE_OUT_OF_BORROW,
+					move message,
+					span,
+					String::of(label),
+				).withNote("a reference can read a value but cannot take ownership of it")
+				if kept then
+					diagnostic = diagnostic.withHelp(
+						"it lies behind a reference, which neither `move` nor `match move` takes from; copy it with `clone()`",
+					)
+				else if element then
+					diagnostic = diagnostic.withHelp(
+						"elements stay where they are while a loop walks them; to take one out, move the whole array",
+					)
+				else if binding then
+					diagnostic = diagnostic.withHelp(
+						"to take the value apart, match it with `match move …`",
+					)
+				else if lent then
+					diagnostic = diagnostic.withHelp(
+						"a projection lends a place that belongs to its caller; nothing is taken out of it",
+					)
+				self.report(move diagnostic)
+			}
+			.Element(..) => {
+				val taken: Option<str> = match ctx {
+					.Move(..) => .Some("move out of")
+					.Value if self.owns(ty) => .Some("copy")
+					_ => .None
+				}
+				if taken is .Some(verb) {
+					val diagnostic = Diagnostic::error(
+						CANNOT_MOVE_OUT_OF_ARRAY,
+						"cannot \(verb) an array element that contains `own`",
+						span,
+						"an element of an array",
+					).withNote(
+						"taking one element would leave a hole in the array; an array of `own` values is moved as a whole",
+					)
+					self.report(move diagnostic)
+				}
+			}
+			.Temporary(..) => {
+				if ctx == .Value && self.owns(ty) {
+					val diagnostic = Diagnostic::error(
+						CANNOT_MOVE_OUT_OF_TEMPORARY,
+						"cannot take `\(name)` out of a temporary",
+						span,
+						"part of a temporary value",
+					).withHelp("bind the temporary with `val`, then `move` this part out of it")
+					self.report(move diagnostic)
+				}
+			}
+		}
+	}
+
+	/// Whether `local` is a `for` binding, which refers to an element.
+	fn refersToElement(local: LocalId): bool = match self.aliases.get(&local) {
+		.Some(path) => {
+			val element = Proj::Element
+			path.projs.contains(&element)
+		}
+		.None => false
+	}
+
+	/// Binds a pattern's names to the fields of `scrutinee`, the value tested.
+	/// An alias binding refers into the place, which must not change while
+	/// the bindings are in scope, so a borrow is pushed, for the caller to
+	/// release; an owned binding is a new variable. A place behind a kept `&`
+	/// reference is not this function's: its aliases are kept references too,
+	/// which borrow what that one does and hold nothing of the variable, which
+	/// may be pointed somewhere else while they are used.
+	var fn bindPattern(pattern: &Pattern, scrutinee: ExprId, holder: Holder, state: &var State) = {
+		val body = self.body
+		val scrutPath = self.accessPath(scrutinee)
+		val scrutSpan = body.exprs[scrutinee].span
+		// Each binding, and the place it refers into, at any depth.
+		var binders: Vec<(LocalId, Option<Path>)> = Vec()
+		bindingsOf(&pattern, scrutPath.clone(), &var binders)
+		// An alias behind a reference the pattern tests through is a kept
+		// reference, which borrows what the value tested does.
+		var behind: Vec<LocalId> = Vec()
+		behindReferences(&pattern, &var behind)
+		for local in behind {
+			if body.aliasBindings.contains(&local) then self.keptBindings.add(local)
+		}
+		if self.keptReferenceBehind(scrutinee) is .Some(reference) {
+			val found = self.strRoots(reference, &state)
+			for (local, _) in binders {
+				if body.aliasBindings.contains(&local) {
+					self.keptBindings.add(local)
+					state.roots.put(local, found.paths.clone())
+					state.stale.remove(&local)
+				} else {
+					val whole = Path(local: local, projs: Vec())
+					state.reinit(&whole)
+				}
+			}
+			return
+		}
+		var aliased = false
+		for (local, path) in move binders {
+			if body.aliasBindings.contains(&local) {
+				match move path {
+					.Some(found) => {
+						self.aliases.put(local, move found)
+						aliased = true
+					}
+					.None => {}
+				}
+			} else {
+				val whole = Path(local: local, projs: Vec())
+				state.reinit(&whole)
+			}
+		}
+		if aliased {
+			match move scrutPath {
+				.Some(path) => self.borrows.push(Borrow(
+					path: move path,
+					span: scrutSpan,
+					writes: false,
+					holder: holder,
+					heap: false,
+				))
+				.None => {}
+			}
+		}
+	}
+}
+
+extend Checker {
+	/// The locals the `is` tests of a condition bind, through the `&&`s that
+	/// join them.
+	fn boundByTests(id: ExprId, out: &var Vec<LocalId>) = match self.body.exprs[id].kind {
+		.Is(pattern, ..) => pattern.locals(&var out)
+		.Binary(op: .And, lhs, rhs, ..) => {
+			self.boundByTests(lhs, &var out)
+			self.boundByTests(rhs, &var out)
+		}
+		_ => {}
+	}
+}

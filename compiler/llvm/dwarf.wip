@@ -1,0 +1,634 @@
+// The DWARF LLVM writes, read as far as the table a panic reads needs: each
+// unit's entries — functions and the calls inlined into them — with their
+// names, files and lines, the address ranges they cover, and the unit's line
+// program. What it reads is version 4, in the 32-bit format, which is what
+// the compiler asks LLVM for, and the line programs of version 5 that an
+// assembler writes by itself from the lines the assembly marks; each value
+// read where a relocation says what goes is what the relocation puts there.
+
+import std::collections::{Map}
+
+val DW_TAG_subprogram: u64 = 0x2e
+val DW_TAG_inlined_subroutine: u64 = 0x1d
+val DW_AT_name: u64 = 0x03
+val DW_AT_stmt_list: u64 = 0x10
+val DW_AT_low_pc: u64 = 0x11
+val DW_AT_high_pc: u64 = 0x12
+val DW_AT_comp_dir: u64 = 0x1b
+val DW_AT_abstract_origin: u64 = 0x31
+val DW_AT_artificial: u64 = 0x34
+val DW_AT_decl_file: u64 = 0x3a
+val DW_AT_specification: u64 = 0x47
+val DW_AT_ranges: u64 = 0x55
+val DW_AT_call_file: u64 = 0x58
+val DW_AT_call_line: u64 = 0x59
+
+/// A section of DWARF: its bytes, and what its relocations put at each
+/// offset — an addend, and whether it adds to what is written there.
+struct DebugSection {
+	data: Vec<u8>
+	relocations: Map<u64, (bool, u64)>
+}
+
+extend DebugSection {
+	static fn empty(): DebugSection = DebugSection(data: Vec(), relocations: Map())
+
+	fn relocate(at: i64, value: u64): u64 = {
+		val key = at as u64
+		return match self.relocations.get(&key) {
+			.Some((true, addend)) => value +% addend
+			.Some((false, addend)) => addend
+			.None => value
+		}
+	}
+
+	fn byte(at: &var i64): u8 = {
+		val b = if at < self.data.len() then self.data[at] else 0
+		at += 1
+		return b
+	}
+
+	fn word(at: &var i64, size: i64): u64 = {
+		var value: u64 = 0
+		for i in 0..size {
+			val b = if at + i < self.data.len() then self.data[at + i] else 0
+			value = value | (b as u64) << (8 * i as u64)
+		}
+		at += size
+		return value
+	}
+
+	fn uleb(at: &var i64): u64 = {
+		var value: u64 = 0
+		var shift: u64 = 0
+		while true {
+			val b = self.byte(&var at)
+			if shift < 64 then value = value | ((b & 0x7f) as u64) << shift
+			shift += 7
+			if b & 0x80 == 0 then break
+		}
+		return value
+	}
+
+	fn sleb(at: &var i64): i64 = {
+		var value: i64 = 0
+		var shift: u64 = 0
+		var b: u8 = 0
+		while true {
+			b = self.byte(&var at)
+			if shift < 64 then value = value | ((b & 0x7f) as i64) << shift
+			shift += 7
+			if b & 0x80 == 0 then break
+		}
+		if shift < 64 && b & 0x40 != 0 then value = value | -((1 as i64) << shift)
+		return value
+	}
+
+	/// An address of `size` bytes, as its relocation puts it.
+	fn address(at: &var i64, size: i64): u64 = {
+		val place = at
+		val value = self.word(&var at, size)
+		return self.relocate(place, value)
+	}
+
+	/// An offset into another section, as its relocation puts it.
+	fn offset(at: &var i64): u64 = {
+		val place = at
+		val value = self.word(&var at, 4)
+		return self.relocate(place, value)
+	}
+
+	/// The NUL-terminated text at `at`.
+	fn text(at: &var i64): String = {
+		val start = at
+		while at < self.data.len() && self.data[at] != 0 {
+			at += 1
+		}
+		val end = at
+		at += 1
+		return lossyText(&self.data[start..end])
+	}
+}
+
+/// What an entry's attribute is, as its form says.
+@derive(Clone)
+enum FormValue {
+	Addr(address: u64)
+	/// A constant.
+	Data(value: u64)
+	Signed(value: i64)
+	Flag(set: bool)
+	Text(text: String)
+	/// A string in `.debug_str`, by its offset.
+	StrRef(offset: u64)
+	/// A string in `.debug_line_str`, by its offset.
+	LineStrRef(offset: u64)
+	/// Another entry of the unit, by its offset in it.
+	UnitRef(offset: u64)
+	/// An entry of another unit.
+	InfoRef(offset: u64)
+	/// An offset into another section.
+	SecOffset(offset: u64)
+	Other
+}
+
+/// An abbreviation: an entry's tag, whether it has children, and its
+/// attributes' names and forms.
+struct Abbrev {
+	tag: u64
+	children: bool
+	specs: Vec<(u64, u64, i64)>
+}
+
+/// An entry: where it is in its unit, how deep, its tag and its attributes.
+struct Die {
+	offset: u64
+	depth: i64
+	tag: u64
+	attrs: Vec<(u64, u64, FormValue)>
+}
+
+extend Die {
+	/// The attribute `name`, with its form.
+	fn attr(name: u64): Option<(u64, FormValue)> = {
+		for (n, form, value) in self.attrs {
+			if n == name then return .Some((form, value.clone()))
+		}
+		return .None
+	}
+}
+
+/// A unit of `.debug_info`: where it is, its version, its addresses' size,
+/// its abbreviations, where its entries are, and what its root says.
+struct Unit {
+	start: i64
+	end: i64
+	version: u16
+	addressSize: i64
+	abbrevs: Map<u64, Abbrev>
+	entries: i64
+	/// The base of its address ranges: its root's low address.
+	lowPc: u64
+	compDir: Option<FormValue>
+	lineProgram: Option<u64>
+}
+
+/// The DWARF sections of an object, each with its relocations.
+struct Dwarf {
+	info: DebugSection
+	abbrev: DebugSection
+	str: DebugSection
+	line: DebugSection
+	lineStr: DebugSection
+	ranges: DebugSection
+}
+
+extend Dwarf {
+	/// Each unit of `.debug_info`.
+	fn units(): Result<Vec<Unit>, String> = {
+		var units: Vec<Unit> = Vec()
+		var at = 0
+		while at < self.info.data.len() {
+			val start = at
+			val length = self.info.word(&var at, 4)
+			if length == 0xffffffff then return .Err(String::of("DWARF of the 64-bit format"))
+			val end = at + length as i64
+			val version = self.info.word(&var at, 2) as u16
+			var abbrevOffset: u64 = 0
+			var addressSize = 8
+			if version >= 5 {
+				at += 1
+				addressSize = self.info.byte(&var at) as i64
+				abbrevOffset = self.info.offset(&var at)
+			} else {
+				abbrevOffset = self.info.offset(&var at)
+				addressSize = self.info.byte(&var at) as i64
+			}
+			var unit = Unit(
+				start: start,
+				end: end,
+				version: version,
+				addressSize: addressSize,
+				abbrevs: self.abbrevs(abbrevOffset),
+				entries: at,
+				lowPc: 0,
+				compDir: .None,
+				lineProgram: .None,
+			)
+			val root = self.entryAt(&unit, (at - start) as u64)?
+			if root.attr(DW_AT_low_pc) is .Some((_, .Addr(address))) then unit.lowPc = address
+			if root.attr(DW_AT_comp_dir) is .Some((_, value)) then
+				unit.compDir = .Some(value.clone())
+			if root.attr(DW_AT_stmt_list) is .Some((_, value)) then
+				unit.lineProgram = match value {
+					.SecOffset(offset) | .Data(value: offset) => .Some(offset)
+					_ => .None
+				}
+			units.push(move unit)
+			at = end
+		}
+		return .Ok(move units)
+	}
+
+	/// The abbreviations at `offset` of `.debug_abbrev`.
+	fn abbrevs(offset: u64): Map<u64, Abbrev> = {
+		var found: Map<u64, Abbrev> = Map()
+		var at = offset as i64
+		while at < self.abbrev.data.len() {
+			val code = self.abbrev.uleb(&var at)
+			if code == 0 then break
+			val tag = self.abbrev.uleb(&var at)
+			val children = self.abbrev.byte(&var at) != 0
+			var specs: Vec<(u64, u64, i64)> = Vec()
+			while true {
+				val name = self.abbrev.uleb(&var at)
+				val form = self.abbrev.uleb(&var at)
+				var implicit: i64 = 0
+				if form == 0x21 then implicit = self.abbrev.sleb(&var at)
+				if name == 0 && form == 0 then break
+				specs.push((name, form, implicit))
+			}
+			found.put(code, Abbrev(tag: tag, children: children, specs: move specs))
+		}
+		return move found
+	}
+
+	/// The unit's entries, depth first, each with its depth, the root's 0.
+	fn entries(unit: &Unit): Result<Vec<Die>, String> = {
+		var entries: Vec<Die> = Vec()
+		var at = unit.entries
+		var depth: i64 = 0
+		while at < unit.end {
+			val offset = (at - unit.start) as u64
+			val code = self.info.uleb(&var at)
+			if code == 0 {
+				depth -= 1
+				continue
+			}
+			val .Some(abbrev) = unit.abbrevs.get(&code) else {
+				return .Err(String::of("an entry of an abbreviation that is not there"))
+			}
+			var attrs: Vec<(u64, u64, FormValue)> = Vec()
+			for (name, form, implicit) in abbrev.specs {
+				val value = self.value(&unit, form, implicit, &var at)?
+				attrs.push((name, form, move value))
+			}
+			entries.push(Die(offset: offset, depth: depth, tag: abbrev.tag, attrs: move attrs))
+			if abbrev.children then depth += 1
+		}
+		return .Ok(move entries)
+	}
+
+	/// The entry at `offset` of the unit.
+	fn entryAt(unit: &Unit, offset: u64): Result<Die, String> = {
+		var at = unit.start + offset as i64
+		val code = self.info.uleb(&var at)
+		val .Some(abbrev) = unit.abbrevs.get(&code) else {
+			return .Err(String::of("an entry of an abbreviation that is not there"))
+		}
+		var attrs: Vec<(u64, u64, FormValue)> = Vec()
+		for (name, form, implicit) in abbrev.specs {
+			val value = self.value(&unit, form, implicit, &var at)?
+			attrs.push((name, form, move value))
+		}
+		return .Ok(Die(offset: offset, depth: 0, tag: abbrev.tag, attrs: move attrs))
+	}
+
+	/// An attribute's value, of `form`, at `at` of `.debug_info`.
+	fn value(unit: &Unit, form: u64, implicit: i64, at: &var i64): Result<FormValue, String> = {
+		val info = &self.info
+		return .Ok(
+			match form {
+				0x01 => .Addr(info.address(&var at, unit.addressSize))
+				0x03 => {
+					val n = info.word(&var at, 2) as i64
+					at += n
+					.Other
+				}
+				0x04 => {
+					val n = info.word(&var at, 4) as i64
+					at += n
+					.Other
+				}
+				0x05 => .Data(info.word(&var at, 2))
+				0x06 => .Data(info.word(&var at, 4))
+				0x07 => .Data(info.word(&var at, 8))
+				0x08 => .Text(info.text(&var at))
+				0x09 | 0x18 => {
+					val n = info.uleb(&var at) as i64
+					at += n
+					.Other
+				}
+				0x0a => {
+					val n = info.byte(&var at) as i64
+					at += n
+					.Other
+				}
+				0x0b => .Data(info.byte(&var at) as u64)
+				0x0c => .Flag(info.byte(&var at) != 0)
+				0x0d => .Signed(info.sleb(&var at))
+				0x0e => .StrRef(info.offset(&var at))
+				0x0f => .Data(info.uleb(&var at))
+				0x10 => .InfoRef(info.offset(&var at))
+				0x11 => .UnitRef(info.byte(&var at) as u64)
+				0x12 => .UnitRef(info.word(&var at, 2))
+				0x13 => .UnitRef(info.word(&var at, 4))
+				0x14 => .UnitRef(info.word(&var at, 8))
+				0x15 => .UnitRef(info.uleb(&var at))
+				0x16 => {
+					val real = info.uleb(&var at)
+					self.value(&unit, real, implicit, &var at)?
+				}
+				0x17 => .SecOffset(info.offset(&var at))
+				0x19 => .Flag(true)
+				0x20 => {
+					at += 8
+					.Other
+				}
+				0x21 => .Signed(implicit)
+				_ => return .Err("an attribute of form \(form), which is not read")
+			},
+		)
+	}
+
+	/// What a string attribute says.
+	fn string(value: &FormValue): String = match value {
+		.Text(text) => text.clone()
+		.StrRef(offset) => {
+			var at = offset as i64
+			self.str.text(&var at)
+		}
+		.LineStrRef(offset) => {
+			var at = offset as i64
+			self.lineStr.text(&var at)
+		}
+		_ => String()
+	}
+
+	/// The address ranges an entry covers: its low and high address, or the
+	/// list `DW_AT_ranges` names, without the empty ones and the tombstones.
+	fn rangesOf(unit: &Unit, entry: &Die): Vec<(u64, u64)> = {
+		var low: Option<u64> = .None
+		var high: Option<u64> = .None
+		var size: Option<u64> = .None
+		for (name, form, value) in entry.attrs {
+			if name == DW_AT_low_pc && value is .Addr(address) then low = .Some(address)
+			if name == DW_AT_high_pc {
+				match value {
+					.Addr(address) => high = .Some(address)
+					.Data(n) => size = .Some(n)
+					_ => {}
+				}
+			}
+			if name == DW_AT_ranges && value is .SecOffset(offset) | .Data(value: offset) then
+				return self.rangeList(&unit, offset)
+		}
+		val .Some(begin) = low else {
+			return Vec()
+		}
+		val end: Option<u64> = match size {
+			.Some(n) => .Some(begin + n)
+			.None => high
+		}
+		return if end is .Some(e) then Vec::of(own [(begin, e)]) else Vec()
+	}
+
+	/// The ranges of the list at `offset` of `.debug_ranges`.
+	fn rangeList(unit: &Unit, offset: u64): Vec<(u64, u64)> = {
+		val size = unit.addressSize
+		val ones: u64 =
+			if size >= 8 then 0xffffffffffffffff else ((1 as u64) << (size * 8) as u64) - 1
+		val tombstone = ones - 1
+		var base = unit.lowPc
+		var found: Vec<(u64, u64)> = Vec()
+		var at = offset as i64
+		while at + 2 * size <= self.ranges.data.len() {
+			val begin = self.ranges.address(&var at, size)
+			val end = self.ranges.address(&var at, size)
+			if begin == 0 && end == 0 then break
+			if begin == ones {
+				base = end
+				continue
+			}
+			if base >= tombstone then continue
+			val b = (begin +% base) & ones
+			val e = (end +% base) & ones
+			if b >= tombstone || b >= e then continue
+			found.push((b, e))
+		}
+		return move found
+	}
+}
+
+/// A line program's file: its name and the index of its directory.
+struct FileEntry {
+	name: FormValue
+	directory: u64
+}
+
+/// A line program: its header's files and directories, and its rows.
+struct LineProgram {
+	version: u16
+	directories: Vec<FormValue>
+	files: Vec<FileEntry>
+	/// Each row: its address, its file's index and its line, and whether it
+	/// ends a sequence.
+	rows: Vec<(u64, u64, u64, bool)>
+}
+
+extend LineProgram {
+	/// The file `index` names: from 1 before DWARF 5, from 0 from it.
+	fn file(index: u64): Option<&FileEntry> = {
+		if self.version >= 5 then
+			return if index < self.files.len() as u64 then .Some(&self.files[index as i64])
+			else .None
+		if index == 0 || index > self.files.len() as u64 then return .None
+		return .Some(&self.files[(index - 1) as i64])
+	}
+
+	/// The directory a file is in: before DWARF 5, 0 is the unit's own.
+	fn directory(file: &FileEntry, unit: &Unit): Option<FormValue> = {
+		if self.version >= 5 then
+			return if file.directory < self.directories.len() as u64 then
+				.Some(self.directories[file.directory as i64].clone())
+			else .None
+		if file.directory == 0 then return unit.compDir.clone()
+		if file.directory > self.directories.len() as u64 then return .None
+		return .Some(self.directories[(file.directory - 1) as i64].clone())
+	}
+}
+
+extend Dwarf {
+	/// The line program at `offset` of `.debug_line`, run.
+	fn lineProgram(unit: &Unit, offset: u64): Result<LineProgram, String> = {
+		val line = &self.line
+		var at = offset as i64
+		val length = line.word(&var at, 4)
+		if length == 0xffffffff then return .Err(String::of("DWARF of the 64-bit format"))
+		val end = at + length as i64
+		val version = line.word(&var at, 2) as u16
+		// The size of an address and of a segment's selector, which the unit
+		// says before version 5.
+		if version >= 5 then at += 2
+		val headerLength = line.word(&var at, 4) as i64
+		val program = at + headerLength
+		val minimum = line.byte(&var at) as u64
+		if version >= 4 then line.byte(&var at)
+		// Whether a row begins a statement: what the table does not ask.
+		line.byte(&var at)
+		val lineBase = line.byte(&var at) as i8 as i64
+		val lineRange = line.byte(&var at) as u64
+		val opcodeBase = line.byte(&var at)
+		var lengths: Vec<u8> = Vec()
+		for _ in 1..(opcodeBase as i64) {
+			lengths.push(line.byte(&var at))
+		}
+		var directories: Vec<FormValue> = Vec()
+		var files: Vec<FileEntry> = Vec()
+		if version >= 5 {
+			// Each list says what its entries hold, and in what form.
+			for entry in self.lineEntries(&var at)? {
+				directories.push(entry.name.clone())
+			}
+			files = self.lineEntries(&var at)?
+		} else {
+			while true {
+				val name = line.text(&var at)
+				if name.isEmpty() then break
+				directories.push(.Text(move name))
+			}
+			while true {
+				val name = line.text(&var at)
+				if name.isEmpty() then break
+				val directory = line.uleb(&var at)
+				line.uleb(&var at)
+				line.uleb(&var at)
+				files.push(FileEntry(name: .Text(move name), directory: directory))
+			}
+		}
+		var rows: Vec<(u64, u64, u64, bool)> = Vec()
+		at = program
+		val ones: u64 =
+			if unit.addressSize >= 8 then 0xffffffffffffffff
+			else ((1 as u64) << (unit.addressSize * 8) as u64) - 1
+		var address: u64 = 0
+		var file: u64 = 1
+		var number: u64 = 1
+		var tombstone = false
+		while at < end {
+			val opcode = line.byte(&var at)
+			if opcode >= opcodeBase {
+				val adjusted = (opcode - opcodeBase) as u64
+				advanceLine(&var number, lineBase + (adjusted % lineRange) as i64)
+				address = (address +% adjusted / lineRange * minimum) & ones
+				if !tombstone then rows.push((address, file, number, false))
+				continue
+			}
+			match opcode {
+				0 => {
+					val size = line.uleb(&var at) as i64
+					val next = at + size
+					val sub = line.byte(&var at)
+					if sub == 1 {
+						if !tombstone then rows.push((address, file, number, true))
+						address = 0
+						file = 1
+						number = 1
+						tombstone = false
+					} else if sub == 2 {
+						val set = line.address(&var at, unit.addressSize)
+						tombstone = set == ones
+						if !tombstone then address = set
+					}
+					at = next
+				}
+				1 => { if !tombstone then rows.push((address, file, number, false)) }
+				2 => address = (address +% line.uleb(&var at) * minimum) & ones
+				3 => advanceLine(&var number, line.sleb(&var at))
+				4 => file = line.uleb(&var at)
+				5 => line.uleb(&var at)
+				6 | 7 | 10 | 11 => {}
+				8 => {
+					val adjusted = (255 - opcodeBase) as u64
+					address = (address +% adjusted / lineRange * minimum) & ones
+				}
+				9 => address = (address +% line.word(&var at, 2)) & ones
+				12 => line.uleb(&var at)
+				_ => {
+					// An opcode this does not know: its operands, as the header
+					// counts them, passed over.
+					for _ in 0..(lengths[(opcode - 1) as i64] as i64) {
+						line.uleb(&var at)
+					}
+				}
+			}
+		}
+		return .Ok(LineProgram(
+			version: version,
+			directories: move directories,
+			files: move files,
+			rows: move rows,
+		))
+	}
+}
+
+extend Dwarf {
+	/// A list of a line program's header from version 5 on: the formats of
+	/// its entries' fields, then the entries, each a path and the index of
+	/// its directory, its time, its size and its MD5 passed over.
+	fn lineEntries(at: &var i64): Result<Vec<FileEntry>, String> = {
+		val line = &self.line
+		var formats: Vec<(u64, u64)> = Vec()
+		val count = line.byte(&var at)
+		for _ in 0..(count as i64) {
+			val content = line.uleb(&var at)
+			val form = line.uleb(&var at)
+			formats.push((content, form))
+		}
+		var entries: Vec<FileEntry> = Vec()
+		val entriesCount = line.uleb(&var at)
+		for _ in 0..(entriesCount as i64) {
+			var entry = FileEntry(name: .Other, directory: 0)
+			for (content, form) in formats {
+				val value: FormValue = match form {
+					0x08 => .Text(line.text(&var at))
+					0x0e => .StrRef(line.offset(&var at))
+					0x1f => .LineStrRef(line.offset(&var at))
+					0x0b => .Data(line.byte(&var at) as u64)
+					0x05 => .Data(line.word(&var at, 2))
+					0x06 => .Data(line.word(&var at, 4))
+					0x07 => .Data(line.word(&var at, 8))
+					0x0f => .Data(line.uleb(&var at))
+					0x1e => {
+						at += 16
+						.Other
+					}
+					0x09 => {
+						val n = line.uleb(&var at) as i64
+						at += n
+						.Other
+					}
+					_ => return .Err("a line program's field of form \(form), which is not read")
+				}
+				// DW_LNCT_path and DW_LNCT_directory_index.
+				if content == 1 then entry.name = value.clone()
+				if content == 2 && value is .Data(index) then entry.directory = index
+			}
+			entries.push(move entry)
+		}
+		return .Ok(move entries)
+	}
+}
+
+/// A line advanced by `by`, which stops at 0 going back.
+fn advanceLine(number: &var u64, by: i64) = {
+	if by < 0 {
+		val back = (-by) as u64
+		number = if back <= number then number - back else 0
+	} else {
+		number = number +% by as u64
+	}
+}
+
+/// Bytes as text, what is not UTF-8 as U+FFFD.
+fn lossyText(bytes: &[u8]): String = String::of(str::fromBytes(&bytes))

@@ -1,0 +1,428 @@
+// The C the compiler writes for itself.
+//
+// Most calls into C are made directly, a struct by value included. Where one
+// cannot be — on a target whose rules are not written, or for a C function
+// taken as a Wip function value, which is called the way Wip calls — the
+// compiler writes a small C function whose signature it *can* express, and
+// `cc` decides how the fields travel:
+//
+//     struct Rect { int32_t x; int32_t y; };
+//     extern struct Rect grow(struct Rect r, int32_t by);
+//
+//     void wip_shim_7(struct Rect *out, const struct Rect *r, int32_t by) {
+//         *out = grow(*r, by);
+//     }
+//
+// Wip already passes an aggregate by its address, and an aggregate result by
+// an address the caller gives — so that shim is the signature code
+// generation would emit anyway. Only the symbol changes.
+//
+// A call that passes more than the declaration names, where it cannot be
+// made directly (`variadicDirect`), is written the same way: a front end that
+// made it would have to apply C's own promotions — `float` to `double`,
+// small integers to `int` — which is where Odin and Zig both shipped bugs:
+//
+//     extern int32_t printf(const char *a0, ...);
+//
+//     int32_t wip_shim_131(const char *a0, int32_t a1, double a2) {
+//         return printf(a0, a1, a2);
+//     }
+//
+// So is a call to what a header defines rather than declares — a macro or a
+// `static inline`, which has no symbol — and a read or write of a variable C
+// owns.
+
+import std::collections::{Set}
+import hir::{FnDef, FnId, Program, StructId, Ty, UNIT}
+import syntax::{Interner, Symbol}
+
+/// What a function that needs one is called in the generated C.
+pub fn shimName(id: FnId): String = "wip_shim_\(id.index())"
+
+/// The C for every call that needs one, or nothing when none do. Which do is
+/// `shimmed`'s to say, since it depends on how the target passes a struct.
+pub fn writeShims(program: &Program, interner: &Interner, needed: &Set<FnId>): Option<String> = {
+	var wanted: Vec<FnId> = Vec()
+	for id in program.fns.ids() {
+		if needed.contains(&id) then wanted.push(id)
+	}
+	if wanted.isEmpty() then return .None
+	var out = String::of(
+		"/* Written by the Wip compiler:\n   the calls where C decides how the arguments travel, since Wip\n   does not. */\n#include <stdint.h>\n\n",
+	)
+	// The headers the declarations name, before anything that uses them. A
+	// header may define what it declares — a macro, a `static inline` — so
+	// what it says is what the wrappers below call.
+	var headers: Vec<String> = Vec()
+	var named: Vec<Symbol> = Vec()
+	for def in program.structs {
+		if def.header is .Some(header) then named.push(header)
+	}
+	for id in wanted {
+		if program.fns[id].header is .Some(header) then named.push(header)
+	}
+	for header in named {
+		val text = String::of(interner.resolve(header))
+		if !headers.contains(&text) then headers.push(move text)
+	}
+	for header in headers {
+		// `@header("<math.h>")` is the system's, `@header("shape.h")` the
+		// module's own, which its directory is searched for.
+		if header.startsWith("<") then out.push("#include \(header)\n")
+		else out.push("#include \"\(header)\"\n")
+	}
+	if !headers.isEmpty() then out.push("\n")
+	// A C function pointer is named by a `typedef`, so that it reads as any
+	// other type where a wrapper declares, takes or answers one: the ones the
+	// layouts, the variables and the wrappers below use.
+	var typedefs: Vec<String> = Vec()
+	for def in program.structs {
+		if !def.isExtern || def.header.isSome() then continue
+		for field in def.fields {
+			functionTypedefs(&program, &interner, field.ty, &var typedefs)
+		}
+	}
+	for def in program.globals {
+		functionTypedefs(&program, &interner, def.ty, &var typedefs)
+	}
+	for id in wanted {
+		val def = &program.fns[id]
+		for p in def.params {
+			functionTypedefs(&program, &interner, p.ty, &var typedefs)
+		}
+		functionTypedefs(&program, &interner, def.ret, &var typedefs)
+	}
+	for typedef in typedefs {
+		out.push("\(typedef)\n")
+	}
+	if !typedefs.isEmpty() then out.push("\n")
+	// Every C layout the program declares, in the order they were written,
+	// since one may hold another.
+	for def in program.structs {
+		// A struct the header declares is C's, written once, by C. Wip writes
+		// only the layouts it was told and no header claims.
+		if !def.isExtern || def.header.isSome() then continue
+		val keyword = if def.isUnion then "union" else "struct"
+		out.push("\(keyword) \(interner.resolve(def.name)) {\n")
+		for field in def.fields {
+			out.push("    \(declaration(&program, &interner, field.ty, interner.resolve(field.name)));\n")
+		}
+		out.push("};\n\n")
+	}
+	// A variable C owns is declared once, however many accessors read it, and
+	// not at all when a header has declared it already.
+	for global in program.globals.ids() {
+		val def = &program.globals[global]
+		var used = false
+		for id in wanted {
+			if program.fns[id].accesses is .Some(.Global(id: g)) && g == global then used = true
+		}
+		if !used || def.header.isSome() then continue
+		val ty = cType(&program, &interner, def.ty)
+		val name = interner.resolve(def.symbol.unwrapOr(def.name))
+		out.push("extern \(declarator(ty.toStr(), name));\n\n")
+	}
+	for id in wanted {
+		writeShim(&var out, &program, &interner, id, &program.fns[id])
+	}
+	return .Some(move out)
+}
+
+fn writeShim(out: &var String, program: &Program, interner: &Interner, id: FnId, def: &FnDef) = {
+	// What C calls it, which `@symbol` may have said.
+	val name = interner.resolve(def.symbol.unwrapOr(def.name))
+	// Reading and writing what C owns: a variable, or a field of a struct C
+	// lays out. Both are a pair of accessors whose bodies say the same thing.
+	if def.accesses is .Some(access) {
+		val shim = shimName(id)
+		// The field of a struct is reached through the pointer the accessor
+		// is given; a variable is simply named.
+		val (reached, first) = match access {
+			.Global(..) => (String::of(name), 0)
+			.Field(id: owner, index) => (
+				"a0->\(interner.resolve(program.structs[owner].fields[index as i64].name))",
+				1,
+			)
+		}
+		var taken: Vec<String> = Vec()
+		for (i, p) in def.params.forwards().enumerate() {
+			val param = "a\(i)"
+			taken.push(declaration(&program, &interner, p.ty, param.toStr()))
+		}
+		val takes = if taken.isEmpty() then String::of("void") else taken.join(", ")
+		if def.params.len() > first {
+			// The last argument is the value to write.
+			out.push("void \(shim)(\(takes)) {\n")
+			out.push("    \(reached) = a\(first);\n")
+		} else {
+			out.push("\(cType(&program, &interner, def.ret)) \(shim)(\(takes)) {\n")
+			out.push("    return \(reached);\n")
+		}
+		out.push("}\n\n")
+		return
+	}
+	val ret = cType(&program, &interner, def.ret)
+	var params: Vec<(String, String)> = Vec()
+	for (i, p) in def.params.forwards().enumerate() {
+		params.push((cType(&program, &interner, p.ty), "a\(i)"))
+	}
+
+	// What C says the function is.
+	var declared: Vec<String> = Vec()
+	for (ty, param) in params {
+		declared.push(declarator(ty.toStr(), param.toStr()))
+	}
+	// A variadic function is declared as it was written — the parameters it
+	// names, and then `...`. The shim below it is the one call, of fixed
+	// arity, and C applies the promotions.
+	val arguments = match def.variadicOf {
+		.Some(original) => {
+			var written: Vec<String> = Vec()
+			for (i, p) in program.fns[original].params.forwards().enumerate() {
+				val param = "a\(i)"
+				written.push(declarator(cType(&program, &interner, p.ty).toStr(), param.toStr()))
+			}
+			written.push(String::of("..."))
+			written.join(", ")
+		}
+		.None => if declared.isEmpty() then String::of("void") else declared.join(", ")
+	}
+	// A header has said what it is already, and it may have defined it — a
+	// second declaration of a macro is not C.
+	if def.header.isNone() then out.push("extern \(ret) \(name)(\(arguments));\n\n")
+
+	// What Wip calls: a struct is an address, here and back, and so is a
+	// function pointer that may be null, which Wip keeps as an `Option`.
+	val aggregateResult = crossesAsStruct(&program, def.ret)
+	var taken: Vec<String> = Vec()
+	if aggregateResult then taken.push("\(ret) *out")
+	var passed: Vec<String> = Vec()
+	for (i, (ty, param)) in params.forwards().enumerate() {
+		if crossesAsStruct(&program, def.params[i].ty) {
+			taken.push("\(ty) *\(param)")
+			passed.push("*\(param)")
+		} else {
+			taken.push(declarator(ty.toStr(), param.toStr()))
+			passed.push(param.clone())
+		}
+	}
+	val shim = shimName(id)
+	val takes = if taken.isEmpty() then String::of("void") else taken.join(", ")
+	val call = "\(name)(\(passed.join(", ")))"
+	// A struct comes back through the address the caller gave; anything else
+	// comes back the way it went in C, and the shim must hand it on.
+	if aggregateResult {
+		out.push("void \(shim)(\(takes)) {\n")
+		out.push("    *out = \(call);\n")
+	} else if def.ret == UNIT {
+		out.push("void \(shim)(\(takes)) {\n")
+		out.push("    \(call);\n")
+	} else {
+		out.push("\(ret) \(shim)(\(takes)) {\n")
+		out.push("    return \(call);\n")
+	}
+	out.push("}\n\n")
+}
+
+/// A declaration of `name` with type `ty`, where C puts part of the type
+/// after the name: an array's length.
+fn declaration(
+	program: &Program,
+	interner: &Interner,
+	ty: Ty,
+	name: str,
+): String = match program.types.kind(ty) {
+	.Array(elem, len) => "\(declaration(&program, &interner, elem, name))[\(len)]"
+	_ => declarator(cType(&program, &interner, ty).toStr(), name)
+}
+
+/// A declaration of `name` with type `ty`, which for a pointer puts the star
+/// where C wants it.
+fn declarator(ty: str, name: str): String =
+	if ty.endsWith("*") then "\(ty)\(name)" else "\(ty) \(name)"
+
+/// The C that means the same as a Wip type. Fixed widths, since a C
+/// declaration written here must agree with the one in the library's header
+/// on every target Wip supports.
+fn cType(program: &Program, interner: &Interner, ty: Ty): String = match program.types.kind(ty) {
+	.Int(int) => {
+		val bits = int.bits()
+		if bits == 8 || bits == 16 || bits == 32 || bits == 64 {
+			if int.signed() then "int\(bits)_t" else "uint\(bits)_t"
+		} else {
+			String::of(if int.signed() then "intptr_t" else "uintptr_t")
+		}
+	}
+	.Float(float: .F32) => String::of("float")
+	.Float(..) => String::of("double")
+	.Bool => String::of("_Bool")
+	.Char => String::of("uint32_t")
+	.Cstring => String::of("const char *")
+	// A pointer to a layout C knows is that layout's pointer, so C checks the
+	// call; anything else is `void *`.
+	.Ptr(inner) =>
+		if program.types.kind(inner) is .Struct(..) then "\(cType(&program, &interner, inner)) *"
+		else String::of("void *")
+	.Struct(id, ..) => {
+		val keyword = if program.structs[id].isUnion then "union" else "struct"
+		"\(keyword) \(interner.resolve(program.structs[id].name))"
+	}
+	// An array lent is a pointer to its first element, as C's `T x[N]`
+	// parameter is.
+	.Ref(inner, ..) => match program.types.kind(inner) {
+		.Array(elem, ..) => "\(cType(&program, &interner, elem)) *"
+		_ => "\(cType(&program, &interner, inner)) *"
+	}
+	// A C function pointer, by the `typedef` written for it; one that may be
+	// null is the same pointer.
+	.Fn(..) => {
+		val (name, _) = functionTypedef(&program, &interner, ty)
+		move name
+	}
+	.Enum(args, ..) if program.nullableFunction(ty) => cType(
+		&program,
+		&interner,
+		program.types.list(args)[0],
+	)
+	_ => String::of("void")
+}
+
+/// The name of a C function pointer type, and the `typedef` that declares it:
+/// named for what it takes and answers, so the same type has one name.
+fn functionTypedef(program: &Program, interner: &Interner, ty: Ty): (String, String) = {
+	val .Fn(params, ret) = program.types.kind(ty) else {
+		panic("a function type")
+	}
+	val answer = if ret == UNIT then String::of("void") else cType(&program, &interner, ret)
+	var taken: Vec<String> = Vec()
+	for param in program.types.list(params) {
+		taken.push(cType(&program, &interner, param))
+	}
+	val takes = if taken.isEmpty() then String::of("void") else taken.join(", ")
+	val spelled = "\(answer)_of_\(takes)"
+	var name = String::of("wip_fn_")
+	val text = spelled.toStr()
+	for i in 0..text.len() {
+		val byte = text[i]
+		if byte is b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' then name.pushByte(byte)
+		else if byte == b'*' then name.push("p")
+		else name.push("_")
+	}
+	val typedef = "typedef \(answer) (*\(name))(\(takes));"
+	return (move name, move typedef)
+}
+
+/// The `typedef`s `ty` needs, each once and after those it names.
+fn functionTypedefs(program: &Program, interner: &Interner, given: Ty, out: &var Vec<String>) = {
+	val ty = match program.types.kind(given) {
+		.Enum(args, ..) if program.nullableFunction(given) => program.types.list(args)[0]
+		.Array(elem, ..) | .Ref(inner: elem, ..) | .Ptr(inner: elem) => return functionTypedefs(
+			&program,
+			&interner,
+			elem,
+			&var out,
+		)
+		_ => given
+	}
+	val .Fn(params, ret) = program.types.kind(ty) else {
+		return
+	}
+	for param in program.types.list(params) {
+		functionTypedefs(&program, &interner, param, &var out)
+	}
+	functionTypedefs(&program, &interner, ret, &var out)
+	val (_, typedef) = functionTypedef(&program, &interner, ty)
+	if !out.contains(&typedef) then out.push(move typedef)
+}
+
+/// The C declarations for what a library exports: one prototype per
+/// `@export("C")` function, and the structs those mention, which C declared
+/// in the first place.
+pub fn writeHeader(program: &Program, interner: &Interner, guard: str): String = {
+	var exported: Vec<FnId> = Vec()
+	for id in program.fns.ids() {
+		val def = &program.fns[id]
+		// The runtime's entry points are exported from the prelude for the
+		// code generator and for C beside the program, and are no library's
+		// to declare.
+		if def.exportsC && !program.modules[def.module as i64].startsWith("std") then
+			exported.push(id)
+	}
+	var out = String::of(
+		"/* Written by `wip build --header`: what this\n   library exports, for the C that calls it. */\n",
+	)
+	// An archive carries undefined references to whatever the library calls,
+	// and whoever links it must supply them: the libraries the program's
+	// `@link`s name, which on Linux include the maths that a Mac has in
+	// libSystem.
+	var linked: Vec<String> = Vec()
+	for name in program.libraries {
+		linked.push("-l\(name)")
+	}
+	for name in program.frameworks {
+		linked.push("-framework \(name)")
+	}
+	if !linked.isEmpty() then out.push("/* Link what this declares with: \(linked.join(" ")) */\n")
+	out.push("#ifndef \(guard)\n#define \(guard)\n\n")
+	out.push("#include <stdbool.h>\n#include <stdint.h>\n\n")
+	// The structs the signatures name. A struct that crosses the boundary is
+	// C's layout, so its fields are written out.
+	var named: Vec<StructId> = Vec()
+	for id in exported {
+		val def = &program.fns[id]
+		var tys: Vec<Ty> = Vec()
+		for p in def.params {
+			tys.push(p.ty)
+		}
+		tys.push(def.ret)
+		for t in tys {
+			var ty = t
+			while program.types.kind(ty) is .Ptr(inner) | .Ref(inner, ..) {
+				ty = inner
+			}
+			if program.types.kind(ty) is .Struct(id: s, ..) && !named.contains(&s) then
+				named.push(s)
+		}
+	}
+	for id in named {
+		val def = &program.structs[id]
+		val keyword = if def.isUnion then "union" else "struct"
+		out.push("\(keyword) \(interner.resolve(def.name)) {\n")
+		for field in def.fields {
+			val ty = cType(&program, &interner, field.ty)
+			out.push("    \(declarator(ty.toStr(), interner.resolve(field.name)));\n")
+		}
+		out.push("};\n\n")
+	}
+	for id in exported {
+		val def = &program.fns[id]
+		val ret = cType(&program, &interner, def.ret)
+		var params: Vec<String> = Vec()
+		for p in def.params {
+			val name = interner.resolve(p.name)
+			// A slice and a `str` go to C as a pointer and a length, two
+			// arguments.
+			val elem: Option<(String, bool)> = match program.types.kind(p.ty) {
+				.Ref(inner, kind) => match program.types.kind(inner) {
+					.Slice(elem) => .Some((cType(&program, &interner, elem), kind == .Shared))
+					_ => .None
+				}
+				.Str => .Some((String::of("char"), true))
+				_ => .None
+			}
+			match elem {
+				.Some((e, shared)) => {
+					val konst = if shared then "const " else ""
+					params.push("\(konst)\(e) *\(name)")
+					params.push("int64_t \(name)_len")
+				}
+				.None => params.push(declarator(cType(&program, &interner, p.ty).toStr(), name))
+			}
+		}
+		val takes = if params.isEmpty() then String::of("void") else params.join(", ")
+		val signature = "\(interner.resolve(def.name))(\(takes))"
+		out.push("\(declarator(ret.toStr(), signature.toStr()));\n")
+	}
+	out.push("\n#endif\n")
+	return move out
+}

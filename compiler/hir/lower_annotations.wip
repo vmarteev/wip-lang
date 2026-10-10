@@ -1,0 +1,663 @@
+// Annotations: `@name` and `@name(arguments)` before a declaration.
+//
+// The set is closed and written here. An annotation the compiler does not
+// know is an error, and so is one on a declaration that does not take it,
+// one given the wrong arguments, and one written twice: an annotation that
+// quietly does nothing is worse than none, because a reader believes it.
+
+import syntax as ast
+import syntax::{ANNOTATION, Diagnostic, Edit, Span, Symbol}
+
+/// What a declaration is, for the table below.
+@derive(Eq, Clone)
+enum AnnotationTarget {
+	Fn
+	Struct
+	Enum
+	Interface
+	Extend
+	Extern
+	/// A declaration inside an extern block: a function, a variable or a type
+	/// C owns.
+	ExternFn
+	ExternVar
+	ExternType
+	Val
+	Assert
+}
+
+extend AnnotationTarget {
+	fn text(): str = match self {
+		.Fn => "a function"
+		.Struct => "a struct"
+		.Enum => "an enum"
+		.Interface => "an interface"
+		.Extend => "an `extend` block"
+		.Extern => "an `extern` block"
+		.ExternFn => "a C function's declaration"
+		.ExternVar => "a C variable's declaration"
+		.ExternType => "a C type's declaration"
+		.Val => "a constant"
+		.Assert => "a top-level `assert`"
+	}
+}
+
+/// An interface the compiler can write from a type's fields, which is what
+/// `@derive` takes.
+@derive(Eq, Hash, Clone)
+enum Derived {
+	/// `equals`, field by field, written as code.
+	Eq
+	/// `compare`, field by field, written as code.
+	Ord
+	/// `hashInto`, part by part.
+	Hash
+	/// `appendTo`, as the literal that would make the value.
+	Text
+	/// `clone`, field by field, written as code.
+	Clone
+}
+
+extend Derived {
+	fn name(): str = match self {
+		.Eq => "Eq"
+		.Ord => "Ord"
+		.Hash => "Hash"
+		.Text => "Text"
+		.Clone => "Clone"
+	}
+
+	/// The one called `name`, if `@derive` can write it.
+	static fn named(name: str): Option<Derived> = {
+		for d in Derived::all() {
+			if d.name() == name then return .Some(d)
+		}
+		return .None
+	}
+}
+
+/// What each annotation that wrote a body was called before `@derive`:
+/// reported with a fix to the form that replaced it.
+val DERIVED_BEFORE: [(str, str); 4] = [
+	("eq", "Eq"),
+	("ord", "Ord"),
+	("hash", "Hash"),
+	("text", "Text"),
+]
+
+/// The annotations the compiler knows, by name.
+val KNOWN_NAMES: [str; 18] = [
+	"tailrec",
+	"inline",
+	"intrinsic",
+	"target",
+	"test",
+	"export",
+	"link",
+	"include",
+	"source",
+	"define",
+	"prefix",
+	"framework",
+	"symbol",
+	"derive",
+	"oneOf",
+	"opaque",
+	"comptime",
+	"header",
+]
+
+/// One annotation the compiler knows: where it may be written, and what it
+/// takes, for the message when it is given something else; nothing where
+/// it takes no arguments.
+view struct Known {
+	targets: Vec<AnnotationTarget>
+	arguments: Option<str>
+}
+
+/// What the compiler knows of the annotation called `name`, if it knows one.
+fn known(name: str): Option<Known> = match name {
+	"tailrec" => .Some(Known(targets: Vec::of(own [AnnotationTarget::Fn]), arguments: .None))
+	"inline" => .Some(Known(targets: Vec::of(own [AnnotationTarget::Fn]), arguments: .None))
+	"intrinsic" => .Some(Known(
+		targets: Vec::of(own [AnnotationTarget::Fn, AnnotationTarget::Struct]),
+		arguments: .None,
+	))
+	// Every kind of declaration that carries annotations: what a target has
+	// and has not is not one kind of thing.
+	"target" => .Some(Known(
+		targets: Vec::of(own [
+			AnnotationTarget::Fn,
+			AnnotationTarget::Struct,
+			AnnotationTarget::Enum,
+			AnnotationTarget::Interface,
+			AnnotationTarget::Extern,
+			AnnotationTarget::ExternFn,
+			AnnotationTarget::ExternVar,
+			AnnotationTarget::ExternType,
+			AnnotationTarget::Extend,
+			AnnotationTarget::Val,
+			AnnotationTarget::Assert,
+		]),
+		arguments: .Some("what it is for, as in `@target(os = \"linux\")`"),
+	))
+	"test" => .Some(Known(targets: Vec::of(own [AnnotationTarget::Fn]), arguments: .None))
+	"export" => .Some(Known(
+		targets: Vec::of(own [AnnotationTarget::Fn]),
+		arguments: .Some("one ABI name, as in `@export(\"C\")`"),
+	))
+	"link" => .Some(Known(
+		targets: Vec::of(own [AnnotationTarget::Extern]),
+		arguments: .Some("library names, as in `@link(\"sqlite3\")`"),
+	))
+	"include" => .Some(Known(
+		targets: Vec::of(own [AnnotationTarget::Extern]),
+		arguments: .Some("directories in the module, as in `@include(\"src\")`"),
+	))
+	"source" => .Some(Known(
+		targets: Vec::of(own [AnnotationTarget::Extern]),
+		arguments: .Some(
+			"C files in the module, as in `@source(\"src/rcore.c\")`, and what they are written in, `language = \"objective-c\"`",
+		),
+	))
+	"define" => .Some(Known(
+		targets: Vec::of(own [AnnotationTarget::Extern]),
+		arguments: .Some(
+			"settings for the module's C, as in `@define(\"PLATFORM_DESKTOP\", \"LEVEL=2\")`",
+		),
+	))
+	"prefix" => .Some(Known(
+		targets: Vec::of(own [AnnotationTarget::Extern]),
+		arguments: .Some("one header, as in `@prefix(\"build.h\")`"),
+	))
+	"framework" => .Some(Known(
+		targets: Vec::of(own [AnnotationTarget::Extern]),
+		arguments: .Some("framework names, as in `@framework(\"Cocoa\")`"),
+	))
+	"symbol" => .Some(Known(
+		targets: Vec::of(own [AnnotationTarget::ExternFn, AnnotationTarget::ExternVar]),
+		arguments: .Some("one C name, as in `@symbol(\"sqlite3_open\")`"),
+	))
+	"derive" => .Some(Known(
+		targets: Vec::of(own [AnnotationTarget::Struct, AnnotationTarget::Enum]),
+		arguments: .Some("the interfaces it writes, as in `@derive(Eq, Hash)`"),
+	))
+	"oneOf" => .Some(Known(
+		targets: Vec::of(own [AnnotationTarget::Interface]),
+		arguments: .Some(
+			"the methods an implementation writes one of, as in `@oneOf(toString, appendTo)`",
+		),
+	))
+	"opaque" => .Some(Known(targets: Vec::of(own [AnnotationTarget::Struct]), arguments: .None))
+	"comptime" => .Some(Known(targets: Vec::of(own [AnnotationTarget::Val]), arguments: .None))
+	"header" => .Some(Known(
+		targets: Vec::of(own [
+			AnnotationTarget::Extern,
+			AnnotationTarget::Struct,
+			AnnotationTarget::ExternFn,
+			AnnotationTarget::ExternVar,
+		]),
+		arguments: .Some("one header to include, as in `@header(\"<math.h>\")`"),
+	))
+	_ => .None
+}
+
+/// What the annotations of a declaration say about it.
+@derive(Clone)
+struct Annotations {
+	/// `@tailrec`.
+	tailrec: bool = false
+	/// `@intrinsic`: the compiler writes this body.
+	intrinsic: bool = false
+	/// `@inline`: every call to it is spliced, or the program does not
+	/// compile.
+	inline: Option<Span> = .None
+	/// `@test`: `wip test` runs it.
+	test: Option<Span> = .None
+	/// `@link("name", …)`: the libraries the declarations, or the C the
+	/// module builds, come from.
+	link: Vec<(Symbol, Span)> = Vec()
+	/// `@export("C")`: the function gets a plain C symbol, so that C can call
+	/// it by name.
+	export: Option<(Symbol, Span)> = .None
+	/// `@symbol("sqlite3_open")`: what C calls it, when Wip calls it something
+	/// else.
+	symbol: Option<(Symbol, Span)> = .None
+	/// `@derive(Eq, Ord, Hash, Text)`: the interfaces the compiler writes from
+	/// the fields, and where each was named.
+	derive: Vec<(Derived, Span)> = Vec()
+	/// `@opaque`: C knows this struct's layout and Wip does not, so its fields
+	/// are reached through C.
+	opaque: Option<Span> = .None
+	/// `@comptime`: the constant is worked out by running code while the
+	/// program is compiled.
+	comptime: Option<Span> = .None
+	/// `@oneOf(a, b)`, as many as are written: methods of the interface of
+	/// which an implementation writes one at least.
+	oneOf: Vec<OneOf> = Vec()
+	/// `@header("<math.h>")`: the declarations are what this header says they
+	/// are, so each call goes through C that includes it.
+	header: Option<(Symbol, Span)> = .None
+	/// `@include("src", …)`: directories in the module where its C looks for
+	/// headers.
+	include: Vec<(Symbol, Span)> = Vec()
+	/// `@framework("Cocoa", …)`: what an Apple target links besides the
+	/// libraries.
+	framework: Vec<(Symbol, Span)> = Vec()
+	/// `@source("src/rcore.c", …)`: C files of the module, below its own
+	/// directory, each compiled with the program, and `language = "…"`, what
+	/// they are written in where their extension does not say.
+	source: Vec<(Symbol, Span)> = Vec()
+	sourceLanguage: Option<CLanguage> = .None
+	/// `@prefix("build.h")`: a header put before every C file of the module,
+	/// which is how a vendored library is configured.
+	prefix: Option<(Symbol, Span)> = .None
+	/// `@define("PLATFORM_DESKTOP", "LEVEL=2")`: what every C file of the
+	/// module is compiled with defined, as `-D` defines it.
+	define: Vec<(Symbol, Span)> = Vec()
+}
+
+extend Lowerer {
+	/// Checks the annotations written on a declaration, and returns what they
+	/// say.
+	var fn annotations(written: &[ast::Annotation], target: AnnotationTarget): Annotations = {
+		var annotations = Annotations()
+		var seen: Vec<(Symbol, Span)> = Vec()
+		for annotation in written {
+			val name = String::of(self.text(annotation.name.sym))
+			// `@eq` and its three siblings are written `@derive(Eq)` now.
+			var renamed: Option<str> = .None
+			for (old, interfaceName) in DERIVED_BEFORE {
+				if old == name then renamed = .Some(interfaceName)
+			}
+			if renamed is .Some(interfaceName) {
+				self.report(
+					Diagnostic::error(
+						ANNOTATION,
+						"`@\(name)` is written `@derive(\(interfaceName))`",
+						annotation.span,
+						String::of("the old spelling"),
+					).withFix(
+						"write `@derive(\(interfaceName))`",
+						own [Edit::replace(annotation.span, "@derive(\(interfaceName))")],
+					).withNote(
+						String::of(
+							"the annotations that write an interface's body are one, and it names the interface: `@derive(Eq, Ord, Hash, Text)`",
+						),
+					),
+				)
+				continue
+			}
+			val .Some(knownOne) = known(name.toStr()) else {
+				var diagnostic = Diagnostic::error(
+					ANNOTATION,
+					"there is no annotation `@\(name)`",
+					annotation.name.span,
+					String::of("not an annotation"),
+				).withNote(
+					String::of(
+						"the compiler knows every annotation there is; a name it does not know is a mistake, not a hint",
+					),
+				)
+				if suggest(name.toStr(), &KNOWN_NAMES) is .Some(similar) then
+					diagnostic = diagnostic.withFix(
+						"did you mean `@\(similar)`?",
+						own [Edit::replace(annotation.name.span, String::of(similar))],
+					)
+				self.report(move diagnostic)
+				continue
+			}
+			// `@derive` may be written more than once, and what the lines name
+			// is one list: it is what fixing `@eq @hash` one at a time leaves.
+			// `@target` may too, and the lines are the targets it is for, any
+			// of them; and `@oneOf`, each line a group of its own.
+			if !(name.toStr() is "derive" | "target" | "oneOf") {
+				var first: Option<Span> = .None
+				for (sym, span) in seen {
+					if first.isNone() && sym == annotation.name.sym then first = .Some(span)
+				}
+				if first is .Some(first) {
+					self.report(
+						Diagnostic::error(
+							ANNOTATION,
+							"`@\(name)` is written twice",
+							annotation.span,
+							String::of("written again"),
+						).withSecondary(first, String::of("written here")).withHelp(
+							String::of("remove one of them"),
+						),
+					)
+					continue
+				}
+			}
+			seen.push((annotation.name.sym, annotation.span))
+			if !knownOne.targets.contains(&target) {
+				var places: Vec<str> = Vec()
+				for t in knownOne.targets {
+					places.push(t.text())
+				}
+				self.report(
+					Diagnostic::error(
+						ANNOTATION,
+						"`@\(name)` cannot be written on \(target.text())",
+						annotation.span,
+						"on \(target.text())",
+					).withHelp("`@\(name)` belongs on \(oneOfPlaces(&places))"),
+				)
+				continue
+			}
+			val argumentsFit = match (knownOne.arguments, annotation.parens) {
+				(.None, .Some(parens)) => {
+					self.report(
+						Diagnostic::error(
+							ANNOTATION,
+							"`@\(name)` takes no arguments",
+							parens,
+							String::of("arguments"),
+						).withFix(String::of("remove them"), own [Edit::replace(parens, String())]),
+					)
+					false
+				}
+				(.Some(takes), .None) => {
+					self.report(
+						Diagnostic::error(
+							ANNOTATION,
+							"`@\(name)` takes \(takes)",
+							annotation.span,
+							String::of("no arguments"),
+						),
+					)
+					false
+				}
+				_ => true
+			}
+			if !argumentsFit then continue
+			match name.toStr() {
+				"tailrec" => annotations.tailrec = true
+				"intrinsic" => annotations.intrinsic = true
+				"inline" => annotations.inline = .Some(annotation.span)
+				"test" => annotations.test = .Some(annotation.span)
+				// The driver has already read it and dropped what this target
+				// does not take; here it is known so that it is not reported as
+				// an annotation that is not.
+				"target" => {}
+				"link" => annotations.link = self.strings(&annotation)
+				"header" => annotations.header = self.oneString(&annotation)
+				"include" => annotations.include = self.strings(&annotation)
+				"framework" => annotations.framework = self.strings(&annotation)
+				"source" => {
+					val (files, language) = self.sources(&annotation)
+					annotations.source = move files
+					annotations.sourceLanguage = language
+				}
+				"prefix" => annotations.prefix = self.oneString(&annotation)
+				"define" => annotations.define = self.strings(&annotation)
+				"symbol" => annotations.symbol = self.oneString(&annotation)
+				"opaque" => annotations.opaque = .Some(annotation.span)
+				"comptime" => annotations.comptime = .Some(annotation.span)
+				"derive" => {
+					for d in self.derivedOf(&annotation, &annotations.derive) {
+						annotations.derive.push(d)
+					}
+				}
+				"export" => annotations.export = self.oneString(&annotation)
+				"oneOf" => {
+					match self.oneOf(&annotation) {
+						.Some(group) => annotations.oneOf.push(move group)
+						.None => {}
+					}
+				}
+				other => panic("`@\(other)` is known but does nothing")
+			}
+		}
+		return move annotations
+	}
+
+	/// The interfaces `@derive` names, each one the compiler can write, and
+	/// each once.
+	var fn derivedOf(
+		annotation: &ast::Annotation,
+		earlier: &[(Derived, Span)],
+	): Vec<(Derived, Span)> = {
+		var derived: Vec<(Derived, Span)> = Vec()
+		if annotation.args.isEmpty() then
+			self.report(
+				Diagnostic::error(
+					ANNOTATION,
+					String::of("`@derive` names what it writes"),
+					annotation.span,
+					String::of("nothing named"),
+				).withHelp(String::of("write the interfaces, as in `@derive(Eq, Hash)`")),
+			)
+		for arg in annotation.args {
+			val .Name(sym) = arg.value else {
+				self.report(
+					Diagnostic::error(
+						ANNOTATION,
+						String::of("`@derive` takes the names of interfaces"),
+						arg.span,
+						String::of("not a name"),
+					),
+				)
+				continue
+			}
+			if arg.name is .Some(written) {
+				self.report(
+					Diagnostic::error(
+						ANNOTATION,
+						String::of("`@derive`'s arguments have no names"),
+						written.span,
+						String::of("a named argument"),
+					),
+				)
+				continue
+			}
+			val text = String::of(self.text(sym))
+			val .Some(which) = Derived::named(text.toStr()) else {
+				var names: Vec<String> = Vec()
+				for d in Derived::all() {
+					names.push("`\(d.name())`")
+				}
+				self.report(
+					Diagnostic::error(
+						ANNOTATION,
+						"the compiler cannot write `\(text)`",
+						arg.span,
+						String::of("not an interface it writes"),
+					).withNote("`@derive` writes \(names.join(", ")) from the fields; any other interface is written by hand in an `extend` block"),
+				)
+				continue
+			}
+			var first: Option<Span> = .None
+			for (d, span) in earlier {
+				if first.isNone() && d == which then first = .Some(span)
+			}
+			for (d, span) in derived {
+				if first.isNone() && d == which then first = .Some(span)
+			}
+			if first is .Some(first) {
+				self.report(
+					Diagnostic::error(
+						ANNOTATION,
+						"`\(text)` is named twice",
+						arg.span,
+						String::of("named again"),
+					).withSecondary(first, String::of("named here")),
+				)
+				continue
+			}
+			derived.push((which, arg.span))
+		}
+		return move derived
+	}
+
+	/// The methods `@oneOf` names, as names; whether the interface has them
+	/// is asked once its methods are known.
+	var fn oneOf(annotation: &ast::Annotation): Option<OneOf> = {
+		var names: Vec<(Symbol, Span)> = Vec()
+		for arg in annotation.args {
+			if arg.name.isNone() && arg.value is .Name(sym) {
+				names.push((sym, arg.span))
+				continue
+			}
+			self.report(
+				Diagnostic::error(
+					ANNOTATION,
+					String::of("`@oneOf` takes the names of the interface's methods"),
+					arg.span,
+					String::of("not a method's name"),
+				).withHelp(
+					String::of(
+						"write them as they are declared, as in `@oneOf(toString, appendTo)`",
+					),
+				),
+			)
+			return .None
+		}
+		return .Some(OneOf(names: move names, span: annotation.span))
+	}
+
+	/// The one string an annotation was given, where it takes one: reports
+	/// anything else, since an annotation that is read wrongly is worse than
+	/// one that is not read at all.
+	var fn oneString(annotation: &ast::Annotation): Option<(Symbol, Span)> = {
+		val name = String::of(self.text(annotation.name.sym))
+		if annotation.args.len() != 1 {
+			self.report(
+				Diagnostic::error(
+					ANNOTATION,
+					"`@\(name)` takes one argument",
+					annotation.span,
+					"\(plural(annotation.args.len(), "argument", "arguments")) given",
+				),
+			)
+			return .None
+		}
+		return self.annotationString(name.toStr(), &annotation.args[0])
+	}
+
+	/// `@source("sokol.h", language = "objective-c")`: the files, each checked
+	/// as `strings` checks its strings, and the language they are written in,
+	/// if it is said.
+	var fn sources(annotation: &ast::Annotation): (Vec<(Symbol, Span)>, Option<CLanguage>) = {
+		var language: Option<CLanguage> = .None
+		var files: Vec<(Symbol, Span)> = Vec()
+		var wrong = false
+		for arg in annotation.args {
+			val .Some(name) = arg.name else {
+				if self.annotationString("source", &arg) is .Some(file) then files.push(file)
+				continue
+			}
+			val said: Option<CLanguage> = match arg.value {
+				.Str(text) if self.text(name.sym) == "language" => match self.text(text) {
+					"c" => .Some(.C)
+					"objective-c" => .Some(.ObjectiveC)
+					_ => .None
+				}
+				_ => .None
+			}
+			match said {
+				.Some(said) if language.isNone() => language = .Some(said)
+				_ => {
+					self.report(
+						Diagnostic::error(
+							ANNOTATION,
+							String::of(
+								"`@source` takes files, and `language = \"c\"` or `language = \"objective-c\"` once",
+							),
+							arg.span,
+							String::of("not a file, nor a language it knows"),
+						).withNote(
+							String::of(
+								"a file is compiled as its extension says — `.c` as C, `.m` as Objective-C — unless `language` says otherwise, as a header holding a library's implementation needs",
+							),
+						),
+					)
+					wrong = true
+				}
+			}
+		}
+		if files.isEmpty() && !wrong then
+			self.report(
+				Diagnostic::error(
+					ANNOTATION,
+					String::of("`@source` takes one file or more"),
+					annotation.span,
+					String::of("no files given"),
+				),
+			)
+		return (move files, language)
+	}
+
+	/// `@include("src", "include")`: one string or more, each checked as
+	/// `oneString` checks its one.
+	var fn strings(annotation: &ast::Annotation): Vec<(Symbol, Span)> = {
+		val name = String::of(self.text(annotation.name.sym))
+		if annotation.args.isEmpty() {
+			self.report(
+				Diagnostic::error(
+					ANNOTATION,
+					"`@\(name)` takes one string or more",
+					annotation.span,
+					String::of("no arguments given"),
+				),
+			)
+			return Vec()
+		}
+		var found: Vec<(Symbol, Span)> = Vec()
+		for arg in annotation.args {
+			if self.annotationString(name.toStr(), &arg) is .Some(s) then found.push(s)
+		}
+		return move found
+	}
+
+	/// One argument of `@name(…)` that must be a string, not named and not
+	/// empty.
+	var fn annotationString(name: str, arg: &ast::AnnotationArg): Option<(Symbol, Span)> = {
+		if arg.name is .Some(written) {
+			self.report(
+				Diagnostic::error(
+					ANNOTATION,
+					"`@\(name)`'s argument has no name",
+					written.span,
+					String::of("a named argument"),
+				),
+			)
+			return .None
+		}
+		val .Str(text) = arg.value else {
+			self.report(
+				Diagnostic::error(
+					ANNOTATION,
+					"`@\(name)` takes a string",
+					arg.span,
+					String::of("not a string"),
+				),
+			)
+			return .None
+		}
+		if self.text(text).isEmpty() {
+			self.report(
+				Diagnostic::error(
+					ANNOTATION,
+					"`@\(name)` needs a name",
+					arg.span,
+					String::of("an empty string"),
+				),
+			)
+			return .None
+		}
+		return .Some((text, arg.span))
+	}
+}
+
+/// `a`, `a or b`, `a, b or c`: the places an annotation may be written.
+fn oneOfPlaces(places: &[str]): String = {
+	if places.isEmpty() then return String()
+	if places.len() == 1 then return String::of(places[0])
+	var rest: Vec<str> = Vec()
+	for i in 0..places.len() - 1 {
+		rest.push(places[i])
+	}
+	return "\(rest.join(", ")) or \(places[places.len() - 1])"
+}

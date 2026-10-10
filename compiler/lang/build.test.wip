@@ -1,0 +1,101 @@
+// Building: what the linker is told, and what the IR passes.
+
+import std::fs
+import std::future
+
+/// What the linker is told after the objects, in order: where to look for
+/// libraries, the libraries, the frameworks on an Apple target, and the
+/// threads' library on Linux.
+@test
+fn linkArguments() = {
+	val args = linkArgs(
+		Vec::of(own [String::of("/opt/lib")]),
+		Vec::of(own [String::of("sqlite3"), String::of("z")]),
+		Vec::of(own [String::of("Cocoa")]),
+	)
+	var expected: Vec<String> = Vec()
+	expected.push(String::of("-L/opt/lib"))
+	expected.push(String::of("-lsqlite3"))
+	expected.push(String::of("-lz"))
+	if TARGET_OS == "linux" then expected.push(String::of("-lpthread"))
+	if TARGET_VENDOR == "apple" {
+		expected.push(String::of("-framework"))
+		expected.push(String::of("Cocoa"))
+	}
+	// The maths are not added here: the prelude asks for them where it needs
+	// them.
+	assert(args == expected)
+}
+
+/// `BOARD_H` for `board.h`, and one `_` for each character that is not a
+/// letter or a digit.
+@test
+fn aHeaderIsGuardedByItsName() = {
+	assert(headerGuard("include/board.h") == "WIP_BOARD_H")
+	assert(headerGuard("é-x.h") == "WIP___X_H")
+}
+
+/// A vector of `void`, dropped: `destroy` is called on each element, whose
+/// `void` is passed as a null pointer, which the signature has for it.
+@test
+fn aVoidArgumentIsPassedAsNull() = {
+	val unique = Unique::new()
+	val .Ok(dir) = TempDir::new(&unique) else {
+		panic("a temporary directory")
+	}
+	val main = dir.join("main.wip")
+	val program =
+		"fn kept<R>(work: &() => R): Vec<R> = {\n\tvar answers: Vec<R> = Vec()\n\tanswers.push(work())\n\treturn move answers\n}\n\nfn main() = {\n\tval done = kept(() => {})\n\tassert(done.len() == 1)\n}\n"
+	assert(fs::writeFile(main.toStr(), program).isOk())
+	var timings = Timings()
+	val .Ok(loaded) = loadMode(main.toStr(), .Program, &var timings, future::cores()) else {
+		panic("the program is read")
+	}
+	var program = move loaded
+	val output = dir.join("main.ll")
+	val options = BuildOptions(emit: .LlvmIr, profile: .Release)
+	assert(buildLoaded(&var program, output.toStr(), &options, &unique, &var timings).isOk())
+	val .Ok(ir) = fs::readFile(output.toStr()) else {
+		panic("the IR is written")
+	}
+	var passed = false
+	for line in ir.lines() {
+		if line.contains("destroy<void>") && line.contains("(ptr null)") then passed = true
+	}
+	assert(passed)
+}
+
+/// A reference read out of memory is not null to LLVM, and aligned, but not
+/// promised to reach its value: where the place is an enum's payload, LLVM
+/// takes the promise as true even where the enum holds another variant, and
+/// reads through the reference before the branch that loads it.
+@test
+fn aReferenceReadFromMemoryPromisesOnlyWhatHoldsEverywhere() = {
+	val unique = Unique::new()
+	val .Ok(dir) = TempDir::new(&unique) else {
+		panic("a temporary directory")
+	}
+	val main = dir.join("main.wip")
+	val program =
+		"import std::collections::{Map}\n\nfn first(seen: &Map<i64, i64>, key: i64): i64 = match seen.get(&key) {\n\t.Some(value) => value + 1\n\t.None => 0\n}\n\nfn main() = {\n\tvar seen: Map<i64, i64> = Map()\n\tseen.put(1, 2)\n\tassert(first(&seen, 1) == 3 && first(&seen, 5) == 0)\n}\n"
+	assert(fs::writeFile(main.toStr(), program).isOk())
+	var timings = Timings()
+	val .Ok(loaded) = loadMode(main.toStr(), .Program, &var timings, future::cores()) else {
+		panic("the program is read")
+	}
+	var read = move loaded
+	val output = dir.join("main.ll")
+	val options = BuildOptions(emit: .LlvmIr, profile: .Release)
+	assert(buildLoaded(&var read, output.toStr(), &options, &unique, &var timings).isOk())
+	val .Ok(ir) = fs::readFile(output.toStr()) else {
+		panic("the IR is written")
+	}
+	var loads = 0
+	for line in ir.lines() {
+		if !line.contains("load ptr") || !line.contains("!nonnull") then continue
+		loads += 1
+		assert(!line.contains("!dereferenceable"), line)
+	}
+	assert(loads > 0, "no reference is loaded")
+	assert(ir.contains("nonnull dereferenceable("), "a parameter promises it")
+}

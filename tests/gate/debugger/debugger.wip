@@ -1,0 +1,367 @@
+// What a debugger is told of a program: the lines its code was written at,
+// each function's name and place, the variables in scope, and, with the
+// scripts `wip debug` gives it, Wip's values as they are meant. The system's
+// debugger is asked — lldb on a Mac, gdb elsewhere — where it is installed;
+// a machine without it skips what it would say.
+
+import std::fs
+import std::path
+import std::process::{Command}
+import check::{Checked, Gate, Ran, across, isDirectory, isFile, onPath, read, run, wrong, write}
+
+val ITEMS = [
+	"a build tells the debugger its lines",
+	"a release build by LLVM tells the debugger its lines",
+	"the debugger shows Wip's values",
+	"a release build by LLVM shows Wip's values, or none",
+]
+
+pub fn check(gate: &Gate): Checked = {
+	var chosen: Vec<i64> = Vec()
+	for index in 0..ITEMS.len() {
+		if gate.takes(ITEMS[index]) then chosen.push(index)
+	}
+	val failed = across(
+		chosen.len(),
+		(at) => {
+			val index = chosen[at]
+			val root = gate.work.join("debugger-\(index)")
+			fs::makeDirs(root.toStr())
+			val found = match index {
+				0 => tellsItsLines(&gate, root.toStr())
+				1 => releaseTellsItsLines(&gate, root.toStr())
+				2 => showsValues(&gate, root.toStr())
+				_ => releaseShowsValues(&gate, root.toStr())
+			}
+			return match found {
+				.Some(why) => .Some("\(ITEMS[index]): \(why)")
+				.None => .None
+			}
+		},
+	)
+	return Checked::of(chosen.len(), move failed)
+}
+
+/// What `tool`, run in `root` with `arguments`, wrote on its standard
+/// output: nothing where it is not on `PATH`.
+fn asked(tool: str, root: str, arguments: &[str]): Option<String> = {
+	if !onPath(tool) then return .None
+	val ran = run(Command::of(tool).args(&arguments).directory(root))
+	return .Some(ran.stdout.clone())
+}
+
+/// The address lldb says a breakpoint or a lookup is at.
+fn addressIn(said: str): Option<str> = match said.find("address = ") {
+	.Some(at) => said[at + 10..].splitWhitespace().next()
+	.None => .None
+}
+
+/// A build carries the lines its code was written at, and each function's
+/// name and place: the debugger finds `main.wip:8` in `total`, and says
+/// where `total` is declared. A debug build describes the variables in
+/// scope there too, each in its slot. A release build keeps its lines
+/// beside the program: on Linux they leave the program for a file it names,
+/// as the distributions ship theirs; on a Mac they are gathered beside it.
+/// `greet`'s text comes before the code in the object, so that an address
+/// which forgets where the code starts is caught. The debugger is asked
+/// without running the program, which a Mac lets only a developer do.
+fn tellsItsLines(gate: &Gate, root: str): Option<String> = {
+	write(
+		root,
+		"main.wip",
+		"import std::io\n\nfn greet(): str = \"hi\"\n\nfn total(values: &[i64]): i64 = {\n\tvar sum = 0\n\tfor value in values {\n\t\tsum += value\n\t}\n\treturn sum\n}\n\nfn main() = {\n\tval xs = [1, 2, 3]\n\tio::println(greet())\n\tio::println(\"\\(total(&xs))\")\n}\n",
+	)
+	val built = gate.wip(root, ["build", "main.wip"])
+	if !built.exit.success() then return wrong("`wip build main.wip`", &built)
+	if tellsTheDebugger(root, "main") is .Some(why) then return .Some(why.clone())
+	val released = gate.wip(root, ["build", "--release", "main.wip", "-o", "released"])
+	if !released.exit.success() then return wrong("`wip build --release main.wip`", &released)
+	if TARGET_VENDOR == "apple" {
+		if !isDirectory(root, "released.dSYM") then
+			return .Some("a release build gathers no `released.dSYM`")
+	} else {
+		if !isFile(root, "released.debug") then
+			return .Some("a release build writes no `released.debug`")
+		val program = read(root, "released")
+		if !program.contains(".gnu_debuglink") || program.contains(".debug_line") then
+			return .Some("a release build keeps its lines in the program")
+	}
+	return .None
+}
+
+/// Asks the debugger where `main.wip:8` is in `program`, where `total` is
+/// declared, and which variables are in scope there, which a debug build
+/// describes.
+fn tellsTheDebugger(root: str, program: str): Option<String> = {
+	val names = ["value", "sum", "values"]
+	if TARGET_VENDOR == "apple" {
+		// Apple's linker leaves the lines in the objects; the build gathers
+		// them beside the program.
+		if !isDirectory(root, "\(program).dSYM".toStr()) then
+			return .Some("no `\(program).dSYM` beside the program")
+		val .Some(said) = asked("lldb", root, [
+			"--batch",
+			"-o",
+			"breakpoint set --file main.wip --line 8",
+			"-o",
+			"image lookup --verbose --name total",
+			program,
+		]) else {
+			return .None
+		}
+		if !said.contains("total + ") ||
+			!said.contains("at main.wip:8") ||
+			!said.contains("decl = main.wip:5") {
+			return .Some("lldb says\n\(said)")
+		}
+		val .Some(address) = addressIn(said.toStr()) else {
+			return .Some("lldb gives no address:\n\(said)")
+		}
+		val lookup = "image lookup --verbose --address \(address)"
+		val seen = asked("lldb", root, ["--batch", "-o", lookup.toStr(), program]).unwrapOr(
+			String(),
+		)
+		for name in names {
+			if !seen.contains("name = \"\(name)\"".toStr()) then
+				return .Some("`\(name)` is not in scope:\n\(seen)")
+		}
+	} else {
+		val .Some(said) = asked("gdb", root, [
+			"-batch",
+			"-ex",
+			"info line main.wip:8",
+			"-ex",
+			"info scope main.wip:8",
+			program,
+		]) else {
+			return .None
+		}
+		if !said.contains("Line 8 of") || !said.contains("<total+") then
+			return .Some("gdb says\n\(said)")
+		for name in names {
+			if !said.contains("Symbol \(name) ".toStr()) then
+				return .Some("`\(name)` is not in scope:\n\(said)")
+		}
+	}
+	return .None
+}
+
+/// A release build carries its lines too, beside the program: the debugger
+/// finds `main.wip:4`, in code LLVM may have inlined into `main`, and the
+/// variable `sum` in scope there, where LLVM keeps it. What it adds up
+/// arrives as the program runs, so the line has code.
+fn releaseTellsItsLines(gate: &Gate, root: str): Option<String> = {
+	write(
+		root,
+		"main.wip",
+		"fn total(values: &[cstring]): i64 = {\n\tvar sum = 0\n\tfor value in values {\n\t\tsum += value.toStr().len()\n\t}\n\treturn sum\n}\n\nfn main(args: &[cstring]): i64 = {\n\treturn total(&args)\n}\n",
+	)
+	val built = gate.wip(root, ["build", "--release", "main.wip"])
+	if !built.exit.success() then return wrong("`wip build --release main.wip`", &built)
+	if TARGET_VENDOR == "apple" {
+		if !isDirectory(root, "main.dSYM") then return .Some("no `main.dSYM` beside the program")
+		val .Some(found) = asked("lldb", root, [
+			"--batch",
+			"-o",
+			"breakpoint set --file main.wip --line 4",
+			"main",
+		]) else {
+			return .None
+		}
+		if !found.contains("at main.wip:4") then return .Some("lldb says\n\(found)")
+		val .Some(address) = addressIn(found.toStr()) else {
+			return .Some("lldb gives no address:\n\(found)")
+		}
+		val lookup = "image lookup --verbose --address \(address)"
+		val seen = asked("lldb", root, ["--batch", "-o", lookup.toStr(), "main"]).unwrapOr(String())
+		if !seen.contains("name = \"sum\"") then return .Some("`sum` is not in scope:\n\(seen)")
+	} else {
+		if !isFile(root, "main.debug") then return .Some("no `main.debug` beside the program")
+		val .Some(found) = asked("gdb", root, [
+			"-batch",
+			"-ex",
+			"info line main.wip:4",
+			"-ex",
+			"info scope main.wip:4",
+			"main",
+		]) else {
+			return .None
+		}
+		if !found.contains("Line 4 of") || !found.contains("Symbol sum ") then
+			return .Some("gdb says\n\(found)")
+	}
+	return .None
+}
+
+/// Where `wip debug --scripts` says the script for `debugger` is.
+fn scriptFor(listed: str, debugger: str): Option<String> = {
+	val prefix = "\(debugger): "
+	for line in listed.lines() {
+		if line.stripPrefix(prefix.toStr()) is .Some(at) then return .Some(String::of(at))
+	}
+	return .None
+}
+
+/// The debugger shows Wip's values as they are meant, with the scripts
+/// `wip debug` loads: a `Vec`, a `Map` and a slice as their elements, a
+/// `String` as its text, an enum as the variant it holds, a `char` as
+/// itself. The program is run to a breakpoint, which a Mac lets only a
+/// developer do; where the debugger cannot run it, or is not there, nothing
+/// is asked of it. And `wip debug` starts the system's debugger with its
+/// script loaded.
+fn showsValues(gate: &Gate, root: str): Option<String> = {
+	write(
+		root,
+		"main.wip",
+		"import std::io\nimport std::collections::{Map}\n\nenum Shape {\n\tCircle(radius: i64)\n\tEmpty\n}\n\nfn count(items: &[i64]): i64 = {\n\treturn items.len()\n}\n\nfn main() = {\n\tvar numbers: Vec<i64> = Vec()\n\tnumbers.push(4)\n\tnumbers.push(5)\n\tval name = String::of(\"hello\")\n\tvar ages: Map<str, i64> = Map()\n\tages.put(\"ann\", 31)\n\tval shape = Shape::Circle(radius: 2)\n\tval none: Option<i64> = .None\n\tval letter = 'x'\n\tio::println(\"\\(count(&numbers.items())) \\(name) \\(ages.len()) \\(none.isSome()) \\(letter)\")\n\tio::println(\"\\(shape is .Empty)\")\n}\n",
+	)
+	val built = gate.wip(root, ["build", "main.wip"])
+	if !built.exit.success() then return wrong("`wip build main.wip`", &built)
+	val scripts = gate.wip(root, ["debug", "--scripts"])
+	if !scripts.exit.success() then return wrong("`wip debug --scripts`", &scripts)
+	val .Some(lldb) = scriptFor(scripts.stdout.toStr(), "lldb") else {
+		return wrong("`wip debug --scripts` names no lldb script", &scripts)
+	}
+	val .Some(gdb) = scriptFor(scripts.stdout.toStr(), "gdb") else {
+		return wrong("`wip debug --scripts` names no gdb script", &scripts)
+	}
+	for script in [lldb.toStr(), gdb.toStr()] {
+		if !fs::exists(script) then return .Some("`\(script)` is not there")
+	}
+	val apple = TARGET_VENDOR == "apple"
+	val tool = if apple then "lldb" else "gdb"
+	// Where the program stopped at the breakpoint, which the debugger says
+	// only once it has run it there.
+	val stopped = if apple then "stop reason = breakpoint" else "Breakpoint 1, "
+	val importLldb = "command script import \(lldb)"
+	val arguments: Vec<str> =
+		if apple then
+			[
+				"--batch",
+				"-o",
+				importLldb.toStr(),
+				"-o",
+				"breakpoint set --name count",
+				"-o",
+				"run",
+				"-o",
+				"frame variable items",
+				"-o",
+				"up",
+				"-o",
+				"frame variable",
+				"-o",
+				"kill",
+				"main",
+			].toVec()
+		else [
+			"-batch",
+			"-x",
+			gdb.toStr(),
+			"-ex",
+			"break count",
+			"-ex",
+			"run",
+			"-ex",
+			"info args",
+			"-ex",
+			"up",
+			"-ex",
+			"info locals",
+			"main",
+		].toVec()
+	if !onPath(tool) then return .None
+	// A debugger launches the program through a server of its own, and on a
+	// machine busy with everything else the gate runs that launch can time
+	// out: a run that did not stop is tried again before it counts as one
+	// the debugger cannot make here.
+	var said = String()
+	for _ in 0..3 {
+		val ran = run(Command::of(tool).args(&arguments).directory(root))
+		if ran.stdout.contains(stopped) {
+			said = ran.stdout.clone()
+			break
+		}
+	}
+	if said.isEmpty() then return .None
+	val shown = if apple then LLDB_SHOWS.toVec() else GDB_SHOWS.toVec()
+	for value in shown {
+		if !said.contains(value) then return .Some("\(tool) does not show `\(value)`:\n\(said)")
+	}
+	val debugging = gate.wipReading("quit\n", root, ["debug", "main"])
+	if !debugging.exit.success() then return wrong("`wip debug main`", &debugging)
+	return .None
+}
+
+/// Each value as lldb prints a variable, with the script.
+val LLDB_SHOWS = [
+	"(&[i64]) items = len 2 {\n  [0] = 4\n  [1] = 5\n}",
+	"(Vec<i64>) numbers = len 2 {\n  [0] = 4\n  [1] = 5\n}",
+	"(String) name = \"hello\"",
+	"(Map<str, i64>) ages = len 1 {\n  [\"ann\"] = 31\n}",
+	"(Shape) shape = .Circle(radius: 2)",
+	"(Option<i64>) none = .None",
+	"(char32_t) letter = 'x'",
+]
+
+/// Each value as gdb prints a variable, with the script.
+val GDB_SHOWS = [
+	"\nitems = len 2 = {4, 5}",
+	"\nnumbers = len 2 = {4, 5}",
+	"\nname = \"hello\"",
+	"\nages = len 1 = {[\"ann\"] = 31}",
+	"\nshape = .Circle = {radius = 2}",
+	"\nnone = .None",
+	"\nletter = 'x'",
+]
+
+/// A release build by LLVM describes its variables, which gdb shows through
+/// `wip debug`'s script each as it is or, where LLVM kept only part of it,
+/// as `<optimized out>` — never as what it does not hold. Where gdb, or a
+/// system that lets gdb run the program, is missing, nothing is checked.
+fn releaseShowsValues(gate: &Gate, root: str): Option<String> = {
+	if TARGET_VENDOR == "apple" || !onPath("gdb") then return .None
+	write(
+		root,
+		"main.wip",
+		"import std::io\nimport std::collections::{Map}\n\nfn main() = {\n\tvar numbers: Vec<i64> = Vec()\n\tnumbers.push(4)\n\tnumbers.push(5)\n\tval name = String::of(\"hello\")\n\tvar ages: Map<str, i64> = Map()\n\tages.put(\"ann\", 31)\n\tval none: Option<i64> = .None\n\tval letter = 'x'\n\tio::println(\"\\(numbers.len()) \\(name) \\(ages.len()) \\(none.isSome()) \\(letter)\")\n}\n",
+	)
+	val built = gate.wip(root, ["build", "--release", "main.wip"])
+	if !built.exit.success() then return wrong("`wip build --release main.wip`", &built)
+	val scripts = gate.wip(root, ["debug", "--scripts"])
+	val .Some(gdb) = scriptFor(scripts.stdout.toStr(), "gdb") else {
+		return wrong("`wip debug --scripts` names no gdb script", &scripts)
+	}
+	val said = asked("gdb", root, [
+		"-batch",
+		"-x",
+		gdb.toStr(),
+		"-ex",
+		"break main.wip:13",
+		"-ex",
+		"run",
+		"-ex",
+		"info locals",
+		"main",
+	]).unwrapOr(String())
+	if !said.contains("main.wip:13") then return .None
+	var shownWhole = 0
+	for (name, whole) in [
+		("numbers", "len 2 = {4, 5}"),
+		("name", "\"hello\""),
+		("ages", "len 1 = {[\"ann\"] = 31}"),
+		("none", ".None"),
+		("letter", "'x'"),
+	] {
+		val prefix = "\(name) = "
+		val .Some(line) = said.lines().find((line) => line.startsWith(prefix.toStr())) else {
+			return .Some("`\(name)` is not described:\n\(said)")
+		}
+		val value = line[prefix.len()..]
+		if value != whole && value != "<optimized out>" then
+			return .Some("`\(name)` is shown as \(value):\n\(said)")
+		if value == whole then shownWhole += 1
+	}
+	if shownWhole == 0 then return .Some("nothing is shown whole:\n\(said)")
+	return .None
+}

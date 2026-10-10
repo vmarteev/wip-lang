@@ -1,0 +1,1165 @@
+// Struct literals and enum variants.
+
+import std::collections::{Map}
+import syntax as ast
+import syntax::{
+	ARGUMENT_COUNT,
+	CANNOT_INFER,
+	Diagnostic,
+	Edit,
+	OPAQUE_VALUE,
+	PACKAGE,
+	SELF_OUTSIDE_METHOD,
+	STRUCT_LITERAL_FIELDS,
+	Span,
+	Symbol,
+	UNKNOWN_TYPE,
+	UNKNOWN_VARIANT,
+	UNNAMED_FIELDS,
+	VARIANT_WITH_DOT
+}
+
+/// A struct literal as it is written, `Name<…>(field: value, ..rest)`, and
+/// the type expected where it is.
+@derive(Clone)
+view struct StructLit {
+	typeArgs: Option<&ast::TypeArgs>
+	fields: Written
+	rest: Option<ast::ExprId>
+	hint: Option<Ty>
+	span: Span
+}
+
+/// The fields a struct literal is given, as written: a call's arguments, by
+/// position and then by name.
+@derive(Clone)
+view struct Written {
+	args: &[ast::ExprId]
+	names: &[Option<ast::Name>]
+}
+
+/// A field a literal sets, under its name: a positional argument is given
+/// the name of the field it fills.
+@derive(Clone)
+struct FieldInit {
+	name: ast::Name
+	value: ast::ExprId
+}
+
+extend Lowerer {
+	var fn structLit(path: &[ast::Name], lit: StructLit): ExprId = {
+		val fields = lit.fields
+		val span = lit.span
+		if lit.typeArgs is .Some(typeArgs) &&
+			self.variableWithTypeArgs(&path, &typeArgs) is .Some(diagnostic) {
+			self.report(move diagnostic)
+			return self.giveUp(fields.args, span)
+		}
+		// `Self { … }` builds the type the method belongs to.
+		if path.len() == 1 && self.text(path[0].sym) == "Self" {
+			val only = path[0]
+			val .Some(selfTy) = self.selfTy else {
+				self.report(
+					Diagnostic::error(
+						SELF_OUTSIDE_METHOD,
+						"`Self` is only available in a method",
+						only.span,
+						"no type here",
+					).withNote("`Self` is the type a method belongs to"),
+				)
+				return self.giveUp(fields.args, span)
+			}
+			if self.kind(selfTy) is .Struct(id, ..) {
+				// The struct under its own name, so the literal is checked as any
+				// other is.
+				val name = ast::Name(sym: self.program.structs[id].name, span: only.span)
+				var plain = lit
+				plain.typeArgs = .None
+				return self.structLitOf(self.current, name, 0, plain)
+			}
+			self.report(
+				Diagnostic::error(
+					STRUCT_LITERAL_FIELDS,
+					"\(self.tyName(selfTy)) is an enum, not a struct",
+					only.span,
+					"not a struct",
+				).withHelp("construct a variant with `.Variant(…)`"),
+			)
+			return self.giveUp(fields.args, span)
+		}
+		val .Item(module, name) = self.resolvePath(&path, false, MODULE_NOTE) else {
+			return self.giveUp(fields.args, span)
+		}
+		return self.structLitOf(module, name, path.len() - 1, lit)
+	}
+
+	/// The fields a literal did not name, read from the value after `..`. It
+	/// must be a value that is there — a variable, a field, an element — since
+	/// each field is read from it where it lies, and each must be one that
+	/// copies.
+	var fn restFields(
+		rest: ast::ExprId,
+		ty: Ty,
+		taken: &[i64],
+		name: ast::Name,
+		span: Span,
+	): Vec<(i64, ExprId)> = {
+		val context: Option<(Span, str)> = .Some((name.span, "the literal's type"))
+		val value = self.checkIn(rest, ty, context)
+		val restSpan = self.state.body.exprs[value].span
+		// Where the value is not one the fields can be read from, the fields
+		// it would have given are errors of their own, so that nothing reports
+		// them missing as well.
+		if self.tyOf(value) != ty {
+			// Reported by the check above.
+			return self.restBroken(taken, restSpan)
+		}
+		if !self.state.body.isPlace(value) {
+			self.report(
+				Diagnostic::error(
+					STRUCT_LITERAL_FIELDS,
+					"`..` takes the rest of the fields from a value that is there",
+					restSpan,
+					"not a variable, a field or an element",
+				).withHelp("put it in a variable first, and name that after `..`").withNote(
+					"each field is copied from where it lies, so the value is read and not built",
+				),
+			)
+			return self.restBroken(taken, restSpan)
+		}
+		var fields: Vec<(i64, ExprId)> = Vec()
+		if taken.isEmpty() {
+			self.report(
+				Diagnostic::warning(
+					STRUCT_LITERAL_FIELDS,
+					"`..` has no fields to take",
+					restSpan,
+					"every field is named already",
+				),
+			)
+			return move fields
+		}
+		for i in taken {
+			val fieldTy = self.program.fieldTy(ty, i as u32)
+			// A field that owns memory would be moved out of a value that goes
+			// on living, which nothing else in the language does.
+			if self.owns(fieldTy) {
+				val .Struct(id, ..) = self.kind(ty) else {
+					panic("a struct literal's type is a struct")
+				}
+				val field = String::of(self.text(self.program.structs[id].fields[i].name))
+				self.report(
+					Diagnostic::error(
+						STRUCT_LITERAL_FIELDS,
+						"`\(field)` is \(self.tyName(fieldTy)), which owns memory",
+						restSpan,
+						"not a field `..` can copy",
+					).withHelp("give `\(field)` a value of its own in the literal, or build the whole value with `move`").withNote(
+						"`..` copies the fields it takes, and a value that owns memory has one owner",
+					),
+				)
+				// Reported here, so it is not reported again as missing.
+				fields.push((i, self.errorExpr(restSpan)))
+				continue
+			}
+			val read = self.alloc(.Field(base: value, index: i as u32), fieldTy, span)
+			fields.push((i, read))
+		}
+		return move fields
+	}
+
+	/// The fields `..` would have given, each an error of its own.
+	var fn restBroken(taken: &[i64], span: Span): Vec<(i64, ExprId)> = {
+		val error = self.errorExpr(span)
+		var fields: Vec<(i64, ExprId)> = Vec()
+		for i in taken {
+			fields.push((i, error))
+		}
+		return move fields
+	}
+
+	/// `Event { key: … }`, `Event {}`: a C union.
+	var fn unionLiteral(id: StructId, name: ast::Name, fields: &[FieldInit], span: Span): ExprId = {
+		val decls = self.program.structs[id].fields.clone()
+		val unionName = String::of(self.text(name.sym))
+		// Two fields would be two values over the same bytes, and only the last
+		// one written would be there.
+		if fields.len() > 1 then
+			self.report(
+				Diagnostic::error(
+					STRUCT_LITERAL_FIELDS,
+					"a `\(unionName)` holds one field at a time",
+					fields[1].name.span,
+					"a second field",
+				).withSecondary(fields[0].name.span, "this one is already set").withNote(
+					"a union's fields are the same bytes, so a literal sets one of them, or none and every byte is zero",
+				),
+			)
+		var written: Option<(u32, ExprId)> = .None
+		for (n, f) in fields.forwards().enumerate() {
+			var found: Option<i64> = .None
+			for (i, d) in decls.forwards().enumerate() {
+				if found.isNone() && d.name == f.name.sym then found = .Some(i)
+			}
+			val .Some(i) = found else {
+				val field = self.text(f.name.sym)
+				var texts: Vec<str> = Vec()
+				for d in decls {
+					texts.push(self.text(d.name))
+				}
+				var diagnostic = Diagnostic::error(
+					STRUCT_LITERAL_FIELDS,
+					"union `\(unionName)` has no field `\(field)`",
+					f.name.span,
+					"unknown field",
+				)
+				if suggest(field, &texts) is .Some(similar) then
+					diagnostic = diagnostic.withFix(
+						"did you mean `\(similar)`?",
+						own [Edit::replace(f.name.span, String::of(similar))],
+					)
+				self.report(move diagnostic)
+				self.infer(f.value, .None)
+				continue
+			}
+			val context: Option<(Span, str)> = .Some((decls[i].span, "field declared here"))
+			val value = self.checkIn(f.value, decls[i].ty, context)
+			if n == 0 then written = .Some((i as u32, value))
+		}
+		val ty = self.intern(.Struct(id: id, args: TyList::empty()))
+		return self.alloc(.Union(id: id, field: written), ty, span)
+	}
+
+	/// The fields a literal sets, each under its name, by a variant's rules:
+	/// with two or more fields each is named; a value by position fills the
+	/// field in its position, which is how a struct of one field and a tuple
+	/// are built. More of them than the struct has fields is reported, and
+	/// answers nothing.
+	var fn writtenFields(
+		id: StructId,
+		name: ast::Name,
+		written: Written,
+	): Option<Vec<FieldInit>> = {
+		val args = written.args
+		val names: Vec<Option<ast::Name>> = if self.program.structs[id].isTuple {
+			written.names.toVec()
+		} else {
+			val decls = self.program.structs[id].fields.clone()
+			val path = String::of(self.text(name.sym))
+			self.fieldNames(&path, &decls, args, written.names.toVec())
+		}
+		var fields: Vec<FieldInit> = Vec()
+		for (i, value) in args.forwards().enumerate() {
+			val span = self.ast.exprs[value].span
+			val named: Option<ast::Name> = if i < names.len() then names[i] else .None
+			val field = match named {
+				.Some(n) => FieldInit(name: n, value: value)
+				.None => {
+					if i >= self.program.structs[id].fields.len() {
+						val count = self.program.structs[id].fields.len()
+						val text = String::of(self.text(name.sym))
+						self.report(
+							Diagnostic::error(
+								STRUCT_LITERAL_FIELDS,
+								"`\(text)` has \(plural(count, "field", "fields")), and \(args.len()) are given",
+								span,
+								"no field is left for this one",
+							).withNote(
+								"a call's arguments set a struct's fields in the order they are declared, then by name",
+							),
+						)
+						return .None
+					}
+					FieldInit(
+						name: ast::Name(sym: self.program.structs[id].fields[i].name, span: span),
+						value: value,
+					)
+				}
+			}
+			fields.push(move field)
+		}
+		return .Some(move fields)
+	}
+
+	/// Whether every byte zero is a value of `ty`, as C takes a field it
+	/// leaves out to be: a number, a `bool`, a C pointer or string, an
+	/// `Option` of a function, and C's structs and arrays of those; not a
+	/// reference, which is never null.
+	fn zeroable(ty: Ty): bool = match self.kind(ty) {
+		.Int(..) | .Float(..) | .Bool | .Char | .Ptr(..) | .Cstring | .Unit => true
+		.Array(elem, ..) => self.zeroable(elem)
+		.Struct(id, args) if self.program.structs[id].isExtern => {
+			val list = self.program.types.list(args).toVec()
+			for f in self.program.structs[id].fields {
+				if !self.zeroable(self.program.types.substFind(f.ty, &list)) then return false
+			}
+			true
+		}
+		_ => self.program.nullableFunction(ty)
+	}
+
+	/// A struct literal whose struct is known: its fields, checked together,
+	/// since they may decide its type arguments.
+	var fn structLitOf(module: i64, name: ast::Name, nameSegment: i64, lit: StructLit): ExprId = {
+		val fields = lit.fields
+		val span = lit.span
+		// `type Grid = Map<Id, Cell>`: the struct the alias names, with the
+		// type arguments the alias gives it.
+		if !self.modules[module].types.contains(&name.sym) &&
+			self.modules[module].aliases.contains(&name.sym) {
+			val args: Vec<ast::TypeId> = match lit.typeArgs {
+				.Some(written) => written.args.clone()
+				.None => Vec()
+			}
+			val .Some(ty) = self.aliasTypeOf(module, name.sym, &args, name.span) else {
+				return self.giveUp(fields.args, span)
+			}
+			val .Struct(id, args: list) = self.kind(ty) else {
+				if !self.isPoisoned(ty) {
+					val text = String::of(self.text(name.sym))
+					self.report(
+						Diagnostic::error(
+							STRUCT_LITERAL_FIELDS,
+							"`\(text)` names \(self.tyName(ty)), not a struct",
+							name.span,
+							"not a struct",
+						),
+					)
+				}
+				return self.giveUp(fields.args, span)
+			}
+			val known = self.program.types.list(list).toVec()
+			return self.structLitKnown(id, name, nameSegment, .Some(move known), lit)
+		}
+		// A struct of the prelude, whose names are in scope in every file. A
+		// tuple is one of them.
+		val found =
+			if self.modules[module].types.contains(&name.sym) then module
+			else self.preludeModule(name.sym).unwrapOr(module)
+		val id = match self.modules[found].types.get(&name.sym) {
+			.Some((.Struct(id), _)) => {
+				if !self.visible(found, self.program.structs[id].isPub) then
+					self.privateItem(found, "struct", name)
+				id
+			}
+			other => {
+				val text = self.text(name.sym)
+				val diagnostic = match other {
+					.Some(_) => Diagnostic::error(
+						STRUCT_LITERAL_FIELDS,
+						"`\(text)` is an enum, not a struct",
+						name.span,
+						"not a struct",
+					).withHelp("construct a variant with `\(text)::Variant(…)`")
+					.None => Diagnostic::error(
+						UNKNOWN_TYPE,
+						"cannot find struct `\(text)`",
+						name.span,
+						"unknown struct",
+					)
+				}
+				self.report(move diagnostic)
+				return self.giveUp(fields.args, span)
+			}
+		}
+		return self.structLitKnown(id, name, nameSegment, .None, lit)
+	}
+
+	/// A struct literal of struct `id`, whose type arguments are `known`
+	/// where an alias said them, and are written or inferred otherwise.
+	var fn structLitKnown(
+		id: StructId,
+		name: ast::Name,
+		nameSegment: i64,
+		known: Option<Vec<Ty>>,
+		lit: StructLit,
+	): ExprId = {
+		val span = lit.span
+		// `@opaque`: nothing here knows how large one is, so there is nothing
+		// to make.
+		if self.program.structs[id].isOpaque {
+			val text = String::of(self.text(name.sym))
+			val declared = self.program.structs[id].span
+			self.report(
+				Diagnostic::error(
+					OPAQUE_VALUE,
+					"`\(text)` is laid out by C, so Wip cannot make one",
+					span,
+					"not a value Wip can build",
+				).withSecondary(declared, "declared `@opaque` here").withNote(
+					"`@opaque` says where the fields are is C's business, so C is what makes one and hands it over",
+				),
+			)
+			return self.giveUp(lit.fields.args, span)
+		}
+		// A call's arguments are its fields: by position, in the order the
+		// fields are declared, then by name.
+		val .Some(fields) = self.writtenFields(id, name, lit.fields) else {
+			return self.giveUp(lit.fields.args, span)
+		}
+		// A union is one field over the bytes of all of them, so a literal
+		// names one or none, and the rest of the bytes are zero.
+		if self.program.structs[id].isUnion then return self.unionLiteral(id, name, &fields, span)
+		// Its fields' defaults, which a literal in another's default may need
+		// before their turn.
+		self.ensureDefaults(.Struct(id))
+		val decls = self.program.structs[id].fields.clone()
+		val generics = self.program.structs[id].generics.clone()
+		val structName = String::of(self.text(name.sym))
+		// Which field each initializer sets: nothing for an unknown field. The
+		// values are checked together below, since they may decide the
+		// struct's type arguments.
+		var targets: Vec<Option<(i64, bool)>> = Vec()
+		var set: Vec<bool> = Vec()
+		for _ in 0..decls.len() {
+			set.push(false)
+		}
+		for f in fields {
+			var found: Option<i64> = .None
+			for (i, d) in decls.forwards().enumerate() {
+				if found.isNone() && d.name == f.name.sym then found = .Some(i)
+			}
+			val .Some(i) = found else {
+				val field = self.text(f.name.sym)
+				var texts: Vec<str> = Vec()
+				for d in decls {
+					texts.push(self.text(d.name))
+				}
+				var diagnostic = Diagnostic::error(
+					STRUCT_LITERAL_FIELDS,
+					"struct `\(structName)` has no field `\(field)`",
+					f.name.span,
+					"unknown field",
+				)
+				val similar = suggest(field, &texts)
+				if similar is .Some(s) then
+					diagnostic = diagnostic.withFix(
+						"did you mean `\(s)`?",
+						own [Edit::replace(f.name.span, String::of(s))],
+					)
+				self.report(move diagnostic)
+				// Treat a misspelt field as the field it was probably meant to be,
+				// so the literal is not also reported as missing it.
+				var meant: Option<i64> = .None
+				if similar is .Some(s) {
+					for (k, d) in decls.forwards().enumerate() {
+						if meant.isNone() && self.text(d.name) == s then meant = .Some(k)
+					}
+				}
+				if meant is .Some(k) && set[k] then meant = .None
+				if meant is .Some(k) then set[k] = true
+				targets.push(
+					match meant {
+						.Some(k) => .Some((k, false))
+						.None => .None
+					},
+				)
+				continue
+			}
+			if set[i] then
+				self.report(
+					Diagnostic::error(
+						STRUCT_LITERAL_FIELDS,
+						"field `\(self.text(f.name.sym))` is set more than once",
+						f.name.span,
+						"set again here",
+					),
+				)
+			// Another module may set only what is `pub var`: a `pub` field is
+			// read out there and written here, and building a value is writing
+			// every one of its fields.
+			if !self.fieldVisible(id, i) then self.privateField(id, i, f.name.span)
+			else if !self.fieldSettable(id, i) then
+				self.readonlyField(id, i, f.name.span, "set here")
+			set[i] = true
+			targets.push(.Some((i, true)))
+		}
+		// Type arguments written, or taken from the expected type, were checked
+		// where that type was made.
+		val start: Vec<Option<Ty>> = match known {
+			.Some(tys) => {
+				var given: Vec<Option<Ty>> = Vec()
+				for t in tys {
+					given.push(.Some(t))
+				}
+				move given
+			}
+			.None =>
+				if lit.typeArgs.isSome() then
+					self.explicitTypeArgs(name.sym, &generics, lit.typeArgs, nameSegment)
+				else self.expectedArgs(.Struct(id), lit.hint)
+		}
+		var inference = Inference::new(move start)
+		// A view's reference field is given a `&`, as a parameter is.
+		val isView = self.program.structs[id].isView
+		var operands: Vec<GenericOperand> = Vec()
+		for (k, f) in fields.forwards().enumerate() {
+			val .Some((i, declaredHere)) = targets[k] else {
+				continue
+			}
+			operands.push(GenericOperand(
+				expr: f.value,
+				declared: decls[i].ty,
+				context: if declaredHere then .Some((decls[i].span, "field declared here"))
+				else .None,
+				isArg: isView && self.kind(decls[i].ty) is .Ref(..),
+			))
+		}
+		val checked = self.genericOperands(&operands, &var inference.tys)
+		var next = 0
+		var values: Vec<Option<ExprId>> = Vec()
+		for _ in 0..decls.len() {
+			values.push(.None)
+		}
+		// The fields are evaluated in the order they are written.
+		var written: Vec<u32> = Vec()
+		for (k, f) in fields.forwards().enumerate() {
+			match targets[k] {
+				.Some((i, _)) => {
+					val value = checked[next]
+					next += 1
+					if values[i].isNone() {
+						values[i] = .Some(value)
+						written.push(i as u32)
+					}
+				}
+				.None => { self.infer(f.value, .None) }
+			}
+		}
+		var list = TyList::empty()
+		if !generics.isEmpty() {
+			val writtenForm = "\(structName)<\(elided(generics.len()))> { … }"
+			val tys = self.finishTypeArgs(
+				&structName,
+				&writtenForm,
+				&generics,
+				move inference,
+				span,
+			)
+			list = self.program.types.internList(&tys)
+		}
+		val ty = self.intern(.Struct(id: id, args: list))
+		// `..value`: the fields the literal does not name are copied from a
+		// value that has them.
+		if lit.rest is .Some(rest) {
+			var taken: Vec<i64> = Vec()
+			for i in 0..decls.len() {
+				if values[i].isNone() then taken.push(i)
+			}
+			for (i, value) in self.restFields(rest, ty, &taken, name, span) {
+				values[i] = .Some(value)
+				written.push(i as u32)
+			}
+		}
+		// A field that is still not set takes its default, evaluated here. The
+		// value after `..` comes first: it is what the literal names, and a
+		// default is what the declaration says.
+		val mark = self.state.unsettledDefaults.len()
+		for i in 0..decls.len() {
+			if values[i].isSome() then continue
+			val .Some(default) = decls[i].default else {
+				continue
+			}
+			values[i] = .Some(self.useDefault(&default, span))
+			written.push(i as u32)
+		}
+		val args = self.program.types.list(list).toVec()
+		self.settleDefaults(mark, &args)
+		// A C struct takes C's zero for a field it is not given, as a designated
+		// initializer leaves one.
+		val cStruct = self.program.structs[id].isExtern && !self.program.structs[id].isUnion
+		for i in 0..decls.len() {
+			if !cStruct || values[i].isSome() then continue
+			val fieldTy = self.program.types.subst(decls[i].ty, &args)
+			if self.zeroable(fieldTy) {
+				values[i] = .Some(self.alloc(.Zeroed, fieldTy, span))
+				written.push(i as u32)
+			}
+		}
+		// A field another module cannot name is one it cannot leave out either:
+		// the value has to be built where the field is seen.
+		var hidden: Vec<i64> = Vec()
+		for i in 0..decls.len() {
+			if values[i].isNone() && !self.fieldSettable(id, i) then hidden.push(i)
+		}
+		for i in hidden {
+			if self.fieldVisible(id, i) then self.readonlyField(id, i, name.span, "not set here")
+			else self.privateField(id, i, name.span)
+			values[i] = .Some(self.errorExpr(span))
+			written.push(i as u32)
+		}
+		var missing: Vec<String> = Vec()
+		for i in 0..decls.len() {
+			if values[i].isNone() then missing.push("`\(self.text(decls[i].name))`")
+		}
+		if !missing.isEmpty() then
+			self.report(
+				Diagnostic::error(
+					STRUCT_LITERAL_FIELDS,
+					"missing \(if missing.len() == 1 then "field" else "fields") in `\(structName)`",
+					name.span,
+					"missing \(missing.join(", "))",
+				),
+			)
+		for i in 0..values.len() {
+			if values[i].isNone() then written.push(i as u32)
+		}
+		var fieldValues: Vec<ExprId> = Vec()
+		for value in values {
+			fieldValues.push(
+				match value {
+					.Some(v) => v
+					.None => self.errorExpr(span)
+				},
+			)
+		}
+		return self.alloc(
+			.Struct(id: id, fields: move fieldValues, order: orderOf(move written)),
+			ty,
+			span,
+		)
+	}
+
+	/// The enum and variant that `Enum::Variant` or `.Variant` names. Without
+	/// an enum name, the enum is the one expected here. What is wrong is
+	/// reported where it does not resolve.
+	var fn resolveVariant(
+		enumName: Option<(i64, ast::Name)>,
+		variant: ast::Name,
+		expected: Option<Ty>,
+	): Option<(EnumId, u32)> = {
+		val id = match enumName {
+			.Some((module, named)) => {
+				val found = self.namedEnum(module, named)?
+				self.program.names.push((named.span, .Owner(.Enum(found))))
+				found
+			}
+			.None => self.expectedEnum(variant, expected)?
+		}
+		val text = String::of(self.text(self.program.enums[id].name))
+		for (i, v) in self.program.enums[id].variants.forwards().enumerate() {
+			if v.name == variant.sym {
+				self.program.names.push((variant.span, .Variant(id: id, variant: i as u32)))
+				return .Some((id, i as u32))
+			}
+		}
+		val name = self.text(variant.sym)
+		var texts: Vec<str> = Vec()
+		for v in self.program.enums[id].variants {
+			texts.push(self.text(v.name))
+		}
+		var diagnostic = Diagnostic::error(
+			UNKNOWN_VARIANT,
+			"no variant `\(name)` in enum `\(text)`",
+			variant.span,
+			"unknown variant",
+		)
+		if suggest(name, &texts) is .Some(similar) then
+			diagnostic = diagnostic.withFix(
+				"did you mean `\(similar)`?",
+				own [Edit::replace(variant.span, String::of(similar))],
+			)
+		self.report(move diagnostic)
+		return .None
+	}
+
+	/// The enum named by `Enum` in `Enum::Variant`.
+	var fn namedEnum(module: i64, enumName: ast::Name): Option<EnumId> = {
+		val text = self.text(enumName.sym)
+		// A type of the prelude, where the path named this module.
+		var found: Option<TypeDef> = match self.modules[module].types.get(&enumName.sym) {
+			.Some((def, _)) => .Some(def)
+			.None => .None
+		}
+		if found.isNone() && module == self.current then found = self.preludeType(enumName.sym)
+		val id = match found {
+			.Some(.Enum(id)) => id
+			.Some(.Builtin(_)) => panic("a module declares no built-in type")
+			.Some(.Struct(_)) => {
+				self.report(
+					Diagnostic::error(
+						UNKNOWN_VARIANT,
+						"`\(text)` is a struct, not an enum",
+						enumName.span,
+						"not an enum",
+					),
+				)
+				return .None
+			}
+			// `package::NAME` where nothing names the package.
+			.None if text == "package" => {
+				self.report(
+					Diagnostic::error(
+						PACKAGE,
+						"this program is not a package",
+						enumName.span,
+						"`package::` names the package the code is in",
+					).withHelp("write a `package.wip` beside the program, holding `package NAME`"),
+				)
+				return .None
+			}
+			.None => {
+				var candidates: Vec<str> = Vec()
+				val types = &self.modules[module].types
+				for i in 0..types.len() {
+					candidates.push(self.text(types.keyAt(i).clone()))
+				}
+				// `Name::member` may be an enum's variant or a type's static
+				// function, so what is missing is a type.
+				var diagnostic = Diagnostic::error(
+					UNKNOWN_TYPE,
+					"cannot find type `\(text)`",
+					enumName.span,
+					"unknown type",
+				)
+				if leftThePrelude(text) is .Some(help) then
+					diagnostic = diagnostic.withHelp(move help)
+				else if suggest(text, &candidates) is .Some(similar) then
+					diagnostic = diagnostic.withFix(
+						"did you mean `\(similar)`?",
+						own [Edit::replace(enumName.span, String::of(similar))],
+					)
+				self.report(move diagnostic)
+				return .None
+			}
+		}
+		if !self.visible(module, self.program.enums[id].isPub) {
+			self.privateItem(module, "enum", enumName)
+			return .None
+		}
+		return .Some(id)
+	}
+
+	/// The enum a `.Variant` belongs to: the one expected where it is written,
+	/// through any `own` or reference around it.
+	var fn expectedEnum(variant: ast::Name, given: Option<Ty>): Option<EnumId> = {
+		val expected: Option<Ty> = match given {
+			.Some(ty) => .Some(self.underRefs(ty))
+			.None => .None
+		}
+		// With nothing expected, `.Some` and `.None` are the prelude's
+		// `Option`, whose one type argument `.Some(x)` says.
+		val text = self.text(variant.sym)
+		if expected.isNone() &&
+			(text == "Some" || text == "None") &&
+			self.program.preludeItems.enumeration(.Option) is .Some(id) {
+			return .Some(id)
+		}
+		if expected is .Some(ty) {
+			if self.kind(ty) is .Enum(id, ..) then return .Some(id)
+			if self.isPoisoned(ty) then return .None
+		}
+		val name = self.text(variant.sym)
+		// A name in lower case is a method's or a field's: most likely a chain
+		// meant to go on.
+		val lower = !name.isEmpty() && name.chars().next().unwrap().isLowercase()
+		val help =
+			if lower then
+				"to call `\(name)` on the value above, end that line with the `.`, or wrap the chain in parentheses"
+			else "write `Enum::\(name)`, or give the value it belongs to a type"
+		var diagnostic = Diagnostic::error(
+			CANNOT_INFER,
+			"cannot tell which enum `.\(name)` belongs to",
+			variant.span,
+			"no enum is expected here",
+		).withHelp(move help)
+		if expected is .Some(ty) then
+			diagnostic = diagnostic.withNote("the expected type is \(self.tyName(ty))")
+		self.report(move diagnostic)
+		return .None
+	}
+
+	/// Looks through `own` and references to the value's own type.
+	fn underRefs(start: Ty): Ty = {
+		var ty = start
+		while self.kind(ty) is .Own(inner) | .Ref(inner, ..) {
+			ty = inner
+		}
+		return ty
+	}
+
+	/// A variant, with the type arguments written in its path, if any.
+	var fn variantLit(
+		enumName: Option<(i64, ast::Name)>,
+		variant: ast::Name,
+		item: ItemUse,
+	): ExprId = {
+		val hint = item.hint
+		val span = item.span
+		val .Some((id, index)) = self.resolveVariant(enumName, variant, hint) else {
+			return self.giveUpItem(item)
+		}
+		// Defaults that are code, called with the variant's type arguments once
+		// they are known.
+		val defaults = self.state.unsettledDefaults.len()
+		self.ensureDefaults(.Enum(id))
+		val fields = self.program.enums[id].variants[index as i64].fields.clone()
+		val generics = self.program.enums[id].generics.clone()
+		val enumSym = self.program.enums[id].name
+		val isView = self.program.enums[id].isView
+		val path = "\(self.text(enumSym))::\(self.text(variant.sym))"
+		val start: Vec<Option<Ty>> = if item.typeArgs.isSome() {
+			self.explicitTypeArgs(enumSym, &generics, item.typeArgs, item.nameSegment)
+		} else {
+			val expected: Option<Ty> = match hint {
+				.Some(h) => .Some(self.underRefs(h))
+				.None => .None
+			}
+			self.expectedArgs(.Enum(id), expected)
+		}
+		var inference = Inference::new(move start)
+		var hirArgs: Vec<ExprId> = Vec()
+		var order: Vec<u32> = Vec()
+		match item.args {
+			.None if !fields.isEmpty() => self.variantWithoutFields(
+				enumName,
+				variant,
+				&path,
+				&fields,
+				&inference,
+				span,
+			)
+			.None => {}
+			.Some(args) if fields.isEmpty() => {
+				val parens = Span::new(variant.span.hi, span.hi)
+				var diagnostic = Diagnostic::error(
+					ARGUMENT_COUNT,
+					"`\(path)` has no fields",
+					parens,
+					"unexpected parentheses",
+				)
+				if args.isEmpty() then
+					diagnostic = diagnostic.withFix("remove the parentheses", own [
+						Edit::replace(parens, String()),
+					])
+				self.report(move diagnostic)
+				for a in args {
+					self.infer(a, .None)
+				}
+			}
+			// `.Ok()` where the payload is nothing: the parentheses say there is
+			// one, and writing `{}` for it says so twice.
+			.Some(args) if args.isEmpty() && self.allHoldNothing(&fields, &inference) => {
+				for i in 0..fields.len() {
+					hirArgs.push(self.nothing(span))
+					order.push(i as u32)
+				}
+			}
+			.Some(args) => {
+				val (values, arranged) = self.variantArgs(
+					&path,
+					&fields,
+					args,
+					item,
+					isView,
+					&var inference,
+					span,
+				)
+				hirArgs = move values
+				order = move arranged
+			}
+		}
+		var list = TyList::empty()
+		if !generics.isEmpty() {
+			val written = "\(self.text(enumSym))<\(elided(generics.len()))>::\(self.text(variant.sym))"
+			val tys = self.finishTypeArgs(&path, &written, &generics, move inference, span)
+			list = self.program.types.internList(&tys)
+			self.settleDefaults(defaults, &tys)
+		}
+		val ty = self.intern(.Enum(id: id, args: list))
+		return self.alloc(
+			.Variant(id: id, variant: index, args: move hirArgs, order: move order),
+			ty,
+			span,
+		)
+	}
+
+	/// `.Variant` written without the fields it has.
+	var fn variantWithoutFields(
+		enumName: Option<(i64, ast::Name)>,
+		variant: ast::Name,
+		path: str,
+		fields: &[FieldDef],
+		inference: &Inference,
+		span: Span,
+	) = {
+		val diagnostic = Diagnostic::error(
+			ARGUMENT_COUNT,
+			"`\(path)` has \(plural(fields.len(), "field", "fields"))",
+			span,
+			"missing its fields",
+		)
+		// The one field is `void`, here: `.Ok()` says there is a payload and it
+		// is nothing.
+		var voidField = false
+		if fields.len() == 1 {
+			var ty = fields[0].ty
+			if self.kind(ty) is .Param(param) &&
+				(param.index as i64) < inference.tys.len() &&
+				inference.tys[param.index as i64] is .Some(t) {
+				ty = t
+			}
+			voidField = ty == UNIT
+		}
+		var defaulted = true
+		for f in fields {
+			if f.default.isNone() then defaulted = false
+		}
+		// Every field has a default: `()` takes them all, as a call does.
+		val fixed = if voidField {
+			val written =
+				if enumName.isSome() then String::of(path) else ".\(self.text(variant.sym))"
+			diagnostic.withFix("write `\(written)()`", own [Edit::insert(span.hi, "()")]).withNote(
+				"a field of type `void` is written with nothing in the parentheses: the parentheses say there is a payload, and that it is nothing",
+			)
+		} else if defaulted {
+			diagnostic.withFix(
+				"write `\(path)()`, which takes the defaults",
+				own [Edit::insert(span.hi, "()")],
+			)
+		} else {
+			diagnostic.withHelp("write `\(path)(…)`")
+		}
+		self.report(move fixed)
+	}
+
+	/// The values a variant is given, matched to its fields.
+	var fn variantArgs(
+		path: str,
+		fields: &[FieldDef],
+		args: &[ast::ExprId],
+		item: ItemUse,
+		isView: bool,
+		inference: &var Inference,
+		span: Span,
+	): (Vec<ExprId>, Vec<u32>) = {
+		val names = self.fieldNames(path, &fields, args, item.argNames())
+		// A field left out takes its default, as a parameter does.
+		var slots: Vec<Slot> = Vec()
+		for f in fields {
+			slots.push(Slot(name: f.name, ty: f.ty, span: f.span, default: f.default.clone()))
+		}
+		val matched = self.matchArguments(&slots, args, &names, "field", path)
+		val missing = matched.missing(&slots)
+		if !missing.isEmpty() || matched.extra > 0 {
+			// Where a field has a default, the count says nothing: what is
+			// missing is named.
+			var plain = true
+			for n in names {
+				if n.isSome() then plain = false
+			}
+			for s in slots {
+				if s.default.isSome() then plain = false
+			}
+			val diagnostic = if missing.isEmpty() || plain {
+				Diagnostic::error(
+					ARGUMENT_COUNT,
+					"`\(path)` has \(plural(fields.len(), "field", "fields")) but \(plural(args.len(), "value was", "values were")) given",
+					span,
+					"expected \(plural(fields.len(), "value", "values"))",
+				)
+			} else {
+				var listed: Vec<String> = Vec()
+				for i in missing {
+					listed.push("`\(self.text(fields[i].name))`")
+				}
+				val which = if missing.len() == 1 then "the field" else "the fields"
+				Diagnostic::error(
+					ARGUMENT_COUNT,
+					"`\(path)` is missing \(which) \(listed.join(", "))",
+					span,
+					"missing \(listed.join(", "))",
+				)
+			}
+			self.report(move diagnostic)
+		}
+		// The values as written.
+		var written: Vec<(i64, i64)> = Vec()
+		for (slot, arg) in matched.slots.forwards().enumerate() {
+			if arg is .Some(a) then written.push((a, slot))
+		}
+		written.sortUnstable()
+		var operands: Vec<GenericOperand> = Vec()
+		for (arg, slot) in written {
+			operands.push(
+				GenericOperand(
+					expr: args[arg],
+					declared: fields[slot].ty,
+					context: .Some((fields[slot].span, "field declared here")),
+					// A view's reference field is given a `&`, as a parameter is.
+					isArg: isView && self.kind(fields[slot].ty) is .Ref(..),
+				),
+			)
+		}
+		val values = self.genericOperands(&operands, &var inference.tys)
+		var checked: Vec<Option<ExprId>> = Vec()
+		for _ in 0..args.len() {
+			checked.push(.None)
+		}
+		for (i, (arg, _)) in written.forwards().enumerate() {
+			if i < values.len() then checked[arg] = .Some(values[i])
+		}
+		for arg in matched.unmatched {
+			self.infer(args[arg], .None)
+		}
+		return self.arrangeArguments(&slots, &matched, &checked, span)
+	}
+
+	/// Whether every field holds nothing in this instance.
+	fn allHoldNothing(fields: &[FieldDef], inference: &Inference): bool = {
+		for f in fields {
+			if !self.holdsNothing(f.ty, &inference) then return false
+		}
+		return true
+	}
+
+	/// Whether a field holds nothing in this instance: its type is `void`, or
+	/// a parameter the instance fills with `void`.
+	fn holdsNothing(ty: Ty, inference: &Inference): bool = match self.kind(ty) {
+		.Param(param) =>
+			param.index as i64 < inference.tys.len() &&
+				inference.tys[param.index as i64] == .Some(UNIT)
+		_ => ty == UNIT
+	}
+
+	/// The unit value, which is what an empty block is.
+	var fn nothing(span: Span): ExprId = self.alloc(
+		.Block(Block(stmts: Vec(), value: .None, span: span)),
+		UNIT,
+		span,
+	)
+
+	/// The name of the field each value of a variant or a struct is for. With
+	/// two or more fields, every value is named, as a call's are where they
+	/// must be: a value by position is reported, with a fix that names it — a
+	/// variable with a field's name, that field; anything else, the field in
+	/// its position. It is then taken as the field in its position, so that
+	/// the rest of the literal is still checked.
+	var fn fieldNames(
+		path: str,
+		fields: &[FieldDef],
+		args: &[ast::ExprId],
+		given: Vec<Option<ast::Name>>,
+	): Vec<Option<ast::Name>> = {
+		var names = move given
+		if fields.len() < 2 then return move names
+		val file = self.ast
+		var positional: Vec<i64> = Vec()
+		for i in 0..names.len() {
+			if names[i].isNone() then positional.push(i)
+		}
+		if positional.isEmpty() then return move names
+		// The field each value is meant for: a variable named as one of the
+		// fields, that one; anything else, the first field nothing else names,
+		// in order.
+		var taken: Vec<Symbol> = Vec()
+		for n in names {
+			if n is .Some(named) then taken.push(named.sym)
+		}
+		for i in positional {
+			if self.namedAsField(&fields, args[i]) is .Some(sym) then taken.push(sym)
+		}
+		var free: Vec<Symbol> = Vec()
+		for f in fields {
+			if !taken.contains(&f.name) then free.push(f.name)
+		}
+		var nextFree = 0
+		var meant: Map<i64, Symbol> = Map()
+		for i in positional {
+			match self.namedAsField(&fields, args[i]) {
+				.Some(sym) => meant.put(i, sym)
+				.None => {
+					if nextFree < free.len() {
+						meant.put(i, free[nextFree])
+						nextFree += 1
+					}
+				}
+			}
+		}
+		var edits: Vec<Edit> = Vec()
+		for i in positional {
+			if meant.get(&i) is .Some(sym) then
+				edits.push(Edit::insert(file.exprs[args[i]].span.lo, "\(self.text(sym)): "))
+		}
+		val first = file.exprs[args[positional[0]]].span
+		var diagnostic = Diagnostic::error(
+			UNNAMED_FIELDS,
+			"the fields of `\(path)` are named where it is built",
+			first,
+			"a value without its field's name",
+		).withNote(
+			"a variant or a struct with two or more fields names each one, a variable of a field's name too; with one field, a name is optional",
+		)
+		if edits.len() == positional.len() then
+			diagnostic = diagnostic.withFix("name the fields", (move edits).intoBuffer())
+		self.report(move diagnostic)
+		for i in positional {
+			if meant.get(&i) is .Some(sym) then
+				names[i] = .Some(ast::Name(sym: sym, span: file.exprs[args[i]].span))
+		}
+		return move names
+	}
+
+	/// The field a value written as a variable of a field's name is for.
+	fn namedAsField(fields: &[FieldDef], arg: ast::ExprId): Option<Symbol> = {
+		val .Name(sym) = self.ast.exprs[arg].kind else {
+			return .None
+		}
+		for f in fields {
+			if f.name == sym then return .Some(sym)
+		}
+		return .None
+	}
+
+	/// `Enum.Variant` written with a dot, which is not Wip. If `base` names an
+	/// enum, reports it with a fix and returns the variant literal it was
+	/// meant to be.
+	var fn variantWithDot(base: ast::ExprId, name: ast::Name, item: ItemUse): Option<ExprId> = {
+		val file = self.ast
+		val .Name(sym) = file.exprs[base].kind else {
+			return .None
+		}
+		if self.lookup(sym).isSome() then return .None
+		// The enum may be one the file imported by name.
+		val named = ast::Name(sym: sym, span: file.exprs[base].span)
+		var module = self.current
+		var enumSym = sym
+		match self.imported(named) {
+			.Some(.Item(module: m, name: n)) => {
+				module = m
+				enumSym = n.sym
+			}
+			.Some(.Broken) => return .None
+			.None => {}
+		}
+		val .Some((.Enum(id), _)) = self.modules[module].types.get(&enumSym) else {
+			return .None
+		}
+		// Only a variant: `Json.parse` is not one written with a dot, and
+		// neither is what an interpolation of the enum's name calls on it.
+		var isVariant = false
+		for v in self.program.enums[id].variants {
+			if v.name == name.sym then isVariant = true
+		}
+		if !isVariant then return .None
+		val baseSpan = file.exprs[base].span
+		val path = "\(self.text(sym))::\(self.text(name.sym))"
+		self.report(
+			Diagnostic::error(
+				VARIANT_WITH_DOT,
+				"enum variants are written with `::`",
+				baseSpan.to(name.span),
+				"write `\(path)`",
+			).withNote(
+				"after a name, `.` accesses a field; a variant is `Enum::Variant`, or `.Variant` where the enum is known",
+			).withFix("use `::`", own [
+				Edit::replace(Span::new(lo: baseSpan.hi, hi: name.span.lo), "::"),
+			]),
+		)
+		var used = item
+		used.hint = .None
+		return .Some(
+			self.variantLit(.Some((module, ast::Name(sym: enumSym, span: baseSpan))), name, used),
+		)
+	}
+}

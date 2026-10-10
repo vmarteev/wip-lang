@@ -167,11 +167,16 @@ module.exports = grammar({
         field('return_type', $._type),
         optional(field('lends_from', $.lends_from)),
       )),
+      optional(field('keeps', $.keeps)),
       optional(seq('=', field('body', $._expression))),
     ),
 
     // What a result borrows: `from a, self.ast`. A word only here.
     lends_from: $ => prec.right(seq('from', commaSep1($.lend_path))),
+
+    // What a call may keep of its arguments: `keeps value`. A word only
+    // here.
+    keeps: $ => prec.right(seq('keeps', commaSep1($.identifier))),
 
     lend_path: $ => seq(
       choice($.self, $.identifier),
@@ -204,7 +209,11 @@ module.exports = grammar({
       optional(seq('=', field('default', $._type))),
     ),
 
-    constraint: $ => seq($._type_identifier, optional($.type_arguments)),
+    // An interface is named as a type is: `Area`, or another module's by
+    // its path, `shapes::Area`.
+    constraint: $ => seq($._interface_name, optional($.type_arguments)),
+
+    _interface_name: $ => choice($._type_identifier, $.scoped_type_identifier),
 
     struct_declaration: $ => seq(
       repeat($.annotation),
@@ -282,7 +291,7 @@ module.exports = grammar({
         seq($._type_identifier, optional($.type_parameters)),
         seq('[', $.type_parameter, ']'),
       )),
-      optional(seq(':', field('interface', $._type_identifier), optional($.type_arguments))),
+      optional(seq(':', field('interface', $._interface_name), optional($.type_arguments))),
       field('body', $.declaration_list),
     ),
 
@@ -359,7 +368,7 @@ module.exports = grammar({
 
     slice_type: $ => seq('[', field('element', $._type), ']'),
 
-    dyn_type: $ => prec.right(seq('dyn', $._type_identifier, optional($.type_arguments))),
+    dyn_type: $ => prec.right(seq('dyn', $._interface_name, optional($.type_arguments))),
 
     function_type: $ => prec.right(seq(
       '(',
@@ -607,8 +616,28 @@ module.exports = grammar({
     cast_expression: $ => prec.left(PREC.cast, seq(
       field('value', $._expression),
       'as',
-      field('type', $._type),
+      field('type', $._cast_type),
     )),
+
+    // The type after `as` takes no type arguments, so `x as i64 < y`
+    // compares (R7); only `ptr` takes them there, `p as ptr<u8>`.
+    _cast_type: $ => choice(
+      $._type_identifier,
+      $.scoped_type_identifier,
+      alias($._pointer_type, $.generic_type),
+      $.reference_type,
+      $.own_type,
+      $.array_type,
+      $.slice_type,
+      $.dyn_type,
+      $.function_type,
+      $.tuple_type,
+    ),
+
+    _pointer_type: $ => seq(
+      field('type', alias('ptr', $.type_identifier)),
+      field('type_arguments', $.type_arguments),
+    ),
 
     // `value is pattern`, and `value !is pattern`, written together.
     is_expression: $ => prec.left(PREC.comparison, seq(

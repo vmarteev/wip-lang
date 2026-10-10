@@ -1,0 +1,2001 @@
+// `match`: arms, patterns and exhaustiveness.
+
+import std::collections::{Map, Set}
+import std::mem
+import syntax as ast
+import syntax::{
+	BINDING_SHADOWS_VARIANT,
+	CANNOT_COPY_OWN,
+	Diagnostic,
+	Edit,
+	GUARD_ELSE_FALLS_THROUGH,
+	GUARD_REFUTABILITY,
+	INVALID_PATTERN,
+	IS_BINDING_OUTSIDE_CONDITION,
+	MAX_TUPLE,
+	MIN_TUPLE,
+	MISMATCHED_TYPES,
+	NON_EXHAUSTIVE_MATCH,
+	NO_SUCH_FIELD,
+	PATTERN_FIELDS,
+	SLICE_PATTERN_REST,
+	Span,
+	Symbol,
+	UNDERSCORE_BINDER,
+	UNKNOWN_NAME,
+	UNREACHABLE_ARM
+}
+
+/// Whether anything in the pattern was reported already, so that what it
+/// covers is not worth asking about.
+fn patternHasError(pattern: &Pattern): bool = match pattern {
+	.Error => true
+	.Any(alternatives, ..) => {
+		for a in alternatives {
+			if patternHasError(&a) then return true
+		}
+		false
+	}
+	.Deref(inner) => patternHasError(&inner)
+	.Variant(binders, ..) | .Fields(binders) => {
+		for b in binders {
+			if b is .Nested(nested) && patternHasError(&nested) then return true
+		}
+		false
+	}
+	_ => false
+}
+
+/// The elements of a tuple written as `e` itself, through parentheses: `(a,
+/// b)` is the prelude's `Tuple2(a, b)`.
+fn tupleWritten(file: &ast::Ast, e: ast::ExprId): Option<&[ast::ExprId]> from file = {
+	match file.exprs[e].kind {
+		.Paren(inner) => return tupleWritten(&file, inner)
+		.Call(callee, args, names, rest: .None) => {
+			for n in names {
+				if n.isSome() then return .None
+			}
+			if args.len() < MIN_TUPLE || args.len() > MAX_TUPLE then return .None
+			if file.exprs[callee].kind is .Name(sym) && sym == Symbol::tuple(args.len()) then
+				return .Some(&args.items())
+			return .None
+		}
+		_ => return .None
+	}
+}
+
+/// The last `is` test of a `&&` chain, if the chain ends with one.
+fn lastTest(
+	file: &ast::Ast,
+	e: ast::ExprId,
+): Option<&ast::Pattern> from file = match file.exprs[e].kind {
+	.Paren(inner) => lastTest(&file, inner)
+	.Binary(op: .And, rhs, ..) => lastTest(&file, rhs)
+	.Is(pattern, negated: false, ..) => .Some(&pattern)
+	_ => .None
+}
+
+/// How the bindings of a pattern bind: to the value they name, or as
+/// aliases of the place it lies in, which a `match` on a place makes them;
+/// and whether plain data is copied out of the place instead, as a `val …
+/// else` binds it.
+@derive(Clone)
+struct Binds {
+	/// The reference a binding aliases the place with, where it aliases.
+	alias: Option<RefKind> = .None
+	/// The place the bindings alias, which the checks after them follow.
+	source: Option<ExprId> = .None
+	/// Plain data is copied out of the place.
+	copy: bool = false
+	/// An alias of plain data that nothing writes through becomes a copy once
+	/// the body is lowered: the bindings of a `match` and an `is`.
+	settle: bool = false
+	/// The bindings are variables of their own, which hold their parts and
+	/// can be written: a `var` pattern's.
+	variables: bool = false
+}
+
+/// What the alternatives of one `|` bind: the first's names, which every
+/// other binds again, and the one being checked's.
+@derive(Clone)
+struct Alternatives {
+	first: Option<Map<Symbol, (LocalId, Ty, Span)>> = .None
+	bound: Map<Symbol, (LocalId, Ty, Span)> = Map()
+}
+
+/// What a pattern writes of a struct's or a variant's fields: the binders,
+/// where it lists them, and whether `..` passes over the rest.
+@derive(Clone)
+view struct Fields {
+	binders: Option<&[ast::Binder]>
+	rest: bool
+}
+
+/// How each alternative of a `|` is lowered: as a pattern on a value of a
+/// type, or as one on a tuple matched in place.
+@derive(Clone)
+enum Alternative {
+	Plain(scrutTy: Ty, binds: Binds)
+	Places(scrutTy: Ty, elementBinds: Vec<Binds>, binds: Binds)
+}
+
+/// How often a local is named, and how often read through.
+fn usesOf(uses: &Map<LocalId, (u32, u32)>, local: LocalId): (u32, u32) = match uses.get(&local) {
+	.Some(counts) => counts
+	.None => (0, 0)
+}
+
+/// No binders, for a pattern that wrote none.
+val NO_BINDERS: [ast::Binder; 0] = []
+
+/// `NO_BINDERS`, lent.
+fn noBinders(): &[ast::Binder] = lend NO_BINDERS
+
+extend Lowerer {
+	var fn matchExpr(
+		scrutinee: ast::ExprId,
+		arms: &[ast::Arm],
+		hint: Option<Ty>,
+		span: Span,
+	): ExprId = {
+		val file = self.ast
+		// A tuple written here is matched where its elements are; anything
+		// else is one value.
+		val (scrut, places) = match tupleWritten(file, scrutinee) {
+			.Some(elements) => self.places(elements, file.exprs[scrutinee].span)
+			.None => (self.operand(scrutinee, .None), .None)
+		}
+		val scrutTy = self.tyOf(scrut)
+		val alias: Option<RefKind> = match places {
+			// A guard may not take from what an arm binds where any element is
+			// a value whose bindings take it.
+			.Some(binds) => {
+				var kind: Option<RefKind> = .Some(.Var)
+				for b in binds {
+					kind = match (kind, b.alias) {
+						(.Some(k), .Some(a)) => .Some(if a == .Shared then a else k)
+						_ => .None
+					}
+				}
+				kind
+			}
+			.None => self.aliasKind(scrut)
+		}
+		var result = hint
+		var hirArms: Vec<Arm> = Vec()
+		for arm in arms {
+			self.state.scopes.push(Map())
+			val binds = Binds(
+				alias: alias,
+				source: .Some(scrut),
+				copy: false,
+				settle: true,
+				variables: false,
+			)
+			val pattern = match places {
+				.Some(elementBinds) => self.placesPattern(
+					&arm.pattern,
+					scrutTy,
+					elementBinds.clone(),
+					binds,
+				)
+				.None => self.pattern(&arm.pattern, scrutTy, binds)
+			}
+			// `if …` after the pattern: the bindings are in scope for it, and it
+			// decides whether the arm matches.
+			if arm.guard is .Some(written) then
+				self.guardTakesNothing(&pattern, alias, arm.pattern.span, written)
+			val guard: Option<ExprId> = match arm.guard {
+				.Some(g) => .Some(self.check(g, BOOL))
+				.None => .None
+			}
+			// The first arm that produces a value sets the type of the others.
+			val body = match result {
+				.Some(t) => self.check(arm.body, t)
+				.None => self.infer(arm.body, .None)
+			}
+			val ty = self.tyOf(body)
+			if result.isNone() && ty != NEVER then result = .Some(ty)
+			self.state.scopes.pop()
+			hirArms.push(Arm(pattern: move pattern, guard: guard, body: body, span: arm.span))
+		}
+		self.exhaustiveness(scrutTy, file.exprs[scrutinee].span, &arms, &hirArms)
+		val ty = result.unwrapOr(NEVER)
+		return self.alloc(.Match(scrutinee: scrut, arms: move hirArms), ty, span)
+	}
+
+	/// A tuple matched where its elements are: each element checked as a
+	/// `match` would check it alone, and how its bindings bind. The
+	/// expression has the tuple's type, and nothing is built.
+	var fn places(elements: &[ast::ExprId], span: Span): (ExprId, Option<Vec<Binds>>) = {
+		var lowered: Vec<ExprId> = Vec()
+		var binds: Vec<Binds> = Vec()
+		for element in elements {
+			val id = self.operand(element, .None)
+			binds.push(Binds(
+				alias: self.aliasKind(id),
+				source: .Some(id),
+				copy: false,
+				settle: true,
+				variables: false,
+			))
+			lowered.push(id)
+		}
+		var tys: Vec<Ty> = Vec()
+		for id in lowered {
+			tys.push(self.tyOf(id))
+		}
+		// The prelude's tuple, found as a tuple pattern finds it: in the module
+		// being lowered first, which is where it is while the prelude itself
+		// is.
+		val name = Symbol::tuple(tys.len())
+		val declared: Option<TypeDef> = match self.types().get(&name) {
+			.Some((def, _)) => .Some(def)
+			.None => self.preludeType(name)
+		}
+		val ty = match declared {
+			.Some(.Struct(id)) => {
+				val list = self.program.types.internList(&tys)
+				self.intern(.Struct(id: id, args: list))
+			}
+			_ => ERROR
+		}
+		return (self.alloc(.Places(move lowered), ty, span), .Some(move binds))
+	}
+
+	/// An arm's pattern on a tuple matched in place: a tuple pattern, whose
+	/// elements bind as their elements do, or `_`. A name for the whole has no
+	/// tuple to bind.
+	var fn placesPattern(
+		pattern: &ast::Pattern,
+		scrutTy: Ty,
+		elementBinds: Vec<Binds>,
+		binds: Binds,
+	): Pattern = match pattern.kind {
+		.Binding(sym) if self.patternConst(ast::Name(sym: sym, span: pattern.span)).isNone() => {
+			val name = String::of(self.text(sym))
+			self.report(
+				Diagnostic::error(
+					INVALID_PATTERN,
+					"`\(name)` would bind a tuple that is not made",
+					pattern.span,
+					"names the whole",
+				).withHelp("name the elements: `(a, b) => …`").withNote(
+					"a tuple written as a `match`'s scrutinee is matched where its elements are, and is not built",
+				),
+			)
+			Pattern::Error
+		}
+		.Variant(leadingDot: false, segments, ..) if segments.len() == 1 => {
+			self.state.placeBinds = .Some(move elementBinds)
+			val lowered = self.pattern(&pattern, scrutTy, binds)
+			self.state.placeBinds = .None
+			move lowered
+		}
+		// Tuples of which any one may match: each is matched where the
+		// elements are, as one alone would be.
+		.Any(alternatives) => {
+			val how = Alternative::Places(
+				scrutTy: scrutTy,
+				elementBinds: move elementBinds,
+				binds: binds,
+			)
+			self.anyPattern(&alternatives, &how)
+		}
+		_ => self.pattern(&pattern, scrutTy, binds)
+	}
+
+	/// `.Round(..) | .Square(..)`: any one of them, each lowered as `how`
+	/// says. Where they bind, each binds the same names, and whichever matched
+	/// gives the arm its fields.
+	var fn anyPattern(alternatives: &[ast::Pattern], how: &Alternative): Pattern = {
+		self.state.alternatives.push(Alternatives())
+		var lowered: Vec<Pattern> = Vec()
+		for alternative in alternatives {
+			val pattern = match how {
+				.Plain(scrutTy, binds) => self.pattern(&alternative, scrutTy, binds)
+				.Places(scrutTy, elementBinds, binds) => self.placesPattern(
+					&alternative,
+					scrutTy,
+					elementBinds.clone(),
+					binds,
+				)
+			}
+			val top = self.state.alternatives.len() - 1
+			val bound = mem::replace(&var self.state.alternatives[top].bound, Map())
+			match self.state.alternatives[top].first.clone() {
+				.None => self.state.alternatives[top].first = .Some(move bound)
+				.Some(earlier) => {
+					if !patternHasError(&pattern) then
+						self.alternativeDiffers(&earlier, &bound, alternative.span)
+				}
+			}
+			lowered.push(move pattern)
+		}
+		val done = self.state.alternatives.pop().unwrap()
+		val bindsNames = match done.first {
+			.Some(first) => !first.isEmpty()
+			.None => false
+		}
+		var binding: Option<u32> = .None
+		if bindsNames {
+			binding = .Some(self.state.bindingAlternatives)
+			self.state.bindingAlternatives += 1
+		}
+		return .Any(alternatives: move lowered, binding: binding)
+	}
+
+	/// The kind of reference the bindings of a pattern on `scrut` are:
+	/// matching a place binds aliases for its fields, which can be written
+	/// when the place can; matching any other value binds the fields
+	/// themselves.
+	fn aliasKind(scrut: ExprId): Option<RefKind> = {
+		if !self.rootsInLocal(scrut) then return .None
+		return .Some(if self.writable(scrut) then .Var else .Shared)
+	}
+
+	/// `value is pattern`. `binds` says whether it is part of a condition,
+	/// where the caller has made a scope for its bindings.
+	var fn isExpr(
+		scrutinee: ast::ExprId,
+		pattern: &ast::Pattern,
+		inCondition: bool,
+		span: Span,
+	): ExprId = {
+		val scrut = self.operand(scrutinee, .None)
+		val scrutTy = self.tyOf(scrut)
+		val alias = self.aliasKind(scrut)
+		// What the pattern binds, at any depth: a pattern that only tests binds
+		// nothing, whatever its shape.
+		var names: Vec<(Symbol, Span)> = Vec()
+		self.namesOf(&pattern, &var names)
+		// A test alone outside a condition has nothing after it to see what it
+		// binds. It is reported below, and bound in a scope of its own.
+		val outside = !inCondition && !names.isEmpty()
+		if outside then self.state.scopes.push(Map())
+		val binds = Binds(
+			alias: alias,
+			source: .Some(scrut),
+			copy: false,
+			settle: true,
+			variables: false,
+		)
+		val lowered = self.pattern(&pattern, scrutTy, binds)
+		if outside then self.state.scopes.pop()
+		// Any pattern that can fail is a test; one that matches every value
+		// would always be true.
+		val always =
+			!patternHasError(&lowered) &&
+			!self.isPoisoned(scrutTy) &&
+			self.alwaysMatches(&lowered, scrutTy)
+		val tested = if always {
+			self.reportAlwaysTrue(&pattern, &lowered)
+			Pattern::Error
+		} else {
+			if outside && !patternHasError(&lowered) {
+				val (sym, at) = names[0]
+				val diagnostic = self.unseenBinding(sym, at)
+				self.report(move diagnostic)
+			}
+			move lowered
+		}
+		return self.alloc(.Is(scrutinee: scrut, pattern: move tested), BOOL, span)
+	}
+
+	/// Reports an `is` test whose pattern matches every value, with what to
+	/// write for what it was meant to do.
+	var fn reportAlwaysTrue(written: &ast::Pattern, pattern: &Pattern) = {
+		val diagnostic = Diagnostic::error(
+			INVALID_PATTERN,
+			"this `is` test is always true",
+			written.span,
+			"matches every value",
+		)
+		val helped = match pattern {
+			.Wildcard | .Binding(_) => diagnostic.withHelp(
+				"to bind the value, use `val`; to compare it with another, use `==`",
+			)
+			.Fields(_) => diagnostic.withHelp(
+				"take it apart where it is bound: `val Point(x, y) = point`",
+			)
+			_ => diagnostic.withHelp("every value matches it, so the test can go")
+		}
+		self.report(helped.withNote("`is` asks whether a value matches a pattern that can fail"))
+	}
+
+	/// `val pattern = value else { … }`. The `else` block is checked first,
+	/// without the bindings, and must leave; the bindings go into the
+	/// enclosing block's scope. With `var`, each binding is a variable that
+	/// holds its part.
+	var fn guard(
+		mutable: bool,
+		pattern: &ast::Pattern,
+		value: ast::ExprId,
+		elseBlock: Option<&ast::Block>,
+	): StmtKind = {
+		val scrut = self.operand(value, .None)
+		val scrutTy = self.tyOf(scrut)
+		// A variable aliases nothing: it holds its part, as `var x = …` holds
+		// its value.
+		val alias: Option<RefKind> = if mutable then .None else self.aliasKind(scrut)
+		var elseHir: Option<Block> = .None
+		if elseBlock is .Some(written) {
+			val (checked, elseTy) = self.checkBlock(&written, .None)
+			if elseTy != NEVER && !self.isPoisoned(elseTy) {
+				val hi = written.span.hi
+				val end = Span::new(if hi > 0 then hi - 1 else 0, hi)
+				self.report(
+					Diagnostic::error(
+						GUARD_ELSE_FALLS_THROUGH,
+						"the `else` block of a `\(if mutable then "var" else "val")` pattern must leave",
+						end,
+						"can reach its end",
+					).withHelp("end it with `return`, `break` or `continue`").withNote(
+						"the code after the `val` uses its bindings, which the `else` path does not have",
+					),
+				)
+			}
+			elseHir = .Some(move checked)
+		}
+		// A binding of plain data takes a copy, so the place it came from stays
+		// free for the rest of the block.
+		val binds = Binds(
+			alias: alias,
+			source: .Some(scrut),
+			copy: true,
+			settle: false,
+			variables: mutable,
+		)
+		val lowered = self.pattern(&pattern, scrutTy, binds)
+		if mutable then self.variablesTake(&lowered, scrut)
+		// A pattern that leaves nothing out always matches, so an `else` beside
+		// it never runs, and one that can fail has no path to take without it.
+		val irrefutable = self.alwaysMatches(&lowered, scrutTy)
+		if elseHir.isSome() && irrefutable {
+			val at = elseBlock.unwrap().span
+			self.report(
+				Diagnostic::error(
+					GUARD_REFUTABILITY,
+					"this pattern always matches, so `else` cannot run",
+					at,
+					"never reached",
+				).withNote("a struct has one shape, so taking it apart cannot fail"),
+			)
+		} else if elseHir.isNone() && !irrefutable && !(lowered is .Error) {
+			self.report(
+				Diagnostic::error(
+					GUARD_REFUTABILITY,
+					"a pattern that can fail needs `else`",
+					self.state.body.exprs[scrut].span,
+					"may not match",
+				).withNote(
+					"`val pattern = value else { … }` runs the `else` block when the value does not match; the block must leave",
+				),
+			)
+		}
+		return .Guard(scrutinee: scrut, pattern: move lowered, elseBlock: move elseHir)
+	}
+
+	/// The condition of an `if` or a `while`. An `is` test in it, alone or
+	/// joined by `&&`, binds names into the scope the caller made, for the
+	/// rest of the chain and for the block.
+	var fn bindingCondition(e: ast::ExprId): ExprId = {
+		val file = self.ast
+		val span = file.exprs[e].span
+		return match file.exprs[e].kind {
+			.Paren(inner) => self.bindingCondition(inner)
+			.Is(scrutinee, pattern, negated: false) => self.isExpr(scrutinee, &pattern, true, span)
+			.Binary(op: .And, lhs, rhs, ..) => {
+				val l = self.bindingCondition(lhs)
+				val r = self.bindingCondition(rhs)
+				self.alloc(.Binary(op: .And, lhs: l, rhs: r, wrapping: false), BOOL, span)
+			}
+			_ => self.condition(e)
+		}
+	}
+
+	/// A `&&` chain outside a condition whose `is` tests bind: each test's
+	/// names are bound for the rest of the chain, and nowhere after it. It is
+	/// lowered as `if chain { true } else { false }`, so that the bindings,
+	/// the borrows they hold and their drops end where a condition's end —
+	/// with the `if`, which here is the chain.
+	var fn boundChain(e: ast::ExprId, span: Span): ExprId = {
+		// The last test of the chain has nothing after it to see what it
+		// binds.
+		if lastTest(self.ast, e) is .Some(pattern) {
+			var names: Vec<(Symbol, Span)> = Vec()
+			self.namesOf(&pattern, &var names)
+			if !names.isEmpty() {
+				val diagnostic = self.unseenBinding(names[0].0, names[0].1)
+				self.report(move diagnostic)
+			}
+		}
+		self.state.scopes.push(Map())
+		val cond = self.bindingCondition(e)
+		self.state.scopes.pop()
+		val yes = self.alloc(.Bool(true), BOOL, span)
+		val thenBlock = Block(stmts: Vec(), value: .Some(yes), span: span)
+		val no = self.alloc(.Bool(false), BOOL, span)
+		val elseBlock = Block(stmts: Vec(), value: .Some(no), span: span)
+		return self.alloc(
+			.If(cond: cond, thenBlock: move thenBlock, elseBlock: .Some(move elseBlock)),
+			BOOL,
+			span,
+		)
+	}
+
+	/// Whether `e` is a `&&` chain — through parentheses — with an `is` test
+	/// in it that binds a name.
+	fn chainBinds(e: ast::ExprId): bool = match self.ast.exprs[e].kind {
+		.Paren(inner) => self.chainBinds(inner)
+		.Binary(op: .And, lhs, rhs, ..) => self.chainBinds(lhs) || self.chainBinds(rhs)
+		.Is(pattern, negated: false, ..) => {
+			var names: Vec<(Symbol, Span)> = Vec()
+			self.namesOf(&pattern, &var names)
+			!names.isEmpty()
+		}
+		_ => false
+	}
+
+	/// `value !is pattern`: `!(value is pattern)`, which binds nothing. A
+	/// name in the pattern would be bound only where the test fails, so it
+	/// is refused, as a test's name nothing can see is.
+	var fn negatedIs(scrutinee: ast::ExprId, pattern: &ast::Pattern, span: Span): ExprId = {
+		var names: Vec<(Symbol, Span)> = Vec()
+		self.namesOf(&pattern, &var names)
+		if !names.isEmpty() {
+			val (sym, at) = names[0]
+			val name = String::of(self.text(sym))
+			self.report(
+				Diagnostic::error(
+					IS_BINDING_OUTSIDE_CONDITION,
+					"`!is` binds nothing, and `\(name)` would be bound",
+					at,
+					"a name of the pattern",
+				).withHelp(
+					"test without the name, as `.Some(_)`; to name what is there when the test fails, write `val .Some(x) = value else { … }`",
+				).withNote(
+					"`x !is P` is true where `x` is not `P`, where there is nothing for a name to hold",
+				),
+			)
+		}
+		// The test itself would say again, less to the point, that its names
+		// go unseen.
+		val before = self.diagnostics.len()
+		val test = self.isExpr(scrutinee, &pattern, false, span)
+		if !names.isEmpty() {
+			var i = before
+			while i < self.diagnostics.len() {
+				if self.diagnostics[i].code == IS_BINDING_OUTSIDE_CONDITION then
+					self.diagnostics.remove(i)
+				else i += 1
+			}
+		}
+		return self.alloc(.Unary(op: .Not, operand: test), BOOL, span)
+	}
+
+	/// An `is` test binds a name nothing after it can see.
+	fn unseenBinding(sym: Symbol, span: Span): Diagnostic = Diagnostic::error(
+		IS_BINDING_OUTSIDE_CONDITION,
+		"nothing after this `is` test can use `\(self.text(sym))`",
+		span,
+		"a binding",
+	).withNote(
+		"an `is` test binds names for the rest of its `&&` chain, and, in the condition of an `if` or `while`, for its block",
+	).withHelp("to test without binding, write `(..)`")
+
+	/// Whether `e` is a place a pattern binds into: a variable, a field or
+	/// element of one, or what any reference points to.
+	fn rootsInLocal(e: ExprId): bool = match self.state.body.exprs[e].kind {
+		.Local(_) => true
+		// What a reference refers to is a place wherever the reference came
+		// from — a call that lends one, as a projection does — and is
+		// another's: a pattern binds into it, and takes nothing out. What an
+		// `own` points to is the `own`'s, which may be a value just moved
+		// here, to be taken apart.
+		.Deref(base) => self.kind(self.tyOf(base)) is .Ref(..) || self.rootsInLocal(base)
+		.Field(base, ..) | .Index(base, ..) => self.rootsInLocal(base)
+		_ => false
+	}
+
+	/// What a `for` binds to each element: a name, `_`, or a struct taken
+	/// apart. The bindings refer into the element, as a `match` binding of a
+	/// place does.
+	var fn elementPattern(
+		pattern: &ast::Pattern,
+		elementTy: Ty,
+		elem: Option<Ty>,
+		kind: RefKind,
+		source: Option<ExprId>,
+	): Pattern = match pattern.kind {
+		.Wildcard => .Wildcard
+		.Binding(sym) => {
+			val local = self.declare(sym, elementTy, .Binding, pattern.span)
+			if self.kind(elementTy) is .Ref(..) then self.state.body.aliasBindings.add(local)
+			.Binding(local)
+		}
+		.Error => .Error
+		// A struct taken apart: its binders refer into the element.
+		_ => {
+			val binds = Binds(
+				alias: .Some(kind),
+				source: source,
+				copy: false,
+				settle: false,
+				variables: false,
+			)
+			val lowered = self.pattern(&pattern, elem.unwrapOr(ERROR), binds)
+			// Every element is taken apart, so the pattern must match them all.
+			if elem is .Some(t) && !self.alwaysMatches(&lowered, t) {
+				self.report(
+					Diagnostic::error(
+						INVALID_PATTERN,
+						"a `for` binding takes every element apart, so its pattern must always match",
+						pattern.span,
+						"can fail",
+					).withHelp(
+						"bind the element and test it with `match` or `is` inside the loop",
+					).withNote(
+						"a name, `_`, a struct taken apart, and a pattern whose fields do the same, match every value",
+					),
+				)
+				return .Error
+			}
+			move lowered
+		}
+	}
+
+	/// What a binder does with a field: binds it under a name, ignores it, or
+	/// takes it apart in turn.
+	var fn binder(b: &ast::Binder, fieldTy: Ty, binds: Binds): Binder = {
+		val .Some(pattern) = b.pattern else {
+			return .Bind(self.declareBinding(b.field.sym, fieldTy, b.span, binds))
+		}
+		return match pattern.kind {
+			// `field: name` binds it under that name, which is what a bare name
+			// in a pattern always means.
+			.Binding(sym) => .Bind(self.declareBinding(sym, fieldTy, pattern.span, binds))
+			.Wildcard | .Error => .Ignored
+			// A pattern inside a pattern tests what its field holds, to any
+			// depth.
+			_ => .Nested(self.pattern(&pattern, fieldTy, binds))
+		}
+	}
+
+	/// The variants of an enum no arm matches at all, as the patterns that
+	/// would: `.Yellow`, `.Round(_)`.
+	fn missingVariants(scrutTy: Ty, matrix: &[Vec<Shape>]): Vec<String> = {
+		var missing: Vec<String> = Vec()
+		val .Enum(id, ..) = self.kind(scrutTy) else {
+			return move missing
+		}
+		val variants = self.program.enums[id].variants.len()
+		for variant in 0..variants {
+			val fields = self.program.enums[id].variants[variant].fields.len()
+			var wilds: Vec<Shape> = Vec()
+			for _ in 0..fields {
+				wilds.push(.Wild)
+			}
+			val row = Vec::of(own [Shape::Ctor(ctor: .Variant(variant as u32), fields: move wilds)])
+			if useful(&self.program, &matrix, &row, [scrutTy]) is .Some(witness) then
+				missing.push(witness.text(&self.program, scrutTy, self.interner))
+		}
+		return move missing
+	}
+
+	/// Whether a pattern matches every value of its type: nothing is left for
+	/// an `else` or a next arm.
+	fn alwaysMatches(pattern: &Pattern, ty: Ty): bool = {
+		if self.isPoisoned(ty) || pattern is .Error then return true
+		val row = Vec::of(own [Shape::of(&self.program, &pattern, ty)])
+		return useful(&self.program, [move row], [Shape::Wild], [ty]).isNone()
+	}
+
+	/// A pattern where a field name could stand, in a pattern whose type has
+	/// more than one field: which field it tests must be said.
+	var fn nameTheField(path: str, fields: &[FieldDef], b: &ast::Binder) = {
+		val span = b.span
+		// `_` does not pass a field over by position, where there are fields to
+		// confuse.
+		if b.pattern is .Some(p) && p.kind is .Wildcard {
+			self.report(
+				Diagnostic::error(
+					UNDERSCORE_BINDER,
+					"`_` is not a binder",
+					span,
+					"a field name is expected here",
+				).withHelp(
+					"binders name their fields: leave a field out, and end the pattern with `..`",
+				),
+			)
+			return
+		}
+		var names: Vec<String> = Vec()
+		for f in fields {
+			names.push("`\(self.text(f.name))`")
+		}
+		self.report(
+			Diagnostic::error(
+				NO_SUCH_FIELD,
+				"`\(path)` has \(fields.len()) fields: say which this tests",
+				span,
+				"names no field",
+			).withHelp("write `field: pattern`, with one of \(names.join(", "))").withNote(
+				"a pattern that names no field tests the one field its variant has",
+			),
+		)
+	}
+
+	/// Declares a binder's names as errors, so that what follows resolves.
+	var fn binderFailed(b: &ast::Binder) = {
+		var names: Vec<(Symbol, Span)> = Vec()
+		match b.pattern {
+			.Some(pattern) => self.namesOf(&pattern, &var names)
+			.None => names.push((b.field.sym, b.span))
+		}
+		for (sym, span) in names {
+			self.declare(sym, ERROR, .Binding, span)
+		}
+	}
+
+	/// Declares every binder's names as errors, and answers the pattern that
+	/// failed.
+	var fn bindersFailed(binders: Option<&[ast::Binder]>): Pattern = {
+		if binders is .Some(all) {
+			for b in all {
+				self.binderFailed(&b)
+			}
+		}
+		return .Error
+	}
+
+	/// The names a pattern binds, for recovery.
+	fn namesOf(pattern: &ast::Pattern, out: &var Vec<(Symbol, Span)>) = match pattern.kind {
+		.Binding(sym) => out.push((sym, pattern.span))
+		.Variant(binders, ..) => {
+			if binders is .Some(all) {
+				for b in all {
+					match b.pattern {
+						.Some(inner) => self.namesOf(&inner, &var out)
+						.None => out.push((b.field.sym, b.span))
+					}
+				}
+			}
+		}
+		// Any one of several: each binds the same names, or is reported.
+		.Any(alternatives) => {
+			for alternative in alternatives {
+				self.namesOf(&alternative, &var out)
+			}
+		}
+		.Slice(elements) => {
+			for element in elements {
+				match element {
+					.Pattern(p) => self.namesOf(&p, &var out)
+					// A constant's name after `..` binds nothing.
+					.Rest(name, ..) =>
+						if name is .Some(n) && self.patternConst(n).isNone() then
+							out.push((n.sym, n.span))
+				}
+			}
+		}
+		.Wildcard | .Int(..) | .Range(..) | .Bool(..) | .Str(..) | .Char(..) | .Byte(..) | .Error => {}
+	}
+
+	/// Reports a guard on an arm whose bindings take what they match: the
+	/// guard runs after the value has been taken apart, and one that fails
+	/// would leave it half taken.
+	var fn guardTakesNothing(
+		pattern: &Pattern,
+		alias: Option<RefKind>,
+		span: Span,
+		guard: ast::ExprId,
+	) = {
+		if alias.isSome() then return
+		var locals: Vec<LocalId> = Vec()
+		pattern.locals(&var locals)
+		var taken: Option<LocalId> = .None
+		for local in locals {
+			val ty = self.state.body.locals[local].ty
+			if taken.isNone() && !self.isPoisoned(ty) && self.owns(ty) then taken = .Some(local)
+		}
+		val .Some(local) = taken else {
+			return
+		}
+		val name = String::of(self.text(self.state.body.locals[local].name))
+		val typeName = self.tyName(self.state.body.locals[local].ty)
+		self.report(
+			Diagnostic::error(
+				INVALID_PATTERN,
+				"an arm that takes `\(name)` cannot have a guard",
+				self.ast.exprs[guard].span,
+				"a guard",
+			).withSecondary(span, "`\(name)` is \(typeName), which owns memory").
+				withHelp("match without `move`, and take what the arm needs in its body").
+				withNote(
+					"a guard runs once the pattern has taken the value apart, so a guard that fails would leave it half taken",
+				),
+		)
+	}
+
+	/// A number in a pattern, in the bits of the type being matched.
+	var fn intPattern(negative: bool, magnitude: u128, scrutTy: Ty, span: Span): Pattern = {
+		if !self.program.types.isInteger(scrutTy) then
+			return self.literalPattern(scrutTy, I64, "a number", span).unwrapOr(.Error)
+		return .Int(self.intLiteral(negative, magnitude, scrutTy, span))
+	}
+
+	/// `'a'..='z'`, `0..10`, `..0`, `10..`: the values between two ends, of
+	/// an integer or a character type, both ends included once it is lowered;
+	/// one left off is not tested.
+	var fn rangePattern(
+		lo: Option<&ast::RangeBound>,
+		hi: Option<&ast::RangeBound>,
+		inclusive: bool,
+		scrutTy: Ty,
+		span: Span,
+	): Pattern = {
+		if self.isPoisoned(scrutTy) then return .Error
+		val .Some((least, greatest)) = self.program.types.orderRange(scrutTy) else {
+			self.report(
+				Diagnostic::error(
+					INVALID_PATTERN,
+					"a range cannot match \(self.tyName(scrutTy))",
+					span,
+					"a range, and the value is \(self.tyName(scrutTy))",
+				).withNote(
+					"a range matches an integer, a character or a byte: values in an order with none between two neighbours",
+				),
+			)
+			return .Error
+		}
+		var loBits: Option<u128> = .None
+		if lo is .Some(bound) {
+			loBits = self.rangeEnd(&bound, scrutTy)
+			if loBits.isNone() then return .Error
+		}
+		var hiBits: Option<u128> = .None
+		if hi is .Some(bound) {
+			hiBits = self.rangeEnd(&bound, scrutTy)
+			if hiBits.isNone() then return .Error
+		}
+		val loKey = match loBits {
+			.Some(bits) => self.program.types.orderKey(scrutTy, bits).unwrap()
+			.None => least
+		}
+		val hiKey = match hiBits {
+			.Some(bits) => self.program.types.orderKey(scrutTy, bits).unwrap()
+			.None => greatest
+		}
+		// `lo..hi` leaves `hi` out: its last value is the one before.
+		val last: Option<u128> =
+			if hiBits.isSome() && !inclusive then (if hiKey == 0 then .None else .Some(hiKey - 1))
+			else .Some(hiKey)
+		if !(last is .Some(l) && l >= loKey) {
+			self.report(
+				Diagnostic::error(
+					INVALID_PATTERN,
+					"this range has nothing in it",
+					span,
+					"no value lies between its ends",
+				).withNote(
+					"`lo..=hi` takes `hi` and `lo..hi` leaves it out, so its end comes after its start",
+				),
+			)
+			return .Error
+		}
+		val end = last.unwrap()
+		return .Range(
+			lo: if loBits.isSome() then .Some(self.program.types.fromOrderKey(scrutTy, loKey))
+			else .None,
+			hi: if hiBits.isSome() then .Some(self.program.types.fromOrderKey(scrutTy, end))
+			else .None,
+		)
+	}
+
+	/// The bits of one end of a range, of the type being matched: a literal,
+	/// or a constant worked out here if nothing has asked for it yet.
+	/// Reported, and nothing, where it is not one.
+	var fn rangeEnd(bound: &ast::RangeBound, scrutTy: Ty): Option<u128> = {
+		val span = bound.span
+		return match bound.kind {
+			.Int(negative, magnitude) => {
+				if !self.program.types.isInteger(scrutTy) {
+					self.literalPattern(scrutTy, I64, "a number", span)
+					return .None
+				}
+				.Some(self.intLiteral(negative, magnitude, scrutTy, span))
+			}
+			.Char(c) =>
+				if self.literalPattern(scrutTy, CHAR, "a character", span).isNone() then
+					.Some(c as u128)
+				else .None
+			.Byte(b) =>
+				if self.literalPattern(scrutTy, U8, "a byte", span).isNone() then .Some(b as u128)
+				else .None
+			.Const(path) => self.constEnd(&path, scrutTy, span)
+		}
+	}
+
+	/// A range's end that names a constant.
+	var fn constEnd(path: &[ast::Name], scrutTy: Ty, span: Span): Option<u128> = {
+		val found: Option<ConstId> = if path.len() == 1 {
+			self.constNamed(path[0])
+		} else {
+			match self.resolvePath(&path, false, MODULE_NOTE) {
+				.Item(module, name) => match self.modules[module].consts.get(&name.sym) {
+					.Some(id) => .Some(id)
+					.None => .None
+				}
+				_ => return .None
+			}
+		}
+		var parts: Vec<str> = Vec()
+		for n in path {
+			parts.push(self.text(n.sym))
+		}
+		val written = parts.join("::")
+		val .Some(id) = found else {
+			self.report(
+				Diagnostic::error(
+					UNKNOWN_NAME,
+					"cannot find the constant `\(written)`",
+					span,
+					"not a constant",
+				).withNote("a range's ends are literals or constants"),
+			)
+			return .None
+		}
+		self.constValue(id)
+		if !self.knownNow(id, span, "a range's end") then return .None
+		val ty = self.program.consts[id].ty
+		if ty != scrutTy {
+			if !self.isPoisoned(ty) then
+				self.report(
+					Diagnostic::error(
+						MISMATCHED_TYPES,
+						"`\(written)` is \(self.tyName(ty)), and the value matched is \(self.tyName(scrutTy))",
+						span,
+						"an end of another type",
+					),
+				)
+			return .None
+		}
+		return match self.program.consts[id].value {
+			.Some(.Int(bits)) => .Some(bits)
+			_ => .None
+		}
+	}
+
+	/// The constant a name in a pattern stands for: one of this module's, one
+	/// it imported, or one the prelude exports. Another module's private
+	/// constant is no more a pattern than it is a value.
+	fn patternConst(name: ast::Name): Option<ConstId> = {
+		val id = self.constNamed(name)?
+		val ownConst = match self.consts().get(&name.sym) {
+			.Some(found) => found == id
+			.None => false
+		}
+		return if ownConst || self.program.consts[id].isPub then .Some(id) else .None
+	}
+
+	/// A constant in a pattern: the value the scrutinee must equal, as the
+	/// literal it was written with would be.
+	var fn constPattern(id: ConstId, scrutTy: Ty, span: Span): Pattern = {
+		self.constValue(id)
+		if !self.knownNow(id, span, "a pattern") then return .Error
+		val ty = self.program.consts[id].ty
+		val name = String::of(self.text(self.program.consts[id].name))
+		if self.isPoisoned(ty) || self.isPoisoned(scrutTy) then return .Error
+		// Text matches a `String` by what it holds, as a literal does.
+		val textOfString = ty == STR && self.program.isString(scrutTy)
+		if ty != scrutTy && !textOfString {
+			self.report(
+				Diagnostic::error(
+					MISMATCHED_TYPES,
+					"`\(name)` is \(self.tyName(ty)), and the value matched is \(self.tyName(scrutTy))",
+					span,
+					"a constant of another type",
+				).withNote(
+					"a constant in a pattern asks whether the value equals it, so the two are of one type",
+				),
+			)
+			return .Error
+		}
+		return match self.program.consts[id].value.clone() {
+			.Some(.Int(bits)) => .Int(bits)
+			.Some(.Bool(value)) => .Bool(value)
+			.Some(.Str(symbol)) if ty == STR => .Str(symbol)
+			.Some(_) => {
+				self.report(
+					Diagnostic::error(
+						INVALID_PATTERN,
+						"`\(name)` is \(self.tyName(ty)), which a pattern cannot equal",
+						span,
+						"not a number, a character, a `bool` or text",
+					).withNote(
+						"a constant in a pattern is one a literal could be written for: an integer, a character, a `bool` or a `str`; a float is compared with `==`",
+					),
+				)
+				Pattern::Error
+			}
+			// Working it out failed, and said so.
+			.None => .Error
+		}
+	}
+
+	/// Reports a literal pattern against a type it cannot equal, and answers
+	/// nothing where the type is the one it wants.
+	var fn literalPattern(scrutTy: Ty, wanted: Ty, what: str, span: Span): Option<Pattern> = {
+		if self.isPoisoned(scrutTy) then return .Some(.Error)
+		// A byte matches a `u8`, as `==` compares it with one. A number is
+		// only asked here of what is not an integer at all.
+		if scrutTy == wanted then return .None
+		self.report(
+			Diagnostic::error(
+				INVALID_PATTERN,
+				"\(what) cannot match \(self.tyName(scrutTy))",
+				span,
+				"\(what), and the value is \(self.tyName(scrutTy))",
+			).withNote(
+				"a pattern that is a value asks whether the value being matched equals it, so the two are of one type",
+			),
+		)
+		return .Some(.Error)
+	}
+
+	/// Whether a binding takes a copy rather than aliasing the place it came
+	/// from: plain data bound by a `val … else`, which leaves the place free
+	/// for the rest of the block. What owns memory cannot be copied out of a
+	/// place, and what holds a `str` or a view must keep referring to it, so
+	/// that a change to what it borrows is caught.
+	var fn copiedBinding(ty: Ty, binds: Binds): bool = {
+		// A function value is always copied: a reference to one would be a
+		// `&(…) => …`, which is a closure lent for a call, not an address, so
+		// there is no alias of it to bind.
+		if self.kind(ty) is .Fn(..) then return true
+		return binds.copy && !self.isPoisoned(ty) && !self.owns(ty) && !self.program.holdsView(ty)
+	}
+
+	/// A `var` pattern on a place copies its parts out, so a part that owns
+	/// memory, which is never copied, needs the place to give the value up
+	/// with `move`, as `var x = place` does.
+	var fn variablesTake(pattern: &Pattern, scrut: ExprId) = {
+		if !self.rootsInLocal(scrut) then return
+		var locals: Vec<LocalId> = Vec()
+		pattern.locals(&var locals)
+		var owning: Option<LocalId> = .None
+		for local in locals {
+			val ty = self.state.body.locals[local].ty
+			if owning.isNone() && !self.isPoisoned(ty) && self.owns(ty) then owning = .Some(local)
+		}
+		val .Some(local) = owning else {
+			return
+		}
+		val name = String::of(self.text(self.state.body.locals[local].name))
+		val span = self.state.body.locals[local].span
+		val ty = self.state.body.locals[local].ty
+		val scrutSpan = self.state.body.exprs[scrut].span
+		self.report(
+			Diagnostic::error(
+				CANNOT_COPY_OWN,
+				"`\(name)` would hold a copy of a \(self.tyName(ty))",
+				span,
+				"owns memory, so it is never copied",
+			).withSecondary(scrutSpan, "a place, which keeps its value").
+				withNote(
+					"the names of a `var` pattern are variables of their own, which hold their parts; a place gives its value up to them with `move`",
+				).
+				withFix("to take the value apart, move it", own [
+					Edit::insert(scrutSpan.lo, "move "),
+				]),
+		)
+	}
+
+	/// Declares a binding of a value of type `ty`: an alias for it, a
+	/// reference to it, where `binds` aliases and it is not copied, and the
+	/// value itself otherwise. It records which, and the place an alias
+	/// refers into.
+	var fn declareBinding(name: Symbol, ty: Ty, span: Span, binds: Binds): LocalId = {
+		// An alternative after the first binds the first's local.
+		if self.boundBefore(name, ty, span) is .Some(local) then return local
+		val local = self.declareNewBinding(name, ty, span, binds)
+		self.noteBound(name, local, ty, span)
+		return local
+	}
+
+	var fn declareNewBinding(name: Symbol, ty: Ty, span: Span, binds: Binds): LocalId = {
+		val copied = self.copiedBinding(ty, binds)
+		val alias: Option<RefKind> = if !copied && !self.isPoisoned(ty) then binds.alias else .None
+		val localTy = match alias {
+			.Some(kind) => self.intern(.Ref(inner: ty, kind: kind))
+			.None => ty
+		}
+		val kind: LocalKind = if binds.variables then .Var else .Binding
+		val local = self.declare(name, localTy, kind, span)
+		if alias.isSome() {
+			self.state.body.aliasBindings.add(local)
+			if binds.source is .Some(source) then self.state.body.aliases.put(local, source)
+			val plain =
+				!self.isPoisoned(ty) &&
+				!self.owns(ty) &&
+				!self.program.holdsView(ty) &&
+				!(self.kind(ty) is .Ref(..) | .Fn(..))
+			if binds.settle && plain then self.state.settling.push(local)
+		} else if binds.copy && !binds.variables {
+			// A binding that took a copy refers to nothing.
+			self.state.body.copiedBindings.add(local)
+		}
+		return local
+	}
+
+	var fn pattern(pattern: &ast::Pattern, scrutTy: Ty, binds: Binds): Pattern = {
+		// A pattern that tests a value, met where the value is a reference,
+		// tests what it refers to, at any depth: `.Some(3)` on an
+		// `Option<&i64>`. A name or `_` there takes the reference itself.
+		if self.kind(scrutTy) is .Ref(inner: referent, kind) && self.testsAValue(&pattern) {
+			// What it binds aliases what it names there, which can be written
+			// only through a `&var` in a place that can be.
+			val alias: RefKind =
+				if kind == .Var && binds.alias == .Some(.Var) then .Var else .Shared
+			var through = binds
+			through.alias = .Some(alias)
+			val tested = self.pattern(&pattern, referent, through)
+			if tested is .Error then return .Error
+			return .Deref(own move tested)
+		}
+		return match pattern.kind {
+			.Wildcard => .Wildcard
+			// A number, a `bool` or text the value must equal.
+			.Int(negative, magnitude) => self.intPattern(negative, magnitude, scrutTy, pattern.span)
+			.Bool(value) => self.literalPattern(scrutTy, BOOL, "a `bool`", pattern.span).unwrapOr(
+				.Bool(value),
+			)
+			// Text matches a `str`, and a `String` by the text it holds.
+			.Str(symbol) => {
+				val text = if self.program.isString(scrutTy) then scrutTy else STR
+				self.literalPattern(scrutTy, text, "text", pattern.span).unwrapOr(.Str(symbol))
+			}
+			// A character is matched as the number it is.
+			.Char(c) => self.literalPattern(scrutTy, CHAR, "a character", pattern.span).unwrapOr(
+				.Int(c as u128),
+			)
+			// And a byte as the `u8` it is.
+			.Byte(b) => self.literalPattern(scrutTy, U8, "a byte", pattern.span).unwrapOr(
+				.Int(b as u128),
+			)
+			// `'a'..='z'`, `0..10`, `..0`, `10..`.
+			.Range(lo, hi, inclusive) => self.rangePattern(
+				lo.asRef(),
+				hi.asRef(),
+				inclusive,
+				scrutTy,
+				pattern.span,
+			)
+			// `.Round(..) | .Square(..)`: any one of them. Where they bind, each
+			// binds the same names, and whichever matched gives the arm its
+			// fields.
+			.Any(alternatives) => {
+				val how = Alternative::Plain(scrutTy: scrutTy, binds: binds)
+				self.anyPattern(&alternatives, &how)
+			}
+			.Binding(sym) => self.bindingPattern(sym, scrutTy, pattern.span, binds)
+			.Variant(leadingDot, segments, binders, rest) => {
+				val written: Option<&[ast::Binder]> = match binders {
+					.Some(b) => .Some(&b.items())
+					.None => .None
+				}
+				val fields = Fields(binders: written, rest: rest)
+				self.variantPatternOf(leadingDot, &segments, fields, scrutTy, pattern.span, binds)
+			}
+			.Slice(elements) => self.slicePattern(&elements, scrutTy, pattern.span, binds)
+			.Error => .Error
+		}
+	}
+
+	/// A bare name in a pattern: a constant's value, or a new binding.
+	var fn bindingPattern(sym: Symbol, scrutTy: Ty, span: Span, binds: Binds): Pattern = {
+		// A constant's name is the value it stands for, as a range's end is:
+		// `OP_ADD => …`.
+		val name = ast::Name(sym: sym, span: span)
+		if self.patternConst(name) is .Some(id) {
+			// A local of the name hides the constant everywhere else, and a
+			// pattern cannot compare with a local, so the name says two things
+			// here.
+			if self.lookup(sym).isSome() {
+				self.hiddenConstant(name)
+				return .Error
+			}
+			return self.constPattern(id, scrutTy, span)
+		}
+		if self.kind(scrutTy) is .Enum(id, ..) {
+			var isVariant = false
+			for v in self.program.enums[id].variants {
+				if v.name == sym then isVariant = true
+			}
+			if isVariant {
+				val enumName = self.text(self.program.enums[id].name)
+				val text = self.text(sym)
+				self.report(
+					Diagnostic::warning(
+						BINDING_SHADOWS_VARIANT,
+						"`\(text)` binds a new name; it does not match the variant `\(enumName)::\(text)`",
+						span,
+						"matches every value",
+					).withFix(
+						"to match the variant, write `.\(text)`",
+						own [Edit::replace(span, ".\(text)")],
+					),
+				)
+			}
+		}
+		return .Binding(self.declareBinding(sym, scrutTy, span, binds))
+	}
+
+	/// A pattern with a path: a struct taken apart, or a variant.
+	var fn variantPatternOf(
+		leadingDot: bool,
+		segments: &[ast::Name],
+		fields: Fields,
+		scrutTy: Ty,
+		span: Span,
+		binds: Binds,
+	): Pattern = {
+		val note = "a variant pattern is `.Variant`, `Enum::Variant`, or a module path to one"
+		// `Point(x, y)`: one name and no leading dot is a struct taken apart,
+		// or a variant whose enum was left out.
+		if !leadingDot && segments.len() == 1 {
+			val name = segments[0]
+			// The file's own types, then what it imported, then the prelude's,
+			// as a type name resolves anywhere else.
+			var declared: Option<TypeDef> = match self.types().get(&name.sym) {
+				.Some((def, _)) => .Some(def)
+				.None => .None
+			}
+			if declared.isNone() then declared = self.importedType(name)
+			if declared.isNone() then declared = self.preludeType(name.sym)
+			if declared is .Some(.Struct(id)) then
+				return self.structPattern(id, name, fields, scrutTy, span, binds)
+			val text = String::of(self.text(name.sym))
+			// The old mistake: a variant of the type being matched, written
+			// without its enum.
+			var isVariant = false
+			if self.kind(scrutTy) is .Enum(id, ..) {
+				for v in self.program.enums[id].variants {
+					if v.name == name.sym then isVariant = true
+				}
+			}
+			val message =
+				if isVariant then String::of("variant pattern is missing its enum")
+				else "cannot find a struct named `\(text)`"
+			self.report(
+				Diagnostic::error(
+					INVALID_PATTERN,
+					move message,
+					span,
+					"write `.\(text)(…)` to match a variant",
+				).withFix(
+					"match the variant `.\(text)`",
+					own [Edit::insert(name.span.lo, ".")],
+				).withNote(
+					"a name with fields after it is a struct taken apart; a variant is `.Variant(…)` or `Enum::Variant(…)`",
+				),
+			)
+			return self.bindersFailed(fields.binders)
+		}
+		var enumName: Option<(i64, ast::Name)> = .None
+		if leadingDot {
+			if segments.len() != 1 {
+				self.unknownModule(segments[0], note)
+				return .Error
+			}
+		} else {
+			match self.resolvePath(&segments, true, note) {
+				.Variant(module, enumName: named, ..) => enumName = .Some((module, named))
+				.Item(name: item, ..) => {
+					self.unknownModule(item, note)
+					return .Error
+				}
+				.Broken => return .Error
+			}
+		}
+		val variant = segments[segments.len() - 1]
+		return self.variantPattern(enumName, variant, fields, scrutTy, span, binds)
+	}
+
+	/// The local an earlier alternative of an enclosing `|` bound `name` to,
+	/// where there is one: this alternative binds it too, which it notes. A
+	/// name of another type is reported.
+	var fn boundBefore(name: Symbol, ty: Ty, span: Span): Option<LocalId> = {
+		var found: Option<(LocalId, Ty, Span)> = .None
+		var i = self.state.alternatives.len()
+		while i > 0 && found.isNone() {
+			i -= 1
+			if self.state.alternatives[i].first is .Some(first) &&
+				first.get(&name) is .Some(entry) {
+				found = .Some(entry)
+			}
+		}
+		val (local, firstTy, firstSpan) = found?
+		if firstTy != ty && !self.isPoisoned(ty) && !self.isPoisoned(firstTy) {
+			val text = String::of(self.text(name))
+			self.report(
+				Diagnostic::error(
+					INVALID_PATTERN,
+					"`\(text)` is \(self.tyName(ty)) here and \(self.tyName(firstTy)) in the first alternative",
+					span,
+					self.tyName(ty),
+				).withSecondary(firstSpan, self.tyName(firstTy)).withNote(
+					"the arm is checked once, so a name its alternatives bind has one type",
+				),
+			)
+		}
+		self.noteBound(name, local, ty, span)
+		return .Some(local)
+	}
+
+	/// `name` is bound in the alternative of each enclosing `|`.
+	var fn noteBound(name: Symbol, local: LocalId, ty: Ty, span: Span) = {
+		for i in 0..self.state.alternatives.len() {
+			if !self.state.alternatives[i].bound.contains(&name) then
+				self.state.alternatives[i].bound.put(name, (local, ty, span))
+		}
+	}
+
+	/// Reports a name an alternative binds that the first does not, or one
+	/// the first binds that it does not.
+	var fn alternativeDiffers(
+		first: &Map<Symbol, (LocalId, Ty, Span)>,
+		bound: &Map<Symbol, (LocalId, Ty, Span)>,
+		span: Span,
+	) = {
+		var extra: Vec<(Symbol, Span)> = Vec()
+		for i in 0..bound.len() {
+			val name = bound.keyAt(i).clone()
+			if !first.contains(&name) then extra.push((name, bound.valueAt(i).2))
+		}
+		extra.sortByKey((e) => e.1.lo)
+		// One name for another: the field is renamed.
+		var missed: Vec<Symbol> = Vec()
+		for i in 0..first.len() {
+			val name = first.keyAt(i).clone()
+			if !bound.contains(&name) then missed.push(name)
+		}
+		val rename: Option<(Symbol, Symbol)> =
+			if extra.len() == 1 && missed.len() == 1 then .Some((extra[0].0, missed[0])) else .None
+		for (name, at) in extra {
+			val text = String::of(self.text(name))
+			var diagnostic = Diagnostic::error(
+				INVALID_PATTERN,
+				"`\(text)` is bound here and not in the first alternative",
+				at,
+				"bound in this alternative only",
+			).withNote(
+				"whichever alternative matches gives the arm its names, so each binds the same ones",
+			)
+			if rename is .Some((field, wanted)) then
+				diagnostic = diagnostic.withHelp("to bind one name from each, rename: `\(self.text(field)): \(self.text(wanted))`")
+			self.report(move diagnostic)
+		}
+		var missing: Vec<(Symbol, Span)> = Vec()
+		for i in 0..first.len() {
+			val name = first.keyAt(i).clone()
+			if !bound.contains(&name) then missing.push((name, first.valueAt(i).2))
+		}
+		missing.sortByKey((e) => e.1.lo)
+		for (name, at) in missing {
+			val text = String::of(self.text(name))
+			self.report(
+				Diagnostic::error(
+					INVALID_PATTERN,
+					"this alternative does not bind `\(text)`",
+					span,
+					"binds no `\(text)`",
+				).withSecondary(at, "bound in the first alternative").withNote(
+					"whichever alternative matches gives the arm its names, so each binds the same ones",
+				),
+			)
+		}
+	}
+
+	/// Whether a pattern tests the value it meets, rather than naming it or
+	/// passing over it: a constant's name tests, as its value does.
+	fn testsAValue(pattern: &ast::Pattern): bool = match pattern.kind {
+		.Wildcard | .Error => false
+		.Binding(sym) => self.patternConst(ast::Name(sym: sym, span: pattern.span)).isSome()
+		_ => true
+	}
+
+	/// Whether an element of a slice pattern is its rest: `..MAX`, where
+	/// `MAX` is a constant, is an element below it, as a constant's name is
+	/// its value anywhere in a pattern; any other `..` is the rest, of which
+	/// there is one.
+	fn isRest(element: &ast::SliceElement): bool = match element {
+		.Rest(name: .Some(name), ..) => self.patternConst(name).isNone()
+		.Rest(name: .None, ..) => true
+		.Pattern(_) => false
+	}
+
+	/// `[first, ..rest]`: the elements of an array or a slice, from either
+	/// end. An element binds as a field does; the rest binds the elements
+	/// between as a slice of where they lie.
+	var fn slicePattern(
+		elements: &[ast::SliceElement],
+		scrutTy: Ty,
+		span: Span,
+		binds: Binds,
+	): Pattern = {
+		val (elem, len) = match self.kind(scrutTy) {
+			.Array(elem, len) => (elem, .Some(len))
+			.Slice(elem) => (elem, .None)
+			_ => {
+				if !self.isPoisoned(scrutTy) then self.notASlice(scrutTy, span)
+				self.sliceFailed(&elements)
+				return .Error
+			}
+		}
+		var rests: Vec<Span> = Vec()
+		for element in elements {
+			if !self.isRest(&element) then continue
+			rests.push(
+				match element {
+					.Rest(span: at, ..) => at
+					.Pattern(p) => p.span
+				},
+			)
+		}
+		if rests.len() >= 2 {
+			self.report(
+				Diagnostic::error(
+					SLICE_PATTERN_REST,
+					"a slice pattern has one `..`",
+					rests[1],
+					"a second `..`",
+				).withSecondary(rests[0], "the elements between are these").withNote(
+					"`..` stands for the elements the pattern does not name, so which would be in which `..` is not said",
+				),
+			)
+			self.sliceFailed(&elements)
+			return .Error
+		}
+		var before: Vec<Binder> = Vec()
+		var after: Vec<Binder> = Vec()
+		var rest: Option<SliceRest> = .None
+		for element in elements {
+			if self.isRest(&element) {
+				val .Rest(name, ..) = element else {
+					panic("a rest is a `..`")
+				}
+				rest = .Some(
+					match name {
+						.Some(n) => self.declareRest(n, elem, scrutTy, binds)
+						.None => .Ignored
+					},
+				)
+				continue
+			}
+			val binder: Binder = match element {
+				.Pattern(p) => match self.pattern(&p, elem, binds) {
+					.Wildcard => .Ignored
+					.Binding(local) => .Bind(local)
+					other => .Nested(move other)
+				}
+				// A constant's name after `..`: the elements below it.
+				.Rest(name, span: at) => {
+					val n = name.unwrap()
+					val range = if self.lookup(n.sym).isSome() {
+						self.hiddenConstant(n)
+						Pattern::Error
+					} else {
+						val bound = ast::RangeBound(kind: .Const(Vec::of(own [n])), span: n.span)
+						self.rangePattern(.None, .Some(&bound), false, elem, at)
+					}
+					.Nested(move range)
+				}
+			}
+			if rest.isSome() then after.push(move binder) else before.push(move binder)
+		}
+		val named = before.len() + after.len()
+		if len is .Some(count) {
+			val wrong = if rest.isSome() then named as u64 > count else named as u64 != count
+			if wrong {
+				val wanted = if rest.isSome() then "at least \(named)" else "\(named)"
+				var diagnostic = Diagnostic::error(
+					INVALID_PATTERN,
+					"this array has \(count) elements, and the pattern matches \(wanted)",
+					span,
+					"matches \(wanted)",
+				).withNote("the value being matched has type \(self.tyName(scrutTy))")
+				if rest.isNone() && (named as u64) < count then
+					diagnostic = diagnostic.withHelp("to match the first \(named) and pass over the rest, end it with `..`")
+				self.report(move diagnostic)
+				return .Error
+			}
+		}
+		return .Slice(prefix: move before, rest: move rest, suffix: move after)
+	}
+
+	/// Declares a slice pattern's names as errors, so that what follows
+	/// resolves.
+	var fn sliceFailed(elements: &[ast::SliceElement]) = {
+		var names: Vec<(Symbol, Span)> = Vec()
+		for element in elements {
+			match element {
+				.Pattern(p) => self.namesOf(&p, &var names)
+				.Rest(name, ..) => if name is .Some(n) then names.push((n.sym, n.span))
+			}
+		}
+		for (sym, span) in names {
+			self.declare(sym, ERROR, .Binding, span)
+		}
+	}
+
+	/// A constant's name in a pattern where a local of that name hides it: a
+	/// pattern cannot compare with a local, so the name says two things.
+	var fn hiddenConstant(name: ast::Name) = {
+		val text = String::of(self.text(name.sym))
+		self.report(
+			Diagnostic::error(
+				INVALID_PATTERN,
+				"`\(text)` is a constant, and a local of that name hides it",
+				name.span,
+				"a constant or a new name?",
+			).withHelp("rename the local, or bind a name of its own here").withNote(
+				"a constant's name in a pattern is the value it stands for",
+			),
+		)
+	}
+
+	/// A slice pattern on what is not an array or a slice. A container that
+	/// lends its elements is matched through them.
+	var fn notASlice(scrutTy: Ty, span: Span) = {
+		var diagnostic = Diagnostic::error(
+			INVALID_PATTERN,
+			"a slice pattern cannot match \(self.tyName(scrutTy))",
+			span,
+			"matches the elements of an array or a slice",
+		).withNote("the value being matched has type \(self.tyName(scrutTy))")
+		val lends =
+			self.program.preludeItems.interfaceOf(.Items) is .Some(items) &&
+			self.implementsAny(scrutTy, items)
+		if lends then
+			diagnostic = diagnostic.withHelp(
+				"match the elements it lends: `match value.items() { … }`",
+			)
+		self.report(move diagnostic)
+	}
+
+	/// `..rest` in a slice pattern: the elements between, as a slice of where
+	/// they lie. It refers into the value as an alias does, and so needs a
+	/// place: a value made where it is matched is gone when its statement
+	/// ends.
+	var fn declareRest(name: ast::Name, elem: Ty, scrutTy: Ty, binds: Binds): SliceRest = {
+		val inPlace =
+			self.kind(scrutTy) is .Slice(..) ||
+			(binds.source is .Some(source) && self.rootsInLocal(source))
+		if !inPlace {
+			val text = String::of(self.text(name.sym))
+			self.report(
+				Diagnostic::error(
+					INVALID_PATTERN,
+					"`\(text)` would borrow elements that are not kept",
+					name.span,
+					"a slice of the elements between",
+				).withNote(
+					"`..rest` borrows the elements where they lie, and a value made where it is matched is gone when its statement ends",
+				).withHelp("keep the value in a variable, and match that"),
+			)
+			self.declare(name.sym, ERROR, .Binding, name.span)
+			return .Ignored
+		}
+		val slice = self.intern(.Slice(elem))
+		val ty = self.intern(.Ref(inner: slice, kind: binds.alias.unwrapOr(.Shared)))
+		if self.boundBefore(name.sym, ty, name.span) is .Some(local) then return .Bind(local)
+		// A `var` pattern's rest is a variable of its own, which holds a
+		// reference.
+		val kind: LocalKind = if binds.variables then .Var else .Binding
+		val local = self.declare(name.sym, ty, kind, name.span)
+		self.noteBound(name.sym, local, ty, name.span)
+		if binds.alias.isSome() {
+			self.state.body.aliasBindings.add(local)
+			if binds.source is .Some(source) then self.state.body.aliases.put(local, source)
+		}
+		return .Bind(local)
+	}
+
+	/// The position of the field a binder names, among `fields`: by its name,
+	/// or, with one field, any bare binder.
+	fn binderField(b: &ast::Binder, fields: &[FieldDef]): Option<i64> = {
+		// With one field, a bare binder of any name binds it, as a variant's
+		// does, and so does a pattern that names no field.
+		val positional = b.field.sym == Symbol::positional()
+		val bare = b.pattern.isNone() || positional
+		if !positional {
+			for (i, f) in fields.forwards().enumerate() {
+				if f.name == b.field.sym then return .Some(i)
+			}
+		}
+		return if fields.len() == 1 && bare then .Some(0) else .None
+	}
+
+	/// A binder that names no field there is.
+	var fn unknownBinderField(path: str, fields: &[FieldDef], b: &ast::Binder, listFields: bool) = {
+		val field = self.text(b.field.sym)
+		var texts: Vec<str> = Vec()
+		for f in fields {
+			texts.push(self.text(f.name))
+		}
+		var diagnostic = Diagnostic::error(
+			NO_SUCH_FIELD,
+			"`\(path)` has no field `\(field)`",
+			b.field.span,
+			"unknown field",
+		)
+		if suggest(field, &texts) is .Some(similar) {
+			diagnostic = diagnostic.withFix(
+				"did you mean `\(similar)`?",
+				own [Edit::replace(b.field.span, String::of(similar))],
+			)
+		} else if listFields {
+			var names: Vec<String> = Vec()
+			for f in fields {
+				names.push("`\(self.text(f.name))`")
+			}
+			diagnostic = diagnostic.withNote("the fields are \(names.join(", "))")
+		}
+		self.report(move diagnostic)
+	}
+
+	/// The fields a pattern without `..` leaves unnamed, reported.
+	var fn reportUnnamedFields(
+		path: str,
+		fields: &[FieldDef],
+		bound: &[Option<Span>],
+		span: Span,
+	): bool = {
+		var missing: Vec<String> = Vec()
+		for i in 0..fields.len() {
+			if bound[i].isNone() then missing.push("`\(self.text(fields[i].name))`")
+		}
+		if missing.isEmpty() then return false
+		self.report(
+			Diagnostic::error(
+				PATTERN_FIELDS,
+				"`\(path)` has \(plural(missing.len(), "field", "fields")) the pattern does not name: \(missing.join(", "))",
+				span,
+				"not every field is named",
+			).withHelp("name them, or end the pattern with `..`"),
+		)
+		return true
+	}
+
+	/// `Point(x, y)`: a struct taken apart where it is bound. Its binders are
+	/// a variant's binders, and it always matches, so it only declares them.
+	var fn structPattern(
+		id: StructId,
+		name: ast::Name,
+		fields: Fields,
+		scrutTy: Ty,
+		span: Span,
+		binds: Binds,
+	): Pattern = {
+		val defs = self.program.structs[id].fields.clone()
+		val path = String::of(self.text(self.program.structs[id].name))
+		val matches = self.kind(scrutTy) is .Struct(id: scrut, ..) && scrut == id
+		if !matches && !self.isPoisoned(scrutTy) then
+			self.report(
+				Diagnostic::error(INVALID_PATTERN, "pattern does not match the type being matched", span, "a `\(path)`").withNote("the value being matched has type \(self.tyName(scrutTy))"),
+			)
+		val binders = fields.binders.unwrapOr(&noBinders())
+		if !matches {
+			for b in binders {
+				self.binderFailed(&b)
+			}
+			return .Error
+		}
+		// The elements of a tuple matched in place bind each as its own
+		// element does.
+		val elementBinds = self.state.placeBinds.take()
+		var locals: Vec<Binder> = Vec()
+		var bound: Vec<Option<Span>> = Vec()
+		for _ in 0..defs.len() {
+			locals.push(.Ignored)
+			bound.push(.None)
+		}
+		var failed = false
+		for b in binders {
+			val .Some(i) = self.binderField(&b, &defs) else {
+				if b.field.sym == Symbol::positional() {
+					self.nameTheField(&path, &defs, &b)
+					failed = true
+					continue
+				}
+				self.unknownBinderField(&path, &defs, &b, false)
+				self.binderFailed(&b)
+				failed = true
+				continue
+			}
+			if bound[i] is .Some(first) {
+				val field = self.text(b.field.sym)
+				self.report(
+					Diagnostic::error(
+						PATTERN_FIELDS,
+						"field `\(field)` is named twice",
+						b.field.span,
+						"named again",
+					).withSecondary(first, "first named here"),
+				)
+				self.binderFailed(&b)
+				failed = true
+				continue
+			}
+			// Another module may take apart only what is `pub`.
+			if !self.fieldVisible(id, i) then self.privateField(id, i, b.field.span)
+			bound[i] = .Some(b.field.span)
+			val fieldTy = self.structFieldTy(scrutTy, i)
+			val fieldBinds = match elementBinds {
+				.Some(e) if i < e.len() => e[i].clone()
+				_ => binds
+			}
+			locals[i] = self.binder(&b, fieldTy, fieldBinds)
+		}
+		if !fields.rest && !failed && self.reportUnnamedFields(&path, &defs, &bound, span) then
+			failed = true
+		if failed then return .Error
+		return .Fields(move locals)
+	}
+
+	var fn variantPattern(
+		enumName: Option<(i64, ast::Name)>,
+		variant: ast::Name,
+		fields: Fields,
+		scrutTy: Ty,
+		span: Span,
+		binds: Binds,
+	): Pattern = {
+		// Declare the bindings whatever happens, so the arm body resolves.
+		val .Some((id, index)) = self.resolveVariant(enumName, variant, .Some(scrutTy)) else {
+			return self.bindersFailed(fields.binders)
+		}
+		val patternTy = self.intern(.Enum(id: id, args: TyList::empty()))
+		if !(self.kind(scrutTy) is .Enum(id: scrutId, ..) && scrutId == id) {
+			if !self.isPoisoned(scrutTy) then
+				self.report(
+					Diagnostic::error(INVALID_PATTERN, "pattern does not match the type being matched", span, "a variant of \(self.tyName(patternTy))").withNote("the value being matched has type \(self.tyName(scrutTy))"),
+				)
+			return self.bindersFailed(fields.binders)
+		}
+		val defs = self.program.enums[id].variants[index as i64].fields.clone()
+		val path = "\(self.text(self.program.enums[id].name))::\(self.text(variant.sym))"
+		val .Some(binders) = fields.binders else {
+			if defs.isEmpty() then return .Variant(variant: index, binders: Vec())
+			self.report(
+				Diagnostic::error(
+					INVALID_PATTERN,
+					"`\(path)` has \(plural(defs.len(), "field", "fields")); the pattern must name them or end with `..`",
+					span,
+					"fields not mentioned",
+				).withFix("ignore them", own [Edit::insert(span.hi, "(..)")]),
+			)
+			return .Error
+		}
+		if defs.isEmpty() {
+			val parens = Span::new(variant.span.hi, span.hi)
+			var diagnostic = Diagnostic::error(
+				INVALID_PATTERN,
+				"`\(path)` has no fields",
+				parens,
+				"unexpected parentheses",
+			)
+			if binders.isEmpty() then
+				diagnostic = diagnostic.withFix("remove the parentheses", own [
+					Edit::replace(parens, String()),
+				])
+			self.report(move diagnostic)
+			return self.bindersFailed(fields.binders)
+		}
+		// Binders name their fields, in any order.
+		var locals: Vec<Binder> = Vec()
+		var bound: Vec<Option<Span>> = Vec()
+		for _ in 0..defs.len() {
+			locals.push(.Ignored)
+			bound.push(.None)
+		}
+		var failed = false
+		for b in binders {
+			val .Some(i) = self.binderField(&b, &defs) else {
+				if b.field.sym == Symbol::positional() {
+					self.nameTheField(&path, &defs, &b)
+					failed = true
+					continue
+				}
+				self.unknownBinderField(&path, &defs, &b, true)
+				self.binderFailed(&b)
+				failed = true
+				continue
+			}
+			if bound[i] is .Some(first) {
+				val field = self.text(b.field.sym)
+				self.report(
+					Diagnostic::error(
+						PATTERN_FIELDS,
+						"field `\(field)` is named twice",
+						b.field.span,
+						"named again",
+					).withSecondary(first, "first named here"),
+				)
+				self.binderFailed(&b)
+				failed = true
+				continue
+			}
+			bound[i] = .Some(b.field.span)
+			val fieldTy = self.variantFieldTy(scrutTy, index as i64, i)
+			locals[i] = self.binder(&b, fieldTy, binds)
+		}
+		// Only when every binder landed: after an unknown or repeated field,
+		// the fields left over are not the real mistake.
+		if !fields.rest && !failed && self.reportUnnamedFields(&path, &defs, &bound, span) then
+			failed = true
+		if failed then return .Error
+		return .Variant(variant: index, binders: move locals)
+	}
+
+	/// Whether the arms cover every value, and whether each can be reached:
+	/// both are whether a pattern matches something the arms before it do
+	/// not.
+	var fn exhaustiveness(scrutTy: Ty, scrutSpan: Span, astArms: &[ast::Arm], arms: &[Arm]) = {
+		if self.isPoisoned(scrutTy) then return
+		var matrix: Vec<Vec<Shape>> = Vec()
+		var hasError = false
+		var i = 0
+		while i < astArms.len() && i < arms.len() {
+			val arm = &arms[i]
+			val astArm = &astArms[i]
+			i += 1
+			if patternHasError(&arm.pattern) {
+				hasError = true
+				continue
+			}
+			val row = Vec::of(own [Shape::of(&self.program, &arm.pattern, scrutTy)])
+			if useful(&self.program, &matrix, &row, [scrutTy]).isNone() then
+				self.report(
+					Diagnostic::warning(
+						UNREACHABLE_ARM,
+						"unreachable match arm",
+						astArm.pattern.span,
+						"never reached",
+					).withNote("the arms above it match every value this one does"),
+				)
+			// An arm with a guard may not match, whatever its pattern, so it
+			// covers nothing.
+			if arm.guard.isNone() then matrix.push(move row)
+		}
+		if hasError then return
+		val .Some(witness) = useful(&self.program, &matrix, [Shape::Wild], [scrutTy]) else {
+			return
+		}
+		// Where whole variants are left out, each is named: that is what an arm
+		// for it would say, and there may be several; so is each run of numbers
+		// or characters no arm has. Anything deeper is one value that no arm
+		// matches.
+		var names = self.missingVariants(scrutTy, &matrix)
+		if names.isEmpty() then names = missingRanges(&self.program, &matrix, scrutTy)
+		if names.isEmpty() then names.push(witness.text(&self.program, scrutTy, self.interner))
+		val listed = if names.len() <= 3 {
+			"`\(names.join("`, `"))`"
+		} else {
+			var first: Vec<String> = Vec()
+			for k in 0..3 {
+				first.push(names[k].clone())
+			}
+			"`\(first.join("`, `"))` and \(names.len() - 3) more"
+		}
+		val covers = if names.len() == 1 then "is not covered" else "are not covered"
+		val missing = names.swapRemove(0)
+		// A type with more values than can be listed — text, or a number no arm
+		// narrows — is covered only by a `_` or a name.
+		if missing == "_" {
+			self.report(
+				Diagnostic::error(
+					NON_EXHAUSTIVE_MATCH,
+					"non-exhaustive match on \(self.tyName(scrutTy))",
+					scrutSpan,
+					"needs a `_` arm",
+				).withNote(
+					"a `match` on a value that is not an enum ends with `_` or a name: the values it does not list are the ones left",
+				),
+			)
+			return
+		}
+		val help =
+			if covers == "is not covered" then "add an arm for it, or a `_` arm"
+			else "add an arm for each, or a `_` arm"
+		self.report(
+			Diagnostic::error(
+				NON_EXHAUSTIVE_MATCH,
+				"non-exhaustive match: \(listed) \(covers)",
+				scrutSpan,
+				"\(listed) \(covers)",
+			).withHelp(help),
+		)
+	}
+
+	/// Makes a copy of each binding of plain data that its arm or block only
+	/// reads: nothing assigns through it, borrows it as `&var` or lends it,
+	/// and each use reads it. Its local takes the value's type, each read of
+	/// it becomes a read of the local, and it is no longer an alias, so the
+	/// place it came from is free to change.
+	var fn settleBindings() = {
+		val settling = mem::replace(&var self.state.settling, Vec())
+		if settling.isEmpty() then return
+		// Each local: how often it is named, and how often read through.
+		var uses: Map<LocalId, (u32, u32)> = Map()
+		var written: Set<LocalId> = Set()
+		for id in self.state.body.exprs.ids() {
+			val expr = &self.state.body.exprs[id]
+			match expr.kind {
+				.Local(local) => {
+					val (named, read) = usesOf(&uses, local)
+					uses.put(local, (named + 1, read))
+				}
+				.Deref(inner) => {
+					if self.state.body.exprs[inner].kind is .Local(local) {
+						val (named, read) = usesOf(&uses, local)
+						uses.put(local, (named, read + 1))
+					}
+				}
+				.Assign(place, ..) | .Lend(place) => {
+					if self.bindingThrough(place) is .Some(local) then written.add(local)
+				}
+				.Ref(place) if self.kind(expr.ty) is .Ref(kind: .Var, ..) => {
+					if self.bindingThrough(place) is .Some(local) then written.add(local)
+				}
+				_ => {}
+			}
+		}
+		var copies: Set<LocalId> = Set()
+		for local in settling {
+			val (named, read) = usesOf(&uses, local)
+			if !written.contains(&local) && named == read then copies.add(local)
+		}
+		if copies.isEmpty() then return
+		var reads: Vec<ExprId> = Vec()
+		for id in self.state.body.exprs.ids() {
+			if self.state.body.exprs[id].kind is .Deref(inner) &&
+				self.state.body.exprs[inner].kind is .Local(local) &&
+				copies.contains(&local) {
+				reads.push(id)
+			}
+		}
+		for id in reads {
+			val .Deref(inner) = self.state.body.exprs[id].kind else {
+				continue
+			}
+			val local = self.state.body.exprs[inner].kind.clone()
+			self.state.body.exprs[id].kind = move local
+		}
+		for local in copies {
+			if self.kind(self.state.body.locals[local].ty) is .Ref(inner: value, ..) then
+				self.state.body.locals[local].ty = value
+			self.state.body.aliasBindings.remove(&local)
+			self.state.body.aliases.remove(&local)
+			self.state.body.copiedBindings.add(local)
+		}
+	}
+
+	/// The binding a place is found through, where it is one.
+	fn bindingThrough(place: ExprId): Option<LocalId> = {
+		var e = place
+		while true {
+			match self.state.body.exprs[e].kind {
+				.Field(base, ..) | .Index(base, ..) | .SubSlice(base, ..) => e = base
+				.Deref(inner) => match self.state.body.exprs[inner].kind {
+					.Local(local) => return .Some(local)
+					_ => e = inner
+				}
+				_ => return .None
+			}
+		}
+		return .None
+	}
+}

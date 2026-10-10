@@ -1,0 +1,1070 @@
+// Function bodies, blocks and statements, and `if`.
+
+import std::collections::{Map}
+import std::mem
+import syntax as ast
+import syntax::{
+	ASSERT_NOTE,
+	DISCARDED_VALUE,
+	Diagnostic,
+	Edit,
+	INVALID_OPERANDS,
+	INVALID_PATTERN,
+	JUMP_IN_DEFER,
+	LOOP_JUMP_OUTSIDE,
+	MISMATCHED_TYPES,
+	MISSING_RETURN,
+	NOT_ITERABLE,
+	NO_VALUE,
+	RETURN_IN_DEFER,
+	Span,
+	Symbol,
+	UNSIZED_SLICE
+}
+
+/// Whether an `if`, followed along its `else if` chain, ends without `else`.
+fn lacksElse(file: &ast::Ast, e: ast::ExprId): bool = match file.exprs[e].kind {
+	.If(elseBranch: .None, ..) => true
+	.If(elseBranch: .Some(next), ..) => lacksElse(&file, next)
+	_ => false
+}
+
+/// The `-` that an expression statement starts with, if any.
+fn leadingNeg(file: &ast::Ast, stmt: ast::StmtId): Option<Span> = {
+	val .Expr(start) = file.stmts[stmt].kind else {
+		return .None
+	}
+	var e = start
+	while true {
+		match file.exprs[e].kind {
+			.Unary(op: .Neg, opSpan, ..) => return .Some(opSpan)
+			.Binary(lhs, ..) => e = lhs
+			.Cast(expr, ..) => e = expr
+			_ => return .None
+		}
+	}
+	return .None
+}
+
+/// What a `for` found to walk.
+enum Walked {
+	/// The slice it lends, and what one of its elements is.
+	Items(items: ExprId, elem: Ty)
+	/// Nothing, and nothing reported: the caller says so.
+	No
+}
+
+extend Lowerer {
+	/// Checks one body: a function's, a method's, or an interface method's
+	/// default. Where a constraint pins a decided type — `I: Iterator<T>`,
+	/// and `Self: Iterator<Item>` in the interface's own methods — `I::Item`
+	/// is that type in the body.
+	var fn checkFn(body: ast::ExprId, id: FnId) = {
+		val generics = self.program.fns[id].generics.clone()
+		val pins = self.decidedPins(&generics)
+		self.program.types.setPins(move pins)
+		self.checkBodyOf(body, id)
+		self.program.types.setPins(Vec())
+	}
+
+	/// The decided types the constraints of `generics` pin: `I::Item` is `T`
+	/// under `I: Iterator<T>`.
+	var fn decidedPins(generics: &[GenericParamDef]): Vec<Pin> = {
+		var pins: Vec<Pin> = Vec()
+		for (index, param) in generics.forwards().enumerate() {
+			val ty = self.intern(
+				.Param(TyParam(index: index as u32, name: param.name, copy: param.copy)),
+			)
+			for constraint in param.interfaces {
+				val decided = self.program.interfaces[constraint.interfaceId].generics.clone()
+				val args = self.program.types.list(constraint.args).toVec()
+				var at = 0
+				while at < args.len() && at < decided.len() {
+					val arg = args[at]
+					val leftToIt = self.program.types.kind(arg) is .Assoc(base, ..) && base == ty
+					if decided[at].decided && !leftToIt then
+						pins.push(Pin(
+							base: ty,
+							interfaceId: constraint.interfaceId,
+							index: at as u32,
+							pinned: arg,
+						))
+					at += 1
+				}
+			}
+		}
+		return move pins
+	}
+
+	var fn checkBodyOf(body: ast::ExprId, id: FnId) = {
+		self.typeParams = self.program.fns[id].generics.clone()
+		self.derived = self.program.derived.contains(&id)
+		val owner = self.program.fns[id].owner
+		// An expression's id is its file's, so what the last body noted of
+		// its arguments must not be read as this one's.
+		self.state.namedByEquals.clear()
+		self.state.indexOperands.clear()
+		// The `|`s that bind are numbered in each body from 0, wherever the
+		// body is checked and whatever was checked before it.
+		self.state.bindingAlternatives = 0
+		// A function that yields answers a generator.
+		if self.generatorOfFn(id) is .Some(genId) {
+			self.selfTy = match owner {
+				.Some(owner) => .Some(self.ownSelfTy(owner))
+				.None => .None
+			}
+			self.state.lentHalf = false
+			self.state.lends = 0
+			self.state.lentParam = .None
+			self.state.lentTable = false
+			self.checkGeneratorFn(body, id, genId)
+			return
+		}
+		self.state.ret = self.program.fns[id].ret
+		self.state.retSpan = self.program.fns[id].retSpan
+		self.state.lentHalf = self.program.lentHalves.contains(&id)
+		val params = self.program.fns[id].params.clone()
+		// `Self` in the body is the type the method belongs to.
+		self.selfTy = match owner {
+			.Some(owner) => .Some(self.ownSelfTy(owner))
+			.None => .None
+		}
+		self.state.body = Body()
+		self.state.scopes = Vec::of(own [Map()])
+		self.state.lends = 0
+		self.state.lentParam = .None
+		self.state.lentTable = false
+		for p in params {
+			val local = self.declare(p.name, p.ty, .Param, p.nameSpan)
+			self.state.body.params.push(local)
+		}
+		val value =
+			if self.state.ret == UNIT then self.unitBody(body, id) else self.valueBody(body, id)
+		self.state.body.value = .Some(value)
+		if self.kind(self.state.ret) is .Ref(..) then self.checkProjection(id, value)
+		// `@tailrec`: its calls to itself must be tail calls.
+		if self.program.fns[id].isTailrec then self.checkTailrec(id, value)
+		self.settleBindings()
+		self.program.fns[id].body = .Some(mem::replace(&var self.state.body, Body()))
+	}
+
+	/// The body of a function that returns nothing. Its value, if it has one,
+	/// is discarded.
+	var fn unitBody(body: ast::ExprId, id: FnId): ExprId = {
+		val value = self.infer(body, .Some(UNIT))
+		val ty = self.tyOf(value)
+		if ty == UNIT || self.isPoisoned(ty) then return value
+		if !self.hasEffect(value) {
+			// Most likely a forgotten return type: `fn add(a: i64, b: i64) = a + b`.
+			val name = self.program.tyName(ty, self.interner)
+			val fnName = self.program.fns[id].name
+			val sigSpan = self.program.fns[id].span
+			self.report(
+				Diagnostic::warning(
+					DISCARDED_VALUE,
+					"`\(self.text(fnName))` computes a value and discards it",
+					self.state.body.exprs[value].span,
+					"a value of type `\(name)` that is never used",
+				).withNote("a function without `: T` returns nothing").withFix(
+					"to return it, declare the return type: `: \(name)`",
+					own [Edit::insert(sigSpan.hi, ": \(name)")],
+				),
+			)
+		}
+		return self.wrapDiscarded(value)
+	}
+
+	/// The body of a function that returns a value: its value is the result.
+	var fn valueBody(body: ast::ExprId, id: FnId): ExprId = {
+		val ret = self.state.ret
+		val value = self.infer(body, .Some(ret))
+		// A block that ends with a statement instead of a value.
+		val openEnd: Option<u32> = match self.state.body.exprs[value].kind {
+			.Block(block) if block.value.isNone() => .Some(block.span.hi)
+			_ => .None
+		}
+		if openEnd is .Some(hi) && self.state.body.exprs[value].ty == UNIT {
+			if !self.hasError(ret) {
+				val end = Span::new(if hi > 0 then hi - 1 else 0, hi)
+				var diagnostic = Diagnostic::error(
+					MISSING_RETURN,
+					"`\(self.text(self.program.fns[id].name))` can reach its end without returning a value",
+					end,
+					"reaches the end here",
+				)
+				if self.state.retSpan is .Some(retSpan) then
+					diagnostic = diagnostic.withSecondary(retSpan, "declared to return \(self.tyName(ret))")
+				self.report(move diagnostic)
+			}
+			return value
+		}
+		val context: Option<(Span, str)> = match self.state.retSpan {
+			.Some(s) => .Some((s, "return type declared here"))
+			.None => .None
+		}
+		return self.coerce(value, ret, context)
+	}
+
+	var fn declare(name: Symbol, ty: Ty, kind: LocalKind, span: Span): LocalId = {
+		val id = self.state.body.locals.add(Local(name: name, ty: ty, kind: kind, span: span))
+		val last = self.state.scopes.len() - 1
+		self.state.scopes[last].put(name, id)
+		return id
+	}
+
+	fn lookup(name: Symbol): Option<LocalId> = {
+		var i = self.state.scopes.len()
+		while i > 0 {
+			i -= 1
+			if self.state.scopes[i].get(&name) is .Some(id) then return .Some(id)
+		}
+		return .None
+	}
+
+	/// Checks a block. Its last expression is its value, checked against
+	/// `expected` — unless `()` is expected, in which case it is discarded
+	/// like any other statement. Returns the block and its type, which is `!`
+	/// if the block always returns.
+	var fn checkBlock(block: &ast::Block, expected: Option<Ty>): (Block, Ty) = self.blockOf(
+		&block,
+		expected,
+		false,
+	)
+
+	/// A block that is a call's argument, whose value is the argument's: the
+	/// value it answers, having left the block, is lent as a `str` or for the
+	/// call where the argument would be. An interpolated literal is one of
+	/// these. An `&` written as its value is not the argument's, since it
+	/// could point at what the block itself holds.
+	var fn argumentBlock(block: &ast::Block, expected: Option<Ty>): (Block, Ty) = self.blockOf(
+		&block,
+		expected,
+		true,
+	)
+
+	var fn blockOf(block: &ast::Block, expected: Option<Ty>, argument: bool): (Block, Ty) = {
+		val file = self.ast
+		self.state.scopes.push(Map())
+		var stmts: Vec<StmtId> = Vec()
+		var value: Option<ExprId> = .None
+		var diverges = false
+		val count = block.stmts.len()
+		for (i, stmt) in block.stmts.forwards().enumerate() {
+			// An `if` without `else` has no value: where one is expected, it is
+			// a statement and the block falls off its end.
+			if i + 1 == count &&
+				expected != .Some(UNIT) &&
+				file.stmts[stmt].kind is .Expr(e) &&
+				!(expected.isSome() && lacksElse(&file, e)) {
+				val v = match expected {
+					// A block that is an argument answers its value as it is:
+					// what the argument is lent as is the call's to say, of the
+					// value the block answers, which has left the block.
+					.Some(t) if argument => self.infer(e, .Some(t))
+					.Some(t) => self.check(e, t)
+					.None => self.infer(e, .None)
+				}
+				if self.tyOf(v) == NEVER then diverges = true
+				value = .Some(v)
+				break
+			}
+			// A statement that starts with `-` may be meant to continue the
+			// expression above it, which the warning says.
+			val nextNeg =
+				if file.stmts[stmt].kind is .Expr(..) && i + 1 < count then
+					leadingNeg(&file, block.stmts[i + 1])
+				else .None
+			val (id, d) = self.stmt(stmt, nextNeg)
+			stmts.push(id)
+			if d then diverges = true
+		}
+		self.state.scopes.pop()
+		val ty = if diverges {
+			NEVER
+		} else {
+			match value {
+				// The value was checked against `expected`, and any mismatch
+				// reported there; an argument's is checked by the call.
+				.Some(v) if argument => self.tyOf(v)
+				.Some(v) => match expected {
+					.Some(t) => t
+					.None => self.tyOf(v)
+				}
+				.None => UNIT
+			}
+		}
+		return (Block(stmts: move stmts, value: value, span: block.span), ty)
+	}
+
+	/// An expression statement, whose value is not used. `if`, `match` and
+	/// blocks are checked with `()` expected, so the values of their branches
+	/// are discarded too. `nextNeg` is where the statement after it starts
+	/// with `-`, which the warning for a pointless value mentions.
+	var fn discarded(e: ast::ExprId, nextNeg: Option<Span>): ExprId = {
+		val blockLike = self.ast.exprs[e].kind is .Block(..) | .If(..) | .Match(..)
+		val id = self.infer(e, if blockLike then .Some(UNIT) else .None)
+		self.warnIfPointless(id, nextNeg)
+		return id
+	}
+
+	/// Discards the value of `id` where `()` is expected.
+	var fn discard(id: ExprId): ExprId = {
+		val ty = self.tyOf(id)
+		if ty == UNIT || self.isPoisoned(ty) then return id
+		self.warnIfPointless(id, .None)
+		return self.wrapDiscarded(id)
+	}
+
+	/// A block of type `()` whose one statement evaluates `id` and drops its
+	/// value.
+	var fn wrapDiscarded(id: ExprId): ExprId = {
+		val span = self.state.body.exprs[id].span
+		val stmt = self.state.body.stmts.add(Stmt(kind: .Expr(id), span: span))
+		val block = Block(stmts: Vec::of(own [stmt]), value: .None, span: span)
+		return self.alloc(.Block(move block), UNIT, span)
+	}
+
+	/// A value computed without side effects and never used. Warns about a
+	/// discarded value that has no effect. `nextNeg` is the `-` starting the
+	/// next statement, if there is one.
+	var fn warnIfPointless(id: ExprId, nextNeg: Option<Span>) = {
+		val ty = self.tyOf(id)
+		if ty == UNIT || self.isPoisoned(ty) || self.hasEffect(id) then return
+		val span = self.state.body.exprs[id].span
+		val negated = self.state.body.exprs[id].kind is .Unary(op: .Neg, ..)
+		var diagnostic = Diagnostic::warning(DISCARDED_VALUE, "this value is computed and never used", span, "a value of type \(self.tyName(ty))")
+		if nextNeg is .Some(neg) then
+			diagnostic = diagnostic.withSecondary(neg, "this `-` starts a new statement").
+				withNote(
+					"a line break ends a complete expression, so a line that starts with `-` is a new statement",
+				).
+				withHelp("to subtract, move `-` to the end of the previous line")
+		else if negated then
+			diagnostic = diagnostic.withNote(
+				"a line break ends a complete expression, so a line that starts with `-` is a new statement",
+			).withHelp("to continue the previous line, move `-` to its end")
+		self.report(move diagnostic)
+	}
+
+	/// Whether evaluating `id` does anything besides producing its value: a
+	/// call, an assignment, a move, an allocation, or any statement.
+	fn hasEffect(id: ExprId): bool = {
+		val kind = &self.state.body.exprs[id].kind
+		if kind is .Call(..) | .CallClosure(..) | .DynCall(..) | .CallValue(..) | .Assign(..)
+		| .Move(..) | .Own(..) | .OwnRepeat(..) | .Match(..) | .Lend(..) | .Panic(..) | .Error {
+			return true
+		}
+		// Everything else does what the expressions inside it do. A block runs
+		// its statements whether or not its value is used, and the same goes
+		// for the branches of an `if`.
+		for child in kind.children() {
+			if self.hasEffect(child) then return true
+		}
+		for b in kind.blocks() {
+			if !b.stmts.isEmpty() then return true
+			if b.value is .Some(v) && self.hasEffect(v) then return true
+		}
+		return false
+	}
+
+	/// A statement, and whether it never finishes. `nextNeg` is what an
+	/// expression statement passes to `discarded`.
+	var fn stmt(id: ast::StmtId, nextNeg: Option<Span>): (StmtId, bool) = {
+		val file = self.ast
+		val stmt = &file.stmts[id]
+		val (kind, diverges) = match stmt.kind {
+			.Yield(value) => (self.yieldStmt(value, stmt.span), false)
+			.Let(mutable, name, ty: written, init) => {
+				val (checkedInit, checkedTy) = self.letValue(mutable, written, init)
+				// A slice read through a reference is kept as the reference;
+				// any other slice stands for elements that belong to the
+				// caller, with nothing of fixed size to copy.
+				val (kept, keptTy) = match self.keptReference(checkedInit) {
+					.Some(reference) => (reference, self.tyOf(reference))
+					.None => (checkedInit, checkedTy)
+				}
+				val ty = if self.kind(keptTy) is .Slice(..) {
+					self.report(
+						Diagnostic::error(UNSIZED_SLICE, "a slice cannot be stored in a variable", self.state.body.exprs[kept].span, "has type \(self.tyName(keptTy))").withNote(
+							"a slice is a view of elements that belong to someone else, so it exists only as a `&` or `&var` argument",
+						).withHelp("use it directly, or pass it on with `&`"),
+					)
+					ERROR
+				} else {
+					keptTy
+				}
+				val localKind: LocalKind =
+					if mutable then .Var else .Let(Span::new(stmt.span.lo, stmt.span.lo + 3))
+				val local = self.declare(name.sym, ty, localKind, name.span)
+				(.Let(local: local, init: kept), ty == NEVER)
+			}
+			.Defer(e) => {
+				val keyword = Span::new(stmt.span.lo, stmt.span.lo + 5)
+				self.state.defers.push((keyword, self.state.loops.len()))
+				val checked = self.discarded(e, .None)
+				self.state.defers.pop()
+				(.Defer(checked), false)
+			}
+			.Return(value) => {
+				if !self.state.defers.isEmpty() {
+					val keyword = self.state.defers[self.state.defers.len() - 1].0
+					self.report(
+						Diagnostic::error(
+							RETURN_IN_DEFER,
+							"cannot `return` from a deferred expression",
+							stmt.span,
+							"would leave the function in the middle of its cleanup",
+						).withSecondary(keyword, "inside this `defer`").withNote(
+							"a `defer` runs while its block exits: it cannot replace the result or skip the cleanup after it",
+						),
+					)
+				}
+				// A loop that is a generator has no function to leave.
+				self.returnInGenerator(stmt.span)
+				(.Return(self.returnValue(value, stmt.span)), true)
+			}
+			.Guard(mutable, pattern, value, elseBlock) => (
+				self.guard(mutable, &pattern, value, elseBlock.asRef()),
+				false,
+			)
+			.While(label, cond, body) => {
+				val forever = file.exprs[cond].kind is .Bool(true)
+				self.state.scopes.push(Map())
+				val checkedCond = self.bindingCondition(cond)
+				self.pushLoop(label.asRef())
+				val (checkedBody, _) = self.checkBlock(&body, .Some(UNIT))
+				val (_, breaks) = self.state.loops.pop().unwrap()
+				self.state.scopes.pop()
+				// `while true` with no `break` never finishes normally.
+				(.While(cond: checkedCond, body: move checkedBody), forever && !breaks)
+			}
+			.For(label, binding, source, body) => (
+				self.forStmt(label.asRef(), &binding, source, &body),
+				false,
+			)
+			.Break(label) => (self.loopJump(label, true, stmt.span), true)
+			.Continue(label) => (self.loopJump(label, false, stmt.span), true)
+			.Expr(e) => {
+				val checked = self.discarded(e, nextNeg)
+				(.Expr(checked), self.state.body.exprs[checked].ty == NEVER)
+			}
+		}
+		return (self.state.body.stmts.add(Stmt(kind: move kind, span: stmt.span)), diverges)
+	}
+
+	/// The value of a `val` or a `var`, and the variable's type.
+	var fn letValue(
+		mutable: bool,
+		written: Option<ast::TypeId>,
+		init: ast::ExprId,
+	): (ExprId, Ty) = {
+		val file = self.ast
+		if written is .Some(t) {
+			var ty = self.resolveTy(t)
+			// A `val` may keep a closure that reads what it captures: `&(…) =>
+			// R`, which a `var` may not. A `&` reference is a view, kept as
+			// one, and a `&var` is a parameter's.
+			val lentClosure = self.kind(ty) is .Ref(inner, ..) && self.kind(inner) is .Fn(..)
+			if (mutable &&
+				lentClosure &&
+				self.noRef(ty, t, "a `var` cannot hold a lent closure", .None)) ||
+				self.noVarRef(ty, t, "a variable") ||
+				self.noNever(ty, t, "a variable") ||
+				self.bareSlice(ty, t, false) {
+				ty = ERROR
+			}
+			val context = (file.types[t].span, "expected because of this type")
+			return (self.checkIn(init, ty, .Some(context)), ty)
+		}
+		// `val f = (x) => …` may keep what it captures.
+		self.state.keepingClosure = !mutable && file.exprs[init].kind is .Lambda(..)
+		// `val r = &place` holds a reference, as `val r: &T = &place` does.
+		self.state.localReference = file.exprs[init].kind is .Unary(op: .Ref, ..)
+		val checked = self.infer(init, .None)
+		self.state.keepingClosure = false
+		self.state.localReference = false
+		var ty = self.state.body.exprs[checked].ty
+		// `val r = if c { 1 }`: an `if` without `else` has no value to give,
+		// which is said here rather than where `r` is first used.
+		if ty == UNIT && file.exprs[init].kind is .If(..) && lacksElse(&file, init) {
+			val inside = file.exprs[init].span
+			val diagnostic = Diagnostic::error(
+				NO_VALUE,
+				"an `if` without `else` has no value",
+				inside,
+				"nothing when the condition does not hold",
+			).withHelp(
+				"give it an `else`, or say that the value may not be there: `if c { .Some(x) } else { .None }`",
+			).withNote("an `if` without `else` is a statement; what may be missing is an `Option`")
+			// That its branch's value goes unused is this error again.
+			self.diagnostics.retain((d) =>
+				d.code != DISCARDED_VALUE ||
+					!(inside.lo <= d.primary.span.lo && d.primary.span.hi <= inside.hi))
+			self.report(move diagnostic)
+			ty = ERROR
+		}
+		return (checked, ty)
+	}
+
+	/// `break` or `continue`, with the loop it leaves.
+	var fn loopJump(label: Option<ast::Name>, isBreak: bool, span: Span): StmtKind = {
+		val word = if isBreak then "break" else "continue"
+		// Which loop it leaves: the innermost, or the one whose name it
+		// wrote. Outside a loop there is no name to look for; that is reported
+		// below.
+		val depth: Option<u32> = match label {
+			.Some(label) if !self.state.loops.isEmpty() => self.loopNamed(label, word)
+			.Some(_) => .None
+			.None => .Some(0)
+		}
+		val skip = 1 + depth.unwrapOr(0) as i64
+		val target = if self.state.loops.len() > skip then self.state.loops.len() - skip else 0
+		if self.state.loops.isEmpty() {
+			self.report(
+				Diagnostic::error(
+					LOOP_JUMP_OUTSIDE,
+					"`\(word)` outside a loop",
+					span,
+					"not inside `while` or `for`",
+				).withNote(
+					"`break` leaves the innermost loop, and `continue` starts its next pass",
+				),
+			)
+		} else if !self.state.defers.isEmpty() &&
+			self.state.defers[self.state.defers.len() - 1].1 > target {
+			val keyword = self.state.defers[self.state.defers.len() - 1].0
+			self.report(
+				Diagnostic::error(
+					JUMP_IN_DEFER,
+					"cannot `\(word)` from a deferred expression",
+					span,
+					"would leave the loop in the middle of a block's cleanup",
+				).withSecondary(keyword, "inside this `defer`").withNote(
+					"a `defer` runs while its block exits, and cannot jump elsewhere; a loop written inside the deferred expression may use `break` and `continue`",
+				),
+			)
+		} else if isBreak {
+			self.state.loops[target].1 = true
+		}
+		val d = depth.unwrapOr(0)
+		return if isBreak then .Break(d) else .Continue(d)
+	}
+
+	/// What one element of the slice a container lends is, where it lends
+	/// one kind: what `itemsOf` finds, without the call, for inference and
+	/// for an argument lent as its elements. Nothing for a type that lends
+	/// none.
+	fn itemsElement(ty: Ty): Option<Ty> = {
+		val interfaceId = self.program.preludeItems.interfaceOf(.Items)?
+		if self.kind(ty) is .Param(param) {
+			if param.index as i64 >= self.typeParams.len() then return .None
+			for c in self.typeParams[param.index as i64].interfaces {
+				if c.interfaceId == interfaceId {
+					val args = self.program.types.list(c.args)
+					return if args.isEmpty() then .None else .Some(args[0])
+				}
+			}
+			return .None
+		}
+		val owner = self.ownerOf(ty)?
+		var found: Option<FnId> = .None
+		for i in self.program.impls {
+			if i.interfaceId == interfaceId && i.ty == owner {
+				if i.methods.isEmpty() then return .None
+				found = .Some(i.methods[0])
+				break
+			}
+		}
+		val items = found?
+		val args: Vec<Ty> = match self.kind(ty) {
+			.Struct(args, ..) | .Enum(args, ..) => self.program.types.list(args).toVec()
+			_ => Vec()
+		}
+		// The element alone is substituted: the slice of it may be a type
+		// nothing has made yet, which a lookup cannot find.
+		val .Ref(inner: slice, ..) = self.kind(self.program.fns[items].ret) else {
+			return .None
+		}
+		val .Slice(elem) = self.kind(slice) else {
+			return .None
+		}
+		return self.program.types.trySubstFind(elem, &args)
+	}
+
+	/// The elements a container lends, as the slice `for` walks, and what
+	/// one of them is. A type is walked through its implementation of the
+	/// prelude's `Items`, which is a projection, so what the loop visits
+	/// belongs to the container.
+	var fn itemsOf(receiver: ExprId, ty: Ty): Walked = {
+		val .Some(interfaceId) = self.program.preludeItems.interfaceOf(.Items) else {
+			return .No
+		}
+		// A type parameter lends its elements because a constraint says so,
+		// and the call goes through the interface's own method, which its
+		// instance replaces.
+		var items: FnId = self.program.interfaces[interfaceId].methods[0].id
+		var args: Vec<Ty> = Vec()
+		if self.kind(ty) is .Param(param) {
+			var found: Option<Ty> = .None
+			if (param.index as i64) < self.typeParams.len() {
+				for c in self.typeParams[param.index as i64].interfaces {
+					if found.isNone() && c.interfaceId == interfaceId {
+						val list = self.program.types.list(c.args)
+						if list.isEmpty() then break
+						found = .Some(list[0])
+					}
+				}
+			}
+			val .Some(elem) = found else {
+				return .No
+			}
+			args = Vec::of(own [ty, elem])
+		} else {
+			val .Some(owner) = self.ownerOf(ty) else {
+				return .No
+			}
+			// Its element is what its implementation decides, and it has one.
+			var method: Option<FnId> = .None
+			for i in self.program.impls {
+				if i.interfaceId == interfaceId && i.ty == owner {
+					if !i.methods.isEmpty() then method = .Some(i.methods[0])
+					break
+				}
+			}
+			val .Some(m) = method else {
+				return .No
+			}
+			items = m
+			// A method of a generic container is generic in the container's own
+			// parameters.
+			args = match self.kind(ty) {
+				.Struct(args: a, ..) | .Enum(args: a, ..) => self.program.types.list(a).toVec()
+				_ => Vec()
+			}
+		}
+		val typeArgs = self.program.types.internList(&args)
+		val ret = self.program.types.subst(self.program.fns[items].ret, &args)
+		val .Ref(inner: slice, ..) = self.kind(ret) else {
+			return .No
+		}
+		val .Slice(elem) = self.kind(slice) else {
+			return .No
+		}
+		val span = self.state.body.exprs[receiver].span
+		// The container is lent for the call, as `c.items()` lends it.
+		val borrowed = self.intern(.Ref(inner: ty, kind: .Shared))
+		val lent = self.alloc(.Ref(receiver), borrowed, span)
+		val call = self.alloc(
+			.Call(
+				callee: items,
+				args: Vec::of(own [lent]),
+				typeArgs: typeArgs,
+				order: Vec::of(own [0]),
+			),
+			ret,
+			span,
+		)
+		// A projection's call is a place.
+		return .Items(items: self.alloc(.Deref(call), slice, span), elem: elem)
+	}
+
+	/// `for` over elements or a range.
+	var fn forStmt(
+		label: Option<&ast::Name>,
+		binding: &ast::Pattern,
+		source: ast::ForSource,
+		body: &ast::Block,
+	): StmtKind = match source {
+		.Elements(elements) => {
+			// `for x in move c`: `c` gives up its elements, and each is the
+			// loop's to keep; what a loop that stops early leaves is dropped
+			// with the iterator that holds it.
+			if self.ast.exprs[elements].kind is .Unary(op: .Move, ..) then
+				self.forMoved(label, &binding, elements, &body)
+			else self.forLent(label, &binding, elements, &body)
+		}
+		.Range(lo, hi, inclusive) => self.forRange(label, &binding, lo, hi, inclusive, &body)
+	}
+
+	/// `for x in move c`.
+	var fn forMoved(
+		label: Option<&ast::Name>,
+		binding: &ast::Pattern,
+		elements: ast::ExprId,
+		body: &ast::Block,
+	): StmtKind = {
+		val moved = self.operand(elements, .None)
+		val ty = self.tyOf(moved)
+		if self.givenUpIterator(moved) is .Some((taken, next)) then
+			return self.walkIterator(label, &binding, taken, next, &body)
+		// An iterator moved into the loop is walked as it is.
+		if self.iteratorOf(ty) is .Some(next) then
+			return self.walkIterator(label, &binding, moved, next, &body)
+		if !self.isPoisoned(ty) {
+			val span = self.ast.exprs[elements].span
+			self.report(
+				Diagnostic::error(
+					NOT_ITERABLE,
+					"\(self.tyName(ty)) does not give up its elements",
+					span,
+					"`move` takes each element",
+				).withHelp(
+					"walk it without `move`, and each element is lent to the loop: `for x in c`",
+				).withNote(
+					"`for x in move c` walks `c.intoIterator()`, which a `Vec`, a `Deque`, a `Set` and a `Map` answer, and a type of your own by `extend …: IntoIterator<I>`",
+				),
+			)
+		}
+		self.state.scopes.push(Map())
+		val pattern = self.elementPattern(&binding, ERROR, .None, .Shared, .None)
+		val checkedBody = self.loopBody(label, &body)
+		self.state.scopes.pop()
+		return .ForElements(binding: move pattern, elements: moved, body: move checkedBody)
+	}
+
+	/// `for x in c`: each element lent to the loop.
+	var fn forLent(
+		label: Option<&ast::Name>,
+		binding: &ast::Pattern,
+		elements: ast::ExprId,
+		body: &ast::Block,
+	): StmtKind = {
+		// A range of elements is lent to the loop for as long as it runs, as
+		// a container lends its slice: `for x in xs[1..n]` walks part of it.
+		val inferred = self.inferBorrowed(elements, .None)
+		var e = self.autoderef(inferred)
+		val ty = self.tyOf(e)
+		// A temporary is the loop's already, as it is moved where it is used:
+		// one that gives up its elements does.
+		if !self.state.body.isPlace(e) && self.givenUpIterator(e) is .Some((taken, next)) then
+			return self.walkIterator(label, &binding, taken, next, &body)
+		var elem: Option<Ty> = .None
+		match self.kind(ty) {
+			.Array(elem: t, ..) | .Slice(elem: t) => elem = .Some(t)
+			_ if self.isPoisoned(ty) => {}
+			// A container is walked through the elements it lends.
+			_ => match self.itemsOf(e, ty) {
+				.Items(items, elem: t) => {
+					// A container that can be written lends its elements for
+					// writing, as an array in a `var` does: the writing half of
+					// the pair, where it has one.
+					if self.state.body.exprs[items].kind is .Deref(call) &&
+						self.writable(e) &&
+						self.swapInWriter(call) {
+						val callTy = self.tyOf(call)
+						if self.kind(callTy) is .Ref(inner: slice, ..) then
+							self.state.body.exprs[items].ty = slice
+					}
+					e = items
+					elem = .Some(t)
+				}
+				.No => {
+					// What lends no slice may lend its elements one place at a
+					// time …
+					if self.sequenceOf(ty) is .Some(sequence) then
+						return self.walkSequence(label, &binding, e, sequence, &body)
+					// … or hand them out one at a time.
+					if self.iteratorOf(ty) is .Some(next) then
+						return self.walkIterator(label, &binding, e, next, &body)
+					self.report(
+						Diagnostic::error(
+							NOT_ITERABLE,
+							"cannot iterate over \(self.tyName(ty))",
+							self.state.body.exprs[e].span,
+							"not an array, a slice or a buffer",
+						).withHelp("to count, walk a range: `for i in 0..n`").withNote(
+							"a type of your own is walked when it lends its elements, `extend Deck: Items<Card>`, lends them one place at a time, `extend Ring: Sequence<Card>`, or hands them out one at a time, `extend Words: Iterator<str>`, which a generator writes for it: `fn words(): Iterator<str> = { … yield … }`",
+						),
+					)
+				}
+			}
+		}
+		// The binding refers to each element, and can write it when the
+		// elements can be written.
+		val kind: RefKind = if self.writable(e) then .Var else .Shared
+		self.state.scopes.push(Map())
+		// The binding refers to the element, so it is checked against a
+		// reference to it, as a `match` binding of a place is.
+		val elementTy = match elem {
+			.Some(t) => self.intern(.Ref(inner: t, kind: kind))
+			.None => ERROR
+		}
+		val pattern = self.elementPattern(&binding, elementTy, elem, kind, .Some(e))
+		val checkedBody = self.loopBody(label, &body)
+		self.state.scopes.pop()
+		return .ForElements(binding: move pattern, elements: e, body: move checkedBody)
+	}
+
+	/// `for i in lo..hi`.
+	var fn forRange(
+		label: Option<&ast::Name>,
+		binding: &ast::Pattern,
+		lo: ast::ExprId,
+		hi: ast::ExprId,
+		inclusive: bool,
+		body: &ast::Block,
+	): StmtKind = {
+		// A literal bound takes the other bound's type, as a literal operand
+		// does.
+		val (low, high) = if self.numberLiteral(lo) {
+			val h = self.operand(hi, .None)
+			(self.operand(lo, .Some(self.tyOf(h))), h)
+		} else {
+			val l = self.operand(lo, .None)
+			(l, self.operand(hi, .Some(self.tyOf(l))))
+		}
+		val loTy = self.tyOf(low)
+		val hiTy = self.tyOf(high)
+		val ty = if self.isPoisoned(loTy) || self.isPoisoned(hiTy) {
+			ERROR
+		} else if loTy == hiTy && self.program.types.isInteger(loTy) {
+			loTy
+		} else {
+			val span = self.state.body.exprs[low].span.to(self.state.body.exprs[high].span)
+			self.report(
+				Diagnostic::error(INVALID_OPERANDS, "a range counts with integers of one type", span, "from \(self.tyName(loTy)) to \(self.tyName(hiTy))"),
+			)
+			ERROR
+		}
+		self.state.scopes.push(Map())
+		val local: Option<LocalId> = match binding.kind {
+			.Binding(symbol) => .Some(self.declare(symbol, ty, .Binding, binding.span))
+			.Wildcard | .Error => .None
+			_ => {
+				self.report(
+					Diagnostic::error(
+						INVALID_PATTERN,
+						"a range counts with numbers, which have no fields",
+						binding.span,
+						"not a name",
+					).withHelp("write a name, or `_`"),
+				)
+				Option::None
+			}
+		}
+		val checkedBody = self.loopBody(label, &body)
+		self.state.scopes.pop()
+		return .ForRange(
+			binding: local,
+			lo: low,
+			hi: high,
+			inclusive: inclusive,
+			body: move checkedBody,
+		)
+	}
+
+	/// A loop's body, inside the loop for `break` and `continue`.
+	var fn loopBody(label: Option<&ast::Name>, body: &ast::Block): Block = {
+		val (checked, _) = self.typedLoopBody(label, &body)
+		return move checked
+	}
+
+	/// A loop's body and its type: `never` where every path through it
+	/// leaves, by `return`, `break` or `continue`, as for any block. A loop
+	/// written as a `match` on each element holds its body as an arm, and an
+	/// arm that leaves leaves nothing for what follows the `match`.
+	var fn typedLoopBody(label: Option<&ast::Name>, body: &ast::Block): (Block, Ty) = {
+		self.pushLoop(label)
+		val checked = self.checkBlock(&body, .Some(UNIT))
+		self.state.loops.pop()
+		return move checked
+	}
+
+	/// Enters a loop, with the name it was given. A name already in use
+	/// around it is reported: `break` would mean the inner one, and the outer
+	/// one could no longer be named.
+	var fn pushLoop(label: Option<&ast::Name>) = {
+		if label is .Some(label) {
+			var taken = false
+			for (name, _) in self.state.loops {
+				if name == .Some(label.sym) then taken = true
+			}
+			if taken {
+				val text = String::of(self.text(label.sym))
+				self.report(
+					Diagnostic::error(
+						LOOP_JUMP_OUTSIDE,
+						"`\(text)` is the name of a loop around this one",
+						label.span,
+						"a name already in use",
+					).withNote(
+						"a loop's name says which one a `break` leaves, so two around each other cannot share it",
+					),
+				)
+			}
+		}
+		val name: Option<Symbol> = match label {
+			.Some(l) => .Some(l.sym)
+			.None => .None
+		}
+		self.state.loops.push((name, false))
+	}
+
+	/// How many loops out the one with this name is, counted from the
+	/// innermost.
+	var fn loopNamed(label: ast::Name, word: str): Option<u32> = {
+		var depth = 0
+		var i = self.state.loops.len()
+		while i > 0 {
+			i -= 1
+			if self.state.loops[i].0 == .Some(label.sym) then return .Some(depth as u32)
+			depth += 1
+		}
+		val text = String::of(self.text(label.sym))
+		var names: Vec<String> = Vec()
+		for (name, _) in self.state.loops {
+			if name is .Some(n) then names.push("`\(self.text(n))`")
+		}
+		var diagnostic = Diagnostic::error(
+			LOOP_JUMP_OUTSIDE,
+			"no loop around this one is called `\(text)`",
+			label.span,
+			"unknown loop",
+		).withNote("`\(word) name` leaves the loop of that name, which is written `name: while …` or `name: for …`")
+		if !names.isEmpty() then
+			diagnostic = diagnostic.withHelp("the loops here are \(names.join(", "))")
+		self.report(move diagnostic)
+		return .None
+	}
+
+	var fn returnValue(value: Option<ast::ExprId>, span: Span): Option<ExprId> = {
+		// A lambda whose result is not known yet takes the type of what it
+		// first returns.
+		if self.state.inferringRet {
+			self.state.inferringRet = false
+			val .Some(v) = value else {
+				self.state.ret = UNIT
+				return .None
+			}
+			val e = self.infer(v, .None)
+			val ty = self.tyOf(e)
+			self.state.ret = if ty == NEVER then UNIT else ty
+			return .Some(e)
+		}
+		val ret = self.state.ret
+		return match value {
+			.Some(v) if ret == UNIT => {
+				val e = self.infer(v, .None)
+				val ty = self.state.body.exprs[e].ty
+				if ty != UNIT && !self.isPoisoned(ty) then
+					self.report(
+						Diagnostic::error(MISMATCHED_TYPES, "this function returns nothing, but a value is returned", self.state.body.exprs[e].span, "a value of type \(self.tyName(ty))").withHelp("to return it, declare the return type: `: \(self.program.tyName(ty, self.interner))`"),
+					)
+				.Some(e)
+			}
+			.Some(v) => {
+				val context: Option<(Span, str)> = match self.state.retSpan {
+					.Some(s) => .Some((s, "return type declared here"))
+					.None => .None
+				}
+				.Some(self.checkIn(v, ret, context))
+			}
+			.None => {
+				if ret != UNIT && !self.hasError(ret) {
+					var diagnostic = Diagnostic::error(MISMATCHED_TYPES, "missing return value", span, "expected a value of type \(self.tyName(ret))")
+					if self.state.retSpan is .Some(retSpan) then
+						diagnostic = diagnostic.withSecondary(retSpan, "return type declared here")
+					self.report(move diagnostic)
+				}
+				.None
+			}
+		}
+	}
+
+	/// `assert(condition)` and `assert(condition, note)`: the condition
+	/// holds, or the program prints the note and the message the lexer made
+	/// and ends. It is `if !condition { panic(message) }`, so nothing below
+	/// the checker needs to know of it.
+	var fn assertion(
+		cond: ast::ExprId,
+		note: Option<ast::ExprId>,
+		message: Option<Symbol>,
+		span: Span,
+	): ExprId = {
+		// An `is` test binds nothing here: there is no block for a binding to
+		// live in, since a failure ends the program.
+		val condition = self.condition(cond)
+		// A note written as one string is in the message the lexer made; any
+		// other is built when the assert fails, before it.
+		var built: Option<ExprId> = .None
+		if note is .Some(n) &&
+			self.messageText(n, ASSERT_NOTE, "an assert's note") is .Some(value) {
+			if !(self.state.body.exprs[value].kind is .Str(..)) then built = .Some(value)
+		}
+		val .Some(text) = message else {
+			return self.errorExpr(span)
+		}
+		val negated = self.alloc(.Unary(op: .Not, operand: condition), BOOL, span)
+		val panicked = self.alloc(.Panic(note: built, message: .Some(text)), NEVER, span)
+		val thenBlock = Block(stmts: Vec(), value: .Some(panicked), span: span)
+		return self.alloc(
+			.If(cond: negated, thenBlock: move thenBlock, elseBlock: .None),
+			UNIT,
+			span,
+		)
+	}
+
+	var fn ifExpr(
+		cond: ast::ExprId,
+		thenBlock: &ast::Block,
+		elseBranch: Option<ast::ExprId>,
+		hint: Option<Ty>,
+		span: Span,
+	): ExprId = {
+		// The bindings of `is` tests in the condition are in scope in the
+		// `then` block only.
+		self.state.scopes.push(Map())
+		val condition = self.bindingCondition(cond)
+		val .Some(elseAt) = elseBranch else {
+			// Without `else` there is no value: the branch's is discarded.
+			// Where a value is expected, the branch is checked against its type
+			// instead, so that the missing `else` is the only error.
+			val wanted: Option<Ty> = match hint {
+				.Some(t) if t != UNIT && !self.isPoisoned(t) => .Some(t)
+				_ => .Some(UNIT)
+			}
+			val (checked, _) = self.checkBlock(&thenBlock, wanted)
+			self.state.scopes.pop()
+			return self.alloc(
+				.If(cond: condition, thenBlock: move checked, elseBlock: .None),
+				UNIT,
+				span,
+			)
+		}
+		val (checkedThen, thenTy) = self.checkBlock(&thenBlock, hint)
+		self.state.scopes.pop()
+		// Without an expected type, the `then` branch sets the type of the
+		// `else` branch.
+		val expected: Option<Ty> = match hint {
+			.Some(t) => .Some(t)
+			.None => if thenTy != NEVER then .Some(thenTy) else .None
+		}
+		val (checkedElse, elseTy) = self.elseBlock(elseAt, expected)
+		val ty = if thenTy == NEVER && elseTy == NEVER {
+			NEVER
+		} else {
+			match expected {
+				.Some(t) => t
+				.None => elseTy
+			}
+		}
+		return self.alloc(
+			.If(cond: condition, thenBlock: move checkedThen, elseBlock: .Some(move checkedElse)),
+			ty,
+			span,
+		)
+	}
+
+	/// The `else` branch: a block, or an `else if` held as a block's value.
+	var fn elseBlock(elseBranch: ast::ExprId, expected: Option<Ty>): (Block, Ty) = {
+		val file = self.ast
+		val expr = &file.exprs[elseBranch]
+		if expr.kind is .Block(block) then return self.checkBlock(&block, expected)
+		val value = match expected {
+			.Some(t) => self.check(elseBranch, t)
+			.None => self.infer(elseBranch, .None)
+		}
+		val ty = self.tyOf(value)
+		return (Block(stmts: Vec(), value: .Some(value), span: expr.span), ty)
+	}
+}

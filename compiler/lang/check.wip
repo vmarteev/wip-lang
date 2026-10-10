@@ -1,0 +1,169 @@
+// Parsing and checking a file or a loaded program: every phase before code
+// is generated.
+
+import std::fs
+import std::time::{Instant}
+import analysis
+import mir
+import hir::{ModuleAst, Program, instantiate, lower}
+import syntax::{Ast, Diagnostic, Interner, Span, lexAt, parseAt}
+
+/// A file's name, as the command line gave it, and its text.
+pub struct SourceFile {
+	pub name: String
+	pub text: String
+}
+
+extend SourceFile {
+	pub static fn read(path: str): Result<SourceFile, String> = {
+		val text = match fs::readFile(path) {
+			.Ok(text) => move text
+			.Err(error) => return .Err("cannot read `\(path)`: \(error)")
+		}
+		if !text.isValidUtf8() then
+			return .Err("cannot read `\(path)`: stream did not contain valid UTF-8")
+		// Spans are u32 byte offsets.
+		if text.len() > 0xFFFF_FFFF then return .Err("`\(path)` is larger than 4 GiB")
+		return .Ok(SourceFile(name: String::of(path), text: move text))
+	}
+}
+
+pub struct ParsedFile {
+	pub ast: Ast
+	pub interner: Interner
+	/// Lexer and parser diagnostics together, in source order.
+	pub diagnostics: Vec<Diagnostic>
+}
+
+pub fn parseFile(file: &SourceFile): ParsedFile = {
+	var interner = Interner::new()
+	val lexed = lexAt(file.text.toStr(), 0, &var interner)
+	val parsed = parseAt(file.text.toStr(), 0, &lexed)
+	var diagnostics: Vec<Diagnostic> = Vec()
+	for diagnostic in lexed.diagnostics {
+		diagnostics.push(diagnostic.clone())
+	}
+	for diagnostic in parsed.diagnostics {
+		diagnostics.push(diagnostic.clone())
+	}
+	diagnostics.sortByKey((diagnostic) => diagnostic.primary.span.lo)
+	return ParsedFile(ast: move parsed.ast, interner: move interner, diagnostics: move diagnostics)
+}
+
+/// A checked program: every module, and everything the phases reported.
+pub struct Checked {
+	pub program: Program
+	pub diagnostics: Vec<Diagnostic>
+}
+
+/// Checks a loaded program's types and moves, and works out the constants that
+/// are run, whose strings the interner takes.
+pub fn checkLoaded(loaded: &var Loaded, timings: &var Timings): Checked = {
+	val checked = checkTypes(&loaded, &var timings)
+	var program = move checked.program
+	var diagnostics = move checked.diagnostics
+	if !anyError(&diagnostics) {
+		// What each generator keeps between calls, now that every one is
+		// known.
+		mir::generatorFrames(&var program, &loaded.interner)
+		val sources = &loaded.sources
+		val started = Instant::now()
+		val evaluated = mir::evaluateConstants(&var program, &var loaded.interner, (
+			span,
+		) => sources.locate(span))
+		timings.record("constants", started)
+		for d in move evaluated {
+			diagnostics.push(move d)
+		}
+	}
+	diagnostics.sortByKey((d) => d.primary.span.lo)
+	return Checked(program: move program, diagnostics: move diagnostics)
+}
+
+/// What the checker makes of a loaded program: its types checked, its moves
+/// and borrows, and the instances of its generic functions made, before
+/// anything of it is run.
+/// What `wip check --dump-hir` writes.
+pub fn checkTypes(loaded: &Loaded, timings: &var Timings): Checked = {
+	var modules: Vec<ModuleAst> = Vec()
+	for module in loaded.modules {
+		modules.push(module.syntax())
+	}
+	var started = Instant::now()
+	val lowered = lower(&modules, &loaded.interner, loaded.threads)
+	timings.record("type check", started)
+	// A type error inside an item that also has a syntax error is almost
+	// always a consequence of the recovery, not a separate mistake.
+	var broken: Vec<Span> = Vec()
+	for module in loaded.modules {
+		for file in module.files {
+			for item in itemSpans(&file.ast) {
+				for d in loaded.diagnostics {
+					if d.isError() && inside(item, d.primary.span.lo) {
+						broken.push(item)
+						break
+					}
+				}
+			}
+		}
+	}
+	var diagnostics = loaded.diagnostics.clone()
+	for d in lowered.diagnostics {
+		var dropped = false
+		for item in broken {
+			if inside(item, d.primary.span.lo) then dropped = true
+		}
+		if !dropped then diagnostics.push(d.clone())
+	}
+	var program = move lowered.program
+	if !anyError(&diagnostics) {
+		started = Instant::now()
+		val analysed = analysis::check(&program, &loaded.interner, loaded.threads)
+		timings.record("move check", started)
+		for d in move analysed {
+			diagnostics.push(move d)
+		}
+	}
+	// Instances of generic functions, once they are known to be correct.
+	if !anyError(&diagnostics) {
+		started = Instant::now()
+		val instances = instantiate(&var program, &loaded.interner)
+		timings.record("instances", started)
+		for d in move instances {
+			diagnostics.push(move d)
+		}
+	}
+	diagnostics.sortByKey((d) => d.primary.span.lo)
+	return Checked(program: move program, diagnostics: move diagnostics)
+}
+
+fn inside(span: Span, pos: u32): bool = span.lo <= pos && pos <= span.hi
+
+fn anyError(diagnostics: &[Diagnostic]): bool = {
+	for d in diagnostics {
+		if d.isError() then return true
+	}
+	return false
+}
+
+/// Where each item of a file is.
+fn itemSpans(file: &Ast): Vec<Span> = {
+	var spans: Vec<Span> = Vec()
+	for item in file.items {
+		spans.push(
+			match item {
+				.Struct(s) => s.span
+				.Enum(e) => e.span
+				.Fn(f) => f.span
+				.Val(v) => v.span
+				.Assert(a) => a.span
+				.Extern(e) => e.span
+				.Import(i) => i.span
+				.Extend(b) => b.span
+				.Interface(i) => i.span
+				.Type(t) => t.span
+			},
+		)
+	}
+	return move spans
+}

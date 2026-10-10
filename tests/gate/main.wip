@@ -1,0 +1,173 @@
+// The gate's checks of the `wip` command, each running it as a reader
+// would: building, running and checking programs, and comparing what it
+// says with what it said before. It is given the `wip` to check, which it
+// checks the same whichever compiler it is, and runs every check, or those
+// it is given, or every one but those `--except` names; `--only` keeps the
+// items whose name holds a text. It runs from the repository's root.
+//
+//     wip run tests/gate/main.wip target/stages/2/bin/wip cases --only 185
+//
+// Where a snapshot differs from what a check found, what was found is
+// written beside it, which `scripts/snapshots.sh` keeps; `--read-only`
+// writes nothing, for a second run beside the first that would write the
+// same files.
+
+import std::args::{ArgumentError, Arguments}
+import std::fs
+import std::io
+import abi
+import bindgen
+import bitcode
+import cases
+import compiler
+import debugger
+import driver
+import examples
+import library
+import lsp
+import packages
+import reference
+import check::{Checked, Gate, Work}
+
+val USAGE = """
+	usage: tests/gate <wip> [check...] [--except check] [--only text] [--read-only]
+
+	Checks the `wip` it is given: every check, or those named.
+
+	  cases            the language's own cases, tests/cases
+	  reference        every example in docs/language and the README
+	  examples         the programs in examples/: checked, tested, a few run
+	  library          the standard library's tests, and its every target
+	  abi              calls across the C boundary, checked against C
+	  packages         packages that depend on each other, and how they say
+	                   they are laid out
+	  driver           the wip command as people type it
+	  debugger         what a debugger is told of a program, and shows
+	  bindgen          wip bindgen: its tests, what it writes, its command line
+	  bitcode          each case's bitcode, read by clang to its text's module
+	  lsp              wip lsp, as an editor sees it
+	  compiler         the compiler's own tests, compiler/
+	  --except check   every check but this one; given again for each
+	  --only text      only the items whose name holds the text
+	  --read-only      write nothing beside a snapshot that differs
+	  -h, --help       print this
+	"""
+
+/// Every check, by the name it is asked for by.
+val CHECKS = [
+	"cases",
+	"reference",
+	"examples",
+	"library",
+	"abi",
+	"packages",
+	"driver",
+	"debugger",
+	"bindgen",
+	"bitcode",
+	"lsp",
+	"compiler",
+]
+
+/// What the command line asked for.
+struct Asked {
+	wip: String = String()
+	checks: Vec<String> = Vec()
+	except: Vec<String> = Vec()
+	only: String = String()
+	readOnly: bool = false
+}
+
+fn asked(args: &[cstring]): Result<Option<Asked>, ArgumentError> = {
+	var asked = Asked()
+	var arguments = Arguments::of(&args)
+	while arguments.next()? is .Some(argument) {
+		match argument {
+			.Long("only") => asked.only = arguments.value()?
+			.Long("except") => {
+				val name = arguments.value()?
+				if !CHECKS.contains(&name) then
+					return .Err(.UnexpectedArgument(text: String::of(name)))
+				asked.except.push(String::of(name))
+			}
+			.Long("read-only") => asked.readOnly = true
+			.Short('h') | .Long("help") => return .Ok(.None)
+			.Positional(text) if asked.wip.isEmpty() => asked.wip = text
+			.Positional(text) if CHECKS.contains(&text) => asked.checks.push(text)
+			_ => return .Err(argument.unexpected())
+		}
+	}
+	return .Ok(.Some(move asked))
+}
+
+fn main(args: &[cstring]): i64 = {
+	var asked = match asked(&args) {
+		.Ok(.Some(asked)) => move asked
+		.Ok(.None) => {
+			io::println(USAGE)
+			return 0
+		}
+		.Err(error) => {
+			io::eprintln("error: \(error)")
+			io::eprintln(USAGE)
+			return 2
+		}
+	}
+	if asked.wip.isEmpty() {
+		io::eprintln(USAGE)
+		return 2
+	}
+	if asked.checks.isEmpty() {
+		for name in CHECKS {
+			if !asked.except.contains(String::of(name)) then asked.checks.push(name)
+		}
+	}
+	if !fs::exists("tests/cases") {
+		io::eprintln("error: the gate runs from the repository's root")
+		return 2
+	}
+	val wip = match fs::realPath(asked.wip.toStr()) {
+		.Ok(path) => move path
+		.Err(error) => {
+			io::eprintln("error: `\(asked.wip)`: \(error)")
+			return 2
+		}
+	}
+	val work = match Work::new() {
+		.Ok(work) => move work
+		.Err(message) => {
+			io::eprintln("error: \(message)")
+			return 2
+		}
+	}
+	val gate = Gate::of(move wip, asked.only.clone(), !asked.readOnly, move work)
+
+	var failed = false
+	for name in asked.checks {
+		val checked = match name.toStr() {
+			"cases" => cases::check(&gate)
+			"reference" => reference::check(&gate)
+			"examples" => examples::check(&gate)
+			"library" => library::check(&gate)
+			"abi" => abi::check(&gate)
+			"packages" => packages::check(&gate)
+			"driver" => driver::check(&gate)
+			"debugger" => debugger::check(&gate)
+			"bindgen" => bindgen::check(&gate)
+			"bitcode" => bitcode::check(&gate)
+			"lsp" => lsp::check(&gate)
+			"compiler" => compiler::check(&gate)
+			_ => Checked::of(0, Vec())
+		}
+		if checked.failed.isEmpty() {
+			io::println("\(name): \(checked.count) ok")
+			continue
+		}
+		failed = true
+		io::println("\(name): \(checked.failed.len()) of \(checked.count) FAILED")
+		for why in checked.failed {
+			io::println(why.toStr())
+		}
+	}
+	return if failed then 1 else 0
+}

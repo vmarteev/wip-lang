@@ -1,0 +1,1250 @@
+// The module LLVM is given, as data: what the backend builds, and what its
+// writers write — as LLVM's text, which `--emit llvm-ir` writes, and as
+// LLVM's bitcode, which `clang` is given and `--emit llvm-bc` writes.
+//
+// A module is its constants and globals, what it declares and does not
+// define, its functions, the attribute groups they name, and its metadata.
+// Each global and function is named by its number in the module's table of
+// names, which holds each name as LLVM's text writes it, `@"…"`. A module of
+// a large program holds millions of instructions, so a value is two words
+// and an instruction a few: what is large and rare, a call, a wide integer,
+// an array's type, is behind a pointer.
+//
+// Its metadata is a list of nodes, node `i` being `!i`: the debug
+// information LLVM writes as DWARF, and the tuples the rest of the module
+// names — the module's flags, a branch's weights, what a load may assume.
+
+/// A node of the module's metadata.
+@derive(Eq, Hash, Clone)
+pub enum Node {
+	/// Numbered, and not yet written: a type whose members point back to it.
+	Unfilled
+	/// The program, as one unit of C99, as a debugger reads it.
+	CompileUnit(file: i64, optimized: bool)
+	/// A file, by its path and the directory the compiler ran in.
+	File(filename: String, directory: String)
+	/// The one type every subprogram has: no types said.
+	SubroutineType
+	/// A function, in its file, at its line; `artificial` where the compiler
+	/// wrote it on its own.
+	Subprogram(
+		name: String,
+		file: i64,
+		line: u32,
+		typeNode: i64,
+		artificial: bool,
+		optimized: bool,
+		unit: i64,
+	)
+	/// The scope of a variable, from where it is declared.
+	LexicalBlock(scope: i64, file: i64, line: u32, column: u32)
+	/// A subprogram's code written in another file: spliced from an
+	/// `@inline` function.
+	LexicalBlockFile(scope: i64, file: i64)
+	/// Where an instruction was written.
+	Location(line: u32, column: u32, scope: i64)
+	/// A variable or, with its number from one, a parameter.
+	LocalVariable(name: String, arg: Option<i64>, scope: i64, file: i64, line: u32, typeNode: i64)
+	BasicType(name: String, size: u32, encoding: Encoding)
+	/// A pointer to `base`, or to nothing: C's `void *`.
+	PointerType(base: Option<i64>, size: u32)
+	Typedef(name: String, base: i64)
+	/// A member of the structure `scope`, its size and offset in bits.
+	Member(name: String, scope: i64, base: i64, size: u32, offset: u32)
+	/// A structure or union whose members C alone knows.
+	Declared(tag: DiTag, name: String)
+	/// A structure or union, its size in bits, and the tuple of its members.
+	Structure(tag: DiTag, name: String, size: u32, elements: i64)
+	ArrayType(base: Option<i64>, size: u32, elements: i64)
+	/// An enumeration of names, the type its values are written in, and the
+	/// tuple of its enumerators; named where it is a type of its own.
+	Enumeration(name: Option<String>, base: i64, size: u32, elements: i64)
+	Subrange(count: u64)
+	Enumerator(name: String, value: i64)
+	/// `!{…}`: nodes, numbers and texts.
+	Tuple(items: Vec<MetaItem>)
+}
+
+/// What a structure or union is to DWARF.
+@derive(Eq, Hash, Clone)
+pub enum DiTag {
+	Structure
+	Union
+}
+
+/// How a base type's bits are read.
+@derive(Eq, Hash, Clone)
+pub enum Encoding {
+	Signed
+	Unsigned
+	Float
+	Boolean
+	Utf
+	SignedChar
+	UnsignedChar
+}
+
+/// One item of a tuple.
+@derive(Eq, Hash, Clone)
+pub enum MetaItem {
+	Node(node: i64)
+	Int(bits: u32, value: i64)
+	Text(text: String)
+}
+
+extend DiTag {
+	fn text(): str = match self {
+		.Structure => "DW_TAG_structure_type"
+		.Union => "DW_TAG_union_type"
+	}
+}
+
+extend Encoding {
+	fn text(): str = match self {
+		.Signed => "DW_ATE_signed"
+		.Unsigned => "DW_ATE_unsigned"
+		.Float => "DW_ATE_float"
+		.Boolean => "DW_ATE_boolean"
+		.Utf => "DW_ATE_UTF"
+		.SignedChar => "DW_ATE_signed_char"
+		.UnsignedChar => "DW_ATE_unsigned_char"
+	}
+}
+
+extend Node {
+	/// The node as LLVM's text writes it, after `!i = `.
+	fn text(): String = match self {
+		.Unfilled => String()
+		.CompileUnit(file, optimized) =>
+			"distinct !DICompileUnit(language: DW_LANG_C99, file: !\(file), producer: \"wip\", isOptimized: \(optimized), runtimeVersion: 0, emissionKind: FullDebug)"
+		.File(filename, directory) =>
+			"!DIFile(filename: \"\(escape(filename.toStr()))\", directory: \"\(escape(directory.toStr()))\")"
+		.SubroutineType => String::of("!DISubroutineType(types: !{})")
+		.Subprogram(name, file, line, typeNode, artificial, optimized, unit) => {
+			val flags = if artificial then "flags: DIFlagArtificial, " else ""
+			val spFlags = if optimized then " | DISPFlagOptimized" else ""
+			"distinct !DISubprogram(name: \"\(escape(name.toStr()))\", scope: !\(file), file: !\(file), line: \(line), type: !\(typeNode), scopeLine: \(line), \(flags)spFlags: DISPFlagDefinition\(spFlags), unit: !\(unit))"
+		}
+		.LexicalBlock(scope, file, line, column) =>
+			"distinct !DILexicalBlock(scope: !\(scope), file: !\(file), line: \(line), column: \(column))"
+		.LexicalBlockFile(scope, file) =>
+			"!DILexicalBlockFile(scope: !\(scope), file: !\(file), discriminator: 0)"
+		.Location(line, column, scope) =>
+			"!DILocation(line: \(line), column: \(column), scope: !\(scope))"
+		.LocalVariable(name, arg, scope, file, line, typeNode) => {
+			val argument = match arg {
+				.Some(n) => "arg: \(n), "
+				.None => String()
+			}
+			"!DILocalVariable(name: \"\(escape(name.toStr()))\", \(argument)scope: !\(scope), file: !\(file), line: \(line), type: !\(typeNode))"
+		}
+		.BasicType(name, size, encoding) =>
+			"!DIBasicType(name: \"\(escape(name.toStr()))\", size: \(size), encoding: \(encoding.text()))"
+		.PointerType(base, size) =>
+			"!DIDerivedType(tag: DW_TAG_pointer_type, baseType: \(reference(base.clone())), size: \(size))"
+		.Typedef(name, base) =>
+			"!DIDerivedType(tag: DW_TAG_typedef, name: \"\(escape(name.toStr()))\", baseType: !\(base))"
+		.Member(name, scope, base, size, offset) =>
+			"!DIDerivedType(tag: DW_TAG_member, name: \"\(escape(name.toStr()))\", scope: !\(scope), baseType: !\(base), size: \(size), offset: \(offset))"
+		.Declared(tag, name) =>
+			"!DICompositeType(tag: \(tag.text()), name: \"\(escape(name.toStr()))\", flags: DIFlagFwdDecl)"
+		.Structure(tag, name, size, elements) =>
+			"distinct !DICompositeType(tag: \(tag.text()), name: \"\(escape(name.toStr()))\", size: \(size), elements: !\(elements))"
+		.ArrayType(base, size, elements) =>
+			"distinct !DICompositeType(tag: DW_TAG_array_type, baseType: \(reference(base.clone())), size: \(size), elements: !\(elements))"
+		.Enumeration(name, base, size, elements) => match name {
+			.Some(named) =>
+				"distinct !DICompositeType(tag: DW_TAG_enumeration_type, name: \"\(escape(named.toStr()))\", baseType: !\(base), size: \(size), elements: !\(elements))"
+			.None =>
+				"distinct !DICompositeType(tag: DW_TAG_enumeration_type, baseType: !\(base), size: \(size), elements: !\(elements))"
+		}
+		.Subrange(count) => "!DISubrange(count: \(count))"
+		.Enumerator(name, value) =>
+			"!DIEnumerator(name: \"\(escape(name.toStr()))\", value: \(value), isUnsigned: true)"
+		.Tuple(items) => {
+			var parts: Vec<String> = Vec()
+			for item in items {
+				parts.push(
+					match item {
+						.Node(node) => "!\(node)"
+						.Int(bits, value) => "i\(bits) \(value)"
+						.Text(text) => "!\"\(escape(text.toStr()))\""
+					},
+				)
+			}
+			"!{\(parts.join(", "))}"
+		}
+	}
+}
+
+/// A node named in another, or `null` where there is none.
+fn reference(node: Option<i64>): String = match node {
+	.Some(n) => "!\(n)"
+	.None => String::of("null")
+}
+
+/// A type of LLVM's.
+pub enum Type {
+	Void
+	I(bits: u32)
+	F32
+	F64
+	Ptr
+	Array(array: own<ArrayType>)
+	Struct(layout: own<StructType>)
+	/// What `llvm.dbg.declare` takes: a node, or a value as one.
+	Metadata
+	/// A function's type: what a call is made by.
+	Fn(signature: own<FnType>)
+}
+
+/// What a function answers and takes, and whether it takes more than it
+/// names.
+pub struct FnType {
+	pub ret: Type
+	pub params: Vec<Type>
+	pub variadic: bool
+}
+
+/// The type of a function that answers `ret` and takes `params`.
+fn fnOf(ret: Type, params: Vec<Type>, variadic: bool): Type = .Fn(own FnType(
+	ret: move ret,
+	params: move params,
+	variadic: variadic,
+))
+
+/// `[count x element]`.
+pub struct ArrayType {
+	pub count: u64
+	pub element: Type
+}
+
+/// `{ … }`, or `<{ … }>` where it is packed, with no padding.
+pub struct StructType {
+	pub fields: Vec<Type>
+	pub packed: bool
+}
+
+/// `[count x element]`.
+fn arrayOf(count: u64, element: Type): Type = .Array(own ArrayType(
+	count: count,
+	element: move element,
+))
+
+/// A struct of `fields`, packed or padded as C pads one.
+fn structOf(fields: Vec<Type>, packed: bool): Type = .Struct(own StructType(
+	fields: move fields,
+	packed: packed,
+))
+
+extend Type: Clone {
+	fn clone(): Type = match self {
+		.Void => .Void
+		.I(bits) => .I(bits)
+		.F32 => .F32
+		.F64 => .F64
+		.Ptr => .Ptr
+		.Array(array) => arrayOf(array.count, array.element.clone())
+		.Struct(layout) => structOf(layout.fields.clone(), layout.packed)
+		.Metadata => .Metadata
+		.Fn(signature) => fnOf(signature.ret.clone(), signature.params.clone(), signature.variadic)
+	}
+}
+
+extend Type: Eq {
+	fn equals(other: &Type): bool = match (self, other) {
+		(.Void, .Void) | (.F32, .F32) | (.F64, .F64) | (.Ptr, .Ptr) | (.Metadata, .Metadata) => true
+		(.I(a), .I(b)) => a == b
+		(.Array(a), .Array(b)) => a.count == b.count && a.element.equals(&b.element)
+		(.Struct(a), .Struct(b)) => a.packed == b.packed && a.fields == b.fields
+		(.Fn(a), .Fn(b)) => a.variadic == b.variadic && a.ret.equals(&b.ret) && a.params == b.params
+		_ => false
+	}
+}
+
+extend Type {
+	fn text(): String = match self {
+		.Void => String::of("void")
+		.I(bits) => "i\(bits)"
+		.F32 => String::of("float")
+		.F64 => String::of("double")
+		.Ptr => String::of("ptr")
+		.Array(array) => "[\(array.count) x \(array.element.text())]"
+		.Struct(layout) => {
+			var parts: Vec<String> = Vec()
+			for field in layout.fields {
+				parts.push(field.text())
+			}
+			if layout.packed then "<{ \(parts.join(", ")) }>" else "{ \(parts.join(", ")) }"
+		}
+		.Metadata => String::of("metadata")
+		.Fn(signature) => {
+			var parts: Vec<String> = Vec()
+			for param in signature.params {
+				parts.push(param.text())
+			}
+			if signature.variadic then parts.push(String::of("..."))
+			"\(signature.ret.text()) (\(parts.join(", ")))"
+		}
+	}
+}
+
+/// What C's `main` names its parameters and the values it makes.
+@derive(Eq, Clone)
+pub enum MainValue {
+	Argc
+	Argv
+	/// The arguments as a slice.
+	Args
+	Count
+	Length
+	/// Where an entry's result is written, which says the exit code.
+	Result
+	Code64
+	Code
+}
+
+extend MainValue {
+	fn text(): str = match self {
+		.Argc => "argc"
+		.Argv => "argv"
+		.Args => "args"
+		.Count => "count"
+		.Length => "length"
+		.Result => "result"
+		.Code64 => "code64"
+		.Code => "code"
+	}
+}
+
+/// A value an instruction takes: one a function names, a global, or a
+/// constant.
+pub enum Value {
+	/// `%tN`: what an instruction answers.
+	Temp(n: u32)
+	/// `%lN`: the stack slot local `N` lives in.
+	Slot(local: u32)
+	/// `%aN`: the slot that keeps the address aggregate parameter `N`
+	/// arrived at.
+	AddressSlot(local: u32)
+	/// `%pN`: the function's parameter `N`.
+	Param(index: u32)
+	/// What C's `main` names.
+	Main(name: MainValue)
+	/// `%wN`: a value of C's side of an exported function.
+	Wrapper(n: u32)
+	/// A global or a function, by its number in the module's names.
+	Global(index: u32)
+	Int(value: i64)
+	/// An integer past 64 bits.
+	Wide(wide: own<WideInt>)
+	/// A float, by its bits.
+	Float(bits: u64)
+	/// The value of a type that is all zeros: `null`, `0.0`.
+	Zero
+	Undef
+	/// An address that is a number: `inttoptr (i64 n to ptr)`.
+	Address(value: i64)
+}
+
+/// An integer past 64 bits, which a value holds behind a pointer.
+pub struct WideInt {
+	pub value: i128
+}
+
+extend Value: Clone {
+	fn clone(): Value = match self {
+		.Temp(n) => .Temp(n)
+		.Slot(local) => .Slot(local)
+		.AddressSlot(local) => .AddressSlot(local)
+		.Param(index) => .Param(index)
+		.Main(name) => .Main(name.clone())
+		.Wrapper(n) => .Wrapper(n)
+		.Global(index) => .Global(index)
+		.Int(value) => .Int(value)
+		.Wide(wide) => .Wide(own WideInt(value: wide.value))
+		.Float(bits) => .Float(bits)
+		.Zero => .Zero
+		.Undef => .Undef
+		.Address(value) => .Address(value)
+	}
+}
+
+extend Value {
+	/// An integer, wide or not.
+	static fn int(value: i128): Value =
+		if (value as i64) as i128 == value then .Int(value as i64)
+		else .Wide(own WideInt(value: value))
+
+	/// The value as written where its type is `t`, in a module of `names`.
+	fn text(t: &Type, names: &[String]): String = match self {
+		.Temp(n) => "%t\(n)"
+		.Slot(local) => "%l\(local)"
+		.AddressSlot(local) => "%a\(local)"
+		.Param(index) => "%p\(index)"
+		.Main(name) => "%\(name.text())"
+		.Wrapper(n) => "%w\(n)"
+		.Global(index) => names[index as i64].clone()
+		.Int(value) => match t {
+			.I(bits: 1) => String::of(if value == 0 then "false" else "true")
+			_ => "\(value)"
+		}
+		.Wide(wide) => "\(wide.value)"
+		.Float(bits) => hex16(bits)
+		.Zero => match t {
+			.Ptr => String::of("null")
+			.F32 | .F64 => String::of("0.0")
+			.I(..) => String::of("0")
+			_ => String::of("zeroinitializer")
+		}
+		.Undef => String::of("undef")
+		.Address(value) => "inttoptr (i64 \(value) to ptr)"
+	}
+}
+
+/// A value and its type.
+@derive(Clone)
+pub struct Val {
+	pub v: Value
+	pub t: Type
+}
+
+extend Val {
+	static fn of(v: Value, t: Type): Val = Val(v: move v, t: move t)
+
+	/// The value, its type given up.
+	move fn take(): Value = move self.v
+
+	/// `type value`, as an operand whose type is written with it.
+	fn typed(names: &[String]): String = "\(self.t.text()) \(self.v.text(&self.t, &names))"
+}
+
+/// What LLVM may assume of a parameter, a result or an argument, or what C's
+/// ABI asks of it.
+@derive(Eq, Clone)
+pub enum Attr {
+	ZeroExt
+	SignExt
+	NoAlias
+	ReadOnly
+	NonNull
+	Dereferenceable(bytes: u32)
+	Align(bytes: u32)
+	/// Where a struct C answers is written, of this many bytes.
+	Sret(bytes: u32)
+	/// A struct C passes on the stack, of this many bytes.
+	ByVal(bytes: u32)
+}
+
+extend Attr {
+	fn text(): String = match self {
+		.ZeroExt => String::of("zeroext")
+		.SignExt => String::of("signext")
+		.NoAlias => String::of("noalias")
+		.ReadOnly => String::of("readonly")
+		.NonNull => String::of("nonnull")
+		.Dereferenceable(bytes) => "dereferenceable(\(bytes))"
+		.Align(bytes) => "align \(bytes)"
+		.Sret(bytes) => "sret([\(bytes) x i8])"
+		.ByVal(bytes) => "byval([\(bytes) x i8])"
+	}
+}
+
+/// Attributes as written, one space between each.
+fn attrsText(attrs: &[Attr]): String = {
+	var parts: Vec<String> = Vec()
+	for attr in attrs {
+		parts.push(attr.text())
+	}
+	return parts.join(" ")
+}
+
+/// A type and its attributes, as a parameter or a result has them.
+fn slotText(t: &Type, attrs: &[Attr]): String =
+	if attrs.isEmpty() then t.text() else "\(t.text()) \(attrsText(&attrs))"
+
+/// A block of a function, by its name.
+@derive(Eq, Clone)
+pub enum Label {
+	/// The entry block: the stack slots, and the parameters put in them.
+	Start
+	/// `bbN`: MIR's block `N`.
+	Block(index: u32)
+	/// `failN`: where a check that failed goes.
+	Failed(n: u32)
+	/// `fineN`: where a check that passed goes.
+	Fine(n: u32)
+}
+
+extend Label {
+	fn text(): String = match self {
+		.Start => String::of("start")
+		.Block(index) => "bb\(index)"
+		.Failed(n) => "fail\(n)"
+		.Fine(n) => "fine\(n)"
+	}
+}
+
+/// An integer's arithmetic.
+@derive(Eq, Clone)
+pub enum Arithmetic {
+	Add
+	Sub
+	Mul
+	UDiv
+	SDiv
+	URem
+	SRem
+	And
+	Or
+	Xor
+	Shl
+	LShr
+	AShr
+	FAdd
+	FSub
+	FMul
+	FDiv
+	FRem
+}
+
+extend Arithmetic {
+	fn text(): str = match self {
+		.Add => "add"
+		.Sub => "sub"
+		.Mul => "mul"
+		.UDiv => "udiv"
+		.SDiv => "sdiv"
+		.URem => "urem"
+		.SRem => "srem"
+		.And => "and"
+		.Or => "or"
+		.Xor => "xor"
+		.Shl => "shl"
+		.LShr => "lshr"
+		.AShr => "ashr"
+		.FAdd => "fadd"
+		.FSub => "fsub"
+		.FMul => "fmul"
+		.FDiv => "fdiv"
+		.FRem => "frem"
+	}
+}
+
+/// What an arithmetic's answer is promised not to do: wrap past a signed or
+/// an unsigned number.
+@derive(Eq, Clone)
+pub enum Wrap {
+	NoSigned
+	NoUnsigned
+}
+
+/// How two integers are compared.
+@derive(Eq, Clone)
+pub enum IntCompare {
+	Eq
+	Ne
+	Ult
+	Ule
+	Ugt
+	Uge
+	Slt
+	Sle
+	Sgt
+	Sge
+}
+
+extend IntCompare {
+	fn text(): str = match self {
+		.Eq => "eq"
+		.Ne => "ne"
+		.Ult => "ult"
+		.Ule => "ule"
+		.Ugt => "ugt"
+		.Uge => "uge"
+		.Slt => "slt"
+		.Sle => "sle"
+		.Sgt => "sgt"
+		.Sge => "sge"
+	}
+}
+
+/// How two floats are compared: ordered, but for `!=`, which a NaN makes
+/// true.
+@derive(Eq, Clone)
+pub enum FloatCompare {
+	Oeq
+	Une
+	Olt
+	Ole
+	Ogt
+	Oge
+}
+
+extend FloatCompare {
+	fn text(): str = match self {
+		.Oeq => "oeq"
+		.Une => "une"
+		.Olt => "olt"
+		.Ole => "ole"
+		.Ogt => "ogt"
+		.Oge => "oge"
+	}
+}
+
+/// A value as another type.
+@derive(Eq, Clone)
+pub enum Cast {
+	Trunc
+	ZExt
+	SExt
+	FpTrunc
+	FpExt
+	UiToFp
+	SiToFp
+	PtrToInt
+	IntToPtr
+	Bitcast
+}
+
+extend Cast {
+	fn text(): str = match self {
+		.Trunc => "trunc"
+		.ZExt => "zext"
+		.SExt => "sext"
+		.FpTrunc => "fptrunc"
+		.FpExt => "fpext"
+		.UiToFp => "uitofp"
+		.SiToFp => "sitofp"
+		.PtrToInt => "ptrtoint"
+		.IntToPtr => "inttoptr"
+		.Bitcast => "bitcast"
+	}
+}
+
+/// What an atomic read-modify-write does.
+@derive(Eq, Clone)
+pub enum Rmw {
+	Xchg
+	Add
+	Sub
+}
+
+extend Rmw {
+	fn text(): str = match self {
+		.Xchg => "xchg"
+		.Add => "add"
+		.Sub => "sub"
+	}
+}
+
+/// How a debugger reaches a variable from the address it is declared at.
+@derive(Eq, Clone)
+pub enum Expression {
+	/// The address is the variable's.
+	Plain
+	/// The address holds the variable's.
+	Deref
+	/// The address holds an address that holds the variable's.
+	DerefTwice
+}
+
+extend Expression {
+	fn text(): str = match self {
+		.Plain => "!DIExpression()"
+		.Deref => "!DIExpression(DW_OP_deref)"
+		.DerefTwice => "!DIExpression(DW_OP_deref, DW_OP_deref)"
+	}
+}
+
+/// An argument of a call: its value, and what its parameter says of it.
+@derive(Clone)
+pub struct Arg {
+	pub value: Val
+	pub attrs: Vec<Attr>
+}
+
+extend Arg {
+	static fn of(value: Val): Arg = Arg(value: move value, attrs: Vec())
+}
+
+/// A call: the callee, the arguments, and the result's type and attributes.
+@derive(Clone)
+pub struct Call {
+	pub ret: Type
+	pub retAttrs: Vec<Attr>
+	/// Of a call that passes more than the callee names: the types it names,
+	/// which the call writes as the function's type.
+	pub variadic: Option<Vec<Type>>
+	pub callee: Value
+	pub args: Vec<Arg>
+}
+
+/// `ifTrue` where the `i1` `condition` is true, `ifFalse` where not: an op
+/// behind a pointer, as the rarest of the large ones are.
+pub struct Select {
+	pub condition: Value
+	pub ifTrue: Val
+	pub ifFalse: Val
+}
+
+/// `aggregate` with its field `index` replaced by `value`.
+pub struct InsertValue {
+	pub aggregate: Val
+	pub value: Val
+	pub index: u32
+}
+
+/// An atomic compare-and-swap, sequentially consistent, answering the value
+/// found and whether it was `expected`.
+pub struct CmpXchg {
+	pub address: Value
+	pub expected: Val
+	pub replacement: Val
+	pub align: u32
+}
+
+/// What LLVM may assume of what a load reads.
+@derive(Clone)
+pub enum Assumes {
+	Nothing
+	/// A reference: not null, and aligned as the tuple `align` says.
+	Reference(nonnull: i64, align: i64)
+	/// The same wherever it is read: a table of methods.
+	Invariant(node: i64)
+}
+
+extend Call {
+	/// A call of `callee`, answering `ret`, with no attributes: an intrinsic's.
+	static fn plain(callee: Value, ret: Type, values: Vec<Val>): Call = {
+		var args: Vec<Arg> = Vec()
+		for value in move values {
+			args.push(Arg::of(move value))
+		}
+		return Call(
+			ret: move ret,
+			retAttrs: Vec(),
+			variadic: .None,
+			callee: move callee,
+			args: move args,
+		)
+	}
+}
+
+/// What an instruction does, and to what.
+pub enum Op {
+	/// A stack slot of the type.
+	Alloca(t: Type, align: u32)
+	Load(t: Type, address: Value, align: u32, assumes: Assumes)
+	/// A load that is sequentially consistent.
+	LoadAtomic(t: Type, address: Value, align: u32)
+	Store(value: Val, address: Value, align: u32)
+	/// A store that is sequentially consistent.
+	StoreAtomic(value: Val, address: Value, align: u32)
+	/// An address `offset` bytes on from `base`, within its object.
+	Offset(base: Value, offset: Value)
+	/// `op left, right`, of `left`'s type.
+	Arithmetic(op: Arithmetic, wrap: Option<Wrap>, left: Val, right: Value)
+	FNeg(value: Val)
+	IntCompare(cond: IntCompare, left: Val, right: Value)
+	FloatCompare(cond: FloatCompare, left: Val, right: Value)
+	Cast(cast: Cast, value: Val, to: Type)
+	Select(select: own<Select>)
+	ExtractValue(aggregate: Val, index: u32)
+	InsertValue(insert: own<InsertValue>)
+	Call(call: own<Call>)
+	/// An atomic read-modify-write, sequentially consistent.
+	AtomicRmw(op: Rmw, address: Value, value: Val, align: u32)
+	CmpXchg(swap: own<CmpXchg>)
+	/// Where a variable lives, for the debugger: `llvm.dbg.declare`.
+	Declare(address: Value, variable: i64, expression: Expression)
+	Br(target: Label)
+	/// A branch on an `i1`; `weights`, where it says how likely each way is.
+	CondBr(condition: Value, ifTrue: Label, ifFalse: Label, weights: Option<i64>)
+	Switch(value: Val, otherwise: Label, cases: Vec<(i64, Label)>)
+	Ret(value: Option<Val>)
+	Unreachable
+}
+
+/// An instruction: what it answers, if anything, what it does, and where it
+/// was written.
+pub struct Instruction {
+	pub result: Option<Value>
+	pub op: Op
+	/// The node of its location.
+	pub at: Option<i64>
+}
+
+/// A block of a function: its label and its instructions, the last a branch,
+/// a return or `unreachable`.
+pub struct Block {
+	pub label: Label
+	pub instructions: Vec<Instruction>
+}
+
+/// Whom a global or a function is seen by.
+@derive(Eq, Clone)
+pub enum Linkage {
+	/// Every object.
+	External
+	/// The module alone, which LLVM may change or drop it in.
+	Internal
+	/// The module alone, and nothing names it outside it, not even the
+	/// object's symbols.
+	Private
+	/// Every object of the program, and no other.
+	Hidden
+}
+
+extend Linkage {
+	fn text(): str = match self {
+		.External => ""
+		.Internal => "internal "
+		.Private => "private "
+		.Hidden => "hidden "
+	}
+}
+
+/// A parameter: its type, its attributes and, where a function defines it,
+/// its name.
+@derive(Clone)
+pub struct Param {
+	pub t: Type
+	pub attrs: Vec<Attr>
+	pub name: Option<Value>
+}
+
+extend Param {
+	fn text(names: &[String]): String = match self.name {
+		.Some(name) => "\(slotText(&self.t, &self.attrs)) \(name.text(&self.t, &names))"
+		.None => slotText(&self.t, &self.attrs)
+	}
+}
+
+/// What a function's attribute group says of every function in it.
+@derive(Eq, Clone)
+pub enum FnAttr {
+	NoUnwind
+	/// Its unwinding table is written, which a profiler walks.
+	UwTable
+	/// Its frame record is kept.
+	FramePointer
+	/// A call in its tail stays a call.
+	DisableTailCalls
+	NoReturn
+	/// Two calls of it are never made one.
+	NoMerge
+}
+
+extend FnAttr {
+	fn text(): str = match self {
+		.NoUnwind => "nounwind"
+		.UwTable => "uwtable"
+		.FramePointer => "\"frame-pointer\"=\"all\""
+		.DisableTailCalls => "\"disable-tail-calls\"=\"true\""
+		.NoReturn => "noreturn"
+		.NoMerge => "nomerge"
+	}
+}
+
+fn fnAttrsText(attrs: &[FnAttr]): String = {
+	var parts: Vec<String> = Vec()
+	for attr in attrs {
+		parts.push(String::of(attr.text()))
+	}
+	return parts.join(" ")
+}
+
+/// A global's first value: what it holds before the program runs.
+@derive(Clone)
+pub enum Constant {
+	/// `c"…"`: bytes.
+	Bytes(bytes: Vec<u8>)
+	/// All zeros.
+	Zero
+	/// The address of a global, by its number.
+	Address(global: u32)
+	/// A packed struct's fields, each of the type the struct gives it.
+	Packed(fields: Vec<Constant>)
+	/// An array's elements.
+	Array(elements: Vec<Constant>)
+}
+
+extend Constant {
+	/// The constant as written where its type is `t`.
+	fn text(t: &Type, names: &[String]): String = match self {
+		.Bytes(bytes) => "c\"\(escape(str::fromBytes(&bytes)))\""
+		.Zero => String::of("zeroinitializer")
+		.Address(global) => names[global as i64].clone()
+		.Packed(fields) => {
+			val .Struct(layout) = t else {
+				panic("a packed constant is a struct's")
+			}
+			var parts: Vec<String> = Vec()
+			for (i, field) in fields.forwards().enumerate() {
+				val fieldType = &layout.fields[i]
+				parts.push("\(fieldType.text()) \(field.text(&fieldType, &names))")
+			}
+			"<{ \(parts.join(", ")) }>"
+		}
+		.Array(elements) => {
+			val .Array(array) = t else {
+				panic("an array constant is an array's")
+			}
+			var parts: Vec<String> = Vec()
+			for item in elements {
+				parts.push("\(array.element.text()) \(item.text(&array.element, &names))")
+			}
+			"[\(parts.join(", "))]"
+		}
+	}
+}
+
+/// A global: a constant of the program's, a variable, or one another object
+/// defines.
+@derive(Clone)
+pub struct Global {
+	/// Its number in the module's names.
+	pub name: u32
+	pub linkage: Linkage
+	/// Whether its address means nothing, only what it holds: two that hold
+	/// the same may be one.
+	pub unnamedAddr: bool
+	/// Whether nothing writes it.
+	pub constant: bool
+	pub t: Type
+	/// What it holds first; nothing where another object defines it.
+	pub init: Option<Constant>
+	pub align: Option<u32>
+}
+
+extend Global {
+	/// The global as a line of LLVM's text, without its end.
+	fn text(names: &[String]): String = {
+		val external = if self.init.isNone() then "external " else ""
+		val unnamed = if self.unnamedAddr then "unnamed_addr " else ""
+		val kind = if self.constant then "constant" else "global"
+		var out = "\(names[self.name as i64]) = \(external)\(self.linkage.text())\(unnamed)\(kind) \(self.t.text())"
+		if self.init is .Some(init) then out.push(" \(init.text(&self.t, &names))")
+		if self.align is .Some(align) then out.push(", align \(align)")
+		return move out
+	}
+}
+
+/// A function the module calls and does not define: C's, LLVM's intrinsics,
+/// or one another part of a program defines.
+@derive(Clone)
+pub struct Declaration {
+	/// Its number in the module's names.
+	pub symbol: u32
+	pub linkage: Linkage
+	pub ret: Type
+	pub retAttrs: Vec<Attr>
+	pub params: Vec<Param>
+	/// Whether it takes more than it names, as C's `...` does.
+	pub variadic: bool
+	/// Its attributes, as written after it.
+	pub attrs: Vec<FnAttr>
+	/// The attribute group it is in, if any.
+	pub group: Option<i64>
+}
+
+extend Declaration {
+	/// A function of no attributes but its parameters' and its result's.
+	static fn of(symbol: u32, ret: Type, params: Vec<Param>): Declaration = Declaration(
+		symbol: symbol,
+		linkage: .External,
+		ret: move ret,
+		retAttrs: Vec(),
+		params: move params,
+		variadic: false,
+		attrs: Vec(),
+		group: .None,
+	)
+
+	fn text(names: &[String]): String = {
+		var params: Vec<String> = Vec()
+		for param in self.params {
+			params.push(param.text(&names))
+		}
+		if self.variadic then params.push(String::of("..."))
+		var out = "declare \(self.linkage.text())\(retText(&self.ret, &self.retAttrs)) \(names[self.symbol as i64])(\(params.join(", ")))"
+		if !self.attrs.isEmpty() then out.push(" \(fnAttrsText(&self.attrs))")
+		if self.group is .Some(group) then out.push(" #\(group)")
+		return move out
+	}
+}
+
+/// What a module declares: a function, or a global another object defines.
+@derive(Clone)
+pub enum Declared {
+	Function(declaration: Declaration)
+	Global(global: Global)
+}
+
+extend Declared {
+	fn text(names: &[String]): String = match self {
+		.Function(declaration) => declaration.text(&names)
+		.Global(global) => global.text(&names)
+	}
+}
+
+/// A result's type, its attributes before it.
+fn retText(t: &Type, attrs: &[Attr]): String =
+	if attrs.isEmpty() then t.text() else "\(attrsText(&attrs)) \(t.text())"
+
+/// A function defined in the module.
+pub struct Function {
+	/// Its number in the module's names.
+	pub symbol: u32
+	pub linkage: Linkage
+	pub ret: Type
+	pub retAttrs: Vec<Attr>
+	pub params: Vec<Param>
+	/// Whether it returns; a panic does not, which its attributes say.
+	pub returns: bool
+	/// Its subprogram's node; -1 where the module has no debug information.
+	pub subprogram: i64
+	pub blocks: Vec<Block>
+}
+
+extend Function {
+	/// The attribute group it is in: one for a function that returns, and
+	/// one for one that does not.
+	fn group(): i64 = if self.returns then 0 else 1
+
+	/// How a module that does not define it declares it.
+	fn declaration(): Declaration = Declaration(
+		symbol: self.symbol,
+		linkage: self.linkage.clone(),
+		ret: self.ret.clone(),
+		retAttrs: self.retAttrs.clone(),
+		params: self.params.clone(),
+		variadic: false,
+		attrs: Vec(),
+		group: .Some(self.group()),
+	)
+
+	/// The function as LLVM's text writes it.
+	fn write(out: &var String, names: &[String]) = {
+		var params: Vec<String> = Vec()
+		for param in self.params {
+			params.push(param.text(&names))
+		}
+		val subprogram = if self.subprogram < 0 then String() else " !dbg !\(self.subprogram)"
+		out.push("define \(self.linkage.text())\(retText(&self.ret, &self.retAttrs)) \(names[self.symbol as i64])(\(params.join(", "))) #\(self.group())\(subprogram) {\n")
+		for block in self.blocks {
+			out.push("\(block.label.text()):\n")
+			for instruction in block.instructions {
+				instruction.write(&var out, &names)
+			}
+		}
+		out.push("}\n\n")
+	}
+
+	/// How long its text is.
+	fn textLength(names: &[String]): i64 = {
+		var text = String()
+		self.write(&var text, &names)
+		return text.len()
+	}
+}
+
+/// A module: its constants and globals, what it declares, its functions and
+/// their attribute groups, and its metadata, node `i` being `!i`.
+pub struct Module {
+	/// The comment it starts with.
+	pub heading: String
+	/// The name of each global and function, as written, by its number.
+	pub names: Vec<String>
+	/// The program's constants: strings, tables, what files embed.
+	pub data: Vec<Global>
+	/// The program's variables: the runtime's words, and the frame tables.
+	pub globals: Vec<Global>
+	pub declared: Vec<Declared>
+	pub functions: Vec<Function>
+	pub groups: Vec<Vec<FnAttr>>
+	/// The compile unit's node, and the module's flags'; -1 where it has no
+	/// debug information.
+	pub unit: i64
+	pub flags: (i64, i64)
+	pub nodes: Vec<Node>
+}
+
+extend Module {
+	/// The module with no debug information, as `cc -g0` writes one: no
+	/// instruction's location, no function's subprogram, no compile unit or
+	/// its flags, and no variable declared to a debugger. The nodes stay,
+	/// since a load names some of them too; the debugger's are named by
+	/// nothing, and come to nothing.
+	pub var fn dropDebugInfo() = {
+		self.unit = -1
+		self.flags = (-1, -1)
+		for function in self.functions {
+			function.subprogram = -1
+			for block in function.blocks {
+				block.instructions.retain((instruction) => !(instruction.op is .Declare(..)))
+				for instruction in block.instructions {
+					instruction.at = .None
+				}
+			}
+		}
+		val names = &self.names
+		self.declared.retain((declared) =>
+			!(declared is .Function(declaration) &&
+				names[declaration.symbol as i64] == "@llvm.dbg.declare"))
+	}
+
+	/// The module as LLVM's text writes it.
+	pub fn text(): String = {
+		var out = "\(self.heading)\n\n"
+		val names = &self.names
+		for global in self.data {
+			out.push(global.text(&names).toStr())
+			out.push("\n")
+		}
+		for global in self.globals {
+			out.push(global.text(&names).toStr())
+			out.push("\n")
+		}
+		out.push("\n")
+		for declared in self.declared {
+			out.push(declared.text(&names).toStr())
+			out.push("\n")
+		}
+		out.push("\n")
+		for function in self.functions {
+			function.write(&var out, &names)
+		}
+		for (i, group) in self.groups.forwards().enumerate() {
+			out.push("attributes #\(i) = { \(fnAttrsText(&group)) }\n")
+		}
+		out.push("\n")
+		if self.unit >= 0 {
+			out.push("!llvm.dbg.cu = !{!\(self.unit)}\n")
+			out.push("!llvm.module.flags = !{!\(self.flags.0), !\(self.flags.1)}\n")
+		}
+		for (i, node) in self.nodes.forwards().enumerate() {
+			out.push("!\(i) = \(node.text())\n")
+		}
+		return move out
+	}
+}
+
+extend Instruction {
+	/// The instruction as a line of LLVM's text.
+	fn write(out: &var String, names: &[String]) = {
+		out.push("  ")
+		if self.result is .Some(result) {
+			val t = Type::Ptr
+			out.push(result.text(&t, &names).toStr())
+			out.push(" = ")
+		}
+		out.push(self.op.text(&names).toStr())
+		if self.at is .Some(node) then out.push(", !dbg !\(node)")
+		out.push("\n")
+	}
+}
+
+extend Op {
+	fn text(names: &[String]): String = {
+		val ptr = Type::Ptr
+		val word = Type::I(64)
+		val flag = Type::I(1)
+		return match self {
+			.Alloca(t, align) => "alloca \(t.text()), align \(align)"
+			.Load(t, address, align, assumes) => {
+				val facts = match assumes {
+					.Nothing => String()
+					.Reference(nonnull, align: aligned) =>
+						", !nonnull !\(nonnull), !align !\(aligned)"
+					.Invariant(node) => ", !invariant.load !\(node)"
+				}
+				"load \(t.text()), ptr \(address.text(&ptr, &names)), align \(align)\(facts)"
+			}
+			.LoadAtomic(t, address, align) =>
+				"load atomic \(t.text()), ptr \(address.text(&ptr, &names)) seq_cst, align \(align)"
+			.Store(value, address, align) =>
+				"store \(value.typed(&names)), ptr \(address.text(&ptr, &names)), align \(align)"
+			.StoreAtomic(value, address, align) =>
+				"store atomic \(value.typed(&names)), ptr \(address.text(&ptr, &names)) seq_cst, align \(align)"
+			.Offset(base, offset) =>
+				"getelementptr inbounds i8, ptr \(base.text(&ptr, &names)), i64 \(offset.text(&word, &names))"
+			.Arithmetic(op, wrap, left, right) => {
+				val wraps = match wrap {
+					.Some(.NoSigned) => " nsw"
+					.Some(.NoUnsigned) => " nuw"
+					.None => ""
+				}
+				"\(op.text())\(wraps) \(left.typed(&names)), \(right.text(&left.t, &names))"
+			}
+			.FNeg(value) => "fneg \(value.typed(&names))"
+			.IntCompare(cond, left, right) =>
+				"icmp \(cond.text()) \(left.typed(&names)), \(right.text(&left.t, &names))"
+			.FloatCompare(cond, left, right) =>
+				"fcmp \(cond.text()) \(left.typed(&names)), \(right.text(&left.t, &names))"
+			.Cast(cast, value, to) => "\(cast.text()) \(value.typed(&names)) to \(to.text())"
+			.Select(select) =>
+				"select i1 \(select.condition.text(&flag, &names)), \(select.ifTrue.typed(&names)), \(select.ifFalse.typed(&names))"
+			.ExtractValue(aggregate, index) => "extractvalue \(aggregate.typed(&names)), \(index)"
+			.InsertValue(insert) =>
+				"insertvalue \(insert.aggregate.typed(&names)), \(insert.value.typed(&names)), \(insert.index)"
+			.Call(call) => {
+				var args: Vec<String> = Vec()
+				for arg in call.args {
+					args.push("\(slotText(&arg.value.t, &arg.attrs)) \(arg.value.v.text(&arg.value.t, &names))")
+				}
+				var ret =
+					if call.retAttrs.isEmpty() then call.ret.text()
+					else "\(attrsText(&call.retAttrs)) \(call.ret.text())"
+				if call.variadic is .Some(named) {
+					var types: Vec<String> = Vec()
+					for t in named {
+						types.push(t.text())
+					}
+					ret.push(" (\(types.join(", ")), ...)")
+				}
+				"call \(ret) \(call.callee.text(&ptr, &names))(\(args.join(", ")))"
+			}
+			.AtomicRmw(op, address, value, align) =>
+				"atomicrmw \(op.text()) ptr \(address.text(&ptr, &names)), \(value.typed(&names)) seq_cst, align \(align)"
+			.CmpXchg(swap) =>
+				"cmpxchg ptr \(swap.address.text(&ptr, &names)), \(swap.expected.typed(&names)), \(swap.replacement.typed(&names)) seq_cst seq_cst, align \(swap.align)"
+			.Declare(address, variable, expression) =>
+				"call void @llvm.dbg.declare(metadata ptr \(address.text(&ptr, &names)), metadata !\(variable), metadata \(expression.text()))"
+			.Br(target) => "br label %\(target.text())"
+			.CondBr(condition, ifTrue, ifFalse, weights) => {
+				val prof = match weights {
+					.Some(node) => ", !prof !\(node)"
+					.None => String()
+				}
+				"br i1 \(condition.text(&flag, &names)), label %\(ifTrue.text()), label %\(ifFalse.text())\(prof)"
+			}
+			.Switch(value, otherwise, cases) => {
+				var written: Vec<String> = Vec()
+				for (case, target) in cases {
+					written.push("\(value.t.text()) \(case), label %\(target.text())")
+				}
+				"switch \(value.typed(&names)), label %\(otherwise.text()) [ \(written.join(" ")) ]"
+			}
+			.Ret(value) => match value {
+				.Some(given) => "ret \(given.typed(&names))"
+				.None => String::of("ret void")
+			}
+			.Unreachable => String::of("unreachable")
+		}
+	}
+}
+
+/// A float's bits as LLVM writes a float: `0x` and sixteen hexadecimal
+/// digits.
+fn hex16(bits: u64): String = {
+	val digits = "0123456789ABCDEF"
+	var text = String::of("0x")
+	var shift: i64 = 60
+	while shift >= 0 {
+		text.pushByte(digits[((bits >> shift) & 15) as i64])
+		shift -= 4
+	}
+	return move text
+}

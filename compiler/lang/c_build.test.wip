@@ -1,0 +1,107 @@
+// Compiling the C a program carries.
+
+import std::fs
+import std::path
+
+/// The baseline is every processor of the host's kind, as the C compiler and
+/// LLVM are told it: x86-64 v2, every Mac with Apple silicon, and every
+/// 64-bit Arm elsewhere; a level named is that level.
+@test
+fn theBaselineIsEveryProcessorOfTheHostKind() = {
+	val baseline = cpuFlag(Cpu::Baseline)
+	if TARGET_ARCH == "x86_64" {
+		assert(baseline == "-march=x86-64-v2")
+		assert(cpuFlag(Cpu::Level(.X86_64V3)) == "-march=x86-64-v3")
+	} else if TARGET_ARCH == "arm64" && TARGET_VENDOR == "apple" {
+		assert(baseline == "-mcpu=apple-m1")
+	} else if TARGET_ARCH == "arm64" {
+		assert(baseline == "-march=armv8-a")
+		assert(cpuFlag(Cpu::Level(.Armv8_1)) == "-march=armv8.1-a")
+	}
+}
+
+@test
+fn readsTheRuleMakeWould() = {
+	val rule = "out.o: a.c include/b.h \\\n  with\\ space.h \\\n  $$dollar.h\n"
+	val found = dependencies(rule)
+	assert(found.len() == 4)
+	assert(found[0] == "a.c")
+	assert(found[1] == "include/b.h")
+	assert(found[2] == "with space.h")
+	assert(found[3] == "$dollar.h")
+}
+
+/// A file written, its directories made.
+fn written(at: str, text: str) = {
+	fs::makeDirs(path::parent(at))
+	assert(fs::writeFile(at, text).isOk())
+}
+
+/// A C file is compiled once: a second build finds its object, a header it
+/// includes that changes compiles it again, and one whose time moves but
+/// whose text does not is still what it was; and other flags are another
+/// object, position-independent or optimised for a release build.
+@test
+fn cIsCompiledOnce() = {
+	val unique = Unique::new()
+	val .Ok(dir) = TempDir::new(&unique) else {
+		panic("a temporary directory")
+	}
+	val cache = dir.join("cache")
+	val source = dir.join("tally.c")
+	val header = dir.join("include/tally.h")
+	written(header.toStr(), "#define STEP 1\n")
+	written(source.toStr(), "#include \"tally.h\"\nint tally(void) { return STEP; }\n")
+	val files = [CFile::c(source.clone())]
+	val includes = [dir.join("include")]
+	val compiled = (pic: bool, optimize: bool) => match compile(
+		&files,
+		&includes,
+		cache.toStr(),
+		pic,
+		optimize,
+		Cpu::Baseline,
+		&unique,
+	) {
+		.Ok(done) => move done
+		.Err(message) => panic(message.toStr())
+	}
+	val first = compiled(false, false)
+	assert(first.compiled == 1)
+	val second = compiled(false, false)
+	assert(second.compiled == 0)
+	assert(second.objects == first.objects)
+	written(header.toStr(), "#define STEP 22\n")
+	assert(compiled(false, false).compiled == 1, "a changed header compiles its includer")
+	// The same text written again: a new time, and the same object.
+	written(header.toStr(), "#define STEP 22\n")
+	assert(compiled(false, false).compiled == 0, "a header with the same text is unchanged")
+	assert(compiled(true, false).compiled == 1)
+	assert(compiled(false, true).compiled == 1)
+}
+
+/// A C file that does not compile says why, naming the file.
+@test
+fn cThatFailsSaysSo() = {
+	val unique = Unique::new()
+	val .Ok(dir) = TempDir::new(&unique) else {
+		panic("a temporary directory")
+	}
+	val source = dir.join("broken.c")
+	written(source.toStr(), "int broken(void) { return }\n")
+	val cache = dir.join("cache")
+	val none: Vec<String> = Vec()
+	val .Err(error) = compile(
+		[CFile::c(source.clone())],
+		&none,
+		cache.toStr(),
+		false,
+		false,
+		Cpu::Baseline,
+		&unique,
+	) else {
+		panic("broken C compiled")
+	}
+	assert(error.contains("failed"), error.toStr())
+	assert(error.contains("broken.c"), error.toStr())
+}

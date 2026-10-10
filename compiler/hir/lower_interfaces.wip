@@ -1,0 +1,1738 @@
+// Interfaces: what a type may implement, and what a type parameter may be
+// required to implement.
+//
+// An interface's methods are checked with `Self` as its one type parameter,
+// so an implementation is that method with the type substituted for it, and
+// a default body is a generic function with one instance per implementing
+// type.
+
+import std::collections::{Map}
+import std::mem
+import syntax as ast
+import syntax::{
+	ANNOTATION,
+	DUPLICATE_IMPL,
+	Diagnostic,
+	EXTENSION,
+	Edit,
+	IMPL_METHODS,
+	IMPL_TARGET,
+	KEEPS,
+	NOT_DISPATCHABLE,
+	PRELUDE_NAME,
+	REDUNDANT_PUB,
+	Span,
+	Symbol,
+	TYPE_PARAMETER_DEFAULT,
+	UNKNOWN_INTERFACE,
+	UNSATISFIED_CONSTRAINT
+}
+
+/// What a name written where an interface is expected names.
+enum InterfaceAt {
+	Found(id: InterfaceId)
+	/// Nothing, for the caller to say in its own words.
+	NotFound
+	/// Something already reported: a path that names no module, or an
+	/// interface its module keeps to itself or does not have.
+	Reported
+}
+
+extend Lowerer {
+	/// The interfaces of a file, by name. Their methods are declared later,
+	/// once every type has a name.
+	var fn collectInterfaces(): Vec<(&ast::InterfaceDecl, InterfaceId)> = {
+		val file = self.ast
+		var interfaces: Vec<(&ast::InterfaceDecl, InterfaceId)> = Vec()
+		for item in file.items {
+			val .Interface(decl) = item else {
+				continue
+			}
+			val annotations = self.annotations(&decl.annotations, .Interface)
+			// `interface From<T>` is about other types, and `interface
+			// Add<Rhs = Self, Out = Self>` says what they are where a use leaves
+			// them out.
+			val generics = self.interfaceGenericParams(&decl.generics)
+			val id = self.program.interfaces.add(
+				InterfaceDef(
+					name: decl.name.sym,
+					generics: move generics,
+					methods: Vec(),
+					// Checked against the methods once they are declared.
+					oneOf: move annotations.oneOf,
+					extensions: Vec(),
+					module: self.current as u32,
+					isPub: decl.isPub,
+					span: decl.name.span,
+				),
+			)
+			// The interfaces of the prelude's that the compiler asks for, each
+			// for what `KnownInterface` says.
+			if self.prelude == .Some(self.current) &&
+				KnownInterface::named(self.text(decl.name.sym)) is .Some(known) {
+				self.program.preludeItems.setInterface(known, id)
+			}
+			if self.preludeName(decl.name, "an interface named") {
+				interfaces.push((&decl, id))
+				continue
+			}
+			match self.declaredAt(decl.name.sym) {
+				.Some(first) => self.duplicate(decl.name, first)
+				.None => self.modules[self.current].interfaces.put(
+					decl.name.sym,
+					(id, decl.name.span),
+				)
+			}
+			interfaces.push((&decl, id))
+		}
+		return move interfaces
+	}
+
+	/// A type of the prelude, which every file sees without an import.
+	fn preludeType(name: Symbol): Option<TypeDef> = {
+		val prelude = self.prelude?
+		if prelude == self.current then return .None
+		return match self.modules[prelude].types.get(&name) {
+			.Some((def, _)) => .Some(def)
+			.None => .None
+		}
+	}
+
+	/// The prelude, when it holds a type of this name and is not the module
+	/// being lowered.
+	fn preludeModule(name: Symbol): Option<i64> = {
+		val prelude = self.prelude?
+		if prelude == self.current then return .None
+		return if self.modules[prelude].types.contains(&name) then .Some(prelude) else .None
+	}
+
+	/// A function of the prelude.
+	fn preludeFn(name: Symbol): Option<FnId> = {
+		val prelude = self.prelude?
+		if prelude == self.current then return .None
+		return match self.modules[prelude].fns.get(&name) {
+			.Some(id) => .Some(id)
+			.None => .None
+		}
+	}
+
+	/// A constant of the prelude, which every file sees.
+	fn preludeConst(name: Symbol): Option<ConstId> = {
+		val prelude = self.prelude?
+		if prelude == self.current then return .None
+		return match self.modules[prelude].consts.get(&name) {
+			.Some(id) => .Some(id)
+			.None => .None
+		}
+	}
+
+	/// Reports a name the prelude declares, where another module declares or
+	/// imports it. Returns whether it did.
+	var fn preludeName(name: ast::Name, what: str): bool = {
+		val .Some(prelude) = self.prelude else {
+			return false
+		}
+		if prelude == self.current then return false
+		// Only what the prelude exports is reserved: a name it keeps to itself
+		// is in no file's scope, so nothing can mean two things.
+		val scope = &self.modules[prelude]
+		val isType = match scope.types.get(&name.sym) {
+			.Some((def, _)) => match def {
+				.Struct(id) => self.program.structs[id].isPub
+				.Enum(id) => self.program.enums[id].isPub
+				.Builtin(..) => true
+			}
+			.None => false
+		}
+		val isInterface =
+			scope.interfaces.get(&name.sym) is .Some((id, _)) && self.program.interfaces[id].isPub
+		val isFn = scope.fns.get(&name.sym) is .Some(id) && self.program.fns[id].isPub
+		val isConst = scope.consts.get(&name.sym) is .Some(id) && self.program.consts[id].isPub
+		if !(isType || isInterface || isFn || isConst) then return false
+		val text = String::of(self.text(name.sym))
+		self.report(
+			Diagnostic::error(
+				PRELUDE_NAME,
+				"`\(text)` is a name of the prelude",
+				name.span,
+				"\(what) `\(text)`",
+			).withNote(
+				String::of(
+					"the prelude's names are in scope in every file, and mean one thing in every program",
+				),
+			).withHelp("give this one another name, or name the prelude's as `\(PRELUDE)::\(text)`"),
+		)
+		return true
+	}
+
+	/// Where a name is already a type or an interface of this module.
+	fn declaredAt(name: Symbol): Option<Span> = {
+		if self.types().get(&name) is .Some((_, span)) then return .Some(span)
+		return match self.interfaces().get(&name) {
+			.Some((_, span)) => .Some(span)
+			.None => .None
+		}
+	}
+
+	/// The interface a constraint names, here or in the module it was
+	/// imported from.
+	fn interfaceNamed(name: ast::Name): Option<InterfaceId> = {
+		if self.interfaces().get(&name.sym) is .Some((id, _)) then return .Some(id)
+		// An interface of the prelude, which every file sees without an import.
+		if self.prelude is .Some(prelude) &&
+			prelude != self.current &&
+			self.modules[prelude].interfaces.get(&name.sym) is .Some((id, _)) {
+			return .Some(id)
+		}
+		val .Some(.Item(module, name: item)) = self.imported(name) else {
+			return .None
+		}
+		return match self.modules[module].interfaces.get(&item.sym) {
+			.Some((id, _)) => .Some(id)
+			.None => .None
+		}
+	}
+
+	/// The interface a name written where one is expected names: a bare name
+	/// as `interfaceNamed` finds it, and `module::name` a `pub` interface of
+	/// the module the path names, which it resolves as a type's path. A path
+	/// that names no module, an interface its module keeps to itself, and one
+	/// the module does not have are reported here.
+	var fn interfaceAt(module: &[ast::Name], name: ast::Name): InterfaceAt = {
+		if module.isEmpty() then
+			return match self.interfaceNamed(name) {
+				.Some(id) => .Found(id)
+				.None => .NotFound
+			}
+		var segments = module.toVec()
+		segments.push(name)
+		val .Item(module: index, name: item) = self.resolvePath(
+			&segments,
+			false,
+			MODULE_NOTE,
+		) else {
+			return .Reported
+		}
+		match self.modules[index].interfaces.get(&item.sym) {
+			.Some((id, _)) => {
+				if self.visible(index, self.program.interfaces[id].isPub) then return .Found(id)
+				self.privateItem(index, "interface", item)
+				return .Reported
+			}
+			.None => {}
+		}
+		val text = String::of(self.text(item.sym))
+		val path = self.modules[index].path.clone()
+		var candidates: Vec<str> = Vec()
+		val interfaces = &self.modules[index].interfaces
+		for i in 0..interfaces.len() {
+			if self.visible(index, self.program.interfaces[interfaces.valueAt(i).0].isPub) then
+				candidates.push(self.text(interfaces.keyAt(i).clone()))
+		}
+		var diagnostic = Diagnostic::error(
+			UNKNOWN_INTERFACE,
+			"cannot find interface `\(text)` in module `\(path)`",
+			item.span,
+			String::of("not declared there"),
+		)
+		if suggest(text.toStr(), &candidates) is .Some(similar) then
+			diagnostic = diagnostic.withFix(
+				"did you mean `\(similar)`?",
+				own [Edit::replace(item.span, String::of(similar))],
+			)
+		self.report(move diagnostic)
+		return .Reported
+	}
+
+	/// The interface `module::name` names, as `interfaceAt` finds it, with
+	/// nothing reported: where a block's interface is asked about before the
+	/// block is declared, which reports.
+	fn interfaceAtQuietly(module: &[ast::Name], name: ast::Name): Option<InterfaceId> = {
+		if module.isEmpty() then return self.interfaceNamed(name)
+		var segments = module.toVec()
+		segments.push(name)
+		val .Item(module: index, name: item) = self.resolvePathQuietly(&segments) else {
+			return .None
+		}
+		val .Some((id, _)) = self.modules[index].interfaces.get(&item.sym) else {
+			return .None
+		}
+		return if self.visible(index, self.program.interfaces[id].isPub) then .Some(id) else .None
+	}
+
+	/// Whether a constraint is `copy`, which no path names.
+	fn isCopy(bound: &ast::Bound): bool =
+		bound.module.isEmpty() && self.text(bound.name.sym) == "copy"
+
+	/// The signature of every method of every interface, with `Self` as the
+	/// type parameter an implementation substitutes.
+	var fn declareInterfaceMethods(
+		interfaces: &[(&ast::InterfaceDecl, InterfaceId)],
+		bodies: &var Vec<BodyWork>,
+	) = {
+		for (decl, id) in interfaces {
+			var methods: Vec<InterfaceMethodDef> = Vec()
+			var seen: Map<Symbol, (Span, FnId)> = Map()
+			for method in decl.methods {
+				val (receiver, keyword) = method.receiver
+				// A method's type parameters are `Self`, then the interface's own.
+				var typeParams = Vec::of(own [self.selfParam(id, method.sig.name.span)])
+				for g in self.program.interfaces[id].generics {
+					typeParams.push(g.clone())
+				}
+				val member = Member(
+					receiver: receiver,
+					keyword: keyword,
+					owner: .Interface(id),
+					typeParams: move typeParams,
+					overloaded: false,
+					lent: false,
+				)
+				val none: Vec<ast::Annotation> = Vec()
+				val fnId = self.declareFn(&method.sig, &none, false, decl.isPub, .Some(move member))
+				// Two methods of one name are a lending pair, here as on a type:
+				// one reads and one writes.
+				match seen.get(&method.sig.name.sym) {
+					.Some((first, earlier)) if !self.isLendingPair(earlier, fnId) => self.duplicate(
+						method.sig.name,
+						first,
+					)
+					.Some(_) => {}
+					.None => seen.put(method.sig.name.sym, (method.sig.name.span, fnId))
+				}
+				if method.default is .Some(body) then
+					bodies.push(BodyWork(body: body, id: fnId, span: method.span))
+				methods.push(InterfaceMethodDef(id: fnId, hasDefault: method.default.isSome()))
+			}
+			self.program.interfaces[id].methods = move methods
+			self.checkOneOf(id)
+		}
+	}
+
+	/// The interface an `extend` block names, where it names one rather than
+	/// a type: `extend Iterator<T: Ord> { … }`.
+	fn extendedInterface(block: &ast::ExtendBlock): Option<InterfaceId> = {
+		if block.path.len() != 1 then return .None
+		val name = block.path[0]
+		if block.sliceOf.isSome() ||
+			block.derived.isSome() ||
+			self.types().contains(&name.sym) ||
+			self.aliases().contains(&name.sym) {
+			return .None
+		}
+		return self.interfaceNamed(name)
+	}
+
+	/// `extend Iterator<T: Add + Zero> { move fn sum(): T … }`: methods every
+	/// type that implements the interface has, where the interface's types
+	/// meet the block's condition. Each is declared as a default is, generic
+	/// in `Self` and then the interface's types, whose constraints are the
+	/// condition; it adds nothing to the interface's table, and nothing
+	/// implements anything by it.
+	var fn declareExtension(
+		block: &ast::ExtendBlock,
+		id: InterfaceId,
+		bodies: &var Vec<BodyWork>,
+	) = {
+		val name = block.path[0]
+		val text = String::of(self.text(name.sym))
+		val module = self.program.interfaces[id].module
+		val declared = self.program.interfaces[id].span
+		val expected = self.program.interfaces[id].generics.len()
+		// A method comes with its type or its interface, and is never imported
+		// on its own: one another module added would make what a call means
+		// depend on the imports.
+		if module != self.current as u32 {
+			self.report(
+				Diagnostic::error(
+					EXTENSION,
+					"`\(text)` is declared in another module",
+					name.span,
+					String::of("not an interface of this module"),
+				).withSecondary(declared, String::of("declared here")).withNote(
+					String::of("only the module that declares an interface may extend it"),
+				),
+			)
+			return
+		}
+		if block.interfaceName is .Some(implemented) {
+			self.report(
+				Diagnostic::error(
+					EXTENSION,
+					String::of("an interface implements no interface"),
+					implemented.span,
+					String::of("implemented"),
+				).withNote("`extend \(text)<…> { … }` gives methods to every type that implements `\(text)`, where its types meet a condition"),
+			)
+			return
+		}
+		if block.generics.len() != expected {
+			self.report(
+				Diagnostic::error(
+					EXTENSION,
+					"`\(text)` takes \(plural(expected, "type", "types")), and the block names \(block.generics.len())",
+					name.span,
+					String::of("the interface's types"),
+				).withNote("an extension names each of `\(text)`'s types, with what it asks of it: `extend \(text)<T: Ord>`"),
+			)
+			return
+		}
+		// A method every implementer has is a default, written in the
+		// interface; an extension is for those whose types allow it.
+		var conditioned = false
+		for param in block.generics {
+			if !param.bounds.isEmpty() then conditioned = true
+		}
+		if !conditioned {
+			self.report(
+				Diagnostic::error(
+					EXTENSION,
+					"an extension of `\(text)` with no condition",
+					name.span,
+					String::of("asks nothing of its types"),
+				).withSecondary(declared, String::of("the interface")).withHelp(
+					String::of("write the methods in the interface, as defaults"),
+				),
+			)
+			return
+		}
+		for param in block.generics {
+			for bound in param.bounds {
+				if self.isCopy(&bound) {
+					self.report(
+						Diagnostic::error(
+							EXTENSION,
+							String::of("`copy` is not a condition an extension can have"),
+							bound.span,
+							String::of("not an interface"),
+						).withNote(
+							String::of(
+								"an extension's condition is what the interface's types implement",
+							),
+						),
+					)
+					return
+				}
+			}
+		}
+		// The block's parameters follow `Self`, so they are read with a
+		// stand-in for it in scope.
+		val selfName = self.interner.selfTypeSymbol()
+		val standIn = GenericParamDef(
+			decided: false,
+			name: selfName,
+			written: selfName,
+			copy: false,
+			interfaces: Vec(),
+			default: .None,
+			span: name.span,
+		)
+		self.typeParams = Vec::of(own [standIn.clone()])
+		val params = self.genericParams(&block.generics)
+		self.typeParams.clear()
+		var argTys: Vec<Ty> = Vec()
+		for (i, param) in params.forwards().enumerate() {
+			argTys.push(
+				self.intern(
+					.Param(TyParam(index: i as u32 + 1, name: param.name, copy: param.copy)),
+				),
+			)
+		}
+		val args = self.program.types.internList(&argTys)
+		var selfParam = standIn.clone()
+		selfParam.interfaces = Vec::of(own [Constraint(interfaceId: id, args: args)])
+		var typeParams = Vec::of(own [move selfParam])
+		for p in move params {
+			typeParams.push(move p)
+		}
+		val isPub = self.program.interfaces[id].isPub
+		var seen: Map<Symbol, Span> = Map()
+		for method in block.methods {
+			val .Some((receiver, keyword)) = method.receiver else {
+				continue
+			}
+			val methodName = method.sig.name
+			val methodText = String::of(self.text(methodName.sym))
+			if receiver is .Static | .Lend {
+				self.report(
+					Diagnostic::error(
+						EXTENSION,
+						"`\(methodText)` is not called on a value",
+						keyword,
+						String::of("not `fn`, `var fn` or `move fn`"),
+					).withNote(
+						String::of(
+							"an extension's methods are called on a value of a type that implements the interface",
+						),
+					),
+				)
+				continue
+			}
+			// One name, one method: the interface's own, or one extension's,
+			// whatever their conditions, since two conditions may both hold.
+			var first: Option<Span> = .None
+			for m in self.program.interfaces[id].methods {
+				if first.isNone() && self.program.fns[m.id].name == methodName.sym then
+					first = .Some(self.program.fns[m.id].nameSpan)
+			}
+			for other in self.program.interfaces[id].extensions {
+				if first.isNone() && self.program.fns[other].name == methodName.sym then
+					first = .Some(self.program.fns[other].nameSpan)
+			}
+			if first.isNone() then
+				first = match seen.get(&methodName.sym) {
+					.Some(span) => .Some(span.clone())
+					.None => .None
+				}
+			if first is .Some(first) {
+				self.report(
+					Diagnostic::error(
+						EXTENSION,
+						"`\(text)` has a method `\(methodText)` already",
+						methodName.span,
+						String::of("declared again"),
+					).withSecondary(first, String::of("declared here")).withNote(
+						String::of(
+							"an extension adds methods of names the interface and its other extensions do not have, so a call means one of them",
+						),
+					),
+				)
+				continue
+			}
+			seen.put(methodName.sym, methodName.span)
+			val member = Member(
+				receiver: receiver,
+				keyword: keyword,
+				owner: .Interface(id),
+				typeParams: typeParams.clone(),
+				overloaded: false,
+				lent: false,
+			)
+			val fnId = self.declareFn(
+				&method.sig,
+				&method.annotations,
+				false,
+				isPub,
+				.Some(move member),
+			)
+			match method.body {
+				.Some(body) => bodies.push(BodyWork(body: body, id: fnId, span: method.span))
+				.None => {
+					self.report(
+						Diagnostic::error(
+							EXTENSION,
+							"`\(methodText)` has no body",
+							methodName.span,
+							String::of("no body"),
+						).withNote(
+							String::of(
+								"an extension's methods are written there: no implementation writes them",
+							),
+						),
+					)
+				}
+			}
+			self.program.interfaces[id].extensions.push(fnId)
+		}
+	}
+
+	/// Each `@oneOf` of an interface names two of its methods or more, each
+	/// once, and each with a default, since one without is written anyway; a
+	/// group that does not is reported, and dropped.
+	var fn checkOneOf(id: InterfaceId) = {
+		val groups = mem::replace(&var self.program.interfaces[id].oneOf, Vec())
+		val interfaceName = String::of(self.text(self.program.interfaces[id].name))
+		var kept: Vec<OneOf> = Vec()
+		for group in move groups {
+			var fits = true
+			for i in 0..group.names.len() {
+				val (name, span) = group.names[i]
+				val text = String::of(self.text(name))
+				var first: Option<Span> = .None
+				for j in 0..i {
+					if first.isNone() && group.names[j].0 == name then
+						first = .Some(group.names[j].1)
+				}
+				if first is .Some(first) {
+					self.report(
+						Diagnostic::error(
+							ANNOTATION,
+							"`\(text)` is named twice",
+							span,
+							String::of("named again"),
+						).withSecondary(first, String::of("named here")),
+					)
+					fits = false
+					continue
+				}
+				var method: Option<InterfaceMethodDef> = .None
+				for m in self.program.interfaces[id].methods {
+					if method.isNone() && self.program.fns[m.id].name == name then
+						method = .Some(m.clone())
+				}
+				match method {
+					.None => {
+						self.report(
+							Diagnostic::error(
+								ANNOTATION,
+								"`\(interfaceName)` has no method `\(text)`",
+								span,
+								String::of("not a method of the interface"),
+							).withNote(
+								String::of(
+									"`@oneOf` names methods of the interface it is written on",
+								),
+							),
+						)
+						fits = false
+					}
+					.Some(m) if !m.hasDefault => {
+						self.report(
+							Diagnostic::error(
+								ANNOTATION,
+								"`\(text)` has no default, so every implementation writes it",
+								span,
+								String::of("a method without a default"),
+							).withNote(
+								String::of(
+									"`@oneOf` names methods with defaults, each written with another, of which an implementation writes one at least",
+								),
+							),
+						)
+						fits = false
+					}
+					.Some(_) => {}
+				}
+			}
+			if group.names.len() < 2 {
+				self.report(
+					Diagnostic::error(
+						ANNOTATION,
+						String::of("`@oneOf` names two methods or more"),
+						group.span,
+						plural(group.names.len(), "method named", "methods named"),
+					).withNote(
+						String::of(
+							"one method an implementation must write is a method without a default",
+						),
+					),
+				)
+				fits = false
+			}
+			if fits then kept.push(move group)
+		}
+		self.program.interfaces[id].oneOf = move kept
+	}
+
+	/// Reads the defaults of this file's interfaces' type parameters, once
+	/// every type has a name. A default is read as a method's types are, with
+	/// `Self` and then the interface's own parameters in scope, and may name
+	/// `Self` and the parameters before it: `interface Add<Rhs = Self, Out =
+	/// Self>`.
+	var fn resolveInterfaceDefaults(interfaces: &[(&ast::InterfaceDecl, InterfaceId)]) = {
+		for (decl, id) in interfaces {
+			for index in 0..decl.generics.len() {
+				val param = &decl.generics[index]
+				val .Some(written) = param.default else {
+					continue
+				}
+				val selfParam = self.selfParam(id, decl.name.span)
+				val selfTy = self.intern(
+					.Param(TyParam(index: 0, name: selfParam.name, copy: false)),
+				)
+				var scope = Vec::of(own [move selfParam])
+				for g in self.program.interfaces[id].generics {
+					scope.push(g.clone())
+				}
+				val outer = mem::replace(&var self.typeParams, move scope)
+				val outerSelf = mem::replace(&var self.selfTy, .Some(selfTy))
+				var ty = self.typeArg(written)
+				self.selfTy = outerSelf
+				self.typeParams = move outer
+				val later = self.program.types.any(ty, (kind) =>
+					kind is .Param(param: p) && p.index as i64 > index)
+				if later {
+					val text = String::of(self.text(param.name.sym))
+					self.report(
+						Diagnostic::error(
+							TYPE_PARAMETER_DEFAULT,
+							"the default of `\(text)` names a parameter that is not before it",
+							self.ast.types[written].span,
+							String::of("names a later parameter"),
+						).withNote(
+							String::of(
+								"a use leaves out type arguments from the end, so a default is worked out from `Self` and the ones before it",
+							),
+						),
+					)
+					ty = ERROR
+				}
+				self.program.interfaces[id].generics[index].default = .Ty(ty)
+			}
+		}
+	}
+
+	/// `extend Type: Interface { … }`: the type's methods for that
+	/// interface, checked against it.
+	var fn declareImpl(
+		block: &ast::ExtendBlock,
+		interfaceName: ast::Name,
+		owner: TypeDef,
+		typeParams: &[GenericParamDef],
+		bodies: &var Vec<BodyWork>,
+	) = {
+		val id = match self.interfaceAt(&block.interfaceModule, interfaceName) {
+			.Found(id) => id
+			.Reported => return
+			.NotFound => {
+				val text = String::of(self.text(interfaceName.sym))
+				self.report(
+					Diagnostic::error(
+						UNKNOWN_INTERFACE,
+						"cannot find interface `\(text)`",
+						interfaceName.span,
+						String::of("unknown interface"),
+					).withNote(String::of("an interface is declared `interface Name { … }`")),
+				)
+				return
+			}
+		}
+		// A built-in type is copied, so a drop of one would run per copy.
+		if self.program.preludeItems.interfaceOf(.Destroy) == .Some(id) && owner is .Builtin(..) {
+			val name = self.typeName(owner)
+			self.report(
+				Diagnostic::error(
+					IMPL_TARGET,
+					"`\(name)` cannot clean up after itself",
+					interfaceName.span,
+					String::of("a built-in type"),
+				).withNote(
+					String::of(
+						"a built-in type is copied freely, and `destroy` must run exactly once for exactly one owner",
+					),
+				),
+			)
+			return
+		}
+		val declaredName = self.program.interfaces[id].name
+		val interfacePub = self.program.interfaces[id].isPub
+		val interfaceModule = self.program.interfaces[id].module as i64
+		// `extend ConfigError: From<io::IoError>`: what the interface's own
+		// type parameters are here.
+		val generics = self.program.interfaces[id].generics.clone()
+		val written: Vec<ast::TypeId> = match block.interfaceArgs {
+			.Some(args) => args.args.clone()
+			.None => Vec()
+		}
+		if written.len() < requiredTypeArgs(&generics) || written.len() > generics.len() {
+			for arg in written {
+				self.resolveTy(arg)
+			}
+			self.typeArgCount(declaredName, &generics, written.len(), interfaceName.span)
+			return
+		}
+		var argTys: Vec<Ty> = Vec()
+		// The block's own parameters are in scope for them, which is what
+		// `extend Vec<T>: Items<T>` says.
+		val outer = mem::replace(&var self.typeParams, typeParams.toVec())
+		for i in 0..written.len() {
+			val arg = written[i]
+			val ty = self.typeArg(arg)
+			self.checkCopy(ty, &generics[i], self.ast.types[arg].span)
+			self.checkConstraints(ty, &generics[i], self.ast.types[arg].span)
+			argTys.push(ty)
+		}
+		self.typeParams = move outer
+		// What is left out, as the interface's defaults say, with the type the
+		// block is for as `Self`: `extend Money: Add` is `Add<Money, Money>`.
+		val implementing = self.selfTyOf(owner, &typeParams)
+		val allArgs = self.interfaceDefaults(id, move argTys, implementing)
+		// An operator a built-in type answers itself is an instruction and
+		// never calls an implementation: `extend f32: Multiply<f32, Vec2>`
+		// would never run, so it is refused where it is written. The prelude's
+		// own are the exception: `a + b` between numbers is still the
+		// instruction, and they are what a type parameter reaches.
+		if owner is .Builtin(..) &&
+			self.prelude != .Some(self.current) &&
+			KnownInterface::named(self.text(declaredName)) is .Some(known) &&
+			self.program.preludeItems.interfaceOf(known) == .Some(id) &&
+			known.binaryOp() is .Some(op) &&
+			!allArgs.isEmpty() &&
+			allArgs[0] == implementing &&
+			self.operatorApplies(op, implementing) {
+			val typeName = self.tyName(implementing)
+			val bare = typeName.toStr()[1..typeName.len() - 1]
+			self.report(
+				Diagnostic::error(
+					IMPL_TARGET,
+					"`\(bare) \(op.text()) \(bare)` is the machine's",
+					interfaceName.span,
+					String::of("an operator the type answers itself"),
+				).withNote(
+					String::of(
+						"an operator between two built-in numbers is an instruction, and never calls an implementation",
+					),
+				),
+			)
+			return
+		}
+		val args = self.program.types.internList(&allArgs)
+		if !self.visible(interfaceModule, interfacePub) then
+			self.privateItem(interfaceModule, "interface", interfaceName)
+		// One implementation per interface and type. A type an implementation
+		// decides is not part of which one it is: a second `Items<…>` for one
+		// type is a second implementation.
+		val which = self.undecided(args, &generics)
+		var firstSpan: Option<Span> = .None
+		for i in self.program.impls {
+			if firstSpan.isNone() &&
+				i.interfaceId == id &&
+				i.ty == owner &&
+				self.undecided(i.args, &generics) == which {
+				firstSpan = .Some(i.span)
+			}
+		}
+		val nameSpan = block.path[block.path.len() - 1].span
+		if firstSpan is .Some(first) {
+			val text = String::of(self.text(declaredName))
+			val typeName = self.typeName(owner)
+			// What `@derive` writes comes after the module's own files, so it is
+			// the second.
+			val (label, note) =
+				if block.derived.isSome() then
+					(
+						"`@derive(\(text))` implements it again",
+						"`@derive(\(text))` writes an implementation, and this type has one: a type implements an interface once",
+					)
+				else (
+					String::of("implemented again here"),
+					String::of(
+						"a type implements an interface once, so which implementation applies is never in question",
+					),
+				)
+			self.report(
+				Diagnostic::error(
+					DUPLICATE_IMPL,
+					"`\(typeName)` already implements `\(text)`",
+					nameSpan,
+					move label,
+				).withSecondary(first, String::of("implemented here")).withNote(move note),
+			)
+			return
+		}
+		// The methods the block writes, declared as the type's own. An
+		// interface that takes types may be implemented more than once, and
+		// then one name is declared per implementation.
+		val overloaded = !generics.isEmpty()
+		// A conformance's methods are as visible as the interface, so `pub` on
+		// one says nothing.
+		for method in block.methods {
+			val .Some(pubSpan) = method.pubSpan else {
+				continue
+			}
+			val name = String::of(self.text(declaredName))
+			self.report(
+				Diagnostic::error(
+					REDUNDANT_PUB,
+					String::of("`pub` says nothing here"),
+					pubSpan,
+					"a method of `\(name)`, which says how visible it is",
+				).withFix(
+					String::of("remove `pub`"),
+					own [Edit::replace(pubSpan, String())],
+				).withNote(
+					String::of(
+						"a conformance's methods are as visible as the interface it implements",
+					),
+				),
+			)
+		}
+		// The methods are as visible as the interface, which is what makes the
+		// `pub` above say nothing.
+		self.declareMethodsOf(
+			owner,
+			&typeParams,
+			&block.methods,
+			&var bodies,
+			overloaded,
+			.Some(interfacePub),
+		)
+		var writtenMethods: Vec<(ast::Name, Option<FnId>)> = Vec()
+		for method in block.methods {
+			val name = method.sig.name
+			var found: Option<FnId> = .None
+			for candidate in self.methodsNamed(owner, name.sym) {
+				if found.isNone() && self.program.fns[candidate].nameSpan == name.span then
+					found = .Some(candidate)
+			}
+			writtenMethods.push((name, found))
+		}
+		if block.derived.isSome() {
+			for (_, found) in writtenMethods {
+				if found is .Some(fnId) then self.program.derived.add(fnId)
+			}
+		}
+		val wanted = self.program.interfaces[id].methods.clone()
+		var methods: Vec<FnId> = Vec()
+		var missing: Vec<String> = Vec()
+		for want in wanted {
+			val wantName = self.program.fns[want.id].name
+			// A lending pair is two methods of one name, so which half
+			// implements which is the receiver.
+			val wantReceiver = self.program.fns[want.id].receiver
+			var found: Option<(ast::Name, Option<FnId>)> = .None
+			for (name, fnId) in writtenMethods {
+				val halves = match fnId {
+					.Some(fnId) => self.program.fns[fnId].receiver == wantReceiver
+					.None => true
+				}
+				if found.isNone() && name.sym == wantName && halves then found = .Some((name, fnId))
+			}
+			for (name, fnId) in writtenMethods {
+				if found.isNone() && name.sym == wantName then found = .Some((name, fnId))
+			}
+			match found {
+				.Some((name, .Some(implementation))) => {
+					self.checkSignature(
+						want.id,
+						implementation,
+						owner,
+						args,
+						name,
+						typeParams.len(),
+					)
+					methods.push(implementation)
+				}
+				.Some((_, .None)) => methods.push(want.id)
+				// A method with a default needs no implementation: the
+				// interface's own is used, with `Self` the type.
+				.None if want.hasDefault => {
+					self.addDefault(owner, want.id)
+					methods.push(want.id)
+				}
+				.None => {
+					missing.push(String::of(self.text(wantName)))
+					methods.push(want.id)
+				}
+			}
+		}
+		// A method the interface does not have.
+		for (name, _) in writtenMethods {
+			var known = false
+			for want in wanted {
+				if self.program.fns[want.id].name == name.sym then known = true
+			}
+			if !known {
+				val text = String::of(self.text(name.sym))
+				val interfaceText = String::of(self.text(declaredName))
+				self.report(
+					Diagnostic::error(
+						IMPL_METHODS,
+						"`\(interfaceText)` has no method `\(text)`",
+						name.span,
+						String::of("not a method of the interface"),
+					).withHelp(
+						String::of(
+							"methods that are not the interface's belong in `extend Type { … }`",
+						),
+					),
+				)
+			}
+		}
+		// Of each `@oneOf`, one at least, since each of its methods' defaults
+		// is written with another of them.
+		val interfaceText = String::of(self.text(declaredName))
+		for group in self.program.interfaces[id].oneOf.clone() {
+			var writtenOne = false
+			for (name, _) in group.names {
+				for (w, _) in writtenMethods {
+					if w.sym == name then writtenOne = true
+				}
+			}
+			if writtenOne then continue
+			var names: Vec<String> = Vec()
+			for (name, _) in group.names {
+				names.push("`\(self.text(name))`")
+			}
+			val either = if names.isEmpty() {
+				String()
+			} else {
+				var rest: Vec<String> = Vec()
+				for i in 0..names.len() - 1 {
+					rest.push(names[i].clone())
+				}
+				"\(rest.join(", ")) or \(names[names.len() - 1])"
+			}
+			val typeName = self.typeName(owner)
+			self.report(
+				Diagnostic::error(
+					IMPL_METHODS,
+					"`\(typeName)` does not implement \(either) of `\(interfaceText)`",
+					nameSpan,
+					String::of("write one of them"),
+				).withNote("`\(interfaceText)`'s defaults for them are each written with another, so one must be written here: `@oneOf` says so"),
+			)
+		}
+		if !missing.isEmpty() {
+			val typeName = self.typeName(owner)
+			var names: Vec<String> = Vec()
+			for n in missing {
+				names.push("`\(n)`")
+			}
+			self.report(
+				Diagnostic::error(
+					IMPL_METHODS,
+					"`\(typeName)` does not implement \(plural(missing.len(), "method", "methods")) of `\(interfaceText)`",
+					nameSpan,
+					"missing \(names.join(", "))",
+				).withNote(String::of("every method without a default must be implemented")),
+			)
+		}
+		// What it decides, for `I::Item` once `I` is known.
+		var decides = false
+		for param in generics {
+			if param.decided then decides = true
+		}
+		if decides then self.program.types.addDecided(id, implementing, args)
+		self.program.impls.push(
+			ImplDef(
+				interfaceId: id,
+				args: args,
+				ty: owner,
+				methods: move methods,
+				// When it holds: what the block's parameters must satisfy.
+				conditions: typeParams.toVec(),
+				module: self.current as u32,
+				span: nameSpan,
+			),
+		)
+	}
+
+	/// The arguments of an implementation that say which one it is: those an
+	/// implementation does not decide.
+	fn undecided(list: TyList, generics: &[GenericParamDef]): Vec<Ty> = {
+		var tys: Vec<Ty> = Vec()
+		val all = self.program.types.list(list)
+		var i = 0
+		while i < all.len() && i < generics.len() {
+			if !generics[i].decided then tys.push(all[i])
+			i += 1
+		}
+		return move tys
+	}
+
+	/// Why an interface cannot be a `&dyn`: a call through a pointer knows
+	/// nothing of the type, so it cannot make one, take one by value, or
+	/// choose types for it.
+	fn notDispatchable(interfaceId: InterfaceId, span: Span): Option<Diagnostic> = {
+		val def = &self.program.interfaces[interfaceId]
+		val name = self.text(def.name)
+		// A table of methods is made for a type and an interface; one per set
+		// of type arguments is a different thing.
+		if !def.generics.isEmpty() then
+			return .Some(
+				Diagnostic::error(
+					NOT_DISPATCHABLE,
+					"`\(name)` cannot be used behind `dyn`",
+					span,
+					String::of("an interface that takes types"),
+				).withSecondary(def.span, String::of("declared here")).withNote(
+					String::of(
+						"a table of methods is made for a type and an interface, and a type may implement this one more than once",
+					),
+				),
+			)
+		for method in def.methods {
+			val fnDef = &self.program.fns[method.id]
+			val methodName = self.text(fnDef.name)
+			var selfInParams = false
+			for i in 1..fnDef.params.len() {
+				if self.mentionsSelf(fnDef.params[i].ty) then selfInParams = true
+			}
+			val found: Option<(str, str)> = match fnDef.receiver {
+				.Some(.Static) => .Some(
+					(
+						"a `static fn`",
+						"a function without a receiver needs the type, which a `&dyn` does not name",
+					),
+				)
+				.Some(.Move) => .Some(
+					(
+						"a `move fn`",
+						"taking the receiver by value needs its size, which a `&dyn` does not know",
+					),
+				)
+				_ if fnDef.generics.len() > 1 => .Some(
+					(
+						"type parameters of its own",
+						"each set of type arguments is a function of its own, and a table holds one",
+					),
+				)
+				// `Self` in a parameter or the result needs the type, which a
+				// call through a table does not know.
+				_ if selfInParams || self.mentionsSelf(fnDef.ret) => .Some(
+					("written with `Self`", "a call through a table does not know what `Self` is"),
+				)
+				_ => .None
+			}
+			val .Some((what, why)) = found else {
+				continue
+			}
+			return .Some(
+				Diagnostic::error(
+					NOT_DISPATCHABLE,
+					"`\(name)` cannot be used behind `dyn`",
+					span,
+					"`\(methodName)` is \(what)",
+				).withSecondary(fnDef.nameSpan, String::of("declared here")).
+					withNote(String::of(why)).
+					withHelp("`\(name)` still works as a constraint: `fn f<T: \(name)>(x: &T)`"),
+			)
+		}
+		return .None
+	}
+
+	/// Whether a type mentions the `Self` of an interface's method, which is
+	/// its first type parameter.
+	fn mentionsSelf(ty: Ty): bool = self.program.types.isGeneric(ty)
+
+	/// Whether a type implements an interface: an implementation for it, or,
+	/// for a type parameter, a constraint that requires it.
+	fn implements(ty: Ty, interfaceId: InterfaceId): bool = self.implementsWith(ty, Constraint(
+		interfaceId: interfaceId,
+		args: TyList::empty(),
+	))
+
+	/// Whether the type implements the interface for any arguments at all,
+	/// which is what `x[i]` asks before it looks for an `at`: the arguments
+	/// are the implementation's to say.
+	fn implementsAny(ty: Ty, interfaceId: InterfaceId): bool = {
+		// Plain data is its own clone.
+		if self.program.isClone(interfaceId) && self.program.clonesByCopy(ty) then return true
+		if self.program.referred(ty) is .Some(inner) then
+			return self.program.answeredThroughReferences(interfaceId) &&
+				self.implementsAny(inner, interfaceId)
+		if self.kind(ty) is .Param(param) {
+			if param.index as i64 >= self.typeParams.len() then return false
+			for c in self.typeParams[param.index as i64].interfaces {
+				if c.interfaceId == interfaceId then return true
+			}
+			return false
+		}
+		if self.holdsItsValueElsewhere(ty) then return false
+		val .Some(owner) = self.ownerOf(ty) else {
+			return false
+		}
+		val ownerArgs: Vec<Ty> = match self.kind(ty) {
+			.Struct(args, ..) | .Enum(args, ..) => self.program.types.list(args).toVec()
+			.Slice(elem) => Vec::of(own [elem])
+			_ => Vec()
+		}
+		for (at, i) in self.program.impls.forwards().enumerate() {
+			if i.interfaceId == interfaceId &&
+				i.ty == owner &&
+				self.unmetCondition(at, &ownerArgs).isNone() {
+				return true
+			}
+		}
+		return false
+	}
+
+	/// Whether `ty` is an `own<T>`, or a reference that is not answered by
+	/// what it refers to (`&var T`): a method is looked up through it, as a
+	/// field is, but it implements nothing itself. `own<Point>` is not a
+	/// `Point`, and the code an implementation's call becomes is `Point`'s,
+	/// which takes a `Point` where it is given; asked as a constraint,
+	/// `own<Point>: Eq` would pass and leave nothing to call.
+	fn holdsItsValueElsewhere(ty: Ty): bool = self.kind(ty) is .Own(..) | .Ref(..)
+
+	/// The same, for an interface that takes types: the implementation must
+	/// be the one for those types.
+	fn implementsWith(ty: Ty, wanted: Constraint): bool = {
+		val args = self.program.types.list(wanted.args).toVec()
+		return self.implementsArgs(ty, wanted.interfaceId, &args)
+	}
+
+	/// `implementsWith`, with the interface's arguments as they are rather
+	/// than interned.
+	fn implementsArgs(ty: Ty, interfaceId: InterfaceId, wanted: &[Ty]): bool = {
+		// Plain data is its own clone, a `&T` among it, and a `&T` answers what
+		// `T` answers about itself.
+		if self.program.isClone(interfaceId) && self.program.clonesByCopy(ty) then return true
+		if self.program.referred(ty) is .Some(inner) then
+			return self.program.answeredThroughReferences(interfaceId) &&
+				self.implementsArgs(inner, interfaceId, &wanted)
+		// A decided type asked as the type's own, `I::Item` of `I: Iterator`,
+		// is whatever its implementation decides: it asks nothing.
+		val generics = &self.program.interfaces[interfaceId].generics
+		var open: Vec<bool> = Vec()
+		for at in 0..wanted.len() {
+			val decided = at < generics.len() && generics[at].decided
+			open.push(
+				decided &&
+					self.kind(wanted[at]) is .Assoc(base, interfaceId: i, index) &&
+					base == ty &&
+					i == interfaceId &&
+					index as i64 == at,
+			)
+		}
+		if self.kind(ty) is .Param(param) {
+			if param.index as i64 >= self.typeParams.len() then return false
+			for c in self.typeParams[param.index as i64].interfaces {
+				val have = self.program.types.list(c.args)
+				if c.interfaceId != interfaceId || have.len() != wanted.len() then continue
+				var all = true
+				for k in 0..have.len() {
+					if !open[k] && have[k] != wanted[k] then all = false
+				}
+				if all then return true
+			}
+			return false
+		}
+		if self.holdsItsValueElsewhere(ty) then return false
+		val .Some(owner) = self.ownerOf(ty) else {
+			return false
+		}
+		// An implementation of a generic type is written in that type's
+		// parameters — `extend Vec<T>: Items<T>` — so its arguments are read
+		// with the type's own.
+		val ownerArgs = self.ownerArgs(ty)
+		var candidates: Vec<i64> = Vec()
+		for (at, i) in self.program.impls.forwards().enumerate() {
+			if i.interfaceId == interfaceId &&
+				i.ty == owner &&
+				argsMatchOpen(&self.program.types, i.args, &ownerArgs, &wanted, &open) {
+				candidates.push(at)
+			}
+		}
+		// An implementation may hold only for some type arguments.
+		for at in candidates {
+			if self.unmetCondition(at, &ownerArgs).isNone() then return true
+		}
+		return false
+	}
+
+	/// A type's own type arguments: what an implementation's conditions are
+	/// asked of.
+	fn ownerArgs(ty: Ty): Vec<Ty> = match self.kind(ty) {
+		.Struct(args, ..) | .Enum(args, ..) => self.program.types.list(args).toVec()
+		// An array has a slice's implementations.
+		.Slice(elem) | .Array(elem, ..) => Vec::of(own [elem])
+		_ => Vec()
+	}
+
+	/// The method an interface's implementation gives `ty`, where the
+	/// implementation holds: `extend Option<T: Eq>: Eq` gives `equals` to an
+	/// `Option<i64>` and to no `Option<T>` whose `T` has none.
+	fn methodOfImpl(ty: Ty, interfaceId: InterfaceId): Option<FnId> = {
+		val owner = self.ownerOf(ty)?
+		val args = self.ownerArgs(ty)
+		for (at, i) in self.program.impls.forwards().enumerate() {
+			if i.interfaceId == interfaceId && i.ty == owner {
+				if self.unmetCondition(at, &args).isSome() then return .None
+				return if i.methods.isEmpty() then .None else .Some(i.methods[0])
+			}
+		}
+		return .None
+	}
+
+	/// The condition that keeps a type from implementing an interface it
+	/// otherwise would, for a message.
+	fn unmetFor(ty: Ty, wanted: Constraint): Option<(Ty, Constraint)> = {
+		val owner = self.ownerOf(ty)?
+		val args = self.ownerArgs(ty)
+		for (at, i) in self.program.impls.forwards().enumerate() {
+			if i.interfaceId == wanted.interfaceId &&
+				i.ty == owner &&
+				argsMatch(&self.program.types, i.args, &args, wanted.args) {
+				return self.unmetCondition(at, &args)
+			}
+		}
+		return .None
+	}
+
+	/// Why `ty` does not implement `wanted` where an implementation would hold
+	/// but for its conditions: each argument whose condition is not met, in
+	/// turn, down to one that has no implementation at all.
+	/// `Result<Option<Argument>, E>` compares where `Option<Argument>` does,
+	/// and that where `Argument` does. Empty where no condition holds it back.
+	fn unmetChain(ty: Ty, wanted: Constraint): Vec<(Ty, Constraint)> = {
+		var chain: Vec<(Ty, Constraint)> = Vec()
+		var at = (ty, wanted)
+		while self.unmetFor(at.0, at.1) is .Some(next) {
+			// A type that holds itself would lead round for ever.
+			if next.0 == ty then break
+			var seen = false
+			for (t, _) in chain {
+				if t == next.0 then seen = true
+			}
+			if seen then break
+			chain.push(next)
+			at = next
+		}
+		return move chain
+	}
+
+	/// The chain `unmetChain` found, in words: `X` implements `Eq` where `Y`
+	/// does, `Y` where `Z` does, and `Z` does not.
+	fn unmetHelp(ty: Ty, wanted: Constraint, chain: &[(Ty, Constraint)]): String = {
+		var asked = self.constraintName(wanted, ty)
+		var text = "\(self.tyName(ty)) implements `\(asked)`"
+		for (index, (inside, constraint)) in chain.forwards().enumerate() {
+			val name = self.constraintName(constraint, inside)
+			if index > 0 then text.push(", \(self.tyName(chain[index - 1].0))".toStr())
+			val what = if name == asked then String::of("does") else "implements `\(name)`"
+			text.push(" where \(self.tyName(inside)) \(what)".toStr())
+			asked = move name
+		}
+		if !chain.isEmpty() then
+			text.push(", and \(self.tyName(chain[chain.len() - 1].0)) does not".toStr())
+		return move text
+	}
+
+	/// The module of the standard library that declares `ty`, where one does:
+	/// a program cannot derive or implement an interface for it.
+	fn stdModuleOf(ty: Ty): Option<String> = {
+		val module = match self.kind(ty) {
+			.Struct(id, ..) => self.program.structs[id].module
+			.Enum(id, ..) => self.program.enums[id].module
+			_ => return .None
+		}
+		val path = &self.modules[module as i64].path
+		return if path == "std" || path.startsWith("std::") then .Some(path.clone()) else .None
+	}
+
+	/// The condition an implementation asks for that this type's arguments do
+	/// not meet, if there is one.
+	fn unmetCondition(at: i64, args: &[Ty]): Option<(Ty, Constraint)> = {
+		val conditions = &self.program.impls[at].conditions
+		var i = 0
+		while i < conditions.len() && i < args.len() {
+			val arg = args[i]
+			for constraint in conditions[i].interfaces {
+				// A condition may name the type's other parameters: `extend
+				// Mapped<I: Iterator<T>, T, U>` asks the first argument for the
+				// second.
+				val types = &self.program.types
+				var wanted: Vec<Ty> = Vec()
+				var made = true
+				for t in types.list(constraint.args) {
+					match types.trySubstFind(t, &args) {
+						.Some(found) => wanted.push(found)
+						.None => made = false
+					}
+				}
+				// What it would be was never made, so nothing implements it.
+				val met = made && self.implementsArgs(arg, constraint.interfaceId, &wanted)
+				if !met then return .Some((arg, constraint))
+			}
+			i += 1
+		}
+		return .None
+	}
+
+	/// A constraint as a program writes it, on `subject`: the arguments that
+	/// are what their defaults would be left out, as a type's are, so `T: Add`
+	/// is not shown as `Add<T, T>`.
+	fn constraintName(constraint: Constraint, subject: Ty): String = {
+		val def = &self.program.interfaces[constraint.interfaceId]
+		val name = String::of(self.text(def.name))
+		val args = self.program.types.list(constraint.args)
+		var shown = args.len()
+		while shown > 0 {
+			if shown - 1 >= def.generics.len() then break
+			val .Ty(default) = def.generics[shown - 1].default else {
+				break
+			}
+			var known = Vec::of(own [subject])
+			for k in 0..shown - 1 {
+				known.push(args[k])
+			}
+			if self.program.types.trySubstFind(default, &known) != .Some(args[shown - 1]) then break
+			shown -= 1
+		}
+		if shown == 0 then return move name
+		var written: Vec<String> = Vec()
+		for k in 0..shown {
+			written.push(self.program.tyName(args[k], self.interner))
+		}
+		return "\(name)<\(written.join(", "))>"
+	}
+
+	/// A type argument against the interfaces its parameter requires.
+	var fn checkConstraints(ty: Ty, param: &GenericParamDef, span: Span) = {
+		val none: [Ty; 0] = []
+		self.checkConstraintsIn(ty, &param, span, &none)
+	}
+
+	/// The same, where the constraint's own type arguments name the item's
+	/// parameters: they are substituted with what those turned out to be.
+	var fn checkConstraintsIn(ty: Ty, param: &GenericParamDef, span: Span, solution: &[Ty]) = {
+		if self.isPoisoned(ty) then return
+		var constraints: Vec<Constraint> = Vec()
+		for declared in param.interfaces {
+			val args = if solution.isEmpty() {
+				// The item's other arguments are not known here, but this
+				// parameter's is: `T: Add` is `Add<T, T>`, and `T` is the type
+				// being checked.
+				var replaced: Vec<Ty> = Vec()
+				for arg in self.program.types.list(declared.args).toVec() {
+					replaced.push(self.program.types.replaceParam(arg, param.name, ty))
+				}
+				self.program.types.internList(&replaced)
+			} else {
+				self.program.types.substList(declared.args, &solution)
+			}
+			constraints.push(Constraint(interfaceId: declared.interfaceId, args: args))
+		}
+		// Nothing implements anything until the `extend` blocks are declared,
+		// so a type written before then — a field's, an alias's — is checked
+		// once they are. A type that mentions a type parameter is not one of
+		// those: what it implements is what the parameter promises, which is
+		// known here and forgotten later.
+		if self.phase < .ImplsDeclared && !self.program.types.isGeneric(ty) {
+			for constraint in constraints {
+				self.pendingConstraints.push(PendingConstraint(
+					ty: ty,
+					constraint: constraint,
+					written: param.written,
+					declared: param.span,
+					span: span,
+				))
+			}
+			return
+		}
+		for constraint in constraints {
+			self.checkOneConstraint(ty, constraint, param.written, param.span, span)
+		}
+	}
+
+	/// A type indexed by a position says so once: by `Sequence<T>`, which is
+	/// `x[i]` and `for` together, or by `Index<i64, V>`, not both, or `x[i]`
+	/// would have two meanings.
+	var fn oneWayByPosition() = {
+		val .Some(index) = self.program.preludeItems.interfaceOf(.Index) else {
+			return
+		}
+		val .Some(sequence) = self.program.preludeItems.interfaceOf(.Sequence) else {
+			return
+		}
+		var clashes: Vec<(Span, Span, String)> = Vec()
+		for a in 0..self.program.impls.len() {
+			if self.program.impls[a].interfaceId != sequence then continue
+			for b in 0..self.program.impls.len() {
+				val list = self.program.types.list(self.program.impls[b].args)
+				if self.program.impls[b].interfaceId == index &&
+					self.program.impls[b].ty == self.program.impls[a].ty &&
+					!list.isEmpty() &&
+					list[0] == I64 {
+					clashes.push(
+						(
+							self.program.impls[a].span,
+							self.program.impls[b].span,
+							self.typeName(self.program.impls[a].ty),
+						),
+					)
+					break
+				}
+			}
+		}
+		for (walked, indexed, name) in clashes {
+			self.report(
+				Diagnostic::error(
+					DUPLICATE_IMPL,
+					"`\(name)` is indexed by a position twice",
+					walked,
+					String::of("`Sequence` says what `x[i]` finds"),
+				).withSecondary(indexed, String::of("and so does `Index<i64, …>`")).
+					withHelp(
+						String::of(
+							"keep `Sequence`, which gives `x[i]` and `for` both, and remove the `Index`",
+						),
+					).
+					withNote(
+						String::of(
+							"a container indexed by a position from 0 implements `Sequence`; `Index` is for a lookup whose key is not a position",
+						),
+					),
+			)
+		}
+	}
+
+	/// Runs the constraint checks that waited for the implementations.
+	var fn flushConstraintChecks() = {
+		self.phase = .ImplsDeclared
+		self.oneWayByPosition()
+		for pending in mem::replace(&var self.pendingConstraints, Vec()) {
+			self.checkOneConstraint(
+				pending.ty,
+				pending.constraint,
+				pending.written,
+				pending.declared,
+				pending.span,
+			)
+		}
+	}
+
+	/// One constraint, against the type given for the parameter.
+	var fn checkOneConstraint(
+		ty: Ty,
+		constraint: Constraint,
+		written: Symbol,
+		declared: Span,
+		span: Span,
+	) = {
+		// Whether it is plain data, and so its own clone, is read from its
+		// fields' types.
+		completeType(&var self.program, ty)
+		if self.implementsWith(ty, constraint) then return
+		val interfaceId = constraint.interfaceId
+		val name = self.constraintName(constraint, ty)
+		// An implementation that would hold but for a condition says which
+		// one.
+		val unmet = self.unmetChain(ty, constraint)
+		val paramName = String::of(self.text(written))
+		val note = if self.program.referred(ty).isSome() &&
+			!self.program.answeredThroughReferences(interfaceId) {
+			// A reference answers only what reads its value.
+			"a `&` reference answers what its value answers about itself, through `&` alone — `Eq`, `Ord`, `Hash`, `Text` — and is `Clone`; `\(name)` takes, changes or answers a `Self`"
+		} else if self.kind(ty) is .Own(inner) &&
+			self.program.answeredThroughReferences(interfaceId) &&
+			self.implementsWith(inner, constraint) {
+			// A box is not what it holds: what it holds may implement it, and
+			// where a reference to it would do, lends it.
+			val innerName = self.tyName(inner)
+			val bare = innerName.toStr()[1..innerName.len() - 1]
+			"an `own<T>` implements nothing itself, whatever its `T` does; where \(innerName) is wanted, `&` of the box lends it, and a type argument written out, `<\(bare)>`, asks for it"
+		} else {
+			"a type implements an interface by `extend …: \(name)`"
+		}
+		var diagnostic = Diagnostic::error(
+			UNSATISFIED_CONSTRAINT,
+			"\(self.tyName(ty)) does not implement `\(name)`",
+			span,
+			"`\(paramName)` requires `\(name)`",
+		).withSecondary(declared, "`\(paramName): \(name)` declared here").withNote(move note)
+		// Text is left out of the sequences on purpose, and says so.
+		val isText = self.kind(ty) == .Str || self.program.isString(ty)
+		if isText && self.program.preludeItems.interfaceOf(.Sequence) == .Some(interfaceId) then
+			diagnostic = diagnostic.withHelp(
+				String::of(
+					"text is not a sequence: its positions are bytes, not characters; walk the characters with `chars()`, or lend the bytes with `items()`",
+				),
+			)
+		// The three the compiler can write are worth naming, since a struct or
+		// an enum asks for them with an annotation rather than a block.
+		val declares = self.kind(ty) is .Struct(..) | .Enum(..)
+		val annotation: Option<str> = match self.program.preludeItems.whichInterface(interfaceId) {
+			.Some(.Eq) => .Some("@derive(Eq)")
+			.Some(.Ord) => .Some("@derive(Ord)")
+			.Some(.Hash) => .Some("@derive(Hash)")
+			.Some(.Clone) => .Some("@derive(Clone)")
+			_ => .None
+		}
+		if !unmet.isEmpty() then
+			diagnostic = diagnostic.withHelp(self.unmetHelp(ty, constraint, &unmet))
+		if annotation is .Some(annotation) && declares && unmet.isEmpty() then
+			diagnostic = diagnostic.withHelp("`\(annotation)` on the declaration writes it from the fields")
+		self.report(move diagnostic)
+	}
+
+	/// A method with a default becomes the type's own, so it is called like
+	/// any other; it is generic in `Self`, and each type gets an instance.
+	var fn addDefault(owner: TypeDef, method: FnId) = {
+		val name = self.program.fns[method].name
+		if self.methodOf(owner, name).isSome() then return
+		match owner {
+			.Struct(id) => self.program.structs[id].methods.push(method)
+			.Enum(id) => self.program.enums[id].methods.push(method)
+			.Builtin(builtin) => {
+				var built = match self.program.builtins.get(&builtin) {
+					.Some(found) => found.clone()
+					.None => BuiltinImpl()
+				}
+				built.methods.push(method)
+				self.program.builtins.put(builtin, move built)
+			}
+		}
+	}
+
+	/// An implementation's method against the interface's, with `Self` read
+	/// as the type: the same receiver, the same parameters and the same
+	/// result.
+	var fn checkSignature(
+		want: FnId,
+		got: FnId,
+		owner: TypeDef,
+		interfaceArgs: TyList,
+		name: ast::Name,
+		typeParams: i64,
+	) = {
+		val selfTy = self.ownSelfTy(owner)
+		val wanted = self.program.fns[want].clone()
+		val gotDef = self.program.fns[got].clone()
+		val .Some(interfaceId) = wanted.interfaceId else {
+			panic("an interface's method knows its interface")
+		}
+		val interfaceName = String::of(self.text(self.program.interfaces[interfaceId].name))
+		val method = String::of(self.text(wanted.name))
+		if wanted.receiver != gotDef.receiver {
+			val wantText = match wanted.receiver {
+				.Some(r) => r.text()
+				.None => panic("a method has a receiver")
+			}
+			val gotText = match gotDef.receiver {
+				.Some(r) => r.text()
+				.None => panic("a method has a receiver")
+			}
+			self.signatureMismatch(
+				method.toStr(),
+				interfaceName.toStr(),
+				name,
+				wanted.nameSpan,
+				"declared `\(gotText)`, and the interface declares `\(wantText)`",
+				"a method takes the receiver its interface declares",
+			)
+			return
+		}
+		// The interface's own type parameters come after `Self`, which the type
+		// replaces.
+		var all = Vec::of(own [selfTy])
+		for t in self.program.types.list(interfaceArgs) {
+			all.push(t)
+		}
+		val args = self.program.types.internList(&all)
+		// The interface's method has `Self` and its own parameters; the
+		// implementation has the type's and its own.
+		val interfaceGenerics = self.program.types.list(interfaceArgs).len()
+		if wanted.generics.len() - 1 - interfaceGenerics != gotDef.generics.len() - typeParams {
+			self.signatureMismatch(
+				method.toStr(),
+				interfaceName.toStr(),
+				name,
+				wanted.nameSpan,
+				String::of("a different number of type parameters"),
+				"a method has the type parameters its interface declares",
+			)
+			return
+		}
+		if wanted.params.len() != gotDef.params.len() {
+			self.signatureMismatch(
+				method.toStr(),
+				interfaceName.toStr(),
+				name,
+				wanted.nameSpan,
+				"takes \(plural(gotDef.params.len(), "parameter", "parameters")), and the interface declares \(wanted.params.len())",
+				"a method takes the parameters its interface declares",
+			)
+			return
+		}
+		for i in 1..wanted.params.len() {
+			val expected = self.substSelf(wanted.params[i].ty, args)
+			if expected != gotDef.params[i].ty && !self.hasError(expected) {
+				val expectedName = self.tyName(expected)
+				val actual = self.tyName(gotDef.params[i].ty)
+				val param = String::of(self.text(gotDef.params[i].name))
+				self.signatureMismatch(
+					method.toStr(),
+					interfaceName.toStr(),
+					name,
+					wanted.nameSpan,
+					"`\(param)` is \(actual), and the interface declares \(expectedName)",
+					"a method's parameters are its interface's, with `Self` the type",
+				)
+				return
+			}
+		}
+		val expected = self.substSelf(wanted.ret, args)
+		if expected != gotDef.ret && !self.hasError(expected) {
+			val expectedName = self.tyName(expected)
+			val actual = self.tyName(gotDef.ret)
+			self.signatureMismatch(
+				method.toStr(),
+				interfaceName.toStr(),
+				name,
+				wanted.nameSpan,
+				"returns \(actual), and the interface declares \(expectedName)",
+				"a method returns what its interface declares, with `Self` the type",
+			)
+		}
+		// A call through the interface keeps what the interface says, so an
+		// implementation may keep no more.
+		for extra in gotDef.keeps {
+			if wanted.keeps.contains(&extra) then continue
+			val param = String::of(self.text(gotDef.params[extra as i64].name))
+			self.report(
+				Diagnostic::error(
+					KEEPS,
+					"`\(method)` keeps `\(param)`, and `\(interfaceName)` does not say it may",
+					name.span,
+					"keeps `\(param)`",
+				).withSecondary(
+					wanted.nameSpan,
+					String::of("declared here, keeping less"),
+				).withNote(
+					String::of(
+						"a call through the interface keeps only what the interface's `keeps` names, so an implementation keeps no more",
+					),
+				),
+			)
+			break
+		}
+	}
+
+	/// An implementation's method that does not match its interface's.
+	var fn signatureMismatch(
+		method: str,
+		interfaceName: str,
+		name: ast::Name,
+		declared: Span,
+		label: String,
+		note: str,
+	) = {
+		self.report(
+			Diagnostic::error(
+				IMPL_METHODS,
+				"`\(method)` does not match `\(interfaceName)`",
+				name.span,
+				move label,
+			).withSecondary(declared, String::of("declared here")).withNote(String::of(note)),
+		)
+	}
+
+	/// A type of an interface's method, with the implementing type in place
+	/// of `Self`.
+	var fn substSelf(ty: Ty, args: TyList): Ty = {
+		val tys = self.program.types.list(args).toVec()
+		return self.program.types.subst(ty, &tys)
+	}
+
+	/// `Self`: the one type parameter of an interface's methods, required to
+	/// implement the interface itself, so a default body may call its other
+	/// methods.
+	var fn selfParam(interfaceId: InterfaceId, span: Span): GenericParamDef = {
+		val name = self.interner.selfTypeSymbol()
+		// `Self: From<T>` inside `interface From<T>`: the interface's own
+		// parameters, which follow `Self` in a method's type arguments, so a
+		// call substitutes them along with it.
+		val generics = self.program.interfaces[interfaceId].generics.clone()
+		var argTys: Vec<Ty> = Vec()
+		for (i, param) in generics.forwards().enumerate() {
+			argTys.push(
+				self.intern(
+					.Param(TyParam(index: i as u32 + 1, name: param.name, copy: param.copy)),
+				),
+			)
+		}
+		val args = self.program.types.internList(&argTys)
+		return GenericParamDef(
+			decided: false,
+			name: name,
+			written: name,
+			copy: false,
+			interfaces: Vec::of(own [Constraint(interfaceId: interfaceId, args: args)]),
+			default: .None,
+			span: span,
+		)
+	}
+}

@@ -14,15 +14,22 @@ shows a call's signature as you type its arguments.
 ## The `wip` command
 
 Both editors start the server as `wip lsp`, so `wip` must be on your
-`PATH`. From the repository:
+`PATH`. From the repository, with a `clang` 15 or newer:
 
 ```sh
-cargo install --path crates/wip-lang
+scripts/bootstrap.sh --out ~/wip
+export PATH="$HOME/wip/bin:$PATH"
 wip --version
 ```
 
-This puts `wip` in `~/.cargo/bin`. Run it again after the compiler
-changes, so the editors serve the new one.
+This builds the compiler into `~/wip`, `bin/wip` beside the standard
+library it reads, which is the repository's own: a change to the library
+is seen at once. After the compiler changes, build it again from its
+source, so the editors serve the new one:
+
+```sh
+scripts/build.sh --release --out ~/wip
+```
 
 ## Neovim
 

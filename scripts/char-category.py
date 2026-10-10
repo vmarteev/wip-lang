@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 # Writes std/prelude/category.wip: whether a character is a letter or a
 # number, by Unicode's general categories, from the Unicode data Python
-# carries.
+# carries. The compiler's lexer asks the same table whether what it cannot
+# read begins with a letter, so that it answers as the library does.
 #
 #   scripts/char-category.py          write it
 #   scripts/char-category.py --check  fail if it is not what would be written
@@ -87,17 +88,18 @@ extend char {{
 
 
 if __name__ == "__main__":
-    path = "std/prelude/category.wip"
-    wanted = text()
+    outputs = [("std/prelude/category.wip", text())]
     if "--check" in sys.argv:
-        with open(path) as f:
-            found = f.read()
-        written = re.search(r"from Unicode ([0-9.]+);", found)
-        if written is None or written.group(1) != unicodedata.unidata_version:
-            print(f"{path}: not checked, as this Python has Unicode {unicodedata.unidata_version}")
-            sys.exit(0)
-        if found != wanted:
-            sys.exit(f"{path} is not what scripts/char-category.py writes")
+        for path, wanted in outputs:
+            with open(path) as f:
+                found = f.read()
+            written = re.search(r"from Unicode ([0-9.]+);", found)
+            if written is None or written.group(1) != unicodedata.unidata_version:
+                print(f"{path}: not checked, as this Python has Unicode {unicodedata.unidata_version}")
+                continue
+            if found != wanted:
+                sys.exit(f"{path} is not what scripts/char-category.py writes")
         sys.exit(0)
-    with open(path, "w") as f:
-        f.write(wanted)
+    for path, wanted in outputs:
+        with open(path, "w") as f:
+            f.write(wanted)

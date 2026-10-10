@@ -1,0 +1,771 @@
+// What `@derive` writes: for each struct and enum of a module that asks, an
+// `extend Type: Interface` whose method is ordinary code, built as
+// syntax-tree nodes after the module is parsed and checked as the
+// program's own code is. A field then compares or clones by whatever
+// implementation its type has, generic or not.
+//
+// Every node is placed at the `@derive` argument that asked for it, in the
+// programmer's own source, and the block says so (`ExtendBlock.derived`):
+// the checker reports what keeps a derive from applying where the field is
+// written, and an editor passes over what the programmer did not write.
+//
+// All five are written here: `Eq` and `Ord`, `Hash`, `Text` and `Clone`.
+
+import std::mem
+
+/// What `@derive` writes for the types of one module, whose files are
+/// `files`: one more syntax tree of the module, with an `extend` block for
+/// each interface a type asks for. Empty where no type asks.
+pub fn expand(files: &[Parsed], interner: &var Interner): Ast = {
+	val names = Names::new(&var interner)
+	// The builder holds the interner while it runs, and gives it back.
+	var builder = Builder(
+		out: Ast(),
+		interner: mem::replace(&var interner, Interner::new()),
+		names: names,
+		at: Span::new(0, 0),
+	)
+	for file in files {
+		for item in file.ast.items {
+			match item {
+				// An `extern union`'s fields lie over the same bytes, so
+				// none of them is the value to compare or to clone.
+				.Struct(decl) if !decl.isUnion => builder.derives(
+					&decl.annotations,
+					decl.name.sym,
+					&decl.generics,
+					&item,
+				)
+				.Enum(decl) => builder.derives(
+					&decl.annotations,
+					decl.name.sym,
+					&decl.generics,
+					&item,
+				)
+				_ => {}
+			}
+		}
+	}
+	interner = move builder.interner
+	return move builder.out
+}
+
+/// The interfaces written here.
+@derive(Eq, Clone)
+enum Derive {
+	Eq
+	Ord
+	Hash
+	Text
+	Clone
+}
+
+extend Derive {
+	fn interfaceOf(names: &Names): Symbol = match self {
+		.Eq => names.eq
+		.Ord => names.ord
+		.Hash => names.hash
+		.Text => names.text
+		.Clone => names.cloneInterface
+	}
+}
+
+/// The names the expansion writes: the prelude's, which no program can
+/// declare again (E0345), `derive` to find what asks, and the names its
+/// methods bind, which hold a `#` no program can write.
+struct Names {
+	derive: Symbol
+	eq: Symbol
+	equals: Symbol
+	ord: Symbol
+	compare: Symbol
+	ordering: Symbol
+	less: Symbol
+	same: Symbol
+	more: Symbol
+	hash: Symbol
+	hashInto: Symbol
+	hasher: Symbol
+	writeInt: Symbol
+	out: Symbol
+	text: Symbol
+	appendTo: Symbol
+	string: Symbol
+	push: Symbol
+	cloneInterface: Symbol
+	clone: Symbol
+	cloneOf: Symbol
+	boolType: Symbol
+	other: Symbol
+	order: Symbol
+	/// `Self`, which names the type without looking its name up: a type
+	/// whose name was refused is still the one that asked.
+	selfType: Symbol
+}
+
+extend Names {
+	static fn new(interner: &var Interner): Names = Names(
+		derive: interner.intern("derive"),
+		eq: interner.intern("Eq"),
+		equals: Symbol::equalsMethod(),
+		ord: interner.intern("Ord"),
+		compare: Symbol::compareMethod(),
+		ordering: interner.intern("Ordering"),
+		less: interner.intern("Less"),
+		same: interner.intern("Same"),
+		more: interner.intern("More"),
+		hash: interner.intern("Hash"),
+		hashInto: Symbol::hashIntoMethod(),
+		hasher: interner.intern("Hasher"),
+		writeInt: interner.intern("writeInt"),
+		out: interner.intern("out"),
+		text: interner.intern("Text"),
+		appendTo: Symbol::appendTo(),
+		string: Symbol::stringType(),
+		push: Symbol::push(),
+		cloneInterface: interner.intern("Clone"),
+		clone: interner.intern("clone"),
+		cloneOf: interner.intern("cloneOf"),
+		boolType: interner.intern("bool"),
+		other: interner.intern("other"),
+		order: interner.intern("order#"),
+		selfType: interner.selfTypeSymbol(),
+	)
+}
+
+/// Where `@derive` names `interface`, if it does: the argument's span.
+fn asks(annotations: &[Annotation], names: &Names, wanted: Symbol): Option<Span> = {
+	for annotation in annotations {
+		if annotation.name.sym != names.derive then continue
+		for arg in annotation.args {
+			if arg.value == .Name(wanted) then return .Some(arg.span)
+		}
+	}
+	return .None
+}
+
+/// A piece of what `Text` writes: text as it is, or a value that writes
+/// itself.
+enum TextPiece {
+	Text(text: String)
+	Value(value: ExprId)
+}
+
+/// Which side of a comparison a variant's fields are bound for: `self`'s,
+/// or the other value's.
+@derive(Eq, Clone)
+enum Side {
+	This
+	Other
+}
+
+/// Builds the nodes of one derived block into `out`, each placed at `at`.
+struct Builder {
+	out: Ast
+	interner: Interner
+	names: Names
+	at: Span
+}
+
+extend Builder {
+	/// The blocks a struct or an enum asks for, each placed at the argument
+	/// of `@derive` that names its interface, into `out`.
+	var fn derives(
+		annotations: &[Annotation],
+		name: Symbol,
+		generics: &[GenericParam],
+		item: &Item,
+	) = {
+		for derive in [Derive::Eq, Derive::Ord, Derive::Hash, Derive::Text, Derive::Clone] {
+			// An enum with no variants has no value to clone from.
+			if derive == .Clone && item is .Enum(decl) && decl.variants.isEmpty() then continue
+			val .Some(at) = asks(&annotations, &self.names, derive.interfaceOf(&self.names)) else {
+				continue
+			}
+			self.at = at
+			val block = self.block(derive, name, &generics, &item)
+			self.out.items.push(.Extend(move block))
+		}
+	}
+
+	/// `extend Type<T: Interface>: Interface { fn method(…): … = body }`:
+	/// the type's parameters are bound by the interface, so each field of a
+	/// parameter's type has it, and keep what the type binds them by, as in
+	/// any `extend` of it.
+	var fn block(
+		derive: Derive,
+		ty: Symbol,
+		generics: &[GenericParam],
+		item: &Item,
+	): ExtendBlock = {
+		val names = self.names
+		val made: (Symbol, Vec<Param>, Option<TypeId>, ExprId) = match derive {
+			// `fn equals(other: &Self): bool`
+			.Eq => {
+				val body = match item {
+					.Struct(decl) => {
+						val pairs = self.fieldPairs(&decl.fields)
+						self.allEqual(move pairs)
+					}
+					.Enum(decl) => self.eqVariants(&decl.variants)
+					_ => panic("a struct or an enum")
+				}
+				val ret = self.namedType(names.boolType)
+				(names.equals, Vec::of(own [self.otherParam()]), .Some(ret), body)
+			}
+			// `fn compare(other: &Self): Ordering`
+			.Ord => {
+				val body = match item {
+					.Struct(decl) => {
+						val pairs = self.fieldPairs(&decl.fields)
+						self.firstDifference(move pairs)
+					}
+					.Enum(decl) => self.ordVariants(&decl.variants)
+					_ => panic("a struct or an enum")
+				}
+				val ret = self.namedType(names.ordering)
+				(names.compare, Vec::of(own [self.otherParam()]), .Some(ret), body)
+			}
+			// `fn hashInto(out: &var Hasher)`
+			.Hash => {
+				val body = match item {
+					.Struct(decl) => {
+						var parts: Vec<ExprId> = Vec()
+						for field in decl.fields {
+							val this = self.expr(.SelfRef)
+							parts.push(self.field(this, field.name.sym))
+						}
+						self.hashParts(.None, move parts)
+					}
+					.Enum(decl) => self.hashVariants(&decl.variants)
+					_ => panic("a struct or an enum")
+				}
+				(names.hashInto, Vec::of(own [self.outParam(names.hasher)]), .None, body)
+			}
+			// `fn appendTo(out: &var String)`
+			.Text => {
+				val body = match item {
+					.Struct(decl) => self.textStruct(ty, &decl.fields)
+					.Enum(decl) => self.textVariants(&decl.variants)
+					_ => panic("a struct or an enum")
+				}
+				(names.appendTo, Vec::of(own [self.outParam(names.string)]), .None, body)
+			}
+			// `fn clone(): Self`
+			.Clone => {
+				val body = match item {
+					.Struct(decl) => self.cloneStruct(&decl.fields)
+					.Enum(decl) => self.cloneVariants(&decl.variants)
+					_ => panic("a struct or an enum")
+				}
+				val ret = self.namedType(names.selfType)
+				(names.clone, Vec(), .Some(ret), body)
+			}
+		}
+		val (method, params, ret, body) = move made
+		val implemented = derive.interfaceOf(&names)
+		var bound: Vec<GenericParam> = Vec()
+		for param in generics {
+			bound.push(GenericParam(
+				decided: .None,
+				name: self.name(param.name.sym),
+				bounds: Vec::of(own [
+					Bound(module: Vec(), name: self.name(implemented), args: Vec(), span: self.at),
+				]),
+				default: .None,
+				span: self.at,
+			))
+		}
+		val declared = FnDecl(
+			annotations: Vec(),
+			sig: FnSig(
+				name: self.name(method),
+				generics: Vec(),
+				params: move params,
+				variadic: .None,
+				ret: ret,
+				lendsFrom: Vec(),
+				keeps: Vec(),
+				span: self.at,
+			),
+			body: .Some(body),
+			isPub: false,
+			pubSpan: .None,
+			receiver: .Some((.Read, self.at)),
+			span: self.at,
+		)
+		return ExtendBlock(
+			annotations: Vec(),
+			sliceOf: .None,
+			interfaceName: .Some(self.name(implemented)),
+			interfaceModule: Vec(),
+			interfaceArgs: .None,
+			path: Vec::of(own [self.name(ty)]),
+			generics: move bound,
+			methods: Vec::of(own [move declared]),
+			derived: .Some(self.at),
+			span: self.at,
+		)
+	}
+
+	// ---- Eq ----
+
+	/// `a == c && b == d`, and `true` where there is nothing to compare.
+	var fn allEqual(pairs: Vec<(ExprId, ExprId)>): ExprId = {
+		var all: Option<ExprId> = .None
+		for (this, other) in pairs {
+			val equal = self.binary(.Eq, this, other)
+			all = .Some(
+				match all {
+					.Some(before) => self.binary(.And, before, equal)
+					.None => equal
+				},
+			)
+		}
+		return match all {
+			.Some(all) => all
+			.None => self.expr(.Bool(true))
+		}
+	}
+
+	/// `match self { .Circle(r: self#r) => match other { .Circle(r: other#r) => self#r == other#r  _ => false } … }`.
+	var fn eqVariants(variants: &[Variant]): ExprId = {
+		var arms: Vec<Arm> = Vec()
+		for variant in variants {
+			val (inner, pairs) = self.boundPairs(&variant)
+			val same = self.allEqual(move pairs)
+			var inside = Vec::of(own [self.arm(move inner, same)])
+			if variants.len() > 1 {
+				val differ = self.expr(.Bool(false))
+				inside.push(self.arm(self.wildcard(), differ))
+			}
+			val other = self.other()
+			val body = self.expr(.Match(scrutinee: other, arms: move inside))
+			val outer = self.bound(&variant, .This)
+			arms.push(self.arm(move outer, body))
+		}
+		val this = self.expr(.SelfRef)
+		return self.expr(.Match(scrutinee: this, arms: move arms))
+	}
+
+	// ---- Ord ----
+
+	/// The first of `a.compare(&c)`, `b.compare(&d)`, … that is not `.Same`,
+	/// and `.Same` where every one is:
+	/// `match a.compare(&c) { .Same => b.compare(&d)  order# => order# }`.
+	var fn firstDifference(pairs: Vec<(ExprId, ExprId)>): ExprId = {
+		if pairs.isEmpty() then return self.variant(self.names.same)
+		val (lastThis, lastOther) = pairs[pairs.len() - 1]
+		var rest = self.compareCall(lastThis, lastOther)
+		var i = pairs.len() - 1
+		while i > 0 {
+			i -= 1
+			val (this, other) = pairs[i]
+			val order = self.compareCall(this, other)
+			val same = self.variantPattern(self.names.same, .None)
+			val differs = Pattern(kind: .Binding(self.names.order), span: self.at)
+			val answer = self.expr(.Name(self.names.order))
+			val arms = Vec::of(own [self.arm(move same, rest), self.arm(move differs, answer)])
+			rest = self.expr(.Match(scrutinee: order, arms: move arms))
+		}
+		return rest
+	}
+
+	/// `match self { .Dot => match other { .Dot => .Same  .Circle(..) => .More  _ => .Less } … }`:
+	/// two values of one variant by their fields, and of two by the order
+	/// the variants are written in.
+	var fn ordVariants(variants: &[Variant]): ExprId = {
+		var arms: Vec<Arm> = Vec()
+		for (i, variant) in variants.forwards().enumerate() {
+			val (inner, pairs) = self.boundPairs(&variant)
+			val order = self.firstDifference(move pairs)
+			var inside = Vec::of(own [self.arm(move inner, order)])
+			// A variant written before this one: `self` comes after it.
+			if i > 0 {
+				var before: Vec<Pattern> = Vec()
+				for j in 0..i {
+					before.push(self.anyOf(&variants[j]))
+				}
+				val pattern =
+					if before.len() == 1 then before.remove(0)
+					else Pattern(kind: .Any(move before), span: self.at)
+				val more = self.variant(self.names.more)
+				inside.push(self.arm(move pattern, more))
+			}
+			// One written after it: `self` comes first.
+			if i + 1 < variants.len() {
+				val less = self.variant(self.names.less)
+				inside.push(self.arm(self.wildcard(), less))
+			}
+			val other = self.other()
+			val body = self.expr(.Match(scrutinee: other, arms: move inside))
+			val outer = self.bound(&variant, .This)
+			arms.push(self.arm(move outer, body))
+		}
+		val this = self.expr(.SelfRef)
+		return self.expr(.Match(scrutinee: this, arms: move arms))
+	}
+
+	/// `this.compare(&other)`.
+	var fn compareCall(this: ExprId, other: ExprId): ExprId = {
+		val callee = self.field(this, self.names.compare)
+		val lent = self.expr(.Unary(op: .Ref, opSpan: self.at, operand: other))
+		return self.expr(.Call(
+			callee: callee,
+			args: Vec::of(own [lent]),
+			names: Vec::of(own [Option::None]),
+			rest: .None,
+		))
+	}
+
+	// ---- Hash ----
+
+	/// `{ out.writeInt(1)  self#x.hashInto(&var out)  … }`: a variant's
+	/// number, where there is one, and then each part in turn.
+	var fn hashParts(number: Option<i64>, parts: Vec<ExprId>): ExprId = {
+		var stmts: Vec<StmtId> = Vec()
+		if number is .Some(number) {
+			val out = self.expr(.Name(self.names.out))
+			val callee = self.field(out, self.names.writeInt)
+			val n = self.expr(.Int(number as u128))
+			val written = self.expr(.Call(
+				callee: callee,
+				args: Vec::of(own [n]),
+				names: Vec::of(own [Option::None]),
+				rest: .None,
+			))
+			stmts.push(self.stmt(written))
+		}
+		for part in parts {
+			val callee = self.field(part, self.names.hashInto)
+			val lent = self.lentOut()
+			val hashed = self.expr(.Call(
+				callee: callee,
+				args: Vec::of(own [lent]),
+				names: Vec::of(own [Option::None]),
+				rest: .None,
+			))
+			stmts.push(self.stmt(hashed))
+		}
+		return self.expr(.Block(Block(stmts: move stmts, span: self.at)))
+	}
+
+	/// `match self { .Circle(r: self#r) => { out.writeInt(0)  self#r.hashInto(&var out) } … }`:
+	/// which variant it is, as the number it is written as, then what it
+	/// holds.
+	var fn hashVariants(variants: &[Variant]): ExprId = {
+		var arms: Vec<Arm> = Vec()
+		for (i, variant) in variants.forwards().enumerate() {
+			var parts: Vec<ExprId> = Vec()
+			for field in variant.fields {
+				val bound = self.binding(field.name.sym, .This)
+				parts.push(self.expr(.Name(bound)))
+			}
+			val body = self.hashParts(.Some(i), move parts)
+			val pattern = self.bound(&variant, .This)
+			arms.push(self.arm(move pattern, body))
+		}
+		val this = self.expr(.SelfRef)
+		return self.expr(.Match(scrutinee: this, arms: move arms))
+	}
+
+	// ---- Text ----
+
+	/// `{ out.push("Point(x: ")  self.x.appendTo(&var out)  out.push(")") }`:
+	/// the call that would make the value.
+	var fn textStruct(ty: Symbol, fields: &[Field]): ExprId = {
+		val name = String::of(self.interner.resolve(ty))
+		if fields.isEmpty() then return self.written(Vec::of(own [TextPiece::Text("\(name)()")]))
+		var pieces = Vec::of(own [TextPiece::Text("\(name)(")])
+		for (i, field) in fields.forwards().enumerate() {
+			val fieldName = String::of(self.interner.resolve(field.name.sym))
+			val before = if i == 0 then "" else ", "
+			pieces.push(.Text("\(before)\(fieldName): "))
+			val this = self.expr(.SelfRef)
+			pieces.push(.Value(self.field(this, field.name.sym)))
+		}
+		pieces.push(.Text(String::of(")")))
+		return self.written(move pieces)
+	}
+
+	/// `match self { .Circle(r: self#r) => { out.push(".Circle(r: ")  self#r.appendTo(&var out)  out.push(")") } … }`:
+	/// the variant as a program writes it.
+	var fn textVariants(variants: &[Variant]): ExprId = {
+		var arms: Vec<Arm> = Vec()
+		for variant in variants {
+			val name = String::of(self.interner.resolve(variant.name.sym))
+			var pieces: Vec<TextPiece> = Vec()
+			if variant.fields.isEmpty() {
+				pieces.push(.Text(".\(name)"))
+			} else {
+				pieces.push(.Text(".\(name)("))
+				for (i, field) in variant.fields.forwards().enumerate() {
+					val fieldName = String::of(self.interner.resolve(field.name.sym))
+					val before = if i == 0 then "" else ", "
+					pieces.push(.Text("\(before)\(fieldName): "))
+					val bound = self.binding(field.name.sym, .This)
+					pieces.push(.Value(self.expr(.Name(bound))))
+				}
+				pieces.push(.Text(String::of(")")))
+			}
+			val body = self.written(move pieces)
+			val pattern = self.bound(&variant, .This)
+			arms.push(self.arm(move pattern, body))
+		}
+		val this = self.expr(.SelfRef)
+		return self.expr(.Match(scrutinee: this, arms: move arms))
+	}
+
+	/// `{ out.push("…")  value.appendTo(&var out)  … }`.
+	var fn written(pieces: Vec<TextPiece>): ExprId = {
+		var stmts: Vec<StmtId> = Vec()
+		for piece in move pieces {
+			val call = match move piece {
+				.Text(text) => {
+					val out = self.expr(.Name(self.names.out))
+					val callee = self.field(out, self.names.push)
+					val symbol = self.interner.intern(text.toStr())
+					val literal = self.expr(.Str(symbol))
+					self.expr(.Call(
+						callee: callee,
+						args: Vec::of(own [literal]),
+						names: Vec::of(own [Option::None]),
+						rest: .None,
+					))
+				}
+				.Value(value) => {
+					val callee = self.field(value, self.names.appendTo)
+					val lent = self.lentOut()
+					self.expr(.Call(
+						callee: callee,
+						args: Vec::of(own [lent]),
+						names: Vec::of(own [Option::None]),
+						rest: .None,
+					))
+				}
+			}
+			stmts.push(self.stmt(call))
+		}
+		return self.expr(.Block(Block(stmts: move stmts, span: self.at)))
+	}
+
+	// ---- Clone ----
+
+	/// `Self(x: self.x.clone(), …)`.
+	var fn cloneStruct(fields: &[Field]): ExprId = {
+		var names: Vec<Option<Name>> = Vec()
+		var args: Vec<ExprId> = Vec()
+		for field in fields {
+			val this = self.expr(.SelfRef)
+			val place = self.field(this, field.name.sym)
+			val value = self.cloned(place)
+			names.push(.Some(self.name(field.name.sym)))
+			args.push(value)
+		}
+		val callee = self.expr(.Name(self.names.selfType))
+		return self.expr(.Call(callee: callee, args: move args, names: move names, rest: .None))
+	}
+
+	/// `match self { .Circle(r: self#r) => .Circle(r: self#r.clone()) … }`.
+	var fn cloneVariants(variants: &[Variant]): ExprId = {
+		var arms: Vec<Arm> = Vec()
+		for variant in variants {
+			val path = self.expr(.Path(
+				leadingDot: true,
+				segments: Vec::of(own [self.name(variant.name.sym)]),
+				typeArgs: .None,
+			))
+			val body = if variant.fields.isEmpty() {
+				path
+			} else {
+				var args: Vec<ExprId> = Vec()
+				for field in variant.fields {
+					val bound = self.binding(field.name.sym, .This)
+					val named = self.expr(.Name(bound))
+					args.push(self.cloned(named))
+				}
+				var names: Vec<Option<Name>> = Vec()
+				for field in variant.fields {
+					names.push(.Some(self.name(field.name.sym)))
+				}
+				self.expr(.Call(callee: path, args: move args, names: move names, rest: .None))
+			}
+			val pattern = self.bound(&variant, .This)
+			arms.push(self.arm(move pattern, body))
+		}
+		val this = self.expr(.SelfRef)
+		return self.expr(.Match(scrutinee: this, arms: move arms))
+	}
+
+	/// A field's value in the clone: `cloneOf(&value)`, the prelude's clone
+	/// of a value of the field's own type. A method call, `value.clone()`,
+	/// would look through a field that is a `&T` to what it refers to; this
+	/// clones the `&T`, which is the reference copied.
+	var fn cloned(value: ExprId): ExprId = {
+		val callee = self.expr(.Name(self.names.cloneOf))
+		val lent = self.expr(.Unary(op: .Ref, opSpan: self.at, operand: value))
+		return self.expr(.Call(
+			callee: callee,
+			args: Vec::of(own [lent]),
+			names: Vec::of(own [Option::None]),
+			rest: .None,
+		))
+	}
+
+	// ---- what they share ----
+
+	/// `other: &Self`.
+	var fn otherParam(): Param = {
+		val inner = self.namedType(self.names.selfType)
+		val ty = self.out.types.add(Type(kind: .Ref(isVar: false, inner: inner), span: self.at))
+		return Field(
+			isPub: false,
+			isVar: false,
+			name: self.name(self.names.other),
+			ty: ty,
+			default: .None,
+			span: self.at,
+		)
+	}
+
+	/// `out: &var Hasher`, or `out: &var String`: what is written into.
+	var fn outParam(into: Symbol): Param = {
+		val inner = self.namedType(into)
+		val ty = self.out.types.add(Type(kind: .Ref(isVar: true, inner: inner), span: self.at))
+		return Field(
+			isPub: false,
+			isVar: false,
+			name: self.name(self.names.out),
+			ty: ty,
+			default: .None,
+			span: self.at,
+		)
+	}
+
+	/// `&var out`.
+	var fn lentOut(): ExprId = {
+		val out = self.expr(.Name(self.names.out))
+		return self.expr(.Unary(op: .RefVar, opSpan: self.at, operand: out))
+	}
+
+	var fn stmt(value: ExprId): StmtId = self.out.stmts.add(Stmt(kind: .Expr(value), span: self.at))
+
+	var fn other(): ExprId = self.expr(.Name(self.names.other))
+
+	/// `(self.x, other.x)` for each field.
+	var fn fieldPairs(fields: &[Field]): Vec<(ExprId, ExprId)> = {
+		var pairs: Vec<(ExprId, ExprId)> = Vec()
+		for field in fields {
+			val this = self.expr(.SelfRef)
+			val thisField = self.field(this, field.name.sym)
+			val other = self.other()
+			val otherField = self.field(other, field.name.sym)
+			pairs.push((thisField, otherField))
+		}
+		return move pairs
+	}
+
+	/// The variant as `other` is matched against it, its fields bound, and
+	/// each field of `self`'s beside the same field of `other`'s.
+	var fn boundPairs(variant: &Variant): (Pattern, Vec<(ExprId, ExprId)>) = {
+		val pattern = self.bound(&variant, .Other)
+		var pairs: Vec<(ExprId, ExprId)> = Vec()
+		for field in variant.fields {
+			val this = self.binding(field.name.sym, .This)
+			val other = self.binding(field.name.sym, .Other)
+			val thisName = self.expr(.Name(this))
+			val otherName = self.expr(.Name(other))
+			pairs.push((thisName, otherName))
+		}
+		return (move pattern, move pairs)
+	}
+
+	/// `self#field` or `other#field`: a name no program can write, so it
+	/// shadows nothing.
+	var fn binding(field: Symbol, side: Side): Symbol = {
+		val prefix = if side == .This then "self" else "other"
+		val text = "\(prefix)#\(self.interner.resolve(field))"
+		return self.interner.intern(text.toStr())
+	}
+
+	/// `.Circle(r: self#r)`, or `.Dot` for a variant that carries nothing.
+	var fn bound(variant: &Variant, side: Side): Pattern = {
+		var binders: Option<Vec<Binder>> = .None
+		if !variant.fields.isEmpty() {
+			var listed: Vec<Binder> = Vec()
+			for field in variant.fields {
+				val bound = self.binding(field.name.sym, side)
+				listed.push(Binder(
+					field: self.name(field.name.sym),
+					pattern: .Some(Pattern(kind: .Binding(bound), span: self.at)),
+					span: self.at,
+				))
+			}
+			binders = .Some(move listed)
+		}
+		return self.variantPattern(variant.name.sym, move binders)
+	}
+
+	/// `.Circle(..)`, or `.Dot`: the variant, whatever it holds.
+	fn anyOf(variant: &Variant): Pattern = {
+		val rest = !variant.fields.isEmpty()
+		return Pattern(
+			kind: .Variant(
+				leadingDot: true,
+				segments: Vec::of(own [self.name(variant.name.sym)]),
+				binders: if rest then .Some(Vec()) else .None,
+				rest: rest,
+			),
+			span: self.at,
+		)
+	}
+
+	fn variantPattern(name: Symbol, binders: Option<Vec<Binder>>): Pattern = Pattern(
+		kind: .Variant(
+			leadingDot: true,
+			segments: Vec::of(own [self.name(name)]),
+			binders: move binders,
+			rest: false,
+		),
+		span: self.at,
+	)
+
+	fn wildcard(): Pattern = Pattern(kind: .Wildcard, span: self.at)
+
+	fn arm(pattern: Pattern, body: ExprId): Arm = Arm(
+		pattern: move pattern,
+		guard: .None,
+		body: body,
+		span: self.at,
+	)
+
+	/// `.Same`, of the type expected where it stands.
+	var fn variant(name: Symbol): ExprId = self.expr(.Path(
+		leadingDot: true,
+		segments: Vec::of(own [self.name(name)]),
+		typeArgs: .None,
+	))
+
+	var fn binary(op: BinaryOp, lhs: ExprId, rhs: ExprId): ExprId = self.expr(.Binary(
+		op: op,
+		opSpan: self.at,
+		lhs: lhs,
+		rhs: rhs,
+		wrapping: false,
+	))
+
+	var fn namedType(name: Symbol): TypeId = self.out.types.add(Type(
+		kind: .Named(name: name, args: Vec()),
+		span: self.at,
+	))
+
+	fn name(sym: Symbol): Name = Name(sym: sym, span: self.at)
+
+	var fn expr(kind: ExprKind): ExprId = self.out.exprs.add(Expr(kind: move kind, span: self.at))
+
+	/// `base.name`.
+	var fn field(base: ExprId, name: Symbol): ExprId = {
+		val named = self.name(name)
+		return self.expr(.Field(base: base, name: named))
+	}
+}

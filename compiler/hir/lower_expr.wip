@@ -1,0 +1,1424 @@
+// Expressions whose type is synthesized: literals, names, operators and
+// casts. Calls are in `lower_calls`, and `lend` in `lower_projections`.
+
+import syntax as ast
+import syntax::{
+	BinaryOp,
+	CANNOT_INFER,
+	DROP_RULES,
+	Diagnostic,
+	Edit,
+	FN_VALUE_REF,
+	INTEGER_OUT_OF_RANGE,
+	INVALID_CAST,
+	INVALID_OPERANDS,
+	MOVE_NOT_A_PLACE,
+	NOT_A_VALUE,
+	NULL_WITHOUT_TYPE,
+	REF_NOT_A_PLACE,
+	REF_OUTSIDE_ARGUMENT,
+	RUNTIME_LENGTH,
+	Span,
+	Symbol,
+	UNKNOWN_NAME
+}
+
+/// The implementation an arithmetic operator calls on a type of a program's
+/// own, and what it takes and answers.
+@derive(Clone)
+struct OperatorImpl {
+	method: FnId
+	typeArgs: TyList
+	rhs: Ty
+	out: Ty
+}
+
+/// The one type of a list, where it holds one.
+fn onlyOne(tys: &[Ty]): Option<Ty> = if tys.len() == 1 then .Some(tys[0]) else .None
+
+/// Whether an operator compares its operands.
+fn comparison(op: BinaryOp): bool = op is .Eq | .Ne | .Lt | .Le | .Gt | .Ge
+
+extend Lowerer {
+	var fn infer(id: ast::ExprId, hint: Option<Ty>): ExprId = {
+		val file = self.ast
+		val expr = &file.exprs[id]
+		val span = expr.span
+		return match expr.kind {
+			.Int(v) => {
+				val ty = self.intLiteralType(hint)
+				val value = self.intLiteral(false, v, ty, span)
+				self.alloc(.Int(value), ty, span)
+			}
+			.Block(block) => {
+				val (checked, ty) = self.checkBlock(&block, hint)
+				self.alloc(.Block(move checked), ty, span)
+			}
+			.If(cond, thenBlock, elseBranch) => self.ifExpr(
+				cond,
+				&thenBlock,
+				elseBranch,
+				hint,
+				span,
+			)
+			.Try(value) => self.tryExpr(value, span)
+			.Assert(cond, note, message) => self.assertion(cond, note, message, span)
+			.Lambda(..) => self.lambda(id, hint, false, span)
+			.Cast(expr: inner, ty) => self.cast(inner, ty, span)
+			// Literals take the type expected of them.
+			.Float(v) => self.alloc(.Float(v), if hint == .Some(F32) then F32 else F64, span)
+			.Str(s) => self.alloc(.Str(s), if hint == .Some(CSTRING) then CSTRING else STR, span)
+			.Bool(b) => self.alloc(.Bool(b), BOOL, span)
+			// A character is its number, in 32 bits.
+			.Char(c) => self.alloc(.Int(c as u128), CHAR, span)
+			// A byte is the number it is, a `u8`.
+			.Byte(b) => self.alloc(.Int(b as u128), U8, span)
+			// `null`: a C pointer that points at nothing. Which pointer it is
+			// comes from what is expected.
+			.Null => {
+				val ty = match hint {
+					.Some(h) if self.kind(h) is .Ptr(..) => h
+					_ => {
+						self.report(
+							Diagnostic::error(
+								NULL_WITHOUT_TYPE,
+								"the type of this `null` is not known here",
+								span,
+								"no pointer type",
+							).withNote(
+								"`null` is a C pointer that points at nothing, so what it points at comes from what is expected",
+							).withHelp("write the type, as in `val handle: ptr<sqlite3> = null`"),
+						)
+						return self.errorExpr(span)
+					}
+				}
+				self.alloc(.Null, ty, span)
+			}
+			.Name(sym) => self.name(sym, hint, span)
+			.SelfRef => self.selfExpr(span)
+			.Paren(inner) => self.infer(inner, hint)
+			.Path(leadingDot, segments, typeArgs) => {
+				var item = ItemUse::plain(.None, hint, span)
+				item.typeArgs = typeArgs.asRef()
+				self.pathExpr(leadingDot, &segments, item)
+			}
+			.Array(elems) => self.arrayLit(&elems, hint, span)
+			.ArrayRepeat(elem, count: .Literal(count)) => self.arrayRepeat(elem, count, hint, span)
+			// `[0; SIZE]`: a count that names a constant is known where it is
+			// written, as a type's length is.
+			.ArrayRepeat(elem, count: .Expr(count)) if self.constantCount(count).isSome() => {
+				val name = self.constantCount(count).unwrap()
+				match self.arrayLen(.Name(name)) {
+					.Some(n) => self.arrayRepeat(elem, n, hint, span)
+					.None => {
+						self.infer(elem, .None)
+						self.errorExpr(span)
+					}
+				}
+			}
+			// `own [x; n]` handles its own count; anywhere else a count must be
+			// a literal.
+			.ArrayRepeat(elem, count: .Expr(count)) => {
+				self.infer(elem, .None)
+				self.checkOperand(count, I64)
+				self.report(
+					Diagnostic::error(
+						RUNTIME_LENGTH,
+						"a length known only at run time needs `own`",
+						span,
+						"the length is not a literal",
+					).withNote(
+						"an array's length is part of its type; only a buffer on the heap keeps its length with it",
+					).withFix("allocate it on the heap", own [Edit::insert(span.lo, "own ")]),
+				)
+				self.errorExpr(span)
+			}
+			.Match(scrutinee, arms) => self.matchExpr(scrutinee, &arms, hint, span)
+			.Is(scrutinee, pattern, negated: false) => self.isExpr(scrutinee, &pattern, false, span)
+			.Is(scrutinee, pattern, negated: true) => self.negatedIs(scrutinee, &pattern, span)
+			.Unary(op, operand, ..) => self.unary(op, operand, hint, span)
+			// A chain whose tests bind, outside a condition.
+			.Binary(op: .And, ..) if self.chainBinds(id) => self.boundChain(id, span)
+			.Binary(op, opSpan, lhs, rhs, wrapping) => self.binary(
+				op,
+				opSpan,
+				lhs,
+				rhs,
+				wrapping,
+				hint,
+				span,
+			)
+			// `f(style = x)` was reported as the named argument it was meant to
+			// be, and is checked as its value.
+			.Assign(value, ..) if self.state.namedByEquals.contains(&id) => self.infer(value, hint)
+			.Assign(target, op, wrapping, value) => self.assign(target, op, wrapping, value, span)
+			.Field(base, name) => self.field(base, name, span)
+			.Lend(value) => self.lendExpr(value, span)
+			.Call(callee, args, names, rest) => self.callExpr(
+				callee,
+				&args,
+				&names,
+				rest,
+				hint,
+				span,
+			)
+			.Index(base, index) => self.index(base, index, span)
+			.SubSlice(base, lo, hi, inclusive) => self.subSlice(
+				base,
+				lo,
+				hi,
+				inclusive,
+				span,
+				false,
+			)
+			.Error => self.errorExpr(span)
+			// A loop where a value stands, which no `own` collects: a
+			// generator, whose loop runs as it is asked.
+			.ForElement(binding, source, body) => self.loopGenerator(
+				id,
+				&binding,
+				source,
+				&body,
+				span,
+			)
+		}
+	}
+
+	/// `own [elem; count]` with a count known only at run time: a buffer of
+	/// type `own<[T]>`.
+	var fn ownRepeat(
+		elem: ast::ExprId,
+		count: ast::ExprId,
+		hint: Option<Ty>,
+		span: Span,
+	): ExprId = {
+		var elemHint: Option<Ty> = .None
+		if hint is .Some(h) && self.kind(h) is .Own(inner) && self.kind(inner) is .Slice(t) then
+			elemHint = .Some(t)
+		val checked = match elemHint {
+			.Some(ty) => self.check(elem, ty)
+			.None => self.infer(elem, .None)
+		}
+		val checkedCount = self.checkOperand(count, I64)
+		val elemTy = self.tyOf(checked)
+		if self.isPoisoned(elemTy) || self.storedViewAt(elemTy, span, "a buffer", .None) then
+			return self.errorExpr(span)
+		val slice = self.intern(.Slice(elemTy))
+		val ty = self.intern(.Own(slice))
+		return self.alloc(.OwnRepeat(elem: checked, count: checkedCount), ty, span)
+	}
+
+	/// The type of an integer literal: the integer type expected of it, or
+	/// `i64`.
+	fn intLiteralType(hint: Option<Ty>): Ty = match hint {
+		.Some(ty) if self.program.types.isInteger(ty) => ty
+		_ => I64
+	}
+
+	/// The bits of an integer literal of type `ty`, `-magnitude` when
+	/// `negative`, reporting it if it is out of range.
+	var fn intLiteral(negative: bool, magnitude: u128, ty: Ty, span: Span): u128 = {
+		val t = self.program.types.intTy(ty).unwrap()
+		val fits = if negative then magnitude <= t.minMagnitude() else magnitude <= t.max()
+		if fits {
+			val bits = if negative then 0 -% magnitude else magnitude
+			return bits & t.mask()
+		}
+		val name = t.name()
+		val text = if negative then "-\(magnitude)" else "\(magnitude)"
+		val diagnostic = Diagnostic::error(
+			INTEGER_OUT_OF_RANGE,
+			"integer literal `\(text)` is out of range for `\(name)`",
+			span,
+			"does not fit in `\(name)`",
+		)
+		val note =
+			if negative && !t.signed() then "`\(name)` is unsigned, so it has no negative values"
+			else if t.signed() then "`\(name)` holds -\(t.minMagnitude()) to \(t.max())"
+			else "`\(name)` holds 0 to \(t.max())"
+		self.report(diagnostic.withNote(move note))
+		return 0
+	}
+
+	/// What a variable or a constant holding a reference stands for: the
+	/// place it refers to, and through a reference to a reference what the
+	/// inner one refers to, except where that `&` reference is what is
+	/// expected: `&var at` of a `var at: &Node` lends the variable, and `val
+	/// b: &Node = a` copies `a`. A closure is the reference itself: it
+	/// carries what it captured beside its code.
+	var fn referent(start: ExprId, hint: Option<Ty>, span: Span): ExprId = {
+		var e = start
+		while self.kind(self.tyOf(e)) is .Ref(inner, kind) &&
+			!(self.kind(inner) is .Fn(..)) &&
+			!(kind == .Shared && hint == .Some(self.tyOf(e))) {
+			e = self.alloc(.Deref(e), inner, span)
+		}
+		return e
+	}
+
+	/// The reference a slice was read through, where what is kept is the
+	/// slice: `val all = bytes` and `[bytes, other]` of a `bytes: &[u8]` hold
+	/// the reference, since there is nothing of fixed size to copy. Anything
+	/// else is not a slice read so.
+	fn keptReference(e: ExprId): Option<ExprId> = {
+		val .Deref(inner) = self.state.body.exprs[e].kind else {
+			return .None
+		}
+		val .Ref(inner: referent, kind: .Shared) = self.kind(self.tyOf(inner)) else {
+			return .None
+		}
+		return if self.kind(referent) is .Slice(..) then .Some(inner) else .None
+	}
+
+	/// The amount of a shift of `shifted`, made the shifted value's type
+	/// where both are integers of different types; anything else as it is.
+	var fn shiftAmount(op: BinaryOp, shifted: ExprId, amount: ExprId): ExprId = {
+		val st = self.tyOf(shifted)
+		val at = self.tyOf(amount)
+		val integers = self.kind(st) is .Int(..) && self.kind(at) is .Int(..)
+		if !(op is .Shl | .Shr) || st == at || !integers then return amount
+		val span = self.state.body.exprs[amount].span
+		return self.alloc(.Cast(amount), st, span)
+	}
+
+	/// An operand of `op`. A comparison reads its operands, as a method reads
+	/// its receiver, so a range of elements may be one, lent where it is
+	/// written: `window[0..4] == magic`.
+	var fn comparedOperand(op: BinaryOp, e: ast::ExprId, hint: Option<Ty>): ExprId = {
+		if comparison(op) {
+			val id = self.inferBorrowed(e, hint)
+			return self.autoderef(id)
+		}
+		return self.operand(e, hint)
+	}
+
+	/// What a comparison reads of an array, a slice, a buffer or a reference
+	/// to a slice: its elements as a slice place, and their type. Nothing for
+	/// anything else.
+	var fn asElements(e: ExprId): Option<(ExprId, Ty)> = {
+		val ty = self.tyOf(e)
+		val span = self.state.body.exprs[e].span
+		return match self.kind(ty) {
+			.Array(elem, ..) => {
+				val slice = self.intern(.Slice(elem))
+				.Some((self.alloc(.SubSlice(base: e, lo: .None, hi: .None), slice, span), elem))
+			}
+			.Slice(elem) => .Some((e, elem))
+			.Own(inner) | .Ref(inner, ..) => match self.kind(inner) {
+				.Slice(elem) => .Some((self.alloc(.Deref(e), inner, span), elem))
+				_ => .None
+			}
+			_ => .None
+		}
+	}
+
+	/// `+%` or `+%=` on a type of a program's own, which answers only the
+	/// plain operators: the wrapping forms are the machine's, for its
+	/// integers. `suffix` is `=` for the compound form.
+	var fn reportWrappingOwnType(op: BinaryOp, opSpan: Span, ty: Ty, suffix: str) = {
+		val text = op.text()
+		self.report(
+			Diagnostic::error(
+				INVALID_OPERANDS,
+				"`\(text)%\(suffix)` wraps an integer, and \(self.tyName(ty)) is not one",
+				opSpan,
+				"the wrapping form",
+			).withNote(
+				"the wrapping operators say what an integer does when it overflows; a type of a program's own answers only the plain ones",
+			).withHelp("write `\(text)\(suffix)`, which the type answers where it implements its interface"),
+		)
+	}
+
+	var fn name(sym: Symbol, hint: Option<Ty>, span: Span): ExprId = {
+		if self.lookup(sym) is .Some(local) {
+			val ty = self.state.body.locals[local].ty
+			val e = self.alloc(.Local(local), ty, span)
+			return self.referent(e, hint, span)
+		}
+		// A variable of the function around a lambda is captured, before
+		// anything the module or the prelude calls by its name.
+		if self.namesAround(sym) && self.capturedName(sym, span) is .Some(captured) then
+			return captured
+		// What else the name could be, here or in the module it was imported
+		// from.
+		var module = self.current
+		var item = sym
+		match self.imported(ast::Name(sym: sym, span: span)) {
+			.Some(.Broken) => return self.errorExpr(span)
+			.Some(.Item(module: m, name: n)) => {
+				module = m
+				item = n.sym
+			}
+			.None => {}
+		}
+		// A top-level `val`: the value it was worked out to.
+		if self.modules[module].consts.get(&item) is .Some(id) {
+			if self.program.consts[id].isPub || module == self.current {
+				val value = self.constUse(id, span)
+				return self.referent(value, hint, span)
+			}
+		}
+		// A variable C owns: reading it is a call to the accessor the compiler
+		// declared for it.
+		if self.modules[module].globals.get(&item) is .Some(id) {
+			if self.program.globals[id].isPub || module == self.current {
+				val getter = self.program.globals[id].getter
+				val ty = self.program.globals[id].ty
+				return self.alloc(
+					.Call(callee: getter, args: Vec(), typeArgs: TyList::empty(), order: Vec()),
+					ty,
+					span,
+				)
+			}
+		}
+		// A function named as a value.
+		if self.modules[module].fns.get(&item) is .Some(id) then
+			return self.fnValue(id, ItemUse::plain(.None, hint, span), .None)
+		if self.preludeConst(item) is .Some(id) {
+			val value = self.constUse(id, span)
+			return self.referent(value, hint, span)
+		}
+		if self.preludeFn(item) is .Some(id) then
+			return self.fnValue(id, ItemUse::plain(.None, hint, span), .None)
+		// A name of the function around a lambda is captured.
+		if self.capturedName(sym, span) is .Some(captured) then return captured
+		val text = String::of(self.text(sym))
+		val diagnostic = match self.modules[module].types.get(&item) {
+			.Some((def, _)) => {
+				val d = Diagnostic::error(
+					NOT_A_VALUE,
+					"`\(text)` is a type, not a value",
+					span,
+					"type used as a value",
+				)
+				match def {
+					.Builtin(_) => move d
+					.Enum(_) => d.withHelp("enum variants are written `\(text)::Variant`")
+					.Struct(_) => d.withHelp("to construct one, write `\(text) { … }`")
+				}
+			}
+			.None => self.unknownName(sym, span)
+		}
+		self.report(move diagnostic)
+		return self.errorExpr(span)
+	}
+
+	fn unknownName(sym: Symbol, span: Span): Diagnostic = {
+		val text = self.text(sym)
+		var candidates: Vec<str> = Vec()
+		for scope in self.state.scopes {
+			for i in 0..scope.len() {
+				candidates.push(self.text(scope.keyAt(i).clone()))
+			}
+		}
+		val fns = &self.fns()
+		for i in 0..fns.len() {
+			candidates.push(self.text(fns.keyAt(i).clone()))
+		}
+		val diagnostic = Diagnostic::error(
+			UNKNOWN_NAME,
+			"cannot find `\(text)` in this scope",
+			span,
+			"not found",
+		)
+		if leftThePrelude(text) is .Some(help) then return diagnostic.withHelp(move help)
+		return match suggest(text, &candidates) {
+			.Some(similar) => diagnostic.withFix(
+				"a name with a similar spelling exists: `\(similar)`",
+				own [Edit::replace(span, String::of(similar))],
+			)
+			.None => move diagnostic
+		}
+	}
+
+	var fn arrayLit(elems: &[ast::ExprId], hint: Option<Ty>, span: Span): ExprId = {
+		val file = self.ast
+		// An array's length is part of its type, known where it is written; a
+		// list built as it runs is on the heap.
+		for e in elems {
+			if yields(&file, e) then
+				return self.needsOwn(file.exprs[e].span, span, "a list whose elements are yielded")
+		}
+		// `[a, if c { b }]`: an element that is no value.
+		for e in elems {
+			if file.exprs[e].kind is .If(..) && lacksElse(&file, e) {
+				self.addsNothing(file.exprs[e].span)
+				return self.errorExpr(span)
+			}
+		}
+		// An array is expected, or a slice it becomes, as `own<[View]>` takes
+		// `own [.Text(…), .Space()]`.
+		var elemHint: Option<Ty> = .None
+		if hint is .Some(h) && self.kind(h) is .Array(elem: t, ..) | .Slice(elem: t) then
+			elemHint = .Some(t)
+		if elems.isEmpty() {
+			val .Some(elem) = elemHint else {
+				self.report(
+					Diagnostic::error(
+						CANNOT_INFER,
+						"cannot infer the element type of an empty array",
+						span,
+						"type unknown",
+					).withHelp("annotate the variable, for example `val xs: [i64; 0] = []`"),
+				)
+				return self.errorExpr(span)
+			}
+			val ty = self.intern(.Array(elem: elem, len: 0))
+			return self.alloc(.Array(Vec()), ty, span)
+		}
+		val first = match elemHint {
+			.Some(t) => self.check(elems[0], t)
+			.None => {
+				val inferred = self.infer(elems[0], .None)
+				self.keptReference(inferred).unwrapOr(inferred)
+			}
+		}
+		val elem = match elemHint {
+			.Some(t) => t
+			.None => self.tyOf(first)
+		}
+		var checked = Vec::of(own [first])
+		for i in 1..elems.len() {
+			checked.push(self.check(elems[i], elem))
+		}
+		val ty = self.intern(.Array(elem: elem, len: elems.len() as u64))
+		return self.alloc(.Array(move checked), ty, span)
+	}
+
+	/// `[elem; count]` with its count known.
+	var fn arrayRepeat(elem: ast::ExprId, count: u64, hint: Option<Ty>, span: Span): ExprId = {
+		var elemHint: Option<Ty> = .None
+		if hint is .Some(h) && self.kind(h) is .Array(elem: t, ..) then elemHint = .Some(t)
+		val checked = match elemHint {
+			.Some(t) => self.check(elem, t)
+			.None => self.infer(elem, .None)
+		}
+		val ty = self.intern(.Array(elem: self.tyOf(checked), len: count))
+		return self.alloc(.ArrayRepeat(elem: checked, count: count), ty, span)
+	}
+
+	/// The name of a repeat count that is a constant, not a variable.
+	fn constantCount(count: ast::ExprId): Option<ast::Name> = {
+		val expr = &self.ast.exprs[count]
+		val .Name(sym) = expr.kind else {
+			return .None
+		}
+		if self.lookup(sym).isSome() then return .None
+		val name = ast::Name(sym: sym, span: expr.span)
+		return if self.constNamed(name).isSome() then .Some(name) else .None
+	}
+
+	var fn unary(op: ast::UnaryOp, operand: ast::ExprId, hint: Option<Ty>, span: Span): ExprId = {
+		val file = self.ast
+		return match op {
+			.Neg => {
+				// `-9223372036854775808` is a literal, not the negation of an
+				// out-of-range one.
+				if file.exprs[operand].kind is .Int(v) {
+					val ty = self.intLiteralType(hint)
+					val value = self.intLiteral(true, v, ty, span)
+					return self.alloc(.Int(value), ty, span)
+				}
+				val e = self.operand(operand, hint)
+				val ty = self.tyOf(e)
+				if self.program.types.intTy(ty) is .Some(t) && !t.signed() {
+					self.report(
+						Diagnostic::error(
+							INVALID_OPERANDS,
+							"cannot negate a value of type `\(t.name())`",
+							span,
+							"`-` needs a signed number",
+						).withNote("`\(t.name())` is unsigned, so it has no negative values").withHelp(
+							"convert it to a signed type first, for example `-(x as i64)`",
+						),
+					)
+					return self.errorExpr(span)
+				}
+				if self.program.types.isNumeric(ty) then
+					return self.alloc(.Unary(op: .Neg, operand: e), ty, span)
+				// `-x` on a type that implements `Negate` is `x.negate()`.
+				if self.interfaceMethod(.Negate, ty) is .Some(negate) then
+					return self.unaryCall(negate, ty, e, span)
+				if !self.isPoisoned(ty) {
+					var diagnostic = Diagnostic::error(
+						INVALID_OPERANDS,
+						"cannot negate a value of type \(self.tyName(ty))",
+						span,
+						"`-` needs a number",
+					)
+					diagnostic = self.operatorHint(move diagnostic, ty, "Negate", "negates")
+					self.report(move diagnostic)
+				}
+				self.errorExpr(span)
+			}
+			// `!` negates a `bool` and flips every bit of an integer.
+			.Not => {
+				val e = self.operand(operand, hint)
+				val ty = self.tyOf(e)
+				if ty == BOOL || self.program.types.isInteger(ty) then
+					return self.alloc(.Unary(op: .Not, operand: e), ty, span)
+				// `!x` on a type that implements `Not` is `x.not()`.
+				if self.interfaceMethod(.Not, ty) is .Some(not) then
+					return self.unaryCall(not, ty, e, span)
+				if !self.isPoisoned(ty) {
+					var diagnostic = Diagnostic::error(
+						INVALID_OPERANDS,
+						"cannot apply `!` to \(self.tyName(ty))",
+						span,
+						"`!` needs a `bool` or an integer",
+					)
+					diagnostic = self.operatorHint(move diagnostic, ty, "Not", "answers `!`")
+					self.report(move diagnostic)
+				}
+				self.errorExpr(span)
+			}
+			.Ref | .RefVar => self.reference(op, operand, hint, span, false)
+			.Move => {
+				val e = self.infer(operand, hint)
+				val ty = self.tyOf(e)
+				if !self.state.body.isPlace(e) && !self.isPoisoned(ty) then
+					self.report(
+						Diagnostic::error(
+							MOVE_NOT_A_PLACE,
+							"`move` needs a variable, field or element",
+							self.state.body.exprs[e].span,
+							"a temporary value",
+						).withHelp("a temporary is already moved where it is used; remove `move`"),
+					)
+				self.noMoveOutOfDrop(e, span)
+				self.alloc(.Move(e), ty, span)
+			}
+			.Own => self.ownExpr(operand, hint, span)
+		}
+	}
+
+	/// `own …`: a value moved to the heap, or a buffer, a list or a closure
+	/// made there.
+	var fn ownExpr(operand: ast::ExprId, hint: Option<Ty>, span: Span): ExprId = {
+		val file = self.ast
+		// `own [a, for x in xs { yield x }]` and `own for …`: a list whose
+		// `yield`s decide how long it is.
+		if file.exprs[operand].kind is .Array(elems) {
+			for e in elems {
+				if yields(&file, e) then return self.builtList(&elems, hint, span)
+			}
+		}
+		if file.exprs[operand].kind is .ForElement(..) then
+			return self.builtList([operand], hint, span)
+		// `own [x; n]` with a length known only at run time.
+		if file.exprs[operand].kind is .ArrayRepeat(elem, count: .Expr(count)) then
+			return self.ownRepeat(elem, count, hint, span)
+		// `own (x) => …`: an owned closure, whose environment holds what it
+		// captured on the heap.
+		if file.exprs[operand].kind is .Lambda(..) then
+			return self.lambda(operand, hint, true, span)
+		var innerHint: Option<Ty> = .None
+		if hint is .Some(h) && self.kind(h) is .Own(t) then innerHint = .Some(t)
+		val e = self.infer(operand, innerHint)
+		val inner = self.tyOf(e)
+		if self.isPoisoned(inner) then return self.errorExpr(span)
+		val ty = self.intern(.Own(inner))
+		return self.alloc(.Own(e), ty, span)
+	}
+
+	/// Whether what is borrowed is an owned closure, which lends itself as a
+	/// closure lent for the call, `&(…) => R`.
+	fn lendsAnOwnedClosure(inner: Ty): bool =
+		self.kind(inner) is .Own(code) && self.kind(code) is .Fn(..)
+
+	/// Whether an expression is a number written down, which takes the type
+	/// expected of it rather than one of its own.
+	fn numberLiteral(id: ast::ExprId): bool = match self.ast.exprs[id].kind {
+		.Int(_) | .Float(_) => true
+		.Unary(op: .Neg, operand, ..) => self.ast.exprs[operand].kind is .Int(..) | .Float(..)
+		_ => false
+	}
+
+	/// A literal or `null`, which takes the type of the other operand.
+	fn takesOther(id: ast::ExprId): bool =
+		self.numberLiteral(id) || self.ast.exprs[id].kind is .Null
+
+	var fn binary(
+		op: BinaryOp,
+		opSpan: Span,
+		lhs: ast::ExprId,
+		rhs: ast::ExprId,
+		wrapping: bool,
+		given: Option<Ty>,
+		span: Span,
+	): ExprId = {
+		if op is .And | .Or {
+			val l = self.checkOperand(lhs, BOOL)
+			val r = self.checkOperand(rhs, BOOL)
+			return self.alloc(.Binary(op: op, lhs: l, rhs: r, wrapping: wrapping), BOOL, span)
+		}
+		// A literal takes the type of the other operand, whichever side it is
+		// on: `byte >= 48` and `48 <= byte` mean the same thing. Arithmetic
+		// answers its operands' type, so a number expected of it is expected
+		// of them: `val step: f32 = 1.0 / 60.0`.
+		val arithmetic =
+			op is .Add | .Sub | .Mul | .Div | .Rem | .BitAnd | .BitOr | .BitXor | .Shl | .Shr
+		val hint: Option<Ty> = match given {
+			.Some(ty) if arithmetic && self.program.types.isNumeric(ty) => .Some(ty)
+			_ => .None
+		}
+		// Beside a type of a program's own, a number is what an
+		// implementation of the operator takes it as: on the right, the `Rhs`
+		// of the left type's one implementation that is not of its own type,
+		// `v * 0.5`; on the left, the built-in type whose implementation takes
+		// the right side, `2.0 * v`.
+		val which = KnownInterface::ofBinary(op)
+		// Not a shift's amount, though: it may be of any type, and says
+		// nothing of what is shifted, whose type is the answer's — `1 << n` of
+		// a `u32` amount is the `1` expected, or an `i64`.
+		val shift = op is .Shl | .Shr
+		val (l0, r0) = if self.takesOther(lhs) && !self.takesOther(rhs) && !shift {
+			val r = self.comparedOperand(op, rhs, hint)
+			val rt = self.tyOf(r)
+			var left: Option<Ty> = .None
+			if which is .Some(w) && !self.program.types.isNumeric(rt) {
+				val builtins = self.operatorLhsBuiltins(w, rt)
+				left = onlyOne(&builtins)
+			}
+			val l = self.comparedOperand(op, lhs, .Some(left.unwrapOr(rt)))
+			(l, r)
+		} else {
+			val l = self.comparedOperand(op, lhs, hint)
+			val lt = self.tyOf(l)
+			var right: Option<Ty> = .None
+			if which is .Some(w) && !self.operatorApplies(op, lt) {
+				var tys = self.operatorRhsTys(w, lt)
+				tys.retain((t) => t != lt)
+				right = onlyOne(&tys)
+			}
+			val r = self.comparedOperand(op, rhs, .Some(right.unwrapOr(lt)))
+			(l, r)
+		}
+		val lt0 = self.tyOf(l0)
+		val rt0 = self.tyOf(r0)
+		val result = if arithmetic then lt0 else BOOL
+		if self.isPoisoned(lt0) || self.isPoisoned(rt0) then
+			return self.alloc(.Binary(op: op, lhs: l0, rhs: r0, wrapping: wrapping), result, span)
+		// Comparing reads the text, so a `String` lends its bytes for it, as
+		// it does for an argument.
+		var l = l0
+		var r = r0
+		if comparison(op) &&
+			(self.lendsText(lt0) || self.lendsText(rt0)) &&
+			(self.lendsText(lt0) || lt0 == STR) &&
+			(self.lendsText(rt0) || rt0 == STR) {
+			l = self.lendString(l).unwrapOr(l)
+			r = self.lendString(r).unwrapOr(r)
+		}
+		// A shift's amount may be of any integer type: it is taken modulo the
+		// width of what is shifted, which it keeps when it is made that type
+		// first, since every width is a power of two.
+		r = self.shiftAmount(op, l, r)
+		var lt = self.tyOf(l)
+		var rt = self.tyOf(r)
+		// Two strings are compared by their bytes, not by where they are: the
+		// same word is the same word wherever it was written.
+		if lt == STR && rt == STR && comparison(op) {
+			val order = self.alloc(.StrCmp(lhs: l, rhs: r), I64, span)
+			val zero = self.alloc(.Int(0), I64, span)
+			return self.alloc(.Binary(op: op, lhs: order, rhs: zero, wrapping: false), BOOL, span)
+		}
+		// An array is compared as the slice of all of it, which is what
+		// implements `Eq` and `Ord`; and an array, a slice and a buffer of one
+		// element type are compared with each other, either way round, as the
+		// slices of their elements. A mistake is reported with the operands as
+		// written.
+		val written = (l, r)
+		val compared = comparison(op) && (lt != rt || self.kind(lt) is .Array(..))
+		if compared {
+			val left = self.asElements(l)
+			val right = self.asElements(r)
+			if left is .Some((le, lElem)) && right is .Some((re, rElem)) && lElem == rElem {
+				val slice = self.intern(.Slice(lElem))
+				l = le
+				r = re
+				lt = slice
+				rt = slice
+			}
+		}
+		// `a < b` on a type that implements `Ord` asks it.
+		if op is .Lt | .Le | .Gt | .Ge &&
+			lt == rt &&
+			!self.operatorApplies(op, lt) &&
+			self.interfaceMethod(.Ord, lt) is .Some(compare) {
+			return self.ordering(op, compare, l, r, span)
+		}
+		// `a == b` on a type that implements `Eq` is `a.equals(&b)`.
+		if op is .Eq | .Ne &&
+			lt == rt &&
+			!self.operatorApplies(op, lt) &&
+			self.interfaceMethod(.Eq, lt) is .Some(equals) {
+			return self.equality(op, equals, l, r, span)
+		}
+		// `a + b` on a type that implements `Add` is `a.add(&b)`, and so for
+		// the rest of the arithmetic: the left side's implementation whose
+		// `Rhs` is the right side's type, answering its `Out`. The wrapping
+		// forms are the machine's, for its integers.
+		if op is .Add | .Sub | .Mul | .Div | .Rem &&
+			!wrapping &&
+			!(lt == rt && self.operatorApplies(op, lt)) &&
+			KnownInterface::ofBinary(op) is .Some(known) &&
+			self.operatorImpl(known, lt, rt) is .Some(found) {
+			return self.operatorCall(found, l, r, span)
+		}
+		// The wrapping forms are the machine's, for its integers: a type of a
+		// program's own answers `+`, never `+%`.
+		if wrapping && self.kind(lt) is .Struct(..) | .Enum(..) {
+			self.reportWrappingOwnType(op, opSpan, lt, "")
+			return self.errorExpr(span)
+		}
+		if !(lt == rt && self.operatorApplies(op, lt)) {
+			self.reportOperands(op, opSpan, op.text(), written.0, written.1)
+			// With a type of a program's own on either side, what the answer
+			// would have been is unknown, and nothing more is said of it.
+			if lt != rt &&
+				(self.kind(lt) is .Struct(..) | .Enum(..) ||
+					self.kind(rt) is .Struct(..) | .Enum(..)) {
+				return self.errorExpr(span)
+			}
+		}
+		return self.alloc(.Binary(op: op, lhs: l, rhs: r, wrapping: wrapping), result, span)
+	}
+
+	/// `&place` or `&var place`. A call's argument may be either, which
+	/// `argument` says. Anywhere else a `&place` may stand where a `&`
+	/// reference is expected — a variant's payload, a local declared as one,
+	/// an assignment to one — since a `&` is kept where a view is; a `&var`
+	/// may not. What is refused is reported, and checked as if it were an
+	/// argument, so that what is inside is checked too.
+	var fn reference(
+		op: ast::UnaryOp,
+		operand: ast::ExprId,
+		hint: Option<Ty>,
+		span: Span,
+		argument: bool,
+	): ExprId = {
+		val kind: RefKind = if op == .RefVar then .Var else .Shared
+		// A `val`'s whole value: this `&`, and no `&` inside it.
+		val local = self.state.localReference
+		self.state.localReference = false
+		var innerHint: Option<Ty> = .None
+		if hint is .Some(h) && self.kind(h) is .Ref(inner: t, ..) then innerHint = .Some(t)
+		// The operand may be a range of elements.
+		val e = self.inferBorrowed(operand, innerHint)
+		val inner = self.tyOf(e)
+		if self.isPoisoned(inner) then return self.errorExpr(span)
+		// A reference to a function value would be written `&(…) => R`, which
+		// is a closure's type, and a closure is a pair: the value is passed as
+		// it is, or called from a lambda.
+		if self.kind(inner) is .Fn(..) {
+			self.report(
+				Diagnostic::error(
+					FN_VALUE_REF,
+					"`\(op.text())` of a function value",
+					span,
+					"a function value, which `\(op.text())` would make a closure's type",
+				).withNote(
+					"a closure is an environment and its code; a function value is code alone",
+				).withHelp(
+					"pass it as it is where a function value is taken, or wrap it in a lambda that calls it, as in `(x) => f(x)`",
+				),
+			)
+			return self.errorExpr(span)
+		}
+		val hintShared = hint is .Some(h) && self.kind(h) is .Ref(kind: .Shared, ..)
+		val expected = kind == .Shared && (local || hintShared)
+		if !argument && !expected {
+			val (message, note, help) =
+				if kind == .Var then
+					(
+						"`&var` can only be passed as an argument",
+						"a `&var` exists only while a call runs, so that two writers of one place are only ever two arguments of one call",
+						"write the place directly, or pass it to a function that takes a `&var`",
+					)
+				else (
+					"`&` can only be written where a reference is expected",
+					"a `&` reference is an argument, a view's field, a variant's payload, a local's value or an assignment to one",
+					"use the value directly, or keep it in a local: `val r = &place`",
+				)
+			self.report(
+				Diagnostic::error(
+					REF_OUTSIDE_ARGUMENT,
+					String::of(message),
+					span,
+					"`\(op.text())` where no reference is expected",
+				).withNote(String::of(note)).withHelp(String::of(help)),
+			)
+		}
+		if kind == .Var then self.requireWritable(e, .Borrow)
+		// A value with no place of its own is lent where it is used, as it is
+		// moved where it is used: `move` on one is refused, and this is the
+		// same rule for `&`. Elsewhere, where a reference is expected, `&` is
+		// the only way to lend one, and the move checker refuses it where it
+		// is kept past its statement.
+		if kind == .Shared &&
+			argument &&
+			!self.lendsAnOwnedClosure(inner) &&
+			self.placeRoot(e) is .NotAPlace {
+			val amp = Span::new(span.lo, span.lo + 1)
+			self.report(
+				Diagnostic::error(
+					REF_NOT_A_PLACE,
+					"`&` needs a variable, field or element",
+					self.state.body.exprs[e].span,
+					"a temporary value",
+				).withFix("remove the `&`", own [Edit::replace(amp, String())]).withNote(
+					"a temporary is already lent where it is used, as it is already moved",
+				),
+			)
+		}
+		// An owned closure lends itself, as an `own<T>` lends a `&T`: the same
+		// pair, seen as one lent for a call.
+		if self.kind(inner) is .Own(code) && self.kind(code) is .Fn(..) {
+			val ty = self.intern(.Ref(inner: code, kind: kind))
+			return self.alloc(.LendClosure(e), ty, span)
+		}
+		val ty = self.intern(.Ref(inner: inner, kind: kind))
+		return self.alloc(.Ref(e), ty, span)
+	}
+
+	/// `-x` or `!x` as the call it stands for, with the operand lent.
+	var fn unaryCall(method: FnId, ty: Ty, operand: ExprId, span: Span): ExprId = {
+		val lent = self.intern(.Ref(inner: ty, kind: .Shared))
+		val receiver = self.alloc(.Ref(operand), lent, span)
+		val typeArgs = match self.program.fns[method].interfaceId {
+			.Some(_) => self.program.types.internList([ty])
+			.None => {
+				val args = self.ownerArgs(ty)
+				self.program.types.internList(&args)
+			}
+		}
+		return self.alloc(
+			.Call(
+				callee: method,
+				args: Vec::of(own [receiver]),
+				typeArgs: typeArgs,
+				order: Vec::of(own [0]),
+			),
+			ty,
+			span,
+		)
+	}
+
+	/// The help for an operator a type of a program's own does not answer:
+	/// the block that would make it.
+	fn operatorHint(diagnostic: Diagnostic, ty: Ty, interfaceName: str, what: str): Diagnostic = {
+		if !(self.kind(ty) is .Struct(..) | .Enum(..)) then return move diagnostic
+		val name = self.tyName(ty)
+		return diagnostic.withHelp("a type \(what) by `extend \(name.toStr().trimMatches("`")): \(interfaceName)`")
+	}
+
+	/// The method of one of the prelude's one-method interfaces for a type
+	/// that implements it, if it does: the implementation's, or for a type
+	/// parameter constrained by the interface, the interface's own, which its
+	/// instance replaces. It is what `==`, `<`, `+`, `-x` and the rest call on
+	/// a type of a program's own.
+	fn interfaceMethod(which: KnownInterface, ty: Ty): Option<FnId> = {
+		val interfaceId = self.program.preludeItems.interfaceOf(which)?
+		if self.kind(ty) is .Param(param) {
+			if param.index as i64 >= self.typeParams.len() then return .None
+			for c in self.typeParams[param.index as i64].interfaces {
+				if c.interfaceId == interfaceId then
+					return .Some(self.program.interfaces[interfaceId].methods[0].id)
+			}
+			return .None
+		}
+		return self.methodOfImpl(ty, interfaceId)
+	}
+
+	/// The implementation `a op b` calls, where `a` is of type `lt` and `b` of
+	/// `rt`: the left type's implementation of the operator's interface whose
+	/// `Rhs` is `rt`, or, for a type parameter, a constraint that says it has
+	/// one. Nothing is looked for on the right: `2.0 * v` is an
+	/// implementation for `f32`.
+	var fn operatorImpl(which: KnownInterface, lt: Ty, rt: Ty): Option<OperatorImpl> = {
+		val interfaceId = self.program.preludeItems.interfaceOf(which)?
+		if self.kind(lt) is .Param(param) {
+			if param.index as i64 >= self.typeParams.len() then return .None
+			var found: Option<Constraint> = .None
+			for c in self.typeParams[param.index as i64].interfaces {
+				val list = self.program.types.list(c.args)
+				if found.isNone() &&
+					c.interfaceId == interfaceId &&
+					!list.isEmpty() &&
+					list[0] == rt {
+					found = .Some(c)
+				}
+			}
+			val constraint = found?
+			val args = self.program.types.list(constraint.args).toVec()
+			var typeArgs = Vec::of(own [lt])
+			for a in args {
+				typeArgs.push(a)
+			}
+			return .Some(OperatorImpl(
+				method: self.program.interfaces[interfaceId].methods[0].id,
+				typeArgs: self.program.types.internList(&typeArgs),
+				rhs: rt,
+				out: if args.len() > 1 then args[1] else lt,
+			))
+		}
+		val owner = self.ownerOf(lt)?
+		val ownerArgs = self.ownerArgs(lt)
+		for at in 0..self.program.impls.len() {
+			if self.program.impls[at].interfaceId != interfaceId ||
+				self.program.impls[at].ty != owner {
+				continue
+			}
+			val args = self.program.types.list(self.program.impls[at].args).toVec()
+			if args.len() < 2 then continue
+			val rhs = self.program.types.subst(args[0], &ownerArgs)
+			if rhs != rt || self.unmetCondition(at, &ownerArgs).isSome() then continue
+			if self.program.impls[at].methods.isEmpty() then return .None
+			val method = self.program.impls[at].methods[0]
+			val out = self.program.types.subst(args[1], &ownerArgs)
+			return .Some(OperatorImpl(
+				method: method,
+				typeArgs: self.program.types.internList(&ownerArgs),
+				rhs: rhs,
+				out: out,
+			))
+		}
+		return .None
+	}
+
+	/// The right sides the left type's implementations of an operator take,
+	/// which say what a number written there is.
+	var fn operatorRhsTys(which: KnownInterface, lt: Ty): Vec<Ty> = {
+		var found: Vec<Ty> = Vec()
+		val .Some(interfaceId) = self.program.preludeItems.interfaceOf(which) else {
+			return move found
+		}
+		if self.kind(lt) is .Param(param) {
+			if param.index as i64 >= self.typeParams.len() then return move found
+			for c in self.typeParams[param.index as i64].interfaces {
+				val list = self.program.types.list(c.args)
+				if c.interfaceId == interfaceId && !list.isEmpty() then found.push(list[0])
+			}
+			return move found
+		}
+		val .Some(owner) = self.ownerOf(lt) else {
+			return move found
+		}
+		val ownerArgs = self.ownerArgs(lt)
+		for at in 0..self.program.impls.len() {
+			if self.program.impls[at].interfaceId != interfaceId ||
+				self.program.impls[at].ty != owner {
+				continue
+			}
+			val list = self.program.types.list(self.program.impls[at].args).toVec()
+			if !list.isEmpty() then found.push(self.program.types.subst(list[0], &ownerArgs))
+		}
+		return move found
+	}
+
+	/// The left sides whose implementations of an operator take `rt` on the
+	/// right, of the built-in types: what a number written on the left of a
+	/// type of a program's own is, `2.0 * v`.
+	var fn operatorLhsBuiltins(which: KnownInterface, rt: Ty): Vec<Ty> = {
+		var tys: Vec<Ty> = Vec()
+		val .Some(interfaceId) = self.program.preludeItems.interfaceOf(which) else {
+			return move tys
+		}
+		var owners: Vec<TypeDef> = Vec()
+		for i in self.program.impls {
+			val list = self.program.types.list(i.args)
+			if i.interfaceId == interfaceId &&
+				i.ty is .Builtin(..) &&
+				!list.isEmpty() &&
+				list[0] == rt {
+				owners.push(i.ty)
+			}
+		}
+		for owner in owners {
+			tys.push(self.ownSelfTy(owner))
+		}
+		return move tys
+	}
+
+	/// `a op b` as the call of the implementation `operatorImpl` found, with
+	/// both sides lent.
+	var fn operatorCall(found: OperatorImpl, l: ExprId, r: ExprId, span: Span): ExprId = {
+		val lt = self.tyOf(l)
+		val left = self.intern(.Ref(inner: lt, kind: .Shared))
+		val right = self.intern(.Ref(inner: found.rhs, kind: .Shared))
+		val receiver = self.alloc(.Ref(l), left, span)
+		val other = self.alloc(.Ref(r), right, span)
+		return self.alloc(
+			.Call(
+				callee: found.method,
+				args: Vec::of(own [receiver, other]),
+				typeArgs: found.typeArgs,
+				order: Vec::of(own [0, 1]),
+			),
+			found.out,
+			span,
+		)
+	}
+
+	/// `a < b` as what it asks: `a.compare(&b)`, and then which answer that
+	/// operator wants.
+	var fn ordering(op: BinaryOp, compare: FnId, l: ExprId, r: ExprId, span: Span): ExprId = {
+		val .Some(ordering) = self.program.preludeItems.enumeration(.Ordering) else {
+			return self.errorExpr(span)
+		}
+		val ty = self.tyOf(l)
+		val answerTy = self.intern(.Enum(id: ordering, args: TyList::empty()))
+		val call = self.compareCall(compare, ty, answerTy, l, r, span)
+		// `.Less` is the first variant of `Ordering`, `.Same` the second and
+		// `.More` the third.
+		val variant: u32 = if op is .Lt | .Ge then 0 else 2
+		val negated = op is .Ge | .Le
+		val test = self.alloc(
+			.Is(scrutinee: call, pattern: .Variant(variant: variant, binders: Vec())),
+			BOOL,
+			span,
+		)
+		if negated then return self.alloc(.Unary(op: .Not, operand: test), BOOL, span)
+		return test
+	}
+
+	/// The call of a generated or written `compare`, with both sides lent.
+	var fn compareCall(
+		compare: FnId,
+		ty: Ty,
+		answer: Ty,
+		l: ExprId,
+		r: ExprId,
+		span: Span,
+	): ExprId = {
+		val other = self.intern(.Ref(inner: ty, kind: .Shared))
+		val receiver = self.alloc(.Ref(l), other, span)
+		val borrowed = self.alloc(.Ref(r), other, span)
+		val typeArgs = self.methodTypeArgs(compare, ty)
+		return self.alloc(
+			.Call(
+				callee: compare,
+				args: Vec::of(own [receiver, borrowed]),
+				typeArgs: typeArgs,
+				order: Vec::of(own [0, 1]),
+			),
+			answer,
+			span,
+		)
+	}
+
+	/// The type arguments of a call of a method on a value of `ty`: an
+	/// interface's method is generic in `Self`, which is this type; a method
+	/// of a generic type is generic in the type's own parameters.
+	var fn methodTypeArgs(
+		method: FnId,
+		ty: Ty,
+	): TyList = match self.program.fns[method].interfaceId {
+		.Some(_) => self.program.types.internList([ty])
+		.None => {
+			val args = self.ownerArgs(ty)
+			self.program.types.internList(&args)
+		}
+	}
+
+	/// `a == b` as the call it stands for, and `a != b` as its negation.
+	var fn equality(op: BinaryOp, equals: FnId, l: ExprId, r: ExprId, span: Span): ExprId = {
+		val ty = self.tyOf(l)
+		val other = self.intern(.Ref(inner: ty, kind: .Shared))
+		// Both sides are lent for the call, as `a.equals(&b)` lends them.
+		val receiver = self.alloc(.Ref(l), other, span)
+		val borrowed = self.alloc(.Ref(r), other, span)
+		val typeArgs = self.methodTypeArgs(equals, ty)
+		val call = self.alloc(
+			.Call(
+				callee: equals,
+				args: Vec::of(own [receiver, borrowed]),
+				typeArgs: typeArgs,
+				order: Vec::of(own [0, 1]),
+			),
+			BOOL,
+			span,
+		)
+		return if op == .Ne then self.alloc(.Unary(op: .Not, operand: call), BOOL, span) else call
+	}
+
+	/// Whether a type is a struct or an enum: a type of a program's own.
+	fn declaredType(ty: Ty): bool = self.kind(ty) is .Struct(..) | .Enum(..)
+
+	/// Reports operands of `op`, written `text`, that it does not apply to:
+	/// of different types, or of a type it does not take.
+	var fn reportOperands(op: BinaryOp, opSpan: Span, text: str, l: ExprId, r: ExprId) = {
+		val lt = self.tyOf(l)
+		val rt = self.tyOf(r)
+		val allowed = self.operatorApplies(op, lt)
+		val lspan = self.state.body.exprs[l].span
+		val rspan = self.state.body.exprs[r].span
+		var diagnostic = if lt != rt && (self.declaredType(lt) || self.declaredType(rt)) {
+			// A type of a program's own on either side: no implementation takes
+			// the two.
+			Diagnostic::error(
+				INVALID_OPERANDS,
+				"cannot apply `\(text)` to \(self.tyName(lt)) and \(self.tyName(rt))",
+				opSpan,
+				"no implementation takes these two",
+			)
+		} else if lt != rt && allowed {
+			val d = Diagnostic::error(
+				INVALID_OPERANDS,
+				"cannot apply `\(text)` to \(self.tyName(lt)) and \(self.tyName(rt))",
+				opSpan,
+				"operands of different types",
+			).withNote("Wip has no implicit numeric conversions")
+			// An integer literal next to a float was almost certainly meant as a
+			// float literal.
+			if self.program.types.isFloat(lt) && self.state.body.exprs[r].kind is .Int(..) then
+				d.withFix("use a float literal", own [Edit::insert(rspan.hi, ".0")])
+			else if self.program.types.isFloat(rt) && self.state.body.exprs[l].kind is .Int(..) then
+				d.withFix("use a float literal", own [Edit::insert(lspan.hi, ".0")])
+			else move d
+		} else {
+			val what = match op {
+				.Rem => "`%` needs integer operands"
+				.BitAnd | .BitOr | .BitXor | .Shl | .Shr =>
+					"bitwise operators need integer operands"
+				.Eq | .Ne => "`==` and `!=` compare numbers or `bool`"
+				_ => "arithmetic and ordering need numbers"
+			}
+			Diagnostic::error(
+				INVALID_OPERANDS,
+				"cannot apply `\(text)` to \(self.tyName(lt))",
+				opSpan,
+				String::of(what),
+			)
+		}
+		diagnostic = diagnostic.withSecondary(lspan, self.tyName(lt)).withSecondary(
+			rspan,
+			self.tyName(rt),
+		)
+		// A type of a program's own answers an arithmetic operator by
+		// implementing its interface, with the type on the other side its
+		// argument where it is another.
+		if KnownInterface::ofBinary(op) is .Some(known) {
+			val verb = match op {
+				.Add => "adds"
+				.Sub => "subtracts"
+				.Mul => "multiplies"
+				.Div => "divides"
+				_ => "answers `%`"
+			}
+			if lt == rt {
+				diagnostic = self.operatorHint(move diagnostic, lt, known.name(), verb)
+			} else if self.declaredType(lt) {
+				val other = self.tyName(rt)
+				val writtenName = "\(known.name())<\(other.toStr().trimMatches("`"))>"
+				diagnostic = self.operatorHint(move diagnostic, lt, &writtenName, verb)
+			} else if self.declaredType(rt) {
+				val numberName = self.tyName(lt)
+				val otherName = self.tyName(rt)
+				val number = numberName.toStr().trimMatches("`")
+				val other = otherName.toStr().trimMatches("`")
+				diagnostic = diagnostic.withHelp("a number \(verb) a `\(other)` by `extend \(number): \(known.name())<\(other), …>`, written in the module of `\(other)`")
+			}
+		}
+		// On `bool`, `&` and `|` were almost certainly meant as `&&` and `||`.
+		if lt == BOOL && rt == BOOL && text == op.text() then
+			diagnostic = match op {
+				.BitAnd => diagnostic.withFix("for logical and, write `&&`", own [
+					Edit::replace(opSpan, "&&"),
+				])
+				.BitOr => diagnostic.withFix("for logical or, write `||`", own [
+					Edit::replace(opSpan, "||"),
+				])
+				.BitXor => diagnostic.withHelp("for `bool`, `!=` is exclusive or")
+				_ => move diagnostic
+			}
+		// A type that does implement the interface, but only for type
+		// arguments that do themselves, is told which argument does not:
+		// `Option<T: Eq>` compares where `T` does.
+		val wanted: Option<InterfaceId> = match op {
+			.Eq | .Ne => self.program.preludeItems.interfaceOf(.Eq)
+			.Lt | .Le | .Gt | .Ge => self.program.preludeItems.interfaceOf(.Ord)
+			_ => .None
+		}
+		var unmet: Option<(Constraint, Vec<(Ty, Constraint)>)> = .None
+		if lt == rt && wanted is .Some(interfaceId) {
+			val constraint = Constraint(interfaceId: interfaceId, args: TyList::empty())
+			val chain = self.unmetChain(lt, constraint)
+			if !chain.isEmpty() then unmet = .Some((constraint, move chain))
+		}
+		// A type says it compares with `@derive(Eq)` and that it is ordered
+		// with `@derive(Ord)`, and the compiler writes both.
+		val declared = self.declaredType(lt)
+		if unmet is .Some((constraint, chain)) {
+			diagnostic = diagnostic.withHelp(self.unmetHelp(lt, constraint, &chain))
+			// The type that lacks it is the innermost, which is where it is
+			// written, if the program may write it.
+			val (arg, condition) = chain[chain.len() - 1]
+			val name = self.constraintName(condition, arg)
+			val insideName = self.tyName(arg)
+			val inside = insideName.toStr().trimMatches("`")
+			if self.stdModuleOf(arg) is .Some(module) {
+				val where = if module == PRELUDE then String::of("the prelude") else "`\(module)`"
+				diagnostic = diagnostic.withHelp("`\(inside)` is declared in \(where), which does not implement `\(name)` for it")
+			} else if self.declaredType(arg) {
+				diagnostic = diagnostic.withHelp("write `@derive(\(name))` on `\(inside)`, and the compiler writes it field by field")
+			}
+			diagnostic = diagnostic.withNote(
+				"an implementation may hold only for some type arguments: `extend Option<T: Eq>: Eq`",
+			)
+		} else if op is .Eq | .Ne && declared {
+			val typeName = self.tyName(lt)
+			val name = typeName.toStr().trimMatches("`")
+			diagnostic = diagnostic.withHelp("write `@derive(Eq)` on `\(name)`, and the compiler writes the comparison field by field").withNote(
+				"a type whose equality is not its fields writes `extend …: Eq` itself instead",
+			)
+		} else if op is .Lt | .Le | .Gt | .Ge && declared && lt == rt {
+			val typeName = self.tyName(lt)
+			val name = typeName.toStr().trimMatches("`")
+			diagnostic = diagnostic.withHelp("write `@derive(Eq, Ord)` on `\(name)`, and the compiler writes the order field by field").withNote(
+				"a type whose order is not its fields writes `extend …: Ord` itself instead",
+			)
+		} else if op is .Eq | .Ne && self.kind(lt) is .Array(..) {
+			diagnostic = diagnostic.withHelp("compare the elements one by one")
+		}
+		self.report(move diagnostic)
+	}
+
+	/// Whether `op` applies to operands of type `ty`.
+	fn operatorApplies(op: BinaryOp, ty: Ty): bool = {
+		val types = &self.program.types
+		return match op {
+			.Rem | .BitAnd | .BitOr | .BitXor | .Shl | .Shr => types.isInteger(ty)
+			.Add | .Sub | .Mul | .Div => types.isNumeric(ty)
+			// Characters compare as the numbers they are.
+			.Lt | .Le | .Gt | .Ge => types.isNumeric(ty) || ty == CHAR
+			// Two pointers are equal where they point at the same place.
+			.Eq | .Ne =>
+				types.isNumeric(ty) || ty == BOOL || ty == CHAR || types.kind(ty) is .Ptr(..)
+			.And | .Or => false
+		}
+	}
+
+	/// A field of a type that cleans up after itself may not be moved out:
+	/// its drop is about to run over the hole.
+	var fn noMoveOutOfDrop(place: ExprId, span: Span) = {
+		var at = place
+		while true {
+			val base = match self.state.body.exprs[at].kind {
+				.Field(base, ..) | .Index(base, ..) => base
+				.Deref(inner) => inner
+				_ => return
+			}
+			val ty = self.underRefs(self.tyOf(base))
+			if self.program.hasDrop(ty) {
+				val name = self.tyName(ty)
+				self.report(
+					Diagnostic::error(
+						DROP_RULES,
+						"cannot move out of \(name), which cleans up after itself",
+						span,
+						"a part of it",
+					).withNote(
+						"its `destroy` runs over the whole value, so a part that was taken out would be ended twice or not at all",
+					).withHelp(
+						"move the whole value, or give the type a method that hands out what it holds",
+					),
+				)
+				return
+			}
+			at = base
+		}
+	}
+
+	/// `expr as T`: a conversion between numbers, between a character and a
+	/// number, between C pointers, and between a pointer and an address.
+	var fn cast(expr: ast::ExprId, ty: ast::TypeId, span: Span): ExprId = {
+		val target = self.resolveTy(ty)
+		// `null as ptr<T>` is a pointer of the type it is cast to.
+		val hint: Option<Ty> =
+			if self.ast.exprs[expr].kind is .Null && self.kind(target) is .Ptr(..) then
+				.Some(target)
+			else .None
+		val e = self.operand(expr, hint)
+		val from = self.tyOf(e)
+		if self.isPoisoned(from) || self.hasError(target) then return self.errorExpr(span)
+		val types = &self.program.types
+		if types.isNumeric(from) && types.isNumeric(target) then
+			return self.alloc(.Cast(e), target, span)
+		// A character is its number, which fits any integer type that holds
+		// it; of the numbers, only a byte is always a character.
+		if from == CHAR && types.isInteger(target) then return self.alloc(.Cast(e), target, span)
+		if target == CHAR && from == U8 then return self.alloc(.Cast(e), target, span)
+		if target == CHAR && types.isInteger(from) {
+			self.report(
+				Diagnostic::error(
+					INVALID_CAST,
+					"cannot convert \(self.tyName(from)) to `char`",
+					span,
+					"not every number is a character",
+				).withNote(
+					"a character is a Unicode scalar value: up to 10FFFF, and not a surrogate; only a `u8` is always one",
+				).withHelp(
+					"`char::fromInt(n)` answers the character, or nothing where there is none",
+				),
+			)
+			return self.errorExpr(span)
+		}
+		// An enum whose variants carry nothing is a number: which variant it
+		// holds.
+		if self.kind(from) is .Enum(id, ..) && types.isInteger(target) {
+			if self.namesAlone(id) then return self.alloc(.VariantIndex(e), target, span)
+			val name = self.tyName(from)
+			self.report(
+				Diagnostic::error(
+					INVALID_CAST,
+					"\(name) carries values, so it is not a number",
+					span,
+					"not an enum of names alone",
+				).withNote(
+					"an enum whose variants carry nothing is which one it holds, and one that carries values is that and what it holds",
+				),
+			)
+			return self.errorExpr(span)
+		}
+		// One C pointer as another: what C's casts between pointer types do.
+		// The bits are the same, so nothing is converted.
+		val fromPointer = self.kind(from) is .Ptr(..)
+		val toPointer = self.kind(target) is .Ptr(..)
+		if fromPointer && toPointer then return self.alloc(.Cast(e), target, span)
+		// A pointer as the integer that is its address, and back: what C's
+		// handles are passed as, and compared or hashed by. Only an integer as
+		// wide as a pointer holds one.
+		val fromAddress = from == USIZE || from == ISIZE || from == U64 || from == I64
+		val toAddress = target == USIZE || target == ISIZE || target == U64 || target == I64
+		if (fromPointer && toAddress) || (fromAddress && toPointer) then
+			return self.alloc(.Cast(e), target, span)
+		var diagnostic = Diagnostic::error(
+			INVALID_CAST,
+			"cannot convert \(self.tyName(from)) to \(self.tyName(target))",
+			span,
+			"not a numeric conversion",
+		).withNote(
+			"`as` converts between the integer types, `f32` and `f64`, between C pointer types, and between a pointer and an integer as wide as one, `usize`, `isize`, `u64` or `i64`",
+		)
+		// A number is not a variant on its own: an enum has the numbers of its
+		// own variants and no others.
+		if self.kind(target) is .Enum(id, ..) &&
+			self.program.types.isInteger(from) &&
+			self.namesAlone(id) {
+			val name = self.typeName(.Enum(id))
+			diagnostic = diagnostic.withHelp("`\(name)::fromIndex(n)` answers the variant with that number, or nothing where `\(name)` has no such variant")
+		}
+		self.report(move diagnostic)
+		return self.errorExpr(span)
+	}
+
+	/// Whether no variant of an enum carries anything.
+	fn namesAlone(id: EnumId): bool = {
+		for v in self.program.enums[id].variants {
+			if !v.fields.isEmpty() then return false
+		}
+		return true
+	}
+}

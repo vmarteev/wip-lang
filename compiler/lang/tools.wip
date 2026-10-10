@@ -1,0 +1,120 @@
+// The tools written in Wip that `wip` carries and runs. Their source is in
+// the compiler's home, beside the library; the first time one is asked for
+// it is built into the cache, keyed by what it says and by the compiler that
+// builds it, and it is run from there after.
+
+import std::digest::{Sha256}
+import std::fs
+import std::path
+import std::process
+
+/// The binding generator, built by this compiler from its source in the
+/// home: where its executable is, or why it could not be built. Its tests
+/// are not built: they are run from the repository, by `wip test
+/// tools/bindgen/main.wip`.
+pub fn bindgen(color: bool, unique: &Unique, threads: i64): Result<String, String> = {
+	val home = findHome()?
+	val dir = path::join(home.toStr(), "tools/bindgen")
+	var names: Vec<String> = Vec()
+	toolFiles(dir.toStr(), "", &var names)
+	if names.isEmpty() then return .Err("the source of `wip bindgen` is not in `\(dir)`")
+	names.sort()
+	var files: Vec<(String, String)> = Vec()
+	for name in names {
+		val file = path::join(dir.toStr(), name.toStr())
+		match fs::readFile(file.toStr()) {
+			.Ok(text) => files.push((name.clone(), move text))
+			.Err(error) => return .Err("cannot read `\(file)`: \(error)")
+		}
+	}
+	return built("bindgen", &files, color, &unique, threads)
+}
+
+/// The `.wip` files of a tool under `dir`, by their paths from its root, but
+/// not its tests.
+fn toolFiles(dir: str, within: str, out: &var Vec<String>) = {
+	val .Ok(entries) = fs::readDir(path::join(dir, within).toStr()) else {
+		return
+	}
+	for entry in entries {
+		val name = path::join(within, entry.name.toStr())
+		if entry.isDirectory() then toolFiles(dir, name.toStr(), &var out)
+		else if name.endsWith(".wip") && !name.endsWith(".test.wip") then out.push(move name)
+	}
+}
+
+/// The tool `name` of `files`, built into `<cache>/tools/<name>/<key>` the
+/// first time it is asked for, and found there after.
+fn built(
+	name: str,
+	files: &[(String, String)],
+	color: bool,
+	unique: &Unique,
+	threads: i64,
+): Result<String, String> = {
+	var hasher = Sha256()
+	field(&var hasher, compilerIdentity())
+	for (file, text) in files {
+		field(&var hasher, file.toStr())
+		field(&var hasher, text.toStr())
+	}
+	val tools = path::join(path::join(cacheDir().toStr(), "tools").toStr(), name)
+	val dir = path::join(tools.toStr(), hex(hasher.finish()).toStr())
+	val exe = path::join(dir.toStr(), name)
+	if isFile(exe.toStr()) then return .Ok(move exe)
+	// Built beside where it goes and moved into place, so that two runs at
+	// once never find half of one.
+	val partial = "\(dir).partial\(process::id())"
+	fs::removeAll(partial.toStr())
+	if buildInto(partial.toStr(), name, &files, color, &unique, threads) is .Err(message) {
+		fs::removeAll(partial.toStr())
+		return .Err(move message)
+	}
+	// Where another run moved its own into place first, that one is kept.
+	if fs::rename(partial.toStr(), dir.toStr()).isErr() then fs::removeAll(partial.toStr())
+	if isFile(exe.toStr()) then return .Ok(move exe)
+	return .Err("cannot keep `wip \(name)` in `\(dir)`")
+}
+
+/// Writes `files` into `dir/src` and builds them into `dir/<name>`.
+fn buildInto(
+	dir: str,
+	name: str,
+	files: &[(String, String)],
+	color: bool,
+	unique: &Unique,
+	threads: i64,
+): Result<void, String> = {
+	val src = path::join(dir, "src")
+	for (file, text) in files {
+		val written = path::join(src.toStr(), file.toStr())
+		val parent = path::parent(written.toStr())
+		if fs::makeDirs(parent) is .Err(error) then
+			return .Err("cannot create `\(parent)`: \(error)")
+		if fs::writeFile(written.toStr(), text.toStr()) is .Err(error) then
+			return .Err("cannot write `\(written)`: \(error)")
+	}
+	var timings = Timings()
+	var loaded =
+		loadMode(path::join(src.toStr(), "main.wip").toStr(), .Program, &var timings, threads)?
+	val exe = path::join(dir, name)
+	// A tool is built to be used, once, and run many times.
+	val options = BuildOptions(profile: .Release)
+	return match buildLoaded(&var loaded, exe.toStr(), &options, &unique, &var timings) {
+		.Ok(..) => .Ok()
+		.Err(
+			.Diagnostics(diagnostics),
+		) => .Err("`wip \(name)` does not compile with this compiler:\n\(renderProgram(&diagnostics, &loaded.sources, color))")
+		.Err(.Link(message)) => .Err(move message)
+	}
+}
+
+/// Which compiler this is, as far as what it builds depends on it: its
+/// version, and its executable, by where it is, how large it is and when it
+/// was written. A compiler built again is another compiler.
+fn compilerIdentity(): Vec<u8> = {
+	var id: Vec<u8> = Vec()
+	id.pushAll(described().toStr())
+	id.pushAll(thisCompiler())
+	return move id
+}

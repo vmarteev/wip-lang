@@ -469,6 +469,62 @@ a call and not kept ([page 7](07-references.md)). A generic parameter is the
 other way to write the same thing, and compiles to a direct call per type;
 `&dyn` compiles to one function for all of them.
 
+## Another module's interface
+
+A `pub interface` is imported by name, and named by its path, as a type
+is: in a constraint, behind `dyn`, and as the interface an `extend` block
+implements. A type a program declares implements an interface in the
+type's own module, whichever module declares the interface, so that each
+type's methods are where the type is. Calling them takes no import, since a
+method comes with its type ([page 3](03-functions.md)); only naming the
+interface does:
+
+```wip,run
+import shapes
+import shapes::{Area}
+
+struct Rect {
+    width: i64
+    height: i64
+}
+
+extend Rect: shapes::Area {
+    fn area(): i64 = self.width * self.height
+}
+
+fn twice<T: Area>(shape: &T): i64 = shape.area() * 2
+
+fn main() = {
+    val rect = Rect(width: 2, height: 3)
+    assert(twice(&rect) == 12)
+    assert(shapes::described(&rect) == "6")
+    assert(rect.area() == 6)
+}
+
+// file: shapes/shapes.wip
+pub interface Area {
+    fn area(): i64
+}
+
+pub fn described(shape: &dyn Area): String = "\(shape.area())"
+```
+
+An interface its module keeps to itself is refused as a private type is,
+by an import or by a path:
+
+```wip,error=E0210
+import shapes
+
+fn measured<T: shapes::Measured>(shape: &T): i64 = 0
+
+fn main() = {}
+
+// file: shapes/shapes.wip
+interface Measured {
+    fn size(): i64
+}
+```
+
 ## The interfaces the prelude declares
 
 | Interface | For |

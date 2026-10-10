@@ -1,0 +1,164 @@
+// `wip bindgen`, the binding generator, which is written in Wip: its own
+// tests, run by `wip test` as the library's are; what it writes for a header
+// with one of everything in it, `tests/bindgen/shapes.h`, which is a
+// snapshot, since the file it writes is committed and read by people; and
+// its command line. It asks clang for a header's syntax tree, which only
+// clang writes, so where clang is not installed what it would write is not
+// asked: the Linux image the gate runs in carries gcc.
+
+import std::process::{Command}
+import check::{Checked, Gate, across, read, run, said, wrong}
+import snapshot
+
+val ITEMS = [
+	"it passes its own tests",
+	"what it writes for shapes.h",
+	"a header read with a setting",
+	"it renames around every keyword",
+	"it reads its command line",
+]
+
+pub fn check(gate: &Gate): Checked = {
+	var chosen: Vec<i64> = Vec()
+	for index in 0..ITEMS.len() {
+		if gate.takes(ITEMS[index]) then chosen.push(index)
+	}
+	val failed = across(
+		chosen.len(),
+		(at) => {
+			val index = chosen[at]
+			val found = match index {
+				0 => ownTests(&gate)
+				1 => shapes(&gate)
+				2 => configured(&gate)
+				3 => everyKeyword()
+				_ => commandLine(&gate)
+			}
+			return match found {
+				.Some(why) => .Some("\(ITEMS[index]): \(why)")
+				.None => .None
+			}
+		},
+	)
+	return Checked::of(chosen.len(), move failed)
+}
+
+fn clangIsInstalled(): bool = run(Command::of("clang").arg("--version")).exit.success()
+
+/// Its tests pass, and there are some: a run that compiled none would pass
+/// with nothing checked.
+fn ownTests(gate: &Gate): Option<String> = {
+	val tested = gate.wip(".", ["test", "tools/bindgen/main.wip"])
+	if !tested.exit.success() || tested.stdout.contains("running 0 tests") then
+		return wrong("`wip test tools/bindgen/main.wip`", &tested)
+	return .None
+}
+
+/// What `wip bindgen` writes for `tests/bindgen/shapes.h` with
+/// `arguments`, or why it wrote nothing.
+fn writtenFor(gate: &Gate, arguments: &[str]): Result<String, String> = {
+	var all: Vec<str> = ["bindgen", "tests/bindgen/shapes.h"].toVec()
+	for argument in arguments {
+		all.push(argument)
+	}
+	val ran = gate.wip(".", &all)
+	if !ran.exit.success() then return .Err("`wip \(all.join(" "))` failed\(said(&ran))")
+	return .Ok(ran.stdout.clone())
+}
+
+fn shapes(gate: &Gate): Option<String> = {
+	if !clangIsInstalled() then return .None
+	return match writtenFor(gate, ["--link", "shapes", "--module", "shapes"]) {
+		.Ok(written) => snapshot::compare("tests/bindgen/shapes.snap", written.toStr(), gate.writes)
+		.Err(why) => .Some(move why)
+	}
+}
+
+/// A header read with a setting declares what that setting makes it
+/// declare, and the file says the setting, so that the C compiled with the
+/// program is configured the same way.
+fn configured(gate: &Gate): Option<String> = {
+	if !clangIsInstalled() then return .None
+	val wide = match writtenFor(gate, ["-D", "SHAPES_WIDE", "--module", "shapes"]) {
+		.Ok(written) => move written
+		.Err(why) => return .Some(move why)
+	}
+	if !wide.contains("pub val SHAPES_WIDTH: i64 = 64") ||
+		!wide.contains("@define(\"SHAPES_WIDE\")\n@header(\"shapes.h\")") {
+		return .Some("with `-D SHAPES_WIDE` it writes\n\(wide)")
+	}
+	val plain = match writtenFor(gate, ["--module", "shapes"]) {
+		.Ok(written) => move written
+		.Err(why) => return .Some(move why)
+	}
+	if !plain.contains("pub val SHAPES_WIDTH: i64 = 32") || plain.contains("@define") then
+		return .Some("with no setting it writes\n\(plain)")
+	return .None
+}
+
+/// The words a C name is renamed around are the language's keywords, every
+/// one: bindgen keeps its own list, which the compiler's lexer's is read
+/// against here, so that a keyword added to the language is not a name
+/// bindgen writes as it is.
+fn everyKeyword(): Option<String> = {
+	val lexer = read(".", "compiler/syntax/token.wip")
+	val .Some(start) = lexer.find("pub static fn keyword(") else {
+		return .Some(String::of("the lexer reads no keywords"))
+	}
+	val .Some(length) = lexer[start..].find("_ => return .None") else {
+		return .Some(String::of("the lexer's keywords do not end"))
+	}
+	var keywords: Vec<String> = Vec()
+	for line in lexer[start..start + length].lines() {
+		if line.trim().stripPrefix("\"") is .Some(rest) && rest.find("\" =>") is .Some(at) then
+			keywords.push(String::of(rest[0..at]))
+	}
+	keywords.sort()
+	val types = read(".", "tools/bindgen/types/types.wip")
+	val .Some(listed) = types.find("val KEYWORDS") else {
+		return .Some(String::of("bindgen lists no keywords"))
+	}
+	val list = types[listed..]
+	val end = list.find("\n]").unwrapOr(list.len())
+	var renamed: Vec<String> = Vec()
+	for line in list[0..end].lines() {
+		if line.trim().stripPrefix("\"") is .Some(rest) && rest.stripSuffix("\",") is .Some(word) {
+			renamed.push(String::of(word))
+		}
+	}
+	renamed.sort()
+	if renamed != keywords then
+		return .Some("bindgen's KEYWORDS are \(renamed.join(", "))\n  and the lexer's \(keywords.join(", "))")
+	return .None
+}
+
+/// Its own command line, read with `std::args`: what is wrong with it is
+/// said, with the usage, before clang is asked anything.
+fn commandLine(gate: &Gate): Option<String> = {
+	val help = gate.wip(".", ["bindgen", "--help"])
+	if !help.exit.success() || !help.stdout.contains("usage: wip bindgen <header>") then
+		return wrong("`wip bindgen --help`", &help)
+	if refused(
+		gate,
+		["bindgen", "--frobnicate"],
+		"error: `--frobnicate` is not an option",
+	) is .Some(why) {
+		return .Some(why.clone())
+	}
+	if refused(gate, ["bindgen", "a.h", "b.h"], "error: unexpected argument `b.h`") is .Some(why) {
+		return .Some(why.clone())
+	}
+	if refused(gate, ["bindgen", "a.h", "-o"], "error: `-o` needs a value") is .Some(why) then
+		return .Some(why.clone())
+	if refused(gate, ["bindgen"], "usage: wip bindgen <header>") is .Some(why) then
+		return .Some(why.clone())
+	return .None
+}
+
+/// `wip` with `arguments` ends with 1, saying `says`.
+fn refused(gate: &Gate, arguments: &[str], says: str): Option<String> = {
+	val ran = gate.wip(".", arguments)
+	if ran.exit != .Code(1) || !ran.stderr.contains(says) then
+		return wrong("`wip \(arguments.join(" "))`", &ran)
+	return .None
+}

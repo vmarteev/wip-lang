@@ -1,0 +1,183 @@
+// A session with `wip lsp`, as an editor holds one: messages framed by
+// their length, written on the server's standard input and read from its
+// output as it runs, each answer waited for, and the diagnostics it
+// publishes on the way kept by file.
+
+import std::json::{Json}
+import std::json
+import std::process::{Command, Connected}
+import std::time::{Duration}
+import check::{Gate}
+
+/// How long an answer is waited for before the server counts as hung: a
+/// server among the gate's other work answers slower than one alone.
+val PATIENCE: i64 = 60
+
+/// A server, talked to.
+struct Session {
+	server: Connected
+	next: i64
+	/// The diagnostics last published for each file, by its URI.
+	shown: Vec<(String, Json)>
+}
+
+/// The server of the `wip` the gate checks, with the cache `cache` where
+/// one is given, so that what it writes there can be looked at.
+fn start(gate: &Gate, root: str, cache: Option<str>): Result<Session, String> = {
+	var command = gate.command(root, ["lsp"])
+	if cache is .Some(dir) then command = command.env("WIP_CACHE_DIR", dir)
+	var server = match command.connect() {
+		.Ok(server) => move server
+		.Err(error) => return .Err("`wip lsp` does not start: \(error)")
+	}
+	server.output().setTimeout(.Some(Duration::seconds(PATIENCE)))
+	return .Ok(Session(server: move server, next: 1, shown: Vec()))
+}
+
+/// A text as JSON writes it, quoted and escaped.
+fn quoted(text: str): String = "\(Json::Text(text: String::of(text)))"
+
+/// A file's URI.
+fn uri(path: str): String = "file://\(path)"
+
+/// The value at `names` in `json`, where every one is there.
+fn field(json: &Json, names: &[str]): Option<&Json> = {
+	if names.isEmpty() then return .Some(json)
+	return match json.get(names[0]) {
+		.Some(next) => field(next, &names[1..])
+		.None => .None
+	}
+}
+
+/// The value at `names`, copied, or `null`.
+fn fieldOf(json: &Json, names: &[str]): Json = match field(json, names) {
+	.Some(found) => found.clone()
+	.None => Json::Null
+}
+
+/// Element `index` of an array, copied, or `null`.
+fn itemAt(json: &Json, index: i64): Json = match json.item(index) {
+	.Some(found) => found.clone()
+	.None => Json::Null
+}
+
+/// The elements of an array, copied, or none.
+fn itemsOf(json: &Json): Vec<Json> = match json.asArray() {
+	.Some(items) => items.clone()
+	.None => Vec()
+}
+
+/// The text at `names`, or nothing.
+fn textAt(json: &Json, names: &[str]): str = match field(json, names) {
+	.Some(found) => found.asText().unwrapOr("")
+	.None => ""
+}
+
+/// The number at `names`, or -1.
+fn intAt(json: &Json, names: &[str]): i64 = match field(json, names) {
+	.Some(found) => found.asInt().unwrapOr(-1)
+	.None => -1
+}
+
+extend Session {
+	/// One message, framed as the protocol frames it.
+	var fn send(message: str): Result<void, String> = {
+		val framed = "Content-Length: \(message.len())\r\n\r\n\(message)"
+		if self.server.writeText(framed.toStr()) is .Err(error) then
+			return .Err("the server reads no more: \(error)")
+		return .Ok()
+	}
+
+	/// A notification, which nothing answers.
+	var fn notify(method: str, params: str): Result<void, String> = self.send(
+		"{\"jsonrpc\":\"2.0\",\"method\":\(quoted(method)),\"params\":\(params)}".toStr(),
+	)
+
+	/// A request, and the message that answers it, waited for.
+	var fn ask(method: str, params: str): Result<Json, String> = {
+		val id = self.next
+		self.next += 1
+		self.send(
+			"{\"jsonrpc\":\"2.0\",\"id\":\(id),\"method\":\(quoted(method)),\"params\":\(params)}".toStr(),
+		)?
+		return self.wait((message) => message.get("id") == .Some(&Json::Int(value: id)))
+	}
+
+	/// A request, and its result: an error answered is a failure.
+	var fn request(method: str, params: str): Result<Json, String> = {
+		val answer = self.ask(method, params)?
+		if answer.get("error") is .Some(error) then
+			return .Err("`\(method)` answers an error: \(error)")
+		return .Ok(fieldOf(&answer, ["result"]))
+	}
+
+	/// The next message the server sends that `wanted` takes, keeping the
+	/// diagnostics published on the way.
+	var fn wait(wanted: &(message: &Json) => bool): Result<Json, String> = {
+		while true {
+			val message = self.read()?
+			if textAt(&message, ["method"]) == "textDocument/publishDiagnostics" {
+				val file = String::of(textAt(&message, ["params", "uri"]))
+				val diagnostics = fieldOf(&message, ["params", "diagnostics"])
+				self.shown.retain((kept) => kept.0 != file)
+				self.shown.push((move file, move diagnostics))
+			}
+			if wanted(&message) then return .Ok(move message)
+		}
+		return .Err(String::of("unreachable"))
+	}
+
+	/// The diagnostics published next for `file`.
+	var fn diagnostics(file: str): Result<Vec<Json>, String> = {
+		val published =
+			self.wait((message) =>
+				textAt(&message, ["method"]) == "textDocument/publishDiagnostics" &&
+					textAt(&message, ["params", "uri"]) == file)?
+		return match field(&published, ["params", "diagnostics"]) {
+			.Some(.Array(items)) => .Ok(items.clone())
+			_ => .Err("diagnostics that are not a list: \(published)")
+		}
+	}
+
+	/// One message from the server: a header of lines, ended by an empty
+	/// one, that says the length of the body that follows.
+	var fn read(): Result<Json, String> = {
+		var length = -1
+		while true {
+			var line = String()
+			match self.server.output().readLine(&var line) {
+				.Ok(true) => {}
+				.Ok(false) => return .Err(String::of("the server ended before it answered"))
+				.Err(
+					.WouldBlock,
+				) => return .Err("the server has not answered in \(PATIENCE) seconds")
+				.Err(error) => return .Err("the server cannot be read: \(error)")
+			}
+			val header = line.trimEnd()
+			if header.isEmpty() then break
+			if header.stripPrefix("Content-Length:") is .Some(count) then
+				length = count.trim().toInt().unwrapOr(-1)
+		}
+		if length < 0 then return .Err(String::of("a message without its length"))
+		var body = String()
+		match self.server.output().readExact(length, &var body) {
+			.Ok(read) if read == length => {}
+			.Ok(_) => return .Err(String::of("the server ended within a message"))
+			.Err(error) => return .Err("a message cannot be read: \(error)")
+		}
+		return match json::parse(body.toStr()) {
+			.Ok(message) => .Ok(move message)
+			.Err(error) => .Err("a message that is not JSON, \(error): \(body)")
+		}
+	}
+
+	/// Shuts the server down, and waits for it to end, as it must.
+	move fn end(): Option<String> = {
+		var session = move self
+		if session.request("shutdown", "null") is .Err(why) then return .Some(why.clone())
+		if session.notify("exit", "null") is .Err(why) then return .Some(why.clone())
+		val exit = session.server.wait()
+		if !exit.success() then return .Some("the server \(exit)")
+		return .None
+	}
+}

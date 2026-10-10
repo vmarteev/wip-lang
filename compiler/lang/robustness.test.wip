@@ -1,0 +1,185 @@
+// The front end survives any input: no panic, no loop that does not end,
+// and every diagnostic's span inside the source, on character boundaries.
+// A panic ends the run where it is, with where it was, which is how such a
+// test fails; a span out of place is said with the text it was found in.
+
+import std::fs
+import std::future
+import std::io
+import std::path
+import syntax::{Diagnostic, Interner, Span, lex}
+
+/// What is wrong with a span of `src`, where anything is.
+fn spanFault(src: str, span: Span, what: str): Option<String> = {
+	val lo = span.lo as i64
+	val hi = span.hi as i64
+	if lo > hi || hi > src.len() then
+		return .Some("\(what) span \(lo)..\(hi) out of bounds in `\(src)`")
+	if !onBoundary(src, lo) || !onBoundary(src, hi) then
+		return .Some("\(what) span \(lo)..\(hi) splits a character in `\(src)`")
+	return .None
+}
+
+/// Whether a byte offset of `src` is where a character begins, or its end.
+fn onBoundary(src: str, at: i64): bool = at == src.len() || (src.items()[at] & 0xC0) != 0x80
+
+/// What is wrong with the spans of `diagnostics`, where anything is.
+fn spansFault(src: str, diagnostics: &[Diagnostic]): Option<String> = {
+	for d in diagnostics {
+		if spanFault(src, d.primary.span, "primary") is .Some(why) then return .Some(why.clone())
+		for label in d.secondary {
+			if spanFault(src, label.span, "secondary") is .Some(why) then return .Some(why.clone())
+		}
+		if d.fix is .Some(fix) {
+			for edit in fix.edits {
+				if spanFault(src, edit.span, "fix") is .Some(why) then return .Some(why.clone())
+			}
+		}
+	}
+	return .None
+}
+
+/// Each prefix of `src` that ends where a token begins, and `src` with
+/// that token left out — the two most common shapes of half-written code —
+/// parsed, and its diagnostics drawn: what is wrong with any of them.
+fn mutated(src: str): Option<String> = {
+	var interner = Interner::new()
+	val lexed = lex(src, &var interner)
+	for token in lexed.tokens {
+		val lo = token.span.lo as i64
+		val hi = token.span.hi as i64
+		for text in [String::of(src[0..lo]), "\(src[0..lo])\(src[hi..])"] {
+			val file = SourceFile(name: String::of("mutated.wip"), text: text.clone())
+			val parsed = parseFile(&file)
+			if spansFault(text.toStr(), &parsed.diagnostics) is .Some(why) then
+				return .Some(why.clone())
+			// Drawing them must not panic either.
+			renderAll(&parsed.diagnostics, "mutated.wip", text.toStr(), false)
+		}
+	}
+	return .None
+}
+
+/// Every `.wip` file under `dir`, at any depth.
+fn wipFilesUnder(dir: str, found: &var Vec<String>) = {
+	val .Ok(entries) = fs::readDir(dir) else {
+		return
+	}
+	for entry in entries {
+		val at = path::join(dir, entry.name.toStr())
+		if entry.isDirectory() then wipFilesUnder(at.toStr(), &var found)
+		else if entry.name.endsWith(".wip") then found.push(move at)
+	}
+}
+
+/// Every file of the language's cases, truncated at each token and with
+/// each token cut out.
+@test
+fn theCasesSurviveBeingCutShortAndCutUp() = {
+	var files: Vec<String> = Vec()
+	wipFilesUnder("tests/cases/ok", &var files)
+	wipFilesUnder("tests/cases/err", &var files)
+	assert(files.len() >= 40, "found only \(files.len()) files of the cases")
+	val faults = future::map(&files, (file) => match fs::readFile(file.toStr()) {
+		.Ok(src) => mutated(src.toStr())
+		.Err(error) => .Some("`\(file)`: \(error)")
+	})
+	for fault in faults {
+		if fault is .Some(why) then panic(why.toStr())
+	}
+}
+
+/// The program an editor checks `file` in: the package around it, or its
+/// directory.
+fn programOf(file: str): String = {
+	var dir = path::parent(file)
+	while !dir.isEmpty() && dir != "/" && dir != "." {
+		if fs::exists(path::join(dir, "package.wip").toStr()) then return String::of(dir)
+		dir = path::parent(dir)
+	}
+	return String::of(path::parent(file))
+}
+
+/// Where `src`'s lines are cut: before every token with `every`, and
+/// otherwise before one token of each line, a different one from line to
+/// line, which keeps the check quick enough to run on every commit.
+fn cuts(src: str, every: bool): Vec<i64> = {
+	var interner = Interner::new()
+	var lines: Vec<Vec<i64>> = Vec()
+	var lineOf = -1
+	val lexed = lex(src, &var interner)
+	for token in lexed.tokens {
+		val lo = token.span.lo as i64
+		var line = 0
+		for byte in src.items()[0..lo] {
+			if byte == '\n' as u8 then line += 1
+		}
+		if line != lineOf {
+			lines.push(Vec())
+			lineOf = line
+		}
+		lines[lines.len() - 1].push(lo)
+	}
+	var cut: Vec<i64> = Vec()
+	for i in 0..lines.len() {
+		val starts = &lines[i]
+		if every {
+			for start in starts {
+				cut.push(start)
+			}
+		} else {
+			cut.push(starts[i * 7 % starts.len()])
+		}
+	}
+	return move cut
+}
+
+/// One of the examples' files, each line cut short in turn, the rest of the
+/// file as it is, and its program checked as an editor checks it.
+struct Cut {
+	file: String
+	src: String
+	at: i64
+}
+
+/// An editor checks a program at every keystroke, so the checker must
+/// survive a line half typed. Each line of the examples is cut short, the
+/// rest of the file left as it is, and the program checked. With
+/// `WIP_EVERY_CUT=1` each line is cut before every one of its tokens, which
+/// takes some minutes.
+@test
+fn theExamplesAreCheckedWhileALineIsTyped() = {
+	val every = io::env("WIP_EVERY_CUT").isSome()
+	var files: Vec<String> = Vec()
+	wipFilesUnder("examples", &var files)
+	var work: Vec<Cut> = Vec()
+	for file in files {
+		val .Ok(src) = fs::readFile(file.toStr()) else {
+			continue
+		}
+		for at in cuts(src.toStr(), every) {
+			work.push(Cut(file: file.clone(), src: src.clone(), at: at))
+		}
+	}
+	assert(work.len() >= 300, "found only \(work.len()) lines to cut")
+	future::each(&var work, (cut) => checkCut(&cut))
+}
+
+/// `cut`'s file with its line cut there, and its program checked; a panic
+/// is the failure, and says where.
+fn checkCut(cut: &Cut) = {
+	val src = cut.src.toStr()
+	val lineEnd = match src[cut.at..].find("\n") {
+		.Some(length) => cut.at + length
+		.None => src.len()
+	}
+	var overlay = Overlay()
+	overlay.set(cut.file.toStr(), "\(src[0..cut.at])\(src[lineEnd..])")
+	val root = programOf(cut.file.toStr())
+	val .Ok(loaded) = loadOverlaid(root.toStr(), .Tests, &overlay, 1) else {
+		return
+	}
+	var checking = move loaded
+	var timings = Timings()
+	checkLoaded(&var checking, &var timings)
+}

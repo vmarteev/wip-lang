@@ -1,0 +1,373 @@
+// What a program says about the machine it is compiled for.
+//
+// `@target(os = "linux")` on an item compiles it only where the condition
+// holds. The item is dropped here, before anything is declared, so a name
+// another target's item takes is free, and nothing that is not compiled
+// is checked — as with Rust's `cfg`, an item for another target is not
+// checked unless that target is checked for.
+//
+// A program is built for the machine the compiler runs on, and may be
+// checked for any target the standard library is written for: `wip check
+// --target linux` reads the items and files Linux takes.
+
+import std::mem
+import syntax::{
+	ANNOTATION,
+	Annotation,
+	AnnotationValue,
+	Ast,
+	Diagnostic,
+	ExternFn,
+	ExternGlobal,
+	ExternType,
+	Interner,
+	Item,
+	Span,
+	Symbol
+}
+
+/// A system a program may be compiled for.
+@derive(Eq, Clone)
+pub enum Os {
+	Macos
+	Linux
+	Windows
+}
+
+/// A processor a program may be compiled for.
+@derive(Eq, Clone)
+pub enum Arch {
+	Arm64
+	X86_64
+}
+
+/// The machine being compiled for: what `@target`'s keys are answered
+/// with.
+@derive(Eq, Clone)
+pub struct Target {
+	pub os: Os
+	pub arch: Arch
+}
+
+/// The keys `@target` takes. What each one may be is `valuesOf`'s: the
+/// lists are closed, so a value the compiler does not know is a mistake
+/// rather than a condition that is quietly false.
+val KEYS: [str; 3] = ["os", "arch", "vendor"]
+
+val OS_VALUES: [str; 3] = ["macos", "linux", "windows"]
+val ARCH_VALUES: [str; 2] = ["arm64", "x86_64"]
+val VENDOR_VALUES: [str; 1] = ["apple"]
+
+/// What a key of `KEYS` may be.
+fn valuesOf(key: str): &[str] = match key {
+	"os" => lend OS_VALUES
+	"arch" => lend ARCH_VALUES
+	_ => lend VENDOR_VALUES
+}
+
+extend Os {
+	pub fn text(): str = match self {
+		.Macos => "macos"
+		.Linux => "linux"
+		.Windows => "windows"
+	}
+}
+
+extend Arch {
+	pub fn text(): str = match self {
+		.Arm64 => "arm64"
+		.X86_64 => "x86_64"
+	}
+}
+
+extend Target {
+	/// The machine this compiler runs on.
+	pub static fn host(): Target = Target(
+		os: match TARGET_OS {
+			"macos" => .Macos
+			"windows" => .Windows
+			_ => .Linux
+		},
+		arch: if TARGET_ARCH == "arm64" then .Arm64 else .X86_64,
+	)
+
+	/// The targets the standard library is written for: what `--target
+	/// all` checks.
+	pub static fn all(): Vec<Target> = Vec::of(own [
+		Target(os: .Macos, arch: .Arm64),
+		Target(os: .Macos, arch: .X86_64),
+		Target(os: .Linux, arch: .Arm64),
+		Target(os: .Linux, arch: .X86_64),
+	])
+
+	/// What `--target` names: one of `Target::all` as `os-arch`, a system
+	/// alone on this machine's processor, or `all`.
+	pub static fn parse(name: str): Result<Vec<Target>, String> = {
+		if name == "all" then return .Ok(Target::all())
+		if name == "windows" || name.startsWith("windows-") then
+			return .Err("`\(name)` is not a target to check: the standard library is not written for Windows")
+		val (os, arch) = match name.splitOnce("-") {
+			.Some((os, arch)) => (os, arch)
+			.None => (name, Target::host().arch.text())
+		}
+		for target in Target::all() {
+			if target.os.text() == os && target.arch.text() == arch then
+				return .Ok(Vec::of(own [target]))
+		}
+		var names = String()
+		val all = Target::all()
+		for (i, target) in all.forwards().enumerate() {
+			if i > 0 then names.push(", ")
+			names.push("`\(target.name())`")
+		}
+		return .Err("`\(name)` is not a target: there are \(names), `macos` and `linux` for this machine's processor, and `all`")
+	}
+
+	/// Its name, as `--target` takes it: `linux-x86_64`.
+	pub fn name(): String = "\(self.os.text())-\(self.arch.text())"
+
+	/// `apple` for macOS and its siblings, and nothing elsewhere: what
+	/// `@framework` and Objective-C belong to.
+	pub fn vendor(): str = if self.os == .Macos then "apple" else ""
+
+	fn answer(key: str): str = match key {
+		"os" => self.os.text()
+		"arch" => self.arch.text()
+		_ => self.vendor()
+	}
+}
+
+/// Drops the items `target` does not take, and reports every `@target`
+/// that cannot be read — including on the items that are dropped, so that
+/// a condition is checked wherever it is compiled.
+pub fn keep(ast: &var Ast, interner: &Interner, target: Target): Vec<Diagnostic> = {
+	var diagnostics: Vec<Diagnostic> = Vec()
+	var kept: Vec<Item> = Vec::withCapacity(ast.items.len())
+	for item in mem::replace(&var ast.items, Vec()) {
+		if !wantedItem(&item, &interner, target, &var diagnostics) then continue
+		var taken = move item
+		// An `extern` block's own declarations may each say what they are
+		// for: a library spells a function one way here and another there.
+		if taken is .Extern(..) {
+			val .Extern(block) = move taken else {
+				panic("an extern block")
+			}
+			var block = move block
+			var fns: Vec<ExternFn> = Vec()
+			for f in mem::replace(&var block.fns, Vec()) {
+				if wanted(&f.annotations, &interner, target, &var diagnostics) then fns.push(move f)
+			}
+			block.fns = move fns
+			var globals: Vec<ExternGlobal> = Vec()
+			for g in mem::replace(&var block.globals, Vec()) {
+				if wanted(&g.annotations, &interner, target, &var diagnostics) then
+					globals.push(move g)
+			}
+			block.globals = move globals
+			var types: Vec<ExternType> = Vec()
+			for t in mem::replace(&var block.types, Vec()) {
+				if wanted(&t.annotations, &interner, target, &var diagnostics) then
+					types.push(move t)
+			}
+			block.types = move types
+			taken = .Extern(move block)
+		}
+		kept.push(move taken)
+	}
+	ast.items = move kept
+	return move diagnostics
+}
+
+/// Whether an item is compiled for `target`, by the annotations written
+/// before it. An import and a type alias take none, and the parser refuses
+/// one written before either.
+fn wantedItem(
+	item: &Item,
+	interner: &Interner,
+	target: Target,
+	diagnostics: &var Vec<Diagnostic>,
+): bool = match item {
+	.Import(..) | .Type(..) => true
+	.Val(v) => wanted(&v.annotations, &interner, target, &var diagnostics)
+	.Assert(a) => wanted(&a.annotations, &interner, target, &var diagnostics)
+	.Struct(s) => wanted(&s.annotations, &interner, target, &var diagnostics)
+	.Enum(e) => wanted(&e.annotations, &interner, target, &var diagnostics)
+	.Fn(f) => wanted(&f.annotations, &interner, target, &var diagnostics)
+	.Extern(e) => wanted(&e.annotations, &interner, target, &var diagnostics)
+	.Extend(e) => wanted(&e.annotations, &interner, target, &var diagnostics)
+	.Interface(i) => wanted(&i.annotations, &interner, target, &var diagnostics)
+}
+
+/// Whether a declaration carrying `annotations` is compiled for `target`:
+/// one that says nothing is for every target, one that says something is
+/// for the targets any of its `@target`s names.
+fn wanted(
+	annotations: &[Annotation],
+	interner: &Interner,
+	target: Target,
+	diagnostics: &var Vec<Diagnostic>,
+): bool = {
+	var said = false
+	var matched = false
+	for annotation in annotations {
+		if interner.resolve(annotation.name.sym) != "target" then continue
+		said = true
+		// Every `@target` is read, so that each is checked.
+		if condition(&annotation, &interner, target, &var diagnostics) then matched = true
+	}
+	return !said || matched
+}
+
+/// Whether one `@target(…)` holds: every key it names must answer.
+fn condition(
+	annotation: &Annotation,
+	interner: &Interner,
+	target: Target,
+	diagnostics: &var Vec<Diagnostic>,
+): bool = {
+	if annotation.args.isEmpty() {
+		diagnostics.push(
+			Diagnostic::error(
+				ANNOTATION,
+				String::of("`@target` takes what it is for"),
+				annotation.span,
+				String::of("nothing is named"),
+			).withHelp("the keys are \(keyNames())").withNote(
+				String::of("`@target(os = \"linux\")` compiles an item for one target"),
+			),
+		)
+		return false
+	}
+	var holds = true
+	for arg in annotation.args {
+		val .Some(name) = arg.name else {
+			diagnostics.push(
+				Diagnostic::error(
+					ANNOTATION,
+					String::of("`@target` takes `key = \"value\"`"),
+					arg.span,
+					String::of("no key"),
+				).withHelp("the keys are \(keyNames())"),
+			)
+			holds = false
+			continue
+		}
+		val key = interner.resolve(name.sym)
+		var known = false
+		for k in KEYS {
+			if k == key then known = true
+		}
+		if !known {
+			diagnostics.push(
+				Diagnostic::error(
+					ANNOTATION,
+					"`@target` knows no key `\(key)`",
+					name.span,
+					String::of("not a key"),
+				).withHelp("the keys are \(keyNames())"),
+			)
+			holds = false
+			continue
+		}
+		val values = valuesOf(key)
+		val .Str(value) = arg.value else {
+			diagnostics.push(
+				Diagnostic::error(
+					ANNOTATION,
+					"`\(key)` is a name in quotes",
+					arg.span,
+					String::of("not a string"),
+				).withHelp("`\(key)` is one of \(quoted(values))"),
+			)
+			holds = false
+			continue
+		}
+		if !valueHolds(key, value, values, arg.span, &interner, target, &var diagnostics) then
+			holds = false
+	}
+	return holds
+}
+
+/// Whether one `key = "value"` holds, where the value is one the compiler
+/// knows.
+fn valueHolds(
+	key: str,
+	value: Symbol,
+	values: &[str],
+	span: Span,
+	interner: &Interner,
+	target: Target,
+	diagnostics: &var Vec<Diagnostic>,
+): bool = {
+	val text = interner.resolve(value)
+	var known = false
+	for v in values {
+		if v == text then known = true
+	}
+	if !known {
+		diagnostics.push(
+			Diagnostic::error(
+				ANNOTATION,
+				"the compiler knows no `\(key)` called `\(text)`",
+				span,
+				String::of("not a target"),
+			).withHelp("`\(key)` is one of \(quoted(values))"),
+		)
+		return false
+	}
+	return target.answer(key) == text
+}
+
+fn keyNames(): String = quoted(&KEYS)
+
+fn quoted(names: &[str]): String = {
+	var out = String()
+	for (i, name) in names.forwards().enumerate() {
+		if i > 0 then out.push(", ")
+		out.push("`\(name)`")
+	}
+	return move out
+}
+
+/// Whether a file belongs to `target`, by its name: `window.linux.wip` is
+/// Linux's and `rglfw.macos.c` is a Mac's, as `.test.wip` is a test's.
+/// A name whose last piece is not a target the compiler knows says nothing,
+/// and belongs to every target.
+pub fn takesFile(name: str, target: Target): bool = {
+	val whole = match name.rsplitOnce(".") {
+		.Some((stem, _)) => stem
+		.None => name
+	}
+	// `board.linux.test.wip` is a test for Linux: the test suffix is read
+	// first, and what is left says the target.
+	val stem = match whole.stripSuffix(".test") {
+		.Some(stem) => stem
+		.None => whole
+	}
+	val .Some((_, last)) = stem.rsplitOnce(".") else {
+		return true
+	}
+	for key in KEYS {
+		for value in valuesOf(key) {
+			if value == last then return target.answer(key) == last
+		}
+	}
+	return true
+}
+
+/// The prelude file that says what the target is. It is written here
+/// because the compiler is the only one that knows, and it is the prelude
+/// so that every file can ask without an import.
+pub fn prelude(target: Target): String = """
+	// Written by the compiler: the machine this program is compiled
+	// for. It is here, in the prelude, for the places
+	// where splitting an item with `@target` is more than the
+	// difference is worth; the branch that cannot be taken costs
+	// nothing, since the comparison is of constants.
+
+	pub val TARGET_OS: str = "\(target.os.text())"
+	pub val TARGET_ARCH: str = "\(target.arch.text())"
+	/// `apple` on a Mac, and empty elsewhere.
+	pub val TARGET_VENDOR: str = "\(target.vendor())"
+
+	"""

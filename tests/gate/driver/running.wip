@@ -1,0 +1,346 @@
+// Running programs: how `wip run` finds the program and passes it its
+// arguments, what `main` may take and answer, what a program reads, and how
+// it ends — the same, built for debugging or for use.
+
+import std::path
+import std::process::{Command}
+import check::{Gate, Ran, read, run, said, wrong, write}
+
+/// `wip run main.wip`, typed in the file's own directory, compiles that
+/// directory: a bare file name's parent is the empty path, which once named
+/// no directory at all, so that nothing was compiled and the only error had
+/// no file to be shown in.
+fn bareFileName(gate: &Gate, root: str): Option<String> = {
+	write(root, "main.wip", "import util::{answer}\n\nfn main(): i64 = answer()\n")
+	write(root, "util/util.wip", "pub fn answer(): i64 = 42\n")
+	val checked = gate.wip(root, ["check", "main.wip"])
+	if !checked.exit.success() then return wrong("`wip check main.wip`", &checked)
+	val ran = gate.wip(root, ["run", "main.wip"])
+	if ran.exit != .Code(42) then return wrong("`wip run main.wip`", &ran)
+	return .None
+}
+
+/// Diagnostics name a file as it was typed, without a leading `./`.
+fn namesAsTyped(gate: &Gate, root: str): Option<String> = {
+	write(root, "main.wip", "fn main(): i64 = nope\n")
+	val checked = gate.wip(root, ["check", "--color", "never", "main.wip"])
+	if checked.exit.success() || !checked.stderr.contains("[ main.wip:1:18 ]") then
+		return wrong("`wip check main.wip`", &checked)
+	return .None
+}
+
+/// The entry's whole directory is compiled, so an entry that does not
+/// exist, or is not a `.wip` file, is an error rather than a build of
+/// whatever else is there.
+fn entryIsWip(gate: &Gate, root: str): Option<String> = {
+	write(root, "other.wip", "fn main(): i64 = 0\n")
+	write(root, "notes.txt", "not a program\n")
+	val missing = gate.wip(root, ["check", "typo.wip"])
+	if missing.exit != .Code(2) || !missing.stderr.contains("cannot read `typo.wip`") then
+		return wrong("`wip check typo.wip`", &missing)
+	val text = gate.wip(root, ["check", "notes.txt"])
+	if text.exit != .Code(2) || !text.stderr.contains("`notes.txt` is not a `.wip` file") then
+		return wrong("`wip check notes.txt`", &text)
+	return .None
+}
+
+/// A `--` right after the file is the program's too, as every other word
+/// after the file is: what it reads as the end of its own options.
+fn runPassesSeparator(gate: &Gate, root: str): Option<String> = {
+	write(
+		root,
+		"main.wip",
+		"import std::io\n\nfn main(args: &[cstring]) = {\n    for i in 1..args.len() {\n        io::printCstring(args[i])\n    }\n}\n",
+	)
+	val ran = gate.wip(root, ["run", "main.wip", "--", "-v", "--", "x"])
+	if !ran.exit.success() || ran.stdout != "--\n-v\n--\nx\n" then
+		return wrong("`wip run main.wip -- -v -- x`", &ran)
+	return .None
+}
+
+/// `wip run` passes what follows the file to the program, which sees it as
+/// `args[1]` and on; `args[0]` is the program's name, as in C. Every word
+/// after the file is the program's, one that looks like an option of
+/// `wip`'s too: those go before the file.
+fn runPassesArguments(gate: &Gate, root: str): Option<String> = {
+	write(
+		root,
+		"main.wip",
+		"import std::io\n\nfn main(args: &[cstring]): i64 = {\n    io::printInt(args.len())\n    var i = 0\n    while i < args.len() {\n        io::printCstring(args[i])\n        i = i + 1\n    }\n    3\n}\n",
+	)
+	val ran = gate.wip(root, [
+		"run",
+		"main.wip",
+		"one",
+		"--two",
+		"three four",
+		"-I",
+		"x",
+		"--release",
+		"--cpu",
+	])
+	val lines = linesOf(ran.stdout.toStr())
+	if ran.exit != .Code(3) ||
+		lines.len() != 9 ||
+		lines[0] != "8" ||
+		!lines[1].endsWith("program") ||
+		lines[2..].join("|") != "one|--two|three four|-I|x|--release|--cpu" {
+		return wrong("`wip run main.wip one --two 'three four' -I x --release --cpu`", &ran)
+	}
+	return .None
+}
+
+/// A program that `wip build` refuses, saying each of `says`.
+fn refusedSaying(gate: &Gate, root: str, program: str, says: &[str]): Option<String> = {
+	write(root, "main.wip", program)
+	val built = gate.wip(root, ["build", "--color", "never", "main.wip"])
+	if built.exit.success() then return wrong("it was built", &built)
+	for text in says {
+		if !built.stderr.contains(text) then return wrong("it does not say \"\(text)\"", &built)
+	}
+	return .None
+}
+
+/// `main` takes nothing, or `&[cstring]`.
+fn mainTakes(
+	gate: &Gate,
+	root: str,
+): Option<String> = refusedSaying(gate, root, "fn main(count: i64): i64 = count\n", [
+	"[E0318] Error: `main` takes no parameters, or the program's arguments",
+	"not `args: &[cstring]`",
+])
+
+/// `main` may return a `Result`, whose error must be writable as text.
+fn mainTextError(
+	gate: &Gate,
+	root: str,
+): Option<String> = refusedSaying(gate, root, "struct Boom {\n    code: i64\n}\n\nfn main(): Result<void, Boom> = .Err(Boom(code: 1))\n", [
+	"[E0318] Error: `main`'s error type, `Boom`, cannot be written as text",
+	"write `extend Boom: Text`",
+])
+
+/// A `Result` `main` gives back nothing or an exit code, and nothing else.
+fn mainOtherResult(
+	gate: &Gate,
+	root: str,
+): Option<String> = refusedSaying(gate, root, "fn main(): Result<bool, i64> = .Ok(true)\n", [
+	"[E0318] Error: `main` must return a `Result` of `i64` or of nothing",
+	"its value is `bool`",
+])
+
+/// The program's arguments and a `Result` together.
+fn mainArgumentsAndResult(gate: &Gate, root: str): Option<String> = {
+	write(
+		root,
+		"main.wip",
+		"import std::io\n\nfn main(args: &[cstring]): Result<i64, i64> = {\n    io::printInt(args.len())\n    .Ok(5)\n}\n",
+	)
+	val ran = gate.wip(root, ["run", "main.wip"])
+	if ran.exit != .Code(5) || ran.stdout.trim() != "1" then
+		return wrong("`wip run main.wip`", &ran)
+	return .None
+}
+
+/// A program reads its standard input a line at a time, and the last line
+/// counts whether or not it ends with a line break.
+fn readsStandardInput(gate: &Gate, root: str): Option<String> = {
+	write(
+		root,
+		"main.wip",
+		"import std::io\n\nfn main(): Result<void, io::IoError> = {\n    var input = io::stdin()\n    var line = String()\n    var count = 0\n    while input.readLine(&var line)? {\n        count += 1\n        io::println(\"\\(count): \\(line)\")\n        line.clear()\n    }\n    io::eprintln(\"read \\(count)\")\n    return .Ok({})\n}\n",
+	)
+	val ran = gate.wipReading("alpha\nbeta\ngamma", root, ["run", "main.wip"])
+	if !ran.exit.success() ||
+		ran.stdout != "1: alpha\n2: beta\n3: gamma\n" ||
+		ran.stderr.trim() != "read 3" {
+		return wrong("`wip run main.wip`", &ran)
+	}
+	return .None
+}
+
+/// A program writes a file, reads it back a line at a time, and says what
+/// went wrong when there is no such file; a `File` closes itself where it
+/// ends, which is what its drop is for.
+fn readsAndWritesFiles(gate: &Gate, root: str): Option<String> = {
+	write(
+		root,
+		"main.wip",
+		"import std::io\nimport std::fs\n\nfn main(): Result<void, io::IoError> = {\n    fs::writeFile(\"notes.txt\", \"alpha\\nbeta\\n\")?\n\n    var more = fs::File::append(\"notes.txt\")?\n    more.write(\"gamma\\n\")?\n    destroy(move more)\n\n    val text = fs::readFile(\"notes.txt\")?\n    io::println(\"bytes: \\(text.len())\")\n\n    var file = fs::File::open(\"notes.txt\")?\n    var line = String()\n    var count = 0\n    while file.readLine(&var line)? {\n        count += 1\n        io::println(\"\\(count): \\(line)\")\n        line.clear()\n    }\n\n    match fs::readFile(\"no-such-file.txt\") {\n        .Ok(found) => io::println(\"unreachable\")\n        .Err(error) => io::println(\"failed: \\(error)\")\n    }\n    return .Ok({})\n}\n",
+	)
+	val ran = gate.wip(root, ["run", "main.wip"])
+	if !ran.exit.success() ||
+		ran.stdout !=
+			"bytes: 17\n1: alpha\n2: beta\n3: gamma\nfailed: no such file or directory\n" ||
+		read(root, "notes.txt") != "alpha\nbeta\ngamma\n" {
+		return wrong("`wip run main.wip`", &ran)
+	}
+	return .None
+}
+
+/// What the environment holds, copied, or nothing.
+fn readsEnvironment(gate: &Gate, root: str): Option<String> = {
+	write(
+		root,
+		"main.wip",
+		"import std::io\n\nfn main() = {\n    match io::env(\"WIP_DRIVER_TEST\") {\n        .Some(value) => io::println(\"set to \\(value)\")\n        .None => io::println(\"unset\")\n    }\n    match io::env(\"WIP_DRIVER_TEST_MISSING\") {\n        .Some(value) => io::println(\"unreachable\")\n        .None => io::println(\"unset\")\n    }\n}\n",
+	)
+	val ran = run(
+		gate.command(root, ["run", "main.wip"]).
+			env("WIP_DRIVER_TEST", "a value").
+			unset("WIP_DRIVER_TEST_MISSING"),
+	)
+	if !ran.exit.success() || ran.stdout != "set to a value\nunset\n" then
+		return wrong("`wip run main.wip`", &ran)
+	return .None
+}
+
+/// A negative length stops the program before anything is allocated.
+fn negativeBuffer(gate: &Gate, root: str): Option<String> = {
+	write(
+		root,
+		"main.wip",
+		"fn length(): i64 = 1 - 3\n\nfn main(): i64 = {\n    val xs = own [0; length()]\n    xs.len()\n}\n",
+	)
+	val ran = gate.wip(root, ["run", "main.wip"])
+	if ran.exit.success() || !ran.stdout.isEmpty() then
+		return wrong("a buffer of length -2 was allocated", &ran)
+	return .None
+}
+
+/// Allocations are counted only where something asks: a trace started part
+/// way numbers from its start, and a block made before it is freed without
+/// a word; the leak check, asked for, still counts every allocation, and a
+/// program that leaks ends with status 70.
+fn allocationsCounted(gate: &Gate, root: str): Option<String> = {
+	write(
+		root,
+		"main.wip",
+		"import std::io\n\nextern \"C\" {\n    fn wip_trace_allocs()\n}\n\nfn main() = {\n    val before = own 1\n    wip_trace_allocs()\n    destroy(move before)\n    val after = own 2\n    io::println(\"\\(after)\")\n}\n",
+	)
+	val traced = run(gate.command(root, ["run", "main.wip"]).unset("WIP_CHECK_LEAKS"))
+	// `before` is freed without a word; `after` is #1, and the text that
+	// prints it #2.
+	if !traced.exit.success() || traced.stdout != "alloc #1\nalloc #2\n2\nfree #2\nfree #1\n" then
+		return wrong("`wip run main.wip`, tracing", &traced)
+	// Ended by `exit` with something still held: the leak check's handler
+	// runs, and finds it.
+	write(
+		root,
+		"main.wip",
+		"import std::libc\n\nfn main() = {\n    val kept = own 1\n    libc::exit(0)\n}\n",
+	)
+	val checked = run(gate.command(root, ["run", "main.wip"]).env("WIP_CHECK_LEAKS", "1"))
+	if checked.exit != .Code(70) || !checked.stderr.contains("1 allocation was never freed") then
+		return wrong("`wip run main.wip`, checking leaks", &checked)
+	val unchecked = run(gate.command(root, ["run", "main.wip"]).unset("WIP_CHECK_LEAKS"))
+	if !unchecked.exit.success() then
+		return wrong("`wip run main.wip`, not checking leaks", &unchecked)
+	return .None
+}
+
+/// A release build does what a debug build does, from MIR that LLVM
+/// optimises — a `&dyn` call that writes, closures, owned memory freed.
+fn releaseDoesTheSame(gate: &Gate, root: str): Option<String> = {
+	write(
+		root,
+		"main.wip",
+		"import std::io\n\ninterface Counter {\n    var fn bump(by: i64)\n    fn get(): i64\n}\n\nstruct Cell {\n    n: i64\n}\n\nextend Cell: Counter {\n    var fn bump(by: i64) = self.n += by\n    fn get(): i64 = self.n\n}\n\nfn tick(c: &var dyn Counter) = c.bump(2)\n\nfn main() = {\n    var cell = Cell(n: 1)\n    tick(&var cell)\n    var names: Vec<String> = Vec()\n    for i in 0..3 {\n        names.push(\"n\\(i)\")\n    }\n    val total = names.items().fold(0, (sum, name) => sum + name.len())\n    io::println(\"\\(cell.get()) \\(total) \\(names[2])\")\n}\n",
+	)
+	val released = run(
+		gate.command(root, ["run", "--release", "main.wip"]).env("WIP_CHECK_LEAKS", "1"),
+	)
+	if !released.exit.success() || released.stdout != "3 6 n2\n" then
+		return wrong("`wip run --release main.wip`", &released)
+	val debug = run(gate.command(root, ["run", "main.wip"]).env("WIP_CHECK_LEAKS", "1"))
+	if !debug.exit.success() || debug.stdout != "3 6 n2\n" then
+		return wrong("`wip run main.wip`", &debug)
+	return .None
+}
+
+/// A panic in a release build lists its calls as a debug build's does,
+/// though LLVM inlines them: a method, a generic function, and a call in
+/// the tail of a function, which stays a call. A debug build's table is an
+/// object of its own on a Mac, made of every part's.
+fn releasePanicCalls(gate: &Gate, root: str): Option<String> = {
+	write(
+		root,
+		"main.wip",
+		"import std::io\n\nstruct Gauge {\n    level: i64\n}\n\nextend Gauge {\n    fn check(): i64 = {\n        if self.level < 0 {\n            panic(\"below zero\")\n        }\n        return self.level\n    }\n}\n\nfn read<T>(gauge: &Gauge, _: T): i64 = gauge.check()\n\nfn last(gauge: &Gauge): i64 = read(gauge, 1)\n\nfn main() = {\n    val gauge = Gauge(level: -1)\n    io::printInt(last(&gauge))\n}\n",
+	)
+	val debug = gate.wip(root, ["run", "main.wip"])
+	if listsCalls(&debug) is .Some(why) then return .Some("a debug build: \(why)")
+	val released = gate.wip(root, ["run", "--release", "main.wip"])
+	if listsCalls(&released) is .Some(why) then return .Some("a release build: \(why)")
+	if released.stderr != debug.stderr then
+		return wrong("the release build lists other calls than\(said(&debug))\n  and", &released)
+	return .None
+}
+
+/// What is wrong with how a run of the program above panicked.
+fn listsCalls(ran: &Ran): Option<String> = {
+	if ran.exit != .Code(101) then return wrong("it did not panic", &ran)
+	for call in [
+		"in Gauge.check (main.wip:10)",
+		"in read<i64> (main.wip:16)",
+		"in last (main.wip:18)",
+		"in main (main.wip:22)",
+	] {
+		if !ran.stderr.contains(call) then return wrong("`\(call)` is missing", &ran)
+	}
+	return .None
+}
+
+/// The most negative `i128` divided by -1, or its remainder by -1, aborts in
+/// a debug build and in a release one, where LLVM's `sdiv` and `srem` would
+/// be undefined. The divisor is known only as the program runs.
+fn i128Aborts(gate: &Gate, root: str): Option<String> = {
+	write(
+		root,
+		"main.wip",
+		"import std::io\n\nfn main(args: &[cstring]): i64 = {\n    val most = (1 as i128) << 127\n    val n = args.len() as i128\n    val by = 0 - n % 2\n    val answer = if n > 2 { most % by } else { most / by }\n    io::printInt(answer as i64)\n    return 0\n}\n",
+	)
+	for name in ["debug", "released"] {
+		val built =
+			if name == "debug" then gate.wip(root, ["build", "main.wip", "-o", name])
+			else gate.wip(root, ["build", "--release", "main.wip", "-o", name])
+		if !built.exit.success() then return wrong("`wip build`, \(name)", &built)
+		val program = path::join(root, name)
+		val divided = run(Command::of(program.toStr()))
+		if divided.exit != .Signal(6) then
+			return wrong("\(name), dividing, did not abort", &divided)
+		val remainder = run(Command::of(program.toStr()).args(["a", "b"]))
+		if remainder.exit != .Signal(6) then
+			return wrong("\(name), the remainder, did not abort", &remainder)
+	}
+	return .None
+}
+
+/// Without a `clang` 15 or newer nothing is built, debug or release, and
+/// the build says so before it reads the program.
+fn nothingWithoutClang(gate: &Gate, root: str): Option<String> = {
+	write(root, "main.wip", "import std::io\n\nfn main() = io::println(\"built\")\n")
+	for arguments in [["run", "main.wip"], ["build", "main.wip"], ["test", "main.wip"]] {
+		if refusedWithoutClang(gate, root, &arguments) is .Some(why) then return .Some(why.clone())
+	}
+	if refusedWithoutClang(gate, root, ["run", "--release", "main.wip"]) is .Some(why) then
+		return .Some(why.clone())
+	return .None
+}
+
+/// `wip` with `arguments`, with no `clang` where `WIP_CLANG` says: what is
+/// wrong with how it refused, where anything is.
+fn refusedWithoutClang(gate: &Gate, root: str, arguments: &[str]): Option<String> = {
+	val clang = path::join(root, "no-clang-here")
+	val cache = path::join(root, "cache")
+	val ran = run(
+		gate.command(root, arguments).
+			env("WIP_CLANG", clang.toStr()).
+			env("WIP_CACHE_DIR", cache.toStr()),
+	)
+	if ran.exit.success() ||
+		!ran.stderr.contains("error: wip builds with a clang 15 or newer: `") ||
+		!ran.stderr.contains("`, which WIP_CLANG names, is not a clang 15 or newer") {
+		return wrong("`wip \(arguments.join(" "))`", &ran)
+	}
+	return .None
+}

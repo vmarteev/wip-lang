@@ -1,0 +1,455 @@
+// Compiling the C a program carries: each file on its own, in parallel, and
+// kept, so that a build whose C has not changed compiles none of it.
+//
+// An object is kept under the hash of what made it: the compiler, the flags,
+// the source's path and contents. Beside it is the list of headers the
+// compiler read, each with its size, time and hash, since a header can
+// change without the file that includes it changing. An entry is used when
+// every header is as it was.
+
+import std::digest::{Sha256}
+import std::fs
+import std::future
+import std::io
+import std::path
+import std::process::{Command}
+
+/// What a file is written in.
+@derive(Eq, Clone)
+pub enum Language {
+	C
+	ObjectiveC
+}
+
+/// One file to compile.
+@derive(Clone)
+pub struct CFile {
+	pub var source: String
+	/// Objective-C for a `.m` file, or what `@source` said.
+	pub var language: Language
+	/// A header put before this file, which is how a module configures the C
+	/// it vendors: `@prefix("build.h")`. The compiler is given `-include`,
+	/// and what it then reads is a dependency like any other, so a change to
+	/// it recompiles.
+	pub var prefix: Option<String>
+	/// What this file is compiled with defined, `NAME` or `NAME=value`: its
+	/// module's `@define`.
+	pub var defines: Vec<String>
+}
+
+extend CFile {
+	pub static fn c(source: String): CFile = CFile(
+		source: move source,
+		language: .C,
+		prefix: .None,
+		defines: Vec(),
+	)
+
+	/// A module's file, by its extension.
+	pub static fn of(source: String): CFile = {
+		val language =
+			if implied(source.toStr()) == .Some(Language::ObjectiveC) then Language::ObjectiveC
+			else Language::C
+		return CFile(source: move source, language: language, prefix: .None, defines: Vec())
+	}
+}
+
+/// What a C compiler takes a file to be written in from its extension:
+/// nothing for a header, which it would make a precompiled header of.
+fn implied(source: str): Option<Language> = match path::extension(source) {
+	.Some("c") => .Some(.C)
+	.Some("m") => .Some(.ObjectiveC)
+	_ => .None
+}
+
+/// What came of compiling: an object for each file, in the order the files
+/// were given, and how many were compiled rather than found.
+pub struct Compiled {
+	pub objects: Vec<String>
+	pub compiled: i64
+}
+
+/// Where the cache is: `$WIP_CACHE_DIR`, or the platform's cache directory.
+pub fn cacheDir(): String = {
+	if io::env("WIP_CACHE_DIR") is .Some(dir) && !dir.isEmpty() then return move dir
+	val home = io::env("HOME")
+	if TARGET_OS == "macos" && home is .Some(home) then
+		return path::join(home.toStr(), "Library/Caches/wip")
+	if io::env("XDG_CACHE_HOME") is .Some(dir) && !dir.isEmpty() then
+		return path::join(dir.toStr(), "wip")
+	return match home {
+		.Some(home) => path::join(home.toStr(), ".cache/wip")
+		.None => path::join(temporaryRoot().toStr(), "wip-cache")
+	}
+}
+
+/// What the cache holds, each a directory of its own in it: the C the
+/// compiler writes (`generated`), the objects compiled from C (`objects`)
+/// and by LLVM (`llvm`), and the tools written in Wip that `wip` builds
+/// (`tools`); and the standard library that versions which carried it
+/// inside themselves wrote out for a debugger and an editor to read
+/// (`std`), which `wip cache clean` removes too.
+pub val CACHED: [str; 5] = ["generated", "llvm", "objects", "std", "tools"]
+
+/// Empties the cache of what the compiler keeps there, and of nothing else,
+/// since `WIP_CACHE_DIR` may name a directory that holds more: how many
+/// bytes it held. A build that runs meanwhile writes what it compiles
+/// again.
+pub fn cleanCache(): Result<i64, String> = {
+	val cache = cacheDir()
+	var freed = 0
+	for part in CACHED {
+		val dir = path::join(cache.toStr(), part)
+		if !isDirectory(dir.toStr()) then continue
+		freed += sizeOf(dir.toStr())
+		if fs::removeAll(dir.toStr()) is .Err(error) then
+			return .Err("cannot remove `\(dir)`: \(error)")
+	}
+	return .Ok(freed)
+}
+
+/// How many bytes the files under `path` hold, not following a link.
+fn sizeOf(path: str): i64 = {
+	val .Ok(meta) = fs::linkMeta(path) else {
+		return 0
+	}
+	if !meta.isDirectory() then return meta.size
+	val .Ok(entries) = fs::readDir(path) else {
+		return 0
+	}
+	var size = 0
+	for entry in entries {
+		size += sizeOf(path::join(path, entry.name.toStr()).toStr())
+	}
+	return size
+}
+
+/// The system's temporary directory: `$TMPDIR`, or `/tmp`.
+fn temporaryRoot(): String = {
+	if io::env("TMPDIR") is .Some(dir) && !dir.isEmpty() then return move dir
+	return String::of("/tmp")
+}
+
+/// The C compiler: `$CC`, or `cc`.
+pub fn compiler(): String = match io::env("CC") {
+	.Some(cc) => move cc
+	.None => String::of("cc")
+}
+
+/// Who the compiler is, as far as an object depends on it: its name and
+/// what it says its version is. A build asks once and keeps the answer.
+pub fn toolIdentity(cc: str): Vec<u8> = {
+	var id: Vec<u8> = Vec()
+	id.pushAll(&cc)
+	if Command::of(cc).arg("--version").output() is .Ok(output) then id.pushAll(&output.stdout)
+	return move id
+}
+
+/// Writes generated C where its path depends only on what it says, so that
+/// the same source is the same entry build after build. `files` are written
+/// side by side, into one directory named by all of them.
+pub fn generated(cache: str, files: &[(str, str)], unique: &Unique): Result<String, String> = {
+	var hasher = Sha256()
+	for (name, text) in files {
+		field(&var hasher, &name)
+		field(&var hasher, &text)
+	}
+	val dir = path::join(path::join(cache, "generated").toStr(), hex(hasher.finish()).toStr())
+	for (name, text) in files {
+		val path = path::join(dir.toStr(), name)
+		if fs::readFile(path.toStr()) is .Ok(kept) && kept.toStr() == text then continue
+		if fs::makeDirs(dir.toStr()) is .Err(error) then
+			return .Err("cannot create `\(dir)`: \(error)")
+		writeAtomically(path.toStr(), text, &unique)?
+	}
+	return .Ok(move dir)
+}
+
+/// Compiles `files` with `includes` on the include path, using what the
+/// cache under `cache` already has. `positionIndependent` is for a shared
+/// library on a system whose compiler does not make all code so.
+pub fn compile(
+	files: &[CFile],
+	includes: &[String],
+	cache: str,
+	positionIndependent: bool,
+	optimize: bool,
+	cpu: &Cpu,
+	unique: &Unique,
+): Result<Compiled, String> = {
+	// A program of Wip alone has no C, and the C compiler is not asked
+	// anything, not even who it is.
+	if files.isEmpty() then return .Ok(Compiled(objects: Vec(), compiled: 0))
+	val cc = compiler()
+	val objectsDir = path::join(cache, "objects")
+	if fs::makeDirs(objectsDir.toStr()) is .Err(error) then
+		return .Err("cannot create `\(objectsDir)`: \(error)")
+	val identity = toolIdentity(cc.toStr())
+	val results = future::map(&files, (file) => objectFor(
+		&file,
+		flags(&file, &includes, positionIndependent, optimize, &cpu),
+		cc.toStr(),
+		&identity,
+		objectsDir.toStr(),
+		&unique,
+	))
+	// The first failure, in the order the files were given, so the message
+	// does not depend on which thread got there first.
+	var objects: Vec<String> = Vec()
+	var compiled = 0
+	for result in move results {
+		val (object, fresh) = result?
+		objects.push(move object)
+		if fresh then compiled += 1
+	}
+	return .Ok(Compiled(objects: move objects, compiled: compiled))
+}
+
+/// What tells a C compiler the processor a program is for, as GCC and Clang
+/// name it: a level by its own name, and the compiling machine as `native`.
+pub fn cpuFlag(cpu: &Cpu): String = match cpu.level() {
+	.None =>
+		if TARGET_ARCH == "arm64" then String::of("-mcpu=native") else String::of("-march=native")
+	.Some(.Armv8_0) => String::of("-march=armv8-a")
+	.Some(.Armv8_1) => String::of("-march=armv8.1-a")
+	// GCC before 13 does not know Apple's processors by name, and Linux on
+	// a Mac may be built with it: v8.4 has what the M1 level does (LSE,
+	// pointer authentication, dot products), and the M1 has v8.4.
+	.Some(.AppleM1) =>
+		if TARGET_VENDOR == "apple" then String::of("-mcpu=apple-m1")
+		else String::of("-march=armv8.4-a+fp16")
+	.Some(level) => "-march=\(level.name())"
+}
+
+/// The flags one file is compiled with, besides where it is and where its
+/// object goes.
+fn flags(
+	file: &CFile,
+	includes: &[String],
+	positionIndependent: bool,
+	optimize: bool,
+	cpu: &Cpu,
+): Vec<String> = {
+	// Optimised in a release build, and not in a debug build; with the debug
+	// information a debugger reads in both, as Wip's own code has it.
+	var args: Vec<String> = Vec()
+	args.push(String::of("-c"))
+	args.push(String::of(if optimize then "-O2" else "-O0"))
+	args.push(String::of("-g"))
+	if positionIndependent then args.push(String::of("-fPIC"))
+	// For the processor Wip's code is for, so that the C beside it runs
+	// where it does, and no further.
+	args.push(cpuFlag(&cpu))
+	// The language, where the extension does not already say it: a header is
+	// then compiled as the implementation it holds.
+	if implied(file.source.toStr()) != .Some(file.language.clone()) ||
+		file.language == Language::ObjectiveC {
+		args.push(String::of("-x"))
+		args.push(String::of(if file.language == Language::C then "c" else "objective-c"))
+	}
+	// Before the prefix header, which may test them.
+	for define in file.defines {
+		args.push("-D\(define)")
+	}
+	if file.prefix is .Some(prefix) {
+		args.push(String::of("-include"))
+		args.push(prefix.clone())
+	}
+	for dir in includes {
+		args.push("-I\(dir)")
+	}
+	return move args
+}
+
+/// The object for `file`: the one kept, if what made it is unchanged, or a
+/// new one. The flag says whether it was compiled now.
+fn objectFor(
+	file: &CFile,
+	flags: Vec<String>,
+	cc: str,
+	identity: &[u8],
+	objectsDir: str,
+	unique: &Unique,
+): Result<(String, bool), String> = {
+	val source = match fs::realPath(file.source.toStr()) {
+		.Ok(source) => move source
+		.Err(error) => return .Err("cannot read `\(file.source)`: \(error)")
+	}
+	val text = match fs::readFile(source.toStr()) {
+		.Ok(text) => move text
+		.Err(error) => return .Err("cannot read `\(source)`: \(error)")
+	}
+	var key = Sha256()
+	field(&var key, &identity)
+	for flag in flags {
+		field(&var key, flag.toStr())
+	}
+	field(&var key, source.toStr())
+	field(&var key, text.toStr())
+	val key = hex(key.finish())
+	val object = path::join(objectsDir, "\(key).o")
+	val deps = path::join(objectsDir, "\(key).deps")
+	if isFile(object.toStr()) && stillCurrent(deps.toStr()) then return .Ok((move object, false))
+
+	// Compiled beside the entry under a name of its own, then renamed into
+	// place: a build running at the same time sees the old entry or the new
+	// one, never half of one.
+	val suffix = unique.next()
+	val fresh = path::join(objectsDir, "\(key).\(suffix).o")
+	val made = path::join(objectsDir, "\(key).\(suffix).d")
+	var args = move flags
+	args.push(source.clone())
+	args.push(String::of("-o"))
+	args.push(fresh.clone())
+	args.push(String::of("-MD"))
+	args.push(String::of("-MF"))
+	args.push(made.clone())
+	var given: Vec<str> = Vec()
+	for arg in args {
+		given.push(arg.toStr())
+	}
+	val result = match Command::of(cc).args(&given).output() {
+		.Ok(result) => move result
+		.Err(error) => return .Err("cannot run `\(cc)`: \(error)")
+	}
+	if !result.exit.success() {
+		fs::removeFile(fresh.toStr())
+		fs::removeFile(made.toStr())
+		return .Err("`\(cc)` failed:\n\(result.stderr)")
+	}
+	val headers = match fs::readFile(made.toStr()) {
+		.Ok(rule) => dependencies(rule.toStr())
+		.Err(..) => Vec()
+	}
+	fs::removeFile(made.toStr())
+	var listing = String()
+	for header in headers {
+		val path = match fs::realPath(header.toStr()) {
+			.Ok(path) => move path
+			.Err(..) => header.clone()
+		}
+		val .Some(stamp) = Stamp::of(path.toStr()) else {
+			continue
+		}
+		listing.push(stamp.line(path.toStr()).toStr())
+	}
+	// The object first, then what says it is current: a reader that finds
+	// the list finds the object it describes.
+	if fs::rename(fresh.toStr(), object.toStr()) is .Err(error) then
+		return .Err("cannot keep `\(object)`: \(error)")
+	writeAtomically(deps.toStr(), listing.toStr(), &unique)?
+	return .Ok((move object, true))
+}
+
+/// What a header was when an object was made from it.
+struct Stamp {
+	size: i64
+	modified: String
+	hash: String
+}
+
+extend Stamp {
+	static fn of(path: str): Option<Stamp> = {
+		val .Ok(meta) = fs::meta(path) else {
+			return .None
+		}
+		val .Ok(text) = fs::readFile(path) else {
+			return .None
+		}
+		return .Some(Stamp(size: meta.size, modified: modified(&meta), hash: hexOf(text.toStr())))
+	}
+
+	/// One line of the list: the size, the time, the hash and the path, the
+	/// path last since it may hold spaces.
+	fn line(path: str): String = "\(self.size) \(self.modified) \(self.hash) \(path)\n"
+}
+
+/// When a file last changed, in nanoseconds since 1970, as a number written
+/// out.
+fn modified(meta: &fs::Meta): String = "\(meta.modified * 1_000_000_000 + meta.modifiedNanos)"
+
+/// Whether every header an entry was made from is as it was: the same size
+/// and time, or, where the time moved, the same contents.
+fn stillCurrent(deps: str): bool = {
+	val .Ok(listing) = fs::readFile(deps) else {
+		return false
+	}
+	for line in listing.toStr().lines() {
+		val .Some((size, afterSize)) = line.splitOnce(" ") else {
+			return false
+		}
+		val .Some((time, afterTime)) = afterSize.splitOnce(" ") else {
+			return false
+		}
+		val .Some((hash, path)) = afterTime.splitOnce(" ") else {
+			return false
+		}
+		val .Ok(meta) = fs::meta(path) else {
+			return false
+		}
+		if size != "\(meta.size)".toStr() then return false
+		if time == modified(&meta).toStr() then continue
+		val .Ok(text) = fs::readFile(path) else {
+			return false
+		}
+		if hexOf(text.toStr()) != hash then return false
+	}
+	return true
+}
+
+/// The files a Make rule written by `-MD` depends on: everything after the
+/// first `: `, with `\` continuations joined and `\ ` read as a space.
+fn dependencies(rule: str): Vec<String> = {
+	val joined = rule.replace("\\\r\n", " ").replace("\\\n", " ")
+	var out: Vec<String> = Vec()
+	val .Some(colon) = joined.toStr().find(": ") else {
+		return move out
+	}
+	val after = joined.toStr()[colon + 2..joined.len()]
+	var current = String()
+	var i = 0
+	while i < after.len() {
+		val byte = after[i]
+		i += 1
+		if byte == b'\\' && i < after.len() && after[i] == b' ' {
+			current.pushByte(b' ')
+			i += 1
+		} else if byte == b'$' && i < after.len() && after[i] == b'$' {
+			current.pushByte(b'$')
+			i += 1
+		} else if byte is b' ' | b'\t' | b'\n' | b'\r' | 0x0B | 0x0C {
+			if !current.isEmpty() {
+				out.push(move current)
+				current = String()
+			}
+		} else {
+			current.pushByte(byte)
+		}
+	}
+	if !current.isEmpty() then out.push(move current)
+	return move out
+}
+
+/// Writes `text` to `path` by way of a name of its own, so a reader never
+/// sees half of it.
+fn writeAtomically(path: str, text: str, unique: &Unique): Result<void, String> = {
+	val extension = "\(unique.next()).tmp"
+	val temporary = withExtension(path, extension.toStr())
+	if fs::writeFile(temporary.toStr(), text) is .Err(error) {
+		fs::removeFile(temporary.toStr())
+		return .Err("cannot write `\(path)`: \(error)")
+	}
+	if fs::rename(temporary.toStr(), path) is .Err(error) {
+		fs::removeFile(temporary.toStr())
+		return .Err("cannot write `\(path)`: \(error)")
+	}
+	return .Ok()
+}
+
+/// `path` with its name's extension, where it has one, replaced by
+/// `extension`, and added where it has none.
+fn withExtension(path: str, extension: str): String = {
+	val name = path::name(path)
+	val stem = path::stem(path)
+	return "\(path[0..path.len() - name.len()])\(stem).\(extension)"
+}

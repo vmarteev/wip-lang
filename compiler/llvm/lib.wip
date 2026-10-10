@@ -1,0 +1,1216 @@
+// An LLVM backend: the MIR every backend takes, written as LLVM's textual IR,
+// which `clang` compiles, at `-O2` for a release build and at `-O0` for a
+// debug build. Nothing of LLVM is linked into the compiler.
+//
+// The whole program is one LLVM module, so LLVM sees every function together
+// and inlines across what were Wip's modules; a debug build is cut into parts
+// compiled at once (`split.wip`), and its functions are hidden rather than
+// kept to their module, so that another part, and the table a panic reads,
+// may name them. Each local is a stack slot of its layout's size, read and
+// written at byte offsets; LLVM's `mem2reg` and SROA turn what can be into
+// registers in a release build. A call passes an aggregate by the address of
+// its place, an aggregate result through an address the caller supplies, and
+// a `str` or a `&[T]` to C as a pointer and a length. A struct C takes by
+// value travels as the C ABI says, and a variadic call is LLVM's own.
+//
+// Debug information is LLVM's metadata, which LLVM writes as DWARF and keeps
+// through its inlining; the table of functions a panic reads to say its calls
+// is made from that DWARF once LLVM has compiled the program
+// (`frames.wip`).
+
+import std::collections::{Deque, Map, Set}
+import std::io
+import hir::{ConstId, FnDef, FnId, GlobalId, I64, InterfaceId, NEVER, Program, Ty, TyKind}
+import mir::{
+	Arch,
+	CCall,
+	Layout,
+	Layouts,
+	Part,
+	Reg,
+	functionBody,
+	isAggregate,
+	isClosurePointer,
+	isDynPointer,
+	isSlicePointer,
+	lowerDropFn,
+	lowerDropInPlaceFn,
+	readsBeforeWrites,
+	scalars,
+	shimName,
+	shimmed,
+	tableBytes
+}
+import syntax::{Interner, Span, Symbol}
+
+/// The number of the runtime's words, the first name a module numbers.
+val RUNTIME_WORDS: u32 = 0
+
+/// The number of the list of the tables a panic reads, the second.
+val FRAME_TABLES: u32 = 1
+
+/// What the program starts at: its `main`, or the tests `wip test` runs.
+pub enum Entry {
+	Main(main: FnId)
+	Tests(tests: Vec<FnId>)
+}
+
+/// The program as LLVM IR, and the files its DWARF names: one module for a
+/// release build, and for a debug build its parts, which are compiled at once
+/// and linked (`split.wip`). Each file is as the DWARF names it, with the
+/// name a panic gives it.
+pub struct Ir {
+	pub modules: Vec<Module>
+	pub files: Map<String, String>
+}
+
+extend Ir {
+	/// Every module without debug information, as `cc -g0` writes one.
+	pub var fn dropDebugInfo() = {
+		for module in self.modules {
+			module.dropDebugInfo()
+		}
+	}
+}
+
+/// The program as LLVM IR, for a release build where `optimize` says so and
+/// for a debug build where it does not.
+pub fn compile(
+	program: &Program,
+	interner: &Interner,
+	entry: Option<Entry>,
+	locations: &(at: Span) => (String, u32, u32),
+	optimize: bool,
+): Ir = {
+	var llvm = Llvm::new(&program, &interner, locations, optimize)
+	for id in program.fns.ids() {
+		if program.fns[id].exportsC && program.isCompiled(id) then llvm.symbol(id)
+	}
+	match entry {
+		.Some(.Main(main)) => llvm.defineEntry(main)
+		.Some(.Tests(tests)) => llvm.defineTestEntry(&tests)
+		.None => {}
+	}
+	while true {
+		if llvm.queue.popFront() is .Some(id) then llvm.defineFunction(id)
+		else if llvm.pendingDrops.pop() is .Some((ty, inPlace)) then llvm.defineDrop(ty, inPlace)
+		else break
+	}
+	return llvm.finish()
+}
+
+/// A parameter or a result as a signature has it: its type, and what C's ABI
+/// asks of it — a narrow integer extended, a struct's address marked as where
+/// the result goes or as the bytes on the stack.
+@derive(Clone)
+struct Slot {
+	t: Type
+	attrs: Vec<Attr>
+}
+
+extend Slot {
+	static fn of(t: Type): Slot = Slot(t: move t, attrs: Vec())
+
+	fn text(): String = slotText(&self.t, &self.attrs)
+}
+
+/// A function's signature in LLVM, as Wip calls it: the address an aggregate
+/// result is written to first, then the parameters.
+@derive(Clone)
+struct Sig {
+	params: Vec<Slot>
+	ret: Option<Slot>
+	/// The first parameter is where an aggregate result goes.
+	sret: bool
+	/// A struct C answers in registers: the pieces, as LLVM returns a struct
+	/// of them.
+	parts: Option<Vec<Part>>
+}
+
+extend Sig {
+	/// What a call of it answers.
+	fn retType(): Type = {
+		if self.parts is .Some(parts) then return partsType(&parts)
+		return match self.ret {
+			.Some(slot) => slot.t.clone()
+			.None => .Void
+		}
+	}
+
+	/// What its result's attributes say.
+	fn retAttrs(): Vec<Attr> = match self.ret {
+		.Some(slot) if self.parts.isNone() => slot.attrs.clone()
+		_ => Vec()
+	}
+
+	/// The result as a declaration writes it: its attributes, then its type.
+	fn retText(): String = {
+		val attrs = self.retAttrs()
+		val t = self.retType()
+		return if attrs.isEmpty() then t.text() else "\(attrsText(&attrs)) \(t.text())"
+	}
+}
+
+/// The LLVM type of a register a piece of a struct travels in.
+fn regType(reg: Reg): Type = match reg {
+	.I64 => .I(64)
+	.F32 => .F32
+	.F64 => .F64
+}
+
+/// The struct LLVM returns pieces in.
+fn partsType(parts: &[Part]): Type = {
+	var fields: Vec<Type> = Vec()
+	for part in parts {
+		fields.push(regType(part.reg.clone()))
+	}
+	return structOf(move fields, false)
+}
+
+view struct Llvm {
+	program: &Program
+	interner: &Interner
+	locations: &(at: Span) => (String, u32, u32)
+	layouts: Layouts
+	shimmed: Set<FnId>
+	/// The processor whose C ABI calls are made in.
+	arch: Option<Arch>
+	/// Whether a `&var` parameter is marked `noalias`.
+	noalias: bool
+	/// A release build's: its MIR's scalars split out, and its functions kept
+	/// to the module.
+	optimize: bool
+	cCalls: Map<FnId, Option<CCall>>
+	/// The variables C owns that the program reads or writes.
+	cGlobals: Map<GlobalId, u32>
+	/// The functions defined so far, in order.
+	functions: Vec<Function>
+	/// The file each function was written in, which says which of a debug
+	/// build's parts it goes in.
+	files: Vec<String>
+	/// What the program's data is: strings, tables, embedded files.
+	data: Vec<Global>
+	/// What is declared and not defined, by its name's number: C's functions
+	/// and variables, and LLVM's intrinsics.
+	declarations: Map<u32, Declared>
+	/// The name of each global and function, as written, by its number.
+	names: Vec<String>
+	/// Each name's number.
+	numbers: Map<String, u32>
+	/// Each function's symbol, once referred to.
+	symbols: Map<FnId, u32>
+	/// The C symbols declared, so that one declared twice under two names is
+	/// one declaration.
+	cDeclared: Set<String>
+	queue: Deque<FnId>
+	debug: Debug
+	/// Each type's node of debug information, once written.
+	diTypes: Map<Ty, Option<i64>>
+	strings: Map<Symbol, u32>
+	texts: Map<String, u32>
+	tables: Map<ConstId, u32>
+	vtables: Map<(InterfaceId, Ty), u32>
+	/// The embedded files written, by the constant each was embedded as,
+	/// which every copy of its bytes names.
+	blobs: Map<ConstId, u32>
+	drops: Map<(Ty, bool), u32>
+	pendingDrops: Vec<(Ty, bool)>
+	/// The runtime's functions, which C's names reach: `wip_alloc`,
+	/// `wip_panic_index` and the rest.
+	runtimeFns: Map<String, FnId>
+}
+
+extend Llvm {
+	static fn new(
+		program: &Program,
+		interner: &Interner,
+		locations: &(at: Span) => (String, u32, u32),
+		optimize: bool,
+	): Llvm = {
+		var runtime: Map<String, FnId> = Map()
+		for id in program.fns.ids() {
+			val def = &program.fns[id]
+			if def.exportsC then
+				runtime.put(String::of(interner.resolve(def.symbol.unwrapOr(def.name))), id)
+		}
+		val noalias = match io::env("WIP_LLVM_NOALIAS") {
+			.Some(value) => value != "0"
+			.None => true
+		}
+		var llvm = Llvm(
+			program: &program,
+			interner: &interner,
+			locations: locations,
+			layouts: Layouts::new(),
+			shimmed: shimmed(&program, Arch::host()),
+			arch: Arch::host(),
+			noalias: noalias,
+			optimize: optimize,
+			cCalls: Map(),
+			cGlobals: Map(),
+			functions: Vec(),
+			files: Vec(),
+			data: Vec(),
+			declarations: Map(),
+			names: Vec(),
+			numbers: Map(),
+			symbols: Map(),
+			cDeclared: Set(),
+			queue: Deque(),
+			debug: Debug::new(locations, optimize),
+			diTypes: Map(),
+			strings: Map(),
+			texts: Map(),
+			tables: Map(),
+			vtables: Map(),
+			blobs: Map(),
+			drops: Map(),
+			pendingDrops: Vec(),
+			runtimeFns: move runtime,
+		)
+		llvm.global("@wip_runtime_words")
+		llvm.global("@\"wip.frame_tables\"")
+		return move llvm
+	}
+
+	/// The declarations, in the order of their text.
+	fn declared(): Vec<Declared> = {
+		var all: Vec<(String, Declared)> = Vec()
+		for entry in self.declarations {
+			all.push((entry.value.text(&self.names), entry.value.clone()))
+		}
+		all.sortBy((a, b) => a.0 < b.0)
+		var declared: Vec<Declared> = Vec()
+		for (_, item) in move all {
+			declared.push(move item)
+		}
+		return move declared
+	}
+
+	move fn finish(): Ir = {
+		// Every function keeps its frame record, which a profiler walks;
+		// nothing unwinds through Wip's code. A call stays a call, so that a
+		// panic's calls are all there: one in the tail of a function would be
+		// a jump, and the function would be missing from them. A function that
+		// does not return — a panic — is never called from two places by one
+		// call, which would have one line for both.
+		val returns = Vec::of(own [
+			FnAttr::NoUnwind,
+			FnAttr::UwTable,
+			FnAttr::FramePointer,
+			FnAttr::DisableTailCalls,
+		])
+		var panics = returns.clone()
+		panics.push(.NoReturn)
+		panics.push(.NoMerge)
+		val declared = self.declared()
+		// The runtime's words, and the list of the tables a panic reads its
+		// calls from, which is written once LLVM has compiled the program and
+		// its DWARF says what is where (`frames.wip`).
+		val globals = Vec::of(own [runtimeWords(RUNTIME_WORDS), frameTables(FRAME_TABLES)])
+		val module = Module(
+			heading: String::of("; Written by wip's LLVM backend."),
+			names: move self.names,
+			data: move self.data,
+			globals: move globals,
+			declared: move declared,
+			functions: move self.functions,
+			groups: Vec::of(own [move returns, move panics]),
+			unit: self.debug.unit,
+			flags: self.debug.flags,
+			nodes: move self.debug.nodes,
+		)
+		val modules =
+			if self.optimize then Vec::of(own [move module]) else split(move module, &self.files)
+		return Ir(modules: move modules, files: move self.debug.paths)
+	}
+
+	/// A function defined, written in `file`.
+	var fn define(file: String, function: Function) = {
+		self.files.push(move file)
+		self.functions.push(move function)
+	}
+
+	/// The number of the global or function named `name`, as written.
+	var fn global(name: str): u32 = {
+		val key = String::of(name)
+		if self.numbers.get(&key) is .Some(number) then return number
+		val number = self.names.len() as u32
+		self.names.push(key.clone())
+		self.numbers.put(move key, number)
+		return number
+	}
+
+	/// What the module declares as `symbol`, once.
+	var fn declare(symbol: u32, declared: Declared) = {
+		if !self.declarations.contains(&symbol) then self.declarations.put(symbol, move declared)
+	}
+
+	/// An intrinsic of LLVM's, declared once: what it answers, and what it
+	/// takes. Its name's number.
+	var fn intrinsic(name: str, ret: Type, params: Vec<Type>): u32 = {
+		val symbol = self.global(name)
+		if self.declarations.contains(&symbol) then return symbol
+		var slots: Vec<Param> = Vec()
+		for t in move params {
+			slots.push(Param(t: move t, attrs: Vec(), name: .None))
+		}
+		self.declare(symbol, .Function(Declaration::of(symbol, move ret, move slots)))
+		return symbol
+	}
+
+	/// A constant of the program's, named `written`: bytes, read-only, which
+	/// nothing names outside the module, at `align`. Its name's number.
+	var fn constant(written: str, t: Type, init: Constant, align: u32): u32 = {
+		val name = self.global(globalName(written).toStr())
+		self.data.push(Global(
+			name: name,
+			linkage: .Private,
+			unnamedAddr: true,
+			constant: true,
+			t: move t,
+			init: .Some(move init),
+			align: .Some(align),
+		))
+		return name
+	}
+
+	/// The file `span` was written in, as a panic names it.
+	fn fileOf(span: Span): String = {
+		val (file, _, _) = (self.locations)(span)
+		return move file
+	}
+
+	/// The linkage of a function the program keeps to itself: kept to the
+	/// module in a release build, so that LLVM may change or drop it, and
+	/// hidden in a debug build, where nothing is changed and an object of its
+	/// own may name it.
+	fn ownLinkage(): Linkage = if self.optimize then .Internal else .Hidden
+
+	fn kind(ty: Ty): TyKind = self.program.types.kind(ty)
+
+	var fn layout(ty: Ty): Layout = self.layouts.of(self.program, ty)
+
+	fn isAggregate(ty: Ty): bool = isAggregate(self.program, ty)
+
+	/// A scalar's LLVM type; nothing for an aggregate or a type with no size.
+	fn lt(ty: Ty): Option<Type> = {
+		if isSlicePointer(self.program, ty) ||
+			isDynPointer(self.program, ty) ||
+			isClosurePointer(self.program, ty) {
+			return .None
+		}
+		return match self.kind(ty) {
+			.Int(int) => .Some(.I(int.bits()))
+			.Float(float: .F32) => .Some(.F32)
+			.Float(..) => .Some(.F64)
+			.Bool => .Some(.I(8))
+			.Char => .Some(.I(32))
+			.Cstring | .Fn(..) | .Own(..) | .Ptr(..) | .Ref(..) => .Some(.Ptr)
+			_ => .None
+		}
+	}
+
+	/// A scalar parameter or result: values narrower than 32 bits are extended
+	/// by the caller, as Apple's arm64 ABI requires.
+	fn slot(ty: Ty): Option<Slot> = {
+		val .Some(lt) = self.lt(ty) else {
+			return .None
+		}
+		val attr: Option<Attr> = match self.kind(ty) {
+			// A `&var` argument is the only way to its place while the call
+			// runs, which is what LLVM's `noalias` says. `WIP_LLVM_NOALIAS=0`
+			// leaves it out, to measure.
+			.Ref(kind: .Var, ..) if self.noalias => .Some(.NoAlias)
+			.Bool => .Some(.ZeroExt)
+			.Int(int) if int.bits() < 32 && int.signed() => .Some(.SignExt)
+			.Int(int) if int.bits() < 32 => .Some(.ZeroExt)
+			_ => .None
+		}
+		var attrs: Vec<Attr> = Vec()
+		if attr is .Some(a) then attrs.push(a)
+		return .Some(Slot(t: move lt, attrs: move attrs))
+	}
+
+	/// A scalar result, as a parameter is but for `noalias`: on a result, LLVM
+	/// reads it as `malloc`'s promise of memory nothing else reaches, which a
+	/// projection's `&var` into its argument is not.
+	fn result(ty: Ty): Option<Slot> = {
+		val .Some(found) = self.slot(ty) else {
+			return .None
+		}
+		var slot = move found
+		val noalias = Attr::NoAlias
+		if slot.attrs.contains(&noalias) then slot.attrs = Vec()
+		return .Some(move slot)
+	}
+
+	/// Whether a `&` parameter of this type reaches a place that nothing
+	/// changes while the call runs, which LLVM's `noalias readonly` says: a
+	/// `&` excludes every `&var` to its place, and through a `&` only an
+	/// `@intrinsic` struct — `std::sync::Atomic` — changes what it holds, so a
+	/// place that holds none of them by value does not change. What it reaches
+	/// through an `own`, a `ptr` or another reference is other memory, of which
+	/// the attribute says nothing; and C, which may write where it likes, is
+	/// never on either side of the call.
+	fn onlyRead(ty: Ty): bool = match self.kind(ty) {
+		.Ref(inner, kind: .Shared) =>
+			self.lt(ty) == Option::Some(Type::Ptr) && !self.changesThroughARef(inner)
+		_ => false
+	}
+
+	/// Whether a value of `ty` holds, by value, what changes through a `&`.
+	fn changesThroughARef(ty: Ty): bool = match self.kind(ty) {
+		.Struct(id, ..) => {
+			if self.program.structs[id].isIntrinsic then return true
+			for field in self.program.fieldTys(ty) {
+				if self.changesThroughARef(field) then return true
+			}
+			false
+		}
+		.Enum(..) => {
+			for fields in self.program.variantFieldTys(ty) {
+				for field in fields {
+					if self.changesThroughARef(field) then return true
+				}
+			}
+			false
+		}
+		.Array(elem, ..) => self.changesThroughARef(elem)
+		_ => false
+	}
+
+	/// Whether C takes the type as two arguments, a pointer and a length.
+	fn isCPair(ty: Ty): bool = match self.kind(ty) {
+		.Str | .Slice(..) => true
+		.Ref(inner, ..) => self.kind(inner) is .Slice(..)
+		_ => false
+	}
+
+	/// The signature of a function of `params` and `ret`; `cAbi` where C is on
+	/// the other side, and a `str` is two arguments.
+	var fn signatureWith(params: &[Ty], ret: Ty, cAbi: bool): Sig = {
+		var slots: Vec<Slot> = Vec()
+		val sret = self.isAggregate(ret)
+		if sret then slots.push(Slot::of(.Ptr))
+		for param in params {
+			if cAbi && self.isCPair(param) {
+				slots.push(Slot::of(.Ptr))
+				slots.push(Slot::of(.I(64)))
+				continue
+			}
+			var slot = match self.slot(param) {
+				.Some(s) => move s
+				.None => Slot::of(.Ptr)
+			}
+			if !cAbi && self.noalias && self.onlyRead(param) then
+				slot.attrs = Vec::of(own [Attr::NoAlias, Attr::ReadOnly])
+			// An aggregate taken by value is passed by the address of a place
+			// nothing else reaches while the call runs: a copy the caller made
+			// of a place it keeps, or what it moved or built, which it no
+			// longer names. The callee never assigns to it, and moves out of it
+			// only what the caller gave up.
+			if !cAbi && self.noalias && self.isAggregate(param) then
+				slot.attrs = Vec::of(own [Attr::NoAlias])
+			addAttr(&var slot, self.referentAttrs(param))
+			slots.push(move slot)
+		}
+		var retSlot = self.result(ret)
+		if retSlot is .Some(..) {
+			val more = self.referentAttrs(ret)
+			var given = retSlot.unwrap()
+			addAttr(&var given, move more)
+			retSlot = .Some(move given)
+		}
+		return Sig(params: move slots, ret: move retSlot, sret: sret, parts: .None)
+	}
+
+	/// The whole value a reference of type `ty` reaches, where it is one
+	/// address and the value has a size: a Wip reference is never null and
+	/// always reaches all of a value of its type, aligned as the type is, for
+	/// as long as it is held. A value of no size may be at any address, and is
+	/// given nothing.
+	var fn referent(ty: Ty): Option<Layout> = match self.kind(ty) {
+		.Ref(inner, ..) if self.lt(ty) == Option::Some(Type::Ptr) => {
+			val layout = self.layout(inner)
+			if layout.size > 0 then .Some(layout) else .None
+		}
+		_ => .None
+	}
+
+	/// What a parameter or result of type `ty` says of what it reaches.
+	var fn referentAttrs(ty: Ty): Vec<Attr> = match self.referent(ty) {
+		.Some(layout) => Vec::of(own [
+			Attr::NonNull,
+			Attr::Dereferenceable(layout.size),
+			Attr::Align(layout.align.max(1)),
+		])
+		.None => Vec()
+	}
+
+	var fn signature(id: FnId): Sig = {
+		if self.cCall(id) is .Some(cCall) then return self.cSignature(id, &cCall)
+		val def = &self.program.fns[id]
+		var params: Vec<Ty> = Vec()
+		for p in def.params {
+			params.push(p.ty)
+		}
+		// For finding where `noalias` goes wrong: only the functions whose
+		// names hold `WIP_LLVM_NOALIAS_ONLY`, where it is set.
+		val keep = self.noalias
+		if io::env("WIP_LLVM_NOALIAS_ONLY") is .Some(only) {
+			val name = self.program.fnName(id, self.interner)
+			var named = false
+			for part in only.toStr().split(",") {
+				if name.contains(part) then named = true
+			}
+			self.noalias = keep && named
+		}
+		val sig = self.signatureWith(&params, def.ret, usesCAbi(&def))
+		self.noalias = keep
+		return move sig
+	}
+
+	/// The signature of a call through a value, with `noalias` only where no
+	/// filter is set.
+	var fn indirectSignature(params: &[Ty], ret: Ty, cAbi: bool): Sig = {
+		val keep = self.noalias
+		if io::env("WIP_LLVM_NOALIAS_ONLY").isSome() then self.noalias = false
+		val sig = self.signatureWith(&params, ret, cAbi)
+		self.noalias = keep
+		return move sig
+	}
+
+	/// How C passes `id`'s structs, where it passes one by value and the call
+	/// is made here rather than in a wrapper.
+	var fn cCall(id: FnId): Option<CCall> = {
+		if self.cCalls.get(&id) is .Some(known) then return known.clone()
+		val def = &self.program.fns[id]
+		val found: Option<CCall> = match self.arch {
+			.Some(arch) if usesCAbi(&def) &&
+				!self.shimmed.contains(&id) &&
+				mir::byValue(self.program, &def) => {
+				val classified = mir::classify(self.program, &var self.layouts, &def, arch)
+				val plain = match classified {
+					.Some(call) => call.isPlain()
+					.None => true
+				}
+				if plain then .None else move classified
+			}
+			_ => .None
+		}
+		self.cCalls.put(id, found.clone())
+		return move found
+	}
+
+	/// The signature C gives a function whose structs travel as `cCall` says:
+	/// pieces in registers, a pointer to a copy, bytes on the stack, and a
+	/// result in registers or through the address C is given.
+	var fn cSignature(id: FnId, cCall: &CCall): Sig = {
+		val def = &self.program.fns[id]
+		var params: Vec<Slot> = Vec()
+		val sret = cCall.ret == mir::Answer::Hidden
+		if sret {
+			val layout = self.layout(def.ret)
+			params.push(Slot(
+				t: .Ptr,
+				attrs: Vec::of(own [
+					Attr::Sret(layout.size.max(1)),
+					Attr::Align(layout.align.max(1)),
+				]),
+			))
+		}
+		for (i, pass) in cCall.params.forwards().enumerate() {
+			if i >= def.params.len() then break
+			val ty = def.params[i].ty
+			match pass {
+				.Plain => {
+					if self.isCPair(ty) {
+						params.push(Slot::of(.Ptr))
+						params.push(Slot::of(.I(64)))
+					} else {
+						params.push(
+							match self.slot(ty) {
+								.Some(s) => move s
+								.None => Slot::of(.Ptr)
+							},
+						)
+					}
+				}
+				.Parts(parts) => {
+					for part in parts {
+						params.push(Slot::of(regType(part.reg.clone())))
+					}
+				}
+				.Spilled(pad, parts) => {
+					for _ in 0..pad.ints {
+						params.push(Slot::of(.I(64)))
+					}
+					for _ in 0..pad.floats {
+						params.push(Slot::of(.F64))
+					}
+					for part in parts {
+						params.push(Slot::of(regType(part.reg.clone())))
+					}
+				}
+				.Copy => params.push(Slot::of(.Ptr))
+				.Stack(size) => params.push(Slot(
+					t: .Ptr,
+					attrs: Vec::of(own [Attr::ByVal(size), Attr::Align(8)]),
+				))
+			}
+		}
+		var ret: Option<Slot> = .None
+		var parts: Option<Vec<Part>> = .None
+		match cCall.ret {
+			.Plain => ret = self.result(def.ret)
+			.Parts(given) => parts = .Some(given.clone())
+			.Hidden => {}
+		}
+		return Sig(params: move params, ret: move ret, sret: sret, parts: move parts)
+	}
+
+	/// A variable C owns, as the symbol the linker resolves.
+	var fn cGlobal(global: GlobalId): u32 = {
+		if self.cGlobals.get(&global) is .Some(name) then return name
+		val def = &self.program.globals[global]
+		val name = self.global(
+			globalName(self.interner.resolve(def.symbol.unwrapOr(def.name))).toStr(),
+		)
+		self.declare(
+			name,
+			.Global(Global(
+				name: name,
+				linkage: .External,
+				unnamedAddr: false,
+				constant: false,
+				t: .I(8),
+				init: .None,
+				align: .None,
+			)),
+		)
+		self.cGlobals.put(global, name)
+		return name
+	}
+
+	/// A function's symbol, declared or asked to be defined the first time it
+	/// is referred to.
+	var fn symbol(id: FnId): u32 = {
+		if self.symbols.get(&id) is .Some(name) then return name
+		val def = &self.program.fns[id]
+		// C's name for a function the program defines itself, exported to C:
+		// the one function, in the one module.
+		if def.isExtern && !self.shimmed.contains(&id) {
+			val cName = String::of(self.interner.resolve(def.symbol.unwrapOr(def.name)))
+			if self.runtimeFns.get(&cName) is .Some(exported) && exported != id {
+				val name = self.symbol(exported)
+				self.symbols.put(id, name)
+				return name
+			}
+		}
+		val name = if def.isExtern {
+			val cName =
+				if self.shimmed.contains(&id) then shimName(id)
+				else String::of(self.interner.resolve(def.symbol.unwrapOr(def.name)))
+			val symbol = self.global(globalName(cName.toStr()).toStr())
+			// One C function may be declared under two names, each with a
+			// signature of its own; a call says its own, and the first is the
+			// declaration's.
+			if self.cDeclared.add(move cName) {
+				val sig = self.signature(id)
+				var params: Vec<Param> = Vec()
+				for slot in sig.params {
+					params.push(Param(t: slot.t.clone(), attrs: slot.attrs.clone(), name: .None))
+				}
+				var declaration = Declaration::of(symbol, sig.retType(), move params)
+				declaration.retAttrs = sig.retAttrs()
+				// A function C declares with `...`, called with more.
+				declaration.variadic = def.isVariadic && !self.shimmed.contains(&id)
+				self.declare(symbol, .Function(move declaration))
+			}
+			symbol
+		} else if def.exportsC {
+			self.queue.pushBack(id)
+			self.global(globalName(self.interner.resolve(def.symbol.unwrapOr(def.name))).toStr())
+		} else {
+			self.queue.pushBack(id)
+			val written = self.program.fnName(id, self.interner)
+			val symbol = "wip.\(written).\(id.index())"
+			self.global(globalName(symbol.toStr()).toStr())
+		}
+		self.symbols.put(id, name)
+		return name
+	}
+
+	/// A runtime function by the name C knows it by.
+	fn runtime(name: str): FnId = {
+		val key = String::of(name)
+		return match self.runtimeFns.get(&key) {
+			.Some(id) => id
+			.None => panic("the prelude exports `\(name)`")
+		}
+	}
+
+	/// The drop function of an `own` of `ty`, or the one that drops a value of
+	/// `ty` where it lies.
+	var fn dropFn(ty: Ty, inPlace: bool): u32 = {
+		val key = (ty, inPlace)
+		if self.drops.get(&key) is .Some(name) then return name
+		val kind = if inPlace then "drop_in_place" else "drop"
+		val symbol = "wip.\(kind).\(self.drops.len())"
+		val name = self.global(globalName(symbol.toStr()).toStr())
+		self.drops.put(key, name)
+		self.pendingDrops.push(key)
+		return name
+	}
+
+	/// A string literal's bytes and its NUL.
+	var fn string(symbol: Symbol): u32 = {
+		if self.strings.get(&symbol) is .Some(name) then return name
+		val written = "wip.str.\(self.strings.len())"
+		val text = self.interner.resolve(symbol)
+		var withNul = text.items().toVec()
+		withNul.push(0)
+		val name = self.constant(
+			written.toStr(),
+			byteArray((text.len() + 1) as u32),
+			.Bytes(move withNul),
+			1,
+		)
+		self.strings.put(symbol, name)
+		return name
+	}
+
+	/// Bytes without a NUL: a panic's message and file name.
+	var fn text(text: str): u32 = {
+		val key = String::of(text)
+		if self.texts.get(&key) is .Some(name) then return name
+		val written = "wip.text.\(self.texts.len())"
+		// An object holds a byte at least; an empty text's is never read.
+		val name = self.constant(
+			written.toStr(),
+			byteArray(text.len().max(1) as u32),
+			byteConstant(&text.items()),
+			1,
+		)
+		self.texts.put(move key, name)
+		return name
+	}
+
+	/// An embedded file's bytes, kept once for the constant `origin` they were
+	/// embedded as, however many tables point at them.
+	var fn blob(origin: ConstId, bytes: &[u8]): u32 = {
+		if self.blobs.get(&origin) is .Some(name) then return name
+		val written = "wip.embedded.\(self.blobs.len())"
+		val name = self.constant(
+			written.toStr(),
+			byteArray(bytes.len().max(1) as u32),
+			byteConstant(bytes),
+			1,
+		)
+		self.blobs.put(origin, name)
+		return name
+	}
+
+	/// A constant table, kept once, in read-only data: its bytes, with the
+	/// addresses of strings and files where they go.
+	var fn table(id: ConstId): u32 = {
+		if self.tables.get(&id) is .Some(name) then return name
+		val written = "wip.table.\(id.index())"
+		val def = &self.program.consts[id]
+		val ty = def.ty
+		val .Some(value) = def.value else {
+			panic("only a table that was worked out is kept")
+		}
+		// Every target Wip builds for keeps its words little-endian.
+		val table = tableBytes(self.program, self.interner, &var self.layouts, &value, ty, true)
+		var addresses: Vec<(u32, u32)> = Vec()
+		for (offset, symbol) in table.strings {
+			addresses.push((offset, self.string(symbol)))
+		}
+		for (offset, bytes, origin) in table.blobs {
+			addresses.push((offset, self.blob(origin, &bytes)))
+		}
+		addresses.sortBy((a, b) => a.0 < b.0)
+		var types: Vec<Type> = Vec()
+		var values: Vec<Constant> = Vec()
+		var at = 0
+		val bytes = &table.bytes
+		for (offset, target) in addresses {
+			val start = offset as i64
+			if start > at {
+				types.push(byteArray((start - at) as u32))
+				values.push(.Bytes(bytes[at..start].toVec()))
+			}
+			types.push(.Ptr)
+			values.push(.Address(target))
+			at = start + 8
+		}
+		if at < bytes.len() || types.isEmpty() {
+			types.push(byteArray((bytes.len() - at).max(1) as u32))
+			values.push(byteConstant(&bytes[at..bytes.len()]))
+		}
+		val align = self.layout(ty).align.max(1)
+		val name = self.constant(
+			written.toStr(),
+			structOf(move types, true),
+			.Packed(move values),
+			align,
+		)
+		self.tables.put(id, name)
+		return name
+	}
+
+	/// A type's table of methods for an interface.
+	var fn vtable(interfaceId: InterfaceId, ty: Ty): u32 = {
+		val key = (interfaceId, ty)
+		if self.vtables.get(&key) is .Some(name) then return name
+		val written = "wip.vtable.\(self.vtables.len())"
+		var methods: Vec<FnId> = Vec()
+		var found = false
+		for table in self.program.vtables {
+			if table.interfaceId == interfaceId && table.ty == ty {
+				methods = table.methods.clone()
+				found = true
+				break
+			}
+		}
+		if !found then panic("every table a program needs was made with its instances")
+		// Numbered before its methods, which a method's own table may name.
+		val name = self.global(globalName(written.toStr()).toStr())
+		self.vtables.put(key, name)
+		var entries: Vec<Constant> = Vec()
+		for method in methods {
+			entries.push(.Address(self.symbol(method)))
+		}
+		val t = arrayOf(entries.len() as u64, .Ptr)
+		self.data.push(Global(
+			name: name,
+			linkage: .Private,
+			unnamedAddr: true,
+			constant: true,
+			t: move t,
+			init: .Some(.Array(move entries)),
+			align: .Some(8),
+		))
+		return name
+	}
+
+	/// C's `abort`, declared once, whether or not the program declares it
+	/// itself.
+	var fn abort(): u32 = {
+		val symbol = self.global(globalName("abort").toStr())
+		if self.cDeclared.add(String::of("abort")) {
+			var declaration = Declaration::of(symbol, .Void, Vec())
+			declaration.attrs = Vec::of(own [FnAttr::NoReturn, FnAttr::NoUnwind])
+			self.declare(symbol, .Function(move declaration))
+		}
+		return symbol
+	}
+
+	var fn defineFunction(id: FnId) = {
+		val program = self.program
+		val def = &program.fns[id]
+		val .Some(lowered) = functionBody(program, self.interner, id) else {
+			return
+		}
+		var body = move lowered
+		// A release build's MIR splits its scalars out; a debug build's keeps
+		// each variable whole, for the debugger.
+		if self.optimize then scalars(program, &var body)
+		// For finding what MIR reads before it writes.
+		if io::env("WIP_MIR_UNWRITTEN").isSome() {
+			for (local, block) in readsBeforeWrites(&body) {
+				val decl = body.local(local)
+				val name = match decl.source {
+					.Some(source) => String::of(self.interner.resolve(source.name))
+					.None => String::of("-")
+				}
+				io::eprintln("unwritten: \(program.fnName(id, self.interner)) _\(local.index) (\(name), \(decl.kind), \(program.tyName(decl.ty, self.interner))) read in bb\(block.index)")
+			}
+		}
+		var sig = self.signature(id)
+		var symbol = self.symbol(id)
+		var linkage = if def.exportsC then Linkage::External else self.ownLinkage()
+		val name = program.fnName(id, self.interner)
+		// C's side of a function C passes a struct by value to, or is answered
+		// one by, is a function of its own, and the function is Wip's as any
+		// other.
+		if def.exportsC && self.cCall(id) is .Some(cCall) {
+			val inner = "wip.\(name).\(id.index())"
+			val bodySymbol = self.global(globalName(inner.toStr()).toStr())
+			val export = self.defineExport(id, symbol, bodySymbol, &cCall)
+			self.define(self.fileOf(def.span), move export)
+			var params: Vec<Ty> = Vec()
+			for p in def.params {
+				params.push(p.ty)
+			}
+			sig = self.signatureWith(&params, def.ret, true)
+			symbol = bodySymbol
+			linkage = self.ownLinkage()
+		}
+		val at = def.span
+		val subprogram = self.debug.subprogram(name.toStr(), .Some(at))
+		val function = defineFn(
+			&var self,
+			&body,
+			symbol,
+			linkage,
+			&sig,
+			usesCAbi(&def),
+			def.ret == NEVER,
+			subprogram,
+			.Some(at),
+		)
+		self.define(self.fileOf(at), move function)
+	}
+
+	var fn defineDrop(ty: Ty, inPlace: bool) = {
+		val body =
+			if inPlace then lowerDropInPlaceFn(self.program, self.interner, ty)
+			else lowerDropFn(self.program, self.interner, ty)
+		val symbol = self.dropFn(ty, inPlace)
+		val sig = Sig(params: Vec::of(own [Slot::of(.Ptr)]), ret: .None, sret: false, parts: .None)
+		val name = "drop<\(self.program.tyName(ty, self.interner))>"
+		val subprogram = self.debug.subprogram(name.toStr(), .None)
+		val linkage = self.ownLinkage()
+		val function = defineFn(
+			&var self,
+			&body,
+			symbol,
+			linkage,
+			&sig,
+			false,
+			false,
+			subprogram,
+			.None,
+		)
+		self.define(String(), move function)
+	}
+
+	/// `int main(int argc, char **argv)`: calls Wip's `main`, with the
+	/// program's arguments as a slice if it takes them, and answers its exit
+	/// code.
+	var fn defineEntry(main: FnId) = {
+		val def = &self.program.fns[main]
+		val callee = Value::Global(self.symbol(main))
+		var code: Vec<(Option<Value>, Op)> = Vec()
+		var args: Vec<Val> = Vec()
+		if !def.params.isEmpty() {
+			code.push((.Some(Value::Main(.Args)), .Alloca(t: byteArray(16), align: 8)))
+			code.push(
+				(
+					.None,
+					.Store(
+						value: Val::of(Value::Main(.Argv), .Ptr),
+						address: Value::Main(.Args),
+						align: 8,
+					),
+				),
+			)
+			code.push(
+				(
+					.Some(Value::Main(.Count)),
+					.Cast(cast: .SExt, value: Val::of(Value::Main(.Argc), .I(32)), to: .I(64)),
+				),
+			)
+			code.push(
+				(.Some(Value::Main(.Length)), .Offset(base: Value::Main(.Args), offset: .Int(8))),
+			)
+			code.push(
+				(
+					.None,
+					.Store(
+						value: Val::of(Value::Main(.Count), .I(64)),
+						address: Value::Main(.Length),
+						align: 8,
+					),
+				),
+			)
+			args.push(Val::of(Value::Main(.Args), .Ptr))
+		}
+		val exit = (code: &var Vec<(Option<Value>, Op)>) => {
+			code.push(
+				(
+					.Some(Value::Main(.Code)),
+					.Cast(cast: .Trunc, value: Val::of(Value::Main(.Code64), .I(64)), to: .I(32)),
+				),
+			)
+			code.push((.None, .Ret(.Some(Val::of(Value::Main(.Code), .I(32))))))
+		}
+		if self.program.entryReport is .Some(report) {
+			val layout = self.layout(def.ret)
+			val reporter = Value::Global(self.symbol(report))
+			code.push(
+				(
+					.Some(Value::Main(.Result)),
+					.Alloca(t: byteArray(layout.size.max(1)), align: layout.align.max(1)),
+				),
+			)
+			var withResult = Vec::of(own [Val::of(Value::Main(.Result), .Ptr)])
+			for a in args {
+				withResult.push(a.clone())
+			}
+			code.push((.None, .Call(own Call::plain(move callee, .Void, move withResult))))
+			code.push(
+				(
+					.Some(Value::Main(.Code64)),
+					.Call(own Call::plain(
+						move reporter,
+						.I(64),
+						Vec::of(own [Val::of(Value::Main(.Result), .Ptr)]),
+					)),
+				),
+			)
+			exit(&var code)
+		} else if def.ret == I64 {
+			code.push(
+				(
+					.Some(Value::Main(.Code64)),
+					.Call(own Call::plain(move callee, .I(64), move args)),
+				),
+			)
+			exit(&var code)
+		} else {
+			val sig = self.signature(main)
+			var call = Call::plain(move callee, sig.retType(), move args)
+			call.retAttrs = sig.retAttrs()
+			code.push((.None, .Call(own move call)))
+			code.push((.None, .Ret(.Some(Val::of(.Int(0), .I(32))))))
+		}
+		self.defineCMain(move code)
+	}
+
+	/// C's `main`, whose instructions are `code`: code the compiler writes on
+	/// its own, which a panic's calls pass over, every instruction at no line,
+	/// as LLVM asks of a call in a function it describes.
+	var fn defineCMain(code: Vec<(Option<Value>, Op)>) = {
+		val subprogram = self.debug.subprogram("main", .None)
+		val place = self.debug.noLine(subprogram.clone())
+		var instructions: Vec<Instruction> = Vec()
+		for (result, op) in move code {
+			instructions.push(Instruction(result: move result, op: move op, at: .Some(place)))
+		}
+		val function = Function(
+			symbol: self.global("@main"),
+			linkage: .External,
+			ret: .I(32),
+			retAttrs: Vec(),
+			params: Vec::of(own [
+				Param(t: .I(32), attrs: Vec(), name: .Some(.Main(.Argc))),
+				Param(t: .Ptr, attrs: Vec(), name: .Some(.Main(.Argv))),
+			]),
+			returns: true,
+			subprogram: subprogram.node,
+			blocks: Vec::of(own [Block(label: .Start, instructions: move instructions)]),
+		)
+		self.define(String(), move function)
+	}
+
+	/// The runner `wip test` asks for: each test in turn, its name before and
+	/// `ok` after.
+	var fn defineTestEntry(tests: &[FnId]) = {
+		val plural = if tests.len() == 1 then "test" else "tests"
+		var lines: Vec<String> = Vec::of(own ["running \(tests.len()) \(plural)\n"])
+		for id in tests {
+			lines.push("test \(self.program.testName(id, self.interner)) ... ")
+		}
+		lines.push(String::of("ok\n"))
+		lines.push("\n\(tests.len()) \(plural) passed\n")
+		val printer = self.runtime("wip_print_text")
+		val print = Value::Global(self.symbol(printer))
+		var texts: Vec<(u32, i64)> = Vec()
+		for line in lines {
+			texts.push((self.text(line.toStr()), line.len()))
+		}
+		var callees: Vec<u32> = Vec()
+		for id in tests {
+			callees.push(self.symbol(id))
+		}
+		var code: Vec<(Option<Value>, Op)> = Vec()
+		val say = (code: &var Vec<(Option<Value>, Op)>, said: &(u32, i64)) => code.push(
+			(
+				.None,
+				.Call(own Call::plain(
+					print.clone(),
+					.Void,
+					Vec::of(own [
+						Val::of(.Global(said.0), .Ptr),
+						Val::of(.Int(said.1 as i64), .I(64)),
+					]),
+				)),
+			),
+		)
+		say(&var code, &texts[0])
+		for (index, callee) in callees.forwards().enumerate() {
+			say(&var code, &texts[index + 1])
+			code.push((.None, .Call(own Call::plain(.Global(callee), .Void, Vec()))))
+			say(&var code, &texts[tests.len() + 1])
+		}
+		say(&var code, &texts[tests.len() + 2])
+		code.push((.None, .Ret(.Some(Val::of(.Int(0), .I(32))))))
+		self.defineCMain(move code)
+	}
+}
+
+/// The runtime's words, named `name`.
+fn runtimeWords(name: u32): Global = Global(
+	name: name,
+	linkage: .External,
+	unnamedAddr: false,
+	constant: false,
+	t: arrayOf(8, .I(64)),
+	init: .Some(.Zero),
+	align: .Some(8),
+)
+
+/// The list of the tables a panic reads, named `name`, which the program's
+/// last object defines.
+fn frameTables(name: u32): Global = Global(
+	name: name,
+	linkage: .Hidden,
+	unnamedAddr: false,
+	constant: false,
+	t: arrayOf(0, .I(64)),
+	init: .None,
+	align: .Some(8),
+)
+
+/// Bytes as a constant: an empty one a NUL, since an object holds a byte at
+/// least.
+fn byteConstant(bytes: &[u8]): Constant =
+	if bytes.isEmpty() then .Bytes(Vec::of(own [0 as u8])) else .Bytes(bytes.toVec())
+
+/// `[size x i8]`: a stack slot's bytes.
+fn byteArray(size: u32): Type = arrayOf(size as u64, .I(8))
+
+/// `slot`'s attributes, and `more` after them.
+fn addAttr(slot: &var Slot, more: Vec<Attr>) = {
+	for attr in move more {
+		slot.attrs.push(move attr)
+	}
+}
+
+/// Whether C is on the other side of a function's calls.
+fn usesCAbi(def: &FnDef): bool = def.isExtern || def.exportsC
+
+/// A global's name, quoted as LLVM's IR takes any name.
+fn globalName(name: str): String = "@\"\(escape(name))\""
+
+/// Bytes as LLVM writes them in `c"…"`: printable ASCII as it is, and every
+/// other byte, a quote and a backslash as `\` and two hexadecimal digits.
+fn escape(text: str): String = {
+	val digits = "0123456789ABCDEF"
+	var out = String()
+	for i in 0..text.len() {
+		val byte = text[i]
+		if byte >= 0x20 && byte <= 0x7e && byte != b'"' && byte != b'\\' {
+			out.pushByte(byte)
+		} else {
+			out.pushByte(b'\\')
+			out.pushByte(digits[(byte >> 4) as i64])
+			out.pushByte(digits[(byte & 15) as i64])
+		}
+	}
+	return move out
+}

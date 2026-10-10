@@ -1,0 +1,233 @@
+// Calls across the C boundary, checked against C itself: structs and unions
+// by value, of many shapes; variadic calls; C's function pointers that may
+// be null; C's variables; and what may not cross. The compiler calls C the
+// way the target's ABI says, with no C in between, and a wrong answer there
+// does not crash: it hands C the wrong numbers, which C is written to see.
+//
+// Each runs three ways: as the compiler builds it; with `WIP_FORCE_SHIMS`,
+// which sends every call through a wrapper in C, the path that was the only
+// one before; and as a release build, which is LLVM's. All must pass, on
+// every target the gate runs.
+
+import std::fs
+import std::path
+import check::{Checked, Gate, Ran, across, run, said}
+
+/// How a program is built and run.
+@derive(Eq)
+enum Way {
+	/// A debug build, calling C itself.
+	Directly
+	/// Every call into C through a wrapper in C.
+	ThroughWrappers
+	/// A release build, which LLVM optimises.
+	Released
+}
+
+val WAYS = [Way::Directly, Way::ThroughWrappers, Way::Released]
+
+extend Way {
+	fn name(): str = match self {
+		.Directly => "directly"
+		.ThroughWrappers => "through wrappers"
+		.Released => "released"
+	}
+}
+
+/// A program of the corpus: its name, its files, what it must print, and
+/// the ways it is run.
+struct Program {
+	name: String
+	files: Vec<(String, String)>
+	prints: String
+	ways: Vec<Way>
+}
+
+/// One program run one way.
+struct Item {
+	program: i64
+	way: Way
+}
+
+pub fn check(gate: &Gate): Checked = {
+	val programs = programs()
+	var items: Vec<Item> = Vec()
+	for index in 0..programs.len() {
+		for way in programs[index].ways {
+			if gate.takes("\(programs[index].name), \(way.name())".toStr()) then
+				items.push(Item(program: index, way: way))
+		}
+	}
+	var failed = across(
+		items.len(),
+		(index) => {
+			val item = &items[index]
+			return runs(&gate, &programs[item.program], item.way, index)
+		},
+	)
+	var count = items.len()
+	if gate.takes("the library needs no C of the compiler's writing") {
+		count += 1
+		if libraryNeedsNoC(&gate) is .Some(why) then failed.push(move why)
+	}
+	return Checked::of(count, move failed)
+}
+
+/// A program, written into a directory of its own and run one way: it
+/// prints what it must, and ends well.
+fn runs(gate: &Gate, program: &Program, way: Way, index: i64): Option<String> = {
+	val name = "\(program.name), \(way.name())"
+	val dir = gate.work.join("abi-\(index)")
+	for (file, text) in program.files {
+		val at = path::join(dir.toStr(), file.toStr())
+		fs::makeDirs(path::parent(at.toStr()))
+		if fs::writeFile(at.toStr(), text.toStr()) is .Err(error) then
+			return .Some("\(name): cannot write `\(at)`: \(error)")
+	}
+	val command =
+		if way == .Released then gate.command(dir.toStr(), ["run", "--release", "main.wip"])
+		else gate.command(dir.toStr(), ["run", "main.wip"])
+	val shims = if way == .ThroughWrappers then "1" else "0"
+	val ran = run(command.env("WIP_FORCE_SHIMS", shims))
+	if program.prints.isEmpty() {
+		// A program that must be refused, by the code and the words it
+		// names.
+		if !ran.exit.success() &&
+			ran.stderr.contains("E0901") &&
+			ran.stderr.contains(
+				"`takesPair` is called by C, and cannot also be a Wip function value",
+			) &&
+			!ran.stderr.contains("takesBits") {
+			return .None
+		}
+		return .Some("\(name): it was not refused as it should be\(said(&ran))")
+	}
+	if ran.exit.success() && ran.stdout == program.prints then return .None
+	return .Some("\(name)\(said(&ran))")
+}
+
+/// A program that asks for no macro, no `static inline`, no variable
+/// behind a header and no opaque field gets no C of the compiler's
+/// writing, on any target: the library's own calls into C are all made
+/// directly — floats included, which on x86-64 means `strfromd` rather than
+/// a variadic call that passes a double.
+fn libraryNeedsNoC(gate: &Gate): Option<String> = {
+	val name = "the library needs no C of the compiler's writing"
+	val dir = gate.work.join("abi-library")
+	val cache = gate.work.join("abi-library/cache")
+	fs::makeDirs(dir.toStr())
+	val main = gate.work.join("abi-library/main.wip")
+	fs::writeFile(
+		main.toStr(),
+		"import std::io\nimport std::fs\n\nfn main(): i64 = {\n    io::printFloat(0.1 + 0.2)\n    io::println(\"\\(1234567.0) \\(0.5) \\(-2.5e-10)\")\n    io::printInt(42)\n    val found = fs::exists(\"main.wip\")\n    val unset = io::env(\"WIP_NOT_SET\").isNone()\n    io::println(\"\\(found) \\(unset)\")\n    0\n}\n",
+	)
+	val ran = run(
+		gate.command(dir.toStr(), ["run", "main.wip"]).
+			env("WIP_CACHE_DIR", cache.toStr()).
+			env("WIP_FORCE_SHIMS", "0"),
+	)
+	if ran.stdout != "0.30000000000000004\n1234567 0.5 -2.5e-10\n42\ntrue true\n" then
+		return .Some("\(name)\(said(&ran))")
+	var found: Vec<String> = Vec()
+	generated(cache.toStr(), &var found)
+	if found.isEmpty() then return .None
+	return .Some("\(name): C of the compiler's writing: \(found.join(", "))")
+}
+
+/// Every `wip_shims.c` under a directory: C the compiler wrote.
+fn generated(dir: str, found: &var Vec<String>) = {
+	val .Ok(entries) = fs::readDir(dir) else {
+		return
+	}
+	for entry in entries {
+		val at = path::join(dir, entry.name.toStr())
+		if entry.isDirectory() then generated(at.toStr(), &var found)
+		else if entry.name == "wip_shims.c" then found.push(move at)
+	}
+}
+
+fn programs(): Vec<Program> = {
+	var programs: Vec<Program> = Vec()
+	val (structs, c, _) = structsProgram()
+	programs.push(
+		program(
+			"structs by value",
+			[("main.wip", structs.toStr()), ("structs.c", c.toStr())],
+			"0 failed\n",
+			true,
+		),
+	)
+	programs.push(
+		program(
+			"function pointers that may be null",
+			[("pointers.c", POINTERS_C), ("main.wip", POINTERS)],
+			"7 0\n6 -1\n700\n7 2\n10\n",
+			true,
+		),
+	)
+	programs.push(program("an export taken as a value", [("main.wip", EXPORT_AS_VALUE)], "", false))
+	val variadic = variadicProgram()
+	programs.push(
+		program(
+			"variadic calls",
+			[("main.wip", variadic.toStr()), ("variadic.c", VARIADIC_C)],
+			"0 failed\n",
+			true,
+		),
+	)
+	programs.push(
+		program(
+			"C's variables",
+			[("globals.c", GLOBALS_C), ("main.wip", GLOBALS)],
+			"true 1\n",
+			true,
+		),
+	)
+	return move programs
+}
+
+/// A program of the corpus, run every way where `everyWay`, and otherwise
+/// directly and released.
+fn program(name: str, files: &[(str, str)], prints: str, everyWay: bool): Program = {
+	var written: Vec<(String, String)> = Vec()
+	for (file, text) in files {
+		written.push((String::of(file), String::of(text)))
+	}
+	var ways: Vec<Way> = Vec()
+	for way in WAYS {
+		if everyWay || way != .ThroughWrappers then ways.push(way)
+	}
+	return Program(
+		name: String::of(name),
+		files: move written,
+		prints: String::of(prints),
+		ways: move ways,
+	)
+}
+
+// A C function pointer that may be null is an `Option` to Wip, laid out as
+// the pointer: C passes and answers it as the one word it is, in a
+// register, which Wip's own calls would pass by its address.
+
+val POINTERS_C =
+	"#include <stdint.h>\ntypedef int32_t (*int_fn)(void);\nstatic int32_t seven(void) { return 7; }\nint_fn c_seven(int32_t give) { return give ? seven : 0; }\nint32_t c_call(int_fn f) { return f ? f() + 1 : -1; }\nint_fn wip_pick(int_fn f);\nint32_t c_through_export(void) {\n    int_fn kept = wip_pick(seven);\n    int_fn none = wip_pick(0);\n    return kept() * 100 + (none ? 1 : 0);\n}\ntypedef struct { int_fn f; int32_t n; } Holder;\nint32_t c_holder(Holder h) { return h.f ? h.f() + h.n : h.n; }\nHolder c_made(void) { Holder h = { seven, 3 }; return h; }\n"
+
+val POINTERS =
+	"import std::io\n\nextern struct Holder {\n    f: Option<() => i32>\n    n: i32\n}\n\nextern \"C\" {\n    fn c_seven(give: i32): Option<() => i32>\n    fn c_call(f: Option<() => i32>): i32\n    fn c_through_export(): i32\n    fn c_holder(h: Holder): i32\n    fn c_made(): Holder\n}\n\n@export(\"C\")\nfn wip_pick(f: Option<() => i32>): Option<() => i32> = f\n\nfn five(): i32 = 5\n\nfn called(f: Option<() => i32>): i32 = if f is .Some(g) then g() else 0\n\nfn main() = {\n    io::println(\"\\(called(c_seven(1))) \\(called(c_seven(0)))\")\n    io::println(\"\\(c_call(.Some(five))) \\(c_call(.None))\")\n    io::println(\"\\(c_through_export())\")\n    io::println(\"\\(c_holder(Holder(f: .Some(five), n: 2))) \\(c_holder(Holder(f: .None, n: 2)))\")\n    val made = c_made()\n    io::println(\"\\(called(made.f) + made.n)\")\n}\n"
+
+// A union crosses from C into an export like a struct, but an export that
+// takes a struct by value cannot also be a Wip function value: C passes it
+// in registers and Wip passes its address.
+
+val EXPORT_AS_VALUE =
+	"extern \"C\" {\n    union Bits {\n        whole: i64,\n        half: i32\n    }\n}\n\n@export(\"C\")\nfn takesBits(bits: Bits): i64 = bits.whole\n\n@export(\"C\")\nfn takesPair(pair: Pair): i64 = pair.a\n\nextern struct Pair {\n    a: i64,\n    b: i64\n}\n\nfn main(): i64 = {\n    val f = takesPair\n    f(Pair(a: 1, b: 2)) + takesBits(Bits(whole: 0))\n}\n"
+
+// C's variables, read and written where they are used rather than through C
+// of the compiler's writing: every width, each written by one side and read
+// by the other.
+
+val GLOBALS_C =
+	"#include <stdint.h>\nint8_t small = -5;\nuint16_t middle = 60000;\nint32_t word = -70000;\nint64_t wide = 5000000000;\nfloat single = 0.25f;\ndouble twice = 2.5;\n_Bool flag = 1;\nconst char *name = \"C's\";\nint32_t check(void) {\n    return small == 7 && middle == 1234 && word == 42 && wide == -9000000000\n        && single == 1.5f && twice == -0.75 && flag == 0;\n}\n"
+
+val GLOBALS =
+	"import std::io\n\nextern \"C\" {\n    var small: i8\n    var middle: u16\n    var word: i32\n    var wide: i64\n    var single: f32\n    var twice: f64\n    var flag: bool\n    val name: cstring\n    fn check(): i32\n}\n\nfn main(): i64 = {\n    val read = small == -5 && middle == 60000 && word == -70000 && wide == 5000000000 &&\n        single == 0.25 && twice == 2.5 && flag && name.toStr() == \"C's\"\n    small = 7\n    middle = 1234\n    word = 42\n    wide = -9000000000\n    single = 1.5\n    twice = -0.75\n    flag = false\n    io::println(\"\\(read) \\(check())\")\n    0\n}\n"

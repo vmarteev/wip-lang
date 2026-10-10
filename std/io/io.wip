@@ -3,6 +3,7 @@
 // through `stdout`, in order.
 
 import std::libc
+import std::time::{Duration}
 
 /// Text as it is, with nothing added. A `String` may stand
 /// here too: it lends its bytes for the call. A
@@ -119,14 +120,18 @@ pub fn lastError(): IoError = {
 /// A descriptor, and the bytes read from it but not yet given out.
 /// A reader has to remember them between calls, and the
 /// library has nowhere to keep them, so the program holds one of these:
-/// `io::stdin()` for standard input, and a `File` for a file, which holds
-/// one of these and closes its descriptor where it ends.
+/// `io::stdin()` for standard input, a `File` for a file, which holds
+/// one of these and closes its descriptor where it ends, and a program
+/// talked to for what it writes.
 pub struct Reader {
 	fd: i32
 	held: Vec<u8>
 	// How many of `held` have been given out.
 	given: i64
 	ended: bool
+	// How many milliseconds a read waits for something to come; -1 waits
+	// as long as it takes.
+	timeout: i64
 }
 
 /// Standard input. It closes nothing: descriptor 0 is not a program's to
@@ -134,12 +139,25 @@ pub struct Reader {
 pub fn stdin(): Reader = reader(0)
 
 /// A reader over a descriptor, for the module that opened it.
-pub fn reader(fd: i32): Reader = Reader(fd: fd, held: Vec(), given: 0, ended: false)
+pub fn reader(fd: i32): Reader = Reader(fd: fd, held: Vec(), given: 0, ended: false, timeout: -1)
 
 /// The descriptor a reader reads from, for the module that owns it.
 pub fn descriptorOf(reader: &Reader): i32 = reader.fd
 
 extend Reader {
+	/// How long a read waits for something to come before it answers
+	/// `.WouldBlock`, which is what a read that would wait longer is called;
+	/// `.None`, as a reader begins, waits as long as it takes. What a read
+	/// that gave up had read is appended where it was asked for, so that
+	/// asking again with the same `String` goes on from there: a line comes
+	/// whole to a `readLine` that was given the start of it before.
+	pub var fn setTimeout(length: Option<Duration>) = {
+		self.timeout = match length {
+			.Some(length) => length.asMillis().max(0)
+			.None => -1
+		}
+	}
+
 	/// The next line, appended to `into` without its line break. `false` at
 	/// the end of the input, where nothing was appended.
 	pub var fn readLine(into: &var String): Result<bool, IoError> = {
@@ -216,6 +234,7 @@ extend Reader {
 			self.held = move kept
 			self.given = 0
 		}
+		if self.timeout >= 0 && !self.ready()? then return .Err(.WouldBlock)
 		var chunk = [0 as u8; 4096]
 		// A read cut short by a signal is tried again, so that no program
 		// has to.
@@ -232,6 +251,18 @@ extend Reader {
 			self.held.push(byte)
 		}
 		return .Ok()
+	}
+
+	/// Whether something comes to be read, or the input ends, within the
+	/// timeout. A wait cut short by a signal is waited again.
+	fn ready(): Result<bool, IoError> = {
+		var watched = [libc::PollFd(fd: self.fd, events: libc::POLLIN, answered: 0)]
+		var answered = libc::poll(&var watched, self.timeout as c_int)
+		while answered < 0 && lastError() == .Interrupted {
+			answered = libc::poll(&var watched, self.timeout as c_int)
+		}
+		if answered < 0 then return .Err(lastError())
+		return .Ok(answered > 0)
 	}
 }
 

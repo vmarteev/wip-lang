@@ -1,0 +1,1181 @@
+// Methods: `self`, a call `x.m(…)`, and a static function `Type::name(…)`.
+
+import syntax as ast
+import syntax::{
+	ARGUMENT_COUNT,
+	CANNOT_BORROW_VAR,
+	DROP_RULES,
+	Diagnostic,
+	Edit,
+	INTERPOLATION_OPTION,
+	NOT_A_METHOD,
+	PRIVATE_ITEM,
+	Receiver,
+	SELF_OUTSIDE_METHOD,
+	Span,
+	Symbol
+}
+
+/// How many interfaces offer a call's method.
+fn distinctInterfaces(offered: &[Offered]): i64 = {
+	var seen: Vec<InterfaceId> = Vec()
+	for offer in offered {
+		if !seen.contains(&offer.interfaceId) then seen.push(offer.interfaceId)
+	}
+	return seen.len()
+}
+
+extend Lowerer {
+	/// `self`, the receiver of the method being checked. It is the first
+	/// parameter, so it resolves like any other name.
+	var fn selfExpr(span: Span): ExprId = {
+		val sym = self.interner.selfSymbol()
+		if self.lookup(sym).isSome() then return self.name(sym, .None, span)
+		// A closure or a generator in a method captures it as any name around
+		// it.
+		if self.capturedName(sym, span) is .Some(captured) then return captured
+		self.report(
+			Diagnostic::error(
+				SELF_OUTSIDE_METHOD,
+				"`self` is only available in a method",
+				span,
+				"no receiver here",
+			).withNote(
+				"a method is declared in a type, and takes its receiver from the call: `fn`, `var fn` or `move fn`",
+			),
+		)
+		return self.errorExpr(span)
+	}
+
+	/// The type a method is looked up in: through `&`, `&var` and `own<T>`,
+	/// as a field access looks through them.
+	fn ownerOf(ty: Ty): Option<TypeDef> = match self.kind(ty) {
+		.Struct(id, ..) => .Some(.Struct(id))
+		.Enum(id, ..) => .Some(.Enum(id))
+		.Ref(inner, ..) | .Own(inner) => self.ownerOf(inner)
+		// An array has a slice's methods: what they take is `&[T]`, and an
+		// array lends one.
+		.Array(..) => {
+			val slice: BuiltinOwner = .Slice
+			if self.program.builtins.contains(&slice) then .Some(.Builtin(.Slice)) else .None
+		}
+		// A built-in type the prelude gave methods to.
+		kind => match BuiltinOwner::of(kind) {
+			.Some(builtin) if self.program.builtins.contains(&builtin) => .Some(.Builtin(builtin))
+			_ => .None
+		}
+	}
+
+	/// Which of several implementations a static call means: the one whose
+	/// parameter is the type of what is passed. A call that fits none of
+	/// them, or more than one, is reported here.
+	var fn overload(
+		owner: TypeDef,
+		candidates: &[FnId],
+		member: ast::Name,
+		item: &ItemUse,
+	): Option<FnId> = {
+		val count = match item.args {
+			.Some(a) => a.len()
+			.None => 0
+		}
+		val text = String::of(self.text(member.sym))
+		val typeName = self.typeName(owner)
+		var interfaces: Vec<String> = Vec()
+		for id in candidates {
+			interfaces.push(self.implementedName(id))
+		}
+		if count != 1 {
+			self.reportOverload(
+				&typeName,
+				&text,
+				member,
+				"called with \(plural(count, "argument", "arguments"))",
+				"each implementation of an interface that takes types declares it, so one argument says which is meant",
+				&interfaces,
+			)
+			return .None
+		}
+		// What is passed decides, so it is checked on its own first.
+		val value = self.infer(item.args.unwrap()[0], .None)
+		val ty = self.tyOf(value)
+		var fits: Vec<FnId> = Vec()
+		for id in candidates {
+			val params = &self.program.fns[id].params
+			if !params.isEmpty() && params[0].ty == ty then fits.push(id)
+		}
+		if fits.len() == 1 then return .Some(fits[0])
+		if fits.isEmpty() {
+			val passed = self.tyName(ty)
+			self.reportOverload(
+				&typeName,
+				&text,
+				member,
+				"none of them takes \(passed)",
+				"the implementation is chosen by what is passed, and no implementation takes this",
+				&interfaces,
+			)
+		} else {
+			self.reportOverload(
+				&typeName,
+				&text,
+				member,
+				String::of("more than one of them fits"),
+				"the implementation is chosen by what is passed, and this fits several",
+				&interfaces,
+			)
+		}
+		return .None
+	}
+
+	/// A static call among several implementations that does not say which.
+	var fn reportOverload(
+		typeName: str,
+		text: str,
+		member: ast::Name,
+		label: String,
+		note: str,
+		interfaces: &[String],
+	) = {
+		self.report(
+			Diagnostic::error(
+				NOT_A_METHOD,
+				"`\(typeName)` has more than one `\(text)`",
+				member.span,
+				move label,
+			).withNote(
+				String::of(note),
+			).withHelp("the implementations are \(interfaces.join(", "))"),
+		)
+	}
+
+	/// `From<i64>`, as an implementation is written, for a message.
+	fn implementedName(method: FnId): String = {
+		val name = self.program.fns[method].name
+		var found: Option<i64> = .None
+		for (at, i) in self.program.impls.forwards().enumerate() {
+			if found.isNone() && i.methods.contains(&method) then found = .Some(at)
+		}
+		val .Some(at) = found else {
+			return "`\(self.text(name))`"
+		}
+		val def = &self.program.impls[at]
+		val interfaceText = self.text(self.program.interfaces[def.interfaceId].name)
+		var args: Vec<String> = Vec()
+		for ty in self.program.types.list(def.args) {
+			val shown = self.tyName(ty)
+			args.push(String::of(shown.toStr().trimMatches("`")))
+		}
+		return if args.isEmpty() then "`\(interfaceText)`"
+		else "`\(interfaceText)<\(args.join(", "))>`"
+	}
+
+	/// The methods a type declares, whichever kind of type it is.
+	fn declaredMethods(owner: TypeDef): Vec<FnId> = match owner {
+		.Struct(id) => self.program.structs[id].methods.clone()
+		.Enum(id) => self.program.enums[id].methods.clone()
+		.Builtin(builtin) => match self.program.builtins.get(&builtin) {
+			.Some(built) => built.methods.clone()
+			.None => Vec()
+		}
+	}
+
+	/// Every method of `owner` with this name: more than one where an
+	/// interface that takes types is implemented more than once, or where a
+	/// lending pair reads and writes.
+	fn methodsNamed(owner: TypeDef, name: Symbol): Vec<FnId> = {
+		var found: Vec<FnId> = Vec()
+		for id in self.declaredMethods(owner) {
+			if self.program.fns[id].name == name then found.push(id)
+		}
+		return move found
+	}
+
+	fn methodOf(owner: TypeDef, name: Symbol): Option<FnId> = {
+		// A lending pair is two methods of one name, and a call reads unless
+		// it is where a write happens.
+		val found = self.methodsNamed(owner, name)
+		for id in found {
+			if self.program.fns[id].receiver != .Some(.Var) then return .Some(id)
+		}
+		return if found.isEmpty() then .None else .Some(found[0])
+	}
+
+	/// The writing half of a lending pair, for a call to the reading one.
+	fn writingTwin(reader: FnId): Option<FnId> = {
+		// An interface's own declaration has no type to look in; what
+		// implements it does, pair and all.
+		if self.program.fns[reader].receiver != .Some(.Read) then return .None
+		val owner = self.program.fns[reader].owner?
+		val name = self.program.fns[reader].name
+		for id in self.methodsNamed(owner, name) {
+			if self.program.fns[id].receiver == .Some(.Var) &&
+				self.kind(self.program.fns[id].ret) is .Ref(kind: .Var, ..) {
+				return .Some(id)
+			}
+		}
+		return .None
+	}
+
+	/// Whether two methods of one name are a lending pair: the same
+	/// parameters, one reading and one writing.
+	fn isLendingPair(first: FnId, second: FnId): bool = {
+		val a = &self.program.fns[first]
+		val b = &self.program.fns[second]
+		val reads = a.receiver == .Some(.Read) || b.receiver == .Some(.Read)
+		val writes = a.receiver == .Some(.Var) || b.receiver == .Some(.Var)
+		if !reads || !writes then return false
+		val (reader, writer) =
+			if a.receiver == .Some(.Read) then (first, second) else (second, first)
+		if !(self.kind(self.program.fns[reader].ret) is .Ref(kind: .Shared, ..)) then return false
+		if !(self.kind(self.program.fns[writer].ret) is .Ref(kind: .Var, ..)) then return false
+		// The receiver is the first parameter, and differs by design.
+		val readerParams = &self.program.fns[reader].params
+		val writerParams = &self.program.fns[writer].params
+		if readerParams.len() != writerParams.len() then return false
+		for i in 1..readerParams.len() {
+			if readerParams[i].name != writerParams[i].name ||
+				readerParams[i].ty != writerParams[i].ty {
+				return false
+			}
+		}
+		return true
+	}
+
+	/// `s.toStr()`: the bytes C owns, seen as a `str`. The length is found by
+	/// walking to the NUL, once, here.
+	var fn cstrToStr(receiver: ExprId, name: ast::Name, item: ItemUse): ExprId = {
+		if item.args is .Some(args) && !args.isEmpty() {
+			self.report(
+				Diagnostic::error(
+					ARGUMENT_COUNT,
+					"`toStr` takes no arguments",
+					item.span,
+					"arguments",
+				),
+			)
+			return self.giveUp(args, item.span)
+		}
+		if item.args.isNone() {
+			val text = String::of(self.text(name.sym))
+			self.report(
+				Diagnostic::error(
+					NOT_A_METHOD,
+					"`\(text)` is a method, and is called",
+					name.span,
+					"a method, not a field",
+				).withFix("call it", own [Edit::insert(name.span.hi, "()")]),
+			)
+			return self.errorExpr(item.span)
+		}
+		return self.alloc(.CstrToStr(receiver), STR, item.span)
+	}
+
+	/// The arguments of a use, given up on.
+	var fn giveUpItem(item: ItemUse): ExprId = match item.args {
+		.Some(args) => self.giveUp(args, item.span)
+		.None => self.giveUp(&noArgs(), item.span)
+	}
+
+	/// `x.m(…)`: the method `m` of `x`'s type, if it has one. The receiver is
+	/// borrowed or moved as the method declares.
+	var fn methodCall(base: ast::ExprId, name: ast::Name, item: ItemUse): Option<ExprId> = {
+		// A receiver is lent where it is written, so a range of elements may
+		// be one: `window[at..at + n].copyFrom(&block)`.
+		val receiver = self.inferBorrowed(base, .None)
+		val ty = self.tyOf(receiver)
+		// The receiver is already broken, and looking for a field of this name
+		// would lower it a second time and report it twice.
+		if self.isPoisoned(ty) then return .Some(self.giveUpItem(item))
+		// `x.len()` of an array, a slice or a `str` is the length the value
+		// carries, known where the program is compiled for an array. The
+		// prelude declares the method, so it is listed and can answer for an
+		// interface; a direct call is read here, at no cost.
+		var held = ty
+		while self.kind(held) is .Ref(inner, ..) | .Own(inner) {
+			held = inner
+		}
+		val noArgs = item.args is .Some(args) && args.isEmpty()
+		if self.text(name.sym) == "len" &&
+			noArgs &&
+			item.names.isEmpty() &&
+			self.kind(held) is .Array(..) | .Str | .Slice(..) {
+			val value = self.autoderef(receiver)
+			return .Some(self.alloc(.Len(value), I64, item.span))
+		}
+		// A call through a `&dyn`, and a method of a type parameter, come from
+		// an interface.
+		if self.kind(self.underRefs(ty)) is .Dyn(interfaceId, ..) then
+			return self.dynMethodCall(receiver, interfaceId, name, item)
+		// A C string can say how long it is, which costs a walk through it.
+		if self.kind(ty) == .Cstring && self.text(name.sym) == "toStr" then
+			return .Some(self.cstrToStr(receiver, name, item))
+		// Its length is not something it carries, so it has no `len()`: the
+		// text is walked first.
+		if self.kind(ty) == .Cstring && self.text(name.sym) == "len" {
+			self.report(
+				Diagnostic::error(
+					NOT_A_METHOD,
+					"no method `len` on `cstring`",
+					name.span,
+					"its length is not known",
+				).withNote(
+					"a `cstring` is a pointer to bytes that end with a NUL, so its length is not known until it is walked",
+				).withFix("walk it first, with `toStr()`", own [
+					Edit::insert(name.span.lo, "toStr()."),
+				]),
+			)
+			return .Some(self.giveUpItem(item))
+		}
+		// Plain data is its own clone, which no method of its type need say.
+		val ownClone = match self.ownerOf(ty) {
+			.Some(owner) => self.methodOf(owner, name.sym).isSome()
+			.None => false
+		}
+		if !ownClone &&
+			self.text(name.sym) == "clone" &&
+			self.plainClone(receiver, ty, name, item) is .Some(call) {
+			return .Some(call)
+		}
+		val .Some(owner) = self.ownerOf(ty) else {
+			return self.constrainedCall(receiver, ty, name, item)
+		}
+		// A `String` has the methods of the text it holds: where it has none
+		// of its own by that name, it lends its bytes for the call, as it does
+		// for an argument. Its own win, so nothing it declares is hidden.
+		if self.methodOf(owner, name.sym).isNone() &&
+			self.lendText(receiver, name.sym) is .Some(text) {
+			val textTy = self.tyOf(text)
+			val textOwner = self.ownerOf(textTy).unwrap()
+			return self.dispatch(text, textOwner, name, item)
+		}
+		return self.dispatch(receiver, owner, name, item)
+	}
+
+	/// The receiver, read as the text it holds, when it is a `String` and
+	/// `str` has the method it is asked for. What comes back borrows the
+	/// receiver, and lives as long as the call.
+	var fn lendText(receiver: ExprId, name: Symbol): Option<ExprId> = {
+		if self.methodOf(.Builtin(.Str), name).isNone() then return .None
+		return self.lendString(receiver)
+	}
+
+	/// The method of `owner` that `name` asks for, called on `receiver`.
+	var fn dispatch(
+		receiver: ExprId,
+		owner: TypeDef,
+		name: ast::Name,
+		item: ItemUse,
+	): Option<ExprId> = {
+		val ty = self.tyOf(receiver)
+		// A type's own method wins; otherwise what its interfaces give it,
+		// which must be one interface's.
+		var unmet: Option<Unmet> = .None
+		var found = self.methodOf(owner, name.sym)
+		val typesOwn = match found {
+			.Some(id) => !self.throughAnInterface(owner, id)
+			.None => false
+		}
+		if !typesOwn {
+			val (offered, missed) = self.offered(owner, ty, name.sym)
+			if distinctInterfaces(&offered) > 1 {
+				val subject = self.typeName(owner)
+				self.ambiguousMethod(&offered, &subject, name)
+				return .Some(self.giveUpItem(item))
+			}
+			if !missed.isEmpty() then unmet = .Some(missed[0].clone())
+			if found.isNone() && !offered.isEmpty() then found = .Some(offered[0].method)
+		}
+		val .Some(id) = found else {
+			return self.noMethod(owner, name, item, unmet)
+		}
+		// `destroy` runs where a value ends; a program that could call it
+		// could run it twice.
+		if self.program.dropMethod(self.underRefs(ty)) == .Some(id) {
+			val typeName = self.typeName(owner)
+			self.report(
+				Diagnostic::error(
+					DROP_RULES,
+					"`\(typeName)`'s `destroy` cannot be called",
+					name.span,
+					"a `destroy`",
+				).withNote("`destroy` runs where a value ends, and exactly once").withHelp(
+					"to end a value early, write `destroy(move value)`",
+				),
+			)
+			return .Some(self.giveUpItem(item))
+		}
+		val receiverKind = self.program.fns[id].receiver
+		val hasParams = !self.program.fns[id].params.isEmpty()
+		if receiverKind == .Some(.Static) {
+			val typeName = self.typeName(owner)
+			val method = String::of(self.text(name.sym))
+			self.report(
+				Diagnostic::error(
+					NOT_A_METHOD,
+					"`\(method)` takes no receiver",
+					name.span,
+					"a `static fn`",
+				).withNote(
+					"a `static fn` is a function of the type, not a method",
+				).withHelp("call it as `\(typeName)::\(method)(…)`"),
+			)
+			return .Some(self.giveUpItem(item))
+		}
+		val .Some(kind) = receiverKind else {
+			return .None
+		}
+		if !hasParams then return .None
+		if !self.methodIsVisible(id) {
+			val typeName = self.typeName(owner)
+			val method = String::of(self.text(name.sym))
+			self.report(
+				Diagnostic::error(
+					PRIVATE_ITEM,
+					"`\(method)` of `\(typeName)` is not exported",
+					name.span,
+					"not `pub`",
+				).withNote("a method is used outside its module only if it is `pub`"),
+			)
+		}
+		// A slice's methods take `&[T]`, which an array lends.
+		val asSlice = owner == .Builtin(.Slice)
+		val .Some(lent) = self.receiverExpr(receiver, kind, name, asSlice) else {
+			// Reported; the call is given up on, not looked for elsewhere.
+			return .Some(self.giveUpItem(item))
+		}
+		// A default body is the interface's own function, generic in the
+		// interface's types too; what they are here is what this type
+		// implements it with: `Count: Iterator<i64>` makes `T` an `i64`.
+		val interfaceArgs = self.defaultArgs(id, owner, ty)
+		var used = item
+		used.receiver = .Some(lent)
+		used.interfaceArgs = interfaceArgs
+		return .Some(self.call(id, used))
+	}
+
+	/// A call of a name the type has no method of: an extension whose
+	/// condition is not met, a field of function type, or a name that is
+	/// not there.
+	var fn noMethod(
+		owner: TypeDef,
+		name: ast::Name,
+		item: ItemUse,
+		unmet: Option<Unmet>,
+	): Option<ExprId> = {
+		// An extension of that name whose condition is not met.
+		if unmet is .Some(missed) {
+			val subject = self.typeName(owner)
+			self.unmetExtension(missed, &subject, name)
+			return .Some(self.giveUpItem(item))
+		}
+		// A field of function type can be called; any other name is a method
+		// that does not exist.
+		if self.fieldNamed(owner, name.sym) then return .None
+		// An interpolated literal appends each of its values through `Text`,
+		// so a type that does not implement it is reported here.
+		if name.sym == Symbol::appendTo() {
+			val typeName = self.typeName(owner)
+			self.report(
+				Diagnostic::error(
+					NOT_A_METHOD,
+					"no method `appendTo` on `\(typeName)`",
+					name.span,
+					"unknown method",
+				).withNote("a value written between `\\(` and `)` is appended by `Text`, which `\(typeName)` does not implement").withHelp("write `extend \(typeName): Text`, or build the text with `String` yourself"),
+			)
+			// The argument is the `String` being built, which nothing else
+			// would report on.
+			return .Some(self.giveUp(&noArgs(), item.span))
+		}
+		// A number written to a precision or in a radix, of a type that is not
+		// that number, is reported for what the option asks.
+		val written = Symbol::written()
+		if name.sym == written[2] || name.sym == written[3] {
+			val typeName = self.typeName(owner)
+			val (message, label, note) =
+				if name.sym == written[2] then
+					(
+						"a precision is a float's, and this is `\(typeName)`",
+						"not a float",
+						"a precision is how many digits a float is written with after its point: `\\(seconds, precision: 3)`",
+					)
+				else (
+					"a radix is an integer's, and this is `\(typeName)`",
+					"not an integer",
+					"a radix is the base an integer is written in: `\\(byte, radix: 16)`",
+				)
+			self.report(
+				Diagnostic::error(
+					INTERPOLATION_OPTION,
+					move message,
+					name.span,
+					String::of(label),
+				).withNote(String::of(note)),
+			)
+			return .Some(self.giveUpItem(item))
+		}
+		val typeName = self.typeName(owner)
+		val text = String::of(self.text(name.sym))
+		val names = self.memberNames(owner)
+		var diagnostic = Diagnostic::error(
+			NOT_A_METHOD,
+			"no method `\(text)` on `\(typeName)`",
+			name.span,
+			"unknown method",
+		)
+		if suggest(&text, &names) is .Some(similar) {
+			diagnostic = diagnostic.withFix(
+				"did you mean `\(similar)`?",
+				own [Edit::replace(name.span, String::of(similar))],
+			)
+		} else if !names.isEmpty() {
+			var quoted: Vec<String> = Vec()
+			for n in names {
+				quoted.push("`\(n)`")
+			}
+			diagnostic = diagnostic.withNote("`\(typeName)` has \(quoted.join(", "))")
+		}
+		self.report(move diagnostic)
+		return .Some(self.giveUpItem(item))
+	}
+
+	/// The interface's own type arguments for a call of its default method
+	/// `id` on a value of `ty`, whose type is `owner`; none for any other
+	/// method.
+	var fn defaultArgs(id: FnId, owner: TypeDef, ty: Ty): TyList = {
+		val .Some(interfaceId) = self.program.fns[id].interfaceId else {
+			return TyList::empty()
+		}
+		if self.program.fns[id].owner.isSome() then return TyList::empty()
+		var found: Option<i64> = .None
+		for (at, i) in self.program.impls.forwards().enumerate() {
+			if found.isNone() &&
+				i.interfaceId == interfaceId &&
+				i.ty == owner &&
+				i.methods.contains(&id) {
+				found = .Some(at)
+			}
+		}
+		if found.isNone() {
+			for (at, i) in self.program.impls.forwards().enumerate() {
+				if found.isNone() && i.interfaceId == interfaceId && i.ty == owner then
+					found = .Some(at)
+			}
+		}
+		val .Some(at) = found else {
+			return TyList::empty()
+		}
+		val written = self.program.types.list(self.program.impls[at].args).toVec()
+		// They are written in the type's own parameters, which are this
+		// value's type arguments: a slice's element is its one.
+		val ownArgs = self.ownerArgs(self.underRefs(ty))
+		var args: Vec<Ty> = Vec()
+		for arg in written {
+			args.push(self.program.types.subst(arg, &ownArgs))
+		}
+		return self.program.types.internList(&args)
+	}
+
+	/// `x.m(…)` through a `&dyn Interface`: the method is found in the table
+	/// the reference carries.
+	var fn dynMethodCall(
+		receiver: ExprId,
+		interfaceId: InterfaceId,
+		name: ast::Name,
+		item: ItemUse,
+	): Option<ExprId> = {
+		val methods = self.program.interfaces[interfaceId].methods.clone()
+		var found: Option<i64> = .None
+		for (at, m) in methods.forwards().enumerate() {
+			if found.isNone() && self.program.fns[m.id].name == name.sym then found = .Some(at)
+		}
+		val .Some(index) = found else {
+			val text = String::of(self.text(name.sym))
+			val interfaceName = String::of(self.text(self.program.interfaces[interfaceId].name))
+			self.report(
+				Diagnostic::error(
+					NOT_A_METHOD,
+					"no method `\(text)` on `dyn \(interfaceName)`",
+					name.span,
+					"unknown method",
+				).withNote("a `&dyn` gives the methods of its interface"),
+			)
+			return .Some(self.giveUpItem(item))
+		}
+		val method = methods[index].id
+		val args = item.args.unwrap()
+		val kind = self.program.fns[method].receiver.unwrap()
+		// The receiver is the reference itself: it already carries the table.
+		val .Some(lent) = self.dynReceiver(receiver, kind, name) else {
+			return .Some(self.giveUp(args, item.span))
+		}
+		val params = self.program.fns[method].params.clone()
+		var hirArgs = Vec::of(own [lent])
+		var checked: Vec<ExprId> = Vec()
+		// Checked as any call's arguments are: `&place` and `&var place` lend,
+		// where a parameter takes a reference.
+		for (i, arg) in args.forwards().enumerate() {
+			val value =
+				if i + 1 < params.len() then self.checkArgument(arg, params[i + 1].ty, .None)
+				else self.inferArgument(arg, .None)
+			checked.push(value)
+		}
+		if args.len() + 1 != params.len() {
+			val nameText = String::of(self.text(name.sym))
+			var slots: Vec<Slot> = Vec()
+			for i in 1..params.len() {
+				slots.push(Slot(
+					name: params[i].name,
+					ty: params[i].ty,
+					span: params[i].span,
+					default: params[i].default.clone(),
+				))
+			}
+			val names = item.argNames()
+			val matched = self.matchArguments(&slots, args, &names, "parameter", &nameText)
+			val sigSpan = self.program.fns[method].span
+			self.reportArgumentCount(&nameText, &slots, &matched, &names, sigSpan, item.span)
+		}
+		for c in checked {
+			hirArgs.push(c)
+		}
+		val ret = self.program.fns[method].ret
+		// The receiver is a pointer to a value whose type is not known here.
+		var paramTys = Vec::of(own [PTR_U8])
+		for i in 1..params.len() {
+			paramTys.push(params[i].ty)
+		}
+		val list = self.program.types.internList(&paramTys)
+		val fnTy = self.intern(.Fn(params: list, ret: ret))
+		return .Some(
+			self.alloc(
+				.DynCall(
+					interfaceId: interfaceId,
+					index: index as u32,
+					fnTy: fnTy,
+					args: move hirArgs,
+					order: Vec(),
+				),
+				ret,
+				item.span,
+			),
+		)
+	}
+
+	/// The receiver of a call through a `&dyn`: the reference itself, whose
+	/// kind must allow what the method does.
+	var fn dynReceiver(receiver: ExprId, kind: Receiver, name: ast::Name): Option<ExprId> = {
+		// A reference parameter is seen through where it is named; the
+		// reference itself carries the table.
+		val reference = match self.state.body.exprs[receiver].kind {
+			.Deref(inner) => inner
+			_ => receiver
+		}
+		val .Ref(kind: refKind, ..) = self.kind(self.tyOf(reference)) else {
+			return .None
+		}
+		if kind == .Var && refKind == .Shared {
+			val text = String::of(self.text(name.sym))
+			self.report(
+				Diagnostic::error(
+					CANNOT_BORROW_VAR,
+					"`\(text)` writes through its receiver",
+					name.span,
+					"a `var fn`",
+				).withNote("a `&dyn` reference only reads; `&var dyn` writes"),
+			)
+			return .None
+		}
+		return .Some(reference)
+	}
+
+	/// The constraints of a type parameter.
+	fn constraintsOf(param: TyParam): Vec<Constraint> = {
+		if param.index as i64 >= self.typeParams.len() then return Vec()
+		return self.typeParams[param.index as i64].interfaces.clone()
+	}
+
+	/// `x.m(…)` where `x` is a type parameter: the method of one of the
+	/// interfaces it is constrained by.
+	var fn constrainedCall(
+		receiver: ExprId,
+		ty: Ty,
+		name: ast::Name,
+		item: ItemUse,
+	): Option<ExprId> = {
+		val .Param(param) = self.kind(self.underRefs(ty)) else {
+			return .None
+		}
+		val constraints = self.constraintsOf(param)
+		val subject = self.underRefs(ty)
+		val (offered, missed) = self.offeredByConstraints(subject, &constraints, name.sym)
+		if distinctInterfaces(&offered) > 1 {
+			val paramName = String::of(self.text(param.name))
+			self.ambiguousMethod(&offered, &paramName, name)
+			return .Some(self.giveUpItem(item))
+		}
+		if offered.isEmpty() {
+			if constraints.isEmpty() then return .None
+			if !missed.isEmpty() {
+				val paramName = String::of(self.text(param.name))
+				self.unmetExtension(missed[0].clone(), &paramName, name)
+				return .Some(self.giveUpItem(item))
+			}
+			var names: Vec<String> = Vec()
+			for c in constraints {
+				names.push("`\(self.constraintName(c, self.underRefs(ty)))`")
+			}
+			val text = String::of(self.text(name.sym))
+			val paramName = String::of(self.text(param.name))
+			self.report(
+				Diagnostic::error(
+					NOT_A_METHOD,
+					"no method `\(text)` on `\(paramName)`",
+					name.span,
+					"unknown method",
+				).withNote("`\(paramName)` gives the methods of \(names.join(" and "))"),
+			)
+			return .Some(self.giveUpItem(item))
+		}
+		val found = offered[0].clone()
+		val kind = self.program.fns[found.method].receiver.unwrap()
+		val .Some(lent) = self.receiverExpr(receiver, kind, name, false) else {
+			return .Some(self.giveUpItem(item))
+		}
+		var used = item
+		used.receiver = .Some(lent)
+		// What the constraint says the interface's own types are.
+		used.interfaceArgs = found.args
+		return .Some(self.call(found.method, used))
+	}
+
+	/// Whether a type's method is one an interface gives it: a default, or
+	/// the method an implementation writes.
+	fn throughAnInterface(owner: TypeDef, id: FnId): bool = {
+		if self.program.fns[id].owner.isNone() then return true
+		for i in self.program.impls {
+			if i.ty == owner && i.methods.contains(&id) then return true
+		}
+		return false
+	}
+
+	/// `x.clone()` of plain data: the prelude's `Clone::clone`, which the
+	/// monomorphizer answers with a copy where the type has no
+	/// implementation of its own. Nothing where the value is not plain data.
+	var fn plainClone(receiver: ExprId, ty: Ty, name: ast::Name, item: ItemUse): Option<ExprId> = {
+		val held = self.underRefs(ty)
+		val interfaceId = self.program.preludeItems.interfaceOf(.Clone)?
+		completeType(&var self.program, held)
+		if self.isPoisoned(held) || !self.program.clonesByCopy(held) then return .None
+		var found: Option<FnId> = .None
+		for m in self.program.interfaces[interfaceId].methods {
+			if found.isNone() && self.program.fns[m.id].name == name.sym then found = .Some(m.id)
+		}
+		val method = found?
+		val kind = self.program.fns[method].receiver.unwrap()
+		val .Some(lent) = self.receiverExpr(receiver, kind, name, false) else {
+			return .Some(self.giveUpItem(item))
+		}
+		var used = item
+		used.receiver = .Some(lent)
+		return .Some(self.call(method, used))
+	}
+
+	/// Whether a method may be used here: its own module sees all of them,
+	/// another only what is `pub`.
+	fn methodIsVisible(id: FnId): bool =
+		self.program.fns[id].isPub || self.program.fns[id].module as i64 == self.current
+
+	/// The innermost `&` reference of a value that is a reference to a
+	/// reference: `&&T` read as the `&T` it holds.
+	var fn autoderefToRef(start: ExprId): ExprId = {
+		var id = start
+		while true {
+			val ty = self.state.body.exprs[id].ty
+			val .Ref(inner, kind: .Shared) = self.kind(ty) else {
+				return id
+			}
+			if !(self.kind(inner) is .Ref(kind: .Shared, ..)) then return id
+			val span = self.state.body.exprs[id].span
+			id = self.alloc(.Deref(id), inner, span)
+		}
+		return id
+	}
+
+	/// The receiver as the method takes it: `&self`, `&var self` or by value,
+	/// with the borrow or the move the call site does not write.
+	var fn receiverExpr(
+		receiver: ExprId,
+		kind: Receiver,
+		name: ast::Name,
+		asSlice: bool,
+	): Option<ExprId> = {
+		val start = self.tyOf(receiver)
+		val span = self.state.body.exprs[receiver].span
+		return match kind {
+			// A `lend fn` is declared as its two halves, and a call is to one of
+			// them.
+			.Lend => panic("a `lend fn` is declared as its reading and writing halves")
+			.Read | .Var => {
+				val refKind: RefKind = if kind == .Var then .Var else .Shared
+				// The method belongs to what the `own`s point to, as the
+				// `&own<T>` to `&T` coercion does for an argument.
+				var place = receiver
+				var ty = start
+				while self.kind(ty) is .Own(inner) {
+					place = self.alloc(.Deref(place), inner, span)
+					ty = inner
+				}
+				// An array lends a slice of all of it, which is what a slice's
+				// methods take.
+				if asSlice && self.kind(ty) is .Array(elem, ..) {
+					ty = self.intern(.Slice(elem))
+					place = self.alloc(.SubSlice(base: place, lo: .None, hi: .None), ty, span)
+				}
+				// A `&T` — a parameter, one kept in a variable, or one a call, a
+				// `?` or an element answers — is the reference the method takes:
+				// it is passed on, not lent again from what holds it. For a
+				// slice's method, so is a `&[T]`; a `&[T; N]` is lent as a slice
+				// first.
+				if refKind == .Shared &&
+					place == receiver &&
+					self.kind(ty) is .Ref(inner, kind: .Shared) &&
+					!(self.kind(inner) is .Own(..)) &&
+					(!asSlice || self.kind(inner) is .Slice(..)) {
+					return .Some(self.autoderefToRef(receiver))
+				}
+				// A value made where it is called is lent `&var` for the call,
+				// and ends with its statement: what the method changed in it goes
+				// with it.
+				if refKind == .Var && !self.madeHere(place) then
+					self.requireWritable(place, .Borrow)
+				val refTy = self.intern(.Ref(inner: ty, kind: refKind))
+				.Some(self.alloc(.Ref(place), refTy, span))
+			}
+			// A `move fn` takes the value itself; `own<T>` waits for a receiver
+			// of its own.
+			.Move => {
+				if self.kind(start) is .Own(..) {
+					val method = String::of(self.text(name.sym))
+					self.report(
+						Diagnostic::error(
+							NOT_A_METHOD,
+							"`\(method)` takes its receiver by value, and \(self.tyName(start)) is on the heap",
+							name.span,
+							"a `move fn`",
+						).withNote("a receiver of type `own<Self>` comes later"),
+					)
+					return .None
+				}
+				if self.state.body.isPlace(receiver) && self.owns(start) then
+					return .Some(self.alloc(.Move(receiver), start, span))
+				.Some(receiver)
+			}
+			.Static => .None
+		}
+	}
+
+	/// `T::name(…)`: a `static fn` of one of the interfaces a type parameter
+	/// is constrained by.
+	var fn constrainedStatic(
+		typeName: ast::Name,
+		member: ast::Name,
+		item: ItemUse,
+	): Option<ExprId> = {
+		val selfTy = self.typeParam(typeName.sym)?
+		val .Param(param) = self.kind(selfTy) else {
+			return .None
+		}
+		val constraints = self.constraintsOf(param)
+		var method: Option<FnId> = .None
+		for constraint in constraints {
+			if method.isSome() then break
+			for m in self.program.interfaces[constraint.interfaceId].methods {
+				if method.isNone() && self.program.fns[m.id].name == member.sym then
+					method = .Some(m.id)
+			}
+		}
+		if method is .Some(m) && item.args.isNone() {
+			val written = "\(self.text(typeName.sym))::\(self.text(member.sym))"
+			return .Some(self.functionNotAValue(m, &written, item.span))
+		}
+		val .Some(found) = method else {
+			val text = String::of(self.text(member.sym))
+			val paramName = String::of(self.text(param.name))
+			self.report(
+				Diagnostic::error(
+					NOT_A_METHOD,
+					"no function `\(text)` on `\(paramName)`",
+					member.span,
+					"unknown function",
+				).withNote(
+					"a type parameter gives the methods of the interfaces it is constrained by",
+				),
+			)
+			return .Some(self.giveUpItem(item))
+		}
+		if self.program.fns[found].receiver != .Some(.Static) {
+			val text = String::of(self.text(member.sym))
+			self.report(
+				Diagnostic::error(
+					NOT_A_METHOD,
+					"`\(text)` takes a receiver",
+					member.span,
+					"not a `static fn`",
+				).withNote("a method is called on a value: `x.name(…)`"),
+			)
+			return .Some(self.giveUpItem(item))
+		}
+		var used = item
+		used.selfTy = .Some(selfTy)
+		return .Some(self.call(found, used))
+	}
+
+	/// `Type::name` not called: the function's value, a method's receiver its
+	/// first parameter. Among several of the name — `Meters::from`, for two
+	/// interfaces — the expected type says which.
+	var fn typeFnValue(
+		candidates: &[FnId],
+		written: str,
+		member: ast::Name,
+		item: ItemUse,
+	): ExprId = {
+		// A `lend fn` is its two halves, and lends a place, which no value
+		// does: it is refused as any projection is.
+		for id in candidates {
+			if self.kind(self.program.fns[id].ret) is .Ref(..) then
+				return self.fnValue(candidates[0], item, .Some(written))
+		}
+		var id = candidates[0]
+		if candidates.len() != 1 {
+			var fits: Vec<FnId> = Vec()
+			for c in candidates {
+				if item.hint is .Some(hint) && self.valueFits(c, hint) then fits.push(c)
+			}
+			if fits.len() != 1 {
+				var interfaces: Vec<String> = Vec()
+				for c in candidates {
+					interfaces.push(self.implementedName(c))
+				}
+				self.report(
+					Diagnostic::error(
+						NOT_A_METHOD,
+						"`\(written)` is more than one function",
+						member.span,
+						"which one is not said",
+					).withNote("the type has one for each of \(interfaces.join(" and ")); the type of the value expected says which").withHelp("give the value a type, or write a lambda that calls `\(written)(…)`"),
+				)
+				return self.errorExpr(item.span)
+			}
+			id = fits[0]
+		}
+		if !self.methodIsVisible(id) then
+			self.report(
+				Diagnostic::error(
+					PRIVATE_ITEM,
+					"`\(written)` is not exported",
+					member.span,
+					"not `pub`",
+				).withNote("a function of a type is used outside its module only if it is `pub`"),
+			)
+		return self.fnValue(id, item, .Some(written))
+	}
+
+	/// Whether the function's type is the type expected of it, or the type a
+	/// closure lent or owned would be made from.
+	fn valueFits(id: FnId, hint: Ty): bool = {
+		val def = &self.program.fns[id]
+		val wanted = match self.kind(hint) {
+			.Ref(inner, ..) | .Own(inner) => inner
+			_ => hint
+		}
+		val .Fn(params: wantedParams, ret: wantedRet) = self.kind(wanted) else {
+			return false
+		}
+		val wantedList = self.program.types.list(wantedParams)
+		if def.params.len() != wantedList.len() then return false
+		for i in 0..def.params.len() {
+			if def.params[i].ty != wantedList[i] then return false
+		}
+		return def.ret == wantedRet
+	}
+
+	/// `T::name` written where it is not called: a function a type
+	/// parameter's constraint answers is not a value yet.
+	var fn functionNotAValue(id: FnId, written: str, span: Span): ExprId = {
+		// The lambda that stands in for it takes what it takes, by the names
+		// it gives them.
+		var parts: Vec<str> = Vec()
+		for p in self.program.fns[id].params {
+			parts.push(self.text(p.name))
+		}
+		val names = parts.join(", ")
+		self.report(
+			Diagnostic::error(
+				NOT_A_METHOD,
+				"`\(written)` is a function of a type parameter, and is not a value",
+				span,
+				"not called",
+			).withNote(
+				"what a type parameter's constraint answers is not a value yet: it can only be called",
+			).
+				withHelp("to call it, write `\(written)(…)`").
+				withHelp("where a function is wanted, a lambda can call it: `(\(names)) => \(written)(\(names))`"),
+		)
+		return self.errorExpr(span)
+	}
+
+	/// `Type::name(…)`: a function of the type, with no receiver.
+	var fn staticFn(
+		module: i64,
+		typeName: ast::Name,
+		member: ast::Name,
+		given: ItemUse,
+	): Option<ExprId> = {
+		// `type Grid = Map<Id, Cell>`: a `static fn` of the type the alias
+		// names, whose parameters the alias decides.
+		var item = given
+		var ownerFromAlias: Option<TypeDef> = .None
+		if !self.modules[module].types.contains(&typeName.sym) &&
+			self.modules[module].aliases.contains(&typeName.sym) {
+			val args: Vec<ast::TypeId> = match item.typeArgs {
+				.Some(written) => written.args.clone()
+				.None => Vec()
+			}
+			val ty = self.aliasTypeOf(module, typeName.sym, &args, typeName.span)?
+			// The arguments belong to the alias, not to the function.
+			item.typeArgs = .None
+			item.ownerTy = .Some(ty)
+			ownerFromAlias = match self.kind(ty) {
+				.Struct(id, ..) => .Some(.Struct(id))
+				.Enum(id, ..) => .Some(.Enum(id))
+				_ => {
+					val text = String::of(self.text(typeName.sym))
+					val named = self.tyName(ty)
+					self.report(
+						Diagnostic::error(
+							NOT_A_METHOD,
+							"`\(text)` names \(named), which has no functions of its own",
+							typeName.span,
+							"not a struct or an enum",
+						).withNote(
+							"an alias stands for the type it names, and a `static fn` belongs to a type a program declares",
+						),
+					)
+					return .Some(self.giveUpItem(item))
+				}
+			}
+		}
+		// A type of the prelude, where the path named this module.
+		val owner: TypeDef = match ownerFromAlias {
+			.Some(o) => o
+			.None => match self.modules[module].types.get(&typeName.sym) {
+				.Some((o, _)) => o
+				// A built-in type the prelude gave a `static fn` — `Slots<T>`, and
+				// whatever else it comes to have.
+				.None if self.text(typeName.sym) == "Slots" => .Builtin(.Slots)
+				.None if module == self.current => match self.preludeType(typeName.sym) {
+					.Some(o) => o
+					.None => {
+						val ty = self.builtin(typeName.sym)?
+						val builtin = BuiltinOwner::of(self.kind(ty))?
+						if !self.program.builtins.contains(&builtin) then return .None
+						.Builtin(builtin)
+					}
+				}
+				.None => return .None
+			}
+		}
+		// `Ball` in `Ball::new()` names the type; through an alias, the alias
+		// is what is written.
+		if ownerFromAlias.isNone() then self.program.names.push((typeName.span, .Owner(owner)))
+		val candidates = self.methodsNamed(owner, member.sym)
+		// Not called, it is the function itself, a method's receiver its first
+		// parameter.
+		if !candidates.isEmpty() && item.args.isNone() {
+			val written = "\(self.text(typeName.sym))::\(self.text(member.sym))"
+			return .Some(self.typeFnValue(&candidates, &written, member, item))
+		}
+		val id = match candidates.len() {
+			0 => return .None
+			1 => candidates[0]
+			// `Meters::from(x)`, where the type implements `From` more than
+			// once: the argument says which.
+			_ => match self.overload(owner, &candidates, member, &item) {
+				.Some(id) => id
+				// Reported there; a call that fits no implementation is not
+				// something else.
+				.None => return .Some(self.giveUpItem(item))
+			}
+		}
+		if self.program.fns[id].receiver != .Some(.Static) {
+			val ownerName = self.typeName(owner)
+			val method = String::of(self.text(member.sym))
+			self.report(
+				Diagnostic::error(
+					NOT_A_METHOD,
+					"`\(method)` is a method of `\(ownerName)`, and takes a receiver",
+					member.span,
+					"not a `static fn`",
+				).withNote("a method is called on a value: `x.name(…)`"),
+			)
+			return .Some(self.giveUpItem(item))
+		}
+		if !self.methodIsVisible(id) {
+			val ownerName = self.typeName(owner)
+			val method = String::of(self.text(member.sym))
+			self.report(
+				Diagnostic::error(
+					PRIVATE_ITEM,
+					"`\(method)` of `\(ownerName)` is not exported",
+					member.span,
+					"not `pub`",
+				).withNote("a static function is used outside its module only if it is `pub`"),
+			)
+		}
+		return .Some(self.call(id, item))
+	}
+
+	/// Whether the type has a field of this name; a variant is not one.
+	fn fieldNamed(owner: TypeDef, name: Symbol): bool = match owner {
+		.Struct(id) => {
+			for f in self.program.structs[id].fields {
+				if f.name == name then return true
+			}
+			false
+		}
+		.Builtin(_) | .Enum(_) => false
+	}
+
+	/// The names of a type's methods and static functions, for a suggestion.
+	fn memberNames(owner: TypeDef): Vec<str> = {
+		// A static function is not a method: it is called through the type
+		// rather than through a value. A lending pair is one name, and is
+		// named once.
+		var names: Vec<str> = Vec()
+		for id in self.declaredMethods(owner) {
+			if self.program.fns[id].receiver is .None | .Some(.Static) then continue
+			// What could not be called here is not offered.
+			if !self.methodIsVisible(id) then continue
+			val name = self.text(self.program.fns[id].name)
+			if !names.contains(&name) then names.push(name)
+		}
+		return move names
+	}
+
+	/// The name of a type, for messages.
+	fn typeName(owner: TypeDef): String = match owner {
+		.Struct(id) => self.program.declaredName(
+			self.program.structs[id].name,
+			self.program.structs[id].module,
+			self.interner,
+		)
+		.Enum(id) => self.program.declaredName(
+			self.program.enums[id].name,
+			self.program.enums[id].module,
+			self.interner,
+		)
+		.Builtin(builtin) => builtin.text()
+	}
+}

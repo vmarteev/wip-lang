@@ -1,0 +1,796 @@
+// Types, interned: two `Ty`s are equal exactly when the types are equal.
+
+import std::collections::{Map}
+import syntax::{Symbol}
+
+/// An interned type.
+@derive(Eq, Hash, Clone, Text)
+pub struct Ty {
+	number: u32
+}
+
+/// An interned list of types: the type arguments of a generic struct, enum
+/// or function.
+@derive(Eq, Hash, Clone, Text)
+pub struct TyList {
+	number: u32
+}
+
+extend Ty {
+	/// The type interned `index`th.
+	pub static fn nth(index: i64): Ty = Ty(number: index as u32)
+
+	/// Where it was interned: 0 for the first.
+	pub fn index(): i64 = self.number as i64
+}
+
+extend TyList {
+	/// No type arguments: every type that is not generic.
+	pub static fn empty(): TyList = TyList(number: 0)
+
+	pub fn index(): i64 = self.number as i64
+}
+
+/// A type parameter of the generic item it is written in.
+@derive(Eq, Hash, Clone)
+pub struct TyParam {
+	/// Its position in the item's list of type parameters.
+	pub index: u32
+	pub name: Symbol
+	/// Declared `T: copy`: it owns no memory.
+	pub copy: bool
+}
+
+@derive(Eq, Hash, Clone)
+pub enum TyKind {
+	/// The type of an expression that already produced an error. It is
+	/// compatible with everything, so one mistake does not cause more errors.
+	Error
+	/// The type of an expression that never produces a value, such as a
+	/// `match` whose arms all return.
+	Never
+	/// `void`: what a function without a return type returns.
+	Unit
+	Int(int: IntTy)
+	Float(float: FloatTy)
+	Bool
+	/// A Unicode scalar value: a number from 0 to 10FFFF that is not a
+	/// surrogate, in 32 bits.
+	Char
+	/// A pointer and a length.
+	Str
+	/// A pointer to NUL-terminated bytes, for C.
+	Cstring
+	/// A struct, with its type arguments if it is generic.
+	Struct(id: StructId, args: TyList)
+	Enum(id: EnumId, args: TyList)
+	/// A type parameter, inside the generic item that declares it.
+	Param(param: TyParam)
+	/// `(a: A, b: B) => R`: the address of a function that takes the types in
+	/// the list and returns the second type, `void` if nothing. Parameter
+	/// names are not part of the type.
+	Fn(params: TyList, ret: Ty)
+	Own(inner: Ty)
+	Ref(inner: Ty, kind: RefKind)
+	Array(elem: Ty, len: u64)
+	/// `[T]`: elements of a number known only at run time. Only behind a
+	/// reference.
+	Slice(elem: Ty)
+	/// `dyn Interface`: a value of some type that implements it, known only
+	/// behind a reference, as a pointer and a table of methods.
+	Dyn(interfaceId: InterfaceId, args: TyList)
+	/// `ptr<T>`: a C pointer. It may be null, it is copied like an integer,
+	/// it is never dropped, and the move checker leaves it alone — which is
+	/// why it can be held in a variable or a field, where a reference cannot.
+	Ptr(inner: Ty)
+	/// A C type whose contents Wip does not know, declared `type name` in an
+	/// extern block. No value of one exists: it is only ever used as
+	/// `ptr<name>`.
+	Opaque(id: OpaqueId)
+	/// `Slots<T>`: a block of slots, none of them initialized — the one value
+	/// in Wip whose contents may be nothing at all. Only the prelude may name
+	/// it, and `Vec<T>` is what it is for.
+	Slots(inner: Ty)
+	/// `I::Item`: the type an implementation of the interface decides, its
+	/// parameter at the index, for a type that is a parameter still. Once the
+	/// type is known it is what that type's implementation says, which
+	/// interning it answers; a known type never stands in one.
+	Assoc(base: Ty, interfaceId: InterfaceId, index: u32)
+}
+
+/// What one implementation of an interface with decided types decides: for
+/// a type of the pattern's shape, with the pattern's parameters bound to its
+/// parts, the interface's arguments.
+@derive(Clone)
+struct Decided {
+	interfaceId: InterfaceId
+	pattern: Ty
+	args: TyList
+}
+
+/// The integer types.
+@derive(Eq, Hash, Clone)
+pub enum IntTy {
+	I8
+	I16
+	I32
+	I64
+	I128
+	Isize
+	U8
+	U16
+	U32
+	U64
+	U128
+	Usize
+}
+
+extend IntTy {
+	pub fn signed(): bool = self is .I8 | .I16 | .I32 | .I64 | .I128 | .Isize
+
+	/// The width in bits. `isize` and `usize` are 64 bits wide: the compiler
+	/// targets 64-bit platforms only.
+	pub fn bits(): u32 = match self {
+		.I8 | .U8 => 8
+		.I16 | .U16 => 16
+		.I32 | .U32 => 32
+		.I64 | .U64 | .Isize | .Usize => 64
+		.I128 | .U128 => 128
+	}
+
+	pub fn name(): str = match self {
+		.I8 => "i8"
+		.I16 => "i16"
+		.I32 => "i32"
+		.I64 => "i64"
+		.I128 => "i128"
+		.Isize => "isize"
+		.U8 => "u8"
+		.U16 => "u16"
+		.U32 => "u32"
+		.U64 => "u64"
+		.U128 => "u128"
+		.Usize => "usize"
+	}
+
+	/// The bits of the type's width set.
+	pub fn mask(): u128 =
+		if self.bits() == 128 then 0xFFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF
+		else (1 << self.bits()) - 1
+
+	/// The largest value.
+	pub fn max(): u128 = if self.signed() then self.mask() >> 1 else self.mask()
+
+	/// The magnitude of the smallest value: 0 for an unsigned type.
+	pub fn minMagnitude(): u128 = if self.signed() then 1 << (self.bits() - 1) else 0
+}
+
+@derive(Eq, Hash, Clone)
+pub enum FloatTy {
+	F32
+	F64
+}
+
+/// What a reference allows.
+@derive(Eq, Hash, Clone)
+pub enum RefKind {
+	/// `&T`: reads.
+	Shared
+	/// `&var T`: reads and writes, and excludes every other reference to the
+	/// same place.
+	Var
+}
+
+/// What a type contains, anywhere inside it.
+@derive(Clone)
+struct Facts {
+	/// A type parameter.
+	generic: bool
+	/// The error type.
+	error: bool
+	reference: bool
+	/// How deeply its parts nest: 1 for a type without parts.
+	depth: u32
+}
+
+/// A pin of the body being checked: the decided type at `index` of
+/// `interfaceId` for `base` is `pinned`.
+@derive(Clone)
+pub struct Pin {
+	pub base: Ty
+	pub interfaceId: InterfaceId
+	pub index: u32
+	pub pinned: Ty
+}
+
+/// The type interner. Interning order is deterministic, so `Ty` values are
+/// stable for a given program.
+@derive(Clone)
+pub struct Types {
+	kinds: Vec<TyKind>
+	numbers: Map<TyKind, u32>
+	/// What each type contains, recorded when it is interned, so that no
+	/// question about a type's parts walks them: a type can share parts many
+	/// times over, as `Pair<Pair<T, T>, Pair<T, T>>` does.
+	facts: Vec<Facts>
+	lists: Vec<Vec<Ty>>
+	listNumbers: Map<Vec<Ty>, u32>
+	/// What each implementation of an interface with decided types decides,
+	/// in the order they were made.
+	decided: Vec<Decided>
+	/// In the body being checked, the decided types its constraints pin:
+	/// `I::Item` is `T` under `I: Iterator<T>`.
+	pins: Vec<Pin>
+	/// What was interned, a type or a list, in the order it was: what
+	/// `absorb` replays.
+	log: Vec<Interned>
+}
+
+/// One entry of the log of what was interned.
+@derive(Eq, Clone)
+enum Interned {
+	Ty
+	List
+}
+
+/// How many types and lists an interner had, where a copy of it started.
+@derive(Clone)
+struct Mark {
+	types: i64
+	lists: i64
+	log: i64
+	decided: i64
+}
+
+/// Where the types of one interner are in another, as `absorb` found them.
+struct TyMap {
+	/// Types below this are the same in both.
+	start: i64
+	added: Vec<Ty>
+	/// Lists below this are the same in both.
+	listStart: i64
+	lists: Vec<TyList>
+}
+
+extend TyMap {
+	fn get(ty: Ty): Ty = if ty.index() < self.start then ty else self.added[ty.index() - self.start]
+
+	fn getList(list: TyList): TyList =
+		if list.index() < self.listStart then list else self.lists[list.index() - self.listStart]
+
+	/// Whether every type and list keeps its number, so nothing needs
+	/// renumbering.
+	fn isIdentity(): bool = {
+		for (i, ty) in self.added.forwards().enumerate() {
+			if ty.index() != self.start + i then return false
+		}
+		for (i, list) in self.lists.forwards().enumerate() {
+			if list.index() != self.listStart + i then return false
+		}
+		return true
+	}
+}
+
+pub val ERROR: Ty = Ty(number: 0)
+pub val NEVER: Ty = Ty(number: 1)
+pub val UNIT: Ty = Ty(number: 2)
+pub val I64: Ty = Ty(number: 3)
+pub val F64: Ty = Ty(number: 4)
+pub val BOOL: Ty = Ty(number: 5)
+pub val STR: Ty = Ty(number: 6)
+pub val I32: Ty = Ty(number: 7)
+pub val I8: Ty = Ty(number: 8)
+pub val I16: Ty = Ty(number: 9)
+pub val I128: Ty = Ty(number: 10)
+pub val ISIZE: Ty = Ty(number: 11)
+pub val U8: Ty = Ty(number: 12)
+pub val U16: Ty = Ty(number: 13)
+pub val U32: Ty = Ty(number: 14)
+pub val U64: Ty = Ty(number: 15)
+pub val U128: Ty = Ty(number: 16)
+pub val USIZE: Ty = Ty(number: 17)
+pub val F32: Ty = Ty(number: 18)
+pub val CSTRING: Ty = Ty(number: 19)
+/// A Unicode scalar value.
+pub val CHAR: Ty = Ty(number: 20)
+/// An address, where MIR holds one whose pointee it does not name: a
+/// `&dyn`'s receiver, a closure's captures, a table of methods.
+pub val PTR_U8: Ty = Ty(number: 21)
+
+extend Types {
+	pub static fn new(): Types = {
+		var types = Types(
+			kinds: Vec(),
+			numbers: Map(),
+			facts: Vec(),
+			lists: Vec(),
+			listNumbers: Map(),
+			decided: Vec(),
+			pins: Vec(),
+			log: Vec(),
+		)
+		types.lists.push(Vec())
+		types.listNumbers.put(Vec(), 0)
+		val builtins: [(TyKind, Ty); 22] = [
+			(.Error, ERROR),
+			(.Never, NEVER),
+			(.Unit, UNIT),
+			(.Int(.I64), I64),
+			(.Float(.F64), F64),
+			(.Bool, BOOL),
+			(.Str, STR),
+			(.Int(.I32), I32),
+			(.Int(.I8), I8),
+			(.Int(.I16), I16),
+			(.Int(.I128), I128),
+			(.Int(.Isize), ISIZE),
+			(.Int(.U8), U8),
+			(.Int(.U16), U16),
+			(.Int(.U32), U32),
+			(.Int(.U64), U64),
+			(.Int(.U128), U128),
+			(.Int(.Usize), USIZE),
+			(.Float(.F32), F32),
+			(.Cstring, CSTRING),
+			(.Char, CHAR),
+			(.Ptr(U8), PTR_U8),
+		]
+		for (kind, expected) in builtins {
+			assert(types.intern(kind) == expected)
+		}
+		return move types
+	}
+
+	pub var fn intern(kind: TyKind): Ty = {
+		if self.numbers.get(&kind) is .Some(number) then return Ty(number: number)
+		val index = self.kinds.len()
+		self.kinds.push(kind.clone())
+		self.numbers.put(kind.clone(), index as u32)
+		self.log.push(.Ty)
+		val parts: Vec<Ty> = match kind {
+			.Own(inner: t) | .Ref(inner: t, ..) | .Array(elem: t, ..) | .Slice(elem: t)
+			| .Ptr(inner: t) | .Slots(inner: t) | .Assoc(base: t, ..) => Vec::of(own [t])
+			.Struct(args, ..) | .Enum(args, ..) => self.list(args).toVec()
+			.Fn(params, ret) => {
+				var parts = self.list(params).toVec()
+				parts.push(ret)
+				move parts
+			}
+			_ => Vec()
+		}
+		var facts = Facts(
+			generic: kind is .Param(..),
+			error: kind == .Error,
+			reference: kind is .Ref(..),
+			depth: 1,
+		)
+		for part in parts {
+			val of = self.facts[part.index()].clone()
+			facts.generic = facts.generic || of.generic
+			facts.error = facts.error || of.error
+			// A function's parameters may be references, but its address
+			// holds none.
+			facts.reference = facts.reference || (of.reference && !(kind is .Fn(..)))
+			if of.depth + 1 > facts.depth then facts.depth = of.depth + 1
+		}
+		self.facts.push(facts)
+		// A buffer's elements are dropped where they lie by a function that
+		// takes a pointer to one, `own<T>`, and so is any struct, enum or
+		// array in a debug build; so that type is there when code is
+		// generated, after which nothing is interned.
+		if kind is .Own(inner) && self.kind(inner) is .Slice(elem) then self.intern(.Own(elem))
+		if kind is .Struct(..) | .Enum(..) | .Array(..) && !self.facts[index].generic then
+			self.intern(.Own(Ty(number: index as u32)))
+		return Ty(number: index as u32)
+	}
+
+	pub var fn internList(tys: &[Ty]): TyList = {
+		val key = tys.toVec()
+		if self.listNumbers.get(&key) is .Some(number) then return TyList(number: number)
+		val number = self.lists.len() as u32
+		self.log.push(.List)
+		self.lists.push(key.clone())
+		self.listNumbers.put(move key, number)
+		return TyList(number: number)
+	}
+
+	pub fn list(list: TyList): &[Ty] = lend self.lists[list.index()].items()
+
+	/// Where interning has got to, for `absorb`.
+	fn mark(): Mark = Mark(
+		types: self.kinds.len(),
+		lists: self.lists.len(),
+		log: self.log.len(),
+		decided: self.decided.len(),
+	)
+
+	/// Interns the types `other` added after `mark`, before which the two
+	/// interners are the same, and answers where each of `other`'s types is
+	/// here. A type is interned after the types inside it, so each of those
+	/// is already in the map when it is needed.
+	var fn absorb(other: &Types, mark: &Mark): TyMap = {
+		var map = TyMap(start: mark.types, added: Vec(), listStart: mark.lists, lists: Vec())
+		var nextTy = mark.types
+		var nextList = mark.lists
+		for at in mark.log..other.log.len() {
+			if other.log[at] == .Ty {
+				val kind: TyKind = match other.kinds[nextTy] {
+					.Own(inner) => .Own(map.get(inner))
+					.Ref(inner, kind) => .Ref(inner: map.get(inner), kind: kind)
+					.Array(elem, len) => .Array(elem: map.get(elem), len: len)
+					.Slice(elem) => .Slice(map.get(elem))
+					.Ptr(inner) => .Ptr(map.get(inner))
+					.Slots(inner) => .Slots(map.get(inner))
+					.Assoc(base, interfaceId, index) => .Assoc(
+						base: map.get(base),
+						interfaceId: interfaceId,
+						index: index,
+					)
+					.Struct(id, args) => .Struct(id: id, args: map.getList(args))
+					.Enum(id, args) => .Enum(id: id, args: map.getList(args))
+					.Fn(params, ret) => .Fn(params: map.getList(params), ret: map.get(ret))
+					kind => kind.clone()
+				}
+				val ty = self.intern(move kind)
+				map.added.push(ty)
+				nextTy += 1
+			} else {
+				var tys: Vec<Ty> = Vec()
+				for t in other.lists[nextList] {
+					tys.push(map.get(t))
+				}
+				map.lists.push(self.internList(&tys.items()))
+				nextList += 1
+			}
+		}
+		// What the other's implementations decided, a generator's among
+		// them, made while its bodies were checked.
+		for at in mark.decided..other.decided.len() {
+			val rule = &other.decided[at]
+			self.decided.push(Decided(
+				interfaceId: rule.interfaceId,
+				pattern: map.get(rule.pattern),
+				args: map.getList(rule.args),
+			))
+		}
+		return move map
+	}
+
+	/// Whether `ty`, or any type inside it, has a kind that `test` accepts:
+	/// through `own`, references, arrays, slices, and type arguments.
+	pub fn any(ty: Ty, test: &(kind: TyKind) => bool): bool = {
+		val kind = self.kind(ty)
+		if test(kind.clone()) then return true
+		return match kind {
+			.Own(inner: t) | .Ref(inner: t, ..) | .Array(elem: t, ..) | .Slice(elem: t)
+			| .Assoc(base: t, ..) => self.any(t, test)
+			.Struct(args, ..) | .Enum(args, ..) => {
+				for t in self.list(args) {
+					if self.any(t, test) then return true
+				}
+				false
+			}
+			.Fn(params, ret) => {
+				for t in self.list(params) {
+					if self.any(t, test) then return true
+				}
+				self.any(ret, test)
+			}
+			_ => false
+		}
+	}
+
+	/// Whether `ty` contains a type parameter, so that it stands for
+	/// different types in different instances.
+	pub fn isGeneric(ty: Ty): bool = self.facts[ty.index()].generic
+
+	/// Whether `ty` contains the error type.
+	pub fn hasError(ty: Ty): bool = self.facts[ty.index()].error
+
+	/// Whether `ty` contains a reference.
+	pub fn containsRef(ty: Ty): bool = self.facts[ty.index()].reference
+
+	/// How deeply the parts of `ty` nest: 1 for a type without parts.
+	pub fn depth(ty: Ty): u32 = self.facts[ty.index()].depth
+
+	/// `ty` with each type parameter replaced by its argument in `args`.
+	pub var fn subst(ty: Ty, args: &[Ty]): Ty = {
+		if !self.isGeneric(ty) then return ty
+		val kind: TyKind = match self.kind(ty) {
+			.Param(param: p) => return args[p.index as i64]
+			.Own(inner: t) => .Own(self.subst(t, &args))
+			.Ref(inner: t, kind: k) => .Ref(inner: self.subst(t, &args), kind: k)
+			.Array(elem: t, len: n) => .Array(elem: self.subst(t, &args), len: n)
+			.Slice(elem: t) => .Slice(self.subst(t, &args))
+			.Ptr(inner: t) => .Ptr(self.subst(t, &args))
+			.Slots(inner: t) => .Slots(self.subst(t, &args))
+			.Assoc(base: t, interfaceId, index) => {
+				val base = self.subst(t, &args)
+				return self.assoc(base, interfaceId, index)
+			}
+			.Struct(id, args: list) => .Struct(id: id, args: self.substList(list, &args))
+			.Enum(id, args: list) => .Enum(id: id, args: self.substList(list, &args))
+			.Fn(params, ret) => {
+				val substituted = self.substList(params, &args)
+				.Fn(params: substituted, ret: self.subst(ret, &args))
+			}
+			_ => panic("only types with parts can contain a type parameter")
+		}
+		return self.intern(kind)
+	}
+
+	/// `ty` with the type parameter named `name` replaced by `with`, and
+	/// every other left as it is: a constraint's arguments about the
+	/// parameter it constrains, where that parameter's argument is known and
+	/// the item's others are not.
+	pub var fn replaceParam(ty: Ty, name: Symbol, with: Ty): Ty = {
+		if !self.isGeneric(ty) then return ty
+		val kind: TyKind = match self.kind(ty) {
+			.Param(param: p) if p.name == name => return with
+			.Param(..) => return ty
+			.Own(inner: t) => .Own(self.replaceParam(t, name, with))
+			.Ref(inner: t, kind: k) => .Ref(inner: self.replaceParam(t, name, with), kind: k)
+			.Array(elem: t, len: n) => .Array(elem: self.replaceParam(t, name, with), len: n)
+			.Slice(elem: t) => .Slice(self.replaceParam(t, name, with))
+			.Ptr(inner: t) => .Ptr(self.replaceParam(t, name, with))
+			.Slots(inner: t) => .Slots(self.replaceParam(t, name, with))
+			.Assoc(base: t, interfaceId, index) => {
+				val base = self.replaceParam(t, name, with)
+				return self.assoc(base, interfaceId, index)
+			}
+			.Struct(id, args: list) => .Struct(id: id, args: self.replaceInList(list, name, with))
+			.Enum(id, args: list) => .Enum(id: id, args: self.replaceInList(list, name, with))
+			.Fn(params, ret) => {
+				val replaced = self.replaceInList(params, name, with)
+				.Fn(params: replaced, ret: self.replaceParam(ret, name, with))
+			}
+			_ => panic("only types with parts can contain a type parameter")
+		}
+		return self.intern(kind)
+	}
+
+	/// `replaceParam` over each type of a list.
+	var fn replaceInList(list: TyList, name: Symbol, with: Ty): TyList = {
+		val tys = self.list(list).toVec()
+		var replaced: Vec<Ty> = Vec()
+		for t in tys {
+			replaced.push(self.replaceParam(t, name, with))
+		}
+		return self.internList(&replaced)
+	}
+
+	pub var fn substList(list: TyList, args: &[Ty]): TyList = {
+		val tys = self.list(list).toVec()
+		var substituted: Vec<Ty> = Vec()
+		for t in tys {
+			substituted.push(self.subst(t, &args))
+		}
+		return self.internList(&substituted)
+	}
+
+	/// Like `subst`, for phases that share the types read-only: the type
+	/// must have been interned already. Every field type of every interned
+	/// instance is.
+	pub fn substFind(ty: Ty, args: &[Ty]): Ty = match self.trySubstFind(ty, &args) {
+		.Some(found) => found
+		.None => panic("the substituted type was interned while checking")
+	}
+
+	/// `substFind`, answering nothing where the substituted type was never
+	/// interned.
+	pub fn trySubstFind(ty: Ty, args: &[Ty]): Option<Ty> = {
+		if !self.isGeneric(ty) then return .Some(ty)
+		val kind: TyKind = match self.kind(ty) {
+			// A parameter the arguments do not reach is not a type this can
+			// find: the answer is nothing rather than a panic.
+			.Param(param: p) => return if (p.index as i64) < args.len() then
+				.Some(args[p.index as i64])
+			else .None
+			.Own(inner: t) => .Own(self.trySubstFind(t, &args)?)
+			.Ref(inner: t, kind: k) => .Ref(inner: self.trySubstFind(t, &args)?, kind: k)
+			.Array(elem: t, len: n) => .Array(elem: self.trySubstFind(t, &args)?, len: n)
+			.Slice(elem: t) => .Slice(self.trySubstFind(t, &args)?)
+			.Ptr(inner: t) => .Ptr(self.trySubstFind(t, &args)?)
+			.Slots(inner: t) => .Slots(self.trySubstFind(t, &args)?)
+			.Assoc(base: t, interfaceId, index) => {
+				val base = self.trySubstFind(t, &args)?
+				return self.findAssoc(base, interfaceId, index)
+			}
+			.Struct(id, args: list) => .Struct(id: id, args: self.substListFind(list, &args)?)
+			.Enum(id, args: list) => .Enum(id: id, args: self.substListFind(list, &args)?)
+			.Fn(params, ret) => .Fn(
+				params: self.substListFind(params, &args)?,
+				ret: self.trySubstFind(ret, &args)?,
+			)
+			_ => panic("only types with parts can contain a type parameter")
+		}
+		return self.find(kind)
+	}
+
+	fn substListFind(list: TyList, args: &[Ty]): Option<TyList> = {
+		var tys: Vec<Ty> = Vec()
+		for t in self.list(list) {
+			tys.push(self.trySubstFind(t, &args)?)
+		}
+		return self.findList(&tys)
+	}
+
+	/// The type of `kind`, if it has been interned. Once type checking is
+	/// done the program is shared read-only, so later phases look types up
+	/// rather than interning new ones.
+	pub fn find(kind: TyKind): Option<Ty> = match self.numbers.get(&kind) {
+		.Some(number) => .Some(Ty(number: number))
+		.None => .None
+	}
+
+	/// The list of `tys`, if it has been interned, for the same reason as
+	/// `find`.
+	pub fn findList(tys: &[Ty]): Option<TyList> = {
+		val key = tys.toVec()
+		return match self.listNumbers.get(&key) {
+			.Some(number) => .Some(TyList(number: number))
+			.None => .None
+		}
+	}
+
+	/// How many types have been interned.
+	pub fn len(): i64 = self.kinds.len()
+
+	/// Records what an implementation of an interface with decided types
+	/// decides: for `pattern`, the implementing type with its parameters,
+	/// the interface's `args`.
+	pub var fn addDecided(interfaceId: InterfaceId, pattern: Ty, args: TyList) = {
+		self.decided.push(Decided(interfaceId: interfaceId, pattern: pattern, args: args))
+	}
+
+	/// `base::Item`, the interface's parameter at `index` for `base`: what
+	/// the implementation for `base` decides, where `base` is known and has
+	/// one, and the type that stands for it otherwise.
+	pub var fn assoc(base: Ty, interfaceId: InterfaceId, index: u32): Ty = {
+		for pin in self.pins {
+			if pin.base == base && pin.interfaceId == interfaceId && pin.index == index then
+				return pin.pinned
+		}
+		if self.hasShape(base) {
+			for i in 0..self.decided.len() {
+				if self.decided[i].interfaceId != interfaceId then continue
+				val pattern = self.decided[i].pattern
+				val args = self.decided[i].args
+				var bound: Vec<Option<Ty>> = Vec()
+				if self.bind(pattern, base, &var bound) {
+					val arg = self.list(args)[index as i64]
+					var given: Vec<Ty> = Vec()
+					for t in bound {
+						given.push(t.unwrapOr(ERROR))
+					}
+					return self.subst(arg, &given)
+				}
+			}
+		}
+		return self.intern(.Assoc(base: base, interfaceId: interfaceId, index: index))
+	}
+
+	/// The decided types the body being checked pins, in place of the last
+	/// body's.
+	pub var fn setPins(pins: Vec<Pin>) = {
+		self.pins = move pins
+	}
+
+	/// Whether an implementation's rule can be matched against `ty`: it is
+	/// built from what it is, as `Mapped<I, U>` is even where `I` is still a
+	/// parameter, not a parameter itself, which only a constraint pins.
+	fn hasShape(ty: Ty): bool = !(self.kind(ty) is .Param(..) | .Assoc(..))
+
+	/// `assoc`, for phases that share the types read-only.
+	fn findAssoc(base: Ty, interfaceId: InterfaceId, index: u32): Option<Ty> = {
+		if self.hasShape(base) {
+			for rule in self.decided {
+				if rule.interfaceId != interfaceId then continue
+				var bound: Vec<Option<Ty>> = Vec()
+				if self.bind(rule.pattern, base, &var bound) {
+					val arg = self.list(rule.args)[index as i64]
+					var given: Vec<Ty> = Vec()
+					for t in bound {
+						given.push(t.unwrapOr(ERROR))
+					}
+					return self.trySubstFind(arg, &given)
+				}
+			}
+		}
+		return self.find(.Assoc(base: base, interfaceId: interfaceId, index: index))
+	}
+
+	/// Whether `ty` has the shape of `pattern`, binding each of the
+	/// pattern's parameters to the part of `ty` where it stands.
+	fn bind(pattern: Ty, ty: Ty, bound: &var Vec<Option<Ty>>): bool = {
+		if self.kind(pattern) is .Param(param: p) {
+			val at = p.index as i64
+			while bound.len() <= at {
+				bound.push(.None)
+			}
+			return match bound[at] {
+				.Some(earlier) => earlier == ty
+				.None => {
+					bound[at] = .Some(ty)
+					true
+				}
+			}
+		}
+		if !self.isGeneric(pattern) then return pattern == ty
+		return match (self.kind(pattern), self.kind(ty)) {
+			(.Own(inner: a), .Own(inner: b)) | (.Array(elem: a, ..), .Array(elem: b, ..))
+			| (.Slice(elem: a), .Slice(elem: b)) | (.Ptr(inner: a), .Ptr(inner: b))
+			| (.Slots(inner: a), .Slots(inner: b)) => self.bind(a, b, &var bound)
+			(.Ref(inner: a, kind: k), .Ref(inner: b, kind: l)) if k == l => self.bind(
+				a,
+				b,
+				&var bound,
+			)
+			(.Struct(id: i, args: a), .Struct(id: j, args: b)) if i == j => self.bindLists(
+				a,
+				b,
+				&var bound,
+			)
+			(.Enum(id: i, args: a), .Enum(id: j, args: b)) if i == j => self.bindLists(
+				a,
+				b,
+				&var bound,
+			)
+			(.Fn(params: a, ret: r), .Fn(params: b, ret: s)) =>
+				self.bindLists(a, b, &var bound) && self.bind(r, s, &var bound)
+			_ => false
+		}
+	}
+
+	/// `bind`, over two lists of the same length, element by element.
+	fn bindLists(a: TyList, b: TyList, bound: &var Vec<Option<Ty>>): bool = {
+		val (xs, ys) = (self.list(a), self.list(b))
+		if xs.len() != ys.len() then return false
+		for i in 0..xs.len() {
+			if !self.bind(xs[i], ys[i], &var bound) then return false
+		}
+		return true
+	}
+
+	pub fn kind(ty: Ty): TyKind = self.kinds[ty.index()].clone()
+
+	/// An integer or float type: the types arithmetic and `as` work on.
+	pub fn isNumeric(ty: Ty): bool = self.kind(ty) is .Int(..) | .Float(..)
+
+	pub fn isInteger(ty: Ty): bool = self.kind(ty) is .Int(..)
+
+	/// Where a value of an integer or character type stands in the type's
+	/// order, from its bits: a signed number's with the sign bit turned
+	/// over, so that the least value comes first, and anything else's as
+	/// they are. What a range pattern and the check of what a `match` covers
+	/// compare.
+	pub fn orderKey(ty: Ty, bits: u128): Option<u128> = match self.kind(ty) {
+		.Int(int: t) if t.signed() => .Some((bits & t.mask()) ^ (1 << (t.bits() - 1)))
+		.Int(int: t) => .Some(bits & t.mask())
+		.Char => .Some(bits)
+		_ => .None
+	}
+
+	/// The bits of the value at `key` in the type's order: what `orderKey`
+	/// undoes.
+	pub fn fromOrderKey(ty: Ty, key: u128): u128 = match self.kind(ty) {
+		.Int(int: t) if t.signed() => key ^ (1 << (t.bits() - 1))
+		_ => key
+	}
+
+	/// The least and the greatest key of a type's values: an integer's every
+	/// value, and a `char`'s from U+0000 to U+10FFFF, of which the
+	/// surrogates are not values.
+	pub fn orderRange(ty: Ty): Option<(u128, u128)> = match self.kind(ty) {
+		.Int(int: t) => .Some((0, t.mask()))
+		.Char => .Some((0, 0x10_FFFF))
+		_ => .None
+	}
+
+	pub fn isFloat(ty: Ty): bool = self.kind(ty) is .Float(..)
+
+	pub fn intTy(ty: Ty): Option<IntTy> = match self.kind(ty) {
+		.Int(int: t) => .Some(t)
+		_ => .None
+	}
+}

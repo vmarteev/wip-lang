@@ -187,6 +187,7 @@
 "fn" @keyword.function
 
 "from" @keyword
+"keeps" @keyword
 
 [
   "import"

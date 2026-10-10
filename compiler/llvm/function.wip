@@ -1,0 +1,1867 @@
+// One MIR body as an LLVM function: every local a stack slot, every statement
+// a few instructions, every block a label.
+
+import std::mem
+import hir::{Access, FnId, I64, IntTy, STR, Ty, TyKind}
+import mir::{
+	Answer,
+	Layout,
+	Part,
+	AtomicOp,
+	Body,
+	CCall,
+	Callee,
+	CheckKind,
+	Const,
+	FloatOp,
+	IntegerOp,
+	Local,
+	Operand,
+	Place,
+	Projection,
+	Promoted,
+	Reg,
+	Rvalue,
+	Source,
+	Statement,
+	Tag,
+	Terminator,
+	Turn,
+	elementTy,
+	operandTy,
+	placeTy,
+	projectTy,
+	promoted
+}
+import syntax::{BinaryOp, Span, UnaryOp}
+
+/// What a move leaves in a build that checks moves.
+val POISON: u64 = 0xA5A5A5A5A5A5A5A5
+
+/// What a failed check does, once control is in its block.
+enum Panics {
+	/// The runtime's panic for a check MIR made.
+	Check(kind: CheckKind, at: Span)
+	/// An answer that does not fit, and which arithmetic it was.
+	Overflow(which: i64, at: Span)
+	/// LLVM's trap.
+	Trap
+	/// C's `abort`.
+	Abort
+}
+
+view struct FnGen {
+	body: &Body
+	/// The blocks written so far, the last the one being written; the first
+	/// is the entry block, which holds the prologue.
+	code: Vec<Block>
+	/// The entry block's stack slots, wherever in the body they are asked
+	/// for: one made in a loop's block would grow the stack each pass.
+	entry: Vec<Instruction>
+	next: u32
+	/// The address each local lives at.
+	storage: Vec<Value>
+	/// In a debug build, the slot that keeps the address an aggregate
+	/// parameter arrived at, which the debugger reads it through: the address
+	/// itself is in a register only until the code uses it.
+	addressSlots: Vec<Option<Value>>
+	subprogram: Subprogram
+	/// Where the code being written was written: the location every
+	/// instruction says.
+	place: Option<i64>
+	/// Each variable's lexical block: where its name is, where its scope
+	/// ends, and its node, outer before inner.
+	blocks: Vec<(u32, u32, i64)>
+}
+
+/// A function defined from `body`, described by `subprogram`; declared at
+/// `at`, or code the compiler writes on its own; `never` where it does not
+/// return.
+fn defineFn(
+	m: &var Llvm,
+	body: &Body,
+	symbol: u32,
+	linkage: Linkage,
+	sig: &Sig,
+	cAbi: bool,
+	never: bool,
+	subprogram: Subprogram,
+	at: Option<Span>,
+): Function = {
+	// The code before the first statement is at the declaration's line; the
+	// compiler's own at none.
+	val located: Option<i64> = match at {
+		.Some(span) => m.debug.location(subprogram.clone(), span, .None)
+		.None => .None
+	}
+	val first = match located {
+		.Some(node) => node
+		.None => m.debug.noLine(subprogram.clone())
+	}
+	var addressSlots: Vec<Option<Value>> = Vec()
+	for _ in 0..body.locals.len() {
+		addressSlots.push(.None)
+	}
+	var g = FnGen(
+		body: &body,
+		code: Vec::of(own [Block(label: .Start, instructions: Vec())]),
+		entry: Vec(),
+		next: 0,
+		storage: Vec(),
+		addressSlots: move addressSlots,
+		subprogram: subprogram.clone(),
+		place: .Some(first),
+		blocks: Vec(),
+	)
+	var params: Vec<Param> = Vec()
+	for (i, slot) in sig.params.forwards().enumerate() {
+		params.push(Param(
+			t: slot.t.clone(),
+			attrs: slot.attrs.clone(),
+			name: .Some(.Param(i as u32)),
+		))
+	}
+	g.prologue(&var m, &sig, cAbi)
+	if at.isSome() then g.declareVariables(&var m)
+	for (i, block) in body.blocks.forwards().enumerate() {
+		g.code.push(Block(label: .Block(i as u32), instructions: Vec()))
+		for statement in block.statements {
+			g.statement(&var m, &statement)
+		}
+		g.terminator(&var m, &block.terminator)
+	}
+	// In a debug build the prologue is at no line, and the branch out of it
+	// at the first statement's: where the entry block ends in a branch at no
+	// line, LLVM says the prologue ends at its first instruction, before the
+	// parameters are in place, and a debugger stops there.
+	val into: Option<i64> = if m.optimize then .None else g.firstPlace()
+	var start = mem::replace(&var g.entry, Vec())
+	for instruction in mem::replace(&var g.code[0].instructions, Vec()) {
+		start.push(move instruction)
+	}
+	start.push(Instruction(result: .None, op: .Br(.Block(0)), at: into))
+	g.code[0].instructions = move start
+	return Function(
+		symbol: symbol,
+		linkage: linkage,
+		ret: sig.retType(),
+		retAttrs: sig.retAttrs(),
+		params: move params,
+		returns: !never,
+		subprogram: subprogram.node,
+		blocks: mem::replace(&var g.code, Vec()),
+	)
+}
+
+/// Whether variable `a` is declared before `b`: the parameters first, in
+/// order, then the variables by where their names are, and of two at one
+/// place, the one seen longer first.
+fn declaredBefore(a: &(Local, Source, Option<i64>), b: &(Local, Source, Option<i64>)): bool = {
+	val aParam = a.2.isSome()
+	val bParam = b.2.isSome()
+	if aParam != bParam then return aParam
+	if aParam then return a.2.unwrap() < b.2.unwrap()
+	if a.1.at.lo != b.1.at.lo then return a.1.at.lo < b.1.at.lo
+	return a.1.seenUntil > b.1.seenUntil
+}
+
+extend FnGen {
+	/// The function's variables and parameters, each declared where it lives,
+	/// as a debug build describes them: a parameter is seen by the whole
+	/// function; a variable by the code written between its name and the end
+	/// of its scope, as a lexical block of that code, nested in the block of
+	/// the variable whose scope holds its own, so that the innermost of two of
+	/// one name is the one a debugger shows. A binding that holds the address
+	/// of what it matched is shown as what it refers to.
+	var fn declareVariables(m: &var Llvm) = {
+		val body = self.body
+		var variables: Vec<(Local, Source, Option<i64>)> = Vec()
+		for (i, decl) in body.locals.forwards().enumerate() {
+			val .Some(source) = decl.source else {
+				continue
+			}
+			val local = Local::of(i as u32)
+			var param: Option<i64> = .None
+			for (p, candidate) in body.params.forwards().enumerate() {
+				if candidate == local {
+					param = .Some(p)
+					break
+				}
+			}
+			variables.push((local, source.clone(), param))
+		}
+		variables.sortBy((a, b) => declaredBefore(&a, &b))
+		var open: Vec<(u32, i64)> = Vec()
+		for (local, source, param) in variables {
+			val slot = self.addressSlots[local.index as i64].clone()
+			val storage = match slot {
+				.Some(s) => s.clone()
+				.None => self.storage[local.index as i64].clone()
+			}
+			val decl = body.local(local)
+			val ty =
+				if source.byAddress && m.kind(decl.ty) is .Ref(inner, ..) then refInner(&m, decl.ty)
+				else decl.ty
+			val .Some(diType) = m.diType(ty) else {
+				continue
+			}
+			val (file, line, column) = m.debug.at(source.at)
+			val scope = if param.isSome() {
+				self.subprogram.node
+			} else {
+				while !open.isEmpty() && open[open.len() - 1].0 < source.seenUntil {
+					open.pop()
+				}
+				val outer = if open.isEmpty() then self.subprogram.node else open[open.len() - 1].1
+				val block = m.debug.add(.LexicalBlock(
+					scope: outer,
+					file: file,
+					line: line,
+					column: column,
+				))
+				open.push((source.seenUntil, block))
+				self.blocks.push((source.at.lo, source.seenUntil, block))
+				block
+			}
+			val variable = m.debug.add(.LocalVariable(
+				name: String::of(m.interner.resolve(source.name)),
+				arg: match param {
+					.Some(index) => .Some(index + 1)
+					.None => .None
+				},
+				scope: scope,
+				file: file,
+				line: line,
+				typeNode: diType,
+			))
+			// Through the slot that keeps its address, where it has one, and
+			// through the address it holds, where it is a binding of one.
+			val expression: Expression =
+				if slot.isSome() && source.byAddress then .DerefTwice
+				else if slot.isSome() || source.byAddress then .Deref
+				else .Plain
+			val place = m.debug.constant(.Location(line: line, column: column, scope: scope))
+			m.intrinsic(
+				"@llvm.dbg.declare",
+				.Void,
+				Vec::of(own [Type::Metadata, Type::Metadata, Type::Metadata]),
+			)
+			self.entry.push(Instruction(
+				result: .None,
+				op: .Declare(address: move storage, variable: variable, expression: expression),
+				at: .Some(place),
+			))
+		}
+	}
+
+	/// The innermost variable's block whose scope holds code written at `lo`,
+	/// if any.
+	fn blockAt(lo: u32): Option<i64> = {
+		var i = self.blocks.len()
+		while i > 0 {
+			i -= 1
+			val (start, end, block) = self.blocks[i]
+			if start <= lo && lo < end then return .Some(block)
+		}
+		return .None
+	}
+
+	/// The first location the body's code says, after the entry block.
+	fn firstPlace(): Option<i64> = {
+		for i in 1..self.code.len() {
+			for instruction in self.code[i].instructions {
+				if instruction.at.isSome() then return instruction.at
+			}
+		}
+		return .None
+	}
+
+	/// The next number of the function's temporaries and labels.
+	var fn number(): u32 = {
+		self.next += 1
+		return self.next
+	}
+
+	var fn temp(): Value = .Temp(self.number())
+
+	/// An instruction at the current place, at the end of the block being
+	/// written.
+	var fn instruction(result: Option<Value>, op: Op) = {
+		val at = self.place
+		val last = self.code.len() - 1
+		self.code[last].instructions.push(Instruction(result: move result, op: move op, at: at))
+	}
+
+	var fn emit(op: Op) = self.instruction(.None, move op)
+
+	/// An instruction whose answer is a new temporary.
+	var fn value(op: Op, t: Type): Val = {
+		val name = self.temp()
+		self.instruction(.Some(name.clone()), move op)
+		return Val(v: move name, t: move t)
+	}
+
+	/// Starts a block.
+	var fn startBlock(label: Label) = self.code.push(Block(label: label, instructions: Vec()))
+
+	/// A stack slot `name` in the entry block, of type `t` at `align`.
+	var fn slot(name: Value, t: Type, align: u32) = self.entry.push(Instruction(
+		result: .Some(move name),
+		op: .Alloca(t: move t, align: align),
+		at: .None,
+	))
+
+	/// A stack slot in the entry block, of `size` bytes at `align`.
+	var fn alloca(size: u32, align: u32): Value = {
+		val name = self.temp()
+		self.slot(name.clone(), byteArray(size.max(1)), align.max(1))
+		return move name
+	}
+
+	fn placeTy(m: &Llvm, place: &Place): Ty = placeTy(m.program, self.body, &place)
+
+	fn operandTy(m: &Llvm, operand: &Operand): Ty = operandTy(m.program, self.body, &operand)
+
+	fn align(m: &var Llvm, ty: Ty): u32 = m.layout(ty).align.max(1)
+
+	/// Where each local lives, and the parameters put there. In a debug build
+	/// this code is at no line, as a C compiler's is, so that a debugger stops
+	/// after it, at the first statement, where every parameter is where it
+	/// describes it.
+	var fn prologue(m: &var Llvm, sig: &Sig, cAbi: bool) = {
+		val body = self.body
+		val debug = !m.optimize
+		val place = self.place
+		if debug then self.place = .None
+		var incoming: u32 = 0
+		var sret: Option<Value> = .None
+		if sig.sret {
+			sret = .Some(.Param(0))
+			incoming = 1
+		}
+		var paramValues: Vec<(Local, Vec<Value>)> = Vec()
+		for param in body.params {
+			val ty = body.local(param).ty
+			val count: u32 = if cAbi && m.isCPair(ty) then 2 else 1
+			var values: Vec<Value> = Vec()
+			for i in incoming..(incoming + count) {
+				values.push(.Param(i))
+			}
+			incoming += count
+			paramValues.push((param, move values))
+		}
+		for (i, decl) in body.locals.forwards().enumerate() {
+			val local = Local::of(i as u32)
+			val aggregate = m.isAggregate(decl.ty)
+			val storage: Value = if decl.kind == .Return && aggregate {
+				match sret {
+					.Some(s) => s.clone()
+					.None => panic("an aggregate result's address")
+				}
+			} else if decl.kind == .Param && aggregate {
+				var values: Vec<Value> = Vec()
+				for (p, given) in paramValues {
+					if p == local then values = given.clone()
+				}
+				if values.len() == 2 {
+					// A pointer and a length from C, put back together.
+					val slot = Value::Slot(i as u32)
+					self.slot(slot.clone(), byteArray(16), 8)
+					val pointer = Val::of(values[0].clone(), .Ptr)
+					self.store(&pointer, slot.clone(), 8)
+					val length = self.temp()
+					self.instruction(
+						.Some(length.clone()),
+						.Offset(base: slot.clone(), offset: .Int(8)),
+					)
+					val count = Val::of(values[1].clone(), .I(64))
+					self.store(&count, move length, 8)
+					move slot
+				} else {
+					if debug {
+						val slot = Value::AddressSlot(i as u32)
+						self.slot(slot.clone(), .Ptr, 8)
+						val address = Val::of(values[0].clone(), .Ptr)
+						self.store(&address, slot.clone(), 8)
+						self.addressSlots[i] = .Some(move slot)
+					}
+					values[0].clone()
+				}
+			} else {
+				val layout = m.layout(decl.ty)
+				val slot = Value::Slot(i as u32)
+				self.slot(slot.clone(), byteArray(layout.size.max(1)), layout.align.max(1))
+				move slot
+			}
+			self.storage.push(move storage)
+		}
+		for (local, values) in paramValues {
+			val ty = body.local(local).ty
+			if m.isAggregate(ty) then continue
+			if m.lt(ty).isSome() {
+				// As the signature has it, which a `usize` is a pointer in.
+				val .Param(index) = values[0] else {
+					panic("a parameter")
+				}
+				val given = Val(v: values[0].clone(), t: sig.params[index as i64].t.clone())
+				val slot = self.storage[local.index as i64].clone()
+				self.writeAt(&var m, &given, ty, move slot)
+			}
+		}
+		self.place = place
+	}
+
+	// Places and values.
+
+	var fn gep(base: Value, offset: i64): Value =
+		if offset == 0 then move base
+		else self.value(.Offset(base: move base, offset: .Int(offset as i64)), .Ptr).take()
+
+	var fn load(addr: Value, t: Type, align: u32): Val = self.value(
+		.Load(t: t.clone(), address: move addr, align: align, assumes: .Nothing),
+		move t,
+	)
+
+	/// A reference read from memory, with what LLVM may assume of it: that it
+	/// is not null, and is aligned. Not that it can be read through: LLVM
+	/// takes `!dereferenceable` on a load as true of the pointer wherever it
+	/// is used, and so may read through it ahead of the branch that loads it,
+	/// where an enum holds another variant and the place no reference. A
+	/// parameter says it, where it is true for the whole call.
+	var fn loadReference(m: &var Llvm, addr: Value, layout: Layout): Val = {
+		val nonnull = m.debug.constant(.Tuple(Vec()))
+		val align = m.debug.constant(
+			.Tuple(Vec::of(own [MetaItem::Int(bits: 64, value: layout.align.max(1) as i64)])),
+		)
+		return self.value(
+			.Load(
+				t: .Ptr,
+				address: move addr,
+				align: 8,
+				assumes: .Reference(nonnull: nonnull, align: align),
+			),
+			.Ptr,
+		)
+	}
+
+	var fn store(value: &Val, addr: Value, align: u32) = self.emit(.Store(
+		value: value.clone(),
+		address: move addr,
+		align: align,
+	))
+
+	/// The address of a place.
+	var fn placeAddr(m: &var Llvm, place: &Place): Value = {
+		var addr = self.storage[place.local.index as i64].clone()
+		var ty = self.body.local(place.local).ty
+		for projection in place.projections {
+			addr = self.project(&var m, move addr, ty, &projection)
+			ty = projectTy(m.program, ty, projection.clone())
+		}
+		return move addr
+	}
+
+	var fn project(
+		m: &var Llvm,
+		addr: Value,
+		ty: Ty,
+		projection: &Projection,
+	): Value = match projection {
+		.Deref => match m.referent(ty) {
+			.Some(layout) => self.loadReference(&var m, move addr, layout).take()
+			.None => self.load(move addr, .Ptr, 8).take()
+		}
+		.Field(index) => {
+			val offset =
+				if m.kind(ty) is .Struct(..) then m.layouts.fieldOffset(m.program, ty, index)
+				else index * 8
+			self.gep(move addr, offset as i64)
+		}
+		.VariantField(variant, field) => {
+			val offset = m.layouts.variantOffset(m.program, ty, variant, field)
+			self.gep(move addr, offset as i64)
+		}
+		.Index(..) | .ConstIndex(..) => {
+			val .Some(elem) = elementTy(m.program, ty) else {
+				panic("elements")
+			}
+			val first =
+				if m.kind(ty) is .Array(..) then move addr else self.load(move addr, .Ptr, 8).take()
+			val stride = m.layout(elem).stride() as i64
+			match projection {
+				.Index(local) => {
+					val read = Operand::Copy(Place::of(local))
+					val index = self.operand(&var m, &read)
+					val wide = self.coerce(&index, .I(64))
+					val offset = self.value(
+						.Arithmetic(
+							op: .Mul,
+							wrap: .None,
+							left: Val::of(move wide, .I(64)),
+							right: .Int(stride as i64),
+						),
+						.I(64),
+					)
+					self.value(.Offset(base: move first, offset: move offset.v), .Ptr).take()
+				}
+				.ConstIndex(index) => self.gep(move first, stride *% index as i64)
+				_ => panic("an element")
+			}
+		}
+	}
+
+	/// A value as another width of integer, where MIR's type and the LLVM
+	/// value differ only in that — a `bool` compared, a shift's amount. An
+	/// address and a number are never taken for each other here: MIR types an
+	/// address as one, and only a cast converts.
+	var fn coerce(value: &Val, to: Type): Value = {
+		if value.t == to then return value.v.clone()
+		if value.t is .I(..) && to is .I(bits) then return self.intResize(&value, bits)
+		panic("no conversion of \(value.t.text()) to \(to.text()) but a cast's")
+	}
+
+	/// A pointer as the number it is, and back: a cast's conversion.
+	var fn convert(value: &Val, to: Type): Value = match (value.t.clone(), to.clone()) {
+		(.Ptr, .I(64)) => self.value(
+			.Cast(cast: .PtrToInt, value: value.clone(), to: to.clone()),
+			move to,
+		).take()
+		(.Ptr, .I(bits)) => {
+			val word = self.value(.Cast(cast: .PtrToInt, value: value.clone(), to: .I(64)), .I(64))
+			self.intResize(&word, bits)
+		}
+		(.I(64), .Ptr) => self.value(
+			.Cast(cast: .IntToPtr, value: value.clone(), to: .Ptr),
+			move to,
+		).take()
+		(.I(..), .Ptr) => {
+			val word = self.intResize(&value, 64)
+			self.value(
+				.Cast(cast: .IntToPtr, value: Val::of(move word, .I(64)), to: .Ptr),
+				move to,
+			).take()
+		}
+		_ => self.coerce(&value, move to)
+	}
+
+	/// An integer to another width: its low bits, or extended with zeros.
+	var fn intResize(value: &Val, bits: u32): Value = {
+		val .I(from) = value.t else {
+			panic("\(value.t.text()) is not an integer")
+		}
+		if from == bits then return value.v.clone()
+		val cast: Cast = if from < bits then .ZExt else .Trunc
+		return self.value(.Cast(cast: cast, value: value.clone(), to: .I(bits)), .I(bits)).take()
+	}
+
+	/// The value of a scalar operand.
+	var fn operand(m: &var Llvm, operand: &Operand): Val = match operand {
+		.Const(constant) => self.constant(&var m, &constant)
+		.Copy(place) => {
+			val ty = self.placeTy(&m, &place)
+			val .Some(lt) = m.lt(ty) else {
+				panic("an aggregate operand is passed by address")
+			}
+			val align = self.align(&var m, ty)
+			val addr = self.placeAddr(&var m, &place)
+			match m.referent(ty) {
+				.Some(layout) => self.loadReference(&var m, move addr, layout)
+				.None => self.load(move addr, move lt, align)
+			}
+		}
+	}
+
+	var fn constant(m: &var Llvm, constant: &Const): Val = match constant {
+		.Int(bits, ty) => match m.lt(ty) {
+			.Some(.Ptr) =>
+				if bits == 0 then Val::of(.Zero, .Ptr)
+				else Val::of(.Address(bits as u64 as i64), .Ptr)
+			.Some(.I(width)) => Val::of(Value::int(signed(bits, width)), .I(width))
+			_ => panic("an integer constant of another type")
+		}
+		.Float(value, ty) => match m.kind(ty) {
+			.Float(float: .F32) => Val::of(.Float((value as f32 as f64).toBits()), .F32)
+			_ => Val::of(.Float(value.toBits()), .F64)
+		}
+		.Bool(value) => Val::of(.Int(if value then 1 else 0), .I(8))
+		.CStr(symbol) => Val::of(.Global(m.string(symbol)), .Ptr)
+		.Fn(id, ..) => Val::of(.Global(m.symbol(id)), .Ptr)
+		.VTable(interfaceId, ty) => Val::of(.Global(m.vtable(interfaceId, ty)), .Ptr)
+		.Table(id, ..) => Val::of(.Global(m.table(id)), .Ptr)
+		.SizeOf(of, ty) | .AlignOf(of, ty) => {
+			val layout = m.layout(of)
+			val bytes = if constant is .SizeOf(..) then layout.stride() else layout.align
+			val .Some(.I(width)) = m.lt(ty) else {
+				panic("a size is an integer")
+			}
+			Val::of(.Int(bytes as i64), .I(width))
+		}
+		.FrameTables => Val::of(.Global(FRAME_TABLES), .Ptr)
+		.RuntimeWords => Val::of(.Global(RUNTIME_WORDS), .Ptr)
+		.DropFn(ty) => Val::of(.Global(m.dropFn(ty, false)), .Ptr)
+	}
+
+	/// Stores a scalar in a local's own slot, as its type.
+	var fn writeAt(m: &var Llvm, value: &Val, ty: Ty, slot: Value) = {
+		val .Some(lt) = m.lt(ty) else {
+			return
+		}
+		val v = self.coerce(&value, lt.clone())
+		val align = self.align(&var m, ty)
+		val stored = Val(v: move v, t: move lt)
+		self.store(&stored, move slot, align)
+	}
+
+	/// Stores a scalar in a place, as the place's type.
+	var fn write(m: &var Llvm, place: &Place, value: &Val) = {
+		val ty = self.placeTy(&m, &place)
+		val .Some(lt) = m.lt(ty) else {
+			return
+		}
+		val v = self.coerce(&value, lt.clone())
+		val align = self.align(&var m, ty)
+		val addr = self.placeAddr(&var m, &place)
+		val stored = Val(v: move v, t: move lt)
+		self.store(&stored, move addr, align)
+	}
+
+	/// A call of a function that answers nothing, already declared.
+	var fn callVoid(callee: u32, values: Vec<Val>) = self.emit(
+		.Call(own Call::plain(.Global(callee), .Void, move values)),
+	)
+
+	/// A call of LLVM's intrinsic `name`, declared as taking what `values`
+	/// are, that answers nothing.
+	var fn intrinsicVoid(m: &var Llvm, name: str, values: Vec<Val>) = {
+		val callee = m.intrinsic(name, .Void, typesOf(&values))
+		self.callVoid(callee, move values)
+	}
+
+	var fn memset(m: &var Llvm, addr: Value, byte: u8, size: u32) = {
+		if size == 0 then return
+		self.intrinsicVoid(
+			&var m,
+			"@llvm.memset.p0.i64",
+			Vec::of(own [
+				Val::of(move addr, .Ptr),
+				Val::of(.Int((byte as i8) as i64), .I(8)),
+				Val::of(.Int(size as i64), .I(64)),
+				Val::of(.Int(0), .I(1)),
+			]),
+		)
+	}
+
+	var fn memmove(m: &var Llvm, dest: Value, src: Value, size: u32) = {
+		if size == 0 then return
+		self.intrinsicVoid(
+			&var m,
+			"@llvm.memmove.p0.p0.i64",
+			Vec::of(own [
+				Val::of(move dest, .Ptr),
+				Val::of(move src, .Ptr),
+				Val::of(.Int(size as i64), .I(64)),
+				Val::of(.Int(0), .I(1)),
+			]),
+		)
+	}
+
+	// Statements.
+
+	var fn statement(m: &var Llvm, statement: &Statement) = match statement {
+		// What follows was written here, until the next says otherwise; a span
+		// with no line leaves the place as it was, as the table a panic reads
+		// passes over it.
+		.At(span) => {
+			val block = self.blockAt(span.lo)
+			if m.debug.location(self.subprogram.clone(), span, block) is .Some(place) then
+				self.place = .Some(place)
+		}
+		.Assign(place, rvalue) => self.assign(&var m, &place, &rvalue)
+		.SetVariant(place, variant) => self.setVariant(&var m, &place, variant)
+		.Zero(place) => {
+			val ty = self.placeTy(&m, &place)
+			val size = m.layout(ty).size
+			val addr = self.placeAddr(&var m, &place)
+			self.memset(&var m, move addr, 0, size)
+		}
+		.Poison(place) => {
+			val ty = self.placeTy(&m, &place)
+			val size = m.layout(ty).size
+			val addr = self.placeAddr(&var m, &place)
+			self.memset(&var m, move addr, POISON as u8, size)
+		}
+		.CheckMoved(place, at) => self.checkMoved(&var m, &place, at)
+		.Call(callee, args, dest) => self.call(&var m, &callee, &args, &dest)
+		.Alloc(dest, ty) => {
+			val size = m.layout(ty).size.max(1)
+			val alloc = m.runtime("wip_alloc")
+			val .Some(ptr) = self.callValues(
+				&var m,
+				alloc,
+				Vec::of(own [Val::of(.Int(size as i64), .I(64))]),
+			) else {
+				panic("an allocation's address")
+			}
+			self.write(&var m, &dest, &ptr)
+		}
+		.AllocBuffer(dest, elem, count) => {
+			val given = self.operand(&var m, &count)
+			val counted = Val(v: self.coerce(&given, .I(64)), t: .I(64))
+			val stride = m.layout(elem).stride()
+			// More bytes than an `i64` counts is more than memory holds.
+			val both = self.intrinsicValue(
+				&var m,
+				"@llvm.smul.with.overflow.i64",
+				withFlag(.I(64)),
+				Vec::of(own [counted.clone(), Val::of(.Int(stride as i64), .I(64))]),
+			)
+			val size = self.value(.ExtractValue(aggregate: both.clone(), index: 0), .I(64))
+			val over = self.value(.ExtractValue(aggregate: move both, index: 1), .I(1))
+			self.trapIf(&var m, move over.v)
+			val alloc = m.runtime("wip_alloc")
+			val .Some(ptr) = self.callValues(&var m, alloc, Vec::of(own [move size])) else {
+				panic("an allocation's address")
+			}
+			val addr = self.placeAddr(&var m, &dest)
+			self.store(&ptr, addr.clone(), 8)
+			val length = self.gep(move addr, 8)
+			self.store(&counted, move length, 8)
+		}
+		.Free(operand) => {
+			val ptr = self.operand(&var m, &operand)
+			val free = m.runtime("wip_free")
+			self.callValues(&var m, free, Vec::of(own [move ptr]))
+		}
+		.DropFn(ty, ptr) => {
+			val given = self.operand(&var m, &ptr)
+			val pointer = self.coerce(&given, .Ptr)
+			val drop = m.dropFn(ty, false)
+			self.callVoid(drop, Vec::of(own [Val::of(move pointer, .Ptr)]))
+		}
+		.DropInPlace(ty, place) => {
+			val pointer = self.placeAddr(&var m, &place)
+			val drop = m.dropFn(ty, true)
+			self.callVoid(drop, Vec::of(own [Val::of(move pointer, .Ptr)]))
+		}
+		.Arith(dest, op, lhs, rhs, at) => {
+			val ty = self.placeTy(&m, &dest)
+			val signed = m.kind(ty) is .Int(int) && int.signed()
+			val left = self.operand(&var m, &lhs)
+			val given = self.operand(&var m, &rhs)
+			val lt = left.t.clone()
+			val right = Val(v: self.coerce(&given, lt.clone()), t: lt.clone())
+			val over = self.overflows(&var m, op, signed, &left, &right)
+			self.checkI1(&var m, move over.v, .Overflow(which: overflowCode(op), at: at))
+			// Past the check the answer fits, which LLVM's flags say of the
+			// operation computed again here, where it is used: a loop's counter
+			// that cannot wrap is one LLVM can reason about. LLVM finds the two
+			// the same.
+			val arithmetic: Arithmetic = match op {
+				.Add => .Add
+				.Sub => .Sub
+				_ => .Mul
+			}
+			val wrap: Wrap = if signed then .NoSigned else .NoUnsigned
+			val answer = self.value(
+				.Arithmetic(
+					op: arithmetic,
+					wrap: .Some(wrap),
+					left: move left,
+					right: move right.v,
+				),
+				move lt,
+			)
+			self.write(&var m, &dest, &answer)
+		}
+		.Atomic(op, ty, address, value, expected, dest) => {
+			val given = self.operand(&var m, &address)
+			val at = self.coerce(&given, .Ptr)
+			val .Some(lt) = m.lt(ty) else {
+				panic("an atomic's value is a scalar")
+			}
+			val align = self.align(&var m, ty)
+			val answer: Option<Val> = match op {
+				.Add | .Subtract | .Swap => {
+					val .Some(operand) = value else {
+						panic("an atomic's value")
+					}
+					val read = self.operand(&var m, &operand)
+					val amount = self.coerce(&read, lt.clone())
+					val rmw: Rmw = match op {
+						.Add => .Add
+						.Subtract => .Sub
+						_ => .Xchg
+					}
+					.Some(
+						self.value(
+							.AtomicRmw(
+								op: rmw,
+								address: move at,
+								value: Val::of(move amount, lt.clone()),
+								align: align,
+							),
+							lt.clone(),
+						),
+					)
+				}
+				.CompareSwap => {
+					val .Some(expect) = expected else {
+						panic("an expected value")
+					}
+					val read = self.operand(&var m, &expect)
+					val wanted = self.coerce(&read, lt.clone())
+					val .Some(operand) = value else {
+						panic("an atomic's value")
+					}
+					val given = self.operand(&var m, &operand)
+					val stored = self.coerce(&given, lt.clone())
+					val both = self.value(
+						.CmpXchg(own CmpXchg(
+							address: move at,
+							expected: Val::of(move wanted, lt.clone()),
+							replacement: Val::of(move stored, lt.clone()),
+							align: align,
+						)),
+						withFlag(lt.clone()),
+					)
+					.Some(self.value(.ExtractValue(aggregate: move both, index: 0), lt.clone()))
+				}
+				.Load => .Some(
+					self.value(
+						.LoadAtomic(t: lt.clone(), address: move at, align: align),
+						lt.clone(),
+					),
+				)
+				.Store => {
+					val .Some(operand) = value else {
+						panic("a store has a value")
+					}
+					val given = self.operand(&var m, &operand)
+					val stored = self.coerce(&given, lt.clone())
+					self.emit(.StoreAtomic(
+						value: Val::of(move stored, lt.clone()),
+						address: move at,
+						align: align,
+					))
+					Option::None
+				}
+			}
+			if dest is .Some(d) && answer is .Some(a) then self.write(&var m, &d, &a)
+		}
+		.Check(fails, kind, at) => {
+			val failing = self.operand(&var m, &fails)
+			self.check(&var m, &failing, .Check(kind: kind.clone(), at: at))
+		}
+	}
+
+	/// Whether `left op right` would not fit, as the intrinsic answers it: an
+	/// `i1`.
+	var fn overflows(m: &var Llvm, op: BinaryOp, signed: bool, left: &Val, right: &Val): Val = {
+		val name = overflowIntrinsic(op, signed)
+		val t = left.t.text()
+		val both = self.intrinsicValue(
+			&var m,
+			"@llvm.\(name).with.overflow.\(t)",
+			withFlag(left.t.clone()),
+			Vec::of(own [left.clone(), right.clone()]),
+		)
+		return self.value(.ExtractValue(aggregate: move both, index: 1), .I(1))
+	}
+
+	/// Branches to what `panics` says when the `bool` `fails` holds is true,
+	/// and carries on otherwise.
+	var fn check(m: &var Llvm, fails: &Val, panics: Panics) = {
+		val flag = self.value(.IntCompare(cond: .Ne, left: fails.clone(), right: .Int(0)), .I(1))
+		self.checkI1(&var m, move flag.v, move panics)
+	}
+
+	var fn checkI1(m: &var Llvm, flag: Value, panics: Panics) = {
+		val failed = Label::Failed(self.number())
+		val fine = Label::Fine(self.number())
+		val unlikely = m.debug.unlikely()
+		self.emit(.CondBr(
+			condition: move flag,
+			ifTrue: failed.clone(),
+			ifFalse: fine.clone(),
+			weights: .Some(unlikely),
+		))
+		self.startBlock(failed)
+		self.panics(&var m, move panics)
+		self.emit(.Unreachable)
+		self.startBlock(fine)
+	}
+
+	/// What a failed check does: in its block, before the `unreachable` after
+	/// it.
+	var fn panics(m: &var Llvm, panics: Panics) = match move panics {
+		.Check(kind, at) => {
+			val (name, numbers) = match kind {
+				.Bounds(index, length) => {
+					val i = self.operand(&var m, &index)
+					val n = self.operand(&var m, &length)
+					("wip_panic_index", Vec::of(own [move i, move n]))
+				}
+				.Length(length) => {
+					val n = self.operand(&var m, &length)
+					("wip_panic_length", Vec::of(own [move n]))
+				}
+				.Division => ("wip_panic_division", Vec())
+				.Overflow(op) => (
+					"wip_panic_overflow",
+					Vec::of(own [Val::of(.Int(overflowCode(op) as i64), .I(64))]),
+				)
+			}
+			self.panicCall(&var m, name, move numbers, at)
+		}
+		.Overflow(which, at) => self.panicCall(
+			&var m,
+			"wip_panic_overflow",
+			Vec::of(own [Val::of(.Int(which as i64), .I(64))]),
+			at,
+		)
+		.Trap => {
+			val trap = m.intrinsic("@llvm.trap", .Void, Vec())
+			self.callVoid(trap, Vec())
+		}
+		.Abort => {
+			val abort = m.abort()
+			self.callVoid(abort, Vec())
+		}
+	}
+
+	var fn trapIf(m: &var Llvm, flag: Value) = self.checkI1(&var m, move flag, .Trap)
+
+	/// A call of a runtime panic: its own numbers, then the file, the line and
+	/// the column.
+	var fn panicCall(m: &var Llvm, name: str, numbers: Vec<Val>, at: Span) = {
+		val (file, line, column) = (m.locations)(at)
+		val fileData = m.text(file.toStr())
+		var args = move numbers
+		args.push(Val::of(.Global(move fileData), .Ptr))
+		args.push(Val::of(.Int(file.len() as i64), .I(64)))
+		args.push(Val::of(.Int(line as i64), .I(64)))
+		args.push(Val::of(.Int(column as i64), .I(64)))
+		val id = m.runtime(name)
+		self.callValues(&var m, id, move args)
+	}
+
+	/// A panic where the value at `place` begins with what a move leaves in a
+	/// build that checks moves: its first bytes, as wide as the value, and the
+	/// poison as wide, handed to the runtime's `wip_check_moved`, which
+	/// compares them. A check is a load and a call, where a branch to a panic
+	/// of its own would be a block more for each, and a debug build has one at
+	/// every drop of a value that may have been moved.
+	var fn checkMoved(m: &var Llvm, place: &Place, at: Span) = {
+		val ty = self.placeTy(&m, &place)
+		val size = m.layout(ty).size
+		if size == 0 then return
+		val bits: u32 =
+			if size >= 8 then 64 else if size >= 4 then 32 else if size >= 2 then 16 else 8
+		val addr = self.placeAddr(&var m, &place)
+		var first = self.load(move addr, .I(bits), 1)
+		if bits < 64 then
+			first = self.value(.Cast(cast: .ZExt, value: move first, to: .I(64)), .I(64))
+		val poison = POISON as u128 & (((1 as u128) << bits) - 1)
+		val (file, line, column) = (m.locations)(at)
+		val fileData = m.text(file.toStr())
+		val args = Vec::of(own [
+			move first,
+			Val::of(Value::int(signed(poison, 64)), .I(64)),
+			Val::of(.Global(move fileData), .Ptr),
+			Val::of(.Int(file.len() as i64), .I(64)),
+			Val::of(.Int(line as i64), .I(64)),
+			Val::of(.Int(column as i64), .I(64)),
+		])
+		val id = m.runtime("wip_check_moved")
+		self.callValues(&var m, id, move args)
+	}
+
+	var fn setVariant(m: &var Llvm, place: &Place, variant: u32) = {
+		val ty = self.placeTy(&m, &place)
+		match m.layouts.enumTag(m.program, ty) {
+			.Byte(size) => {
+				val lt: Type = if size == 1 then .I(8) else .I(32)
+				val addr = self.placeAddr(&var m, &place)
+				val stored = Val::of(.Int(variant as i64), move lt)
+				self.store(&stored, move addr, size.min(4))
+			}
+			.Niche(empty, offset, ..) if variant == empty => {
+				val addr = self.placeAddr(&var m, &place)
+				val at = self.gep(move addr, offset as i64)
+				val stored = Val::of(.Zero, .Ptr)
+				self.store(&stored, move at, 8)
+			}
+			.Niche(..) => {}
+		}
+	}
+
+	var fn variantIndex(m: &var Llvm, addr: Value, ty: Ty): Val = match m.layouts.enumTag(
+		m.program,
+		ty,
+	) {
+		.Byte(size: 1) => {
+			val tag = self.load(move addr, .I(8), 1)
+			self.value(.Cast(cast: .ZExt, value: move tag, to: .I(32)), .I(32))
+		}
+		.Byte(..) => self.load(move addr, .I(32), 4)
+		.Niche(payload, empty, offset) => {
+			val at = self.gep(move addr, offset as i64)
+			val ptr = self.load(move at, .Ptr, 8)
+			val isNull = self.value(.IntCompare(cond: .Eq, left: move ptr, right: .Zero), .I(1))
+			self.value(
+				.Select(own Select(
+					condition: move isNull.v,
+					ifTrue: Val::of(.Int(empty as i64), .I(32)),
+					ifFalse: Val::of(.Int(payload as i64), .I(32)),
+				)),
+				.I(32),
+			)
+		}
+	}
+
+	var fn assign(m: &var Llvm, place: &Place, rvalue: &Rvalue) = {
+		val ty = self.placeTy(&m, &place)
+		if m.isAggregate(ty) {
+			val .Use(.Copy(src)) = rvalue else {
+				panic("an aggregate is assigned by copying a place")
+			}
+			val size = m.layout(ty).size
+			val dest = self.placeAddr(&var m, &place)
+			val from = self.placeAddr(&var m, &src)
+			self.memmove(&var m, move dest, move from, size)
+			return
+		}
+		if m.lt(ty).isNone() then return
+		val value = self.rvalue(&var m, &rvalue, ty)
+		self.write(&var m, &place, &value)
+	}
+
+	/// A call of LLVM's intrinsic `name`, declared as taking what `values`
+	/// are, that answers a value of type `t`.
+	var fn intrinsicValue(m: &var Llvm, name: str, t: Type, values: Vec<Val>): Val = {
+		val callee = m.intrinsic(name, t.clone(), typesOf(&values))
+		return self.value(.Call(own Call::plain(.Global(callee), t.clone(), move values)), move t)
+	}
+
+	var fn rvalue(m: &var Llvm, rvalue: &Rvalue, ty: Ty): Val = match rvalue {
+		.Use(operand) => self.operand(&var m, &operand)
+		// Whether the answer would not fit: the flag of the intrinsic a
+		// checked `+` panics on, as a `bool`.
+		.Overflows(op, lhs, rhs) => {
+			val signed = m.kind(self.operandTy(&m, &lhs)) is .Int(int) && int.signed()
+			val left = self.operand(&var m, &lhs)
+			val given = self.operand(&var m, &rhs)
+			val lt = left.t.clone()
+			val right = Val(v: self.coerce(&given, lt.clone()), t: lt.clone())
+			val over = self.overflows(&var m, op, signed, &left, &right)
+			self.value(.Cast(cast: .ZExt, value: move over, to: .I(8)), .I(8))
+		}
+		.Unary(op, operand) => {
+			val value = self.operand(&var m, &operand)
+			val t = value.t.clone()
+			match op {
+				.Neg => {
+					if m.kind(ty) is .Float(..) then self.value(.FNeg(move value), move t)
+					else self.value(
+						.Arithmetic(
+							op: .Sub,
+							wrap: .None,
+							left: Val::of(.Int(0), t.clone()),
+							right: move value.v,
+						),
+						move t,
+					)
+				}
+				.Not => {
+					val mask: i64 = if m.kind(ty) is .Bool then 1 else -1
+					self.value(
+						.Arithmetic(op: .Xor, wrap: .None, left: move value, right: .Int(mask)),
+						move t,
+					)
+				}
+			}
+		}
+		.Binary(op, lhs, rhs) => self.binary(&var m, op, &lhs, &rhs)
+		.Cast(operand, ty: to) => self.cast(&var m, &operand, to)
+		.AddressOf(place) => Val(v: self.placeAddr(&var m, &place), t: .Ptr)
+		.VTableFn(table, index, methods) => {
+			val given = self.operand(&var m, &table)
+			val at = self.coerce(&given, .Ptr)
+			val entry = self.gep(move at, index as i64 * 8)
+			if methods {
+				// A table of methods is a constant, never freed: what is read
+				// from it is the same wherever it is read, which lets LLVM read
+				// it once where a loop calls through one `&dyn`.
+				val invariant = m.debug.constant(.Tuple(Vec()))
+				self.value(
+					.Load(t: .Ptr, address: move entry, align: 8, assumes: .Invariant(invariant)),
+					.Ptr,
+				)
+			} else {
+				self.load(move entry, .Ptr, 8)
+			}
+		}
+		.Float(op, operand) => {
+			val value = self.operand(&var m, &operand)
+			val name = match op {
+				.Sqrt => "sqrt"
+				.Floor => "floor"
+				.Ceil => "ceil"
+				.Trunc => "trunc"
+			}
+			val (t, suffix) = floatNames(value.t.clone())
+			val answer = value.t.clone()
+			self.intrinsicValue(
+				&var m,
+				"@llvm.\(name).\(suffix)",
+				move answer,
+				Vec::of(own [move value]),
+			)
+		}
+		.MulAdd(first, second, third) => {
+			val a = self.operand(&var m, &first)
+			val b = self.operand(&var m, &second)
+			val c = self.operand(&var m, &third)
+			val (t, suffix) = floatNames(a.t.clone())
+			val answer = a.t.clone()
+			self.intrinsicValue(
+				&var m,
+				"@llvm.fma.\(suffix)",
+				move answer,
+				Vec::of(own [move a, move b, move c]),
+			)
+		}
+		.Integer(op, operand) => {
+			val value = self.operand(&var m, &operand)
+			val t = value.t.text()
+			if op == IntegerOp::SwapBytes && value.t == Type::I(8) then return move value
+			val answer = value.t.clone()
+			match op {
+				.CountOnes | .SwapBytes | .ReverseBits => {
+					val name = match op {
+						.CountOnes => "ctpop"
+						.SwapBytes => "bswap"
+						_ => "bitreverse"
+					}
+					self.intrinsicValue(
+						&var m,
+						"@llvm.\(name).\(t)",
+						move answer,
+						Vec::of(own [move value]),
+					)
+				}
+				.LeadingZeros | .TrailingZeros => {
+					val name = if op == IntegerOp::LeadingZeros then "ctlz" else "cttz"
+					// The width, for 0, as the instruction answers.
+					self.intrinsicValue(
+						&var m,
+						"@llvm.\(name).\(t)",
+						move answer,
+						Vec::of(own [move value, Val::of(.Int(0), .I(1))]),
+					)
+				}
+			}
+		}
+		.Rotate(turn, lhs: rotated, rhs: amount) => {
+			val value = self.operand(&var m, &rotated)
+			val given = self.operand(&var m, &amount)
+			val by = self.coerce(&given, value.t.clone())
+			val t = value.t.text()
+			val name = if turn == Turn::Left then "fshl" else "fshr"
+			val answer = value.t.clone()
+			val shifted = Val::of(move by, value.t.clone())
+			self.intrinsicValue(
+				&var m,
+				"@llvm.\(name).\(t)",
+				move answer,
+				Vec::of(own [value.clone(), move value, move shifted]),
+			)
+		}
+		.Bits(operand) => {
+			val value = self.operand(&var m, &operand)
+			val .Some(target) = m.lt(ty) else {
+				panic("bits are a scalar's")
+			}
+			self.value(.Cast(cast: .Bitcast, value: move value, to: target.clone()), move target)
+		}
+		.CstrLen(operand) => {
+			val pointer = self.operand(&var m, &operand)
+			val id = m.runtime("wip_cstr_len")
+			match self.callValues(&var m, id, Vec::of(own [move pointer])) {
+				.Some(length) => move length
+				.None => panic("a length")
+			}
+		}
+		.Variant(place) => {
+			val placed = self.placeTy(&m, &place)
+			val addr = self.placeAddr(&var m, &place)
+			self.variantIndex(&var m, move addr, placed)
+		}
+	}
+
+	var fn binary(m: &var Llvm, op: BinaryOp, lhs: &Operand, rhs: &Operand): Val = {
+		val operandType = self.operandTy(&m, &lhs)
+		val kind = m.kind(operandType)
+		val l = self.operand(&var m, &lhs)
+		val r = self.operand(&var m, &rhs)
+		val t = l.t.clone()
+		if t is .F32 | .F64 {
+			val compare: Option<FloatCompare> = match op {
+				.Eq => .Some(.Oeq)
+				.Ne => .Some(.Une)
+				.Lt => .Some(.Olt)
+				.Le => .Some(.Ole)
+				.Gt => .Some(.Ogt)
+				.Ge => .Some(.Oge)
+				_ => .None
+			}
+			if compare is .Some(cond) {
+				val answer = self.value(
+					.FloatCompare(cond: cond, left: move l, right: move r.v),
+					.I(1),
+				)
+				return self.value(.Cast(cast: .ZExt, value: move answer, to: .I(8)), .I(8))
+			}
+			val arithmetic: Arithmetic = match op {
+				.Add => .FAdd
+				.Sub => .FSub
+				.Mul => .FMul
+				.Div => .FDiv
+				.Rem => .FRem
+				_ => panic("the type checker rejects this operator on floats")
+			}
+			return self.value(
+				.Arithmetic(op: arithmetic, wrap: .None, left: move l, right: move r.v),
+				move t,
+			)
+		}
+		val unsigned = !(kind is .Int(int) && int.signed())
+		val right = Val(v: self.coerce(&r, t.clone()), t: t.clone())
+		val comparison: Option<IntCompare> = match op {
+			.Eq => .Some(.Eq)
+			.Ne => .Some(.Ne)
+			.Lt => .Some(if unsigned then IntCompare::Ult else IntCompare::Slt)
+			.Le => .Some(if unsigned then IntCompare::Ule else IntCompare::Sle)
+			.Gt => .Some(if unsigned then IntCompare::Ugt else IntCompare::Sgt)
+			.Ge => .Some(if unsigned then IntCompare::Uge else IntCompare::Sge)
+			_ => .None
+		}
+		if comparison is .Some(cond) {
+			val answer = self.value(
+				.IntCompare(cond: cond, left: move l, right: move right.v),
+				.I(1),
+			)
+			return self.value(.Cast(cast: .ZExt, value: move answer, to: .I(8)), .I(8))
+		}
+		val .I(bits) = t else {
+			panic("arithmetic on \(t.text())")
+		}
+		// MIR checks the most negative number divided by -1 only to 64 bits;
+		// past them the program aborts here, where LLVM's `sdiv` and `srem`
+		// would be undefined.
+		if bits > 64 && !unsigned && op is .Div | .Rem {
+			val mostNegative = signed((1 as u128) << (bits - 1), bits)
+			val edge = self.value(
+				.IntCompare(cond: .Eq, left: l.clone(), right: Value::int(mostNegative)),
+				.I(1),
+			)
+			val by = self.value(.IntCompare(cond: .Eq, left: right.clone(), right: .Int(-1)), .I(1))
+			val both = self.value(
+				.Arithmetic(op: .And, wrap: .None, left: move edge, right: move by.v),
+				.I(1),
+			)
+			self.checkI1(&var m, move both.v, .Abort)
+		}
+		val arithmetic: Arithmetic = match op {
+			.Add => .Add
+			.Sub => .Sub
+			.Mul => .Mul
+			// A divisor of zero, and the most negative number divided by -1,
+			// were checked before, and past 64 bits just above.
+			.Div => if unsigned then Arithmetic::UDiv else Arithmetic::SDiv
+			.Rem => if unsigned then Arithmetic::URem else Arithmetic::SRem
+			.BitAnd => .And
+			.BitOr => .Or
+			.BitXor => .Xor
+			.Shl | .Shr => {
+				// The amount is taken modulo the width, which LLVM leaves
+				// undefined past it.
+				val masked = self.value(
+					.Arithmetic(
+						op: .And,
+						wrap: .None,
+						left: move right,
+						right: .Int((bits - 1) as i64),
+					),
+					t.clone(),
+				)
+				val shift: Arithmetic =
+					if op == BinaryOp::Shl then .Shl else if unsigned then .LShr else .AShr
+				return self.value(
+					.Arithmetic(op: shift, wrap: .None, left: move l, right: move masked.v),
+					move t,
+				)
+			}
+			.And | .Or => panic("`&&` and `||` are branches in MIR")
+			_ => panic("compared above")
+		}
+		return self.value(
+			.Arithmetic(op: arithmetic, wrap: .None, left: move l, right: move right.v),
+			move t,
+		)
+	}
+
+	/// `operand as to`.
+	var fn cast(m: &var Llvm, operand: &Operand, to: Ty): Val = {
+		val from = asNumber(m.kind(self.operandTy(&m, &operand)))
+		val .Some(target) = m.lt(to) else {
+			panic("casts are between scalar types")
+		}
+		val value = self.operand(&var m, &operand)
+		val toKind = asNumber(m.kind(to))
+		if from is .Int(int: a) && toKind is .Int(int: b) {
+			if a.bits() < b.bits() {
+				val extend: Cast = if a.signed() then .SExt else .ZExt
+				return self.value(
+					.Cast(cast: extend, value: move value, to: target.clone()),
+					move target,
+				)
+			}
+			if a.bits() > b.bits() then
+				return self.value(
+					.Cast(cast: .Trunc, value: move value, to: target.clone()),
+					move target,
+				)
+			return move value
+		}
+		if from is .Int(int: a) && toKind is .Float(..) {
+			val conversion: Cast = if a.signed() then .SiToFp else .UiToFp
+			return self.value(
+				.Cast(cast: conversion, value: move value, to: target.clone()),
+				move target,
+			)
+		}
+		// Toward zero, saturating at the ends of the range, NaN to 0: what
+		// LLVM's saturating conversion does.
+		if from is .Float(..) && toKind is .Int(int: b) {
+			val name = if b.signed() then "fptosi" else "fptoui"
+			val (ft, suffix) = floatNames(value.t.clone())
+			val t = target.text()
+			return self.intrinsicValue(
+				&var m,
+				"@llvm.\(name).sat.\(t).\(suffix)",
+				move target,
+				Vec::of(own [move value]),
+			)
+		}
+		if from is .Float(float: .F32) && toKind is .Float(float: .F64) then
+			return self.value(
+				.Cast(cast: .FpExt, value: move value, to: target.clone()),
+				move target,
+			)
+		if from is .Float(float: .F64) && toKind is .Float(float: .F32) then
+			return self.value(
+				.Cast(cast: .FpTrunc, value: move value, to: target.clone()),
+				move target,
+			)
+		// A pointer and the number it is, an `own` as a pointer: the same word.
+		val v = self.convert(&value, target.clone())
+		return Val(v: move v, t: move target)
+	}
+
+	// Calls.
+
+	/// A call: an aggregate argument by the address of its place, an aggregate
+	/// result written to the address of `dest`.
+	var fn call(m: &var Llvm, callee: &Callee, args: &[Operand], dest: &Option<Place>) = {
+		val program = m.program
+		if callee is .Fn(id) {
+			val def = &program.fns[id]
+			// A variable C owns: a load, or a store.
+			if def.accesses is .Some(.Global(id: global)) && !m.shimmed.contains(&id) {
+				val symbol = Value::Global(m.cGlobal(global))
+				val ty = program.globals[global].ty
+				val .Some(lt) = m.lt(ty) else {
+					panic("C's variable is a scalar")
+				}
+				val align = self.align(&var m, ty)
+				if args.len() == 1 {
+					val given = self.operand(&var m, &args[0])
+					val v = self.coerce(&given, lt.clone())
+					val stored = Val(v: move v, t: move lt)
+					self.store(&stored, move symbol, align)
+				} else {
+					val value = self.load(move symbol, move lt, align)
+					val .Some(d) = dest else {
+						panic("a read has a destination")
+					}
+					self.write(&var m, &d, &value)
+				}
+				return
+			}
+			// More arguments than the declaration names, made as LLVM's own
+			// variadic call.
+			if def.variadicOf is .Some(original) && !m.shimmed.contains(&id) {
+				self.variadicCall(&var m, id, original, &args, &dest)
+				return
+			}
+			if m.cCall(id) is .Some(cCall) {
+				self.cCall(&var m, id, &cCall, &args, &dest)
+				return
+			}
+		}
+		var params: Vec<Ty> = Vec()
+		var ret = I64
+		var cAbi = true
+		match callee {
+			.StrCmp => { params = Vec::of(own [STR, STR]) }
+			.Fn(id) => {
+				val def = &program.fns[id]
+				for p in def.params {
+					params.push(p.ty)
+				}
+				ret = def.ret
+				cAbi = usesCAbi(&def)
+			}
+			.Value(value) => {
+				val .Fn(params: list, ret: answer) = m.kind(self.operandTy(&m, &value)) else {
+					panic("a value that is called has a function type")
+				}
+				for t in program.types.list(list) {
+					params.push(t)
+				}
+				ret = answer
+				cAbi = false
+			}
+		}
+		// A named function's call is made with its own signature, as its
+		// definition has it.
+		val sig = match callee {
+			.Fn(id) => m.signature(id)
+			_ => m.indirectSignature(&params, ret, cAbi)
+		}
+		var values: Vec<Val> = Vec()
+		if sig.sret {
+			val .Some(d) = dest else {
+				panic("an aggregate result has a destination")
+			}
+			values.push(Val(v: self.placeAddr(&var m, &d), t: .Ptr))
+		}
+		for arg in args {
+			val ty = self.operandTy(&m, &arg)
+			if cAbi && m.isCPair(ty) {
+				val .Copy(place) = arg else {
+					panic("a pointer-and-length operand is a place")
+				}
+				val addr = self.placeAddr(&var m, &place)
+				val pointer = self.load(addr.clone(), .Ptr, 8)
+				val at = self.gep(move addr, 8)
+				val length = self.load(move at, .I(64), 8)
+				values.push(move pointer)
+				values.push(move length)
+			} else if m.isAggregate(ty) {
+				val .Copy(place) = arg else {
+					panic("an aggregate operand is a place")
+				}
+				values.push(Val(v: self.placeAddr(&var m, &place), t: .Ptr))
+			} else if m.lt(ty) == .None {
+				// A value with no size, `void`, which a generic function takes
+				// as it takes any `T`: the signature gives it a pointer, which
+				// the callee never reads.
+				values.push(Val::of(.Zero, .Ptr))
+			} else {
+				values.push(self.operand(&var m, &arg))
+			}
+		}
+		val target: Value = match callee {
+			.StrCmp => {
+				val id = m.runtime("wip_str_cmp")
+				.Global(m.symbol(id))
+			}
+			.Fn(id) => .Global(m.symbol(id))
+			.Value(value) => {
+				val given = self.operand(&var m, &value)
+				self.coerce(&given, .Ptr)
+			}
+		}
+		val answer = self.emitCall(move target, &sig, move values)
+		if !sig.sret && answer is .Some(a) && dest is .Some(d) then self.write(&var m, &d, &a)
+	}
+
+	/// A call of a function C passes a struct by value to, or answers one
+	/// from, made as `cCall` says.
+	var fn cCall(m: &var Llvm, id: FnId, cCall: &CCall, args: &[Operand], dest: &Option<Place>) = {
+		val sig = m.signature(id)
+		val defRet = m.program.fns[id].ret
+		var values: Vec<Val> = Vec()
+		if cCall.ret == Answer::Hidden {
+			val .Some(d) = dest else {
+				panic("an aggregate result has a destination")
+			}
+			values.push(Val(v: self.placeAddr(&var m, &d), t: .Ptr))
+		}
+		for (i, pass) in cCall.params.forwards().enumerate() {
+			if i >= args.len() then break
+			val arg = &args[i]
+			val ty = self.operandTy(&m, &arg)
+			match pass {
+				.Parts(parts) | .Spilled(parts, ..) => {
+					if pass is .Spilled(pad, ..) {
+						for _ in 0..pad.ints {
+							values.push(Val::of(.Int(0), .I(64)))
+						}
+						for _ in 0..pad.floats {
+							values.push(Val::of(.Zero, .F64))
+						}
+					}
+					// Copied to a slot as large as the pieces, which may reach
+					// past the struct's own bytes.
+					val argPlace = placeOf(&arg)
+					val src = self.placeAddr(&var m, &argPlace)
+					val scratch = self.scratch(&var m, ty, &parts)
+					val size = m.layout(ty).size
+					self.memmove(&var m, scratch.clone(), move src, size)
+					for part in parts {
+						val at = self.gep(scratch.clone(), part.offset as i64)
+						values.push(self.load(move at, regType(part.reg.clone()), 1))
+					}
+				}
+				.Copy => {
+					val argPlace = placeOf(&arg)
+					val src = self.placeAddr(&var m, &argPlace)
+					val layout = m.layout(ty)
+					val copy = self.alloca(layout.size, layout.align)
+					self.memmove(&var m, copy.clone(), move src, layout.size)
+					values.push(Val(v: move copy, t: .Ptr))
+				}
+				.Stack(..) => {
+					val argPlace = placeOf(&arg)
+					values.push(Val(v: self.placeAddr(&var m, &argPlace), t: .Ptr))
+				}
+				.Plain => {
+					if m.isCPair(ty) {
+						val argPlace = placeOf(&arg)
+						val addr = self.placeAddr(&var m, &argPlace)
+						val pointer = self.load(addr.clone(), .Ptr, 8)
+						val at = self.gep(move addr, 8)
+						val length = self.load(move at, .I(64), 8)
+						values.push(move pointer)
+						values.push(move length)
+					} else {
+						values.push(self.operand(&var m, &arg))
+					}
+				}
+			}
+		}
+		val target = m.symbol(id)
+		var typed: Vec<Arg> = Vec()
+		for (i, value) in values.forwards().enumerate() {
+			if i >= sig.params.len() then break
+			val slot = &sig.params[i]
+			val v = self.coerce(&value, slot.t.clone())
+			typed.push(Arg(value: Val::of(move v, slot.t.clone()), attrs: slot.attrs.clone()))
+		}
+		val call = Call(
+			ret: sig.retType(),
+			retAttrs: sig.retAttrs(),
+			variadic: .None,
+			callee: .Global(move target),
+			args: move typed,
+		)
+		match cCall.ret {
+			// The pieces, stored where they belong through a slot as large as
+			// all of them.
+			.Parts(parts) => {
+				val ty = partsType(&parts)
+				val both = self.value(.Call(own move call), move ty)
+				val scratch = self.scratch(&var m, defRet, &parts)
+				for (i, part) in parts.forwards().enumerate() {
+					val t = regType(part.reg.clone())
+					val piece = self.value(
+						.ExtractValue(aggregate: both.clone(), index: i as u32),
+						move t,
+					)
+					val at = self.gep(scratch.clone(), part.offset as i64)
+					self.store(&piece, move at, 1)
+				}
+				val .Some(d) = dest else {
+					panic("an aggregate result has a destination")
+				}
+				val to = self.placeAddr(&var m, &d)
+				val size = m.layout(defRet).size
+				self.memmove(&var m, move to, move scratch, size)
+			}
+			.Hidden => self.emit(.Call(own move call))
+			.Plain => match sig.ret {
+				.Some(slot) => {
+					val answer = self.value(.Call(own move call), slot.t.clone())
+					if dest is .Some(d) then self.write(&var m, &d, &answer)
+				}
+				.None => self.emit(.Call(own move call))
+			}
+		}
+	}
+
+	/// A slot for a struct that travels in registers: as large as the struct,
+	/// and as the pieces it is loaded as.
+	var fn scratch(m: &var Llvm, ty: Ty, parts: &[Part]): Value = {
+		val layout = m.layout(ty)
+		var reaches: u32 = 0
+		for part in parts {
+			val end = part.offset + if part.reg == Reg::F32 then 4 else 8
+			if end > reaches then reaches = end
+		}
+		return self.alloca(layout.size.max(reaches), 8)
+	}
+
+	/// A call that passes more than the declaration names: the named arguments
+	/// as they always go, and the rest promoted as C promotes them, in LLVM's
+	/// variadic call, which puts them where the target's C does.
+	var fn variadicCall(
+		m: &var Llvm,
+		id: FnId,
+		original: FnId,
+		args: &[Operand],
+		dest: &Option<Place>,
+	) = {
+		val program = m.program
+		val named = program.fns[original].params.len()
+		val sig = m.signature(original)
+		val target = m.symbol(original)
+		var typed: Vec<Arg> = Vec()
+		var slot = 0
+		for i in 0..named {
+			val arg = &args[i]
+			val ty = self.operandTy(&m, &arg)
+			if m.isCPair(ty) {
+				val .Copy(place) = arg else {
+					panic("a pointer-and-length operand is a place")
+				}
+				val addr = self.placeAddr(&var m, &place)
+				val pointer = self.load(addr.clone(), .Ptr, 8)
+				val at = self.gep(move addr, 8)
+				val length = self.load(move at, .I(64), 8)
+				typed.push(Arg::of(move pointer))
+				typed.push(Arg::of(move length))
+				slot += 2
+				continue
+			}
+			val value = self.operand(&var m, &arg)
+			val param = &sig.params[slot]
+			val v = self.coerce(&value, param.t.clone())
+			typed.push(Arg(value: Val::of(move v, param.t.clone()), attrs: param.attrs.clone()))
+			slot += 1
+		}
+		for i in named..args.len() {
+			val arg = &args[i]
+			val ty = self.operandTy(&m, &arg)
+			val value = self.operand(&var m, &arg)
+			match promoted(program, ty) {
+				.Some(.Double) => {
+					val v =
+						if value.t is .F32 then
+							self.value(
+								.Cast(cast: .FpExt, value: value.clone(), to: .F64),
+								.F64,
+							).take()
+						else value.v.clone()
+					typed.push(Arg::of(Val::of(move v, .F64)))
+				}
+				.Some(.Int(bits, signed)) => {
+					val v = if value.t is .I(from) && from < bits {
+						val extend: Cast = if signed then .SExt else .ZExt
+						self.value(
+							.Cast(cast: extend, value: value.clone(), to: .I(bits)),
+							.I(bits),
+						).take()
+					} else {
+						value.v.clone()
+					}
+					val t: Type = if value.t == Type::Ptr then .Ptr else .I(bits)
+					typed.push(Arg::of(Val::of(move v, move t)))
+				}
+				.None => panic("a scalar extra argument")
+			}
+		}
+		// A function's type names types alone: what C's ABI asks of a parameter
+		// is said of its argument, and of the result before the type.
+		var namedTypes: Vec<Type> = Vec()
+		for p in sig.params {
+			namedTypes.push(p.t.clone())
+		}
+		val call = Call(
+			ret: sig.retType(),
+			retAttrs: sig.retAttrs(),
+			variadic: .Some(move namedTypes),
+			callee: .Global(move target),
+			args: move typed,
+		)
+		match sig.ret {
+			.Some(s) => {
+				val answer = self.value(.Call(own move call), s.t.clone())
+				if dest is .Some(d) then self.write(&var m, &d, &answer)
+			}
+			.None => self.emit(.Call(own move call))
+		}
+	}
+
+	/// A call of a function of the program by its signature, with the values
+	/// already split as it takes them.
+	var fn callValues(m: &var Llvm, id: FnId, values: Vec<Val>): Option<Val> = {
+		val sig = m.signature(id)
+		val target = m.symbol(id)
+		return self.emitCall(.Global(move target), &sig, move values)
+	}
+
+	var fn emitCall(target: Value, sig: &Sig, values: Vec<Val>): Option<Val> = {
+		if values.len() != sig.params.len() then panic("a call passes what its callee takes")
+		var args: Vec<Arg> = Vec()
+		for (i, value) in values.forwards().enumerate() {
+			val slot = &sig.params[i]
+			val v = self.coerce(&value, slot.t.clone())
+			args.push(Arg(value: Val::of(move v, slot.t.clone()), attrs: slot.attrs.clone()))
+		}
+		val call = Call(
+			ret: sig.retType(),
+			retAttrs: sig.retAttrs(),
+			variadic: .None,
+			callee: move target,
+			args: move args,
+		)
+		return match sig.ret {
+			.Some(slot) => .Some(self.value(.Call(own move call), slot.t.clone()))
+			.None => {
+				self.emit(.Call(own move call))
+				Option::None
+			}
+		}
+	}
+
+	// Terminators.
+
+	var fn terminator(m: &var Llvm, terminator: &Terminator) = match terminator {
+		.Goto(target) => self.emit(.Br(.Block(target.index)))
+		.Branch(cond, thenBlock, otherwise) => {
+			val value = self.operand(&var m, &cond)
+			val flag = self.value(.IntCompare(cond: .Ne, left: move value, right: .Int(0)), .I(1))
+			self.emit(.CondBr(
+				condition: move flag.v,
+				ifTrue: .Block(thenBlock.index),
+				ifFalse: .Block(otherwise.index),
+				weights: .None,
+			))
+		}
+		.Switch(value, cases, otherwise) => {
+			val given = self.operand(&var m, &value)
+			val word = self.coerce(&given, .I(32))
+			var written: Vec<(i64, Label)> = Vec()
+			for (case, target) in cases {
+				written.push(((case as i32) as i64, .Block(target.index)))
+			}
+			self.emit(.Switch(
+				value: Val::of(move word, .I(32)),
+				otherwise: .Block(otherwise.index),
+				cases: move written,
+			))
+		}
+		.Return => {
+			val body = self.body
+			if body.ret is .Some(ret) &&
+				!m.isAggregate(body.local(ret).ty) &&
+				m.lt(body.local(ret).ty).isSome() {
+				val ty = body.local(ret).ty
+				val read = Operand::Copy(Place::of(ret))
+				val value = self.operand(&var m, &read)
+				val .Some(slot) = m.slot(ty) else {
+					panic("a scalar result")
+				}
+				val v = self.coerce(&value, slot.t.clone())
+				self.emit(.Ret(.Some(Val::of(move v, slot.t.clone()))))
+			} else {
+				self.emit(.Ret(.None))
+			}
+		}
+		.Panic(note, message, at) => {
+			val text = match message {
+				.Some(written) => String::of(m.interner.resolve(written))
+				.None => String()
+			}
+			val data = m.text(text.toStr())
+			val said = Vec::of(own [
+				Val::of(.Global(move data), .Ptr),
+				Val::of(.Int(text.len() as i64), .I(64)),
+			])
+			match note {
+				.None => self.panicCall(&var m, "wip_panic", move said, at)
+				.Some(.Copy(place)) => {
+					val addr = self.placeAddr(&var m, &place)
+					val pointer = self.load(addr.clone(), .Ptr, 8)
+					val atLength = self.gep(move addr, 8)
+					val length = self.load(move atLength, .I(64), 8)
+					var numbers = Vec::of(own [move pointer, move length])
+					for v in move said {
+						numbers.push(move v)
+					}
+					self.panicCall(&var m, "wip_panic_noted", move numbers, at)
+				}
+				.Some(.Const(..)) => panic("a note is a place")
+			}
+			self.emit(.Unreachable)
+		}
+		.Unreachable => self.emit(.Unreachable)
+	}
+}
+
+/// The place an aggregate operand is.
+fn placeOf(operand: &Operand): Place = match operand {
+	.Copy(place) => place.clone()
+	.Const(..) => panic("an aggregate operand is a place")
+}
+
+/// What a reference refers to.
+fn refInner(m: &Llvm, ty: Ty): Ty = match m.kind(ty) {
+	.Ref(inner, ..) => inner
+	_ => ty
+}
+
+/// A `char` as the number it is.
+fn asNumber(kind: TyKind): TyKind = if kind is .Char then .Int(.U32) else kind
+
+/// The intrinsic that answers whether `+`, `-` or `*` fits, by sign.
+fn overflowIntrinsic(op: BinaryOp, signed: bool): str = match op {
+	.Add => if signed then "sadd" else "uadd"
+	.Sub => if signed then "ssub" else "usub"
+	.Mul => if signed then "smul" else "umul"
+	_ => panic("only `+`, `-` and `*` overflow")
+}
+
+/// Bits as the signed number they are, which LLVM takes for every width.
+fn signed(bits: u128, width: u32): i128 = {
+	if width >= 128 then return bits as i128
+	val shift = 128 - width
+	return ((bits << shift) as i128) >> shift
+}
+
+/// The struct an intrinsic answers a value of type `t` in, with a flag: an
+/// overflow's, or a compare-and-swap's.
+fn withFlag(t: Type): Type = structOf(Vec::of(own [move t, Type::I(1)]), false)
+
+/// A float's LLVM type and the suffix its intrinsics take.
+fn floatNames(t: Type): (str, str) = if t is .F32 then ("float", "f32") else ("double", "f64")
+
+/// Which arithmetic a panic is about, as the runtime's message names it.
+fn overflowCode(op: BinaryOp): i64 = match op {
+	.Add => 0
+	.Sub => 1
+	.Mul => 2
+	_ => 3
+}
+
+/// The types of `values`, in order.
+fn typesOf(values: &[Val]): Vec<Type> = {
+	var types: Vec<Type> = Vec()
+	for value in values {
+		types.push(value.t.clone())
+	}
+	return move types
+}

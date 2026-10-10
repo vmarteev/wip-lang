@@ -1,0 +1,392 @@
+// The documentation as pages: an index, a page per module, and a page per
+// type with methods, in plain HTML and one stylesheet, readable from the
+// disk.
+
+import std::fs
+import std::path
+
+/// Writes every page of `docs` under `dir`, and answers how many pages were
+/// written.
+pub fn writeSite(docs: &Docs, dir: str): Result<i64, String> = {
+	val site = Site(docs: &docs)
+	var pages: Vec<(String, String)> = Vec()
+	pages.push((String::of("index.html"), site.index()))
+	for module in docs.modules {
+		pages.push((moduleFile(&module), site.modulePage(&module)))
+		for file in module.files {
+			for item in file.items {
+				if item.hasPage() then
+					pages.push((itemFile(&module, &item), site.itemPage(&module, &file, &item)))
+			}
+		}
+	}
+	pages.push((String::of("style.css"), String::of(STYLE)))
+	for (page, text) in pages {
+		val file = path::join(dir, page.toStr())
+		val parent = path::parent(file.toStr())
+		if fs::makeDirs(parent) is .Err(error) then return .Err("cannot create \(parent): \(error)")
+		if fs::writeFile(file.toStr(), text.toStr()) is .Err(error) then
+			return .Err("cannot write \(file): \(error)")
+	}
+	return .Ok(pages.len() - 1)
+}
+
+/// A module's page: `std/collections.html`, and `program.html` for a
+/// program's root.
+fn moduleFile(module: &Module): String =
+	if module.path.isEmpty() then String::of("program.html")
+	else "\(module.path.replace("::", "/")).html"
+
+/// A type's page, in its module's directory: `std/collections/Map.html`.
+fn itemFile(module: &Module, item: &DocItem): String = {
+	val dir =
+		if module.path.isEmpty() then String::of("program") else module.path.replace("::", "/")
+	return "\(dir)/\(fileName(item.name.toStr())).html"
+}
+
+/// A name as a file's: `[T]` is `slice`.
+fn fileName(name: str): String = {
+	if name.startsWith("[") then return String::of("slice")
+	var out = String()
+	for c in name.chars() {
+		out.pushChar(if c.isAlphanumeric() || c == '_' then c else '-')
+	}
+	return move out
+}
+
+/// The way from a page back to the site's root: `../` for each directory it
+/// is in.
+fn rootFrom(page: str): String = {
+	var depth = 0
+	for part in page.split("/") {
+		if !part.isEmpty() then depth += 1
+	}
+	return String::of("../").repeat(if depth > 0 then depth - 1 else 0)
+}
+
+view struct Site {
+	docs: &Docs
+}
+
+extend Site {
+	fn page(file: str, title: str, trail: str, body: str): String = {
+		val root = rootFrom(file)
+		return "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>\(escape(title))</title>\n<link rel=\"stylesheet\" href=\"\(root)style.css\">\n</head>\n<body>\n<nav><a href=\"\(root)index.html\">index</a>\(trail)</nav>\n<main>\n\(body)</main>\n</body>\n</html>\n"
+	}
+
+	fn index(): String = {
+		var body = String::of("<h1>Documentation</h1>\n")
+		for (group, heading) in [
+			(Group::Program, "The program"),
+			(Group::Dependency, "Packages it depends on"),
+			(Group::Std, "The standard library"),
+		] {
+			var listed = false
+			for module in self.docs.modules {
+				if module.group != group then continue
+				if !listed {
+					body.push("<h2>\(heading)</h2>\n<ul class=\"modules\">\n")
+					listed = true
+				}
+				var about = String()
+				for f in module.files {
+					val sentence = firstSentence(f.about.toStr())
+					if !sentence.isEmpty() {
+						about = move sentence
+						break
+					}
+				}
+				body.push("<li><a href=\"\(moduleFile(&module))\">\(escape(module.title()))</a> <span class=\"about\">\(inline(about.toStr()))</span></li>\n")
+			}
+			if listed then body.push("</ul>\n")
+		}
+		// Every item by name, which a browser's find searches.
+		var all: Vec<(String, String, String)> = Vec()
+		for module in self.docs.modules {
+			for file in module.files {
+				for item in file.items {
+					val href =
+						if item.hasPage() then itemFile(&module, &item)
+						else "\(moduleFile(&module))#\(anchor(item.name.toStr()))"
+					all.push((item.name.clone(), String::of(module.title()), move href))
+				}
+			}
+		}
+		all.sortBy((a, b) => {
+			val left = a.0.toLowercase()
+			val right = b.0.toLowercase()
+			return left < right || left == right && a.1 < b.1
+		})
+		body.push("<h2>Every item</h2>\n<ul class=\"every\">\n")
+		for (name, module, href) in all {
+			body.push("<li><a href=\"\(href)\"><code>\(escape(name.toStr()))</code></a> <span class=\"about\">\(escape(module.toStr()))</span></li>\n")
+		}
+		body.push("</ul>\n")
+		return self.page("index.html", "Documentation", "", body.toStr())
+	}
+
+	fn modulePage(module: &Module): String = {
+		val file = moduleFile(&module)
+		val root = rootFrom(file.toStr())
+		var body = "<h1>\(escape(module.title()))</h1>\n"
+		for f in module.files {
+			if f.items.isEmpty() && f.about.isEmpty() then continue
+			body.push("<section class=\"file\">\n<h2 class=\"file\">\(escape(f.name.toStr()))</h2>\n")
+			body.push(prose(f.about.toStr()))
+			for item in f.items {
+				body.push(self.itemSummary(&module, &item, root.toStr(), &f))
+			}
+			body.push("</section>\n")
+		}
+		val trail = " › \(escape(module.title()))"
+		return self.page(file.toStr(), module.title(), trail.toStr(), body.toStr())
+	}
+
+	/// An item on its module's page: whole, or, for a type with a page of its
+	/// own, its declaration and first paragraph, linked.
+	fn itemSummary(module: &Module, item: &DocItem, root: str, file: &DocFile): String = {
+		var out = "<article id=\"\(anchor(item.name.toStr()))\">\n"
+		// A type with a page of its own: its name in the declaration links
+		// there, as any type's name does.
+		if item.hasPage() {
+			out.push("<pre class=\"decl\">\(self.decl(&module, &file, item.decl.toStr(), root))</pre>\n")
+			out.push(prose(firstParagraph(item.doc.toStr())))
+		} else {
+			out.push(self.itemBody(&module, &item, root, &file))
+		}
+		out.push("</article>\n")
+		return move out
+	}
+
+	fn itemPage(module: &Module, home: &DocFile, item: &DocItem): String = {
+		val file = itemFile(&module, &item)
+		val root = rootFrom(file.toStr())
+		var body = "<h1>\(escape(item.name.toStr()))</h1>\n"
+		body.push(self.itemBody(&module, &item, root.toStr(), &home))
+		val trail = " › <a href=\"\(root)\(moduleFile(&module))\">\(escape(module.title()))</a> › \(escape(item.name.toStr()))"
+		return self.page(file.toStr(), item.name.toStr(), trail.toStr(), body.toStr())
+	}
+
+	/// An item whole: its declaration, its documentation, its fields or
+	/// variants, what it implements, and its methods.
+	fn itemBody(module: &Module, item: &DocItem, root: str, file: &DocFile): String = {
+		var out = "<pre class=\"decl\">\(self.decl(&module, &file, item.decl.toStr(), root))</pre>\n"
+		out.push(prose(item.doc.toStr()))
+		if !item.members.isEmpty() {
+			val heading = match item.kind {
+				.Enum => "Variants"
+				.Interface => "Methods"
+				_ => "Fields"
+			}
+			out.push("<h3>\(heading)</h3>\n")
+			out.push(self.members(&module, &file, &item.members, root))
+		}
+		if !item.implements.isEmpty() {
+			var names: Vec<String> = Vec()
+			for i in item.implements {
+				names.push("<code>\(self.decl(&module, &file, i.toStr(), root))</code>")
+			}
+			out.push("<p class=\"implements\">Implements \(names.join(", ")).</p>\n")
+		}
+		for group in item.methods {
+			if group.methods.isEmpty() then continue
+			match group.header {
+				.Some(
+					header,
+				) => out.push("<h3>Methods <code>\(self.decl(&module, &file, header.toStr(), root))</code></h3>\n")
+				.None => out.push("<h3>Methods</h3>\n")
+			}
+			out.push(self.members(&module, &file, &group.methods, root))
+		}
+		return move out
+	}
+
+	fn members(module: &Module, file: &DocFile, members: &[Member], root: str): String = {
+		var out = String::of("<dl class=\"members\">\n")
+		for m in members {
+			out.push("<dt id=\"\(anchor(m.name.toStr()))\"><code>\(self.decl(&module, &file, m.decl.toStr(), root))</code></dt>\n<dd>\(prose(m.doc.toStr()))</dd>\n")
+		}
+		out.push("</dl>\n")
+		return move out
+	}
+
+	/// A declaration, escaped, with each type's name that is documented
+	/// linked to it.
+	fn decl(module: &Module, file: &DocFile, text: str, root: str): String = {
+		var out = String()
+		var word = String()
+		for c in text.chars() {
+			if c.isAlphanumeric() || c == '_' {
+				word.pushChar(c)
+			} else {
+				self.flush(&module, &file, &var word, &var out, root)
+				out.push(escape(c.toString().toStr()))
+			}
+		}
+		self.flush(&module, &file, &var word, &var out, root)
+		return move out
+	}
+
+	/// The word `decl` has gathered, put out: linked where it names a type
+	/// that is documented, and then begun again.
+	fn flush(module: &Module, file: &DocFile, word: &var String, out: &var String, root: str) = {
+		if word.isEmpty() then return
+		match self.find(&module, &file, word.toStr()) {
+			.Some(href) => out.push("<a href=\"\(root)\(href)\">\(escape(word.toStr()))</a>")
+			.None => out.push(escape(word.toStr()))
+		}
+		word.clear()
+	}
+
+	/// Where a type of this name is documented, found as the checker finds a
+	/// type's name: the module's own, what the file imports, then the
+	/// prelude's.
+	fn find(module: &Module, file: &DocFile, name: str): Option<String> = {
+		if typed(&module, name) is .Some(href) then return .Some(move href)
+		for (imported, from) in file.imports {
+			if imported != name then continue
+			for m in self.docs.modules {
+				if m.path == from {
+					if typed(&m, name) is .Some(href) then return .Some(move href)
+					break
+				}
+			}
+			break
+		}
+		for m in self.docs.modules {
+			if m.path == "std::prelude" then return typed(&m, name)
+		}
+		return .None
+	}
+}
+
+/// Where in `module` a type named `name` is documented, if it is: its page,
+/// or its place on the module's.
+fn typed(module: &Module, name: str): Option<String> = {
+	for file in module.files {
+		for item in file.items {
+			if item.name != name || item.kind == .Function || item.kind == .Constant then continue
+			return .Some(
+				if item.hasPage() then itemFile(&module, &item)
+				else "\(moduleFile(&module))#\(anchor(item.name.toStr()))",
+			)
+		}
+	}
+	return .None
+}
+
+/// An item's anchor: its name, as an HTML id can hold it.
+fn anchor(name: str): String = fileName(name)
+
+fn escape(text: str): String = text.replace("&", "&amp;").
+	replace("<", "&lt;").
+	replace(">", "&gt;").
+	replace("\"", "&quot;")
+
+/// A comment's text as HTML: paragraphs parted by a blank line, a line
+/// indented four spaces a code example, and `code` code. Nothing else is
+/// markup.
+fn prose(text: str): String = {
+	var out = String()
+	var paragraph: Vec<str> = Vec()
+	var code: Vec<str> = Vec()
+	for line in text.lines() {
+		if line.stripPrefix("    ") is .Some(rest) {
+			flushParagraph(&var paragraph, &var out)
+			code.push(rest)
+		} else if trimSpace(line).isEmpty() {
+			flushParagraph(&var paragraph, &var out)
+			flushCode(&var code, &var out)
+		} else {
+			flushCode(&var code, &var out)
+			paragraph.push(trimSpace(line))
+		}
+	}
+	flushParagraph(&var paragraph, &var out)
+	flushCode(&var code, &var out)
+	return move out
+}
+
+/// The lines of a paragraph `prose` has gathered, put out as one.
+fn flushParagraph(paragraph: &var Vec<str>, out: &var String) = {
+	if paragraph.isEmpty() then return
+	out.push("<p>\(inline(paragraph.join(" ").toStr()))</p>\n")
+	paragraph.clear()
+}
+
+/// The lines of an example `prose` has gathered, put out as one.
+fn flushCode(code: &var Vec<str>, out: &var String) = {
+	if code.isEmpty() then return
+	out.push("<pre class=\"example\">\(escape(code.join("\n").toStr()))</pre>\n")
+	code.clear()
+}
+
+/// One line of prose: escaped, with what is between backticks as code.
+fn inline(text: str): String = {
+	var out = String()
+	for (i, piece) in text.split("`").enumerate() {
+		if i % 2 == 1 then out.push("<code>\(escape(piece))</code>") else out.push(escape(piece))
+	}
+	return move out
+}
+
+fn firstParagraph(text: str): str = match text.split("\n\n").next() {
+	.Some(first) => first
+	.None => ""
+}
+
+/// What a module's index line says of it: its first file's first sentence.
+fn firstSentence(text: str): String = {
+	var lines: Vec<str> = Vec()
+	for line in text.lines() {
+		if trimSpace(line).isEmpty() then break
+		lines.push(line)
+	}
+	val joined = lines.join(" ")
+	return match joined.find(". ") {
+		.Some(end) => String::of(joined[0..end + 1])
+		.None => move joined
+	}
+}
+
+val STYLE: str = """
+	:root {
+	  --bg: #fdfdfc; --fg: #1d1d1b; --muted: #6b6b66; --line: #e4e4df;
+	  --code-bg: #f3f3ef; --link: #2b5fb4; --accent: #8a5a00;
+	}
+	@media (prefers-color-scheme: dark) {
+	  :root {
+	    --bg: #17181a; --fg: #e6e6e3; --muted: #9a9a94; --line: #2c2d30;
+	    --code-bg: #212226; --link: #7aa7f0; --accent: #e0b25c;
+	  }
+	}
+	* { box-sizing: border-box; }
+	body {
+	  margin: 0; background: var(--bg); color: var(--fg);
+	  font: 16px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+	}
+	nav {
+	  padding: 10px 24px; border-bottom: 1px solid var(--line);
+	  color: var(--muted); font-size: 14px;
+	}
+	main { max-width: 860px; margin: 0 auto; padding: 8px 24px 64px; }
+	a { color: var(--link); text-decoration: none; }
+	a:hover { text-decoration: underline; }
+	h1 { font-size: 28px; margin: 24px 0 8px; }
+	h2 { font-size: 20px; margin: 32px 0 8px; }
+	h2.file { color: var(--muted); font-size: 14px; font-weight: 600; letter-spacing: 0.02em; }
+	h3 { font-size: 16px; margin: 20px 0 6px; }
+	code, pre { font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
+	code { background: var(--code-bg); padding: 1px 4px; border-radius: 4px; }
+	pre { background: var(--code-bg); padding: 10px 12px; border-radius: 6px; overflow-x: auto; }
+	pre.decl { border-left: 3px solid var(--accent); }
+	pre code, dt code { background: none; padding: 0; }
+	article { margin: 18px 0 26px; }
+	section.file { border-top: 1px solid var(--line); margin-top: 28px; }
+	dl.members dt { margin-top: 12px; }
+	dl.members dd { margin: 4px 0 0 20px; color: var(--fg); }
+	dl.members dd p { margin: 4px 0; }
+	.about, .implements { color: var(--muted); }
+	ul.modules, ul.every { list-style: none; padding: 0; }
+	ul.modules li, ul.every li { margin: 4px 0; }\n
+	"""

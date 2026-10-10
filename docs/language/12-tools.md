@@ -13,6 +13,22 @@ wip fmt .                        # lay every .wip file out in one way
 wip debug game                   # the debugger, showing Wip's values as they are
 ```
 
+## Where it is
+
+`wip` is a directory: `bin/wip`, and beside it the standard library,
+`std/`, whose sources every program is compiled with, and `tools/`, the
+tools written in Wip that it builds the first time they are asked for.
+It finds them from where `bin/wip` is, its links followed: the nearest
+directory above it that holds `std/`. `WIP_HOME` names another.
+
+From a checkout of Wip's repository, `scripts/bootstrap.sh --out DIR`
+builds it into `DIR` with a `clang` 15 or newer and nothing of Wip's: the
+repository keeps the compiler, which is written in Wip, as LLVM's bitcode
+for each system, and `clang` compiles that into a first `wip`, which
+builds the compiler from its source. `scripts/build.sh --release --with
+WIP --out DIR` builds it from its source with a `wip` there is already.
+The `std/` and `tools/` beside either are links to the checkout's own.
+
 ## What is compiled
 
 `run`, `build`, `test`, `check`, `doc` and `mir` read a *program*, not a
@@ -34,8 +50,8 @@ wip test engine                  # each package's tests, in its own root
 wip test game
 ```
 
-The standard library is inside the compiler, so nothing is installed and
-nothing is fetched. There is no package manager and no build file: the
+The standard library is beside the compiler, so nothing is fetched. There
+is no package manager and no build file: the
 directories are the build, and a `package.wip` only names a package and
 says which others it uses.
 
@@ -47,14 +63,15 @@ says which others it uses.
 | `wip build file.wip` | writes an executable, named after the file unless `-o` says otherwise |
 | `wip build dir` | builds the package whose root is `dir`, named as the package names itself, into that root |
 | `wip test file.wip [filter]` | compiles the program with its `.test.wip` files and runs the `@test` functions; given a package, only that package's |
-| `wip check file.wip` | reports everything wrong, and writes nothing; given a package, every module of it, imported or not; `--target` checks as another target compiles the program |
+| `wip check file.wip` | reports everything wrong, and writes nothing; given a package, every module of it, imported or not; `--target` checks as another target compiles the program; `--dump-diagnostics` writes them plainly, [for a tool](#diagnostics); `--dump-hir` writes what the checker made of the program, [for a tool](#the-checked-program), and with `--library` the standard library's items too |
 | `wip fmt [paths]` | lays `.wip` files out in one way; `--check` writes nothing and fails if any would change; `-` formats standard input |
 | `wip doc [program]` | writes the program's documentation as pages, into `doc` unless `-o` says otherwise, with its packages' and the standard library's; `--std` the standard library's alone |
 | `wip doc path::to::item` | prints one item's documentation: `std::collections::Map`, `str::findLast` |
 | `wip debug program [args]` | starts lldb on a Mac, gdb elsewhere, or the one `--debugger` names, on a program `wip build` wrote, with the scripts that show Wip's values; `--scripts` prints where the scripts are |
 | `wip lsp` | serves an editor: the Language Server Protocol on standard input and output |
+| `wip cache clean` | removes everything `wip` keeps in its cache, and nothing else there ([below](#the-cache)) |
 | `wip bindgen header.h -o out.wip` | writes the `extern "C"` block for a C header, with clang ([page 11](11-c.md)) |
-| `wip mir file.wip` | prints the mid-level IR of every function |
+| `wip mir file.wip` | prints the mid-level IR [as a build compiles the program](#the-program-as-it-is-compiled); `--release` as a release build does; `--library` the standard library's own functions too |
 | `wip parse file.wip` | prints the syntax tree of one file |
 | `wip lex file.wip` | prints the tokens of one file |
 
@@ -83,21 +100,22 @@ and does not check moves. The program does the same either way: arithmetic
 that overflows, an index out of bounds and an `assert` that fails panic in
 both.
 
-A debug build's code is **Cranelift's**, which compiles fast. A release
-build's is **LLVM's** where there is a `clang` of version 15 or newer to
-compile it with — the one `WIP_CLANG` names, or `clang` — and Cranelift's
-where there is not, which the build says in a note:
+Every build's code is **LLVM's**, which a `clang` of version 15 or newer
+compiles — the one `WIP_CLANG` names, or `clang`. Where there is none, the
+build says so before it reads the program:
 
 ```
-note: built by Cranelift: `clang` is not a clang 15 or newer, or is not there; WIP_CLANG names one
+error: wip builds with a clang 15 or newer: `clang` is not a clang 15 or newer, or is not there; WIP_CLANG names one
 ```
 
-LLVM's code runs some two times faster, and takes longer to build: a
-program of eleven thousand lines takes six seconds, where Cranelift takes a
-quarter of one. `--backend cranelift` or `--backend llvm` chooses, for
-`build`, `run` and `test`; `llvm` is refused without a `clang` for it, and
-for a debug build, whose variables its code does not describe. The program
-does the same whichever builds it, and a panic lists the same calls.
+A debug build is compiled at `-O0`, in parts of about a megabyte of LLVM's
+IR, each compiled at once with the others and kept in the cache, so that a
+program built again after an edit compiles only the parts the edit
+changed: a program of ten thousand lines builds in half a second, and
+again after an edit in less. A release build is one part, which LLVM
+optimises across the whole program: it runs some two times faster, and
+takes some seconds to build. The program does the same either way, and a
+panic lists the same calls.
 
 Every build is for a **processor**, which `--cpu` names.
 By default it is the baseline of the machine's kind — x86-64-v2, which
@@ -116,7 +134,7 @@ lldb and gdb stop at `main.wip:12`, step by line, and name the function
 and line of every frame, and a profiler gives time to lines. A debug build
 describes its variables and parameters too, with their types: each is
 kept in memory while it is in scope, where the debugger shows it and may
-change it. A release build by LLVM describes them as well,
+change it. A release build describes them as well,
 where the optimised code keeps them: a variable whose value is in a
 register for part of its scope is shown there, one LLVM computed away is
 `<optimized out>`, and so is one it kept only in part — a `String` whose
@@ -151,18 +169,31 @@ On Linux a debug build keeps it in the program, and a release build moves it
 into `program.debug`, beside the program, which the program names and gdb
 reads; it takes `objcopy`, which comes with the C toolchain.
 
+`--no-debug-info` writes none, as `cc -g0` does: the program does what it
+does, and is smaller, but a panic says where it was without the calls
+that led there, and a debugger sees only the names of functions.
+
 `wip build` takes more:
 
 | Option | For |
 |---|---|
 | `-o name` | where to write it |
 | `-I dir`, `-L dir` | where C headers and libraries are on this machine |
-| `--emit program\|static\|dynamic` | an executable, or a library C links against |
+| `--emit program\|static\|dynamic\|llvm-ir\|llvm-bc` | an executable, a library C links against, or the program's LLVM IR, as text or as bitcode |
 | `--header board.h` | write the C declarations of what the library exports |
 | `--cpu baseline\|native\|level` | the processor it is for, as above |
+| `--no-debug-info` | write no debug information, as above |
 | `--time` | print how long each phase took |
 
 `--cpu` goes with `wip run` and `wip test` too, as `--release` does.
+
+`--emit llvm-ir` writes what the compiler hands LLVM, as text, and stops
+there: no `clang` is run, so it works on a machine without one. A release
+build is one module, `main.ll`; a debug build is cut into parts that are
+compiled at once, and writes each, `main.ll` and beside it `main.1.ll`,
+`main.2.ll` and on. `--emit llvm-bc` writes the same modules as LLVM's
+bitcode, which is what `clang` is given to compile: `main.bc`, and in a
+debug build `main.1.bc` and on.
 
 ## Formatting
 
@@ -358,15 +389,23 @@ them, which threads would otherwise wait on one another to do.
 | 2 | the entry could not be read |
 | 101 | it panicked, or a test failed |
 
-## The C cache
+## The cache
 
 C compiled with a program — a module's own files, and the shims the compiler
 writes — is cached by the compiler's identity, the flags, the file and the
 headers it reads. A second build compiles none of it again. What LLVM makes
-of a release build is kept the same way, by this compiler, the `clang`, the
-flags and the program's IR, so that a program built again unchanged takes no
-longer than Cranelift's. The cache is `$WIP_CACHE_DIR`, or the platform's
-cache directory when that is not set.
+of a program is kept the same way, by this compiler, the `clang`, the flags
+and the IR — a debug build's part by part — so that a program built again
+unchanged compiles none of it, and one built after an edit only what the
+edit changed. The cache is `$WIP_CACHE_DIR`, or the platform's cache
+directory when that is not set: `~/Library/Caches/wip` on a Mac, and
+`$XDG_CACHE_HOME/wip` or `~/.cache/wip` elsewhere.
+
+Nothing is ever removed from it by a build, and each edit to a debug build
+adds what it compiled, so it grows. `wip cache clean` empties it of what
+`wip` keeps there, and says how much that was; a build afterwards compiles
+everything again. It removes only the directories `wip` writes, so a
+`$WIP_CACHE_DIR` that names a directory holding more keeps the rest.
 
 ## Diagnostics
 
@@ -383,3 +422,64 @@ run reports everything it can. A diagnostic reads like this:
 
 The note says why the rule is there, which is the fastest way from an
 error to the reasoning.
+
+For a tool, `wip check --dump-diagnostics` writes them plainly on standard
+output, one fact a line: first each file they are in, in the order the
+program's files lie, then what each is, then each label by its place —
+`file:line:column-line:column`, the end just past what it covers — its
+notes and help, and its fix with each edit. A text that would break the
+line is written with escapes, `\n` and `\\`.
+
+```
+file main.wip
+error E0201 `twice` is defined more than once
+  primary main.wip:3:4-3:9 defined again here
+  secondary main.wip:1:4-1:9 first defined here
+error E0010 digits are separated by one `_`
+  primary main.wip:6:13-6:15 more than one `_`
+  fix keep one `_`
+  edit main.wip:6:13-6:15 _
+```
+
+### The checked program
+
+`wip check --dump-hir` writes what the checker made of the program on
+standard output, one fact a line, and what is wrong on standard error as
+`wip check` writes it. Each of the program's items comes with its
+signature, and each body with every expression: its kind, its type, and
+where it is, the item at `@file:line:column..line:column` and what is in
+it at `@line:column..line:column`. A name is written as what it became —
+a call as the function it calls, a local by its name and its number in
+the body, a field by its index and name — and a type with every type
+argument it has. Of the standard library, only the instances of its
+generic functions the program made are written, by name, unless
+`--library` asks for every item of it too. It is how two checkers are
+compared, and how to see what a line became.
+
+```
+fn norm(p: &Point): i64  @main.wip:5:1..5:24
+  param p#0: &Point  @5:9..5:10
+  value
+    if: i64  @5:27..5:56
+      binary <: bool  @5:30..5:37
+        field 0 x: i64  @5:30..5:33
+          deref: Point  @5:30..5:31
+            local p#0: &Point  @5:30..5:31
+        int 0: i64  @5:36..5:37
+```
+
+### The program as it is compiled
+
+`wip mir` writes the program's mid-level IR, the code every build compiles
+and the compiler runs where a constant is worked out: one statement a line,
+each function's locals, then its blocks. It writes the program's own
+constants first, each with its value once its code has run, as `--dump-hir`
+writes a value; then every function of the program's own modules, called or
+not, and every instance it made of a generic function, each as the build
+compiles it, with each `@inline` call spliced in; then the function that
+drops each type those drop, each once. The standard library's own
+functions are the same in every program and are left out, unless
+`--library` asks for them too. A debug build drops a struct by a
+call to the function that drops its type; with `--release`, what a release
+build compiles: each field dropped where it is, and a small struct's fields
+kept apart. A program with errors writes them, and no IR.

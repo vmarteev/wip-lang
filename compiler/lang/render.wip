@@ -1,0 +1,990 @@
+// Turns structured diagnostics into text. Nothing else in the compiler decides
+// how a diagnostic looks.
+//
+// A diagnostic is laid out as a header, `[E0301] Error: message`, then a
+// section for each file its labels are in, the primary's file first: the
+// file's name and the place the section is about, then each line a label
+// is on with its number, each label underlined, its message at the end of
+// a line drawn from the underline. A label over several lines is drawn in
+// the margin, from the line it begins on to the line it ends on. Help and
+// notes close the last section. The lines between two labels are left out,
+// one blank margin standing for them, or one `┆` inside a label of several
+// lines.
+
+import syntax::{Diagnostic, Label, Span}
+
+pub fn render(diagnostic: &Diagnostic, fileName: str, src: str, color: bool): String = {
+	val sources = Sources::single(String::of(fileName), String::of(src))
+	return renderOne(&diagnostic, &sources, color)
+}
+
+pub fn renderAll(diagnostics: &[Diagnostic], fileName: str, src: str, color: bool): String = {
+	val sources = Sources::single(String::of(fileName), String::of(src))
+	return renderProgram(&diagnostics, &sources, color)
+}
+
+/// Renders every diagnostic against the file it belongs to.
+/// One that points into no file, such as a missing `main` in a program with
+/// no files, is shown without an excerpt rather than dropped.
+pub fn renderProgram(diagnostics: &[Diagnostic], sources: &Sources, color: bool): String = {
+	var out = String()
+	for diagnostic in diagnostics {
+		out.push(renderOne(&diagnostic, &sources, color))
+	}
+	return move out
+}
+
+// What a diagnostic's text is drawn with.
+val HBAR = '─'
+val VBAR = '│'
+val GAP = '┆'
+val UARROW = '▲'
+val RARROW = '▶'
+val LTOP = '╭'
+val LBOT = '╰'
+val MBOT = '┴'
+val RBOT = '╯'
+val LCROSS = '├'
+val UNDERBAR = '┬'
+
+/// A colour of the terminal's: one of the eight, or one of the 256.
+@derive(Eq, Clone)
+enum Color {
+	Red
+	Yellow
+	Blue
+	Fixed(code: u8)
+}
+
+val MARGIN: Option<Color> = .Some(.Fixed(code: 246))
+val SKIPPED: Option<Color> = .Some(.Fixed(code: 240))
+val UNIMPORTANT: Option<Color> = .Some(.Fixed(code: 249))
+val NOTE: Option<Color> = .Some(.Fixed(code: 115))
+
+/// One line of the text being written, coloured where `color` says, and
+/// written without the spaces it ends in.
+struct Row {
+	line: String
+	color: bool
+	/// The colour the line is in at its end so far.
+	now: Option<Color>
+}
+
+extend Row {
+	static fn new(color: bool): Row = Row(line: String(), color: color, now: .None)
+
+	/// `c`, in `color` where the text is coloured. A space is never
+	/// coloured, so that the spaces a line ends in can be left out, and a
+	/// colour is begun only where it changes.
+	var fn put(c: char, color: Option<Color>) = {
+		val color = if self.color && c != ' ' then color else .None
+		if color != self.now {
+			if self.now.isSome() then self.line.push("\u{1b}[0m")
+			match color {
+				.Some(.Red) => self.line.push("\u{1b}[31m")
+				.Some(.Yellow) => self.line.push("\u{1b}[33m")
+				.Some(.Blue) => self.line.push("\u{1b}[34m")
+				.Some(.Fixed(code)) => self.line.push("\u{1b}[38;5;\(code)m")
+				.None => {}
+			}
+			self.now = color
+		}
+		self.line.pushChar(c)
+	}
+
+	var fn text(text: str, color: Option<Color>) = {
+		for c in text.chars() {
+			self.put(c, color)
+		}
+	}
+
+	/// The line written onto `out`, and ended.
+	move fn end(out: &var String) = {
+		var row = move self
+		if row.now.isSome() then row.line.push("\u{1b}[0m")
+		out.push(row.line.toStr().trimEndMatches(" "))
+		out.push("\n")
+	}
+}
+
+/// Characters from `start` to just before `end`, counted from the start of
+/// a file.
+@derive(Eq, Clone)
+struct Run {
+	start: i64
+	end: i64
+}
+
+extend Run {
+	fn contains(at: i64): bool = self.start <= at && at < self.end
+
+	fn len(): i64 = if self.end > self.start then self.end - self.start else 0
+}
+
+/// A line of a file: where it begins, in characters and in bytes, and how
+/// long it is in each, its end of line counted.
+@derive(Clone)
+struct Line {
+	chars: i64
+	charLen: i64
+	bytes: i64
+	byteLen: i64
+}
+
+extend Line {
+	fn span(): Run = Run(start: self.chars, end: self.chars + self.charLen)
+}
+
+/// A file as a diagnostic shows it: its name, its text, and its lines.
+view struct File {
+	name: str
+	text: str
+	lines: Vec<Line>
+}
+
+extend File {
+	static fn new(name: str, text: str): File = {
+		var lines: Vec<Line> = Vec()
+		var chars = 0
+		var bytes = 0
+		while bytes < text.len() {
+			val byteLen = match text[bytes..text.len()].find("\n") {
+				.Some(at) => at + 1
+				.None => text.len() - bytes
+			}
+			val charLen = charCount(text[bytes..bytes + byteLen])
+			lines.push(Line(chars: chars, charLen: charLen, bytes: bytes, byteLen: byteLen))
+			chars += charLen
+			bytes += byteLen
+		}
+		if lines.isEmpty() then lines.push(Line(chars: 0, charLen: 0, bytes: 0, byteLen: 0))
+		return File(name: name, text: text, lines: move lines)
+	}
+
+	/// The line a byte offset is on.
+	fn lineAtByte(byte: i64): i64 = {
+		var lo = 0
+		var hi = self.lines.len()
+		while lo < hi {
+			val middle = (lo + hi) / 2
+			if self.lines[middle].bytes <= byte then lo = middle + 1 else hi = middle
+		}
+		return if lo > 0 then lo - 1 else 0
+	}
+
+	/// The line a character offset is on.
+	fn lineAtChar(at: i64): i64 = {
+		var lo = 0
+		var hi = self.lines.len()
+		while lo < hi {
+			val middle = (lo + hi) / 2
+			if self.lines[middle].chars <= at then lo = middle + 1 else hi = middle
+		}
+		return if lo > 0 then lo - 1 else 0
+	}
+
+	/// The character offset of a byte offset.
+	fn charAt(byte: i64): i64 = {
+		val line = self.lines[self.lineAtByte(byte)]
+		val within = if byte - line.bytes < line.byteLen then byte - line.bytes else line.byteLen
+		val text = self.text[line.bytes..line.bytes + line.byteLen]
+		// An offset inside a character counts the bytes before it.
+		if within < text.len() && (text[within] & 0xC0) == 0x80 then return line.chars + within
+		return line.chars + charCount(text[0..within])
+	}
+
+	/// The text of a line, without its end of line or the spaces before it.
+	fn lineText(index: i64): str = {
+		val line = self.lines[index]
+		return trimEndSpace(self.text[line.bytes..line.bytes + line.byteLen])
+	}
+}
+
+/// How many characters `text` holds.
+fn charCount(text: str): i64 = {
+	var count = 0
+	for b in text {
+		if (b & 0xC0) != 0x80 then count += 1
+	}
+	return count
+}
+
+/// `text` without the white space it ends with, as Unicode counts it.
+fn trimEndSpace(text: str): str = {
+	var end = text.len()
+	while end > 0 {
+		var start = end - 1
+		while start > 0 && (text[start] & 0xC0) == 0x80 {
+			start -= 1
+		}
+		if !text.charAt(start).0.isWhitespace() then break
+		end = start
+	}
+	return text[0..end]
+}
+
+/// A label as it is drawn: which file it is in, the characters it covers,
+/// and the lines it begins and ends on.
+view struct Mark {
+	message: str
+	primary: bool
+	file: i64
+	chars: Run
+	multi: bool
+}
+
+extend Mark {
+	/// Its last character, or where it is if it covers none.
+	fn last(): i64 =
+		if self.chars.end - 1 > self.chars.start then self.chars.end - 1 else self.chars.start
+
+	fn color(): Option<Color> = .Some(if self.primary then .Red else .Blue)
+
+	/// Which of two labels over one character is drawn: the primary, then
+	/// the shorter.
+	fn rank(): (bool, i64) = (!self.primary, self.chars.len())
+}
+
+/// A label on one line: the column its line is drawn from, whether it is a
+/// label of several lines, and whether its message is written there.
+@derive(Eq, Clone)
+struct LineLabel {
+	col: i64
+	mark: i64
+	multi: bool
+	drawMsg: bool
+}
+
+/// How many columns `c` takes at column `col`: a tab to the next stop of
+/// four, any other space one, and anything else as wide as it is drawn.
+fn charWidth(c: char, col: i64): (char, i64) =
+	if c == '\t' then (' ', (col / 4 + 1) * 4 - col)
+	else if c.isWhitespace() then (' ', 1)
+	else (c, c.width())
+
+/// Where a label is: the file it is in, by its place among the files the
+/// diagnostic shows, the characters it covers, and its first and last line.
+struct Located {
+	file: i64
+	chars: Run
+	first: i64
+	last: i64
+}
+
+/// Finds the file `label` is in, adding it to `files` the first time, and
+/// where in it the label is.
+fn locate(
+	label: &Label,
+	sources: &Sources,
+	files: &var Vec<File>,
+	bases: &var Vec<u32>,
+): Option<Located> keeps sources = {
+	val .Some((name, text, base)) = sources.of(label.span) else {
+		return .None
+	}
+	var file = 0
+	while file < bases.len() && bases[file] != base {
+		file += 1
+	}
+	if file == bases.len() {
+		bases.push(base)
+		files.push(File::new(name, text))
+	}
+	val source = &files[file]
+	val lo = (label.span.lo - base) as i64
+	val hi =
+		((if label.span.hi > label.span.lo then label.span.hi else label.span.lo) - base) as i64
+	val start = source.charAt(lo)
+	val end = if hi > lo then source.charAt(hi) else start
+	val first = source.lineAtChar(start)
+	val last = source.lineAtChar(if end - 1 > start then end - 1 else start)
+	return .Some(Located(file: file, chars: Run(start: start, end: end), first: first, last: last))
+}
+
+/// The lines a section shows: from the first its labels are on to the last.
+fn linesOf(files: &[File], marks: &[Mark], members: &[i64]): Run = {
+	val file = &files[marks[members[0]].file]
+	var start = marks[members[0]].chars.start
+	var end = marks[members[0]].chars.end
+	for m in members {
+		if marks[m].chars.start < start then start = marks[m].chars.start
+		if marks[m].chars.end > end then end = marks[m].chars.end
+	}
+	return Run(
+		start: file.lineAtChar(start),
+		end: file.lineAtChar(if end - 1 > start then end - 1 else start) + 1,
+	)
+}
+
+/// One diagnostic. Its labels may lie in several files, since a name declared
+/// twice in one module is declared in two of them.
+fn renderOne(diagnostic: &Diagnostic, sources: &Sources, color: bool): String = {
+	var files: Vec<File> = Vec()
+	var bases: Vec<u32> = Vec()
+	val .Some(primary) = locate(&diagnostic.primary, &sources, &var files, &var bases) else {
+		return renderBare(&diagnostic)
+	}
+	// The labels in the order they are written: files lie end to end, so
+	// that is the files in order too.
+	var labels: Vec<(&Label, bool)> = Vec()
+	labels.push((&diagnostic.primary, true))
+	for label in diagnostic.secondary {
+		labels.push((&label, false))
+	}
+	labels.sortByKey((label) => (label.0.span.lo, label.0.span.hi))
+	var marks: Vec<Mark> = Vec()
+	for (label, isPrimary) in labels {
+		val .Some(located) = locate(&label, &sources, &var files, &var bases) else {
+			continue
+		}
+		marks.push(Mark(
+			message: label.message.toStr(),
+			primary: isPrimary,
+			file: located.file,
+			chars: located.chars,
+			multi: located.first != located.last,
+		))
+	}
+	// A section a file, in the order their labels come.
+	var sections: Vec<(i64, Vec<i64>)> = Vec()
+	for index in 0..marks.len() {
+		var found = false
+		for section in sections {
+			if section.0 == marks[index].file {
+				section.1.push(index)
+				found = true
+				break
+			}
+		}
+		if !found then sections.push((marks[index].file, Vec::of(own [index])))
+	}
+	// The margin is as wide as the largest line number shown.
+	var width = 1
+	for index in 0..sections.len() {
+		val digits = "\(linesOf(&files, &marks, &sections[index].1).end)".len()
+		if index == 0 || digits > width then width = digits
+	}
+
+	var out = String()
+	val (kind, kindColor) = match diagnostic.severity {
+		.Error => ("Error", Color::Red)
+		.Warning => ("Warning", Color::Yellow)
+	}
+	var row = Row::new(color)
+	row.text("[\(diagnostic.code)] \(kind):", .Some(kindColor))
+	row.text(" \(diagnostic.message)", .None)
+	row.end(&var out)
+
+	// The fix is the primary suggestion, so it comes before any other help.
+	var helps: Vec<str> = Vec()
+	if diagnostic.fix is .Some(fix) then helps.push(fix.message.toStr())
+	for help in diagnostic.help {
+		helps.push(help.toStr())
+	}
+	var notes: Vec<str> = Vec()
+	for note in diagnostic.notes {
+		notes.push(note.toStr())
+	}
+	val count = sections.len()
+	for index in 0..count {
+		val file = sections[index].0
+		val members = &sections[index].1
+		val section = Section(
+			file: &files[file],
+			marks: &marks,
+			members: &members,
+			width: width,
+			color: color,
+		)
+		val at = if file == primary.file then primary.chars.start else marks[members[0]].chars.start
+		val last = index + 1 == count
+		section.write(&var out, index == 0, at, linesOf(&files, &marks, &members))
+		if last {
+			section.writeTexts(&var out, "Help", &helps)
+			section.writeTexts(&var out, "Note", &notes)
+		}
+		var row = Row::new(color)
+		if last {
+			for _ in 0..width + 2 {
+				row.put(HBAR, MARGIN)
+			}
+			row.put(RBOT, MARGIN)
+		} else {
+			row.text(" ".repeat(width + 2), .None)
+			row.put(VBAR, MARGIN)
+		}
+		row.end(&var out)
+	}
+	return move out
+}
+
+/// One file's part of a diagnostic.
+view struct Section {
+	file: &File
+	marks: &[Mark]
+	/// The labels in this file, by index, in order.
+	members: &[i64]
+	/// The width of the line numbers.
+	width: i64
+	color: bool
+}
+
+extend Section {
+	/// The labels of several lines, the longest first, each a column of
+	/// the margin.
+	fn multis(): Vec<i64> = {
+		var multis: Vec<i64> = Vec()
+		for m in self.members {
+			if self.marks[m].multi then multis.push(m)
+		}
+		multis.sortByKey((m) => -self.marks[m].chars.len())
+		return move multis
+	}
+
+	/// The label `m` as it is drawn on the line `line`: from its start where
+	/// it begins there and `start` asks for that, from its last character
+	/// where it ends there.
+	fn atLine(m: i64, start: bool, line: Line): Option<LineLabel> = {
+		val mark = &self.marks[m]
+		val span = line.span()
+		if span.contains(mark.chars.start) && start then
+			return .Some(LineLabel(
+				col: mark.chars.start - line.chars,
+				mark: m,
+				multi: true,
+				drawMsg: false,
+			))
+		if span.contains(mark.last()) then
+			return .Some(LineLabel(
+				col: mark.last() - line.chars,
+				mark: m,
+				multi: true,
+				drawMsg: true,
+			))
+		return .None
+	}
+
+	fn write(out: &var String, first: bool, at: i64, lines: Run) = {
+		val line = self.file.lineAtChar(at)
+		val column = at - self.file.lines[line].chars
+		var row = Row::new(self.color)
+		row.text(" ".repeat(self.width + 2), .None)
+		row.put(if first then LTOP else LCROSS, MARGIN)
+		row.put(HBAR, MARGIN)
+		row.put('[', MARGIN)
+		row.text(" \(self.file.name):\(line + 1):\(column + 1) ", .None)
+		row.put(']', MARGIN)
+		row.end(&var out)
+		var row = Row::new(self.color)
+		row.text(" ".repeat(self.width + 2), .None)
+		row.put(VBAR, MARGIN)
+		row.end(&var out)
+
+		val multis = self.multis()
+		var isEllipsis = false
+		for index in lines.start..lines.end {
+			val line = self.file.lines[index]
+			val span = line.span()
+			// A label of several lines that begins or ends here is drawn
+			// into the margin, the leftmost of them.
+			var marginLabel: Option<LineLabel> = .None
+			for m in multis {
+				val .Some(ll) = self.atLine(m, true, line) else {
+					continue
+				}
+				val better = match marginLabel {
+					.Some(best) =>
+						(ll.col, -self.marks[ll.mark].chars.start) <
+							(best.col, -self.marks[best.mark].chars.start)
+					.None => true
+				}
+				if better then marginLabel = .Some(ll)
+			}
+			var lineLabels: Vec<LineLabel> = Vec()
+			for m in multis {
+				if self.atLine(m, !isMargin(m, marginLabel), line) is .Some(ll) then
+					lineLabels.push(ll)
+			}
+			for m in self.members {
+				val mark = &self.marks[m]
+				if !mark.multi && mark.chars.start >= span.start && mark.chars.end <= span.end {
+					val middle = (mark.chars.start + mark.chars.end) / 2
+					lineLabels.push(LineLabel(
+						col: (if middle > mark.chars.start then middle else mark.chars.start) -
+							line.chars,
+						mark: m,
+						multi: false,
+						drawMsg: true,
+					))
+				}
+			}
+			if lineLabels.isEmpty() && marginLabel == .None {
+				var within = false
+				for m in multis {
+					if self.marks[m].chars.contains(span.start) then within = true
+				}
+				if !isEllipsis && within {
+					isEllipsis = true
+				} else {
+					if !isEllipsis {
+						var row = Row::new(self.color)
+						val none: Vec<LineLabel> = Vec()
+						self.margin(&var row, index, false, false, false, .None, &none, .None)
+						row.end(&var out)
+					}
+					isEllipsis = true
+					continue
+				}
+			} else {
+				isEllipsis = false
+			}
+			lineLabels.sortByKey((ll) => (ll.col, -self.marks[ll.mark].chars.start))
+			var arrowLen = 0
+			for ll in lineLabels {
+				if ll.multi {
+					arrowLen = line.charLen
+				} else {
+					val end = self.marks[ll.mark].chars.end - line.chars
+					if end > arrowLen then arrowLen = end
+				}
+			}
+			arrowLen += 2
+
+			val text = self.file.lineText(index)
+			var row = Row::new(self.color)
+			self.margin(&var row, index, true, isEllipsis, true, .None, &lineLabels, marginLabel)
+			if !isEllipsis {
+				var column = 0
+				for (col, c) in text.chars().enumerate() {
+					val (shown, width) = charWidth(c, column)
+					val color = match self.highlightAt(
+						col,
+						line,
+						marginLabel,
+						&multis,
+						&lineLabels,
+					) {
+						.Some(color) => .Some(color)
+						.None => UNIMPORTANT
+					}
+					if shown == ' ' {
+						for _ in 0..width {
+							row.put(' ', .None)
+						}
+					} else {
+						row.put(shown, color)
+					}
+					column += width
+				}
+			}
+			row.end(&var out)
+
+			val widths = columnWidths(text, arrowLen)
+			for (rowIndex, ll) in lineLabels.forwards().enumerate() {
+				val mark = &self.marks[ll.mark]
+				// The underlines, and the lines that go down from them.
+				var row = Row::new(self.color)
+				self.margin(
+					&var row,
+					index,
+					false,
+					isEllipsis,
+					true,
+					.Some((rowIndex, false)),
+					&lineLabels,
+					marginLabel,
+				)
+				for (col, width) in widths.forwards().enumerate() {
+					val vbar = vbarAt(col, rowIndex, &lineLabels, marginLabel)
+					val underline =
+						if rowIndex == 0 then self.underlineAt(col, line, &lineLabels) else .None
+					val (c, tail, color) = match (vbar, underline) {
+						(.Some(v), .Some(_)) => (UNDERBAR, HBAR, self.marks[v.mark].color())
+						(.Some(v), .None) if v.multi && rowIndex == 0 => (
+							UARROW,
+							' ',
+							self.marks[v.mark].color(),
+						)
+						(.Some(v), .None) => (VBAR, ' ', self.marks[v.mark].color())
+						(.None, .Some(u)) => (HBAR, HBAR, self.marks[u.mark].color())
+						(.None, .None) => (' ', ' ', .None)
+					}
+					for i in 0..width {
+						row.put(if i == 0 then c else tail, color)
+					}
+				}
+				row.end(&var out)
+
+				// The line from the label to its message.
+				var row = Row::new(self.color)
+				self.margin(
+					&var row,
+					index,
+					false,
+					isEllipsis,
+					true,
+					.Some((rowIndex, true)),
+					&lineLabels,
+					marginLabel,
+				)
+				for (col, width) in widths.forwards().enumerate() {
+					val isHbar = ((col > ll.col) != ll.multi) || (ll.drawMsg && col > ll.col)
+					var c = ' '
+					var tail = ' '
+					var color: Option<Color> = .None
+					if col == ll.col && !isMargin(ll.mark, marginLabel) {
+						c = if ll.multi && ll.drawMsg then MBOT else if ll.multi then RBOT else LBOT
+						tail = HBAR
+						color = mark.color()
+					} else if vbarAt(col, rowIndex, &lineLabels, marginLabel) is .Some(v) {
+						if isHbar {
+							c = HBAR
+							tail = HBAR
+							color = mark.color()
+						} else {
+							c = VBAR
+							color = self.marks[v.mark].color()
+						}
+					} else if isHbar {
+						c = HBAR
+						tail = HBAR
+						color = mark.color()
+					}
+					if width > 0 then row.put(c, color)
+					for _ in 1..width {
+						row.put(tail, color)
+					}
+				}
+				if ll.drawMsg then row.text(" \(mark.message)", .None)
+				row.end(&var out)
+			}
+		}
+	}
+
+	/// The label underlined at `col`: the primary, then the shorter.
+	fn underlineAt(col: i64, line: Line, lineLabels: &[LineLabel]): Option<LineLabel> = {
+		var best: Option<LineLabel> = .None
+		for ll in lineLabels {
+			if ll.multi || !self.marks[ll.mark].chars.contains(line.chars + col) then continue
+			val better = match best {
+				.Some(b) => self.marks[ll.mark].rank() < self.marks[b.mark].rank()
+				.None => true
+			}
+			if better then best = .Some(ll)
+		}
+		return best
+	}
+
+	/// The colour the character at `col` is drawn in: the colour of the
+	/// label over it, the primary, then the shorter.
+	fn highlightAt(
+		col: i64,
+		line: Line,
+		marginLabel: Option<LineLabel>,
+		multis: &[i64],
+		lineLabels: &[LineLabel],
+	): Option<Color> = {
+		var candidates: Vec<i64> = Vec()
+		if marginLabel is .Some(ml) then candidates.push(ml.mark)
+		candidates.pushAll(&multis)
+		for ll in lineLabels {
+			candidates.push(ll.mark)
+		}
+		var best: Option<i64> = .None
+		for m in candidates {
+			if !self.marks[m].chars.contains(line.chars + col) then continue
+			val better = match best {
+				.Some(b) => self.marks[m].rank() < self.marks[b].rank()
+				.None => true
+			}
+			if better then best = .Some(m)
+		}
+		return match best {
+			.Some(m) => self.marks[m].color()
+			.None => .None
+		}
+	}
+
+	/// The margin of a row: its line number or a bar, and the columns of
+	/// the labels of several lines that pass it. `reportRow` is the row of
+	/// labels being drawn, and whether it is the row of their arrows.
+	fn margin(
+		row: &var Row,
+		index: i64,
+		isLine: bool,
+		isEllipsis: bool,
+		drawLabels: bool,
+		reportRow: Option<(i64, bool)>,
+		lineLabels: &[LineLabel],
+		marginLabel: Option<LineLabel>,
+	) = {
+		row.put(' ', .None)
+		if isLine && !isEllipsis {
+			val number = "\(index + 1)"
+			row.text(" ".repeat(self.width - number.len()), .None)
+			row.text(number, MARGIN)
+			row.put(' ', .None)
+			row.put(VBAR, MARGIN)
+		} else {
+			row.text(" ".repeat(self.width + 1), .None)
+			row.put(if isEllipsis then GAP else VBAR, SKIPPED)
+		}
+		row.put(' ', .None)
+		if !drawLabels then return
+		val multis = self.multis()
+		val span = self.file.lines[index].span()
+		val columns = multis.len() + (if multis.isEmpty() then 0 else 1)
+		for col in 0..columns {
+			var corner: Option<(i64, bool)> = .None
+			var hbar: Option<i64> = .None
+			var vbar: Option<i64> = .None
+			var marginPtr: Option<(LineLabel, bool)> = .None
+			val multiLabel: Option<i64> = if col < multis.len() then .Some(multis[col]) else .None
+			val upTo = if col + 1 < multis.len() then col + 1 else multis.len()
+			for i in 0..upTo {
+				val m = multis[i]
+				val mark = &self.marks[m]
+				val margin: Option<LineLabel> = match marginLabel {
+					.Some(ml) if ml.mark == m => .Some(ml)
+					_ => .None
+				}
+				if !(mark.chars.start <= span.end && mark.chars.end > span.start) then continue
+				val isParent = i != col
+				val isStart = span.contains(mark.chars.start)
+				val isEnd = span.contains(mark.last())
+				if margin is .Some(margin) && isLine {
+					marginPtr = .Some((margin, isStart))
+				} else if !isStart && (!isEnd || isLine) {
+					if vbar == .None && !isParent then vbar = .Some(m)
+				} else if reportRow is .Some((reportRow, isArrow)) {
+					var labelRow = 0
+					for (j, ll) in lineLabels.forwards().enumerate() {
+						if ll.mark == m {
+							labelRow = j
+							break
+						}
+					}
+					if reportRow == labelRow {
+						if margin is .Some(margin) {
+							vbar = if col == i then .Some(margin.mark) else .None
+							if isStart then continue
+						}
+						if isArrow {
+							hbar = .Some(m)
+							if !isParent then corner = .Some((m, isStart))
+						} else if !isStart {
+							if vbar == .None && !isParent then vbar = .Some(m)
+						}
+					} else if vbar == .None && !isParent && (isStart != (reportRow < labelRow)) {
+						vbar = .Some(m)
+					}
+				}
+			}
+			if marginPtr is .Some((margin, _)) && isLine {
+				val isCol = multiLabel == .Some(margin.mark)
+				val isLimit = col + 1 == multis.len()
+				if !isCol && !isLimit && hbar == .None then hbar = .Some(margin.mark)
+			}
+			if hbar is .Some(h) && marginLabel is .Some(ml) && ml.mark == h && isLine then
+				hbar = .None
+			var a = ' '
+			var b = ' '
+			var color: Option<Color> = .None
+			if corner is .Some((m, isStart)) {
+				a = if isStart then LTOP else LBOT
+				b = HBAR
+				color = self.marks[m].color()
+			} else if hbar is .Some(m) {
+				a = HBAR
+				b = HBAR
+				color = self.marks[m].color()
+			} else if vbar is .Some(m) {
+				a = if isEllipsis then GAP else VBAR
+				color = self.marks[m].color()
+			} else if marginPtr is .Some((margin, isStart)) && isLine {
+				val isCol = multiLabel == .Some(margin.mark)
+				val isLimit = col == multis.len()
+				a = if isLimit then RARROW
+				else if isCol && isStart then LTOP
+				else if isCol then LCROSS
+				else HBAR
+				b = if isLimit then ' ' else HBAR
+				color = self.marks[margin.mark].color()
+			}
+			row.put(a, color)
+			row.put(b, color)
+		}
+	}
+
+	/// Help or notes, each after a blank margin, numbered where there are
+	/// several, a text of several lines indented under its first.
+	fn writeTexts(out: &var String, what: str, texts: &[str]) = {
+		val none: Vec<LineLabel> = Vec()
+		for (i, text) in texts.forwards().enumerate() {
+			var row = Row::new(self.color)
+			self.margin(&var row, 0, false, false, true, .Some((0, false)), &none, .None)
+			row.end(&var out)
+			val prefix = if texts.len() == 1 then String::of(what) else "\(what) \(i + 1)"
+			for (n, line) in text.lines().enumerate() {
+				var row = Row::new(self.color)
+				self.margin(&var row, 0, false, false, true, .Some((0, false)), &none, .None)
+				if n == 0 {
+					row.text(prefix.toStr(), NOTE)
+					row.text(": \(line)", .None)
+				} else {
+					row.text(" ".repeat(prefix.len() + 2), .None)
+					row.text(line, .None)
+				}
+				row.end(&var out)
+			}
+		}
+	}
+}
+
+/// Whether `m` is the label drawn into the margin.
+fn isMargin(m: i64, marginLabel: Option<LineLabel>): bool = marginLabel is .Some(ml) && ml.mark == m
+
+/// The label whose line goes down through `col` in row `row`.
+fn vbarAt(
+	col: i64,
+	row: i64,
+	lineLabels: &[LineLabel],
+	marginLabel: Option<LineLabel>,
+): Option<LineLabel> = {
+	for (j, ll) in lineLabels.forwards().enumerate() {
+		if !isMargin(ll.mark, marginLabel) && ll.col == col && row <= j then return .Some(ll)
+	}
+	return .None
+}
+
+/// How many columns each of the first `count` characters of `text` takes,
+/// and 1 for each past its end.
+fn columnWidths(text: str, count: i64): Vec<i64> = {
+	var widths: Vec<i64> = Vec()
+	var column = 0
+	var chars = text.chars()
+	for _ in 0..count {
+		val width = match chars.next() {
+			.Some(c) => charWidth(c, column).1
+			.None => 1
+		}
+		column += width
+		widths.push(width)
+	}
+	return move widths
+}
+
+/// A diagnostic with no source to show: its code, message, notes and help,
+/// laid out as the full rendering lays them out.
+fn renderBare(diagnostic: &Diagnostic): String = {
+	val kind = match diagnostic.severity {
+		.Error => "Error"
+		.Warning => "Warning"
+	}
+	var out = String()
+	out.push("[\(diagnostic.code)] \(kind): \(diagnostic.message)\n")
+	for note in diagnostic.notes {
+		out.push("    Note: \(note)\n")
+	}
+	if diagnostic.fix is .Some(fix) then out.push("    Help: \(fix.message)\n")
+	for help in diagnostic.help {
+		out.push("    Help: \(help)\n")
+	}
+	return move out
+}
+
+/// The diagnostics plainly, one fact a line, for tools and for comparing
+/// two compilers' diagnostics without their layout. First a line `file`
+/// and its name for each file a place is in, in the order the program's
+/// files lie, which is the order labels in several files are drawn in;
+/// then, for each diagnostic, a line of what it is — its severity, code
+/// and message — then, indented, its primary label and each secondary one,
+/// each note and help, and its fix with each edit. A place is
+/// `file:line:column-line:column`, the end just past what it covers,
+/// counted as the rendered text counts them, or `-` where it is in no
+/// file. A text follows its place, with `\\` and the characters that would
+/// break a line written as escapes, so that each fact is one line.
+pub fn dump(diagnostics: &[Diagnostic], sources: &Sources): String = {
+	var bases: Vec<u32> = Vec()
+	for diagnostic in diagnostics {
+		var spans: Vec<Span> = Vec()
+		spans.push(diagnostic.primary.span)
+		for label in diagnostic.secondary {
+			spans.push(label.span)
+		}
+		if diagnostic.fix is .Some(fix) {
+			for edit in fix.edits {
+				spans.push(edit.span)
+			}
+		}
+		for span in spans {
+			if sources.of(span) is .Some((_, _, base)) && !bases.contains(&base) then
+				bases.push(base)
+		}
+	}
+	var out = String()
+	for (name, _, base) in sources.entries() {
+		if bases.contains(&base) then out.push("file \(escaped(name.toStr()))\n")
+	}
+	for diagnostic in diagnostics {
+		val severity = match diagnostic.severity {
+			.Error => "error"
+			.Warning => "warning"
+		}
+		out.push("\(severity) \(diagnostic.code) \(escaped(diagnostic.message.toStr()))\n")
+		fact(
+			&var out,
+			"primary",
+			.Some(diagnostic.primary.span),
+			diagnostic.primary.message.toStr(),
+			&sources,
+		)
+		for label in diagnostic.secondary {
+			fact(&var out, "secondary", .Some(label.span), label.message.toStr(), &sources)
+		}
+		for note in diagnostic.notes {
+			fact(&var out, "note", .None, note.toStr(), &sources)
+		}
+		for help in diagnostic.help {
+			fact(&var out, "help", .None, help.toStr(), &sources)
+		}
+		if diagnostic.fix is .Some(fix) {
+			fact(&var out, "fix", .None, fix.message.toStr(), &sources)
+			for edit in fix.edits {
+				fact(&var out, "edit", .Some(edit.span), edit.replacement.toStr(), &sources)
+			}
+		}
+	}
+	return move out
+}
+
+/// One fact of a diagnostic's dump: what it is, its place, and its text.
+fn fact(out: &var String, what: str, at: Option<Span>, text: str, sources: &Sources) = {
+	out.push("  \(what)")
+	if at is .Some(at) {
+		match sources.place(at) {
+			.Some(
+				place,
+			) => out.push(" \(place.file):\(place.start.0):\(place.start.1)-\(place.end.0):\(place.end.1)")
+			.None => out.push(" -")
+		}
+	}
+	if !text.isEmpty() then out.push(" \(escaped(text))")
+	out.push("\n")
+}
+
+/// `text` on one line: a backslash and every control character escaped.
+fn escaped(text: str): String = {
+	var out = String::withCapacity(text.len())
+	for c in text.chars() {
+		match c {
+			'\\' => out.push("\\\\")
+			'\n' => out.push("\\n")
+			'\t' => out.push("\\t")
+			'\r' => out.push("\\r")
+			'\u{0}'..='\u{1F}' | '\u{7F}'..='\u{9F}' => out.push("\\u{\(c as u32, radix: 16)}")
+			_ => out.pushChar(c)
+		}
+	}
+	return move out
+}

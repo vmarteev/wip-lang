@@ -1,0 +1,764 @@
+// Generators: a loop that yields where a value stands is an `Iterator`,
+// which runs as it is asked.
+//
+//     val evens = for x in xs { if x % 2 == 0 { yield x } }
+//         ⇒ val evens = generator# { state#: 0, xs: &xs }
+//
+//     extend generator#: Iterator<i64> {
+//         var fn next(): Option<i64> = { for x in *self.xs { if x % 2 == 0 { yield .Some(x) } } }
+//     }
+//
+// The struct holds where it stopped and references to what the loop names,
+// as a closure lent for a call holds them, so it is a view of them. Its
+// `next` is the loop, checked as a body of its own; the MIR runs it on from
+// the `yield` it stopped at, and keeps its locals in the struct between
+// calls, after the fields declared here.
+
+import std::collections::{Map, Set}
+import std::mem
+import syntax as ast
+import syntax::{
+	Diagnostic,
+	Edit,
+	GENERATOR_HOLDS_ITSELF,
+	GENERATOR_HOLDS_VAR,
+	GENERATOR_YIELDS_NOTHING,
+	RETURN_IN_GENERATOR,
+	Receiver,
+	Span,
+	Symbol
+}
+
+/// A generator whose body is being checked: what it yields, once a `yield`
+/// or the type expected of it says.
+@derive(Clone)
+struct GeneratorBuild {
+	elem: Option<Ty>
+	/// Where the loop is written, for a loop that is a generator, which a
+	/// `return` in it cannot leave; a function that yields can.
+	loopSpan: Option<Span>
+	/// Whether a `yield` hands it a value.
+	yielded: bool
+}
+
+/// Whether each `for` of a file that stands for a value is a generator: one
+/// among a list's elements, or after `own`, is a list built as it runs.
+fn listElements(file: &ast::Ast): Set<ast::ExprId> = {
+	var elements: Set<ast::ExprId> = Set()
+	for entry in file.exprs {
+		match entry.value.kind {
+			.Array(elems) => {
+				for e in elems {
+					elements.add(e)
+				}
+			}
+			.Unary(op: .Own, operand, ..) => elements.add(operand)
+			_ => {}
+		}
+	}
+	return move elements
+}
+
+extend Lowerer {
+	/// A struct and its `next` for every loop of a file that is a generator,
+	/// before any body is checked, so that nothing is declared while they
+	/// are. What they hold and yield is filled in when the loop is checked.
+	var fn collectGenerators(): Map<ast::ExprId, StructId> = {
+		val file = self.ast
+		val inLists = listElements(&file)
+		var generators: Map<ast::ExprId, StructId> = Map()
+		for entry in file.exprs {
+			if !(entry.value.kind is .ForElement(..)) || inLists.contains(&entry.handle) then
+				continue
+			val id = self.declareGenerator(entry.value.span)
+			generators.put(entry.handle, id)
+		}
+		return move generators
+	}
+
+	/// A generator's struct, and its `next`, empty.
+	var fn declareGenerator(span: Span): StructId = {
+		val next = self.program.fns.add(FnDef(
+			name: Symbol::next(),
+			nameSpan: span,
+			symbol: .None,
+			receiver: .Some(.Var),
+			owner: .None,
+			interfaceId: .None,
+			generics: Vec(),
+			instanceOf: .None,
+			params: Vec(),
+			ret: ERROR,
+			retSpan: .None,
+			isExtern: false,
+			exportsC: false,
+			header: .None,
+			accesses: .None,
+			isVariadic: false,
+			variadicOf: .None,
+			lendsFrom: .None,
+			keeps: Vec(),
+			keepsAt: .None,
+			isLambda: false,
+			generator: .None,
+			isTailrec: false,
+			isTest: false,
+			isInline: false,
+			generated: .None,
+			intrinsic: .None,
+			body: .None,
+			projects: .None,
+			compileTime: false,
+			module: self.current as u32,
+			isPub: false,
+			span: span,
+		))
+		val id = self.program.structs.add(StructDef(
+			isExtern: false,
+			isUnion: false,
+			isOpaque: false,
+			isIntrinsic: false,
+			header: .None,
+			accessors: Vec(),
+			name: Symbol::generator(),
+			generics: Vec(),
+			fields: Vec(),
+			methods: Vec::of(own [next]),
+			isTuple: false,
+			generator: .Some(GeneratorDef(next: next, elem: ERROR, of: .None)),
+			isEnv: false,
+			isView: false,
+			module: self.current as u32,
+			isPub: false,
+			span: span,
+		))
+		self.program.fns[next].owner = .Some(.Struct(id))
+		self.program.fns[next].generator = .Some(id)
+		return id
+	}
+
+	/// The `next` of a generator.
+	fn generatorNext(id: StructId): FnId = match self.program.structs[id].generator {
+		.Some(g) => g.next
+		.None => panic("a generator")
+	}
+
+	/// Each generator of the file implements `Iterator`, with the interface's
+	/// methods its `next` does not replace: `map`, `filter` and the rest.
+	/// What it yields is known once its loop is checked, and filled in then.
+	var fn declareGeneratorImpls() = {
+		val .Some(interfaceId) = self.program.preludeItems.interfaceOf(.Iterator) else {
+			return
+		}
+		var generators: Vec<StructId> = Vec()
+		for i in 0..self.generators.len() {
+			generators.push(self.generators.valueAt(i).clone())
+		}
+		generators.sortByKey((id) => id.index())
+		val wanted = self.program.interfaces[interfaceId].methods.clone()
+		for id in generators {
+			val owner: TypeDef = .Struct(id)
+			val next = self.generatorNext(id)
+			var methods = Vec::of(own [next])
+			for i in 1..wanted.len() {
+				self.addDefault(owner, wanted[i].id)
+				methods.push(wanted[i].id)
+			}
+			val span = self.program.structs[id].span
+			self.program.impls.push(ImplDef(
+				interfaceId: interfaceId,
+				args: TyList::empty(),
+				ty: owner,
+				methods: move methods,
+				conditions: Vec(),
+				module: self.current as u32,
+				span: span,
+			))
+		}
+	}
+
+	/// `for binding in source { … }` where a value stands: a generator, whose
+	/// loop runs as its values are asked for.
+	var fn loopGenerator(
+		expr: ast::ExprId,
+		binding: &ast::Pattern,
+		source: ast::ForSource,
+		body: &ast::Block,
+		span: Span,
+	): ExprId = {
+		val id = match self.generators.get(&expr) {
+			.Some(found) => found.clone()
+			// Among a list's elements, which the list collects; reported where
+			// the list is.
+			.None => return self.errorExpr(span)
+		}
+		val next = self.generatorNext(id)
+		val typeArgs = self.ownTypeArgs()
+		val genTy = self.intern(.Struct(id: id, args: typeArgs))
+		val selfTy = self.intern(.Ref(inner: genTy, kind: .Var))
+		// The loop is checked as a body of its own, as a lambda's is: a name it
+		// does not declare is one around it, which it captures.
+		self.outer.push(mem::replace(&var self.state, BodyState()))
+		self.state.scopes = Vec::of(own [Map()])
+		self.state.ret = UNIT
+		self.state.captureKind = .Some(.Generator)
+		self.state.generator = .Some(GeneratorBuild(
+			elem: .None,
+			loopSpan: .Some(span),
+			yielded: false,
+		))
+		val this = self.declare(Symbol::generator(), selfTy, .Param, span)
+		self.state.body.params.push(this)
+		val kind = self.forStmt(.None, &binding, source, &body)
+		val stmt = self.state.body.stmts.add(Stmt(kind: move kind, span: span))
+		val block = Block(stmts: Vec::of(own [stmt]), value: .None, span: span)
+		val value = self.alloc(.Block(move block), UNIT, span)
+		self.state.body.value = .Some(value)
+		val found = match self.state.generator.take() {
+			.Some(build) => build.elem
+			.None => .None
+		}
+		self.settleBindings()
+		val code = mem::replace(&var self.state.body, Body())
+		val captures = mem::replace(&var self.state.captures, Vec())
+		self.state = self.outer.pop().unwrap()
+		val .Some(elem) = found else {
+			self.report(
+				Diagnostic::error(
+					GENERATOR_YIELDS_NOTHING,
+					"this loop stands for a value, and yields none",
+					span,
+					"no `yield` in it",
+				).withNote(
+					"a loop where a value stands is a generator, whose values are what it yields",
+				).withHelp("hand each value over with `yield`, or write the loop as a statement"),
+			)
+			return self.errorExpr(span)
+		}
+		// What it yields was reported already.
+		if self.isPoisoned(elem) then return self.errorExpr(span)
+		val .Some(option) = self.program.preludeItems.enumeration(.Option) else {
+			return self.errorExpr(span)
+		}
+		val elemList = self.program.types.internList([elem])
+		val ret = self.intern(.Enum(id: option, args: elemList))
+		// Its `next`: the loop, run on from where it stopped.
+		val generics = self.typeParams.clone()
+		self.program.fns[next].params = Vec::of(own [
+			ParamDef(
+				name: Symbol::generator(),
+				nameSpan: span,
+				ty: selfTy,
+				span: span,
+				default: .None,
+			),
+		])
+		self.program.fns[next].ret = ret
+		self.program.fns[next].generics = generics.clone()
+		self.program.fns[next].module = self.current as u32
+		self.program.fns[next].body = .Some(move code)
+		// Its struct: where it stopped, then a reference to each variable the
+		// loop names, as a closure lent for a call holds them.
+		var fields = Vec::of(own [
+			FieldDef(
+				isPub: false,
+				isVar: true,
+				name: Symbol::state(),
+				ty: I32,
+				span: span,
+				default: .None,
+			),
+		])
+		var values = Vec::of(own [self.alloc(.Int(0), I32, span)])
+		for capture in captures {
+			fields.push(FieldDef(
+				isPub: false,
+				isVar: false,
+				name: capture.name,
+				ty: capture.ty,
+				span: capture.span,
+				default: .None,
+			))
+			val (place, localTy) = self.capturedValue(&capture)
+			// A reference is copied: what it refers to outlives the loop.
+			val captured =
+				if self.kind(localTy) is .Ref(..) then place
+				else self.alloc(.Ref(place), capture.ty, capture.span)
+			values.push(captured)
+		}
+		self.program.structs[id].generics = generics.clone()
+		self.program.structs[id].fields = move fields
+		self.program.structs[id].isView = !captures.isEmpty()
+		self.program.structs[id].generator = .Some(GeneratorDef(next: next, elem: elem, of: .None))
+		self.program.structs[id].module = self.current as u32
+		val owner: TypeDef = .Struct(id)
+		if self.program.preludeItems.interfaceOf(.Iterator) is .Some(interfaceId) {
+			// What it decides: its element, for `I::Item` once `I` is known.
+			val params = self.paramTys(&generics)
+			val list = self.program.types.internList(&params)
+			val pattern = self.intern(.Struct(id: id, args: list))
+			self.program.types.addDecided(interfaceId, pattern, elemList)
+			for at in 0..self.program.impls.len() {
+				if self.program.impls[at].ty == owner &&
+					self.program.impls[at].interfaceId == interfaceId {
+					self.program.impls[at].args = elemList
+					self.program.impls[at].conditions = generics.clone()
+					break
+				}
+			}
+		}
+		var order: Vec<u32> = Vec()
+		for i in 0..values.len() {
+			order.push(i as u32)
+		}
+		return self.alloc(.Struct(id: id, fields: move values, order: move order), genTy, span)
+	}
+
+	/// `yield value` in a generator: `.Some(value)`, handed to whoever asked.
+	/// The first sets what the generator yields.
+	var fn generatorYield(value: ast::ExprId, span: Span): StmtKind = {
+		if self.state.generator.isSome() {
+			var build = self.state.generator.take().unwrap()
+			build.yielded = true
+			self.state.generator = .Some(move build)
+		}
+		val elem: Option<Ty> = match self.state.generator {
+			.Some(build) => build.elem
+			.None => .None
+		}
+		val checked = match elem {
+			.Some(t) => self.check(value, t)
+			.None => {
+				val inferred = self.infer(value, .None)
+				val ty = self.tyOf(inferred)
+				if self.state.generator.isSome() {
+					var build = self.state.generator.take().unwrap()
+					build.elem = .Some(ty)
+					self.state.generator = .Some(move build)
+				}
+				inferred
+			}
+		}
+		val elemTy = self.tyOf(checked)
+		val .Some(option) = self.program.preludeItems.enumeration(.Option) else {
+			return .Expr(self.wrapDiscarded(checked))
+		}
+		val (some, _) = self.optionVariants()
+		val list = self.program.types.internList([elemTy])
+		val ty = self.intern(.Enum(id: option, args: list))
+		val wrapped = self.alloc(
+			.Variant(id: option, variant: some, args: Vec::of(own [checked]), order: Vec()),
+			ty,
+			span,
+		)
+		return .Yield(wrapped)
+	}
+
+	/// `return` in a loop that is a generator, which has no function of its
+	/// own to leave.
+	var fn returnInGenerator(span: Span): bool = {
+		val loopSpan: Option<Span> = match self.state.generator {
+			.Some(build) => build.loopSpan
+			.None => .None
+		}
+		val .Some(at) = loopSpan else {
+			return false
+		}
+		self.report(
+			Diagnostic::error(
+				RETURN_IN_GENERATOR,
+				"cannot `return` from a loop that is a generator",
+				span,
+				"the loop runs as its values are asked for",
+			).withSecondary(at, "a generator").
+				withNote(
+					"the loop runs later, from whoever asks for its values, so there is no function around it to leave; `break` ends it",
+				).
+				withHelp("end the loop with `break`"),
+		)
+		return true
+	}
+
+	/// What a result written `Iterator<T>` yields: `T`, where it names the
+	/// prelude's `Iterator`.
+	var fn generatorElem(t: ast::TypeId): Option<Ty> = {
+		val file = self.ast
+		val .Named(name, args) = file.types[t].kind else {
+			return .None
+		}
+		if args.len() != 1 then return .None
+		val span = file.types[t].span
+		val interfaceId =
+			self.interfaceNamed(ast::Name(
+				sym: name,
+				span: Span::new(span.lo, span.lo + self.text(name).len() as u32),
+			))?
+		if .Some(interfaceId) != self.program.preludeItems.interfaceOf(.Iterator) then return .None
+		return .Some(self.resolveTy(args[0]))
+	}
+
+	/// The generator a function that yields answers: a struct that holds what
+	/// the function was given, its `next`, which is the function's body run
+	/// on from where it stopped, and its implementation of `Iterator`.
+	var fn declareFnGenerator(id: FnId, elem: Ty, args: TyList, receiver: Option<Receiver>) = {
+		val span = self.program.fns[id].nameSpan
+		val generics = self.program.fns[id].generics.clone()
+		val params = self.program.fns[id].params.clone()
+		// What it holds between calls may not be changed by anyone else; a
+		// `&var` would be.
+		for param in params {
+			if !(self.kind(param.ty) is .Ref(kind: .Var, ..)) then continue
+			val name = String::of(self.text(param.name))
+			val what =
+				if receiver == .Some(.Var) && param.name == self.interner.selfSymbol() then
+					String::of("a `var fn` that yields")
+				else "`\(name)`, a `&var`"
+			self.report(
+				Diagnostic::error(
+					GENERATOR_HOLDS_VAR,
+					"a function that yields cannot take \(what)",
+					param.span,
+					"the generator would hold it between calls",
+				).withNote(
+					"a function that yields answers a generator, which keeps what it was given until its values are asked for; it may read what it borrows, but not change it",
+				).withHelp(
+					"take it as `&`, or collect the values with `own for`, which runs while the call does",
+				),
+			)
+		}
+		val genId = self.declareGenerator(span)
+		val next = self.generatorNext(genId)
+		val genTy = self.intern(.Struct(id: genId, args: args))
+		val thisTy = self.intern(.Ref(inner: genTy, kind: .Var))
+		val elemList = self.program.types.internList([elem])
+		val ret = match self.program.preludeItems.enumeration(.Option) {
+			.Some(option) => self.intern(.Enum(id: option, args: elemList))
+			.None => ERROR
+		}
+		// Its struct: where it stopped, then what the function was given.
+		var fields = Vec::of(own [
+			FieldDef(
+				isPub: false,
+				isVar: true,
+				name: Symbol::state(),
+				ty: I32,
+				span: span,
+				default: .None,
+			),
+		])
+		var isView = false
+		for param in params {
+			fields.push(FieldDef(
+				isPub: false,
+				isVar: false,
+				name: param.name,
+				ty: param.ty,
+				span: param.span,
+				default: .None,
+			))
+			if self.program.holdsView(param.ty) then isView = true
+		}
+		self.program.structs[genId].generics = generics.clone()
+		self.program.structs[genId].fields = move fields
+		self.program.structs[genId].isView = isView
+		self.program.structs[genId].generator = .Some(GeneratorDef(
+			next: next,
+			elem: elem,
+			of: .Some(id),
+		))
+		self.program.fns[next].params = Vec::of(own [
+			ParamDef(
+				name: Symbol::generator(),
+				nameSpan: span,
+				ty: thisTy,
+				span: span,
+				default: .None,
+			),
+		])
+		self.program.fns[next].ret = ret
+		self.program.fns[next].generics = generics.clone()
+		self.program.fns[id].ret = genTy
+		// It is an `Iterator`, with the interface's other methods.
+		if self.program.preludeItems.interfaceOf(.Iterator) is .Some(interfaceId) {
+			val owner: TypeDef = .Struct(genId)
+			val wanted = self.program.interfaces[interfaceId].methods.clone()
+			var methods = Vec::of(own [next])
+			for i in 1..wanted.len() {
+				self.addDefault(owner, wanted[i].id)
+				methods.push(wanted[i].id)
+			}
+			// What it decides: its element, for `I::Item` once `I` is known.
+			val tys = self.paramTys(&generics)
+			val list = self.program.types.internList(&tys)
+			val pattern = self.intern(.Struct(id: genId, args: list))
+			self.program.types.addDecided(interfaceId, pattern, elemList)
+			self.program.impls.push(ImplDef(
+				interfaceId: interfaceId,
+				args: elemList,
+				ty: owner,
+				methods: move methods,
+				conditions: move generics,
+				module: self.current as u32,
+				span: span,
+			))
+		}
+	}
+
+	/// The generator a function that yields answers, if it is one.
+	fn generatorOfFn(id: FnId): Option<StructId> = match self.kind(self.program.fns[id].ret) {
+		.Struct(id: genId, ..) => match self.program.structs[genId].generator {
+			.Some(g) if g.of == .Some(id) => .Some(genId)
+			_ => .None
+		}
+		_ => .None
+	}
+
+	/// The body of a function that yields. Checked as written, it is the body
+	/// of the generator's `next`, whose parameters are the generator and then
+	/// the function's own, which the MIR takes out of the generator when it
+	/// starts. The function's own body makes the generator from what it was
+	/// given.
+	var fn checkGeneratorFn(body: ast::ExprId, id: FnId, genId: StructId) = {
+		val generator = self.program.structs[genId].generator.clone().unwrap()
+		val next = generator.next
+		val genTy = self.program.fns[id].ret
+		val thisTy = self.program.fns[next].params[0].ty
+		val params = self.program.fns[id].params.clone()
+		val span = self.program.fns[id].nameSpan
+		// `next`: the body as written, which yields.
+		self.state.body = Body()
+		self.state.scopes = Vec::of(own [Map()])
+		self.state.ret = UNIT
+		self.state.generator = .Some(GeneratorBuild(
+			elem: .Some(generator.elem),
+			loopSpan: .None,
+			yielded: false,
+		))
+		val this = self.declare(Symbol::generator(), thisTy, .Param, span)
+		self.state.body.params.push(this)
+		for p in params {
+			val local = self.declare(p.name, p.ty, .Param, p.nameSpan)
+			self.state.body.params.push(local)
+		}
+		val file = self.ast
+		val whole = file.exprs[body].span
+		// A loop written as the body is the function's own, and its `yield`s
+		// are the function's.
+		val value = if file.exprs[body].kind is .ForElement(binding, source, body: loopBody) {
+			val kind = self.forStmt(.None, &binding, source, &loopBody)
+			val stmt = self.state.body.stmts.add(Stmt(kind: move kind, span: whole))
+			val block = Block(stmts: Vec::of(own [stmt]), value: .None, span: whole)
+			self.alloc(.Block(move block), UNIT, whole)
+		} else {
+			val inferred = self.infer(body, .Some(UNIT))
+			self.wrapDiscarded(inferred)
+		}
+		self.state.body.value = .Some(value)
+		val yielded = match self.state.generator.take() {
+			.Some(build) => build.yielded
+			.None => false
+		}
+		self.settleBindings()
+		val code = mem::replace(&var self.state.body, Body())
+		if !yielded {
+			val name = String::of(self.text(self.program.fns[id].name))
+			var diagnostic = Diagnostic::error(
+				GENERATOR_YIELDS_NOTHING,
+				"`\(name)` answers an `Iterator`, and yields nothing",
+				self.program.fns[id].nameSpan,
+				"no `yield` in its body",
+			).withNote(
+				"a function that answers `Iterator<T>` is a generator, whose values are what its body yields",
+			)
+			if self.program.fns[id].retSpan is .Some(retSpan) then
+				diagnostic = diagnostic.withSecondary(retSpan, "a generator")
+			self.report(diagnostic.withHelp("hand each value over with `yield`"))
+		}
+		self.program.fns[next].body = .Some(move code)
+		// The function itself: the generator, holding what it was given.
+		self.state.body = Body()
+		self.state.scopes = Vec::of(own [Map()])
+		self.state.ret = genTy
+		var values = Vec::of(own [self.alloc(.Int(0), I32, span)])
+		for p in params {
+			val local = self.declare(p.name, p.ty, .Param, p.nameSpan)
+			self.state.body.params.push(local)
+			val read = self.alloc(.Local(local), p.ty, p.nameSpan)
+			val given = if self.owns(p.ty) then self.alloc(.Move(read), p.ty, p.nameSpan) else read
+			values.push(given)
+		}
+		var order: Vec<u32> = Vec()
+		for i in 0..values.len() {
+			order.push(i as u32)
+		}
+		val made = self.alloc(
+			.Struct(id: genId, fields: move values, order: move order),
+			genTy,
+			whole,
+		)
+		self.state.body.value = .Some(made)
+		self.settleBindings()
+		self.program.fns[id].body = .Some(mem::replace(&var self.state.body, Body()))
+	}
+
+	/// The generators a value of `ty` holds in itself, rather than behind an
+	/// `own` or a reference: a generator holds what its `next` keeps between
+	/// calls, so one of these in its `next` is part of it. The fields' types
+	/// are worked out here, since not every instance's are interned yet.
+	var fn generatorsHeld(ty: Ty, out: &var Vec<StructId>, seen: &var Set<Ty>) = {
+		if !seen.add(ty) then return
+		match self.kind(ty) {
+			.Struct(id, ..) if self.program.structs[id].generator.isSome() => {
+				if !out.contains(&id) then out.push(id)
+			}
+			.Struct(id, args) => {
+				val list = self.program.types.list(args).toVec()
+				var fields: Vec<Ty> = Vec()
+				for f in self.program.structs[id].fields {
+					fields.push(f.ty)
+				}
+				for field in fields {
+					val substituted = self.program.types.subst(field, &list)
+					self.generatorsHeld(substituted, &var out, &var seen)
+				}
+			}
+			.Enum(id, args) => {
+				val list = self.program.types.list(args).toVec()
+				var fields: Vec<Ty> = Vec()
+				for v in self.program.enums[id].variants {
+					for f in v.fields {
+						fields.push(f.ty)
+					}
+				}
+				for field in fields {
+					val substituted = self.program.types.subst(field, &list)
+					self.generatorsHeld(substituted, &var out, &var seen)
+				}
+			}
+			.Array(elem, ..) => self.generatorsHeld(elem, &var out, &var seen)
+			_ => {}
+		}
+	}
+
+	/// The generators a generator's `next` holds, each with the first
+	/// expression that makes it.
+	var fn heldByNext(body: &Body): Vec<(StructId, ExprId)> = {
+		var edges: Vec<(StructId, ExprId)> = Vec()
+		// What `own` puts on the heap is made there, and never kept in the
+		// generator.
+		var onHeap: Set<ExprId> = Set()
+		for expr in body.exprs {
+			if expr.kind is .Own(inner) then onHeap.add(inner)
+		}
+		// A place reads what is there already, which a local of the body
+		// holds, and makes nothing.
+		var seenLocals: Vec<StructId> = Vec()
+		for local in body.locals {
+			var seen: Set<Ty> = Set()
+			self.generatorsHeld(local.ty, &var seenLocals, &var seen)
+		}
+		for exprId in body.exprs.ids() {
+			val expr = &body.exprs[exprId]
+			if onHeap.contains(&exprId) ||
+				expr.kind is .Deref(..) | .Field(..) | .Index(..) | .Local(..) {
+				continue
+			}
+			var found: Vec<StructId> = Vec()
+			var seen: Set<Ty> = Set()
+			self.generatorsHeld(expr.ty, &var found, &var seen)
+			for held in found {
+				var known = false
+				for (h, _) in edges {
+					if h == held then known = true
+				}
+				if !known then edges.push((held, exprId))
+			}
+		}
+		// A local that holds one it got from a place is held too; the
+		// expression that made it is where it is reported.
+		var left: Vec<StructId> = Vec()
+		for held in seenLocals {
+			var known = false
+			for (h, _) in edges {
+				if h == held then known = true
+			}
+			if !known then left.push(held)
+		}
+		if !left.isEmpty() && body.value is .Some(value) then edges.push((left[0], value))
+		return move edges
+	}
+
+	/// Whether the generator `from` reaches `to` through what each holds.
+	fn reaches(
+		holds: &Map<StructId, Vec<(StructId, ExprId)>>,
+		from: StructId,
+		to: StructId,
+	): bool = {
+		var seen: Set<StructId> = Set()
+		var work = Vec::of(own [from])
+		while work.pop() is .Some(g) {
+			if g == to then return true
+			if !seen.add(g) then continue
+			if holds.get(&g) is .Some(edges) {
+				for (h, _) in edges {
+					work.push(h)
+				}
+			}
+		}
+		return false
+	}
+
+	/// A generator whose `next` keeps a generator that keeps it, however many
+	/// steps away, would be endlessly large: the one that walks a tree,
+	/// walking itself for each child. The inner one goes on the heap.
+	var fn checkGeneratorCycles() = {
+		var generators: Vec<(StructId, FnId)> = Vec()
+		for id in self.program.structs.ids() {
+			if self.program.structs[id].generator is .Some(g) &&
+				self.program.fns[g.next].body.isSome() {
+				generators.push((id, g.next))
+			}
+		}
+		// What each one holds, and the first expression of its `next` that
+		// makes each.
+		var holds: Map<StructId, Vec<(StructId, ExprId)>> = Map()
+		for (id, next) in generators {
+			val body = self.program.fns[next].body.clone().unwrap()
+			holds.put(id, self.heldByNext(&body))
+		}
+		for (id, next) in generators {
+			// The generators this one reaches, and whether it is among them.
+			var cycle = false
+			for (h, _) in holds.get(&id).unwrap() {
+				if self.reaches(&holds, h, id) then cycle = true
+			}
+			if !cycle then continue
+			// Where it holds the first one on the way back to itself.
+			var at: Option<ExprId> = .None
+			for (h, e) in holds.get(&id).unwrap() {
+				if at.isNone() && (h == id || self.reaches(&holds, h, id)) then at = .Some(e)
+			}
+			val .Some(expr) = at else {
+				continue
+			}
+			val span = match self.program.fns[next].body {
+				.Some(body) => body.exprs[expr].span
+				.None => panic("a generator's `next` has a body")
+			}
+			val name = match self.program.structs[id].generator {
+				.Some(g) if g.of.isSome() => "`\(self.text(self.program.fns[g.of.unwrap()].name))`"
+				_ => String::of("this loop")
+			}
+			self.report(
+				Diagnostic::error(
+					GENERATOR_HOLDS_ITSELF,
+					"\(name) would hold itself, and be endlessly large",
+					span,
+					"a generator held here, by value, that holds this one",
+				).withNote(
+					"a generator keeps what it walks inside itself, so one that walks itself holds itself; on the heap, it holds a pointer",
+				).withFix("put the inner one on the heap", own [Edit::insert(span.lo, "own ")]),
+			)
+		}
+	}
+}

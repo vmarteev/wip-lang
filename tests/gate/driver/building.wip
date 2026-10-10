@@ -1,0 +1,526 @@
+// Building: the C a program carries and the C a library is linked into,
+// what a program holds, the processors and targets it is built for, what
+// the build keeps in its cache, and the IR it writes.
+
+import std::fs
+import std::io
+import std::path
+import std::process::{Command}
+import check::{Gate, isDirectory, isFile, listed, read, run, wrong, write}
+
+/// A C compiler that writes down how it was called, to `calls.txt` under
+/// `root`, and then calls the real one: `$CC`, or `cc`.
+fn recordingCompiler(root: str): String = {
+	val real = io::env("CC").unwrapOr(String::of("cc"))
+	val log = path::join(root, "calls.txt")
+	val script = path::join(root, "cc.sh")
+	fs::writeFile(script.toStr(), "#!/bin/sh\necho \"$*\" >> '\(log)'\nexec \(real) \"$@\"\n")
+	run(Command::of("chmod").args(["755", script.toStr()]))
+	return move script
+}
+
+/// A program of Wip alone compiles no C: the runtime is Wip, and `cc` is
+/// asked once, to link.
+fn wipAloneCompilesNoC(gate: &Gate, root: str): Option<String> = {
+	write(
+		root,
+		"main.wip",
+		"import std::fs\nimport std::future::{Future}\nimport std::io\nimport std::process::{Command}\n\nfn main() = {\n    val answer = Future::run(own () => 6 * 7).get()\n    io::println(\"\\(answer) \\(fs::exists(\"main.wip\"))\")\n    val said = Command::of(\"echo\").arg(\"hello\").output()\n    if said is .Ok(..) {\n        io::println(\"spawned\")\n    }\n}\n",
+	)
+	val cc = recordingCompiler(root)
+	val cache = path::join(root, "cache")
+	val ran = run(
+		gate.command(root, ["run", "main.wip"]).
+			env("CC", cc.toStr()).
+			env("WIP_CACHE_DIR", cache.toStr()).
+			env("WIP_CHECK_LEAKS", "1"),
+	)
+	if !ran.exit.success() || ran.stdout != "42 true\nspawned\n" then
+		return wrong("`wip run main.wip`", &ran)
+	val calls = linesOf(read(root, "calls.txt").toStr())
+	if calls.len() != 1 || !calls[0].startsWith("-o ") then
+		return .Some("the C compiler was called otherwise than once, to link: \(calls.join(" | "))")
+	return .None
+}
+
+/// A debug build compiles a module's C unoptimised and with debug
+/// information, and a release build optimised; `--release` is taken by
+/// `build`, `run` and `test`, and the program does the same built either
+/// way.
+fn releaseOptimizes(gate: &Gate, root: str): Option<String> = {
+	write(
+		root,
+		"main.wip",
+		"import std::io\nimport twice\n\nfn main() = io::println(\"\\(twice::twice(21))\")\n",
+	)
+	write(root, "twice/twice.wip", "extern \"C\" {\n    pub fn twice(n: i64): i64\n}\n")
+	write(
+		root,
+		"twice/twice.c",
+		"#include <stdint.h>\nint64_t twice(int64_t n) { return n * 2; }\n",
+	)
+	write(root, "main.test.wip", "@test\nfn itDoubles() = assert(twice::twice(4) == 8)\n")
+	val cc = recordingCompiler(root)
+	val cache = path::join(root, "cache")
+	val withCc = (arguments: &[str]) => run(
+		gate.command(root, arguments).env("CC", cc.toStr()).env("WIP_CACHE_DIR", cache.toStr()),
+	)
+	// The C each build compiled, and how; the record is begun again.
+	val compiled = () => {
+		var calls: Vec<String> = Vec()
+		val log = read(root, "calls.txt")
+		for call in log.lines() {
+			if call.contains("twice.c") then calls.push(String::of(call))
+		}
+		fs::removeFile(path::join(root, "calls.txt").toStr())
+		return calls.join("\n")
+	}
+	val debug = withCc(["run", "main.wip"])
+	if !debug.exit.success() || debug.stdout != "42\n" then
+		return wrong("`wip run main.wip`", &debug)
+	val debugCalls = compiled()
+	if !debugCalls.contains("-O0") || !debugCalls.contains("-g") then
+		return .Some("a debug build compiled C so: \(debugCalls)")
+	val release = withCc(["run", "--release", "main.wip"])
+	if !release.exit.success() || release.stdout != "42\n" then
+		return wrong("`wip run --release main.wip`", &release)
+	val releaseCalls = compiled()
+	if !releaseCalls.contains("-O2") || !releaseCalls.contains("-g") then
+		return .Some("a release build compiled C so: \(releaseCalls)")
+	val built = withCc(["build", "--release", "main.wip", "-o", "doubled"])
+	if !built.exit.success() then return wrong("`wip build --release main.wip`", &built)
+	val doubled = run(Command::of(path::join(root, "doubled").toStr()))
+	if doubled.stdout != "42\n" then return wrong("the program built", &doubled)
+	val tested = withCc(["test", "--release", "main.wip"])
+	if !tested.exit.success() || !tested.stdout.contains("1 test passed") then
+		return wrong("`wip test --release main.wip`", &tested)
+	return .None
+}
+
+/// `-I` and `-L`: where a header and a library are on this machine. The
+/// header is in a directory of its own, which nothing would find without
+/// being told.
+fn includeAndLibraryPaths(gate: &Gate, root: str): Option<String> = {
+	val elsewhere = path::join(root, "elsewhere")
+	write(
+		elsewhere.toStr(),
+		"twice.h",
+		"#ifndef TWICE_H\n#define TWICE_H\nstatic inline int twice(int n) { return n * 2; }\n#endif\n",
+	)
+	write(
+		root,
+		"main.wip",
+		"import std::io\n\nextern \"C\" {\n    @header(\"twice.h\")\n    fn twice(n: c_int): c_int\n}\n\nfn main() = io::printInt(twice(21) as i64)\n",
+	)
+	val blind = gate.wip(root, ["run", "main.wip"])
+	if blind.exit.success() || !blind.stderr.contains("twice.h") then
+		return wrong("`wip run main.wip`, not told", &blind)
+	val told = gate.wip(root, ["run", "-I", elsewhere.toStr(), "-L", elsewhere.toStr(), "main.wip"])
+	if !told.exit.success() || told.stdout != "42\n" then
+		return wrong("`wip run -I … -L … main.wip`", &told)
+	return .None
+}
+
+/// A Wip library a C program links against, with the header the compiler
+/// writes for it. A slice reaches C as a pointer and a length. The archive
+/// holds undefined references to what the library calls, which whoever
+/// links it supplies, and the header says what that is: the prelude's
+/// maths are Wip's own, but for C's `fma` on x86-64, where an older
+/// processor has no instruction for it, which on Linux is in libm.
+fn libraryForC(gate: &Gate, root: str): Option<String> = {
+	write(
+		root,
+		"board.wip",
+		"@export(\"C\")\nfn board_score(row: i64, column: i64): i64 = row * 10 + column\n\n@export(\"C\")\nfn board_best(counts: &[i64]): i64 = {\n    var best = 0\n    for n in counts {\n        if n > best {\n            best = n\n        }\n    }\n    return best\n}\n\n@export(\"C\")\nfn board_greet(name: cstring): i64 = name.toStr().len()\n",
+	)
+	// The C that calls it lives elsewhere: a `.c` beside the Wip is part of
+	// the module.
+	fs::makeDirs(path::join(root, "c").toStr())
+	val built = gate.wip(root, [
+		"build",
+		"board.wip",
+		"--emit",
+		"static",
+		"--header",
+		"c/board.h",
+		"-o",
+		"libboard.a",
+	])
+	if !built.exit.success() then return wrong("`wip build board.wip --emit static`", &built)
+	val header = read(root, "c/board.h")
+	for declared in [
+		"int64_t board_score(int64_t row, int64_t column);",
+		"int64_t board_best(const int64_t *counts, int64_t counts_len);",
+		"int64_t board_greet(const char *name);",
+	] {
+		if !header.contains(declared) then
+			return .Some("the header does not declare `\(declared)`:\n\(header)")
+	}
+	val needsLibm = TARGET_OS == "linux" && TARGET_ARCH == "x86_64"
+	if header.contains("/* Link what this declares with: -lm */") != needsLibm then
+		return .Some("the header says otherwise of libm:\n\(header)")
+	write(
+		root,
+		"c/main.c",
+		"#include <stdio.h>\n#include \"board.h\"\n\nint main(void) {\n    int64_t counts[] = {3, 9, 4};\n    printf(\"%lld %lld %lld\\n\", (long long)board_score(4, 2),\n        (long long)board_best(counts, 3), (long long)board_greet(\"lines\"));\n    return 0;\n}\n",
+	)
+	val cc = io::env("CC").unwrapOr(String::of("cc"))
+	var link = Command::of(cc.toStr()).args([
+		"c/main.c",
+		"libboard.a",
+		"-o",
+		"c/program",
+	]).directory(root)
+	if needsLibm then link = link.arg("-lm")
+	val linked = run(move link)
+	if !linked.exit.success() then return wrong("the C program does not link", &linked)
+	val ran = run(Command::of(path::join(root, "c/program").toStr()))
+	if ran.stdout != "42 9 5\n" then return wrong("the C program", &ran)
+	return .None
+}
+
+/// A program holds what it can reach from where it starts, and nothing else
+/// of its own or of the library's: a function nothing calls, a constant
+/// table nothing reads and the prelude's `pow` are in no object, and what
+/// is reached through a function value, a drop and another module is. The
+/// symbols of a program that was not stripped name the functions it holds,
+/// and a table is its words, which no symbol names.
+fn holdsWhatItReaches(gate: &Gate, root: str): Option<String> = {
+	write(
+		root,
+		"main.wip",
+		"import std::io\n\nval READ: [i64; 3] = [1, 2, 3]\nval UNREAD: [i64; 3] = [4, 5, 6]\n\nstruct Held {\n    text: String\n}\n\nextend Held: Destroy {\n    var fn destroy() = io::println(\"ended\")\n}\n\nfn reached(n: i64): i64 = READ[n]\n\nfn asAValue(n: i64): i64 = n + 1\n\nfn unreached(n: i64): i64 = UNREAD[n] + onlyFromUnreached(n)\n\nfn onlyFromUnreached(n: i64): i64 = (n as f64).pow(2.0) as i64\n\nfn main() = {\n    val held = Held(text: String::of(\"x\"))\n    val f = asAValue\n    io::println(\"\\(reached(1)) \\(f(1)) \\(held.text.len())\")\n}\n",
+	)
+	val built = gate.wip(root, ["build", "main.wip", "-o", "program"])
+	if !built.exit.success() then return wrong("`wip build main.wip`", &built)
+	val ran = run(Command::of(path::join(root, "program").toStr()))
+	if ran.stdout != "2 2 1\nended\n" then return wrong("the program", &ran)
+	val program = read(root, "program")
+	for name in ["wip.reached.", "wip.asAValue.", "wip.Held.destroy."] {
+		if !program.contains(name) then
+			return .Some("`\(name)` is reached, and is not in the program")
+	}
+	if !program.contains(words(1).toStr()) then
+		return .Some("`READ` is reached, and is not in the program")
+	for name in ["wip.unreached.", "wip.onlyFromUnreached.", "wip.std::prelude::power."] {
+		if program.contains(name) then
+			return .Some("`\(name)` is not reached, and is in the program")
+	}
+	if program.contains(words(4).toStr()) then
+		return .Some("`UNREAD` is not reached, and is in the program")
+	return .None
+}
+
+/// Three words in a row, `first` and the two after it, as a table of
+/// `i64`s is laid out: eight bytes each, the lowest first.
+fn words(first: i64): String = {
+	var bytes: Vec<u8> = Vec()
+	for n in first..first + 3 {
+		bytes.push(n as u8)
+		for _ in 0..7 {
+			bytes.push(0)
+		}
+	}
+	return String::of(str::fromBytes(&bytes))
+}
+
+/// A program is built for the processor `--cpu` names, its C too, and does
+/// the same on each: the baseline, the compiling machine, and every level of
+/// its kind — which a name it does not know is refused by listing — each
+/// run where this machine can.
+fn builtForProcessor(gate: &Gate, root: str): Option<String> = {
+	write(
+		root,
+		"main.wip",
+		"import std::io\n\nextern \"C\" {\n    fn twice(n: i64): i64\n}\n\nfn main() = {\n    val bits: u64 = 0b1011_0000\n    io::println(\"\\(bits.countOnes()) \\(bits.leadingZeros()) \\((2.5).floor()) \\((0.1).mulAdd(10.0, -1.0)) \\(twice(21))\")\n}\n",
+	)
+	write(root, "twice.c", "#include <stdint.h>\nint64_t twice(int64_t n) { return n * 2; }\n")
+	val refused = gate.wip(root, ["build", "--cpu", "pentium", "main.wip"])
+	if refused.exit.success() ||
+		!refused.stderr.contains("not a processor this compiler builds for") {
+		return wrong("`wip build --cpu pentium`", &refused)
+	}
+	val .Some(listing) = refused.stderr.find("it takes ") else {
+		return wrong("`wip build --cpu pentium` lists no processor", &refused)
+	}
+	val names = refused.stderr[listing + 9..].lines().next().unwrapOr("").trim()
+	for name in names.split(", ") {
+		val built = gate.wip(root, ["build", "--cpu", name, "main.wip", "-o", "program"])
+		if !built.exit.success() then return wrong("`wip build --cpu \(name)`", &built)
+		val runs = match name {
+			"x86-64-v3" => x86Has(["avx2", "fma", "bmi2", "abm"])
+			"x86-64-v4" => x86Has(["avx512f", "avx512dq", "avx512vl"])
+			_ => true
+		}
+		if runs {
+			val ran = run(Command::of(path::join(root, "program").toStr()))
+			if ran.stdout != "3 56 2 5.551115123125783e-17 42\n" then
+				return wrong("built for \(name), the program", &ran)
+		}
+	}
+	return .None
+}
+
+/// Whether this machine is an x86-64 one whose processor has every one of
+/// `features`, as Linux names them; where that cannot be asked, not.
+fn x86Has(features: &[str]): bool = {
+	if TARGET_ARCH != "x86_64" then return false
+	val .Ok(info) = fs::readFile("/proc/cpuinfo") else {
+		return false
+	}
+	val .Some(flags) = info.lines().find((line) => line.startsWith("flags")) else {
+		return false
+	}
+	val had: Vec<str> = flags.split(" ").toVec()
+	for feature in features {
+		if !had.contains(&feature) then return false
+	}
+	return true
+}
+
+/// A library loaded as the program runs: `--emit dynamic`.
+fn sharedLibrary(gate: &Gate, root: str): Option<String> = {
+	write(root, "twice.wip", "@export(\"C\")\nfn wip_twice(n: i64): i64 = n * 2\n")
+	val built = gate.wip(root, ["build", "twice.wip", "--emit", "dynamic"])
+	val name = if TARGET_VENDOR == "apple" then "libtwice.dylib" else "libtwice.so"
+	if !built.exit.success() || !isFile(root, name) then
+		return wrong("`wip build --emit dynamic` wrote no `\(name)`", &built)
+	return .None
+}
+
+/// On a Mac a module's `.m` file is Objective-C, which a C compiler
+/// refuses — a message sent to a class — and `@framework` links what it
+/// names.
+fn objectiveC(gate: &Gate, root: str): Option<String> = {
+	if TARGET_VENDOR != "apple" then return .None
+	write(
+		root,
+		"main.wip",
+		"import std::io\nimport clock::{seconds_are_positive}\n\nfn main() = io::println(\"\\(seconds_are_positive())\")\n",
+	)
+	write(
+		root,
+		"clock/clock.wip",
+		"@framework(\"Foundation\")\nextern \"C\" {\n    pub fn seconds_are_positive(): bool\n}\n",
+	)
+	write(
+		root,
+		"clock/clock.m",
+		"#import <Foundation/Foundation.h>\n#include <stdbool.h>\n\nbool seconds_are_positive(void) {\n    return [[NSDate date] timeIntervalSince1970] > 0;\n}\n",
+	)
+	val cache = path::join(root, "cache")
+	val ran = run(gate.command(root, ["run", "main.wip"]).env("WIP_CACHE_DIR", cache.toStr()))
+	if ran.stdout != "true\n" then return wrong("`wip run main.wip`", &ran)
+	return .None
+}
+
+/// An `@include` naming a directory the module does not have is reported by
+/// the build, which knows where the module is.
+fn includeNotThere(gate: &Gate, root: str): Option<String> = {
+	write(root, "main.wip", "import lib::{answer}\n\nfn main(): i64 = answer() as i64\n")
+	write(
+		root,
+		"lib/lib.wip",
+		"@include(\"missing\")\nextern \"C\" {\n    pub fn answer(): c_int\n}\n",
+	)
+	write(root, "lib/answer.c", "int answer(void) { return 0; }\n")
+	val built = gate.wip(root, ["build", "main.wip"])
+	if built.exit.success() || !built.stderr.contains("`@include(\"missing\")` in module `lib`") {
+		return wrong("`wip build main.wip`", &built)
+	}
+	return .None
+}
+
+/// A program says which target it is for: `@target` on an item, and a file
+/// named for a target. What is not this target's is not compiled, so two of
+/// them may share a name, and the prelude says what the target is. The
+/// program prints the same thing everywhere, since what differs is which
+/// item was compiled to say it; and `wip parse` shows the file as written,
+/// since what is compiled is a question for compiling.
+fn targetsChoose(gate: &Gate, root: str): Option<String> = {
+	write(
+		root,
+		"main.wip",
+		"import std::io\nimport plat\n\n@target(os = \"macos\")\nfn which(): str = \"here\"\n\n@target(os = \"linux\")\nfn which(): str = \"here\"\n\n@target(os = \"windows\")\nfn which(): str = \"here\"\n\nfn main() = {\n    io::println(which())\n    io::println(plat::name())\n    val known = TARGET_OS == \"macos\" || TARGET_OS == \"linux\" ||\n        TARGET_OS == \"windows\"\n    assert(known && (TARGET_ARCH == \"arm64\" || TARGET_ARCH == \"x86_64\"))\n}\n",
+	)
+	for os in ["macos", "linux", "windows"] {
+		write(root, "plat/plat.\(os).wip".toStr(), "pub fn name(): str = \"a file for this one\"\n")
+	}
+	val ran = gate.wip(root, ["run", "main.wip"])
+	if !ran.exit.success() || ran.stdout != "here\na file for this one\n" then
+		return wrong("`wip run main.wip`", &ran)
+	val parsed = gate.wip(root, ["parse", "main.wip"])
+	if countOf(parsed.stdout.toStr(), "fn which") != 3 then
+		return wrong("`wip parse main.wip`", &parsed)
+	return .None
+}
+
+/// `wip check --target` checks the program as another target compiles it,
+/// from this machine: an item or a file for Linux is read on a Mac, and a
+/// Mac's on Linux. Each mistake is said once, and, where not every target
+/// found it, which did.
+fn checkedForAnotherTarget(gate: &Gate, root: str): Option<String> = {
+	write(
+		root,
+		"main.wip",
+		"import std::io\n\n@target(os = \"linux\")\nfn place(): str = notDeclaredAnywhere()\n\n@target(vendor = \"apple\")\nfn place(): str = \"a Mac\"\n\nfn main() = {\n    io::println(place())\n}\n",
+	)
+	write(root, "wide.x86_64.wip", "fn wide(): i64 = true\n")
+	val linux = gate.wip(root, ["check", "--target", "linux-arm64", "main.wip"])
+	if linux.exit != .Code(1) ||
+		!linux.stderr.contains("cannot find `notDeclaredAnywhere`") ||
+		!linux.stderr.contains("1 error") {
+		return wrong("`wip check --target linux-arm64`", &linux)
+	}
+	val mac = gate.wip(root, ["check", "--target", "macos-arm64", "main.wip"])
+	if mac.exit != .Code(0) then return wrong("`wip check --target macos-arm64`", &mac)
+	val intel = gate.wip(root, ["check", "--target", "macos-x86_64", "main.wip"])
+	if intel.exit != .Code(1) || !intel.stderr.contains("wide.x86_64.wip") then
+		return wrong("`wip check --target macos-x86_64`", &intel)
+	val all = gate.wip(root, ["check", "--target", "all", "main.wip"])
+	if all.exit != .Code(1) ||
+		countOf(all.stderr.toStr(), "cannot find `notDeclaredAnywhere`") != 1 ||
+		!all.stderr.contains("found when checking for linux-arm64, linux-x86_64") ||
+		!all.stderr.contains("found when checking for macos-x86_64, linux-x86_64") ||
+		!all.stderr.contains("2 errors") {
+		return wrong("`wip check --target all`", &all)
+	}
+	val twice = gate.wip(root, ["check", "--target", "linux", "--target", "linux", "main.wip"])
+	if countOf(twice.stderr.toStr(), "cannot find `notDeclaredAnywhere`") != 1 then
+		return wrong("`wip check --target linux --target linux`", &twice)
+	val windows = gate.wip(root, ["check", "--target", "windows", "main.wip"])
+	if windows.exit != .Code(2) || !windows.stderr.contains("not written for Windows") then
+		return wrong("`wip check --target windows`", &windows)
+	val unknown = gate.wip(root, ["check", "--target", "linux-riscv64", "main.wip"])
+	if unknown.exit != .Code(2) || !unknown.stderr.contains("`linux-riscv64` is not a target") then
+		return wrong("`wip check --target linux-riscv64`", &unknown)
+	return .None
+}
+
+/// A mistake in code shared by every target is said once, without saying
+/// which found it.
+fn mistakeSaidOnce(gate: &Gate, root: str): Option<String> = {
+	write(root, "main.wip", "fn main() = {\n    val n: i64 = \"text\"\n}\n")
+	val checked = gate.wip(root, ["check", "--target", "all", "main.wip"])
+	if countOf(checked.stderr.toStr(), "mismatched types") != 1 ||
+		checked.stderr.contains("found when checking for") ||
+		!checked.stderr.contains("1 error") {
+		return wrong("`wip check --target all`", &checked)
+	}
+	return .None
+}
+
+/// `wip cache clean` removes what a build and the debugger's scripts left in
+/// the cache, each a directory it knows, and nothing else there: the cache
+/// may be a directory of the user's own. A second has nothing to remove.
+fn cacheCleaned(gate: &Gate, root: str): Option<String> = {
+	val cache = path::join(root, "cache")
+	write(root, "main.wip", "import std::io\n\nfn main() = io::println(\"built\")\n")
+	val inCache = (arguments: &[str]) => run(
+		gate.command(root, arguments).env("WIP_CACHE_DIR", cache.toStr()),
+	)
+	val built = inCache(["build", "main.wip"])
+	if !built.exit.success() then return wrong("`wip build main.wip`", &built)
+	val scripts = inCache(["debug", "--scripts"])
+	if !scripts.exit.success() then return wrong("`wip debug --scripts`", &scripts)
+	write(cache.toStr(), "mine.txt", "kept")
+	val kept = listed(cache.toStr())
+	if !kept.contains(String::of("llvm")) then
+		return .Some("the cache holds no `llvm`: \(kept.join(", "))")
+	val cleaned = inCache(["cache", "clean"])
+	if !cleaned.exit.success() || !cleaned.stdout.startsWith("removed ") then
+		return wrong("`wip cache clean`", &cleaned)
+	val left = listed(cache.toStr())
+	if left.len() != 1 || left[0] != "mine.txt" then
+		return .Some("`wip cache clean` left \(left.join(", ")), of \(kept.join(", "))")
+	val again = inCache(["cache", "clean"])
+	if !again.stdout.startsWith("nothing to remove in ") then
+		return wrong("`wip cache clean`, again", &again)
+	return .None
+}
+
+/// `build --emit llvm-ir` writes the program's IR and runs no `clang`: a
+/// release build's one module where the output says, and a debug build's
+/// parts, the first there and each after it beside it, numbered before the
+/// extension. How many parts there are is decided by what the functions
+/// hold: every one written, and more than one.
+fn irWithoutClang(gate: &Gate, root: str): Option<String> = {
+	val example = fs::realPath("examples/json-pretty/main.wip").unwrapOr(String())
+	val noClang = (arguments: &[str]) => run(
+		gate.command(root, arguments).env("WIP_CLANG", "/nowhere/clang"),
+	)
+	val release = noClang([
+		"build",
+		"--release",
+		"--emit",
+		"llvm-ir",
+		example.toStr(),
+		"-o",
+		"pretty.ll",
+	])
+	if !release.exit.success() then return wrong("`wip build --release --emit llvm-ir`", &release)
+	if !read(root, "pretty.ll").contains("\ndefine ") then
+		return .Some("the release build's IR defines nothing")
+	if isFile(root, "pretty.1.ll") then return .Some("a release build is one module")
+	val debug = noClang(["build", "--emit", "llvm-ir", example.toStr()])
+	if !debug.exit.success() then return wrong("`wip build --emit llvm-ir`", &debug)
+	var parts: Vec<String> = Vec()
+	parts.push(String::of("main.ll"))
+	while isFile(root, "main.\(parts.len()).ll".toStr()) {
+		parts.push("main.\(parts.len()).ll")
+	}
+	if parts.len() < 2 then return .Some("a debug build of the example is in one part")
+	for part in parts {
+		if !read(root, part.toStr()).startsWith("; A part of a program") then
+			return .Some("`\(part)` is not a part")
+	}
+	return .None
+}
+
+/// `--no-debug-info` writes none, as `cc -g0` does: built either way, the
+/// program does what it does, and a panic says where it was but lists no
+/// calls, which come from what a debugger reads; its IR names no debug
+/// information.
+fn withoutDebugInfo(gate: &Gate, root: str): Option<String> = {
+	write(
+		root,
+		"main.wip",
+		"fn deep(n: i64): i64 = if n == 0 then panic(\"down\") else deep(n - 1)\n\nfn main(): i64 = deep(3)\n",
+	)
+	for release in [false, true] {
+		val built =
+			if release then
+				gate.wip(root, [
+					"build",
+					"--release",
+					"--no-debug-info",
+					"main.wip",
+					"-o",
+					"program",
+				])
+			else gate.wip(root, ["build", "--no-debug-info", "main.wip", "-o", "program"])
+		if !built.exit.success() then return wrong("`wip build --no-debug-info`", &built)
+		val ran = run(Command::of(path::join(root, "program").toStr()))
+		if ran.exit != .Code(101) ||
+			!ran.stderr.contains("panicked: down") ||
+			ran.stderr.contains("in deep") {
+			return wrong("built without debug information, the program", &ran)
+		}
+	}
+	val written = gate.wip(root, [
+		"build",
+		"--release",
+		"--no-debug-info",
+		"--emit",
+		"llvm-ir",
+		"main.wip",
+		"-o",
+		"program.ll",
+	])
+	if !written.exit.success() then
+		return wrong("`wip build --no-debug-info --emit llvm-ir`", &written)
+	val ir = read(root, "program.ll")
+	if ir.contains("!dbg") || ir.contains("llvm.dbg") then
+		return .Some("the IR names debug information")
+	return .None
+}

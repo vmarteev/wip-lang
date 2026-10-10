@@ -1,0 +1,226 @@
+// `@tailrec`: a function whose calls to itself are jumps.
+//
+// Tail position is decided here, where the spans are: the value of the body,
+// the value of a block in tail position, every arm of an `if` or a `match` in
+// tail position, and the operand of `return`. A call to the function itself
+// anywhere else is an error, and so is an argument that refers into the frame
+// the call is about to reuse. What is left — that no local still owns memory,
+// and that no `defer` is pending — needs to know what has been moved, so the
+// move checker asks it.
+
+import std::collections::{Set}
+import syntax::{Diagnostic, NOT_A_TAIL_CALL, Span}
+
+extend Lowerer {
+	/// Checks a `@tailrec` function once its body is checked, and records the
+	/// calls the mid-level IR turns into jumps.
+	var fn checkTailrec(id: FnId, value: ExprId) = {
+		// A projection lends a place of its caller; `yield` is not a call.
+		if self.program.fns[id].projects.isSome() ||
+			self.kind(self.program.fns[id].ret) is .Ref(..) {
+			val span = self.program.fns[id].span
+			self.report(
+				Diagnostic::error(
+					NOT_A_TAIL_CALL,
+					"a projection cannot be `@tailrec`",
+					span,
+					"a projection",
+				).withNote(
+					"a projection lends a place that belongs to its caller, and ends with `lend` rather than a call",
+				),
+			)
+			return
+		}
+		var tails: Vec<ExprId> = Vec()
+		self.tailPositions(value, &var tails)
+		// `return f(x)` is a tail call too, wherever the `return` is written.
+		self.returnedValues(value, &var tails)
+		var tailSet: Set<ExprId> = Set()
+		for t in tails {
+			tailSet.add(t)
+		}
+		// Every call the function makes to itself, in the order written.
+		var calls: Vec<ExprId> = Vec()
+		self.selfCalls(value, id, &var calls)
+		if calls.isEmpty() {
+			val span = self.program.fns[id].nameSpan
+			val name = String::of(self.text(self.program.fns[id].name))
+			self.report(
+				Diagnostic::error(
+					NOT_A_TAIL_CALL,
+					"`\(name)` never calls itself",
+					span,
+					"no call to itself",
+				).withNote(
+					"`@tailrec` promises that a function's calls to itself are jumps; a function that makes none has nothing to promise",
+				).withHelp("remove `@tailrec`"),
+			)
+			return
+		}
+		var tailCalls: Vec<ExprId> = Vec()
+		for call in calls {
+			if !tailSet.contains(&call) {
+				val span = self.state.body.exprs[call].span
+				self.report(
+					Diagnostic::error(
+						NOT_A_TAIL_CALL,
+						"this call to itself is not a tail call",
+						span,
+						"its value is used by what is around it",
+					).withNote(
+						"a tail call's value is the function's value, and nothing of the function runs after it",
+					).withHelp(
+						"in a `@tailrec` function every call to itself is a jump: carry what is computed after the call in a parameter instead",
+					),
+				)
+				continue
+			}
+			if self.borrowsFrame(call) then continue
+			tailCalls.push(call)
+		}
+		self.state.body.tailCalls = move tailCalls
+	}
+
+	/// The expressions in tail position, starting from the body's value.
+	fn tailPositions(id: ExprId, tails: &var Vec<ExprId>) = {
+		tails.push(id)
+		match self.state.body.exprs[id].kind {
+			// A block's value is in tail position; its statements are not, except
+			// a `return`, which the walk below finds anyway.
+			.Block(block) => {
+				if block.value is .Some(value) then self.tailPositions(value, &var tails)
+			}
+			.If(thenBlock, elseBlock, ..) => {
+				if thenBlock.value is .Some(value) then self.tailPositions(value, &var tails)
+				if elseBlock is .Some(b) && b.value is .Some(value) then
+					self.tailPositions(value, &var tails)
+			}
+			.Match(arms, ..) => {
+				for arm in arms {
+					self.tailPositions(arm.body, &var tails)
+				}
+			}
+			_ => {}
+		}
+	}
+
+	/// The operands of every `return` in the body, which are in tail position
+	/// wherever they are written, and what is in tail position inside them.
+	fn returnedValues(id: ExprId, tails: &var Vec<ExprId>) = {
+		val kind = &self.state.body.exprs[id].kind
+		for child in kind.children() {
+			self.returnedValues(child, &var tails)
+		}
+		for block in kind.blocks() {
+			self.returnedValuesInBlock(&block, &var tails)
+		}
+		for arm in kind.arms() {
+			self.returnedValues(arm.body, &var tails)
+		}
+	}
+
+	fn returnedValuesInBlock(block: &Block, tails: &var Vec<ExprId>) = {
+		for stmt in block.stmts {
+			val kind = &self.state.body.stmts[stmt].kind
+			if kind is .Return(.Some(value)) then self.tailPositions(value, &var tails)
+			for child in kind.children() {
+				self.returnedValues(child, &var tails)
+			}
+			for inner in kind.blocks() {
+				self.returnedValuesInBlock(&inner, &var tails)
+			}
+		}
+		if block.value is .Some(value) then self.returnedValues(value, &var tails)
+	}
+
+	/// Every call of the function to itself, wherever it is written. The
+	/// operand of a `return` is in tail position too, so the statements are
+	/// walked for those.
+	fn selfCalls(id: ExprId, function: FnId, calls: &var Vec<ExprId>) = {
+		val kind = &self.state.body.exprs[id].kind
+		if kind is .Call(callee, ..) && callee == function then calls.push(id)
+		for child in kind.children() {
+			self.selfCalls(child, function, &var calls)
+		}
+		for block in kind.blocks() {
+			self.selfCallsInBlock(&block, function, &var calls)
+		}
+		for arm in kind.arms() {
+			self.selfCalls(arm.body, function, &var calls)
+		}
+	}
+
+	fn selfCallsInStmt(id: StmtId, function: FnId, calls: &var Vec<ExprId>) = {
+		val kind = &self.state.body.stmts[id].kind
+		for child in kind.children() {
+			self.selfCalls(child, function, &var calls)
+		}
+		for block in kind.blocks() {
+			self.selfCallsInBlock(&block, function, &var calls)
+		}
+	}
+
+	fn selfCallsInBlock(block: &Block, function: FnId, calls: &var Vec<ExprId>) = {
+		for stmt in block.stmts {
+			self.selfCallsInStmt(stmt, function, &var calls)
+		}
+		if block.value is .Some(value) then self.selfCalls(value, function, &var calls)
+	}
+
+	/// Whether an argument of the call refers into this frame, which the jump
+	/// is about to reuse. Reports it, and returns whether it did.
+	var fn borrowsFrame(call: ExprId): bool = {
+		val .Call(args, ..) = self.state.body.exprs[call].kind.clone() else {
+			panic("a self-call is a call")
+		}
+		var found: Option<(Span, str)> = .None
+		for arg in args {
+			self.frameReference(arg, &var found)
+		}
+		val .Some((span, what)) = found else {
+			return false
+		}
+		self.report(
+			Diagnostic::error(
+				NOT_A_TAIL_CALL,
+				"this argument refers into the frame the call reuses, so it cannot be a \(what)",
+				span,
+				"points into this call's frame",
+			).withNote(
+				"a `@tailrec` function's call to itself is a jump, so this frame is the one the next round uses",
+			).withHelp("pass the value itself, or a reference the function was given"),
+		)
+		return true
+	}
+
+	/// The first reference into this frame inside `id`, if there is one.
+	fn frameReference(id: ExprId, found: &var Option<(Span, str)>) = {
+		if found.isSome() then return
+		val kind = &self.state.body.exprs[id].kind
+		// A closure lent for one call keeps its environment in this frame; an
+		// owned one is on the heap.
+		if kind is .Closure(..) {
+			found = .Some((self.state.body.exprs[id].span, "closure"))
+			return
+		}
+		if kind is .Ref(inner) && self.rootsHere(inner) {
+			found = .Some((self.state.body.exprs[id].span, "reference"))
+			return
+		}
+		for child in kind.children() {
+			self.frameReference(child, &var found)
+		}
+	}
+
+	/// Whether a place stands in this frame, rather than behind a reference
+	/// the function was given.
+	fn rootsHere(id: ExprId): bool = match self.state.body.exprs[id].kind {
+		.Local(local) => !(self.kind(self.state.body.locals[local].ty) is .Ref(..))
+		.Field(base, ..) | .Index(base, ..) | .SubSlice(base, ..) => self.rootsHere(base)
+		// A dereference reaches what the reference points to, which is another
+		// frame's.
+		.Deref(_) => false
+		// A temporary of this call: it lives in this frame.
+		_ => true
+	}
+}

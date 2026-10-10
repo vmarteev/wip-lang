@@ -1,0 +1,303 @@
+// Every example in the language reference, `docs/language/`, and in the
+// README, which is the front door: each a program, which the fence says
+// what is expected of.
+//
+// - ```` ```wip ```` — it must compile. A block that declares no items is
+//   a `main`'s body, so an example can be a few statements; one that
+//   declares items but no `main` is given an empty one.
+// - ```` ```wip,run ```` — it must compile and run to a successful end. An
+//   example that claims something says it with `assert`, so running it is
+//   what checks the claim.
+// - ```` ```wip,error=E0303 ```` — it must be refused, with that code. This
+//   is how the reference shows what the language does not allow.
+// - ```` ```wip,ignore ```` — prose in Wip's clothing: a fragment that
+//   stands for something, not a program.
+//
+// An example that needs more than one file — a module, imported by the
+// program beside it — writes `// file: util/util.wip` where the next file
+// begins; everything before the first such line is the program itself.
+//
+// Each example is also laid out as `wip fmt` lays it out, with four spaces
+// and in 80 columns, since a reader copies what the reference shows. A
+// block of statements is laid out as a `main`'s body, four columns wider so
+// that it fits in 80 on its own; a file that does not parse is left alone,
+// since an example may be refused for its syntax.
+//
+// An example that fails names its document, the line its fence is on, and
+// what `wip` said, so that it can be mended where it is written.
+
+import std::fs
+import std::path
+import check::{Checked, Gate, across, indented}
+
+val REFERENCE = "docs/language"
+
+/// One fenced block, as the check found it.
+struct Example {
+	/// The document it came from, from the repository's root.
+	document: String
+	/// The line its fence is on, counted from one.
+	line: i64
+	expected: Expected
+	code: String
+}
+
+/// What an example's fence says of it.
+@derive(Eq, Clone)
+enum Expected {
+	Compiles
+	/// It compiles, runs, and ends well.
+	Runs
+	/// It is refused, with this code.
+	Refused(code: String)
+}
+
+pub fn check(gate: &Gate): Checked = {
+	var examples: Vec<Example> = Vec()
+	var documents: Vec<String> = Vec()
+	if fs::readDir(REFERENCE) is .Ok(entries) {
+		for entry in entries {
+			if entry.name.endsWith(".md") then documents.push("\(REFERENCE)/\(entry.name)")
+		}
+	}
+	documents.sort()
+	documents.push(String::of("README.md"))
+	for document in documents {
+		val .Ok(text) = fs::readFile(document.toStr()) else {
+			continue
+		}
+		for example in examplesIn(document.toStr(), text.toStr()) {
+			if gate.takes("\(example.document):\(example.line)".toStr()) then
+				examples.push(move example)
+		}
+	}
+	val failed = across(examples.len(), (index) => one(&gate, &examples[index], index))
+	return Checked::of(examples.len(), move failed)
+}
+
+/// The fenced Wip blocks of one document. Every other fence — `ebnf`,
+/// `sh`, the output of a program — is read past, to its end, so that
+/// nothing inside it is mistaken for an example.
+fn examplesIn(document: str, text: str): Vec<Example> = {
+	var examples: Vec<Example> = Vec()
+	var lines = text.lines()
+	var at = 0
+	while lines.next() is .Some(line) {
+		at += 1
+		val .Some(info) = line.stripPrefix("```") else {
+			continue
+		}
+		val fence = at
+		val info = info.trim()
+		val expected: Option<Expected> = match info {
+			"wip" => .Some(.Compiles)
+			"wip,run" => .Some(.Runs)
+			_ => match info.stripPrefix("wip,error=") {
+				.Some(code) => .Some(.Refused(code: String::of(code)))
+				.None => .None
+			}
+		}
+		var code = String()
+		while lines.next() is .Some(inside) {
+			at += 1
+			if inside.startsWith("```") then break
+			code.push(inside)
+			code.push("\n")
+		}
+		if expected is .Some(expected) then
+			examples.push(Example(
+				document: String::of(document),
+				line: fence,
+				expected: expected.clone(),
+				code: move code,
+			))
+	}
+	return move examples
+}
+
+/// One example, compiled, run or refused as its fence says, and laid out as
+/// `wip fmt` lays it out: nothing where it is all it should be.
+fn one(gate: &Gate, example: &Example, index: i64): Option<String> = {
+	val dir = gate.work.join("reference-\(index)")
+	val written = splitFiles(example.code.toStr())
+	var compiled: Vec<(String, String)> = Vec()
+	for (name, text) in written {
+		val made = if compiled.isEmpty() then program(text.toStr()) else text.clone()
+		compiled.push((name.clone(), move made))
+	}
+	for (name, text) in compiled {
+		val file = path::join(dir.toStr(), name.toStr())
+		fs::makeDirs(path::parent(file.toStr()))
+		if fs::writeFile(file.toStr(), text.toStr()) is .Err(error) then
+			return .Some("\(example.document):\(example.line): cannot write `\(file)`: \(error)")
+	}
+	var found: Vec<String> = Vec()
+	if refusal(gate, example, dir.toStr()) is .Some(wrong) {
+		var all = String()
+		for (name, text) in compiled {
+			if !all.isEmpty() then all.push("// file: \(name)\n")
+			all.push(text.toStr())
+		}
+		found.push("\(wrong)\(indented(all.toStr()))")
+	}
+	for at in 0..written.len() {
+		val file = &written[at]
+		if layout(gate, dir.toStr(), file.0.toStr(), file.1.toStr(), at == 0) is .Some(wrong) then
+			found.push(move wrong)
+	}
+	if found.isEmpty() then return .None
+	var out = String()
+	for why in found {
+		if !out.isEmpty() then out.push("\n")
+		out.push("\(example.document):\(example.line): \(why)")
+	}
+	return .Some(move out)
+}
+
+/// What is wrong with what `wip` made of the example, where anything is,
+/// and what it said.
+fn refusal(gate: &Gate, example: &Example, dir: str): Option<String> = {
+	val command = if example.expected == .Runs then "run" else "check"
+	val ran = gate.wip(dir, [command, "--color", "never", "main.wip"])
+	val said = "\(ran.stdout)\(ran.stderr)"
+	val wrong = match example.expected {
+		.Compiles if ran.exit.success() => return .None
+		.Runs if ran.exit.success() => return .None
+		.Compiles => String::of("this example does not compile")
+		.Runs => String::of("this example does not run to a successful end")
+		.Refused(code) => {
+			if said.contains("[\(code)]".toStr()) then return .None
+			"this example must be refused with \(code)"
+		}
+	}
+	return .Some("\(wrong)\(indented(said.toStr()))")
+}
+
+/// What `wip fmt` writes for one file of an example, where that is not
+/// what the reference shows. A block of statements, the first file with no
+/// item, is laid out as a `main`'s body.
+fn layout(gate: &Gate, dir: str, name: str, written: str, first: bool): Option<String> = {
+	if !name.endsWith(".wip") then return .None
+	// The blank line before the next `// file:` is the page's, not the
+	// file's.
+	val text = "\(written.trimEndMatches("\n"))\n"
+	val statements = first && !declares(text.toStr())
+	var given = String()
+	if statements {
+		given.push("fn main() = {\n")
+		for line in text.lines() {
+			if !line.isEmpty() then given.push("    ")
+			given.push(line)
+			given.push("\n")
+		}
+		given.push("}\n")
+	} else {
+		given.push(text.toStr())
+	}
+	// Named for the file it is, so that a package's file is laid out as
+	// one.
+	val stands = path::join(dir, name)
+	val width = if statements then "84" else "80"
+	val laid = gate.wipReading(
+		given.toStr(),
+		dir,
+		[
+			"fmt",
+			"--color",
+			"never",
+			"--spaces",
+			"4",
+			"--width",
+			width,
+			"--stdin-path",
+			stands.toStr(),
+			"-",
+		],
+	)
+	if !laid.exit.success() {
+		if laid.stderr.contains("This is a bug in `wip fmt`") then
+			return .Some("`wip fmt` gets `\(name)` wrong\(indented(laid.stderr.toStr()))")
+		return .None
+	}
+	var out = String()
+	if statements {
+		val lines: Vec<str> = laid.stdout.lines().toVec()
+		for line in lines[1..lines.len() - 1] {
+			out.push(line.stripPrefix("    ").unwrapOr(line))
+			out.push("\n")
+		}
+	} else {
+		out.push(laid.stdout.toStr())
+	}
+	if out == text then return .None
+	return .Some("`wip fmt` writes it as\n  // file: \(name)\(indented(out.toStr()))")
+}
+
+/// The example as a whole program: a block that declares no items is a
+/// `main`'s body, and one that declares items but no `main` gets an empty
+/// one.
+fn program(code: str): String = {
+	if !declares(code) {
+		var body = String::of("fn main() = {\n")
+		for line in code.lines() {
+			body.push("    \(line)\n")
+		}
+		body.push("}\n")
+		return move body
+	}
+	for line in code.lines() {
+		if line.startsWith("fn main") then return String::of(code)
+	}
+	return "\(code)\nfn main() = {}\n"
+}
+
+/// Whether a block declares items, rather than being statements.
+fn declares(code: str): bool = {
+	for line in code.lines() {
+		if startsItem(line) then return true
+	}
+	return false
+}
+
+/// Whether a line of an example begins an item, rather than a statement.
+fn startsItem(line: str): bool = {
+	for start in ITEMS {
+		if line.startsWith(start) then return true
+	}
+	return false
+}
+
+val ITEMS = [
+	"fn ",
+	"pub ",
+	"struct ",
+	"enum ",
+	"interface ",
+	"extend ",
+	"import ",
+	"extern ",
+	"type ",
+	"view ",
+	"@",
+	"lend ",
+	"var fn",
+	"move fn",
+	"static fn",
+]
+
+/// The files an example is written in, as written: `main.wip`, and
+/// whatever a `// file: …` line names after it.
+fn splitFiles(code: str): Vec<(String, String)> = {
+	var files: Vec<(String, String)> = Vec()
+	files.push((String::of("main.wip"), String()))
+	for line in code.lines() {
+		if line.trim().stripPrefix("// file: ") is .Some(name) {
+			files.push((String::of(name.trim()), String()))
+			continue
+		}
+		val last = files.len() - 1
+		files[last].1.push(line)
+		files[last].1.push("\n")
+	}
+	return move files
+}

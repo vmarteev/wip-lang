@@ -1,0 +1,116 @@
+// Diagnostics for using a moved value, and assignment that refills one.
+
+import syntax::{
+	ASSIGN_TO_PART_OF_MOVED,
+	Diagnostic,
+	MOVED_IN_PREVIOUS_ITERATION,
+	Span,
+	USE_OF_MOVED_VALUE,
+	USE_OF_POSSIBLY_MOVED_VALUE
+}
+
+extend Checker {
+	/// Checks that `path` holds a value where it is used, and reports the
+	/// move that emptied it otherwise.
+	var fn checkLive(path: &Path, name: str, span: Span, state: &State): bool = {
+		val .Some(at) = state.conflict(&path) else {
+			return true
+		}
+		val moved = &state.moved.keys()[at]
+		val m = &state.moved.values()[at]
+		val first = m.spans[0]
+		val byDefer = m.byDefer
+		if self.quiet > 0 || !self.reported.add(first) then return false
+		val partial = moved != path && moved.within(&path)
+		val root = self.interner.resolve(self.body.locals[path.local].name)
+		// A move inside the enclosing loop that is not before this use in
+		// the same iteration happened in the previous one.
+		var previousIteration: Option<Span> = .None
+		if self.loops.last() is .Some(body) {
+			for s in m.spans {
+				if body.lo <= s.lo &&
+					s.hi <= body.hi &&
+					(s.lo >= span.lo || (s.lo <= span.lo && span.hi <= s.hi)) {
+					previousIteration = .Some(s)
+					break
+				}
+			}
+		}
+		var diagnostic = match previousIteration {
+			// The use is the move itself: `run(move job)` in a loop.
+			.Some(moveSpan) if moveSpan.lo <= span.lo &&
+				span.hi <= moveSpan.hi => Diagnostic::error(
+				MOVED_IN_PREVIOUS_ITERATION,
+				"`\(m.name)` is moved in every iteration of the loop",
+				moveSpan,
+				"moved here, but only the first iteration has a value to move",
+			).withHelp("assign `\(root)` a new value before the next iteration, or declare it inside the loop")
+			.Some(moveSpan) => Diagnostic::error(
+				MOVED_IN_PREVIOUS_ITERATION,
+				"`\(m.name)` is used after it was moved in the previous iteration of the loop",
+				span,
+				"used here in the next iteration",
+			).withSecondary(
+				moveSpan,
+				"moved here in the previous iteration",
+			).withHelp("assign `\(root)` a new value before the next iteration, or declare it inside the loop")
+			.None if partial => Diagnostic::error(
+				if m.definite then USE_OF_MOVED_VALUE else USE_OF_POSSIBLY_MOVED_VALUE,
+				"use of partially moved value `\(name)`",
+				span,
+				"`\(name)` used as a whole here",
+			).withSecondary(first, "`\(m.name)` moved here").withNote("the other fields of `\(name)` can still be used, but not `\(name)` as a whole")
+			.None if m.definite => Diagnostic::error(
+				USE_OF_MOVED_VALUE,
+				"use of moved value `\(m.name)`",
+				span,
+				"used here after the move",
+			).withSecondary(first, "`\(m.name)` moved here").withNote("after `move`, `\(m.name)` holds no value until it is assigned again")
+			.None => {
+				var possibly = Diagnostic::error(
+					USE_OF_POSSIBLY_MOVED_VALUE,
+					"use of possibly moved value `\(m.name)`",
+					span,
+					"used here",
+				)
+				for s in m.spans.items().take(3) {
+					possibly = possibly.withSecondary(s, "`\(m.name)` moved here")
+				}
+				possibly.withNote("`\(m.name)` is moved on some paths to this point, so it may hold no value").withHelp(
+					"move it on every path, or assign it a new value after the move",
+				)
+			}
+		}
+		if self.exit is .Some((exit, label)) then
+			diagnostic = diagnostic.withSecondary(exit, String::of(label)).withNote(
+				"a deferred expression runs where its block exits, and uses its variables as they are there",
+			)
+		else if byDefer then
+			diagnostic = diagnostic.withNote(
+				"a `defer` makes its moves when it runs, where its block exits",
+			)
+		self.report(move diagnostic)
+		return false
+	}
+
+	var fn assign(path: Path, name: str, span: Span, state: &var State) = {
+		// Assigning a field of a struct that was moved as a whole would write
+		// into nothing.
+		for (i, moved) in state.moved.keys().forwards().enumerate() {
+			if path.within(&moved) && moved != path {
+				val m = &state.moved.values()[i]
+				val movedName = m.name.clone()
+				val first = m.spans[0]
+				val diagnostic = Diagnostic::error(
+					ASSIGN_TO_PART_OF_MOVED,
+					"cannot assign to `\(name)`: `\(movedName)` was moved",
+					span,
+					"assigned here",
+				).withSecondary(first, "`\(movedName)` moved here").withHelp("assign all of `\(movedName)` instead: `\(movedName) = …`")
+				self.report(move diagnostic)
+				return
+			}
+		}
+		state.reinit(&path)
+	}
+}

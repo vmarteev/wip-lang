@@ -1,0 +1,495 @@
+// Places, and writing aggregates into memory.
+
+import hir::{BOOL, ExprId, I64, LocalId, PTR_U8, Ty, U64, evaluationOrder}
+import syntax::{BinaryOp, Span}
+
+extend Builder {
+	/// The local a variable of the source is lowered to.
+	fn varOf(local: LocalId): Local = match self.vars.get(&local) {
+		.Some(found) => found.clone()
+		.None => panic("a variable is lowered before it is used")
+	}
+
+	/// The place of an aggregate-typed expression. Locals, fields, elements
+	/// and dereferences are places already; anything else is built in a
+	/// temporary.
+	var fn aggregate(id: ExprId): Place = {
+		// Worked out already, where its place was written.
+		match self.early.remove(&id) {
+			.Some(.Place(place)) => return move place
+			.Some(_) => panic("an aggregate worked out as a scalar")
+			.None => {}
+		}
+		// A reference to a slice is the slice's pointer and length, which is
+		// what the slice's place already holds.
+		if self.hir.exprs[id].kind is .Ref(inner) {
+			if self.kind(self.ty(inner)) is .Slice(..) then return self.place(inner)
+		}
+		if self.isPlaceKind(id) then return self.place(id)
+		val temp = Place::of(self.temp(self.ty(id)))
+		self.storeExpr(id, temp.clone())
+		return move temp
+	}
+
+	/// Locals, fields, elements, sub-slices and dereferences, which `place`
+	/// finds without building anything.
+	fn isPlaceKind(id: ExprId): bool =
+		self.hir.exprs[id].kind is .Local(..) | .Field(..) | .Index(..) | .SubSlice(..) | .Deref(..)
+
+	/// The place a field or element is taken from. A base that is not a
+	/// place, as in `make_car().seats`, is a temporary dropped when the
+	/// statement ends.
+	var fn projectionBase(base: ExprId): Place = {
+		val place = self.aggregate(base)
+		if !self.isPlaceKind(base) then self.ownTemp(place.clone(), self.ty(base))
+		return move place
+	}
+
+	/// The place an expression denotes. Anything that is not a place is
+	/// evaluated into a temporary first, so `&f()` and `(Point { … }).x` work.
+	var fn place(id: ExprId): Place = {
+		val hir = self.hir
+		val expr = &hir.exprs[id]
+		// Where a check that fails here says it happened.
+		val at = expr.span
+		return match expr.kind {
+			.Local(local) => Place::of(self.varOf(local))
+			.Field(base, index) => self.projectionBase(base).project(.Field(index))
+			// `p[i]` through a C pointer: nothing says how many there are, so
+			// nothing is checked.
+			.Index(base, index) if self.kind(self.ty(base)) is .Ptr(..) => {
+				val elements = self.place(base)
+				val operand = self.scalar(index)
+				val local = self.localOf(move operand, I64)
+				elements.project(.Index(local))
+			}
+			.Index(base, index) => {
+				val (elements, len) = self.elements(base)
+				val operand = self.scalar(index)
+				val local = self.localOf(move operand, I64)
+				self.checkUnsigned(.Ge, .Copy(Place::of(local)), move len, at)
+				elements.project(.Index(local))
+			}
+			// `&xs[lo..hi]`: a new pointer and length, checked against the
+			// elements they are taken from.
+			.SubSlice(base, lo, hi) => {
+				val (elements, len) = self.elements(base)
+				val low = match lo {
+					.Some(e) => self.scalar(e)
+					.None => Builder::int(0, I64)
+				}
+				val high = match hi {
+					.Some(e) => self.scalar(e)
+					.None => len.clone()
+				}
+				// `lo <= hi <= len`, unsigned so that a negative bound fails. A
+				// start of 0 is no unsigned number's greater, so it is not
+				// checked: `[..n]`, and what `Vec` lends, `[0..length]`.
+				self.checkUnsigned(.Gt, high.clone(), move len, at)
+				val startsAtZero = low is .Const(.Int(bits: 0, ..))
+				if !startsAtZero then self.checkUnsigned(.Gt, low.clone(), high.clone(), at)
+				val lowLocal = self.localOf(low.clone(), I64)
+				val start = self.value(PTR_U8, .AddressOf(elements.project(.Index(lowLocal))))
+				val count = self.value(I64, .Binary(op: .Sub, lhs: move high, rhs: move low))
+				val slice = Place::of(self.temp(expr.ty))
+				self.assign(slice.project(.Field(0)), .Use(move start))
+				self.assign(slice.project(.Field(1)), .Use(move count))
+				move slice
+			}
+			// A slice parameter or a buffer: the place of the elements is the
+			// pointer and length it holds.
+			.Deref(pointer) if isSlicePointer(self.program, self.ty(pointer)) => self.place(pointer)
+			.Deref(pointer) => {
+				val ptr = match self.scalar(pointer) {
+					.Copy(p) => move p
+					// A constant table's address.
+					constant => Place::of(self.localOf(move constant, self.ty(pointer)))
+				}
+				// `make().len`: the `own` the call returned is a temporary.
+				val pointerTy = self.ty(pointer)
+				if self.kind(pointerTy) is .Own(..) && !self.isPlaceKind(pointer) then
+					self.ownTemp(ptr.clone(), pointerTy)
+				ptr.project(.Deref)
+			}
+			// A `String` over a `str`'s bytes lives until the statement ends and
+			// is never dropped: what it holds is not its own.
+			.Undropped(inner) => self.aggregate(inner)
+			// `&make()`: the value lives in a temporary until the statement
+			// ends.
+			_ => {
+				val place = if self.isAggregate(expr.ty) {
+					self.aggregate(id)
+				} else {
+					val temp = Place::of(self.temp(expr.ty))
+					self.storeExpr(id, temp.clone())
+					move temp
+				}
+				self.ownTemp(place.clone(), expr.ty)
+				move place
+			}
+		}
+	}
+
+	/// Works out what a place's expression computes, in the order written —
+	/// each index, the bounds of a sub-slice, and what a projection is given
+	/// but the place it lends from — and keeps it for `place`, which finds
+	/// the place later. A place is lent where it is used; what its expression
+	/// computes is computed where it is written.
+	var fn placeOperands(id: ExprId) = match self.hir.exprs[id].kind {
+		.Field(base, ..) => self.baseOperands(base)
+		.Index(base, index) => {
+			self.baseOperands(base)
+			self.keepEarly(index)
+		}
+		.SubSlice(base, lo, hi) => {
+			self.baseOperands(base)
+			if lo is .Some(bound) then self.keepEarly(bound)
+			if hi is .Some(bound) then self.keepEarly(bound)
+		}
+		.Deref(pointer) => self.pointerOperands(pointer)
+		// A local is where it is; anything else is not a place, and is made
+		// where the place is found.
+		_ => {}
+	}
+
+	/// The operands of what a field or element is taken from: a place's, or
+	/// a value's own, made now.
+	var fn baseOperands(base: ExprId) = {
+		if self.isPlaceKind(base) then self.placeOperands(base) else self.keepEarly(base)
+	}
+
+	/// The operands of what a place is behind. A projection's call is the
+	/// finding of its place: its arguments are worked out now, in order, but
+	/// for the place it lends from, whose own operands are; the call is made
+	/// where the place is used. A pointer held in a place is read there too.
+	var fn pointerOperands(pointer: ExprId) = {
+		val hir = self.hir
+		if hir.exprs[pointer].kind is .Call(callee, args, order, ..) {
+			if self.program.fns[callee].projects is .Some(.Param(from)) {
+				for i in evaluationOrder(&order, args.len()) {
+					match hir.exprs[args[i]].kind {
+						.Ref(place) if i == from as i64 &&
+							self.isPlaceKind(place) => self.placeOperands(place)
+						_ => self.keepEarly(args[i])
+					}
+				}
+				return
+			}
+		}
+		if self.isPlaceKind(pointer) then self.placeOperands(pointer) else self.keepEarly(pointer)
+	}
+
+	/// Works out `id` now, for `place` to take later. An aggregate that is a
+	/// place is copied, so that what runs before the place is found cannot
+	/// change it.
+	var fn keepEarly(id: ExprId) = {
+		val lowered = self.expr(id)
+		val value = if self.hir.isPlace(id) && lowered is .Place(place) {
+			val temp = Place::of(self.temp(self.ty(id)))
+			self.assign(temp.clone(), .Use(.Copy(place.clone())))
+			Value::Place(move temp)
+		} else {
+			move lowered
+		}
+		self.early.put(id, move value)
+	}
+
+	/// The place of an array's or slice's elements, and how many there are.
+	var fn elements(base: ExprId): (Place, Operand) = match self.kind(self.ty(base)) {
+		.Array(len, ..) => (self.projectionBase(base), Builder::int(len as u128, I64))
+		// A slice is a pointer and a length, and a block of slots is a pointer
+		// and how many it has.
+		.Slice(..) | .Slots(..) | .Str => {
+			val slice = self.place(base)
+			val len = self.value(I64, .Use(.Copy(slice.project(.Field(1)))))
+			(move slice, move len)
+		}
+		_ => panic("elements of something that is not an array or slice")
+	}
+
+	/// Panics when `lhs op rhs` holds, comparing as unsigned numbers so that a
+	/// negative index is out of bounds too. The message names the index and
+	/// the length.
+	var fn checkUnsigned(op: BinaryOp, lhs: Operand, rhs: Operand, at: Span) = {
+		val index = lhs.clone()
+		val length = rhs.clone()
+		val left = self.value(U64, .Cast(operand: move lhs, ty: U64))
+		val right = self.value(U64, .Cast(operand: move rhs, ty: U64))
+		val fails = self.value(BOOL, .Binary(op: op, lhs: move left, rhs: move right))
+		self.push(.Check(
+			fails: move fails,
+			kind: .Bounds(index: move index, length: move length),
+			at: at,
+		))
+	}
+
+	/// Evaluates `id` into `dest`. Literals, calls, blocks, `if` and `match`
+	/// build their aggregate there rather than in a temporary.
+	var fn storeExpr(id: ExprId, dest: Place) = {
+		val hir = self.hir
+		val expr = &hir.exprs[id]
+		val aggregate = self.isAggregate(expr.ty)
+		match expr.kind {
+			// Every byte zero, as C leaves a field it is not given.
+			.Zeroed => self.push(.Zero(move dest))
+			// `Event { key: … }`: every byte zero, and then the one field it
+			// names, since they are all the same bytes.
+			.Union(field, ..) => {
+				self.push(.Zero(dest.clone()))
+				if field is .Some((index, value)) then
+					self.storeExpr(value, dest.project(.Field(index)))
+			}
+			.Struct(fields, order, ..) => {
+				var pending: Vec<i64> = Vec()
+				val ordered = evaluationOrder(&order, fields.len())
+				for (n, i) in ordered.forwards().enumerate() {
+					val part = dest.project(.Field(i as u32))
+					self.storeExpr(fields[i], part.clone())
+					if n + 1 < fields.len() then
+						self.pendingPart(move part, self.ty(fields[i]), &var pending)
+				}
+				self.forgetParts(move pending)
+			}
+			.Array(elems) => {
+				var pending: Vec<i64> = Vec()
+				for (i, elem) in elems.forwards().enumerate() {
+					val part = dest.project(.ConstIndex(i as u64))
+					self.storeExpr(elem, part.clone())
+					if i + 1 < elems.len() then
+						self.pendingPart(move part, self.ty(elem), &var pending)
+				}
+				self.forgetParts(move pending)
+			}
+			.ArrayRepeat(elem, count) => self.arrayRepeat(elem, count, move dest)
+			.OwnRepeat(elem, count) => self.ownRepeat(elem, count, move dest)
+			// What the closure captured, and the address of its code.
+			.Closure(id: code, env) => {
+				val envTy = self.ty(env)
+				// An owned closure's environment is on the heap already, and the
+				// expression that builds it is its address; a lent one is built
+				// in this frame.
+				val captures = if self.kind(envTy) is .Own(..) {
+					self.scalar(env)
+				} else {
+					val place = Place::of(self.temp(envTy))
+					self.storeExpr(env, place.clone())
+					self.value(PTR_U8, .AddressOf(move place))
+				}
+				self.assign(dest.project(.Field(0)), .Use(move captures))
+				self.assign(dest.project(.Field(1)), .Use(.Const(.Fn(id: code, ty: PTR_U8))))
+			}
+			// The reference stays, and the table of methods joins it.
+			.DynRef(value, interfaceId) => {
+				val .Ref(inner: pointee, ..) = self.kind(self.ty(value)) else {
+					panic("a `&dyn` is made from a reference")
+				}
+				val reference = self.scalar(value)
+				self.assign(dest.project(.Field(0)), .Use(move reference))
+				self.assign(
+					dest.project(.Field(1)),
+					.Use(.Const(.VTable(interfaceId: interfaceId, ty: pointee))),
+				)
+			}
+			// The pointer stays, and the length joins it.
+			.Unsize(inner) => {
+				val .Own(inner: array) = self.kind(self.ty(inner)) else {
+					panic("only an `own` of an array becomes a buffer")
+				}
+				val .Array(len, ..) = self.kind(array) else {
+					panic("only an `own` of an array becomes a buffer")
+				}
+				val ptr = self.scalar(inner)
+				self.assign(dest.project(.Field(0)), .Use(move ptr))
+				self.assign(dest.project(.Field(1)), .Use(Builder::int(len as u128, I64)))
+			}
+			// The tag, then the fields.
+			.Variant(variant, args, order, ..) => {
+				self.push(.SetVariant(place: dest.clone(), variant: variant))
+				var pending: Vec<i64> = Vec()
+				val ordered = evaluationOrder(&order, args.len())
+				for (n, i) in ordered.forwards().enumerate() {
+					val part = dest.project(.VariantField(variant: variant, field: i as u32))
+					self.storeExpr(args[i], part.clone())
+					if n + 1 < args.len() then
+						self.pendingPart(move part, self.ty(args[i]), &var pending)
+				}
+				self.forgetParts(move pending)
+			}
+			.Match(scrutinee, arms) if aggregate => {
+				self.matchExpr(scrutinee, &arms, expr.ty, .Some(move dest))
+			}
+			// An owned closure lent for a call: the pair it already is.
+			.LendClosure(inner) => {
+				val src = self.aggregate(inner)
+				self.assign(move dest, .Use(.Copy(move src)))
+			}
+			// A reference to a slice: its pointer and length.
+			.Ref(inner) if aggregate => {
+				val src = self.place(inner)
+				self.assign(move dest, .Use(.Copy(move src)))
+			}
+			// `s.toStr()`: C's pointer, and the length found by walking to the
+			// NUL.
+			.CstrToStr(inner) => {
+				val pointer = self.scalar(inner)
+				val length = self.value(I64, .CstrLen(pointer.clone()))
+				self.assign(dest.project(.Field(0)), .Use(move pointer))
+				self.assign(dest.project(.Field(1)), .Use(move length))
+			}
+			// A `str` literal: a pointer to its bytes, which are also
+			// NUL-terminated for C, and its length.
+			.Str(symbol) if aggregate => {
+				val len = self.interner.resolve(symbol).len() as u128
+				self.assign(dest.project(.Field(0)), .Use(.Const(.CStr(symbol))))
+				self.assign(dest.project(.Field(1)), .Use(Builder::int(len, I64)))
+			}
+			.Block(block) => { self.blockExpr(&block, .Some(move dest)) }
+			.If(cond, thenBlock, elseBlock) if aggregate => {
+				self.ifExpr(cond, &thenBlock, &elseBlock, expr.ty, .Some(move dest))
+			}
+			// A tail call leaves nothing to store: control goes back to the top
+			// of the body.
+			.Call(args, order, ..) if self.hir.tailCalls.contains(&id) => self.tailCall(
+				&args,
+				&order,
+			)
+			// A body the compiler writes, whose value is an aggregate.
+			.Call(callee, args, ..) if self.program.fns[callee].intrinsic.isSome() => {
+				self.intrinsicCall(callee, &args, expr.ty, expr.span, .Some(move dest))
+			}
+			.Call(callee, args, order, ..) if aggregate => {
+				val ret = self.program.fns[callee].ret
+				self.call(.Fn(callee), ret, &args, &order, .Some(move dest))
+			}
+			.CallValue(callee, args) if aggregate => {
+				val function = self.scalar(callee)
+				self.call(.Value(move function), expr.ty, &args, &NO_ORDER, .Some(move dest))
+			}
+			// A closure or a `dyn` method that answers an aggregate writes it
+			// where it goes, as any call does.
+			.CallClosure(callee, args, codeTy) if aggregate => {
+				val closure = self.place(callee)
+				val code = self.value(codeTy, .Use(.Copy(closure.project(.Field(1)))))
+				val captures = Operand::Copy(closure.project(.Field(0)))
+				self.closureCall(move code, move captures, &args, expr.ty, .Some(move dest))
+			}
+			.DynCall(index, fnTy, args, order, ..) if aggregate => {
+				val receiver = self.place(args[0])
+				val table = Operand::Copy(receiver.project(.Field(1)))
+				val function = self.value(fnTy, .VTableFn(
+					table: move table,
+					index: index,
+					methods: true,
+				))
+				val pointer = Operand::Copy(receiver.project(.Field(0)))
+				self.dynCall(move function, move pointer, &args, &order, expr.ty, .Some(move dest))
+			}
+			.Move(operand) if aggregate => {
+				val src = self.place(operand)
+				self.assign(move dest, .Use(.Copy(src.clone())))
+				val ty = self.ty(operand)
+				self.vacate(move src, ty)
+				self.movedFrom(operand)
+			}
+			// Any other aggregate would come back here through `aggregate`, so
+			// only places may fall through to `expr`.
+			_ if aggregate && !self.isPlaceKind(id) => panic(
+				"aggregate expression without a lowering",
+			)
+			_ => match self.expr(id) {
+				.Scalar(operand) => self.assign(move dest, .Use(move operand))
+				.Place(src) => self.assign(move dest, .Use(.Copy(move src)))
+				.Unit => {}
+			}
+		}
+	}
+
+	/// `own [elem; count]` with a run-time count. `elem` is evaluated, then
+	/// `count`; a negative count stops the program; then the buffer is
+	/// allocated and every element gets a copy of `elem`, which owns nothing.
+	var fn ownRepeat(elem: ExprId, count: ExprId, dest: Place) = {
+		val elemTy = self.ty(elem)
+		val value = Place::of(self.temp(elemTy))
+		self.storeExpr(elem, value.clone())
+		val countAt = self.span(count)
+		val operand = self.scalar(count)
+		val counted = self.localOf(move operand, I64)
+		val negative = self.value(BOOL, .Binary(
+			op: .Lt,
+			lhs: .Copy(Place::of(counted)),
+			rhs: Builder::int(0, I64),
+		))
+		self.push(.Check(
+			fails: move negative,
+			kind: .Length(.Copy(Place::of(counted))),
+			at: countAt,
+		))
+		self.push(.AllocBuffer(dest: dest.clone(), elem: elemTy, count: .Copy(Place::of(counted))))
+		val i = self.temp(I64)
+		self.assign(Place::of(i), .Use(Builder::int(0, I64)))
+		val header = self.newBlock()
+		val body = self.newBlock()
+		val exit = self.newBlock()
+		self.terminate(.Goto(header))
+		self.switchTo(header)
+		val done = self.value(BOOL, .Binary(
+			op: .Ge,
+			lhs: .Copy(Place::of(i)),
+			rhs: .Copy(Place::of(counted)),
+		))
+		self.terminate(.Branch(cond: move done, thenBlock: exit, otherwise: body))
+		self.switchTo(body)
+		self.assign(dest.project(.Index(i)), .Use(.Copy(move value)))
+		val next = self.value(I64, .Binary(
+			op: .Add,
+			lhs: .Copy(Place::of(i)),
+			rhs: Builder::int(1, I64),
+		))
+		self.assign(Place::of(i), .Use(move next))
+		self.terminate(.Goto(header))
+		self.switchTo(exit)
+	}
+
+	/// `[elem; count]`: evaluates `elem` once, into the first element, then
+	/// copies it into the rest.
+	var fn arrayRepeat(elem: ExprId, count: u64, dest: Place) = {
+		if count == 0 {
+			self.expr(elem)
+			return
+		}
+		val first = dest.project(.ConstIndex(0))
+		self.storeExpr(elem, first.clone())
+		if count <= 16 {
+			for i in 1..count {
+				self.assign(dest.project(.ConstIndex(i)), .Use(.Copy(first.clone())))
+			}
+			return
+		}
+		val i = self.temp(U64)
+		self.assign(Place::of(i), .Use(Builder::int(1, U64)))
+		val header = self.newBlock()
+		val body = self.newBlock()
+		val exit = self.newBlock()
+		self.terminate(.Goto(header))
+		self.switchTo(header)
+		val done = self.value(BOOL, .Binary(
+			op: .Ge,
+			lhs: .Copy(Place::of(i)),
+			rhs: Builder::int(count as u128, U64),
+		))
+		self.terminate(.Branch(cond: move done, thenBlock: exit, otherwise: body))
+		self.switchTo(body)
+		self.assign(dest.project(.Index(i)), .Use(.Copy(move first)))
+		val next = self.value(U64, .Binary(
+			op: .Add,
+			lhs: .Copy(Place::of(i)),
+			rhs: Builder::int(1, U64),
+		))
+		self.assign(Place::of(i), .Use(move next))
+		self.terminate(.Goto(header))
+		self.switchTo(exit)
+	}
+}
+
+/// The order of a call whose arguments are evaluated as they are stored.
+val NO_ORDER: [u32; 0] = []

@@ -1,0 +1,177 @@
+// `wip fmt`: a file printed again from its syntax tree,
+// in one layout, to a width — as Prettier does.
+//
+// A file is lexed and parsed, its comments are found between the tokens,
+// and the tree is turned into a document of groups that print flat where
+// they fit and broken where they do not. Before the result is handed
+// back it is parsed again: it must be the same program, with the same
+// comments, and formatting it again must change nothing.
+
+import syntax::{Ast, Diagnostic, Interner, dumpAst, lex, parse, parsePackageAt}
+
+/// Why a file was not formatted.
+pub enum Error {
+	/// It does not parse; the printer does not guess.
+	Parse(diagnostics: Vec<Diagnostic>)
+	/// What would have been written is not the same program, or not the
+	/// same comments, or not stable: a bug in `wip fmt`, which is reported
+	/// rather than written.
+	Bug(message: String)
+}
+
+/// The line among a file's leading comments that leaves it as written.
+pub val OFF: str = "// wip fmt: off"
+
+/// Whether the file asks to be left as written: one of its leading
+/// comments — the `//` lines before anything else, blank lines between
+/// them allowed — is exactly `OFF`. Read from the text, before it is
+/// parsed, so a file that does not parse may ask too. The same words
+/// further down are a comment like any other, and a doc comment, `///`,
+/// belongs to the item below it.
+pub fn switchedOff(src: str): bool = {
+	for whole in src.lines() {
+		val line = trimSpace(whole)
+		if line.isEmpty() then continue
+		if !line.startsWith("//") || line.startsWith("///") then return false
+		if line == OFF then return true
+	}
+	return false
+}
+
+/// The file's text, laid out. `package` says the file is a `package.wip`.
+pub fn format(src: str, style: Style, package: bool): Result<String, Error> = {
+	val first = layout(src, style, package)?
+	val second = match layout(first.toStr(), style, package) {
+		.Ok(second) => move second
+		.Err(.Parse(diagnostics)) => {
+			var messages = String()
+			for (i, diagnostic) in diagnostics.forwards().enumerate() {
+				if i > 0 then messages.push("; ")
+				messages.push(diagnostic.message.toStr())
+			}
+			return .Err(.Bug(message: "what it wrote does not parse: \(messages)"))
+		}
+		.Err(bug) => return .Err(move bug)
+	}
+	if package {
+		if first != second then
+			return .Err(.Bug(message: String::of("formatting it again changes it")))
+		return .Ok(move first)
+	}
+	val before = shape(src)
+	val after = shape(first.toStr())
+	if before != after then
+		return .Err(.Bug(message: "what it wrote is a different program (\(firstDifference(&before, &after)))"))
+	val commentsBefore = commentTexts(src)
+	val commentsAfter = commentTexts(first.toStr())
+	if commentsBefore != commentsAfter then
+		return .Err(.Bug(message: "what it wrote has different comments (\(firstDifference(&commentsBefore, &commentsAfter)))"))
+	if first != second {
+		var a: Vec<String> = Vec()
+		for line in first.lines() {
+			a.push(String::of(line))
+		}
+		var b: Vec<String> = Vec()
+		for line in second.lines() {
+			b.push(String::of(line))
+		}
+		return .Err(.Bug(message: "formatting it again changes it (\(firstDifference(&a, &b)))"))
+	}
+	return .Ok(move first)
+}
+
+/// Where two lists first differ, for a report of a bug.
+fn firstDifference(before: &[String], after: &[String]): String = {
+	val shorter = if before.len() < after.len() then before.len() else after.len()
+	var at = shorter
+	for i in 0..shorter {
+		if before[i] != after[i] {
+			at = i
+			break
+		}
+	}
+	return "\(shown(&before, at)) became \(shown(&after, at))"
+}
+
+/// The line at `at` of a report, in backquotes, or `nothing`.
+fn shown(lines: &[String], at: i64): String =
+	if at < lines.len() then "`\(trimSpace(lines[at].toStr()))`" else String::of("nothing")
+
+/// One pass: parse, and print.
+fn layout(src: str, style: Style, package: bool): Result<String, Error> = {
+	var interner = Interner::new()
+	val lexed = lex(src, &var interner)
+	val found = comments(src, &lexed.tokens)
+	if package {
+		val parsed = parsePackageAt(src, 0, &lexed)
+		val errors = errorsOf(&lexed.diagnostics, &parsed.diagnostics)
+		if !errors.isEmpty() then return .Err(.Parse(diagnostics: move errors))
+		val ast = Ast()
+		var printer = Printer::new(src, &ast, &interner, move found)
+		val doc = printer.package(&parsed.annotations, parsed.name)
+		return .Ok(print(&doc, style))
+	}
+	val parsed = parse(src, &lexed)
+	val errors = errorsOf(&lexed.diagnostics, &parsed.diagnostics)
+	if !errors.isEmpty() then return .Err(.Parse(diagnostics: move errors))
+	var printer = Printer::new(src, &parsed.ast, &interner, move found)
+	val doc = printer.file()
+	return .Ok(print(&doc, style))
+}
+
+/// The errors among the lexer's diagnostics and the parser's, in order.
+fn errorsOf(lexed: &[Diagnostic], parsed: &[Diagnostic]): Vec<Diagnostic> = {
+	var errors: Vec<Diagnostic> = Vec()
+	for diagnostic in lexed {
+		if diagnostic.isError() then errors.push(diagnostic.clone())
+	}
+	for diagnostic in parsed {
+		if diagnostic.isError() then errors.push(diagnostic.clone())
+	}
+	return move errors
+}
+
+/// The syntax tree as `wip parse` shows it, without where each part is:
+/// what must not change. An `assert`'s message is the condition's text as
+/// it was written, so it is left out too — laying the condition out is the
+/// point.
+fn shape(src: str): Vec<String> = {
+	var interner = Interner::new()
+	val lexed = lex(src, &var interner)
+	val parsed = parse(src, &lexed)
+	val dumped = dumpAst(&parsed.ast, src, &interner)
+	var lines: Vec<String> = Vec()
+	for whole in dumped.lines() {
+		val line = match whole.findLast("  @") {
+			.Some(at) => whole[0..at]
+			.None => whole
+		}
+		match line.find("assert \"") {
+			.Some(at) => lines.push(String::of(line[0..at + 6]))
+			.None => lines.push(String::of(line))
+		}
+	}
+	return move lines
+}
+
+/// A file's comments, in order.
+fn commentTexts(src: str): Vec<String> = {
+	var interner = Interner::new()
+	val lexed = lex(src, &var interner)
+	var texts: Vec<String> = Vec()
+	for comment in comments(src, &lexed.tokens) {
+		texts.push(comment.text.clone())
+	}
+	return move texts
+}
+
+/// `text` without the white space at either end, as Unicode counts it.
+fn trimSpace(text: str): str = {
+	var start = 0
+	while start < text.len() {
+		val (c, width) = text.charAt(start)
+		if !c.isWhitespace() then break
+		start += width
+	}
+	return trimEndSpace(text[start..text.len()])
+}

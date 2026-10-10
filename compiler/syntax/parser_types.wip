@@ -1,0 +1,388 @@
+// Types, and the integer literals they contain.
+
+extend Parser {
+	var fn ty(): TypeId = self.tyWithArgs(true)
+
+	/// A type after `as`. `x as i64 < y` compares, so a `<` there does not
+	/// start type arguments — except after `ptr`, which is the one generic
+	/// name a cast's target may have: `p as ptr<Db>`.
+	var fn castTy(): TypeId = self.tyWithArgs(false)
+
+	var fn tyWithArgs(argsAllowed: bool): TypeId = {
+		val start = self.span()
+		val kind: TypeKind = match self.peek() {
+			.Ident(symbol) => {
+				val first = Name(sym: symbol, span: self.bump())
+				if self.at(.ColonColon) {
+					// A type from another module.
+					var segments = Vec::of(own [first])
+					while self.eat(.ColonColon) {
+						val .Some(name) = self.name("a name after `::`") else {
+							break
+						}
+						segments.push(name)
+					}
+					val args = self.typeArgsInType(argsAllowed)
+					.Path(segments: move segments, args: move args)
+				} else {
+					val pointer = self.text(first.span) == "ptr"
+					val args = self.typeArgsInType(argsAllowed || pointer)
+					.Named(name: symbol, args: move args)
+				}
+			}
+			// `dyn Interface`, which only makes sense behind `&`;
+			// the type checker reports it elsewhere.
+			.Dyn => {
+				self.bump()
+				match self.interfaceName("an interface name") {
+					.Some((module, name)) => {
+						var args: Vec<TypeId> = Vec()
+						if self.at(.Lt) {
+							val (listed, _) = self.typeArgList()
+							args = move listed
+						}
+						.Dyn(module: move module, name: name, args: move args)
+					}
+					.None => .Error
+				}
+			}
+			.Own => {
+				self.bump()
+				if self.at(.Lt) {
+					val open = self.bump()
+					val inner = self.inTypeArgs((p) => {
+						val inner = p.ty()
+						p.expectClosing(.Gt, open)
+						return inner
+					})
+					.Own(inner: inner)
+				} else {
+					val diagnostic = self.expected("`<`").withHelp(
+						"an owned type is written `own<T>`",
+					)
+					self.report(move diagnostic)
+					if canStartType(self.peek()) && !self.onLaterLine() then .Own(inner: self.ty())
+					else .Error
+				}
+			}
+			.Amp => {
+				self.bump()
+				val isVar = self.eat(.Var)
+				.Ref(isVar: isVar, inner: self.ty())
+			}
+			.AmpAmp => {
+				val span = self.bump()
+				self.reportDoubleBorrow(span)
+				val isVar = self.eat(.Var)
+				val inner = self.ty()
+				val innerSpan = Span::new(span.lo + 1, self.ast.types[inner].span.hi)
+				.Ref(
+					isVar: false,
+					inner: self.allocType(.Ref(isVar: isVar, inner: inner), innerSpan),
+				)
+			}
+			// `(a: A, b: B) => R`: a function type.
+			// `(A, B)`: a tuple, the prelude's `TupleN`. A
+			// function type is the other thing a `(` opens here: its `)` is
+			// followed by `=>`, or its parameters are named.
+			.LParen if !(self.parenBefore(.FatArrow) ||
+				(isIdent(self.nth(1)) && self.nth(2) == .Colon)) => {
+				val open = self.bump()
+				val (elems, _) = self.list(
+					open,
+					.RParen,
+					"a type",
+					(kind) => canStartType(kind),
+					(p) => .Some(p.ty()),
+				)
+				val span = start.to(self.prevSpan())
+				match self.tupleName(elems.len(), span, "type") {
+					.Some(name) => .Named(name: name, args: move elems)
+					.None => .Error
+				}
+			}
+			.LParen => {
+				val open = self.bump()
+				val (params, _) = self.list(
+					open,
+					.RParen,
+					"a parameter",
+					(kind) => canStartType(kind) || kind == .Underscore,
+					(p): Option<Field> => {
+						if (isIdent(p.peek()) || p.at(.Underscore)) && p.nth(1) == .Colon {
+							val .Some(name) = p.paramName("a parameter name") else {
+								return .None
+							}
+							return p.fieldAfter(name)
+						}
+						// A parameter written without its name.
+						val ty = p.ty()
+						val span = p.ast.types[ty].span
+						val diagnostic = Diagnostic::error(
+							FN_TYPE_SYNTAX,
+							"a function type names its parameters",
+							span,
+							"a parameter without a name",
+						).withHelp(
+							"write the name before the type, as in `(count: i64) => bool`",
+						).withNote("the names document what each argument is for")
+						p.report(move diagnostic)
+						return .None
+					},
+				)
+				if !self.eat(.FatArrow) {
+					val diagnostic = self.expected("`=>` and the result type").withHelp(
+						"a function type is written `(a: A, b: B) => R`, with `=> void` for a function that returns nothing",
+					)
+					self.report(move diagnostic)
+					return self.allocType(.Error, start.to(self.prevSpan()))
+				}
+				val ret = self.ty()
+				.Fn(params: move params, ret: ret)
+			}
+			// The first spelling of a function type, `fn(A, B): R`.
+			.Fn => {
+				val keyword = self.bump()
+				if self.at(.LParen) {
+					val open = self.bump()
+					self.list(
+						open,
+						.RParen,
+						"a parameter type",
+						(kind) => canStartType(kind),
+						(p) => {
+							if isIdent(p.peek()) && p.nth(1) == .Colon {
+								p.bump()
+								p.bump()
+							}
+							return .Some(p.ty())
+						},
+					)
+					if self.eat(.Colon) then self.ty()
+				}
+				val span = keyword.to(self.prevSpan())
+				val diagnostic = Diagnostic::error(
+					FN_TYPE_SYNTAX,
+					"a function type is written `(a: A, b: B) => R`",
+					span,
+					"the `fn(A, B): R` form",
+				).withHelp(
+					"name each parameter, and write the result after `=>`: `(x: i64) => i64`, or `=> void` for none",
+				).withNote("the type is written like a lambda, `(x) => body`")
+				self.report(move diagnostic)
+				return self.allocType(.Error, span)
+			}
+			.LBracket => {
+				val open = self.bump()
+				val elem = self.ty()
+				if self.at(.RBracket) {
+					// `[T]`: a slice.
+					self.bump()
+					TypeKind::Slice(elem: elem)
+				} else {
+					var len: Option<ArrayLen> = .None
+					if self.eat(.Semi) {
+						// A length is a literal, or a constant's name.
+						if isIdent(self.peek()) {
+							if self.name("an array length") is .Some(name) then
+								len = .Some(.Name(name: name))
+						} else if self.intLiteral("an array length") is .Some(value) {
+							len = .Some(.Int(value: value))
+						}
+					} else {
+						val diagnostic = self.expected("`;` and a length").withHelp(
+							"an array type is written `[T; N]`, for example `[i64; 4]`; a slice is `[T]`",
+						)
+						self.report(move diagnostic)
+						// Resume at the `]`, so the rest of the type is not
+						// reported again.
+						self.skipUntil((kind, lineBreak) => kind == .RBracket || lineBreak)
+					}
+					self.expectClosing(.RBracket, open)
+					TypeKind::Array(elem: elem, len: len.unwrapOr(.Int(value: 0)))
+				}
+			}
+			_ => {
+				val diagnostic = self.expected("a type")
+				self.report(move diagnostic)
+				val span = Span::at(self.prevSpan().hi)
+				return self.allocType(.Error, span)
+			}
+		}
+		val span = start.to(self.prevSpan())
+		return self.allocType(move kind, span)
+	}
+
+	/// `<A, B>` after a type's name, if there is one.
+	var fn typeArgsInType(allowed: bool): Vec<TypeId> = {
+		if !allowed || !self.at(.Lt) then return Vec()
+		val (args, _) = self.typeArgList()
+		return move args
+	}
+
+	/// `<A, B>`, at the `<`. Returns the types and the span of the whole list.
+	var fn typeArgList(): (Vec<TypeId>, Span) = {
+		val open = self.bump()
+		val (args, close) = self.inTypeArgs((p) => p.list(
+			open,
+			.Gt,
+			"a type",
+			(kind) => canStartType(kind),
+			(q) => .Some(q.ty()),
+		))
+		return (move args, open.to(close))
+	}
+
+	/// The name of an interface, and the modules written before it where a
+	/// path names one: `Area`, `shapes::Area`.
+	var fn interfaceName(what: str): Option<(Vec<Name>, Name)> = {
+		var module: Vec<Name> = Vec()
+		var name = self.name(what)?
+		while self.eat(.ColonColon) {
+			module.push(name)
+			name = self.name("a name after `::`")?
+		}
+		return .Some((move module, name))
+	}
+
+	/// `: copy`, `: Shape`, `: Shape + copy` after a type parameter,
+	/// and nothing where there is no `:`.
+	var fn bounds(): Option<Vec<Bound>> = {
+		var bounds: Vec<Bound> = Vec()
+		if self.eat(.Colon) {
+			while true {
+				// `T: From<i64>`: an interface with the types it takes.
+				val start = self.span()
+				val (module, name) = self.interfaceName("a constraint: `copy`, or an interface")?
+				var args: Vec<TypeId> = Vec()
+				if self.at(.Lt) {
+					val (listed, _) = self.typeArgList()
+					args = move listed
+				}
+				bounds.push(Bound(
+					module: move module,
+					name: name,
+					args: move args,
+					span: start.to(self.prevSpan()),
+				))
+				if !self.eat(.Plus) then break
+			}
+		}
+		return .Some(move bounds)
+	}
+
+	/// `<T, U: copy>` after the name of a generic item, if there is one.
+	var fn genericParams(): Vec<GenericParam> = {
+		if !self.at(.Lt) then return Vec()
+		val open = self.bump()
+		val (params, _) = self.inTypeArgs(
+			(p) => p.list(
+				open,
+				.Gt,
+				"a type parameter",
+				(kind) => isIdent(kind) || kind == .Type,
+				(q): Option<GenericParam> => {
+					// `type Item`: a type each implementation decides.
+					val decided: Option<Span> = if q.at(.Type) then .Some(q.bump()) else .None
+					val .Some(name) = q.name("a type parameter") else {
+						return .None
+					}
+					val .Some(bounds) = q.bounds() else {
+						return .None
+					}
+					// `K = T`: what a use that leaves it out means.
+					val default: Option<TypeId> = if q.eat(.Eq) then .Some(q.ty()) else .None
+					return .Some(GenericParam(
+						decided: decided,
+						name: name,
+						bounds: move bounds,
+						default: default,
+						span: decided.unwrapOr(name.span).to(q.prevSpan()),
+					))
+				},
+			),
+		)
+		return move params
+	}
+
+	/// Parses an integer literal where only a literal is allowed (array
+	/// lengths and repeat counts). Consumes a misplaced name, for recovery.
+	var fn intLiteral(what: str): Option<u64> = {
+		if self.at(.Int) {
+			val span = self.bump()
+			val value = self.intValue(span)
+			return .Some(if value > U64_MAX as u128 then U64_MAX else value as u64)
+		}
+		val diagnostic = self.expected("\(what) (an integer literal)").withNote(
+			"Wip has no constants yet, so this must be written as a number",
+		)
+		self.report(move diagnostic)
+		if isIdent(self.peek()) then self.bump()
+		return .None
+	}
+
+	/// The value of an integer literal. The type checker decides which type
+	/// it has and whether it fits; here it only has to fit
+	/// the widest one.
+	var fn intValue(span: Span): u128 = {
+		val text = self.text(span)
+		var radix: u128 = 10
+		var at = 0
+		if text.startsWith("0x") {
+			radix = 16
+			at = 2
+		} else if text.startsWith("0o") {
+			radix = 8
+			at = 2
+		} else if text.startsWith("0b") {
+			radix = 2
+			at = 2
+		}
+		// As Rust's `from_str_radix` reads it: the first digit the base does
+		// not allow, or the first that overflows, decides.
+		var value: u128 = 0
+		var digits = 0
+		while at < text.len() {
+			val b = text[at]
+			at += 1
+			if b == b'_' then continue
+			val digit: u128 = match b {
+				b'0'..=b'9' => (b - b'0') as u128
+				b'a'..=b'z' => (b - b'a' + 10) as u128
+				b'A'..=b'Z' => (b - b'A' + 10) as u128
+				_ => radix
+			}
+			// The lexer has reported every other malformed literal: a
+			// prefix without digits, or digits its base does not allow.
+			if digit >= radix then return 0
+			digits += 1
+			val next = value.checkedMul(radix).flatMap((shifted) => shifted.checkedAdd(digit))
+			val .Some(sum) = next else {
+				val diagnostic = Diagnostic::error(
+					INTEGER_TOO_LARGE,
+					"integer literal is too large",
+					span,
+					"does not fit in 128 bits",
+				)
+				self.report(move diagnostic)
+				return 0
+			}
+			value = sum
+		}
+		if digits == 0 then return 0
+		return value
+	}
+
+	var fn reportDoubleBorrow(span: Span) = {
+		val diagnostic = Diagnostic::error(
+			DOUBLE_BORROW,
+			"`&&` is the logical-and operator, not a double borrow",
+			span,
+			"logical and",
+		).withFix("for a reference to a reference, write `& &`", own [Edit::replace(span, "& &")])
+		self.report(move diagnostic)
+	}
+}
+
+/// The largest `u64`, which an array's length saturates at.
+val U64_MAX: u64 = 18446744073709551615

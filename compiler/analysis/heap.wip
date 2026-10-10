@@ -1,0 +1,61 @@
+// Whether a place lies on the heap: behind an `own`, in a block of slots or
+// a buffer, or lent by a projection that lends from one. A generator that
+// holds the value such a place is part of may be moved while it waits, and
+// the place stays where it is, so a loop may walk it across a `yield`. What
+// lies in the value itself moves with it.
+
+import hir::{Body, ExprId, FnId, Program}
+
+/// How many projections deep the answer is looked for: one that forwards to
+/// another, as a map's `items` does to its vector's.
+val DEPTH: u32 = 8
+
+extend Checker {
+	/// Whether the elements `id` names lie on the heap.
+	fn onHeap(id: ExprId): bool = heap(self.program, self.body, id, DEPTH)
+}
+
+/// Whether a value of the expression's type is a buffer: its elements are
+/// where its pointer points.
+fn isBuffer(program: &Program, body: &Body, e: ExprId): bool = match program.types.kind(
+	body.exprs[e].ty,
+) {
+	.Slots(..) => true
+	.Own(inner) => program.types.kind(inner) is .Slice(..)
+	_ => false
+}
+
+fn heap(program: &Program, body: &Body, id: ExprId, depth: u32): bool = {
+	// A buffer's elements are where its pointer points.
+	if isBuffer(&program, &body, id) then return true
+	return match body.exprs[id].kind {
+		.Deref(inner) => match program.types.kind(body.exprs[inner].ty) {
+			.Own(..) => true
+			// Where a projection lends from.
+			_ => heap(&program, &body, inner, depth)
+		}
+		.Field(base, ..) => heap(&program, &body, base, depth)
+		.Index(base, ..) | .SubSlice(base, ..) =>
+			isBuffer(&program, &body, base) || heap(&program, &body, base, depth)
+		.Call(callee, ..) => depth > 0 && lendsFromHeap(&program, callee, depth - 1)
+		_ => false
+	}
+}
+
+/// Whether every place a projection lends lies on the heap.
+fn lendsFromHeap(program: &Program, callee: FnId, depth: u32): bool = {
+	val def = &program.fns[callee]
+	// A projection's place is its reference result's.
+	if !(program.types.kind(def.ret) is .Ref(..)) then return false
+	val .Some(body) = def.body else {
+		return false
+	}
+	var any = false
+	for e in body.exprs {
+		if e.kind is .Lend(place) {
+			if !heap(&program, &body, place, depth) then return false
+			any = true
+		}
+	}
+	return any
+}

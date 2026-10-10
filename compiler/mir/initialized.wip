@@ -1,0 +1,220 @@
+// Which locals a body may read before anything writes them: a forward
+// analysis of what is written on every path to each point.
+//
+// A write to any part of a local counts as writing it — a field assigned, a
+// variant set, its address taken for a call to fill — so what this answers
+// is a local nothing on some path writes at all before a read. LLVM reads
+// such a local as anything, so a body that has one says nothing definite.
+
+/// The locals `body` may read before it writes them, each with the block
+/// where it is read, once each.
+pub fn readsBeforeWrites(body: &Body): Vec<(Local, BlockId)> = {
+	val count = body.locals.len()
+	val blocks = body.blocks.len()
+	// What is written on every path into each block; nothing where no path
+	// has been followed yet.
+	var entry: Vec<Option<Vec<bool>>> = Vec()
+	for _ in 0..blocks {
+		entry.push(.None)
+	}
+	var start = Vec::filled(count, false)
+	for param in body.params {
+		start[param.index as i64] = true
+	}
+	entry[0] = .Some(move start)
+	var changed = true
+	while changed {
+		changed = false
+		for b in 0..blocks {
+			val .Some(known) = entry[b].clone() else {
+				continue
+			}
+			var written = move known
+			var ignored: Vec<Local> = Vec()
+			for statement in body.blocks[b].statements {
+				statementEffect(&statement, &var written, &var ignored)
+			}
+			for next in body.blocks[b].terminator.successors() {
+				val at = next.index as i64
+				match entry[at].clone() {
+					.None => {
+						entry[at] = .Some(written.clone())
+						changed = true
+					}
+					.Some(old) => {
+						var merged = move old
+						var lost = false
+						for i in 0..count {
+							if merged[i] && !written[i] {
+								merged[i] = false
+								lost = true
+							}
+						}
+						if lost {
+							entry[at] = .Some(move merged)
+							changed = true
+						}
+					}
+				}
+			}
+		}
+	}
+	var found: Vec<(Local, BlockId)> = Vec()
+	for (b, block) in body.blocks.forwards().enumerate() {
+		val .Some(known) = entry[b].clone() else {
+			continue
+		}
+		var written = move known
+		val at = BlockId(b as u32)
+		for statement in block.statements {
+			val before = written.clone()
+			var reads: Vec<Local> = Vec()
+			statementEffect(&statement, &var written, &var reads)
+			for local in reads {
+				report(local, &before, at, &var found)
+			}
+		}
+		var reads: Vec<Local> = Vec()
+		terminatorReads(&body, &block.terminator, &var reads)
+		for local in reads {
+			report(local, &written, at, &var found)
+		}
+	}
+	return move found
+}
+
+/// `local`, read in `at` where `written` says what is written, where it is
+/// not and has not been found before.
+fn report(local: Local, written: &[bool], at: BlockId, found: &var Vec<(Local, BlockId)>) = {
+	if written[local.index as i64] then return
+	for (l, _) in found {
+		if l == local then return
+	}
+	found.push((local, at))
+}
+
+/// The locals reading `place` reads: its own, and those its indices name.
+fn placeReads(place: &Place, reads: &var Vec<Local>) = {
+	reads.push(place.local)
+	indexReads(&place, &var reads)
+}
+
+fn indexReads(place: &Place, reads: &var Vec<Local>) = {
+	for projection in place.projections {
+		if projection is .Index(index) then reads.push(index)
+	}
+}
+
+fn operandReads(operand: &Operand, reads: &var Vec<Local>) = {
+	if operand is .Copy(place) then placeReads(&place, &var reads)
+}
+
+fn optionalReads(operand: &Option<Operand>, reads: &var Vec<Local>) = {
+	if operand is .Some(o) then operandReads(&o, &var reads)
+}
+
+/// Whether a place reaches through a pointer.
+fn throughPointer(place: &Place): bool = {
+	for projection in place.projections {
+		if projection is .Deref then return true
+	}
+	return false
+}
+
+/// Writing `place`: through a pointer it holds, a read of the local; into the
+/// local itself, or a part of it, a write.
+fn placeWrite(place: &Place, written: &var Vec<bool>, reads: &var Vec<Local>) = {
+	indexReads(&place, &var reads)
+	if throughPointer(&place) then reads.push(place.local)
+	else written[place.local.index as i64] = true
+}
+
+/// What a statement reads, added to `reads`, and what it writes, marked.
+fn statementEffect(
+	statement: &Statement,
+	written: &var Vec<bool>,
+	reads: &var Vec<Local>,
+) = match statement {
+	.Assign(place: dest, rvalue) => {
+		match rvalue {
+			.Use(o) | .Unary(operand: o, ..) | .Cast(operand: o, ..) | .CstrLen(o)
+			| .Float(operand: o, ..) | .Integer(operand: o, ..) | .Bits(o) | .VTableFn(table: o, ..) => operandReads(
+				&o,
+				&var reads,
+			)
+			.Binary(lhs, rhs, ..) | .Rotate(lhs, rhs, ..) | .Overflows(lhs, rhs, ..) => {
+				operandReads(&lhs, &var reads)
+				operandReads(&rhs, &var reads)
+			}
+			.MulAdd(first, second, third) => {
+				operandReads(&first, &var reads)
+				operandReads(&second, &var reads)
+				operandReads(&third, &var reads)
+			}
+			.Variant(place) => placeReads(&place, &var reads)
+			// An address taken may be where something is written, so the
+			// local counts as written from here.
+			.AddressOf(place) => {
+				indexReads(&place, &var reads)
+				if throughPointer(&place) then reads.push(place.local)
+				else written[place.local.index as i64] = true
+			}
+		}
+		placeWrite(&dest, &var written, &var reads)
+	}
+	.SetVariant(place, ..) | .Zero(place) | .Poison(place) => placeWrite(
+		&place,
+		&var written,
+		&var reads,
+	)
+	.CheckMoved(place, ..) | .DropInPlace(place, ..) => placeReads(&place, &var reads)
+	.Call(callee, args, dest) => {
+		if callee is .Value(value) then operandReads(&value, &var reads)
+		for arg in args {
+			operandReads(&arg, &var reads)
+		}
+		if dest is .Some(d) then placeWrite(&d, &var written, &var reads)
+	}
+	.Alloc(dest, ..) => placeWrite(&dest, &var written, &var reads)
+	.AllocBuffer(dest, count, ..) => {
+		operandReads(&count, &var reads)
+		placeWrite(&dest, &var written, &var reads)
+	}
+	.Free(o) => operandReads(&o, &var reads)
+	.DropFn(ptr, ..) => operandReads(&ptr, &var reads)
+	.Arith(dest, lhs, rhs, ..) => {
+		operandReads(&lhs, &var reads)
+		operandReads(&rhs, &var reads)
+		placeWrite(&dest, &var written, &var reads)
+	}
+	.Atomic(address, value, expected, dest, ..) => {
+		operandReads(&address, &var reads)
+		optionalReads(&value, &var reads)
+		optionalReads(&expected, &var reads)
+		if dest is .Some(d) then placeWrite(&d, &var written, &var reads)
+	}
+	.Check(fails, kind, ..) => {
+		operandReads(&fails, &var reads)
+		match kind {
+			.Bounds(index, length) => {
+				operandReads(&index, &var reads)
+				operandReads(&length, &var reads)
+			}
+			.Length(length) => operandReads(&length, &var reads)
+			.Division | .Overflow(..) => {}
+		}
+	}
+	.At(..) => {}
+}
+
+fn terminatorReads(
+	body: &Body,
+	terminator: &Terminator,
+	reads: &var Vec<Local>,
+) = match terminator {
+	.Branch(cond, ..) => operandReads(&cond, &var reads)
+	.Switch(value, ..) => operandReads(&value, &var reads)
+	.Return => { if body.ret is .Some(ret) then reads.push(ret) }
+	.Panic(note, ..) => optionalReads(&note, &var reads)
+	.Goto(..) | .Unreachable => {}
+}

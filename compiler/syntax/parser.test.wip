@@ -1,0 +1,472 @@
+// The parser: precedence, type arguments against comparisons, line breaks,
+// literals, items, the errors it reports, and that every fix it suggests
+// makes text that parses cleanly.
+
+/// The tree and the names of `src`, which lexes cleanly.
+fn parseStr(src: str): (Parsed, Interner) = {
+	var interner = Interner::new()
+	val lexed = lex(src, &var interner)
+	assert(lexed.diagnostics.isEmpty(), src)
+	val parsed = parse(src, &lexed)
+	return (move parsed, move interner)
+}
+
+/// The codes of what parsing `src` reports, in order.
+fn parseCodes(src: str): String = {
+	val (parsed, _) = parseStr(src)
+	var out = String()
+	for diagnostic in parsed.diagnostics {
+		if !out.isEmpty() then out.push(" ")
+		out.push(diagnostic.code.text())
+	}
+	return move out
+}
+
+/// The statements of `fn f() = { src }`, each rendered as an S-expression,
+/// joined by `; `.
+fn stmts(src: str): String = {
+	val whole = "fn f() = {\n\(src)\n}"
+	val (parsed, interner) = parseStr(whole.toStr())
+	// A warning says how something reads, not what it parsed as, and these
+	// check the shape: `a` and then `.b` is two statements, and says so
+	// (E0126).
+	for diagnostic in parsed.diagnostics {
+		assert(!diagnostic.isError(), "\(whole): \(diagnostic.message)")
+	}
+	val .Fn(decl) = parsed.ast.items[0] else {
+		panic("not a function")
+	}
+	val .Some(body) = decl.body else {
+		panic("a function with a body")
+	}
+	val .Block(block) = parsed.ast.exprs[body].kind else {
+		panic("not a block")
+	}
+	var out = String()
+	for stmt in block.stmts {
+		if !out.isEmpty() then out.push("; ")
+		match parsed.ast.stmts[stmt].kind {
+			.Expr(value) => out.push(render(&parsed.ast, &interner, value))
+			.Let(
+				name,
+				init,
+				..,
+			) => out.push("(val \(interner.resolve(name.sym)) \(render(&parsed.ast, &interner, init)))")
+			.Return(value) => match value {
+				.Some(value) => out.push("(return \(render(&parsed.ast, &interner, value)))")
+				.None => out.push("(return)")
+			}
+			_ => out.push("?")
+		}
+	}
+	return move out
+}
+
+/// An expression as an S-expression, with the parts these tests look at.
+fn render(ast: &Ast, interner: &Interner, id: ExprId): String = match ast.exprs[id].kind {
+	.Int(value) => "\(value)"
+	.Name(symbol) => String::of(interner.resolve(symbol))
+	.Paren(inner) => "(\(render(&ast, &interner, inner)))"
+	.Unary(op, operand, ..) => "(\(op.text()) \(render(&ast, &interner, operand)))"
+	.Binary(op, lhs, rhs, ..) =>
+		"(\(op.text()) \(render(&ast, &interner, lhs)) \(render(&ast, &interner, rhs)))"
+	.Cast(expr, ty) => {
+		val .Named(name, ..) = ast.types[ty].kind else {
+			panic("not a named type")
+		}
+		return "(as \(render(&ast, &interner, expr)) \(interner.resolve(name)))"
+	}
+	.Assign(target, op, wrapping, value) => {
+		val written = match op {
+			.Some((op, _)) => op.text()
+			.None => ""
+		}
+		val wraps = if wrapping then "%" else ""
+		return "(\(written)\(wraps)= \(render(&ast, &interner, target)) \(render(&ast, &interner, value)))"
+	}
+	.Field(base, name) => "(. \(render(&ast, &interner, base)) \(interner.resolve(name.sym)))"
+	.Index(base, index) => "([] \(render(&ast, &interner, base)) \(render(&ast, &interner, index)))"
+	.SubSlice(base, lo, hi, inclusive) => {
+		val dots = if inclusive then "..=" else ".."
+		val from = match lo {
+			.Some(lo) => render(&ast, &interner, lo)
+			.None => String::of("-")
+		}
+		val to = match hi {
+			.Some(hi) => render(&ast, &interner, hi)
+			.None => String::of("-")
+		}
+		return "([\(dots)] \(render(&ast, &interner, base)) \(from) \(to))"
+	}
+	.Call(callee, args, names, rest) => {
+		var written = String()
+		for (i, arg) in args.forwards().enumerate() {
+			if i > 0 then written.push(" ")
+			match names[i] {
+				.Some(
+					name,
+				) => written.push("\(interner.resolve(name.sym)): \(render(&ast, &interner, arg))")
+				.None => written.push(render(&ast, &interner, arg))
+			}
+		}
+		if rest is .Some(rest) {
+			if !args.isEmpty() then written.push(" ")
+			written.push("..\(render(&ast, &interner, rest))")
+		}
+		return "(call \(render(&ast, &interner, callee)) \(written))"
+	}
+	.If(thenBlock, elseBranch, ..) => {
+		val otherwise = match elseBranch {
+			.Some(branch) => render(&ast, &interner, branch)
+			.None => String::of("-")
+		}
+		return "(if \(thenBlock.stmts.len()) \(otherwise))"
+	}
+	.Block(block) => "(block \(block.stmts.len()))"
+	.Array(elems) => {
+		var written = String()
+		for (i, elem) in elems.forwards().enumerate() {
+			if i > 0 then written.push(" ")
+			written.push(render(&ast, &interner, elem))
+		}
+		return "[\(written)]"
+	}
+	.Path(leadingDot, segments, typeArgs) => {
+		var written = String::of(if leadingDot then "." else "")
+		for (i, segment) in segments.forwards().enumerate() {
+			if i > 0 then written.push("::")
+			written.push(interner.resolve(segment.sym))
+		}
+		if typeArgs is .Some(args) then written.push(" <\(args.args.len()) after \(args.after)>")
+		return "(path \(written))"
+	}
+	.Match(arms, ..) => "(match \(arms.len()))"
+	.Is(scrutinee, negated, ..) =>
+		"(\(if negated then "!" else "")is \(render(&ast, &interner, scrutinee)))"
+	_ => String::of("?")
+}
+
+/// A file of a multi-file program is lexed and parsed with its spans based
+/// where the file starts, so one span names a place in one file.
+@test
+fn spansStartAtTheBase() = {
+	val src = "fn first(): i64 = 1\n"
+	var interner = Interner::new()
+	val lexed = lexAt(src, 1000, &var interner)
+	val parsed = parseAt(src, 1000, &lexed)
+	assert(parsed.diagnostics.isEmpty())
+	val .Fn(decl) = parsed.ast.items[0] else {
+		panic("expected a function")
+	}
+	// "fn " is three bytes, and the name is four more.
+	assert(decl.sig.name.span.lo == 1003 && decl.sig.name.span.hi == 1008)
+	assert(interner.resolve(decl.sig.name.sym) == "first")
+}
+
+/// Another module's interface is named by its path in a constraint, behind
+/// `dyn` and in an `extend` block: its name, and the modules before it.
+@test
+fn anInterfaceIsNamedByItsPath() = {
+	val (parsed, interner) = parseStr(
+		"extend Csv: formats::Format {}\nfn f<F: formats::Format + copy>(a: &dyn a::b::Format) = {}\n",
+	)
+	assert(parsed.diagnostics.isEmpty())
+	val .Extend(block) = parsed.ast.items[0] else {
+		panic("expected an extend block")
+	}
+	assert(
+		block.interfaceModule.len() == 1 &&
+			interner.resolve(block.interfaceModule[0].sym) == "formats",
+	)
+	val .Fn(decl) = parsed.ast.items[1] else {
+		panic("expected a function")
+	}
+	val bounds = &decl.sig.generics[0].bounds
+	assert(bounds[0].module.len() == 1 && interner.resolve(bounds[0].name.sym) == "Format")
+	assert(bounds[1].module.isEmpty() && interner.resolve(bounds[1].name.sym) == "copy")
+	val .Ref(inner, ..) = parsed.ast.types[decl.sig.params[0].ty].kind else {
+		panic("expected a reference")
+	}
+	val .Dyn(module, name, ..) = parsed.ast.types[inner].kind else {
+		panic("expected `dyn`")
+	}
+	assert(module.len() == 2 && interner.resolve(name.sym) == "Format")
+}
+
+@test
+fn precedenceAndAssociativity() = {
+	val cases = [
+		("a + b * c", "(+ a (* b c))"),
+		("a - b - c", "(- (- a b) c)"),
+		("a / b % c", "(% (/ a b) c)"),
+		("a = b = c", "(= a (= b c))"),
+		("a || b && c", "(|| a (&& b c))"),
+		("a && b || c", "(|| (&& a b) c)"),
+		("a < b == c < d", "(== (< a b) (< c d))"),
+		("!x == y", "(== (! x) y)"),
+		("-a.b", "(- (. a b))"),
+		("-f(a) * -c", "(* (- (call f a)) (- c))"),
+		("own f(x)", "(own (call f x))"),
+		("own own 1", "(own (own 1))"),
+		("&a[i]", "(& ([] a i))"),
+		("move p.next", "(move (. p next))"),
+		("a.b.c(d)[e]", "([] (call (. (. a b) c) d) e)"),
+		("(a + b) * c", "(* ((+ a b)) c)"),
+		("x = a + b", "(= x (+ a b))"),
+		// Compound assignment, as loose as `=`.
+		("x += a * b", "(+= x (* a b))"),
+		("xs[i] -= 1", "(-= ([] xs i) 1)"),
+		("x *= y /= 2", "(*= x (/= y 2))"),
+		("x %= a == b", "(%= x (== a b))"),
+		("x &= m | 1", "(&= x (| m 1))"),
+		("x |= 1 << b", "(|= x (<< 1 b))"),
+		("x ^= y", "(^= x y)"),
+		("x <<= 2", "(<<= x 2)"),
+		("x >>= a >> 1", "(>>= x (>> a 1))"),
+		("x+=-1", "(+= x (- 1))"),
+		("a < b", "(< a b)"),
+		("a <= b", "(<= a b)"),
+		("-x as i64", "(as (- x) i64)"),
+		("a * b as f64", "(* a (as b f64))"),
+		("a as i32 as i64 + 1", "(+ (as (as a i32) i64) 1)"),
+		("a | b ^ c & d", "(| a (^ b (& c d)))"),
+		("a & b << 1 + 2", "(& a (<< b (+ 1 2)))"),
+		("x & m == 0", "(== (& x m) 0)"),
+		("a >> b > c", "(> (>> a b) c)"),
+		("a < b | c", "(< a (| b c))"),
+		("a << b >> c", "(>> (<< a b) c)"),
+		("!a & b", "(& (! a) b)"),
+		("a * b << c as i64", "(<< (* a b) (as c i64))"),
+		("a is .Some(x) && x > 0", "(&& (is a) (> x 0))"),
+		("!a is .None || b", "(|| (is (! a)) b)"),
+		("f(x) is Shape::Rect(width, ..) == c", "(== (is (call f x)) c)"),
+		("move a is .Some(x)", "(is (move a))"),
+	]
+	for (src, expected) in cases {
+		assert(stmts(src) == expected, src)
+	}
+}
+
+/// After a name, `<` starts type arguments only when `(`, `{` or `::`
+/// follows the matching `>` (grammar R7).
+@test
+fn typeArgumentsOrComparisons() = {
+	val cases = [
+		("f<i64>(x)", "(call (path f <1 after 0>) x)"),
+		("f<own<T>, [i64; 3]>()", "(call (path f <2 after 0>) )"),
+		("Option<i64>::None", "(path Option::None <1 after 0>)"),
+		("pkg::Option<i64>::None", "(path pkg::Option::None <1 after 1>)"),
+		("Pair<A, B>(first: a)", "(call (path Pair <2 after 0>) first: a)"),
+		("a < b", "(< a b)"),
+		("a < b > c", "(> (< a b) c)"),
+		("f(a < b, c > d)", "(call f (< a b) (> c d))"),
+		("f(a < xs[i], c > (d))", "(call f (< a ([] xs i)) (> c (d)))"),
+		("f(a < (b), c > (d))", "(call f (< a (b)) (> c (d)))"),
+		("f(a < (b) > (c))", "(call f (> (< a (b)) (c)))"),
+		("f<[i64; 3], &var T>(x)", "(call (path f <2 after 0>) x)"),
+		("f(g<(item: &T, n: [i64; 2]) => (x: T) => void>)", "(call f (path g <1 after 0>))"),
+		("a < b + 1 > (c)", "(> (< a (+ b 1)) (c))"),
+		("x as i64 < y", "(< (as x i64) y)"),
+		("a << b >> (c)", "(>> (<< a b) (c))"),
+		("f(less<i64>, x)", "(call f (path less <1 after 0>) x)"),
+		("f(x, less<i64>)", "(call f x (path less <1 after 0>))"),
+		("f(apply<(v: i64) => bool>)", "(call f (path apply <1 after 0>))"),
+		("f(x, width: 2, dashed: a < b)", "(call f x width: 2 dashed: (< a b))"),
+		("f(g<i64>(1), n: x::y)", "(call f (call (path g <1 after 0>) 1) n: (path x::y))"),
+	]
+	for (src, expected) in cases {
+		assert(stmts(src) == expected, src)
+	}
+}
+
+/// Literals in other bases, with `_` separators, up to 128 bits.
+@test
+fn integerLiteralValues() = {
+	val cases = [
+		("0xff", "255"),
+		("0xFF_FF", "65535"),
+		("0o755", "493"),
+		("0b1010_1010", "170"),
+		("1_000_000", "1000000"),
+		("0xFFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF", "340282366920938463463374607431768211455"),
+	]
+	for (src, expected) in cases {
+		assert(stmts(src) == expected, src)
+	}
+	// One more digit does not fit in 128 bits.
+	assert(parseCodes("fn f() = 0x1_0000_0000_0000_0000_0000_0000_0000_0000") == "E0111")
+}
+
+@test
+fn aVariantUnderAnExpressionWarns() = {
+	// It reads as `io::println(1).Ok(2)`, and is two statements.
+	assert(parseCodes("fn f() = {\n    g(1)\n    .Ok(2)\n}") == "E0126")
+	// A binding and an assignment cannot take a `.`, so neither is
+	// reported, and saying `return` says which was meant.
+	assert(parseCodes("fn f() = {\n    val x = 1\n    .Ok(x)\n}") == "")
+	assert(parseCodes("fn f() = {\n    var x = 1\n    x += 1\n    .Ok(x)\n}") == "")
+	assert(parseCodes("fn f() = {\n    g(1)\n    return .Ok(2)\n}") == "")
+}
+
+@test
+fn lineBreaks() = {
+	val cases = [
+		// A complete expression ends at a line break.
+		("a\n- b", "a; (- b)"),
+		("f\n(x)", "f; (x)"),
+		("a\n[0]", "a; [0]"),
+		// An incomplete one continues.
+		("a +\nb", "(+ a b)"),
+		("val x =\n1", "(val x 1)"),
+		// `else` continues the line above; a `.` begins a variant instead,
+		// so it starts a new statement.
+		("a\n.b", "a; (path .b)"),
+		("a.b", "(. a b)"),
+		("if c { 1 }\nelse { 2 }", "(if 1 (block 1))"),
+		// Line breaks are whitespace inside parentheses and conditions.
+		("f(a\n, b)", "(call f a b)"),
+		("(a\n+ b)", "((+ a b))"),
+		("if a\n&& b { 1 }", "(if 1 -)"),
+		// `;` separates statements on one line.
+		("val x = 1; val y = 2", "(val x 1); (val y 2)"),
+		// `return` followed by a line break returns nothing.
+		("return\n1", "(return); 1"),
+		// A `{` on the next line starts a block.
+		("p\n{ 1 }", "p; (block 1)"),
+		// Arguments across lines, with commas.
+		("P(\nx: 1,\ny: 2,\n)", "(call P x: 1 y: 2)"),
+		("match e {\nA => 1\nB => 2\n}", "(match 2)"),
+		("match e { A => 1, B => 2 }", "(match 2)"),
+	]
+	for (src, expected) in cases {
+		assert(stmts(src) == expected, src)
+	}
+}
+
+@test
+fn functionsAndExternBlocks() = {
+	val src =
+		"extern \"C\" {\n fn a(x: i64): i64\n fn b(); fn c()\n}\nfn add(x: i64, y: i64): i64 = x + y\nfn square(x: i64): i64 = {\n val s = x * x\n s\n}\nfn main() = a(1)\n"
+	val (parsed, _) = parseStr(src)
+	assert(parsed.diagnostics.isEmpty())
+	assert(parsed.ast.items.len() == 4)
+	val .Extern(block) = parsed.ast.items[0] else {
+		panic("not an extern block")
+	}
+	assert(block.fns.len() == 3)
+}
+
+/// An import names a module, or items of it in braces.
+@test
+fn importLists() = {
+	val src =
+		"import std::io::{print}\nimport a::b::{self, C, d as e}\nimport f::{\n    g\n    h,\n}\nimport i as j\n"
+	val (parsed, interner) = parseStr(src)
+	assert(parsed.diagnostics.isEmpty())
+	var imports = String()
+	for item in parsed.ast.items {
+		val .Import(decl) = item else {
+			panic("not an import")
+		}
+		if !imports.isEmpty() then imports.push("|")
+		for (i, name) in decl.path.forwards().enumerate() {
+			if i > 0 then imports.push("::")
+			imports.push(interner.resolve(name.sym))
+		}
+		if decl.items is .Some(listed) {
+			for imported in listed {
+				match imported.name {
+					.Some(name) => imports.push(" \(interner.resolve(name.sym))")
+					.None => imports.push(" self(module)")
+				}
+				if imported.alias is .Some(alias) then
+					imports.push("=\(interner.resolve(alias.sym))")
+			}
+		}
+		if decl.alias is .Some(alias) then imports.push(" as \(interner.resolve(alias.sym))")
+	}
+	assert(imports == "std::io print|a::b self(module) C d=e|f g h|i as j")
+}
+
+@test
+fn structLiteralRules() = {
+	// A struct is built with a call, in a condition as anywhere.
+	val (built, _) = parseStr("fn f() = { val p = P(x: 1, ..q)\n if P(x: 1).x == 1 {} }")
+	assert(built.diagnostics.isEmpty())
+	// In a condition, `x {}` is a name and an empty block.
+	val (blocks, _) = parseStr("fn f() = { if x {}\n while y {} }")
+	assert(blocks.diagnostics.isEmpty())
+	// Braces are E0133, once each, with a fix that writes the call.
+	assert(parseCodes("fn f() = { val p = P { x: 1 } }") == "E0133")
+	assert(parseCodes("fn f() = { if p == P { x: 1 } { return } }") == "E0133")
+	val (braced, _) = parseStr("fn f() = { val p = P { x, y: 2, ..q } }")
+	val .Some(fix) = braced.diagnostics[0].fix else {
+		panic("a fix")
+	}
+	assert(fix.edits[0].replacement == "P(x: x, y: 2, ..q)")
+}
+
+@test
+fn parserErrorCodes() = {
+	val cases = [
+		("fn f() = { val x = 1 val y = 2 }", "E0112"),
+		("fn f() = {\n val x = 1\n + 2\n}", "E0113"),
+		("fn f() = { let x = 1 }", "E0114"),
+		("fn f() -> i64 = 1", "E0115"),
+		("fn f() { }", "E0106"),
+		("fn f()", "E0106"),
+		("fn f() = match e { A => 1 B => 2 }", "E0104"),
+		("struct P { x: i64 y: i64 }", "E0112"),
+		("extern \"C\" { fn a() fn b() }", "E0112"),
+		("extern \"C\" { fn a(): i64 = 1 }", "E0106"),
+		("import a::{}", "E0119"),
+		("import a::{b} as c", "E0119"),
+	]
+	for (src, expected) in cases {
+		assert(parseCodes(src) == expected, src)
+	}
+}
+
+/// Every fix the parser suggests must produce source that parses cleanly.
+@test
+fn parserFixesApplyCleanly() = {
+	val cases = [
+		"fn f() = { val x = 1 val y = 2 }",
+		"fn f() = {\n val x = 1\n + 2\n}",
+		"fn f() = { let x = 1 }",
+		"fn f() -> i64 = 1",
+		"fn f() { }",
+		"fn f() = match e { A => 1 B => 2 }",
+		"struct P { x: i64 y: i64 }",
+		"struct S { a i64 }",
+		"fn f(a: i64 b: i64) = {}",
+		"fn f() = { return (1 + 2 }",
+		"struct S { a: own<i64, }",
+		"struct P { x: i64 } fn f(p: P) = { if p == P { x: 1 } {} }",
+		"fn f(x: i64) = g(&&x)",
+		"enum E { A() }",
+		"extern \"C\" { fn f(): i64 = 1 }",
+		"extern { fn f() }",
+		"import a::{}",
+	]
+	for src in cases {
+		val (parsed, _) = parseStr(src)
+		assert(parsed.diagnostics.len() == 1, src)
+		val .Some(fix) = parsed.diagnostics[0].fix else {
+			panic("no fix for \(src)")
+		}
+		val fixed = fix.apply(src)
+		val (reparsed, _) = parseStr(fixed.toStr())
+		assert(reparsed.diagnostics.isEmpty(), fixed)
+	}
+}
+
+@test
+fn everyErrorHasASpanInsideTheSource() = {
+	val src = "fn f( = { val = ; if { match x { A(b) => } } struct"
+	val (parsed, _) = parseStr(src)
+	assert(!parsed.diagnostics.isEmpty())
+	for diagnostic in parsed.diagnostics {
+		assert(diagnostic.primary.span.hi as i64 <= src.len())
+	}
+}

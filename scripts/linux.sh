@@ -20,26 +20,29 @@
 # What Linux does not cover: anything about how macOS links.
 #
 # The repository is mounted read-write, but nothing is built into it: the
-# target directory, cargo's downloads and the C cache live in a volume of
-# the guest's own, which is why a run is not held up by a bind mount, and
-# why a second run is warm. `container volume delete wip-build` (or
+# directory the scripts build in, `WIP_TARGET_DIR` — the compiler the seed
+# builds, the stages — the packages installed and the C cache live in a
+# volume of the guest's own, which is why a run is not held up by a bind
+# mount, and why a second run is warm. `container volume delete wip-build` (or
 # `docker volume rm wip-build`) throws that away.
 #
-# The guest gets 8 CPUs and 8 GiB by default, since a Rust build wants
-# both; WIP_LINUX_CPUS and WIP_LINUX_MEMORY say otherwise.
+# The guest gets 8 CPUs and 12 GiB by default: the gate spreads its work
+# over the CPUs, and the compiler holds a release build's whole module while
+# it writes it, some two gigabytes, beside the programs the gate builds;
+# WIP_LINUX_CPUS and WIP_LINUX_MEMORY say otherwise.
 set -uo pipefail
 cd "$(dirname "$0")/.." || exit 1
 
-# The image carries the toolchain this machine has, so that a lint or a
-# warning tells the same story on both sides; WIP_LINUX_IMAGE overrides it.
-host_rust=$(rustc --version 2>/dev/null | cut -d' ' -f2 | cut -d. -f1,2)
-image=${WIP_LINUX_IMAGE:-docker.io/library/rust:${host_rust:-stable}-bookworm}
+# Debian 12 with what a build of anything needs — a C compiler and its
+# linker, git, python3 — to which the guest adds what Wip needs below;
+# WIP_LINUX_IMAGE names another.
+image=${WIP_LINUX_IMAGE:-docker.io/library/buildpack-deps:bookworm}
 arch=${WIP_LINUX_ARCH:-}
 cpus=${WIP_LINUX_CPUS:-8}
-memory=${WIP_LINUX_MEMORY:-8g}
-# One volume per architecture: cargo keeps a host build in the same paths
-# whatever the machine is, so arm64 and x86-64 artifacts would clobber
-# each other and rebuild on every switch.
+memory=${WIP_LINUX_MEMORY:-12g}
+# One volume per architecture: a build is kept in the same paths whatever
+# the machine is, so arm64 and x86-64 builds would clobber each other and
+# be made again on every switch.
 volume=${WIP_LINUX_VOLUME:-wip-build${arch:+-$arch}}
 
 # Apple's `container` (github.com/apple/container) runs Linux in a
@@ -89,19 +92,17 @@ if [ -n "$arch" ]; then
     esac
 fi
 
-# The official `rust` image carries a minimal toolchain, so the two
-# components the gate needs are added first; it takes a couple of seconds
-# and keeps the image an ordinary one rather than something to build.
-# A release build is LLVM's where there is a clang 15 or newer, and Debian
-# 12's own `clang` is 14: the guest is given `clang-19`, its packages kept
-# in the volume, so that both backends are checked here as on a Mac; and
-# gdb, which runs a program to show its values through `wip debug`'s script,
-# as a Mac lets only a developer's lldb do.
-inside='command -v rustup >/dev/null && rustup component add rustfmt clippy >/dev/null 2>&1
+# Every build is LLVM's, through a clang 15 or newer, and Debian 12's own
+# `clang` is 14: the guest is given `clang-19`, its packages kept in the
+# volume, which keeps the image an ordinary one rather than something to
+# build; and gdb, which runs a program to show its values through `wip
+# debug`'s script, as a Mac lets only a developer's lldb do. Git is told
+# the mounted checkout is safe to read, which it doubts, as another user's.
+inside='git config --global --add safe.directory /repo
 if ! command -v clang-19 >/dev/null || ! command -v gdb >/dev/null; then
     mkdir -p /work/apt/partial
     { apt-get update -qq && apt-get install -y -qq -o Dir::Cache::Archives=/work/apt clang-19 gdb; } >/dev/null 2>&1 ||
-        echo "note: clang-19 and gdb could not be installed; the release builds here are Cranelift'"'"'s" >&2
+        echo "note: clang-19 and gdb could not be installed; nothing is built here without a clang" >&2
 fi
 export WIP_CLANG=clang-19
 printf "%-34s %-8s %ss\\n" "the guest made ready" "ok" "$SECONDS"
@@ -140,8 +141,7 @@ started=$SECONDS
     -v "$PWD:/repo" \
     -v "$volume:/work" \
     -w /repo \
-    -e CARGO_TARGET_DIR=/work/target \
-    -e CARGO_HOME=/work/cargo \
+    -e WIP_TARGET_DIR=/work/target \
     -e WIP_CACHE_DIR=/work/wip-cache \
     -e WIP_LINUX_RUN="$run" \
     "$image" \

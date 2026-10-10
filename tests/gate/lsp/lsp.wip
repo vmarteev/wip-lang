@@ -1,0 +1,412 @@
+// `wip lsp` as an editor sees it: a session over its standard input and
+// output, with a program of two modules on disk beside a file that is not
+// part of it, and edits that are never saved.
+
+import std::fs
+import std::json::{Json}
+import std::path
+import check::{Checked, Gate, across, read, write}
+
+val ITEMS = [
+	"a definition in the standard library opens what the compiler reads",
+	"an editor sees what is wrong and how to fix it",
+]
+
+pub fn check(gate: &Gate): Checked = {
+	var chosen: Vec<i64> = Vec()
+	for index in 0..ITEMS.len() {
+		if gate.takes(ITEMS[index]) then chosen.push(index)
+	}
+	val failed = across(
+		chosen.len(),
+		(at) => {
+			val index = chosen[at]
+			val made = gate.work.join("lsp-\(index)")
+			fs::makeDirs(made.toStr())
+			// The server names files by their real paths.
+			val root = fs::realPath(made.toStr()).unwrapOr(made.clone())
+			val found =
+				if index == 0 then libraryDefinition(&gate, root.toStr())
+				else editorSees(&gate, root.toStr())
+			return match found {
+				.Some(why) => .Some("\(ITEMS[index]): \(why)")
+				.None => .None
+			}
+		},
+	)
+	return Checked::of(chosen.len(), move failed)
+}
+
+/// A text document named by its URI, as a request's parameters begin.
+fn document(file: str): String = "{\"uri\":\(quoted(file))}"
+
+/// Where a request asks about: a document and a place in it.
+fn place(
+	file: str,
+	line: i64,
+	character: i64,
+): String = "{\"textDocument\":\(document(file)),\"position\":{\"line\":\(line),\"character\":\(character)}}"
+
+/// `didOpen`'s parameters: a file and its text.
+fn opened(
+	file: str,
+	text: str,
+): String = "{\"textDocument\":{\"uri\":\(quoted(file)),\"languageId\":\"wip\",\"version\":1,\"text\":\(quoted(text))}}"
+
+/// `didChange`'s parameters: the whole text, as the server asks for it.
+fn changed(
+	file: str,
+	version: i64,
+	text: str,
+): String = "{\"textDocument\":{\"uri\":\(quoted(file)),\"version\":\(version)},\"contentChanges\":[{\"text\":\(quoted(text))}]}"
+
+/// Whether the position at `names` is `line` and `character`: compared a
+/// field at a time, since a JSON object's fields have no order.
+fn positionIs(json: &Json, names: &[str], line: i64, character: i64): bool = match field(
+	json,
+	names,
+) {
+	.Some(position) =>
+		intAt(&position, ["line"]) == line && intAt(&position, ["character"]) == character
+	.None => false
+}
+
+/// Whether a location's range runs from one place to another.
+fn rangeIs(location: &Json, line: i64, character: i64, endLine: i64, endCharacter: i64): bool =
+	positionIs(location, ["range", "start"], line, character) &&
+	positionIs(location, ["range", "end"], endLine, endCharacter)
+
+/// A definition in the standard library opens the library the compiler
+/// reads, in its home: beside `bin/wip`, which the server may name through
+/// a link or as it is.
+fn libraryDefinition(gate: &Gate, root: str): Option<String> = {
+	val cache = path::join(root, "cache")
+	val program = path::join(root, "main.wip")
+	val text = "fn main() = {\n\tval o: Option<i64> = .None\n}\n"
+	write(root, "main.wip", text)
+	val main = uri(program.toStr())
+	var session = match start(gate, root, .Some(cache.toStr())) {
+		.Ok(session) => move session
+		.Err(why) => return .Some(move why)
+	}
+	val found = match talkAboutTheLibrary(&var session, main.toStr(), text) {
+		.Ok(found) => move found
+		.Err(why) => return .Some(move why)
+	}
+	if session.end() is .Some(why) then return .Some(why.clone())
+	val target = textAt(&found, ["uri"])
+	if !target.endsWith("std/prelude/option.wip") then return .Some("the definition is \(found)")
+	val opened = target.stripPrefix("file://").unwrapOr(target)
+	if read("/", opened) != read(".", "std/prelude/option.wip") then
+		return .Some("`\(opened)` is not the library's `std/prelude/option.wip`")
+	val home = path::parent(path::parent(gate.program.toStr()))
+	val library = path::join(home, "std")
+	val real = fs::realPath(library.toStr()).unwrapOr(library.clone())
+	if !target.startsWith("\(uri(library.toStr()))/".toStr()) &&
+		!target.startsWith("\(uri(real.toStr()))/".toStr()) {
+		return .Some("the definition opens the library outside the compiler's home: \(target)")
+	}
+	return .None
+}
+
+fn talkAboutTheLibrary(session: &var Session, main: str, text: str): Result<Json, String> = {
+	session.request("initialize", "{\"capabilities\":{}}")?
+	session.notify("initialized", "{}")?
+	session.notify("textDocument/didOpen", opened(main, text).toStr())?
+	return session.request("textDocument/definition", place(main, 1, 9).toStr())
+}
+
+/// What an editor is shown of a program it edits, and what it can ask.
+fn editorSees(gate: &Gate, above: str): Option<String> = {
+	// The program is in a directory beside loose files of its own, which
+	// are not part of it: its root is where it reaches the file edited.
+	write(above, "loose.wip", "fn main() = 0\n")
+	val root = path::join(above, "prog")
+	write(root.toStr(), "main.wip", "import shapes\n\nfn main() = {\n\tval x = shapes::area()\n}\n")
+	write(root.toStr(), "shapes/area.wip", "pub fn area(): i64 = 1\n")
+	val main = uri(path::join(root.toStr(), "main.wip").toStr())
+	val area = uri(path::join(root.toStr(), "shapes/area.wip").toStr())
+	val kept = uri(path::join(root.toStr(), "kept.wip").toStr())
+	var session = match start(gate, root.toStr(), .None) {
+		.Ok(session) => move session
+		.Err(why) => return .Some(move why)
+	}
+	if edit(&var session, main.toStr(), area.toStr(), kept.toStr()) is .Err(why) then
+		return .Some(why.clone())
+	return session.end()
+}
+
+/// The session `editorSees` holds, step by step: what is wrong, and its
+/// fixes; formatting; what names mean; completion; references and rename;
+/// what `@derive` writes; and a call's signature.
+fn edit(session: &var Session, main: str, area: str, kept: str): Result<void, String> = {
+	val initialized = session.request("initialize", "{\"capabilities\":{}}")?
+	if field(&initialized, ["capabilities", "documentFormattingProvider"]) !=
+		.Some(&Json::Bool(value: true)) {
+		return .Err("the server does not format: \(initialized)")
+	}
+	session.notify("initialized", "{}")?
+
+	// The file on disk is right; the one in the editor is not, and the
+	// mistakes are shown in it though the program starts in another.
+	val wrong = "pub fn area(): i64 = {\n\tval total = 1\n\ttotal = \"two\"\n\ttotal\n}\n"
+	session.notify("textDocument/didOpen", opened(area, wrong).toStr())?
+	val shown = session.diagnostics(area)?
+	val .Some(assigned) = shown.find((d) => textAt(&d, ["code"]) == "E0304") else {
+		return .Err("no diagnostic about the `val`: \(Json::Array(items: shown.clone()))")
+	}
+	if intAt(&assigned, ["range", "start", "line"]) != 2 then
+		return .Err("the `val` is shown at \(assigned)")
+	// Its fix: declare it with `var`.
+	val fixes = fixesFor(&var session, area, &assigned, "var")?
+	val first = itemAt(&fixes, 0)
+	if textAt(&first, ["newText"]) != "var" || !positionIs(&first, ["range", "start"], 1, 1) then
+		return .Err("the fix is \(fixes)")
+
+	// The outline.
+	val symbols =
+		session.request(
+			"textDocument/documentSymbol",
+			"{\"textDocument\":\(document(area))}".toStr(),
+		)?
+	val symbol = itemAt(&symbols, 0)
+	if textAt(&symbol, ["name"]) != "area" || intAt(&symbol, ["kind"]) != 12 then
+		return .Err("the outline is \(symbols)")
+
+	// Put right, but not saved: the diagnostics go.
+	val right =
+		"/// The area of the one shape.\npub fn area(): i64 = {\n\tvar total = 1\n\ttotal = 2\n\ttotal\n}\n"
+	session.notify("textDocument/didChange", changed(area, 2, right).toStr())?
+	expectNone(&var session, area)?
+
+	// A struct of two fields built without their names: the fix names the
+	// field a variable is named for, and gives the other value the field
+	// left.
+	val built =
+		"pub struct File {\n\tname: String\n\tfileNo: i64\n}\n\npub fn open(name: str, fileNo: i64): File = File(fileNo, String::of(name))\n"
+	session.notify("textDocument/didChange", changed(area, 3, built).toStr())?
+	val unnamedShown = session.diagnostics(area)?
+	val .Some(unnamed) = unnamedShown.find((d) => textAt(&d, ["code"]) == "E0331") else {
+		return .Err("no diagnostic about the names: \(Json::Array(items: unnamedShown.clone()))")
+	}
+	val named = fixesFor(&var session, area, &unnamed, "name the fields")?
+	val builtLine = String::of(built.lines().nth(5).unwrapOr(""))
+	insertedAre(&named, 5, [
+		(columnOf(builtLine.toStr(), "fileNo, String"), "fileNo: "),
+		(columnOf(builtLine.toStr(), "String::of(name))"), "name: "),
+	])?
+
+	// Arguments in each other's places: the fix names them.
+	val swapped =
+		"fn draw(width: i64, height: i64) = {}\n\nfn frame(width: i64, height: i64) = draw(height, width)\n"
+	session.notify("textDocument/didChange", changed(area, 4, swapped).toStr())?
+	val swappedShown = session.diagnostics(area)?
+	val .Some(warned) = swappedShown.find((d) => textAt(&d, ["code"]) == "E0361") else {
+		return .Err("no warning about the order: \(Json::Array(items: swappedShown.clone()))")
+	}
+	if intAt(&warned, ["severity"]) != 2 then return .Err("the order is not a warning: \(warned)")
+	val ordered = fixesFor(&var session, area, &warned, "name them")?
+	val call = String::of(swapped.lines().nth(2).unwrapOr(""))
+	insertedAre(&ordered, 2, [
+		(columnOf(call.toStr(), "height, width)"), "width: "),
+		(columnOf(call.toStr(), "width)"), "height: "),
+	])?
+	session.notify("textDocument/didChange", changed(area, 5, right).toStr())?
+	expectNone(&var session, area)?
+
+	// Formatting lays the file out as `wip fmt` does; a file whose leading
+	// comments ask to be left as written is given no edits.
+	session.notify(
+		"textDocument/didOpen",
+		opened(main, "import shapes\n\nfn main() = {\nval x = shapes::area()\n}\n").toStr(),
+	)?
+	val formatting = "\"options\":{\"tabSize\":4,\"insertSpaces\":false}"
+	val formatted =
+		session.request(
+			"textDocument/formatting",
+			"{\"textDocument\":\(document(main)),\(formatting)}".toStr(),
+		)?
+	if textAt(itemAt(&formatted, 0), ["newText"]) !=
+		"import shapes\n\nfn main() = {\n\tval x = shapes::area()\n}\n" {
+		return .Err("formatted as \(formatted)")
+	}
+	session.notify(
+		"textDocument/didOpen",
+		opened(kept, "// wip fmt: off\nval  KEPT = [1,2]\n").toStr(),
+	)?
+	val untouched =
+		session.request(
+			"textDocument/formatting",
+			"{\"textDocument\":\(document(kept)),\(formatting)}".toStr(),
+		)?
+	if untouched != Json::Array(items: Vec()) then
+		return .Err("a file left as written is given \(untouched)")
+
+	// What names mean: hover shows what a name is and what its
+	// declaration's comment says, and definition goes there, in another
+	// module or in the library's sources.
+	val text =
+		"import shapes\n\nfn main() = {\n\tval x = shapes::area()\n\tval o: Option<i64> = .None\n}\n"
+	session.notify("textDocument/didChange", changed(main, 2, text).toStr())?
+	val hover = session.request("textDocument/hover", place(main, 3, 18).toStr())?
+	val hovered = textAt(&hover, ["contents", "value"])
+	if !hovered.contains("fn area(): i64") || !hovered.contains("The area of the one shape.") then
+		return .Err("hover shows \(hover)")
+	val declared = session.request("textDocument/definition", place(main, 3, 18).toStr())?
+	if textAt(&declared, ["uri"]) != area || intAt(&declared, ["range", "start", "line"]) != 1 then
+		return .Err("the definition is \(declared)")
+	val local = session.request("textDocument/hover", place(main, 3, 5).toStr())?
+	if !textAt(&local, ["contents", "value"]).contains("val x: i64") then
+		return .Err("hover on a local shows \(local)")
+	val option = session.request("textDocument/definition", place(main, 4, 9).toStr())?
+	if !textAt(&option, ["uri"]).endsWith("std/prelude/option.wip") then
+		return .Err("`Option` is defined at \(option)")
+
+	// Completion, where the text does not parse yet: a module's items after
+	// `::`, a value's methods after `.`, what an interface's extensions give
+	// where the condition holds — a character is ordered, and does not add
+	// up — and the names in scope.
+	val module = completed(&var session, main, "\tval y = shapes::")?
+	if !module.contains(String::of("area")) then
+		return .Err("after `shapes::`: \(module.join(", "))")
+	val methods = completed(&var session, main, "\tval y = x.")?
+	if !methods.contains(String::of("compare")) then
+		return .Err("after `x.`: \(methods.join(", "))")
+	val chars = completed(&var session, main, "\tval y = \"ab\".chars().")?
+	if !chars.contains(String::of("max")) || chars.contains(String::of("sum")) then
+		return .Err("after `.chars().`: \(chars.join(", "))")
+	val scope = completed(&var session, main, "\tval y = ")?
+	for name in ["x", "main", "shapes", "Option", "while"] {
+		if !scope.contains(String::of(name)) then
+			return .Err("`\(name)` is not in scope: \(scope.join(", "))")
+	}
+
+	// References and rename: `area` is declared in one module and called in
+	// the other.
+	session.notify("textDocument/didChange", changed(main, 4, text).toStr())?
+	val found = session.request("textDocument/references", withDeclaration(main, 3, 18).toStr())?
+	val places = itemsOf(&found)
+	if places.len() != 2 ||
+		!places.any((l) => textAt(&l, ["uri"]) == main && rangeIs(&l, 3, 17, 3, 21)) ||
+		!places.any((l) => textAt(&l, ["uri"]) == area && rangeIs(&l, 1, 7, 1, 11)) {
+		return .Err("the references are \(found)")
+	}
+	val renamed = session.request("textDocument/rename", renaming(main, 3, 18, "size").toStr())?
+	for file in [main, area] {
+		val changes = fieldOf(&renamed, ["changes", file])
+		if textAt(itemAt(&changes, 0), ["newText"]) != "size" then
+			return .Err("the rename is \(renamed)")
+	}
+	// What the library declares is not renamed, nor is a name given that is
+	// not one.
+	for (line, character, name) in [(4, 9, "Maybe"), (3, 18, "while")] {
+		val refused =
+			session.ask("textDocument/rename", renaming(main, line, character, name).toStr())?
+		if refused.get("error").isNone() then return .Err("renamed to `\(name)`: \(refused)")
+	}
+
+	// What `@derive` writes is placed at its argument, and an editor passes
+	// over it: a field is named where the program names it, and nowhere in
+	// the annotation.
+	val derived =
+		"@derive(Clone)\nstruct Point {\n\tone: i64\n}\n\nfn main() = {\n\tval p = Point { one: 1 }.clone()\n\tval n = p.one\n}\n"
+	session.notify("textDocument/didChange", changed(main, 5, derived).toStr())?
+	val fields = session.request("textDocument/references", withDeclaration(main, 2, 2).toStr())?
+	var lines: Vec<i64> = Vec()
+	for reference in itemsOf(&fields) {
+		lines.push(intAt(&reference, ["range", "start", "line"]))
+	}
+	if lines.len() != 2 || lines[0] != 2 || lines[1] != 7 then
+		return .Err("the field is named at \(fields)")
+	val annotation = session.request("textDocument/hover", place(main, 0, 10).toStr())?
+	if !annotation.isNull() then return .Err("hover on `@derive` shows \(annotation)")
+
+	// A call's signature, at its second argument, before it is closed.
+	val unclosed =
+		"fn main() = {\n\tval z = scale(1, \n}\n\n/// Times.\nfn scale(by: i64, of: i64): i64 = by * of\n"
+	session.notify("textDocument/didChange", changed(main, 6, unclosed).toStr())?
+	val help = session.request("textDocument/signatureHelp", place(main, 1, 17).toStr())?
+	val signature = itemAt(fieldOf(&help, ["signatures"]), 0)
+	if textAt(&signature, ["label"]) != "scale(by: i64, of: i64): i64" ||
+		intAt(&help, ["activeParameter"]) != 1 ||
+		textAt(&signature, ["documentation", "value"]) != "Times." {
+		return .Err("the signature is \(help)")
+	}
+	return .Ok()
+}
+
+/// The diagnostics published next for `file` are none.
+fn expectNone(session: &var Session, file: str): Result<void, String> = {
+	val shown = session.diagnostics(file)?
+	if !shown.isEmpty() then
+		return .Err("diagnostics where there are none: \(Json::Array(items: shown.clone()))")
+	return .Ok()
+}
+
+/// The edits of the fix whose title holds `title`, offered for
+/// `diagnostic` in `file`.
+fn fixesFor(
+	session: &var Session,
+	file: str,
+	diagnostic: &Json,
+	title: str,
+): Result<Json, String> = {
+	val range = fieldOf(&diagnostic, ["range"])
+	val params = "{\"textDocument\":\(document(file)),\"range\":\(range),\"context\":{\"diagnostics\":[\(diagnostic)]}}"
+	val actions = session.request("textDocument/codeAction", params.toStr())?
+	val offered = itemsOf(&actions)
+	val .Some(action) = offered.find((a) => textAt(&a, ["title"]).contains(title)) else {
+		return .Err("no fix that would \(title): \(actions)")
+	}
+	return match field(&action, ["edit", "changes", file]) {
+		.Some(edits) => .Ok(edits.clone())
+		.None => .Err("a fix that changes nothing of the file: \(action)")
+	}
+}
+
+/// The edits insert `expected`, each its column and its text, on `line`.
+fn insertedAre(edits: &Json, line: i64, expected: &[(i64, str)]): Result<void, String> = {
+	val all = itemsOf(&edits)
+	if all.len() != expected.len() then return .Err("the fix is \(edits)")
+	for i in 0..all.len() {
+		val (column, text) = expected[i]
+		if intAt(&all[i], ["range", "start", "line"]) != line ||
+			intAt(&all[i], ["range", "start", "character"]) != column ||
+			textAt(&all[i], ["newText"]) != text {
+			return .Err("the fix is \(edits)")
+		}
+	}
+	return .Ok()
+}
+
+/// Where `text` begins in `line`.
+fn columnOf(line: str, text: str): i64 = line.find(text).unwrapOr(-1)
+
+/// What completion offers at the end of `line`, written as the fifth line
+/// of a program that does not parse yet.
+fn completed(session: &var Session, main: str, line: str): Result<Vec<String>, String> = {
+	val text = "import shapes\n\nfn main() = {\n\tval x = shapes::area()\n\(line)\n}\n"
+	session.notify("textDocument/didChange", changed(main, 3, text.toStr()).toStr())?
+	val list = session.request("textDocument/completion", place(main, 4, line.len()).toStr())?
+	var labels: Vec<String> = Vec()
+	for item in itemsOf(fieldOf(&list, ["items"])) {
+		labels.push(String::of(textAt(&item, ["label"])))
+	}
+	return .Ok(move labels)
+}
+
+/// A request for the references to what is at a place, its declaration
+/// among them.
+fn withDeclaration(
+	file: str,
+	line: i64,
+	character: i64,
+): String = "{\"textDocument\":\(document(file)),\"position\":{\"line\":\(line),\"character\":\(character)},\"context\":{\"includeDeclaration\":true}}"
+
+/// A request to rename what is at a place to `name`.
+fn renaming(
+	file: str,
+	line: i64,
+	character: i64,
+	name: str,
+): String = "{\"textDocument\":\(document(file)),\"position\":{\"line\":\(line),\"character\":\(character)},\"newName\":\(quoted(name))}"

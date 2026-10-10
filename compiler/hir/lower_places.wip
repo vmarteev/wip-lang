@@ -1,0 +1,1147 @@
+// Places: assignment, what may be written or borrowed as `&var`, fields and
+// indexing.
+
+import syntax as ast
+import syntax::{
+	BinaryOp,
+	CANNOT_BORROW_VAR,
+	Code,
+	Diagnostic,
+	Edit,
+	INVALID_ASSIGNMENT,
+	INVALID_INDEX,
+	INVALID_OPERANDS,
+	NOT_A_METHOD,
+	NO_SUCH_FIELD,
+	Receiver,
+	SLICE_NOT_BORROWED,
+	Span,
+	Symbol
+}
+
+/// The code a place that cannot be written is reported with.
+fn writingCode(how: Writing): Code = match how {
+	.Assign => INVALID_ASSIGNMENT
+	.Borrow => CANNOT_BORROW_VAR
+}
+
+extend Lowerer {
+	fn placeRoot(id: ExprId): PlaceRoot = match self.state.body.exprs[id].kind {
+		.Local(local) => .Local(local)
+		// `p[i]`: C's memory, reached through the pointer the place holds.
+		.Index(base, ..) if self.kind(self.tyOf(base)) is .Ptr(..) => .ThroughPointer
+		.Field(base, ..) | .Index(base, ..) | .SubSlice(base, ..) => self.placeRoot(base)
+		.Deref(inner) => {
+			if self.state.body.exprs[inner].kind is .Table(id) then return .Table(id)
+			match self.kind(self.tyOf(inner)) {
+				.Ref(kind: .Shared, ..) => .ThroughRef
+				.Ref(kind: .Var, ..) => .ThroughVarRef
+				.Ptr(..) => .ThroughPointer
+				_ => self.placeRoot(inner)
+			}
+		}
+		_ => .NotAPlace
+	}
+
+	/// Whether `place` is a value made where it is used, not a place that
+	/// holds one: a call's answer, a literal, or a part of either. A `var fn`
+	/// may be called on one, which it changes and which then ends. A variable
+	/// C owns is read as a copy, and is not one: a change to the copy would
+	/// leave C's as it was.
+	fn madeHere(place: ExprId): bool = {
+		if !(self.placeRoot(place) is .NotAPlace) then return false
+		var e = place
+		while true {
+			match self.state.body.exprs[e].kind {
+				.Field(base, ..) | .Index(base, ..) | .SubSlice(base, ..) | .Deref(base) => e = base
+				.Len(..) | .Error => return false
+				.Call(callee, ..) => return !(self.program.fns[callee].accesses is .Some(
+					.Global(..),
+				))
+				_ => return true
+			}
+		}
+		return true
+	}
+
+	/// Whether `place` may be assigned, or borrowed as `&var`.
+	fn writable(place: ExprId): bool = {
+		// A field of another module's struct is written only where it says
+		// `pub var`.
+		if self.readonlyStep(place).isSome() then return false
+		return match self.placeRoot(place) {
+			.Local(local) => self.state.body.locals[local].mutable()
+			.ThroughVarRef | .ThroughPointer => true
+			.ThroughRef | .Table(..) | .NotAPlace => false
+		}
+	}
+
+	/// The field of this place that another module may read and not write,
+	/// if it goes through one.
+	fn readonlyStep(
+		id: ExprId,
+	): Option<(StructId, i64, Span)> = match self.state.body.exprs[id].kind {
+		.Field(base, index) => {
+			val ty = self.underRefs(self.tyOf(base))
+			if self.kind(ty) is .Struct(id: owner, ..) && !self.fieldSettable(owner, index as i64) {
+				return .Some((owner, index as i64, self.state.body.exprs[id].span))
+			}
+			self.readonlyStep(base)
+		}
+		.Index(base, ..) | .SubSlice(base, ..) | .Deref(base) => self.readonlyStep(base)
+		_ => .None
+	}
+
+	/// The `match` binding that `place` is reached through, if any. A binding
+	/// of a matched place is a read-only alias.
+	fn throughBinding(id: ExprId): Option<LocalId> = match self.state.body.exprs[id].kind {
+		.Field(base, ..) | .Index(base, ..) | .SubSlice(base, ..) => self.throughBinding(base)
+		.Deref(inner) => match self.state.body.exprs[inner].kind {
+			.Local(local) =>
+				if self.state.body.locals[local].kind == .Binding then .Some(local) else .None
+			_ => self.throughBinding(inner)
+		}
+		_ => .None
+	}
+
+	/// Reports a place that cannot be written, after giving a lending
+	/// accessor the chance to be its writing twin.
+	var fn requireWritable(place: ExprId, how: Writing) = {
+		// A `&var` closure keeps a `&var` to what it writes, and a `&` to the
+		// rest.
+		self.noteCaptureWritten(place)
+		// A `pub` field of another module's struct is read out here and
+		// written where it is declared.
+		if self.readonlyStep(place) is .Some((owner, index, span)) {
+			val what = match how {
+				.Assign => "assigned here"
+				.Borrow => "borrowed `&var` here"
+			}
+			self.readonlyField(owner, index, span, what)
+			return
+		}
+		if self.writableForWriting(place) then return
+		if self.notWritable(place, how) is .Some(diagnostic) then self.report(move diagnostic)
+	}
+
+	/// Whether a place may be written, giving a lending accessor the chance
+	/// to be its writing twin first.
+	var fn writableForWriting(place: ExprId): bool =
+		self.writable(place) || (self.retargetToWriter(place) && self.writable(place))
+
+	/// The call that lends a place, if one does.
+	fn lendingCall(place: ExprId): Option<ExprId> = {
+		var e = place
+		while true {
+			match self.state.body.exprs[e].kind {
+				.Field(base, ..) | .Index(base, ..) | .SubSlice(base, ..) => e = base
+				.Deref(base) => {
+					if self.state.body.exprs[base].kind is .Call(..) then return .Some(base)
+					e = base
+				}
+				_ => return .None
+			}
+		}
+		return .None
+	}
+
+	/// A place lent by an accessor that reads, where one that writes is
+	/// needed: the writing half of the pair takes its place, and the receiver
+	/// it was called on is lent `&var` instead.
+	var fn retargetToWriter(place: ExprId): bool = match self.lendingCall(place) {
+		.Some(call) => self.swapInWriter(call)
+		.None => false
+	}
+
+	/// An accessor that lends for reading where a write is needed: the
+	/// writing half of the pair is missing, and the message says so.
+	fn noWritingTwin(place: ExprId, how: Writing): Option<Diagnostic> = {
+		val call = self.lendingCall(place)?
+		val .Call(callee, ..) = self.state.body.exprs[call].kind else {
+			return .None
+		}
+		val def = &self.program.fns[callee]
+		if def.receiver != .Some(.Read) || self.writingTwin(callee).isSome() then return .None
+		val owner = self.typeName(def.owner?)
+		val name = String::of(self.text(def.name))
+		var params: Vec<String> = Vec()
+		for i in 1..def.params.len() {
+			params.push("\(self.text(def.params[i].name)): \(self.program.tyName(def.params[i].ty, self.interner))")
+		}
+		val .Ref(inner: pointee, ..) = self.kind(def.ret) else {
+			return .None
+		}
+		val lends = self.program.tyName(pointee, self.interner)
+		val diagnostic = Diagnostic::error(
+			writingCode(how),
+			"`\(owner)::\(name)` lends for reading",
+			self.state.body.exprs[place].span,
+			"cannot be written through",
+		)
+		// A type of the program's own can be given the writing half; one of
+		// another module's is read-only because that module says so, as a
+		// set's keys are.
+		val helped =
+			if def.module as i64 == self.current then
+				diagnostic.withHelp("declare `var fn \(name)(\(params.join(", "))): &var \(lends)` beside it")
+			else diagnostic.withHelp("`\(owner)` lends what `\(name)` finds for reading only; its own methods are how it is changed")
+		return .Some(
+			helped.withNote(
+				"one name is the accessor that reads and the one that writes, and where the call sits says which",
+			),
+		)
+	}
+
+	/// The call itself: its callee becomes the writing twin, and what it
+	/// lends becomes `&var`.
+	var fn swapInWriter(call: ExprId): bool = {
+		val .Call(callee, args, typeArgs, order) = self.state.body.exprs[call].kind.clone() else {
+			return false
+		}
+		val .Some(writer) = self.writingTwin(callee) else {
+			return false
+		}
+		// The receiver is lent for the call; it must be writable itself, and
+		// may be lent by an accessor in turn.
+		if !args.isEmpty() {
+			val arg = args[0]
+			val .Ref(inner) = self.state.body.exprs[arg].kind else {
+				return false
+			}
+			if !self.writable(inner) && !self.retargetToWriter(inner) then return false
+			if !self.writable(inner) then return false
+			val innerTy = self.tyOf(inner)
+			val lent = self.intern(.Ref(inner: innerTy, kind: .Var))
+			self.state.body.exprs[arg].ty = lent
+		}
+		// What the call lends is the same place, written rather than read.
+		val .Ref(inner: pointee, kind: .Shared) = self.kind(self.tyOf(call)) else {
+			return false
+		}
+		val lent = self.intern(.Ref(inner: pointee, kind: .Var))
+		self.state.body.exprs[call].ty = lent
+		self.state.body.exprs[call].kind = .Call(
+			callee: writer,
+			args: move args,
+			typeArgs: typeArgs,
+			order: move order,
+		)
+		return true
+	}
+
+	/// Why `place` cannot be assigned, or borrowed as `&var`, if it cannot.
+	fn notWritable(place: ExprId, how: Writing): Option<Diagnostic> = {
+		if self.noWritingTwin(place, how) is .Some(diagnostic) then return .Some(move diagnostic)
+		// Lent by an accessor that has a writing twin, which needs the
+		// container lent `&var`: why the container cannot be is the reason,
+		// `v[0] = 3` with `val v`.
+		if self.lendingCall(place) is .Some(call) &&
+			self.state.body.exprs[call].kind is .Call(callee, args, ..) &&
+			self.writingTwin(callee).isSome() &&
+			!args.isEmpty() &&
+			self.state.body.exprs[args[0]].kind is .Ref(container) &&
+			!self.writable(container) {
+			return self.notWritable(container, .Borrow)
+		}
+		val span = self.state.body.exprs[place].span
+		val code = writingCode(how)
+		return match self.placeRoot(place) {
+			.Local(local) if self.state.body.locals[local].mutable() => .None
+			.ThroughVarRef | .ThroughPointer => .None
+			.Table(id) => {
+				val name = self.text(self.program.consts[id].name)
+				val message = match how {
+					.Assign => "cannot assign to `\(name)`, a constant"
+					.Borrow => "cannot borrow `\(name)`, a constant, as `&var`"
+				}
+				.Some(
+					Diagnostic::error(
+						code,
+						move message,
+						span,
+						"a constant cannot change",
+					).withSecondary(self.program.consts[id].span, "declared here").
+						withNote("a top-level `val` is kept once, in memory nothing writes").
+						withHelp("to change a copy of it, copy it first: `var copy = \(name)`"),
+				)
+			}
+			.Local(id) => .Some(self.unwritableLocal(id, how, span))
+			.ThroughRef => .Some(self.unwritableThroughRef(place, how, span))
+			.NotAPlace => .Some(self.unwritableValue(place, how, span))
+		}
+	}
+
+	/// A local that cannot be written.
+	fn unwritableLocal(id: LocalId, how: Writing, span: Span): Diagnostic = {
+		val copied = self.state.body.copiedBindings.contains(&id)
+		val local = &self.state.body.locals[id]
+		val name = self.text(local.name)
+		val (message, label) = match how {
+			.Assign => ("cannot assign to `\(name)`", "cannot be assigned")
+			.Borrow => ("cannot borrow `\(name)` as `&var`", "cannot be written")
+		}
+		val diagnostic = Diagnostic::error(writingCode(how), move message, span, String::of(label))
+		return match local.kind {
+			.Let(keyword) => diagnostic.withSecondary(
+				local.span,
+				"declared with `val`, so it cannot change",
+			).withFix("declare it with `var`", own [Edit::replace(keyword, "var")])
+			.Param => diagnostic.withSecondary(
+				local.span,
+				"a parameter",
+			).withHelp("a parameter cannot change: copy it first (`var \(name) = \(name)`), or declare it `&var` so that the caller's variable changes")
+			// A `val … else` binding of plain data holds a copy, so a write
+			// through it would go nowhere.
+			_ if copied => diagnostic.withSecondary(
+				local.span,
+				"a copy, taken by the `val`",
+			).withHelp(
+				"a `val … else` binding of plain data is a copy: take the value apart with `match`, whose bindings are the place itself",
+			)
+			_ => diagnostic.withSecondary(local.span, "bound by a pattern or a loop").withHelp(
+				"the bindings of patterns and loops cannot be assigned",
+			)
+		}
+	}
+
+	/// A place behind a `&` reference.
+	fn unwritableThroughRef(place: ExprId, how: Writing, span: Span): Diagnostic = {
+		val code = writingCode(how)
+		// What an owned closure captured, which it only reads.
+		if self.state.body.exprs[place].kind is .Field(base, index) &&
+			self.kind(self.tyOf(base)) is .Struct(id, ..) &&
+			self.program.structs[id].isEnv {
+			// The environment's fields are only filled in once the lambda's body
+			// has been checked, so the name comes from what it has captured so
+			// far: the drop function is before them.
+			val at = index as i64 - 1
+			val name =
+				if at >= 0 && at < self.state.captures.len() then
+					String::of(self.text(self.state.captures[at].name))
+				else String::of("what this closure captured")
+			val message = match how {
+				.Assign => "cannot assign to `\(name)`, which this closure captured"
+				.Borrow => "cannot borrow `\(name)`, which this closure captured, as `&var`"
+			}
+			return Diagnostic::error(code, move message, span, "captured by value").withNote(
+				"an owned closure holds what it captured and reads it; whether it may change it is left for later",
+			).withHelp("take what changes as a parameter of the closure")
+		}
+		// What a closure that reads captured: one lent as `&(…) => R`, or kept
+		// in a `val`.
+		if self.state.body.exprs[place].kind is .Deref(field) &&
+			self.state.body.exprs[field].kind is .Field(base, index) &&
+			self.kind(self.tyOf(base)) is .Struct(id, ..) &&
+			self.program.structs[id].isEnv &&
+			self.state.captureKind == .Some(.Lent(.Shared)) {
+			val at = index as i64
+			val name =
+				if at < self.state.captures.len() then
+					"`\(self.text(self.state.captures[at].name))`"
+				else String::of("what this closure captured")
+			val message = match how {
+				.Assign => "cannot assign to \(name), which this closure only reads"
+				.Borrow => "cannot borrow \(name), which this closure only reads, as `&var`"
+			}
+			return Diagnostic::error(code, move message, span, "captured to read").withNote(
+				"a closure lent as `&(…) => R`, or kept in a `val`, reads what it captures; one that changes it is a `&var (…) => R`, lent for the call it is written in",
+			).withHelp(
+				"write the lambda where a `&var (…) => R` is taken, or take what changes as a `&var` parameter of it",
+			)
+		}
+		if self.throughBinding(place) is .Some(binding) {
+			val local = &self.state.body.locals[binding]
+			val name = self.text(local.name)
+			val message = match how {
+				.Assign => "cannot assign through a binding"
+				.Borrow => "cannot borrow through a binding as `&var`"
+			}
+			return Diagnostic::error(
+				code,
+				String::of(message),
+				span,
+				"`\(name)` refers to part of a place that cannot be written",
+			).withSecondary(local.span, "bound here").withHelp(
+				"bindings of `match` and `for` can be written when what they refer to can: a `var`, or a `&var` parameter",
+			)
+		}
+		val message = match how {
+			.Assign => "cannot assign through a `&` reference"
+			.Borrow => "cannot borrow through a `&` reference as `&var`"
+		}
+		return Diagnostic::error(
+			code,
+			String::of(message),
+			span,
+			"behind a `&` reference, which only reads",
+		).withHelp("to write through it, declare the parameter `&var` and pass it with `&var`")
+	}
+
+	/// What is not a place at all.
+	fn unwritableValue(place: ExprId, how: Writing, span: Span): Diagnostic = {
+		val kind = &self.state.body.exprs[place].kind
+		val message = if kind is .Len(..) {
+			"the length of an array or string cannot be changed"
+		} else {
+			match how {
+				.Assign => "cannot assign to this expression"
+				.Borrow => "`&var` needs a variable, field or element"
+			}
+		}
+		// A variable C owns is read as a copy, so there is nothing here to
+		// point at.
+		val global: Option<Access> = match kind {
+			.Call(callee, ..) => self.program.fns[callee].accesses
+			_ => .None
+		}
+		val diagnostic = Diagnostic::error(
+			writingCode(how),
+			String::of(message),
+			span,
+			"not a variable, field or element",
+		)
+		return match global {
+			.Some(.Global(id)) => {
+				val name = String::of(self.text(self.program.globals[id].name))
+				diagnostic.withSecondary(
+					self.program.globals[id].span,
+					"declared here",
+				).withNote("`\(name)` is C's variable, read as a copy of what C holds, so Wip has no address for it; pass the copy, or write it back with `\(name) = …`")
+			}
+			// A field of a struct C lays out, read the same way.
+			.Some(.Field(id, index)) => {
+				val field = &self.program.structs[id].fields[index as i64]
+				val name = String::of(self.text(field.name))
+				diagnostic.withSecondary(
+					field.span,
+					"declared here",
+				).withNote("`\(name)` is where C says it is, so Wip reads it through C rather than pointing at it; use the value, or write it back with `p.\(name) = …`")
+			}
+			.None => move diagnostic
+		}
+	}
+
+	/// Whether a type is a `&` reference to anything but a closure.
+	fn sharedRef(ty: Ty): bool =
+		self.kind(ty) is .Ref(inner, kind: .Shared) && !(self.kind(inner) is .Fn(..))
+
+	/// The reference an assignment to `target` points somewhere else, where it
+	/// is one: a `var` holding a `&`, or what a `&var &T` parameter refers to.
+	var fn repointed(target: ast::ExprId): Option<ExprId> = {
+		val .Name(sym) = self.ast.exprs[target].kind else {
+			return .None
+		}
+		val local = self.lookup(sym)?
+		val kind = self.state.body.locals[local].kind
+		val ty = self.state.body.locals[local].ty
+		val span = self.ast.exprs[target].span
+		if kind == .Var && self.sharedRef(ty) then return .Some(self.alloc(.Local(local), ty, span))
+		if self.kind(ty) is .Ref(inner, kind: .Var) && kind == .Param && self.sharedRef(inner) {
+			val param = self.alloc(.Local(local), ty, span)
+			return .Some(self.alloc(.Deref(param), inner, span))
+		}
+		return .None
+	}
+
+	/// `place = value`, or `place op= value`, whose operands follow the
+	/// operator's rules.
+	var fn assign(
+		target: ast::ExprId,
+		op: Option<(BinaryOp, Span)>,
+		wrapping: bool,
+		value: ast::ExprId,
+		span: Span,
+	): ExprId = {
+		// A variable C owns is written through the accessor the compiler
+		// declared for it, since it may be a macro rather than a place.
+		if self.ast.exprs[target].kind is .Name(sym) &&
+			self.lookup(sym).isNone() &&
+			self.globalNamed(sym) is .Some(id) {
+			return self.writeGlobal(id, target, op, wrapping, value, span)
+		}
+		// A field of a struct C lays out is written through C too.
+		if self.ast.exprs[target].kind is .Field(base, name) &&
+			self.writeCField(base, name, op, wrapping, value, span) is .Some(written) {
+			return written
+		}
+		// A `var` that holds a `&` reference is pointed somewhere else, as a
+		// `var` holding a `str` is: a reference parameter stands for what it
+		// refers to, but this is a view of its own. So is the caller's
+		// variable a `&var &Node` parameter refers to.
+		val place = match self.repointed(target) {
+			.Some(p) => p
+			.None => self.infer(target, .None)
+		}
+		val placeTy = self.tyOf(place)
+		if !self.isPoisoned(placeTy) then self.requireWritable(place, .Assign)
+		val .Some((binary, opSpan)) = op else {
+			val checked = self.check(value, placeTy)
+			return self.alloc(
+				.Assign(place: place, op: .None, wrapping: false, value: checked),
+				UNIT,
+				span,
+			)
+		}
+		// `+%=` is the machine's, for its integers, as `+%` is.
+		if wrapping && self.kind(placeTy) is .Struct(..) | .Enum(..) {
+			self.reportWrappingOwnType(binary, opSpan, placeTy, "=")
+			return self.errorExpr(span)
+		}
+		// A number beside a type of a program's own is what its implementation
+		// takes, as in `a * b`.
+		val which = KnownInterface::ofBinary(binary)
+		var hint = placeTy
+		if which is .Some(w) && !self.operatorApplies(binary, placeTy) {
+			var tys = self.operatorRhsTys(w, placeTy)
+			tys.retain((t) => t != placeTy)
+			if tys.len() == 1 then hint = tys[0]
+		}
+		val operand = self.operand(value, .Some(hint))
+		// `<<=` and `>>=` take an amount of any integer type, as `<<` does.
+		val amount = self.shiftAmount(binary, place, operand)
+		val valueTy = self.tyOf(amount)
+		// `a += b` on a type that implements `Add` is `a = a + b`: the place is
+		// read for the call and then written. The implementation is the one
+		// whose `Rhs` is the value's type, and it must answer the place's.
+		if !(placeTy == valueTy && self.operatorApplies(binary, placeTy)) &&
+			which is .Some(w) &&
+			self.operatorImpl(w, placeTy, valueTy) is .Some(found) {
+			if found.out != placeTy {
+				val text = "\(binary.text())="
+				val placeName = self.tyName(placeTy)
+				val outName = self.tyName(found.out)
+				val valueName = self.tyName(valueTy)
+				val interfaceText = "\(w.name())<\(valueName.toStr().trimMatches("`")), \(outName.toStr().trimMatches("`"))>"
+				self.report(
+					Diagnostic::error(
+						INVALID_OPERANDS,
+						"`\(text)` would put \(outName) in \(placeName)",
+						opSpan,
+						"`\(interfaceText)` answers \(outName)",
+					).withNote(
+						"`a op= b` is `a = a op b`, so the implementation it calls answers the type of `a`",
+					),
+				)
+				return self.errorExpr(span)
+			}
+			val read = self.infer(target, .None)
+			val result = self.operatorCall(found, read, amount, span)
+			return self.alloc(
+				.Assign(place: place, op: .None, wrapping: false, value: result),
+				UNIT,
+				span,
+			)
+		}
+		val applies = placeTy == valueTy && self.operatorApplies(binary, placeTy)
+		if !(applies || self.isPoisoned(placeTy) || self.isPoisoned(valueTy)) {
+			val text = "\(binary.text())\(if wrapping then "%" else "")="
+			self.reportOperands(binary, opSpan, &text, place, amount)
+		}
+		return self.alloc(
+			.Assign(place: place, op: .Some(binary), wrapping: wrapping, value: amount),
+			UNIT,
+			span,
+		)
+	}
+
+	/// `p.mode = 3` where C knows where `mode` is: the accessor that writes
+	/// it, given what the pointer points at. Nothing when this is an ordinary
+	/// field of a struct Wip laid out.
+	var fn writeCField(
+		base: ast::ExprId,
+		name: ast::Name,
+		op: Option<(BinaryOp, Span)>,
+		wrapping: bool,
+		value: ast::ExprId,
+		span: Span,
+	): Option<ExprId> = {
+		val pointer = self.operand(base, .None)
+		val .Ptr(pointee) = self.kind(self.tyOf(pointer)) else {
+			return .None
+		}
+		val .Struct(id, ..) = self.kind(pointee) else {
+			return .None
+		}
+		if !self.program.structs[id].isOpaque then return .None
+		var found: Option<i64> = .None
+		for (i, f) in self.program.structs[id].fields.forwards().enumerate() {
+			if found.isNone() && f.name == name.sym then found = .Some(i)
+		}
+		val index = found?
+		val (get, set) = self.program.structs[id].accessors[index]
+		val ty = self.program.structs[id].fields[index].ty
+		val written = match op {
+			.None => self.check(value, ty)
+			// `p.level += 1` reads it, applies the operator and writes it back,
+			// since C's field is not a place Wip holds.
+			.Some((binary, opSpan)) => {
+				val lhs = self.alloc(
+					.Call(
+						callee: get,
+						args: Vec::of(own [pointer]),
+						typeArgs: TyList::empty(),
+						order: Vec(),
+					),
+					ty,
+					self.ast.exprs[base].span,
+				)
+				val operand = self.operand(value, .Some(ty))
+				val operandTy = self.tyOf(operand)
+				val applies = ty == operandTy && self.operatorApplies(binary, ty)
+				if !(applies || self.isPoisoned(ty) || self.isPoisoned(operandTy)) {
+					val text = "\(binary.text())="
+					self.reportOperands(binary, opSpan, &text, lhs, operand)
+				}
+				self.alloc(
+					.Binary(op: binary, lhs: lhs, rhs: operand, wrapping: wrapping),
+					ty,
+					span,
+				)
+			}
+		}
+		return .Some(
+			self.alloc(
+				.Call(
+					callee: set,
+					args: Vec::of(own [pointer, written]),
+					typeArgs: TyList::empty(),
+					order: Vec(),
+				),
+				UNIT,
+				span,
+			),
+		)
+	}
+
+	/// The variable C owns that a name stands for, if it is one and this
+	/// module may see it.
+	fn globalNamed(sym: Symbol): Option<GlobalId> = {
+		var module = self.current
+		var item = sym
+		match self.imported(ast::Name(sym: sym, span: Span::at(0))) {
+			.Some(.Broken) => return .None
+			.Some(.Item(module: m, name: n)) => {
+				module = m
+				item = n.sym
+			}
+			.None => {}
+		}
+		val id = self.modules[module].globals.get(&item)?
+		return if self.program.globals[id].isPub || module == self.current then .Some(id) else .None
+	}
+
+	/// `errno = 0`, and `count += 1`, which reads it and writes it back.
+	var fn writeGlobal(
+		id: GlobalId,
+		target: ast::ExprId,
+		op: Option<(BinaryOp, Span)>,
+		wrapping: bool,
+		value: ast::ExprId,
+		span: Span,
+	): ExprId = {
+		val ty = self.program.globals[id].ty
+		val name = self.program.globals[id].name
+		val declared = self.program.globals[id].span
+		val .Some(setter) = self.program.globals[id].setter else {
+			val text = String::of(self.text(name))
+			self.report(
+				Diagnostic::error(
+					INVALID_ASSIGNMENT,
+					"cannot assign to `\(text)`, which C owns and Wip only reads",
+					self.ast.exprs[target].span,
+					"declared `val`",
+				).withSecondary(declared, "declared here").
+					withHelp("a variable Wip writes is declared `var`").
+					withNote(
+						"`val` in an extern block reads what C holds; `var` writes it as well",
+					),
+			)
+			self.infer(value, .Some(ty))
+			return self.errorExpr(span)
+		}
+		val written = match op {
+			.None => self.check(value, ty)
+			// `errno += 1` reads it, applies the operator and writes it back,
+			// since C's variable is not a place Wip holds.
+			.Some((binary, opSpan)) => {
+				val read = self.alloc(
+					.Call(
+						callee: self.program.globals[id].getter,
+						args: Vec(),
+						typeArgs: TyList::empty(),
+						order: Vec(),
+					),
+					ty,
+					self.ast.exprs[target].span,
+				)
+				val operand = self.operand(value, .Some(ty))
+				val operandTy = self.tyOf(operand)
+				val applies = ty == operandTy && self.operatorApplies(binary, ty)
+				if !(applies || self.isPoisoned(ty) || self.isPoisoned(operandTy)) {
+					val text = "\(binary.text())="
+					self.reportOperands(binary, opSpan, &text, read, operand)
+				}
+				self.alloc(
+					.Binary(op: binary, lhs: read, rhs: operand, wrapping: wrapping),
+					ty,
+					span,
+				)
+			}
+		}
+		return self.alloc(
+			.Call(
+				callee: setter,
+				args: Vec::of(own [written]),
+				typeArgs: TyList::empty(),
+				order: Vec(),
+			),
+			UNIT,
+			span,
+		)
+	}
+
+	var fn field(base: ast::ExprId, name: ast::Name, span: Span): ExprId = {
+		if self.variantWithDot(base, name, ItemUse::plain(.None, .None, span)) is .Some(variant) {
+			return variant
+		}
+		val b = self.operand(base, .None)
+		val ty = self.tyOf(b)
+		// A method is not a value yet, so `x.name` is not one either.
+		if self.ownerOf(ty) is .Some(owner) && self.methodOf(owner, name.sym) is .Some(method) {
+			self.methodAsField(ty, owner, method, name)
+			return self.errorExpr(span)
+		}
+		// A block of slots says how many it has.
+		if self.kind(ty) is .Slots(..) && self.text(name.sym) == "count" then
+			return self.alloc(.Len(b), I64, span)
+		// A C pointer says whether it points at nothing.
+		if self.kind(ty) is .Ptr(pointee) {
+			if self.text(name.sym) == "isNull" then return self.alloc(.IsNull(b), BOOL, span)
+			// `p.field`: the field of what it points at, which is the deref C
+			// writes `p->field` for.
+			if self.kind(pointee) is .Struct(id, ..) {
+				var found: Option<i64> = .None
+				for (i, f) in self.program.structs[id].fields.forwards().enumerate() {
+					if found.isNone() && f.name == name.sym then found = .Some(i)
+				}
+				if found is .Some(index) {
+					// An `@opaque` struct is read through C, which is where its
+					// fields are known to be.
+					if self.program.structs[id].isOpaque {
+						val (get, _) = self.program.structs[id].accessors[index]
+						val fieldTy = self.program.structs[id].fields[index].ty
+						return self.alloc(
+							.Call(
+								callee: get,
+								args: Vec::of(own [b]),
+								typeArgs: TyList::empty(),
+								order: Vec(),
+							),
+							fieldTy,
+							span,
+						)
+					}
+					val pointed = self.alloc(.Deref(b), pointee, span)
+					return self.fieldOf(pointed, pointee, name, span)
+				}
+			}
+			val text = String::of(self.text(name.sym))
+			self.report(
+				Diagnostic::error(
+					NO_SUCH_FIELD,
+					"no field `\(text)` on \(self.tyName(ty))",
+					name.span,
+					"not a field",
+				).withNote("a `ptr<T>` answers `isNull`, and the fields of a `T` that is a struct"),
+			)
+			return self.errorExpr(span)
+		}
+		return self.fieldOf(b, ty, name, span)
+	}
+
+	/// `x.name` where `name` is a method: not a value.
+	var fn methodAsField(ty: Ty, owner: TypeDef, method: FnId, name: ast::Name) = {
+		val typeName = self.typeName(owner)
+		val text = String::of(self.text(name.sym))
+		val isStatic = self.program.fns[method].receiver == .Some(.Static)
+		val call = if isStatic then "\(typeName)::\(text)(…)" else "\(text)(…)"
+		// A method that takes nothing but its receiver is called by adding
+		// `()`: `v.len` is `v.len()`.
+		val takesNothing = !isStatic && self.program.fns[method].params.len() == 1
+		// The value's own type, not the one its methods are found on: an
+		// array's are its slice's.
+		val valueType = self.program.tyName(ty, self.interner)
+		var diagnostic = Diagnostic::error(
+			NOT_A_METHOD,
+			"no field `\(text)` on `\(valueType)`",
+			name.span,
+			"a method, not a field",
+		).withNote("`x.name` is not a value, since it would hold `x`")
+		diagnostic = if takesNothing then
+			diagnostic.withFix("call it: `\(text)()`", own [Edit::insert(name.span.hi, "()")])
+		else diagnostic.withHelp("to call it, write `\(call)`")
+		// Where a function is wanted, the type's is one, where it can be a
+		// value and its type has a name to write it with.
+		val def = &self.program.fns[method]
+		val aValue =
+			!isStatic &&
+			def.intrinsic.isNone() &&
+			!def.isInline &&
+			!(self.kind(def.ret) is .Ref(..)) &&
+			!(owner is .Builtin(.Slice) | .Builtin(.Slots))
+		if aValue then
+			diagnostic = diagnostic.withHelp("where a function is wanted, `\(typeName)::\(text)` is one, taking the value first")
+		self.report(move diagnostic)
+	}
+
+	/// The field `name` of a value of type `ty`, once what it is has been
+	/// settled: a struct's, or one of the few a built-in type answers.
+	var fn fieldOf(b: ExprId, ty: Ty, name: ast::Name, span: Span): ExprId = {
+		match self.kind(ty) {
+			.Struct(id, ..) => {
+				var found: Option<i64> = .None
+				for (i, f) in self.program.structs[id].fields.forwards().enumerate() {
+					if found.isNone() && f.name == name.sym then found = .Some(i)
+				}
+				if found is .Some(i) {
+					// Another module sees only what is `pub`.
+					if !self.fieldVisible(id, i) then self.privateField(id, i, name.span)
+					val fieldTy = self.structFieldTy(ty, i)
+					return self.alloc(.Field(base: b, index: i as u32), fieldTy, span)
+				}
+				val fieldText = self.text(name.sym)
+				var names: Vec<String> = Vec()
+				var texts: Vec<str> = Vec()
+				for f in self.program.structs[id].fields {
+					names.push("`\(self.text(f.name))`")
+					texts.push(self.text(f.name))
+				}
+				var diagnostic = Diagnostic::error(
+					NO_SUCH_FIELD,
+					"no field `\(fieldText)` on \(self.tyName(ty))",
+					name.span,
+					"unknown field",
+				)
+				if suggest(fieldText, &texts) is .Some(similar) then
+					diagnostic = diagnostic.withFix(
+						"did you mean `\(similar)`?",
+						own [Edit::replace(name.span, String::of(similar))],
+					)
+				else if !names.isEmpty() then
+					diagnostic = diagnostic.withNote("the fields are \(names.join(", "))")
+				self.report(move diagnostic)
+			}
+			_ if self.isPoisoned(ty) => {}
+			// A C string answers nothing by itself: what it holds is found by
+			// walking it.
+			.Cstring => {
+				val fieldText = String::of(self.text(name.sym))
+				var diagnostic = Diagnostic::error(
+					NO_SUCH_FIELD,
+					"`cstring` has no field `\(fieldText)`",
+					name.span,
+					"not a field",
+				).withNote(
+					"a `cstring` is a pointer to bytes that end with a NUL, so its length is not known until it is walked",
+				)
+				if fieldText == "toStr" then
+					diagnostic = diagnostic.withFix("`toStr` is a method: call it", own [
+						Edit::insert(name.span.hi, "()"),
+					])
+				else if fieldText == "len" then
+					diagnostic = diagnostic.withFix("walk it first, with `toStr()`, and ask it: `toStr().len()`", own [
+						Edit::replace(name.span, "toStr().len()"),
+					])
+				self.report(move diagnostic)
+			}
+			_ => {
+				var diagnostic = Diagnostic::error(
+					NO_SUCH_FIELD,
+					"\(self.tyName(ty)) has no fields",
+					name.span,
+					"field access on \(self.tyName(ty))",
+				)
+				// An interpolated literal appends its values through `Text`, so
+				// this is where a value that has none is reported.
+				if name.sym == Symbol::appendTo() then
+					diagnostic = diagnostic.withNote("a value written between `\\(` and `)` is appended by `Text`, and \(self.tyName(ty)) cannot implement it")
+				self.report(move diagnostic)
+			}
+		}
+		return self.errorExpr(span)
+	}
+
+	/// Whether the type a pointer points at is one whose elements or fields
+	/// the compiler can find: `ptr<void>` and a pointer to a C type whose
+	/// contents Wip does not know are not.
+	var fn pointeeSized(elem: Ty, ty: Ty, span: Span): bool = {
+		val unknown =
+			if self.kind(elem) is .Opaque(..) then "a C type whose contents Wip does not know"
+			else if elem == UNIT then "`void`"
+			else return true
+		if self.isPoisoned(elem) then return false
+		self.report(
+			Diagnostic::error(
+				INVALID_INDEX,
+				"\(self.tyName(ty)) points at \(unknown)",
+				span,
+				"how far apart its elements are is not known",
+			).withHelp("cast it to a pointer whose type Wip knows, as in `p as ptr<u8>`").withNote(
+				"a pointer's elements are found by their size, which C does not give for either",
+			),
+		)
+		return false
+	}
+
+	var fn index(base: ast::ExprId, index: ast::ExprId, span: Span): ExprId = {
+		val operand = self.operand(base, .None)
+		// A `String` is read as the text it holds.
+		val b = self.lendString(operand).unwrapOr(operand)
+		val ty = self.tyOf(b)
+		// `v[0]`, `grid[point]`: a lookup the type answers, where it is not the
+		// machine's own indexing.
+		if self.indexThroughAt(b, ty, index, span) is .Some(call) then return call
+		val i = self.indexValue(index)
+		return match self.kind(ty) {
+			.Array(elem, len) => {
+				// An index is an `i64`, so its bits are the literal's value.
+				if self.state.body.exprs[i].kind is .Int(bits) {
+					val v = bits as u64 as i64
+					if v < 0 || v as u64 >= len then
+						self.report(
+							Diagnostic::error(INVALID_INDEX, "index out of bounds", self.state.body.exprs[i].span, "index \(v) is out of bounds for \(self.tyName(ty))"),
+						)
+				}
+				self.alloc(.Index(base: b, index: i), elem, span)
+			}
+			// Checked against the length when the program runs. A block of slots
+			// is indexed the same way, and only the prelude has one.
+			.Slice(elem) | .Slots(inner: elem) => self.alloc(.Index(base: b, index: i), elem, span)
+			// A `str` is bytes, and UTF-8 by convention: `s[i]` is one byte.
+			.Str => self.alloc(.Index(base: b, index: i), U8, span)
+			// `p[i]`: the element C's pointer points at, counted from it. Nothing
+			// is checked — a C pointer says nothing about how many there are.
+			.Ptr(elem) =>
+				if self.pointeeSized(elem, ty, span) then
+					self.alloc(.Index(base: b, index: i), elem, span)
+				else self.errorExpr(span)
+			_ if self.isPoisoned(ty) => self.errorExpr(span)
+			_ => {
+				var diagnostic = Diagnostic::error(
+					INVALID_INDEX,
+					"cannot index into a value of type \(self.tyName(ty))",
+					self.state.body.exprs[b].span,
+					"not an array or slice",
+				)
+				// A type of a program's own says what `x[i]` means by
+				// implementing `Index`.
+				if self.kind(ty) is .Struct(..) | .Enum(..) {
+					val typeName = self.tyName(ty)
+					val name = typeName.toStr().trimMatches("`")
+					diagnostic = diagnostic.withHelp("write `extend \(name): Index<K, V>` to say what `x[i]` finds, or `extend \(name): Sequence<T>` where `i` is a position").withNote(
+						"an array, a slice and a `str` are indexed by the machine; everything else answers for itself",
+					)
+				}
+				self.report(move diagnostic)
+				self.errorExpr(span)
+			}
+		}
+	}
+
+	/// `x[i]` where the type says what that means: the `at` of the prelude's
+	/// `Index`, or of its `Sequence` for a position. Nothing where the type
+	/// is indexed by the machine, or by nothing.
+	var fn indexThroughAt(base: ExprId, ty: Ty, index: ast::ExprId, span: Span): Option<ExprId> = {
+		// An array, a slice and a `str` are indexed by the machine, with a
+		// bounds check and nothing called, though a slice is a `Sequence` too
+		// for generic code.
+		if self.kind(ty) is .Array(..) | .Slice(..) | .Str | .Slots(..) | .Ptr(..) then return .None
+		val interfaceId = self.program.preludeItems.interfaceOf(.Index)?
+		val sequence = self.program.preludeItems.interfaceOf(.Sequence)
+		val name = ast::Name(sym: Symbol::at(), span: self.ast.exprs[index].span)
+		// A position is taken as an integer of any type, as the machine's
+		// indexing takes it.
+		self.state.indexOperands.add(index)
+		val args = [index]
+		val item = ItemUse::plain(.Some(&args), .None, span)
+		return match self.ownerOf(ty) {
+			// A type of its own, which says what `x[i]` means by implementing
+			// `Index`.
+			.Some(owner) if self.implementsAny(ty, interfaceId) ||
+				(sequence is .Some(s) && self.implementsAny(ty, s)) => self.dispatch(
+				base,
+				owner,
+				name,
+				item,
+			)
+			// A type parameter, where the constraint says it.
+			.None if self.kind(ty) is .Param(..) => self.constrainedCall(base, ty, name, item)
+			_ => .None
+		}
+	}
+
+	/// An index, or a range's bound: an integer of any type, as the `i64` a
+	/// position is. One of 32 bits or fewer is widened; one of 64 bits or
+	/// more goes through the prelude's `indexOfUnsigned` or `indexOfSigned`,
+	/// which panic, with the value, where it is more than an `i64` holds, so
+	/// that it is never wrapped into a position. Anything else is checked as
+	/// an `i64`, and reported as one.
+	var fn indexValue(e: ast::ExprId): ExprId = {
+		val id = self.operand(e, .Some(I64))
+		val ty = self.tyOf(id)
+		val .Int(int) = self.kind(ty) else {
+			return self.coerce(id, I64, .None)
+		}
+		if ty == I64 then return id
+		val span = self.state.body.exprs[id].span
+		if int.bits() < 64 then return self.alloc(.Cast(id), I64, span)
+		val names = Symbol::indexOf()
+		val (name, wide) = if int.signed() then (names[1], I128) else (names[0], U128)
+		var callee: Option<FnId> = .None
+		if self.prelude is .Some(prelude) && self.modules[prelude].fns.get(&name) is .Some(found) {
+			callee = .Some(found)
+		}
+		val .Some(function) = callee else {
+			return self.coerce(id, I64, .None)
+		}
+		val widened = if ty == wide then id else self.alloc(.Cast(id), wide, span)
+		return self.alloc(
+			.Call(
+				callee: function,
+				args: Vec::of(own [widened]),
+				typeArgs: TyList::empty(),
+				order: Vec::of(own [0]),
+			),
+			I64,
+			span,
+		)
+	}
+
+	/// An expression borrowed where it is written: the operand of `&`, what a
+	/// `for` walks, and what a projection lends. A range of elements may be
+	/// one, and nothing else may.
+	var fn inferBorrowed(e: ast::ExprId, hint: Option<Ty>): ExprId = {
+		val expr = &self.ast.exprs[e]
+		return match expr.kind {
+			.SubSlice(base, lo, hi, inclusive) => self.subSlice(
+				base,
+				lo,
+				hi,
+				inclusive,
+				expr.span,
+				true,
+			)
+			_ => self.infer(e, hint)
+		}
+	}
+
+	/// The slice a container lends, where a range of it is asked for: a type
+	/// whose `x[i]` is a position, a `Sequence<T>`, and which lends its
+	/// elements as one slice, an `Items<T>`, of one `T`. Otherwise what is
+	/// missing, for the message.
+	var fn rangedItems(base: ExprId, ty: Ty): Result<ExprId, Option<str>> = {
+		val sequence = self.program.preludeItems.interfaceOf(.Sequence)
+		val items = self.program.preludeItems.interfaceOf(.Items)
+		val lends = items is .Some(i) && self.implementsAny(ty, i)
+		val positions = sequence is .Some(s) && self.implementsAny(ty, s)
+		if lends && positions {
+			// Of one element: the positions are those of the slice.
+			var same = false
+			if self.itemsElement(ty) is .Some(elem) && sequence is .Some(s) then
+				same = self.implementsArgs(ty, s, [elem])
+			return match self.itemsOf(base, ty) {
+				.Items(items: found, ..) if same => .Ok(found)
+				_ => .Err(.None)
+			}
+		}
+		if positions then
+			return .Err(
+				.Some("its elements are not in one slice: it is a sequence, and lends no `Items`"),
+			)
+		if lends then
+			return .Err(
+				.Some(
+					"it lends its elements as a slice, and has no positions for a range to count: it is no `Sequence`",
+				),
+			)
+		return .Err(.None)
+	}
+
+	/// `base[lo..hi]`: a range of elements of an array or slice, which must be
+	/// `borrowed` where it is written.
+	var fn subSlice(
+		base: ast::ExprId,
+		lo: Option<ast::ExprId>,
+		hi: Option<ast::ExprId>,
+		inclusive: bool,
+		span: Span,
+		borrowed: bool,
+	): ExprId = {
+		val operand = self.operand(base, .None)
+		// A `String` is read as the text it holds.
+		var b = self.lendString(operand).unwrapOr(operand)
+		val low: Option<ExprId> = match lo {
+			.Some(e) => .Some(self.indexValue(e))
+			.None => .None
+		}
+		var high: Option<ExprId> = match hi {
+			.Some(e) => .Some(self.indexValue(e))
+			.None => .None
+		}
+		// `lo..=hi` is `lo..hi + 1`, which only a range as long as there are
+		// positions could make overflow.
+		if inclusive && high is .Some(end) {
+			val endSpan = self.state.body.exprs[end].span
+			val one = self.alloc(.Int(1), I64, endSpan)
+			high = .Some(
+				self.alloc(.Binary(op: .Add, lhs: end, rhs: one, wrapping: false), I64, endSpan),
+			)
+		}
+		var ty = self.tyOf(b)
+		// A range of a `str` is a `str`: the same bytes, seen from further in.
+		// It is a value, so it needs no borrow.
+		if self.kind(ty) == .Str then
+			return self.alloc(.SubSlice(base: b, lo: low, hi: high), STR, span)
+		// A container whose `x[i]` is a position and which lends its elements
+		// as one slice is ranged as that slice: `v[a..b]` is
+		// `v.items()[a..b]`.
+		if !(self.kind(ty) is .Array(..) | .Slice(..) | .Slots(..)) && !self.isPoisoned(ty) {
+			match self.rangedItems(b, ty) {
+				.Ok(items) => {
+					b = items
+					ty = self.tyOf(items)
+				}
+				.Err(note) => {
+					var diagnostic = Diagnostic::error(
+						INVALID_INDEX,
+						"cannot take a range of a value of type \(self.tyName(ty))",
+						self.state.body.exprs[b].span,
+						"not an array, a slice or a sequence that lends one",
+					)
+					if note is .Some(n) then diagnostic = diagnostic.withNote(String::of(n))
+					self.report(move diagnostic)
+					return self.errorExpr(span)
+				}
+			}
+		}
+		val elem = match self.kind(ty) {
+			.Array(elem: t, ..) | .Slice(elem: t) | .Slots(inner: t) => t
+			_ => return self.errorExpr(span)
+		}
+		if !borrowed {
+			self.report(
+				Diagnostic::error(
+					SLICE_NOT_BORROWED,
+					"a range of elements must be borrowed",
+					span,
+					"a range of elements",
+				).withNote(
+					"a slice is a view of elements that belong to someone else, so it exists only as a `&` or `&var` argument, or as what a `for` loop walks",
+				).withFix("borrow it", own [Edit::insert(span.lo, "&")]),
+			)
+			return self.errorExpr(span)
+		}
+		val sliceTy = self.intern(.Slice(elem))
+		return self.alloc(.SubSlice(base: b, lo: low, hi: high), sliceTy, span)
+	}
+}

@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 # Writes std/prelude/width.wip: how many columns a character takes on a
-# terminal, from the Unicode data Python carries.
+# terminal, from the Unicode data Python carries. The compiler lays out
+# diagnostics and the syntax tree's dump by the same table, the library's,
+# so that it measures text as a program in Wip does.
 #
-#   scripts/char-widths.py        write it
+#   scripts/char-widths.py          write it
 #   scripts/char-widths.py --check  fail if it is not what would be written
 #
 # A Python with another version of Unicode would write another table, so
@@ -112,18 +114,19 @@ val WIDTHS: [(u32, u32, i64); {len(table)}] = [
 
 
 if __name__ == "__main__":
-    path = "std/prelude/width.wip"
-    wanted = text()
+    outputs = [("std/prelude/width.wip", text())]
     if "--check" in sys.argv:
-        with open(path) as f:
-            found = f.read()
-        written = re.search(r"from Unicode ([0-9.]+);", found)
-        if written is None or written.group(1) != unicodedata.unidata_version:
-            print(f"{path}: not checked, as this Python has Unicode {unicodedata.unidata_version}")
-            sys.exit(0)
-        if found != wanted:
-            sys.exit(f"{path} is not what scripts/char-widths.py writes")
+        for path, wanted in outputs:
+            with open(path) as f:
+                found = f.read()
+            written = re.search(r"from Unicode ([0-9.]+);", found)
+            if written is None or written.group(1) != unicodedata.unidata_version:
+                print(f"{path}: not checked, as this Python has Unicode {unicodedata.unidata_version}")
+                continue
+            if found != wanted:
+                sys.exit(f"{path} is not what scripts/char-widths.py writes")
         sys.exit(0)
-    with open(path, "w") as f:
-        f.write(wanted)
-    print(f"wrote {path}: {len(ranges())} ranges, Unicode {unicodedata.unidata_version}")
+    for path, wanted in outputs:
+        with open(path, "w") as f:
+            f.write(wanted)
+    print(f"wrote {', '.join(path for path, _ in outputs)}: {len(ranges())} ranges, Unicode {unicodedata.unidata_version}")

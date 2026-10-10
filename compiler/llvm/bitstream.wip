@@ -1,0 +1,273 @@
+// LLVM's bitstream, which its bitcode is written in: bits, each byte filled
+// from its least significant bit, holding blocks of records. A block says how
+// wide the numbers that start its entries are, and ends on a 32-bit word
+// after saying how many words it holds. A record is written as it is, each of
+// its numbers in pieces of six bits, or by an abbreviation the block defined,
+// which says how each of its fields is written: a constant written nowhere, a
+// number of so many bits, a number in pieces, six-bit characters, an array,
+// or bytes as they are.
+
+/// How an abbreviation writes one field of a record.
+@derive(Eq, Clone)
+pub enum Field {
+	/// The same number in every record, so written nowhere.
+	Literal(value: u64)
+	/// A number in exactly this many bits.
+	Fixed(bits: u32)
+	/// A number in pieces of this many bits, each but the last with its top
+	/// bit set.
+	Vbr(bits: u32)
+	/// The rest of the record, its length first, each element written as the
+	/// field after this one says.
+	Array
+	/// A character of `a`–`z`, `A`–`Z`, `0`–`9`, `.` and `_`, in six bits.
+	Char6
+	/// The rest of the record as bytes: how many, then them, from a 32-bit
+	/// word and to one.
+	Blob
+}
+
+/// An abbreviation the stream may write a record by: the number it is
+/// written as, and its fields, the record's code the first.
+@derive(Clone)
+pub struct Abbreviation {
+	pub id: u32
+	pub fields: Vec<Field>
+}
+
+/// An entry's number, before the abbreviations a block defines.
+val END_BLOCK: u64 = 0
+val ENTER_SUBBLOCK: u64 = 1
+val DEFINE_ABBREV: u64 = 2
+val UNABBREV_RECORD: u64 = 3
+
+/// The first number an abbreviation a block defines is written as.
+val FIRST_ABBREV: u32 = 4
+
+/// A bitstream being written.
+pub struct Bitstream {
+	out: Vec<u8>
+	/// Bits not yet in `out`, the first in the lowest.
+	pending: u64
+	count: u32
+	/// How wide the current block's entry numbers are.
+	width: u32
+	/// Each block open: the width around it, where its length word is, and
+	/// how many abbreviations it has defined.
+	open: Vec<(u32, i64, u32)>
+}
+
+extend Bitstream {
+	/// A stream whose first entries' numbers are two bits wide, as a
+	/// bitcode file's are.
+	static fn new(): Bitstream = Bitstream(out: Vec(), pending: 0, count: 0, width: 2, open: Vec())
+
+	/// `value`'s low `bits` bits, up to 32.
+	var fn emit(value: u64, bits: u32) = {
+		if bits == 0 then return
+		val masked = if bits >= 64 then value else value & ((1 << bits) - 1)
+		self.pending = self.pending | (masked << self.count)
+		self.count += bits
+		while self.count >= 32 {
+			self.word(self.pending)
+			self.pending = self.pending >> 32
+			self.count -= 32
+		}
+	}
+
+	/// A number of up to 64 bits, in two halves.
+	var fn emit64(value: u64, bits: u32) = {
+		if bits <= 32 {
+			self.emit(value, bits)
+		} else {
+			self.emit(value & 0xFFFFFFFF, 32)
+			self.emit(value >> 32, bits - 32)
+		}
+	}
+
+	var fn word(value: u64) = {
+		self.out.push((value & 0xFF) as u8)
+		self.out.push(((value >> 8) & 0xFF) as u8)
+		self.out.push(((value >> 16) & 0xFF) as u8)
+		self.out.push(((value >> 24) & 0xFF) as u8)
+	}
+
+	/// A number in pieces of `bits` bits, each piece's top bit saying
+	/// another follows.
+	var fn vbr(value: u64, bits: u32) = {
+		val more: u64 = 1 << (bits - 1)
+		var rest = value
+		while rest >= more {
+			self.emit((rest & (more - 1)) | more, bits)
+			rest = rest >> (bits - 1)
+		}
+		self.emit(rest, bits)
+	}
+
+	/// Zeros to the next 32-bit word.
+	var fn align() = {
+		if self.count > 0 then self.emit(0, 32 - self.count)
+	}
+
+	/// Starts block `id`, whose entries' numbers are `width` bits wide.
+	var fn enter(id: u32, width: u32) = {
+		self.emit(ENTER_SUBBLOCK, self.width)
+		self.vbr(id as u64, 8)
+		self.vbr(width as u64, 4)
+		self.align()
+		val lengthAt = self.out.len()
+		self.emit(0, 32)
+		self.open.push((self.width, lengthAt, 0))
+		self.width = width
+	}
+
+	/// Ends the block last started, and says how many words it holds.
+	var fn exit() = {
+		self.emit(END_BLOCK, self.width)
+		self.align()
+		val .Some((width, lengthAt, _)) = self.open.pop() else {
+			panic("a block ends that was started")
+		}
+		val words = ((self.out.len() - lengthAt - 4) / 4) as u64
+		self.out[lengthAt] = (words & 0xFF) as u8
+		self.out[lengthAt + 1] = ((words >> 8) & 0xFF) as u8
+		self.out[lengthAt + 2] = ((words >> 16) & 0xFF) as u8
+		self.out[lengthAt + 3] = ((words >> 24) & 0xFF) as u8
+		self.width = width
+	}
+
+	/// A record written as it is: its code, how many numbers, and each, in
+	/// six-bit pieces.
+	var fn record(code: u32, values: &[u64]) = {
+		self.emit(UNABBREV_RECORD, self.width)
+		self.vbr(code as u64, 6)
+		self.vbr(values.len() as u64, 6)
+		for value in values {
+			self.vbr(value, 6)
+		}
+	}
+
+	/// A record of its code alone.
+	var fn bare(code: u32) = {
+		val none: Vec<u64> = Vec()
+		self.record(code, &none.items())
+	}
+
+	/// Defines an abbreviation in the current block: the number its records
+	/// are written as.
+	var fn define(fields: Vec<Field>): Abbreviation = {
+		self.emit(DEFINE_ABBREV, self.width)
+		self.vbr(fields.len() as u64, 5)
+		for field in fields {
+			match field {
+				.Literal(value) => {
+					self.emit(1, 1)
+					self.vbr(value, 8)
+				}
+				.Fixed(bits) => {
+					self.emit(0, 1)
+					self.emit(1, 3)
+					self.vbr(bits as u64, 5)
+				}
+				.Vbr(bits) => {
+					self.emit(0, 1)
+					self.emit(2, 3)
+					self.vbr(bits as u64, 5)
+				}
+				.Array => {
+					self.emit(0, 1)
+					self.emit(3, 3)
+				}
+				.Char6 => {
+					self.emit(0, 1)
+					self.emit(4, 3)
+				}
+				.Blob => {
+					self.emit(0, 1)
+					self.emit(5, 3)
+				}
+			}
+		}
+		val last = self.open.len() - 1
+		val (width, lengthAt, defined) = self.open[last]
+		self.open[last] = (width, lengthAt, defined + 1)
+		return Abbreviation(id: FIRST_ABBREV + defined, fields: move fields)
+	}
+
+	/// A record written by `abbrev`: `values`, its code the first, and
+	/// `blob` where its last field is bytes.
+	var fn abbreviated(abbrev: &Abbreviation, values: &[u64], blob: &[u8]) = {
+		self.emit(abbrev.id as u64, self.width)
+		var at = 0
+		var i = 0
+		while i < abbrev.fields.len() {
+			val field = &abbrev.fields[i]
+			match field {
+				.Literal(value) => {
+					if values[at] != value then panic("a record holds what its abbreviation says")
+					at += 1
+				}
+				.Array => {
+					val element = &abbrev.fields[i + 1]
+					self.vbr((values.len() - at) as u64, 6)
+					while at < values.len() {
+						self.scalar(&element, values[at])
+						at += 1
+					}
+					i += 1
+				}
+				.Blob => {
+					self.vbr(blob.len() as u64, 6)
+					self.align()
+					for byte in blob {
+						self.emit(byte as u64, 8)
+					}
+					self.align()
+				}
+				_ => {
+					self.scalar(&field, values[at])
+					at += 1
+				}
+			}
+			i += 1
+		}
+	}
+
+	/// One number, as `field` writes it.
+	var fn scalar(field: &Field, value: u64) = match field {
+		.Fixed(bits) => self.emit64(value, bits)
+		.Vbr(bits) => self.vbr(value, bits)
+		.Char6 => self.emit(char6(value as u8), 6)
+		_ => panic("a field of one number")
+	}
+
+	/// Raw bytes, at a word: the magic number a file starts with.
+	var fn bytes(bytes: &[u8]) = {
+		for byte in bytes {
+			self.emit(byte as u64, 8)
+		}
+	}
+
+	/// The stream, every bit written, to its last word.
+	move fn finish(): Vec<u8> = {
+		var stream = move self
+		stream.align()
+		return move stream.out
+	}
+}
+
+/// A character as six bits: `a`–`z` 0 to 25, `A`–`Z` 26 to 51, `0`–`9` 52 to
+/// 61, `.` 62 and `_` 63.
+fn char6(byte: u8): u64 = match byte {
+	b'a'..=b'z' => (byte - b'a') as u64
+	b'A'..=b'Z' => (byte - b'A') as u64 + 26
+	b'0'..=b'9' => (byte - b'0') as u64 + 52
+	b'.' => 62
+	b'_' => 63
+	_ => panic("a character six bits hold")
+}
+
+/// A signed number as bitcode writes one: its magnitude shifted up, and its
+/// sign in the lowest bit.
+fn signedVbr(value: i64): u64 =
+	if value >= 0 then (value as u64) << 1 else ((0 - (value as i128)) as u64 << 1) | 1

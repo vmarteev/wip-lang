@@ -1,0 +1,1105 @@
+// Source text to tokens.
+//
+// Lexing never stops at an error. Every malformed construct is reported and
+// still produces the token the parser most likely expects, so one run reports
+// every lexical error in the file and parsing can continue past them. The
+// rules are in `docs/grammar.md` §1.
+
+import std::collections::{Set}
+import std::mem
+
+pub struct Lexed {
+	/// Ends with exactly one `Eof`.
+	pub tokens: Vec<Token>
+	pub diagnostics: Vec<Diagnostic>
+	/// Where the lexer dropped text (unexpected characters) or cut a token
+	/// short (unterminated strings), in source order. The parser stays quiet
+	/// about errors next to these, since they are almost always a consequence
+	/// of the lexical error rather than a separate mistake.
+	pub gaps: Vec<Span>
+}
+
+extend Lexed {
+	/// Renames every symbol through `map`, once the interner these tokens
+	/// were lexed with has been absorbed into another (`Interner::absorb`).
+	pub var fn renameSymbols(map: &[Symbol]) = {
+		for token in self.tokens {
+			token.kind = match token.kind {
+				.Assert(message: .Some(symbol)) => .Assert(message: .Some(map[symbol.index()]))
+				.Ident(symbol) => .Ident(symbol: map[symbol.index()])
+				.Str(symbol) => .Str(symbol: map[symbol.index()])
+				.StrStart(symbol) => .StrStart(symbol: map[symbol.index()])
+				.StrMid(symbol) => .StrMid(symbol: map[symbol.index()])
+				.StrEnd(symbol) => .StrEnd(symbol: map[symbol.index()])
+				_ => continue
+			}
+		}
+	}
+}
+
+/// Lexes a whole source file.
+///
+/// Panics if `src` is longer than `u32`'s largest number of bytes. The
+/// driver rejects such files before lexing.
+pub fn lex(src: str, interner: &var Interner): Lexed = lexAt(src, 0, &var interner)
+
+/// Lexes a file whose spans start at `base`, so that the files of one program
+/// lie end to end and a `Span` names a place in exactly one of them.
+pub fn lexAt(src: str, base: u32, interner: &var Interner): Lexed = {
+	if src.len() > 0xFFFF_FFFF then panic("source file larger than 4 GiB")
+	// The lexer holds the interner while it runs, and gives it back.
+	var lexer = Lexer(
+		src: src,
+		base: base as i64,
+		// A UTF-8 byte order mark is not part of the program.
+		pos: if src.startsWith("\u{feff}") then 3 else 0,
+		interner: mem::replace(&var interner, Interner(texts: Set())),
+		tokens: Vec(),
+		diagnostics: Vec(),
+		gaps: Vec(),
+		buf: String(),
+		lineStart: true,
+		interp: Vec(),
+	)
+	lexer.run()
+	lexer.internAssertMessages()
+	interner = move lexer.interner
+	return Lexed(
+		tokens: move lexer.tokens,
+		diagnostics: move lexer.diagnostics,
+		gaps: move lexer.gaps,
+	)
+}
+
+view struct Lexer {
+	src: str
+	/// Where this file's spans start.
+	base: i64
+	pos: i64
+	interner: Interner
+	tokens: Vec<Token>
+	diagnostics: Vec<Diagnostic>
+	gaps: Vec<Span>
+	/// Scratch space for the contents of the current string literal.
+	buf: String
+	/// No token has been pushed since the last line break.
+	lineStart: bool
+	/// One entry per interpolation being lexed, holding how many `(` are
+	/// open inside it — the `)` that closes it is the one found at zero
+	/// — and the text block the literal is, if it is one.
+	interp: Vec<(i64, Option<TextBlock>)>
+}
+
+/// A text block being lexed: the line its closing `"""`
+/// is on begins at `line`, and the `"""` at `close`. What is before it
+/// on that line is the indentation taken off every line of the text.
+/// Not the syntax tree's `Block`, which shares the module with it.
+@derive(Clone)
+struct TextBlock {
+	line: i64
+	close: i64
+}
+
+fn isIdentContinue(b: u8): bool = b is b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_'
+
+/// Whether `b` is a digit of a number in `base`: 2, 8, 10 or 16.
+fn isDigitOf(b: u8, base: i64): bool = match b {
+	b'0'..=b'9' => ((b - b'0') as i64) < base
+	b'a'..=b'f' | b'A'..=b'F' => base == 16
+	_ => false
+}
+
+/// Whether `c` can begin a token or trivia. Anything else is an unexpected
+/// character.
+fn startsToken(c: char): bool =
+	c.isAsciiAlphanumeric() ||
+	isSpace(c) ||
+	c is '_' | '"' | '/' | '{' | '}' | '(' | ')' | '[' | ']' | ',' | ':' | ';' | '.' | '-' | '='
+	| '!' | '<' | '>' | '&' | '|' | '+' | '*' | '%'
+
+fn isSpace(c: char): bool = c is ' ' | '\t' | '\n' | '\r'
+
+/// Whether `c` is a control character, Unicode's category `Cc`.
+fn isControl(c: char): bool = c is '\u{0}'..='\u{1F}' | '\u{7F}'..='\u{9F}'
+
+/// Whether `text` is nothing but spaces, tabs and carriage returns.
+fn isBlank(text: str): bool = {
+	for b in text {
+		if !(b is b' ' | b'\t' | b'\r') then return false
+	}
+	return true
+}
+
+/// The kind of one piece of a string literal: whether it begins the literal,
+/// and whether an interpolation follows it.
+fn pieceKind(symbol: Symbol, first: bool, interpolates: bool): TokenKind = match (
+	first,
+	interpolates,
+) {
+	(true, false) => .Str(symbol: symbol)
+	(true, true) => .StrStart(symbol: symbol)
+	(false, true) => .StrMid(symbol: symbol)
+	(false, false) => .StrEnd(symbol: symbol)
+}
+
+extend Lexer {
+	var fn run() = {
+		while true {
+			self.skipTrivia()
+			val start = self.pos
+			val .Some(c) = self.peekChar() else {
+				break
+			}
+			// `b'x'`: a byte. An identifier is never
+			// followed directly by a `'`, so the two cannot be confused.
+			if c == 'b' && self.byte(1) == .Some(b'\'') {
+				self.byteLiteral(start)
+			} else if c.isAsciiLetter() || c == '_' {
+				self.ident(start)
+			} else if c.isDigit() {
+				self.number(start)
+			} else if c == '"' && self.rest().startsWith("\"\"\"") {
+				self.textBlock(start)
+			} else if c == '"' {
+				self.string(start)
+			} else if c == '\'' {
+				val value = self.quoted(start, false)
+				self.push(.Char(value: value), start, self.pos)
+			} else if c == ')' && self.closesInterpolation() {
+				// The `)` that closes `\(`: what follows is the rest of the
+				// literal, not a token of its own.
+				val .Some((_, block)) = self.interp.pop() else {
+					panic("just checked")
+				}
+				self.pos += 1
+				self.stringPiece(start, false, block)
+			} else if !self.punct(start) {
+				self.unexpected(start)
+			} else if !self.interp.isEmpty() {
+				// Parentheses inside an interpolation, so that the one that
+				// ends it is known.
+				val last = self.interp.len() - 1
+				match self.tokens[self.tokens.len() - 1].kind {
+					.LParen => self.interp[last].0 += 1
+					.RParen => self.interp[last].0 -= 1
+					_ => {}
+				}
+			}
+		}
+		val end = (self.base + self.src.len()) as u32
+		self.tokens.push(Token(kind: .Eof, span: Span::at(end), lineStart: true))
+	}
+
+	/// Whether the innermost interpolation has no `(` open, so that a `)`
+	/// ends it.
+	fn closesInterpolation(): bool = match self.interp.last() {
+		.Some(entry) => entry.0 == 0
+		.None => false
+	}
+
+	fn byte(ahead: i64): Option<u8> =
+		if self.pos + ahead < self.src.len() then .Some(self.src[self.pos + ahead]) else .None
+
+	fn peekChar(): Option<char> =
+		if self.pos < self.src.len() then .Some(self.src.charAt(self.pos).0) else .None
+
+	/// The text from where the lexer is to the end.
+	fn rest(): str = self.src[self.pos..self.src.len()]
+
+	var fn eatIdent() = {
+		while self.byte(0) is .Some(b) && isIdentContinue(b) {
+			self.pos += 1
+		}
+	}
+
+	/// The message each `assert` in this file prints when it fails.
+	/// It is made here because the lexer is what holds the
+	/// interner: the parser, which reads these tokens, cannot intern the
+	/// text it sees.
+	var fn internAssertMessages() = {
+		for index in 0..self.tokens.len() {
+			if self.tokens[index].kind != .Assert(message: .None) then continue
+			val .Some(message) = self.assertMessage(index) else {
+				continue
+			}
+			val symbol = self.interner.intern(message)
+			self.tokens[index].kind = .Assert(message: .Some(symbol))
+		}
+	}
+
+	/// The message of the `assert` whose keyword is the token at `at`:
+	/// `"<note>: <condition>"` where the call gives a note written as one
+	/// string, `": <condition>"` after a note built when it fails, and
+	/// `"assertion failed: <condition>"` where it gives none. `None` where what
+	/// follows is not `(` … `)`, which the parser reports.
+	fn assertMessage(at: i64): Option<String> = {
+		if at + 1 >= self.tokens.len() || self.tokens[at + 1].kind != .LParen then return .None
+		val open = self.tokens[at + 1].span.hi
+		// The condition runs to the closing parenthesis, or to the comma
+		// before the note. Nesting is counted so that a call's own commas
+		// and parentheses belong to the condition.
+		var depth = 0
+		var comma: Option<i64> = .None
+		var close: Option<i64> = .None
+		for index in at + 2..self.tokens.len() {
+			match self.tokens[index].kind {
+				.LParen | .LBracket | .LBrace => depth += 1
+				.RParen if depth == 0 => {
+					close = .Some(index)
+					break
+				}
+				// A closer with no opener is a file with a mistake in it,
+				// which the parser reports; the message stops at it.
+				.RParen | .RBracket | .RBrace => if depth > 0 then depth -= 1
+				.Comma if depth == 0 && comma == .None => comma = .Some(index)
+				.Eof => break
+				_ => {}
+			}
+		}
+		val .Some(close) = close else {
+			return .None
+		}
+		val condition = self.source(open, self.tokens[comma.unwrapOr(close)].span.lo)
+		// A note is a string written at the call, as a panic's message is;
+		// anything else is reported by the checker, and
+		// the message is the condition alone.
+		var note: Option<str> = .None
+		if comma is .Some(comma) && comma + 2 == close {
+			if self.tokens[comma + 1].kind is .Str(symbol) then
+				note = .Some(self.interner.resolve(symbol))
+		}
+		// A note built when the assert fails comes first, and this after it.
+		return .Some(
+			match (note, comma) {
+				(.Some(note), _) => "\(note): \(condition)"
+				(.None, .Some(_)) => ": \(condition)"
+				(.None, .None) => "assertion failed: \(condition)"
+			},
+		)
+	}
+
+	/// The source text from `lo` to `hi`, on one line: a condition written
+	/// over several lines reads as one in the message.
+	fn source(lo: u32, hi: u32): String = {
+		val lo = if lo as i64 > self.base then lo as i64 - self.base else 0
+		val hi = if hi as i64 > self.base then hi as i64 - self.base else 0
+		val text = if lo <= hi && hi <= self.src.len() then self.src[lo..hi] else ""
+		var out = String()
+		for word in text.splitWhitespace() {
+			if !out.isEmpty() then out.push(" ")
+			out.push(word)
+		}
+		return move out
+	}
+
+	fn span(lo: i64, hi: i64): Span = Span::new(self.offset(lo), self.offset(hi))
+
+	/// Where `pos` in this file is among the program's files, as a span
+	/// and an edit say it.
+	fn offset(pos: i64): u32 = (self.base + pos) as u32
+
+	var fn push(kind: TokenKind, lo: i64, hi: i64) = {
+		val span = self.span(lo, hi)
+		val lineStart = self.lineStart
+		self.lineStart = false
+		self.tokens.push(Token(kind: move kind, span: span, lineStart: lineStart))
+	}
+
+	var fn report(diagnostic: Diagnostic) = self.diagnostics.push(move diagnostic)
+
+	var fn skipTrivia() = {
+		while true {
+			match self.byte(0) {
+				.Some(b'\n') => {
+					self.pos += 1
+					self.lineStart = true
+				}
+				.Some(b' ' | b'\t' | b'\r') => self.pos += 1
+				.Some(b'/') if self.byte(1) == .Some(b'/') => {
+					self.pos = match self.rest().find("\n") {
+						.Some(offset) => self.pos + offset
+						.None => self.src.len()
+					}
+				}
+				_ => break
+			}
+		}
+	}
+
+	var fn ident(start: i64) = {
+		self.eatIdent()
+		val text = self.src[start..self.pos]
+		val kind = if text == "_" {
+			TokenKind::Underscore
+		} else {
+			match TokenKind::keyword(text) {
+				.Some(keyword) => keyword
+				.None => .Ident(symbol: self.interner.intern(text))
+			}
+		}
+		self.push(kind, start, self.pos)
+	}
+
+	var fn number(start: i64) = {
+		// `0x`, `0o` and `0b`.
+		if self.byte(0) == .Some(b'0') {
+			val base = match self.byte(1) {
+				.Some(b'x') => 16
+				.Some(b'o') => 8
+				.Some(b'b') => 2
+				_ => 0
+			}
+			if base != 0 {
+				self.pos += 2
+				self.basedNumber(start, base)
+				return
+			}
+		}
+		self.digits(10)
+		val intEnd = self.pos
+		val intText = self.src[start..intEnd]
+		if intText.len() > 1 && intText.startsWith("0") {
+			// Keep at least one digit: `00` becomes `0`, `007` becomes `7`,
+			// and `0_1` becomes `1`.
+			var zeros = 0
+			while zeros < intText.len() - 1 && intText[zeros] is b'0' | b'_' {
+				zeros += 1
+			}
+			val fixed = self.src[start + zeros..intEnd]
+			val diagnostic = Diagnostic::error(
+				LEADING_ZERO,
+				"number literal has a leading zero",
+				self.span(start, intEnd),
+				"leading zero",
+			).withNote(
+				"in C a leading zero makes a literal octal; Wip rejects it so the literal means the same thing to every reader, and writes octal `0o755`",
+			).withFix(
+				"remove the leading zeros: `\(fixed)`",
+				own [Edit::replace(self.span(start, start + zeros), "")],
+			)
+			self.report(move diagnostic)
+		}
+
+		var isFloat = false
+		if self.byte(0) == .Some(b'.') {
+			match self.byte(1) {
+				.Some(b) if b is b'0'..=b'9' => {
+					self.pos += 1
+					self.digits(10)
+					isFloat = true
+				}
+				// `1.foo` is an integer followed by a field access.
+				.Some(b) if b is b'a'..=b'z' | b'A'..=b'Z' | b'_' => {}
+				// `1..2` is an integer followed by `..`.
+				.Some(b'.') => {}
+				_ => {
+					self.pos += 1
+					isFloat = true
+					val digits = self.src[start..self.pos]
+					val diagnostic = Diagnostic::error(
+						FLOAT_MISSING_FRACTION,
+						"expected a digit after the decimal point",
+						self.span(start, self.pos),
+						"float literal needs a fractional part",
+					).withFix(
+						"add a zero: `\(digits)0`",
+						own [Edit::insert(self.offset(self.pos), "0")],
+					)
+					self.report(move diagnostic)
+				}
+			}
+		}
+
+		if self.byte(0) is .Some(b'e' | b'E') {
+			val firstDigit = if self.byte(1) is .Some(b'+' | b'-') then 2 else 1
+			if self.byte(firstDigit) is .Some(b'0'..=b'9') {
+				self.pos += firstDigit
+				self.digits(10)
+				isFloat = true
+			}
+		}
+
+		val end = self.pos
+		self.suffix(start, end, true)
+		self.push(if isFloat then .Float else .Int, start, end)
+	}
+
+	/// The digits of a number after `0x`, `0o` or `0b`.
+	var fn basedNumber(start: i64, base: i64) = {
+		val digitsStart = self.pos
+		self.digits(base)
+		val prefix = self.src[start..digitsStart]
+		if base < 10 && self.byte(0) is .Some(b'0'..=b'9') {
+			// A decimal digit the base does not allow: `0b102`, `0o9`.
+			val bad = self.pos
+			while self.byte(0) is .Some(b'0'..=b'9' | b'_') {
+				self.pos += 1
+			}
+			val (name, digits) =
+				if base == 2 then ("a binary", "binary digits are 0 and 1")
+				else ("an octal", "octal digits are 0 to 7")
+			val diagnostic = Diagnostic::error(
+				NUMBER_BASE,
+				"invalid digit in \(name) literal",
+				self.span(bad, self.pos),
+				"not \(name) digit",
+			).withNote(digits)
+			self.report(move diagnostic)
+		} else if self.pos == digitsStart {
+			self.eatIdent()
+			val diagnostic = Diagnostic::error(
+				NUMBER_BASE,
+				"`\(prefix)` needs digits after it",
+				self.span(start, self.pos),
+				"no digits",
+			).withHelp("for example `\(prefix)0`")
+			self.report(move diagnostic)
+		}
+		val end = self.pos
+		self.suffix(start, end, false)
+		self.push(.Int, start, end)
+	}
+
+	/// Digits of `base`, with single `_` separators between
+	/// them. A run of several `_` is reported, with a fix
+	/// that keeps one. A `_` with no digit after it is not part of the
+	/// number; `suffix` reports it.
+	var fn digits(base: i64) = {
+		while true {
+			match self.byte(0) {
+				.Some(b) if isDigitOf(b, base) => self.pos += 1
+				.Some(b'_') if self.pos > 0 && isDigitOf(self.src[self.pos - 1], base) => {
+					var run = 0
+					while self.byte(run) == .Some(b'_') {
+						run += 1
+					}
+					if !(self.byte(run) is .Some(b) && isDigitOf(b, base)) then return
+					if run > 1 {
+						val span = self.span(self.pos, self.pos + run)
+						val diagnostic = Diagnostic::error(
+							DIGIT_SEPARATOR,
+							"digits are separated by one `_`",
+							span,
+							"more than one `_`",
+						).withFix("keep one `_`", own [Edit::replace(span, "_")])
+						self.report(move diagnostic)
+					}
+					self.pos += run
+				}
+				_ => return
+			}
+		}
+	}
+
+	/// Reports identifier characters that run into the number ending at
+	/// `end`: `12abc`, `3e`, `1_`.
+	var fn suffix(start: i64, end: i64, decimal: bool) = {
+		if !(self.byte(0) is .Some(b) && isIdentContinue(b)) then return
+		self.eatIdent()
+		val suffix = self.src[end..self.pos]
+		if isUnderscores(suffix) {
+			val span = self.span(end, self.pos)
+			val diagnostic = Diagnostic::error(
+				DIGIT_SEPARATOR,
+				"a number cannot end with `_`",
+				span,
+				"not between two digits",
+			).withFix("remove it", own [Edit::replace(span, "")])
+			self.report(move diagnostic)
+			return
+		}
+		val diagnostic = Diagnostic::error(
+			NUMBER_SUFFIX,
+			"invalid suffix `\(suffix)` on number literal",
+			self.span(end, self.pos),
+			"not part of the number",
+		)
+		if decimal && (suffix == "e" || suffix == "E") {
+			val digits = self.src[start..end]
+			self.report(
+				diagnostic.withFix(
+					"an exponent needs digits: `\(digits)\(suffix)0`",
+					own [Edit::insert(self.offset(self.pos), "0")],
+				),
+			)
+		} else {
+			self.report(
+				diagnostic.withHelp(
+					"a number cannot run into a name; separate them with an operator",
+				),
+			)
+		}
+	}
+
+	var fn string(start: i64) = {
+		self.pos += 1
+		self.stringPiece(start, true, .None)
+	}
+
+	/// A text block: `"""` at the end of a line, the lines
+	/// of the text, and `"""` first on a line of its own. The closing
+	/// `"""`'s indentation is taken off every line, and the line breaks
+	/// after the opening and before the closing are not part of the text.
+	var fn textBlock(start: i64) = {
+		self.pos += 3
+		val lineEnd = match self.rest().find("\n") {
+			.Some(at) => self.pos + at
+			.None => self.src.len()
+		}
+		if !isBlank(self.src[self.pos..lineEnd]) {
+			val diagnostic = Diagnostic::error(
+				TEXT_BLOCK,
+				"a text block begins on the line after its `\"\"\"`",
+				self.span(self.pos, lineEnd),
+				"text on the opening line",
+			).withNote(
+				"a text block is the lines between its `\"\"\"`s; one line of text is a string, `\"…\"`",
+			).withFix("start the text on the next line", own [
+				Edit::insert(self.offset(self.pos), "\n"),
+			])
+			self.report(move diagnostic)
+		}
+		// The closing `"""` is the first that begins a line, after the
+		// line's indentation.
+		var line = lineEnd + 1
+		var found: Option<TextBlock> = .None
+		while line <= self.src.len() {
+			val rest = self.src[line..self.src.len()]
+			var indent = 0
+			while indent < rest.len() && rest[indent] is b' ' | b'\t' {
+				indent += 1
+			}
+			if rest[indent..rest.len()].startsWith("\"\"\"") {
+				found = .Some(TextBlock(line: line, close: line + indent))
+				break
+			}
+			match rest.find("\n") {
+				.Some(at) => line += at + 1
+				.None => break
+			}
+		}
+		val .Some(block) = found else {
+			self.gaps.push(Span::at(self.offset(self.src.len())))
+			val diagnostic = Diagnostic::error(
+				UNTERMINATED_STRING,
+				"unterminated text block",
+				self.span(start, start + 3),
+				"this text block is never closed",
+			).withHelp(
+				"end it with `\"\"\"` at the start of a line of its own, after the line's indentation",
+			)
+			self.report(move diagnostic)
+			self.pos = self.src.len()
+			val symbol = self.interner.intern("")
+			self.push(.Str(symbol: symbol), start, self.pos)
+			return
+		}
+		if lineEnd + 1 == block.line {
+			// Nothing between the two: the empty text.
+			self.pos = block.close + 3
+			val symbol = self.interner.intern("")
+			self.push(.Str(symbol: symbol), start, self.pos)
+			return
+		}
+		self.pos = lineEnd + 1
+		self.buf.clear()
+		self.blockIndentation(block)
+		self.blockPiece(start, true, block)
+	}
+
+	/// At the start of a line of a text block: steps over the indentation
+	/// the closing `"""` has, which is not part of the text. A line of
+	/// nothing but space is an empty one; any other must begin with that
+	/// indentation.
+	var fn blockIndentation(block: TextBlock) = {
+		val indent = self.src[block.line..block.close]
+		val rest = self.rest()
+		if rest.startsWith(indent) {
+			self.pos += indent.len()
+			return
+		}
+		var space = 0
+		while space < rest.len() && rest[space] is b' ' | b'\t' | b'\r' {
+			space += 1
+		}
+		val blank = space == rest.len() || rest[space] == b'\n'
+		if !blank {
+			val diagnostic = Diagnostic::error(
+				TEXT_BLOCK,
+				"a line of a text block is indented less than its closing `\"\"\"`",
+				self.span(self.pos, self.pos + space),
+				"less than the closing `\"\"\"`",
+			).withNote(
+				"the closing `\"\"\"`'s indentation is taken off every line of the text, so each line begins with it",
+			)
+			self.report(move diagnostic)
+		}
+		self.pos += space
+	}
+
+	/// One piece of a text block, as `stringPiece` is of a string: up to
+	/// `\(`, or to the closing `"""`. Space at the end of a line is not
+	/// part of the text; an escape, `\t` or `\u{20}`, keeps it.
+	var fn blockPiece(start: i64, first: bool, block: TextBlock) = {
+		// Where the text of this line begins in `buf`, or ends what an
+		// escape wrote: only the space after it is taken off.
+		var kept = self.buf.len()
+		var interpolates = false
+		while true {
+			if self.pos >= block.close {
+				// An interpolation ran past the end of the block.
+				self.unterminated(start)
+				break
+			}
+			match self.peekChar() {
+				.Some('\n') => {
+					while self.buf.len() > kept &&
+						self.buf.toStr()[self.buf.len() - 1] is b' ' | b'\t' | b'\r' {
+						self.buf.popChar()
+					}
+					if self.pos + 1 == block.line {
+						self.pos = block.close + 3
+						break
+					}
+					self.buf.pushChar('\n')
+					self.pos += 1
+					self.blockIndentation(block)
+					kept = self.buf.len()
+				}
+				.Some('"') if self.rest().startsWith("\"\"\"") => {
+					val diagnostic = Diagnostic::error(
+						TEXT_BLOCK,
+						"a text block cannot hold `\"\"\"`",
+						self.span(self.pos, self.pos + 3),
+						"three quotes",
+					).withFix("escape the first quote: `\\\"\"\"`", own [
+						Edit::insert(self.offset(self.pos), "\\"),
+					])
+					self.report(move diagnostic)
+					self.buf.push("\"\"\"")
+					self.pos += 3
+				}
+				.Some('\\') if self.byte(1) == .Some(b'(') => {
+					self.pos += 2
+					interpolates = true
+					break
+				}
+				.Some('\\') if self.byte(1) is .Some(b'\n' | b'\r') => {
+					val diagnostic = Diagnostic::error(
+						TEXT_BLOCK,
+						"a backslash ends this line of a text block",
+						self.span(self.pos, self.pos + 1),
+						"escapes nothing",
+					).withHelp("the line break is part of the text; write `\\\\` for a backslash")
+					self.report(move diagnostic)
+					self.pos += 1
+				}
+				.Some('\\') => {
+					self.escape()
+					kept = self.buf.len()
+				}
+				.Some(c) => {
+					self.buf.pushChar(c)
+					self.pos += c.utf8Len()
+				}
+				.None => {
+					self.unterminated(start)
+					break
+				}
+			}
+		}
+		val symbol = self.interner.intern(self.buf.toStr())
+		self.buf.clear()
+		self.push(pieceKind(symbol, first, interpolates), start, self.pos)
+		if interpolates then self.interp.push((0, .Some(block)))
+	}
+
+	/// One piece of a literal: the text up to `\(`, which begins an
+	/// interpolation, or up to the closing quote, which ends the literal.
+	/// `first` says whether the piece begins the literal,
+	/// which is what tells a plain literal from an interpolated one; a
+	/// piece of a text block is the block's own.
+	var fn stringPiece(start: i64, first: bool, block: Option<TextBlock>) = {
+		self.buf.clear()
+		if block is .Some(block) {
+			self.blockPiece(start, first, block)
+			return
+		}
+		var interpolates = false
+		while true {
+			match self.peekChar() {
+				.Some('"') => {
+					self.pos += 1
+					break
+				}
+				.None | .Some('\n') => {
+					self.unterminated(start)
+					break
+				}
+				// `\(`: the text so far ends here, and an expression
+				// follows.
+				.Some('\\') if self.byte(1) == .Some(b'(') => {
+					self.pos += 2
+					interpolates = true
+					break
+				}
+				.Some('\\') => self.escape()
+				.Some(c) => {
+					self.buf.pushChar(c)
+					self.pos += c.utf8Len()
+				}
+			}
+		}
+		val symbol = self.interner.intern(self.buf.toStr())
+		self.push(pieceKind(symbol, first, interpolates), start, self.pos)
+		if interpolates then self.interp.push((0, .None))
+	}
+
+	var fn escape() = {
+		val start = self.pos
+		self.pos += 1
+		val value = match self.peekChar() {
+			.Some('n') => '\n'
+			.Some('t') => '\t'
+			.Some('r') => '\r'
+			.Some('0') => '\0'
+			.Some('\\') => '\\'
+			.Some('"') => '"'
+			.Some('\'') => '\''
+			// `\u{1F600}`: a character by its number.
+			.Some('u') if self.byte(1) == .Some(b'{') => {
+				self.unicodeEscape(start)
+				return
+			}
+			// A backslash at the end of the line or file: the string loop
+			// reports the literal as unterminated.
+			.None | .Some('\n') => return
+			.Some(other) => {
+				self.pos += other.utf8Len()
+				val diagnostic = Diagnostic::error(
+					UNKNOWN_ESCAPE,
+					"unknown escape sequence `\\\(other)`",
+					self.span(start, self.pos),
+					"unknown escape",
+				).withHelp(
+					"the escapes are `\\n`, `\\t`, `\\r`, `\\0`, `\\\\`, `\\\"`, `\\'` and `\\u{…}`",
+				).withFix(
+					"to write a backslash, escape it: `\\\\\(other)`",
+					own [Edit::insert(self.offset(start), "\\")],
+				)
+				self.report(move diagnostic)
+				self.buf.pushChar('\\')
+				self.buf.pushChar(other)
+				return
+			}
+		}
+		self.pos += 1
+		self.buf.pushChar(value)
+	}
+
+	/// `\u{1F600}`, with `self.pos` at the `u`: one to six hex digits,
+	/// naming a Unicode scalar value.
+	var fn unicodeEscape(start: i64) = {
+		self.pos += 2
+		val digitsStart = self.pos
+		while self.byte(0) is .Some(b) && isDigitOf(b, 16) {
+			self.pos += 1
+		}
+		val digits = self.src[digitsStart..self.pos]
+		val closed = self.byte(0) == .Some(b'}')
+		if closed then self.pos += 1
+		var scalar: Option<char> = .None
+		if closed && !digits.isEmpty() && digits.len() <= 6 then
+			scalar = char::fromInt(hexValue(digits))
+		match scalar {
+			.Some(c) => self.buf.pushChar(c)
+			.None => {
+				val diagnostic = Diagnostic::error(
+					UNKNOWN_ESCAPE,
+					"`\\u{…}` needs a Unicode scalar value",
+					self.span(start, self.pos),
+					if !closed || digits.isEmpty() then "one to six hex digits, then `}`"
+					else "not a character: past 10FFFF, or a surrogate",
+				).withHelp("write the character's number in hex: `\\u{e9}` is `é`")
+				self.report(move diagnostic)
+				self.buf.pushChar('\u{FFFD}')
+			}
+		}
+	}
+
+	/// `b'x'`: the byte of one ASCII character, read as a character is.
+	/// One past `7F` is an error that says how a byte
+	/// that is not a character is written.
+	var fn byteLiteral(start: i64) = {
+		self.pos += 1
+		val value = self.quoted(start + 1, true)
+		var byte: u8 = 0
+		if value < 0x80 {
+			byte = value as u8
+		} else {
+			val escaped = self.src[start..self.pos].contains("\\")
+			val diagnostic = Diagnostic::error(
+				BYTE_LITERAL,
+				"a byte literal holds one ASCII character",
+				self.span(start, self.pos),
+				"not ASCII",
+			)
+			val helped = match char::fromInt(value as i64) {
+				// `b'é'`: a character, whose UTF-8 is more than one
+				// byte.
+				.Some(
+					c,
+				) if !escaped => diagnostic.withHelp("`'\(c)'` is a character, a `char`; in UTF-8 it is \(c.utf8Len()) bytes")
+				_ if value <=
+					0xFF => diagnostic.withHelp("a byte past 127 is written as its number: `0x\(value, radix: 16, upper: true, width: 2, fill: '0')`")
+				_ => diagnostic.withHelp(
+					"a byte is a number up to 255, and past 127 it is written as one: `0xE9`",
+				)
+			}
+			self.report(
+				helped.withNote(
+					"`b'x'` is the byte of an ASCII character, which is what every byte below 128 is in UTF-8",
+				),
+			)
+		}
+		self.push(.Byte(value: byte), start, self.pos)
+	}
+
+	/// `'x'`: one character, with `quote` at the `'`, or
+	/// the `'x'` of a byte literal, `b'x'`, which is written the same way.
+	/// An escape is read as in a string. What holds none,
+	/// or more than one, is an error that says which, and lexing continues
+	/// with what was there.
+	var fn quoted(quote: i64, byte: bool): u32 = {
+		val start = quote
+		// The whole literal, `b` included, and what it is called.
+		val (whole, what) =
+			if byte then (quote - 1, "a byte literal") else (quote, "a character literal")
+		self.pos += 1
+		self.buf.clear()
+		var closed = false
+		while true {
+			match self.peekChar() {
+				.Some('\'') => {
+					self.pos += 1
+					closed = true
+					break
+				}
+				.None | .Some('\n') => {
+					val diagnostic = Diagnostic::error(
+						SINGLE_QUOTES,
+						"unterminated \(what[2..what.len()])",
+						self.span(whole, start + 1),
+						"this character is never closed",
+					).withHelp(
+						"add the closing `'`; text of more than one character is written in double quotes",
+					)
+					self.report(move diagnostic)
+					break
+				}
+				.Some('\\') => self.escape()
+				.Some(c) => {
+					self.buf.pushChar(c)
+					self.pos += c.utf8Len()
+				}
+			}
+		}
+		val text = self.buf.toStr()
+		val first: Option<char> = if text.isEmpty() then .None else .Some(text.charAt(0).0)
+		val more = !text.isEmpty() && text.charAt(0).1 < text.len()
+		// Reported as unterminated already.
+		if !closed then
+			return match first {
+				.Some(c) => c as u32
+				.None => 0
+			}
+		val .Some(c) = first else {
+			val diagnostic = Diagnostic::error(
+				SINGLE_QUOTES,
+				"\(what) holds one character",
+				self.span(whole, self.pos),
+				"holds none",
+			).withHelp(
+				if byte then "`b' '` is a space" else "`' '` is a space, and `\"\"` the empty text",
+			)
+			self.report(move diagnostic)
+			return 0
+		}
+		if !more then return c as u32
+		val contents = self.src[start + 1..self.pos - 1]
+		var diagnostic = Diagnostic::error(
+			SINGLE_QUOTES,
+			"\(what) holds one character",
+			self.span(whole, self.pos),
+			"holds more than one",
+		).withNote(
+			if byte then
+				"a byte literal is the byte of one ASCII character; text, which is bytes, is written in double quotes"
+			else "a character is one Unicode scalar value; a letter written with a mark after it may be two",
+		)
+		if !contents.contains("\"") && self.src[0..self.pos].endsWith("'") then
+			diagnostic = diagnostic.withFix(
+				"write text in double quotes: `\"\(contents)\"`",
+				own [
+					Edit::replace(self.span(whole, start + 1), "\""),
+					Edit::replace(self.span(self.pos - 1, self.pos), "\""),
+				],
+			)
+		self.report(move diagnostic)
+		return c as u32
+	}
+
+	var fn unterminated(start: i64) = {
+		self.gaps.push(Span::at(self.offset(self.pos)))
+		val atEof = self.pos == self.src.len()
+		val diagnostic = Diagnostic::error(
+			UNTERMINATED_STRING,
+			"unterminated string literal",
+			self.span(start, start + 1),
+			"this string is never closed",
+		).withHelp(
+			if atEof then "add the closing `\"`"
+			else "add the closing `\"`; a string cannot span lines, so write `\\n` for a newline",
+		)
+		self.report(move diagnostic)
+	}
+
+	/// Lexes a punctuation token at `start`. Returns false if the character
+	/// there is not punctuation.
+	var fn punct(start: i64): bool = {
+		val .Some(b) = self.byte(0) else {
+			return false
+		}
+		if b == b'~' {
+			val diagnostic = Diagnostic::error(
+				TILDE,
+				"`~` is not an operator",
+				self.span(start, start + 1),
+				"not an operator",
+			).withNote(
+				"`!` flips every bit of an integer, as it negates a `bool`",
+			).withFix("write `!`", own [Edit::replace(self.span(start, start + 1), "!")])
+			self.report(move diagnostic)
+			self.pos += 1
+			self.push(.Bang, start, self.pos)
+			return true
+		}
+		val found: (TokenKind, i64) = match (b, self.byte(1)) {
+			(b'{', _) => (.LBrace, 1)
+			(b'}', _) => (.RBrace, 1)
+			(b'(', _) => (.LParen, 1)
+			(b')', _) => (.RParen, 1)
+			(b'[', _) => (.LBracket, 1)
+			(b']', _) => (.RBracket, 1)
+			(b',', _) => (.Comma, 1)
+			(b';', _) => (.Semi, 1)
+			(b'.', .Some(b'.')) if self.byte(2) == .Some(b'.') => (.DotDotDot, 3)
+			(b'.', .Some(b'.')) if self.byte(2) == .Some(b'=') => (.DotDotEq, 3)
+			(b'.', .Some(b'.')) => (.DotDot, 2)
+			(b'.', _) => (.Dot, 1)
+			(b'+', .Some(b'=')) => (.PlusEq, 2)
+			// `+%`, `-%` and `*%` wrap rather than panic.
+			(b'+', .Some(b'%')) => (.PlusPercent, 2)
+			(b'+', _) => (.Plus, 1)
+			(b'*', .Some(b'%')) => (.StarPercent, 2)
+			(b'*', .Some(b'=')) => (.StarEq, 2)
+			(b'*', _) => (.Star, 1)
+			(b'/', .Some(b'=')) => (.SlashEq, 2)
+			(b'/', _) => (.Slash, 1)
+			(b'%', .Some(b'=')) => (.PercentEq, 2)
+			(b'%', _) => (.Percent, 1)
+			(b':', .Some(b':')) => (.ColonColon, 2)
+			(b':', _) => (.Colon, 1)
+			(b'-', .Some(b'>')) => (.Arrow, 2)
+			(b'-', .Some(b'=')) => (.MinusEq, 2)
+			(b'-', .Some(b'%')) => (.MinusPercent, 2)
+			(b'-', _) => (.Minus, 1)
+			(b'=', .Some(b'=')) => (.EqEq, 2)
+			(b'=', .Some(b'>')) => (.FatArrow, 2)
+			(b'=', _) => (.Eq, 1)
+			(b'!', .Some(b'=')) => (.BangEq, 2)
+			(b'!', _) => (.Bang, 1)
+			(b'<', .Some(b'=')) => (.LtEq, 2)
+			(b'<', _) => (.Lt, 1)
+			(b'>', .Some(b'=')) => (.GtEq, 2)
+			(b'>', _) => (.Gt, 1)
+			(b'&', .Some(b'&')) => (.AmpAmp, 2)
+			(b'&', .Some(b'=')) => (.AmpEq, 2)
+			(b'&', _) => (.Amp, 1)
+			(b'|', .Some(b'|')) => (.PipePipe, 2)
+			(b'|', .Some(b'=')) => (.PipeEq, 2)
+			(b'|', _) => (.Pipe, 1)
+			(b'?', _) => (.Question, 1)
+			(b'@', _) => (.At, 1)
+			(b'^', .Some(b'=')) => (.CaretEq, 2)
+			(b'^', _) => (.Caret, 1)
+			_ => return false
+		}
+		val (kind, len) = found
+		self.pos += len
+		self.push(kind, start, self.pos)
+		return true
+	}
+
+	/// Reports a run of characters that cannot start a token, as one
+	/// diagnostic, and skips it.
+	var fn unexpected(start: i64) = {
+		while self.peekChar() is .Some(c) {
+			if self.pos > start && startsToken(c) then break
+			self.pos += c.utf8Len()
+		}
+		val text = self.src[start..self.pos]
+		val span = self.span(start, self.pos)
+		self.gaps.push(span)
+		var shown = String()
+		for c in text.chars() {
+			if isControl(c) || c.isWhitespace() then
+				shown.push("\\u{\(c as u32, radix: 16, width: 4, fill: '0')}")
+			else shown.pushChar(c)
+		}
+		if text.isEmpty() then panic("unexpected() called at end of input")
+		val (first, width) = text.charAt(0)
+		val single = width == text.len()
+		val message =
+			if single then "unexpected character `\(shown)`" else "unexpected characters `\(shown)`"
+		val diagnostic = Diagnostic::error(
+			UNEXPECTED_CHAR,
+			move message,
+			span,
+			"not part of the language",
+		)
+		if first.isWhitespace() && single then
+			self.report(
+				diagnostic.withFix("replace it with an ordinary space", own [
+					Edit::replace(span, " "),
+				]),
+			)
+		else if first.isLetter() then
+			self.report(
+				diagnostic.withNote("identifiers may contain only ASCII letters, digits and `_`"),
+			)
+		else self.report(move diagnostic)
+	}
+}
+
+/// Whether `text` is one or more `_` and nothing else.
+fn isUnderscores(text: str): bool = {
+	for b in text {
+		if b != b'_' then return false
+	}
+	return true
+}
+
+/// The number `digits` writes in base 16: at most six digits, so it fits.
+fn hexValue(digits: str): i64 = {
+	var value = 0
+	for b in digits {
+		val digit = match b {
+			b'0'..=b'9' => b - b'0'
+			b'a'..=b'f' => b - b'a' + 10
+			_ => b - b'A' + 10
+		}
+		value = value * 16 + digit as i64
+	}
+	return value
+}

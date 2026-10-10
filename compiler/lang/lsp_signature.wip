@@ -1,0 +1,100 @@
+// A call's signature as its arguments are written.
+
+import std::json::{Json}
+import hir::{Program, UNIT}
+import syntax::{Receiver}
+
+/// A call the cursor is in the arguments of, as the text says.
+@derive(Eq, Clone)
+pub struct Call {
+	/// The byte offset where the called name ends: its `(`.
+	pub paren: i64
+	/// Which argument the cursor is at, from zero.
+	pub argument: i64
+	/// Called as a method, `value.name(…)`, whose receiver is not an
+	/// argument.
+	pub method: bool
+}
+
+/// The call whose arguments hold `cursor`: the `(` before it that is not
+/// closed, after a name. The arguments before the cursor are counted by
+/// their commas, not those inside brackets or strings of their own.
+pub fn callAt(text: str, cursor: i64): Option<Call> = {
+	if cursor > text.len() then return .None
+	val before = text[0..cursor]
+	var depth = 0
+	var argument = 0
+	var inString = false
+	var i = before.len()
+	while i > 0 {
+		i -= 1
+		val c = before[i]
+		if inString {
+			if c == '"' as u8 && (i == 0 || before[i - 1] != '\\' as u8) then inString = false
+			continue
+		}
+		if c == '"' as u8 {
+			inString = true
+		} else if c is b')' | b']' | b'}' {
+			depth += 1
+		} else if c is b'[' | b'{' && depth == 0 {
+			return .None
+		} else if c is b'(' | b'[' | b'{' && depth > 0 {
+			depth -= 1
+		} else if c == '(' as u8 {
+			var start = i
+			while start > 0 && lastCharOf(before[0..start]) is .Some(ch) && isWordChar(ch) {
+				start -= ch.utf8Len()
+			}
+			// `(` after no name: a tuple or a grouping.
+			if start == i then return .None
+			return .Some(Call(paren: i, argument: argument, method: before[0..start].endsWith(".")))
+		} else if c == ',' as u8 && depth == 0 {
+			argument += 1
+		}
+	}
+	return .None
+}
+
+/// The signature help for `call`, from a program checked with the file at
+/// `base`: nothing where the name before the `(` is not a function.
+pub fn signatureHelp(loaded: &Loaded, program: &Program, base: u32, call: &Call): Option<Json> = {
+	val hit = hitAt(&program, &loaded.interner, base + call.paren as u32 - 1)?
+	val .Fn(id) = hit.target else {
+		return .None
+	}
+	val def = &program.fns[id]
+	val interner = &loaded.interner
+	val takesReceiver = !(def.receiver is .None | .Some(.Static))
+	val skip = if call.method && takesReceiver then 1 else 0
+	var params: Vec<String> = Vec()
+	for (at, p) in def.params.forwards().enumerate() {
+		if at >= skip then
+			params.push("\(interner.resolve(p.name)): \(program.tyName(p.ty, &interner))")
+	}
+	var label = "\(interner.resolve(def.name))(\(params.join(", ")))"
+	if def.ret != UNIT then label.push(": \(program.tyName(def.ret, &interner))")
+	val docs = match loaded.sources.of(def.nameSpan) {
+		.Some((_, text, at)) => documentation(text, (def.nameSpan.lo - at) as i64)
+		.None => String()
+	}
+	var labels: Vec<Json> = Vec()
+	for p in params {
+		labels.push(object([("label", jsonText(p.toStr()))]))
+	}
+	var signature = object([("label", Json::Text(move label)), ("parameters", .Array(move labels))])
+	if !docs.isEmpty() then
+		signature = withField(
+			move signature,
+			"documentation",
+			object([("kind", jsonText("markdown")), ("value", .Text(move docs))]),
+		)
+	val last = if params.isEmpty() then 0 else params.len() - 1
+	return .Some(
+		object([
+			("signatures", Json::Array(Vec::of(own [move signature]))),
+			("activeSignature", .Int(0)),
+			("activeParameter", .Int(if call.argument < last then call.argument else last)),
+		]),
+	)
+}

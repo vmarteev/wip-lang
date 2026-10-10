@@ -1,0 +1,707 @@
+// What the server answers with: a program's diagnostics and their fixes, a
+// file laid out by `wip fmt`, a file's outline, and what a name at a place
+// is, where it was declared and where else it is named.
+
+import std::collections::{Map, Set}
+import std::fs
+import std::json::{Json}
+import std::path
+import fmt::{format as formatText, switchedOff}
+import hir::{Program}
+import syntax::{Diagnostic, FnDecl, Interner, Item, Name, Span}
+
+/// A diagnostic's fix, as the editor offers it: a title, the diagnostic, and
+/// the edits, by file.
+pub struct QuickFix {
+	pub title: String
+	pub diagnostic: Json
+	pub changes: Json
+}
+
+/// A file the editor has open: its URI, its path, and its text.
+pub struct OpenFile {
+	pub uri: String
+	pub path: String
+	pub var text: String
+}
+
+/// What is wrong, by file, and what can be fixed.
+pub struct Found {
+	pub var diagnostics: Map<String, Vec<Json>> = Map()
+	pub var fixes: Map<String, Vec<QuickFix>> = Map()
+	/// Each program checked, to answer what its names mean.
+	pub var programs: Vec<(Loaded, Program)> = Vec()
+}
+
+/// Checks the programs of the open files. A file no program reaches — one
+/// of the standard library's, or a module nothing imports — is only parsed.
+pub fn diagnosticsOf(
+	open: &[OpenFile],
+	overlay: &Overlay,
+	known: &var Map<String, String>,
+	threads: i64,
+): Found = {
+	var found = Found()
+	var places = Places::of(&open)
+	var roots: Vec<String> = Vec()
+	for file in open {
+		if !inStd(file.path.toStr()) then
+			roots.push(programRoot(file.path.toStr(), &overlay, &var known, threads))
+	}
+	roots.sort()
+	roots.dedup()
+	var reached: Set<String> = Set()
+	var seen: Set<String> = Set()
+	for root in roots {
+		val .Ok(read) = loadOverlaid(root.toStr(), .Tests, &overlay, threads) else {
+			continue
+		}
+		var loaded = move read
+		var timings = Timings()
+		val checked = checkLoaded(&var loaded, &var timings)
+		for (name, _, _) in loaded.sources.entries() {
+			if name.startsWith("/") then reached.add(canonicalFile(name.toStr()))
+		}
+		for diagnostic in checked.diagnostics {
+			// A file two programs share is reported once.
+			if places.place(&loaded.sources, diagnostic.primary.span) is .Some((uri, range)) {
+				val said = "\(uri)\n\(range)\(diagnostic.code.text())\(diagnostic.message)"
+				if seen.add(move said) then found.add(&diagnostic, &loaded.sources, &var places)
+			}
+		}
+		found.programs.push((move loaded, move checked.program))
+	}
+	for file in open {
+		val canonical = canonicalFile(file.path.toStr())
+		if reached.contains(&canonical) then continue
+		val parsed = parseFile(SourceFile(name: file.path.clone(), text: file.text.clone()))
+		val sources = Sources::single(file.path.clone(), file.text.clone())
+		for diagnostic in parsed.diagnostics {
+			found.add(&diagnostic, &sources, &var places)
+		}
+	}
+	return move found
+}
+
+extend Found {
+	var fn add(diagnostic: &Diagnostic, sources: &Sources, places: &var Places) = {
+		val .Some((uri, range)) = places.place(&sources, diagnostic.primary.span) else {
+			return
+		}
+		var message = diagnostic.message.clone()
+		val label = &diagnostic.primary.message
+		if !label.isEmpty() && label != message then message.push(": \(label)")
+		for help in diagnostic.help {
+			message.push("\nhelp: \(help)")
+		}
+		for note in diagnostic.notes {
+			message.push("\nnote: \(note)")
+		}
+		var related: Vec<Json> = Vec()
+		for label in diagnostic.secondary {
+			if places.place(&sources, label.span) is .Some((at, within)) then
+				related.push(
+					object([
+						(
+							"location",
+							object([("uri", jsonText(at.toStr())), ("range", move within)]),
+						),
+						("message", jsonText(label.message.toStr())),
+					]),
+				)
+		}
+		val value = object([
+			("range", range.clone()),
+			("severity", .Int(if diagnostic.severity == .Error then 1 else 2)),
+			("code", jsonText(diagnostic.code.text().toStr())),
+			("source", jsonText("wip")),
+			("message", .Text(move message)),
+			("relatedInformation", .Array(move related)),
+		])
+		if diagnostic.fix is .Some(fix) {
+			var changes: Map<String, Vec<Json>> = Map()
+			for edit in fix.edits {
+				if places.place(&sources, edit.span) is .Some((at, within)) then
+					changes.atOrPut(move at, Vec()).push(
+						object([
+							("range", move within),
+							("newText", jsonText(edit.replacement.toStr())),
+						]),
+					)
+			}
+			self.fixes.atOrPut(uri.clone(), Vec()).push(QuickFix(
+				title: fix.message.clone(),
+				diagnostic: value.clone(),
+				changes: byFile(&changes),
+			))
+		}
+		self.diagnostics.atOrPut(move uri, Vec()).push(move value)
+	}
+}
+
+/// Edits by file, as the protocol writes them: an object of URIs.
+fn byFile(changes: &Map<String, Vec<Json>>): Json = {
+	var fields: Vec<(String, Json)> = Vec()
+	for at in 0..changes.len() {
+		val uri = String::of(changes.keyAt(at).toStr())
+		val .Some(edits) = changes.get(&uri) else {
+			continue
+		}
+		fields.push((move uri, .Array(edits.clone())))
+	}
+	return .Object(move fields)
+}
+
+/// Turns spans into URIs and ranges.
+struct Places {
+	/// The URI of each open file, by its canonical path.
+	uris: Map<String, String>
+	/// A file's name in the sources, and its URI.
+	named: Map<String, Option<String>>
+	/// The compiler's home, where a span in the standard library is.
+	home: Option<String>
+}
+
+extend Places {
+	/// An open file is named by the URI the editor gave it, however else
+	/// its path is written.
+	static fn of(open: &[OpenFile]): Places = {
+		var uris: Map<String, String> = Map()
+		for file in open {
+			uris.put(canonicalFile(file.path.toStr()), file.uri.clone())
+		}
+		val home = match findHome() {
+			.Ok(home) => .Some(move home)
+			.Err(..) => .None
+		}
+		return Places(uris: move uris, named: Map(), home: move home)
+	}
+
+	/// Like `place`, and a span in the standard library is in the home's
+	/// files.
+	var fn locate(sources: &Sources, span: Span): Option<(String, Json)> = {
+		val (name, text, base) = sources.of(span)?
+		if name.startsWith("/") then return self.place(&sources, span)
+		val .Some(home) = self.home else {
+			return .None
+		}
+		val file = path::join(home.toStr(), name)
+		if !isFile(file.toStr()) then return .None
+		return .Some((uriOf(file.toStr()), rangeIn(text, base, span)))
+	}
+
+	/// The file a span is in and its range there; nothing for the standard
+	/// library's files, which are named from the home, not where anything
+	/// is on disk.
+	var fn place(sources: &Sources, span: Span): Option<(String, Json)> = {
+		val (name, text, base) = sources.of(span)?
+		val key = String::of(name)
+		if !self.named.contains(&key) {
+			var uri: Option<String> = .None
+			if name.startsWith("/") {
+				val canonical = canonicalFile(name)
+				uri = .Some(
+					match self.uris.get(&canonical) {
+						.Some(given) => given.clone()
+						.None => uriOf(canonical.toStr())
+					},
+				)
+			}
+			self.named.put(key.clone(), move uri)
+		}
+		val .Some(.Some(uri)) = self.named.get(&key) else {
+			return .None
+		}
+		return .Some((uri.clone(), rangeIn(text, base, span)))
+	}
+}
+
+/// The range of `span` in `text`, which begins at `base`.
+fn rangeIn(text: str, base: u32, span: Span): Json = {
+	val lo = if span.lo > base then (span.lo - base) as i64 else 0
+	val hi = if span.hi > base then (span.hi - base) as i64 else 0
+	return Lines::of(text).range(lo, if hi > lo then hi else lo)
+}
+
+/// The directory of the program a file belongs to: the nearest above it
+/// with a `package.wip`; or else, of the directories above it, one inside
+/// the next, that hold `.wip` files, the highest whose program reaches the
+/// file — where a program's `main.wip` is, above its modules. Each
+/// directory's answer is kept in `known`.
+pub fn programRoot(
+	file: str,
+	overlay: &Overlay,
+	known: &var Map<String, String>,
+	threads: i64,
+): String = {
+	val dir = String::of(path::parent(file))
+	if known.get(&dir) is .Some(root) then return root.clone()
+	val root = findRoot(file, dir.toStr(), &overlay, threads)
+	known.put(move dir, root.clone())
+	return move root
+}
+
+fn findRoot(file: str, dir: str, overlay: &Overlay, threads: i64): String = {
+	var above = dir
+	while true {
+		if isFile(path::join(above, "package.wip").toStr()) then return String::of(above)
+		if above == "/" || above == "." then break
+		above = path::parent(above)
+	}
+	var chain = Vec::of(own [dir])
+	above = dir
+	while above != "/" && above != "." {
+		above = path::parent(above)
+		if !holdsWip(above) then break
+		chain.push(above)
+	}
+	val canonical = canonicalFile(file)
+	// Its own directory reaches it, being its module; a directory above does
+	// only if it imports it.
+	var i = chain.len() - 1
+	while i >= 0 {
+		if chain.len() == 1 || reaches(chain[i], canonical.toStr(), &overlay, threads) then
+			return String::of(chain[i])
+		i -= 1
+	}
+	return String::of(dir)
+}
+
+/// Whether a directory holds a `.wip` file.
+fn holdsWip(dir: str): bool = {
+	val .Ok(entries) = fs::readDir(dir) else {
+		return false
+	}
+	for entry in entries {
+		if path::extension(entry.name.toStr()) == .Some("wip") then return true
+	}
+	return false
+}
+
+/// Whether the program at `root` reads the file whose canonical path is
+/// `file`.
+fn reaches(root: str, file: str, overlay: &Overlay, threads: i64): bool = {
+	val .Ok(loaded) = loadOverlaid(root, .Tests, &overlay, threads) else {
+		return false
+	}
+	for (name, _, _) in loaded.sources.entries() {
+		if name.startsWith("/") && canonicalFile(name.toStr()) == file then return true
+	}
+	return false
+}
+
+/// Whether a file is one of the standard library's, which is in the home
+/// and no program of its own.
+pub fn inStd(file: str): bool = {
+	val .Some(std) = stdDir() else {
+		return false
+	}
+	val canonical = canonicalFile(file)
+	return canonical == std || canonical.startsWith("\(std)/")
+}
+
+/// Where the standard library is on disk: the home's, its links followed.
+fn stdDir(): Option<String> = {
+	val home = match findHome() {
+		.Ok(home) => move home
+		.Err(..) => return .None
+	}
+	val std = path::join(home.toStr(), "std")
+	return match fs::realPath(std.toStr()) {
+		.Ok(real) => .Some(move real)
+		.Err(..) => .Some(move std)
+	}
+}
+
+/// The program that holds `file`, by its place among `programs`, and where
+/// the file's spans begin in it.
+fn holding(programs: &[(Loaded, Program)], file: str): Option<(i64, u32)> = {
+	val canonical = canonicalFile(file)
+	for (at, (loaded, _)) in programs.forwards().enumerate() {
+		for (name, _, base) in loaded.sources.entries() {
+			if name.startsWith("/") && canonicalFile(name.toStr()) == canonical then
+				return .Some((at, base))
+		}
+	}
+	return .None
+}
+
+/// What is at `position` in the open file, in the program that holds it.
+fn hitIn(programs: &[(Loaded, Program)], file: &OpenFile, position: &Json): Option<(i64, Hit)> = {
+	val (at, base) = holding(&programs, file.path.toStr())?
+	val offset = Lines::of(file.text.toStr()).offset(&position)
+	val loaded = &programs[at].0
+	val program = &programs[at].1
+	val hit = hitAt(&program, &loaded.interner, base + offset as u32)?
+	return .Some((at, move hit))
+}
+
+/// What a name is, as Wip would write it, and what its declaration's `///`
+/// comment says.
+pub fn hover(
+	programs: &[(Loaded, Program)],
+	open: &[OpenFile],
+	file: &OpenFile,
+	position: &Json,
+): Json = {
+	val .Some((at, hit)) = hitIn(&programs, &file, &position) else {
+		return .Null
+	}
+	val loaded = &programs[at].0
+	var shown = "```wip\n\(hit.shown)\n```"
+	if hit.declared is .Some(declared) && loaded.sources.of(declared) is .Some((_, text, base)) {
+		val docs = documentation(
+			text,
+			if declared.lo > base then (declared.lo - base) as i64 else 0,
+		)
+		if !docs.isEmpty() then shown.push("\n\n\(docs)")
+	}
+	var places = Places::of(&open)
+	val range = match places.place(&loaded.sources, hit.span) {
+		.Some((_, range)) => move range
+		.None => Json::Null
+	}
+	return object([
+		("contents", object([("kind", jsonText("markdown")), ("value", .Text(move shown))])),
+		("range", move range),
+	])
+}
+
+/// Where a name was declared.
+pub fn definition(
+	programs: &[(Loaded, Program)],
+	open: &[OpenFile],
+	file: &OpenFile,
+	position: &Json,
+): Json = {
+	val .Some((at, hit)) = hitIn(&programs, &file, &position) else {
+		return .Null
+	}
+	val .Some(declared) = hit.declared else {
+		return .Null
+	}
+	var places = Places::of(&open)
+	return match places.locate(&programs[at].0.sources, declared) {
+		.Some((uri, range)) => object([("uri", Json::Text(move uri)), ("range", move range)])
+		.None => .Null
+	}
+}
+
+/// A file as every program names it: its canonical path, or, for one of the
+/// standard library's, the name the compiler gives it.
+fn fileIdentity(name: str): String =
+	if name.startsWith("/") then canonicalFile(name) else String::of(name)
+
+/// Every place that names what is at `position`, in every program checked,
+/// as `(uri, range)`; with the declaration's own name, where `declaration`
+/// says so. Nothing where nothing with a declaration is there.
+fn occurrences(
+	programs: &[(Loaded, Program)],
+	open: &[OpenFile],
+	file: &OpenFile,
+	position: &Json,
+	declaration: bool,
+): Option<Vec<(String, Json)>> = {
+	val (first, hit) = hitIn(&programs, &file, &position)?
+	val declared = hit.declared?
+	val firstLoaded = &programs[first].0
+	val firstProgram = &programs[first].1
+	val (name, _, base) = firstLoaded.sources.of(declared)?
+	// Where it was declared, as every program can find it: each numbers its
+	// files, and its declarations, its own way.
+	val identity = fileIdentity(name)
+	val lo = declared.lo - base
+	val hi = declared.hi - base
+	val written = nameOfTarget(&firstProgram, &firstLoaded.interner, hit.target.clone())?
+	val importedFrom: Option<String> = match importable(
+		&firstProgram,
+		&firstLoaded.interner,
+		hit.target.clone(),
+	) {
+		.Some((_, module)) => .Some(firstProgram.modules[module as i64].clone())
+		.None => .None
+	}
+	var places = Places::of(&open)
+	var found: Vec<(String, Json)> = Vec()
+	for (loaded, program) in programs {
+		var start: Option<u32> = .None
+		for (entry, _, at) in loaded.sources.entries() {
+			if start.isNone() && fileIdentity(entry.toStr()) == identity then start = .Some(at)
+		}
+		val .Some(start) = start else {
+			continue
+		}
+		val here = Span::new(start + lo, start + hi)
+		val sources = &loaded.sources
+		val none: Vec<Span> = Vec()
+		var spans = referencesTo(&program, &loaded.interner, written.toStr(), here, &sources)
+		if !declaration && sources.of(here) is .Some((_, text, at)) {
+			if nameIn(text, at, here, written.toStr(), &none) is .Some(itself) then
+				spans.retain((s) => s != itself)
+		}
+		// `import shapes::{area}` names it too.
+		if importedFrom is .Some(module) {
+			for span in importedAs(&loaded, module.toStr(), written.toStr()) {
+				spans.push(span)
+			}
+		}
+		for span in spans {
+			if places.locate(&loaded.sources, span) is .Some(place) && !found.contains(&place) then
+				found.push(move place)
+		}
+	}
+	return .Some(move found)
+}
+
+/// Where the imports of `loaded`'s modules name the item `name` of the
+/// module `module` in braces.
+fn importedAs(loaded: &Loaded, module: str, name: str): Vec<Span> = {
+	var spans: Vec<Span> = Vec()
+	for importer in loaded.modules {
+		for file in importer.files {
+			for item in file.ast.items {
+				val .Import(decl) = item else {
+					continue
+				}
+				val .Some(items) = decl.items else {
+					continue
+				}
+				var parts: Vec<str> = Vec()
+				for n in decl.path {
+					parts.push(loaded.interner.resolve(n.sym))
+				}
+				val written = parts.join("::")
+				val meant =
+					written == module ||
+					!importer.prefix.isEmpty() && "\(importer.prefix)::\(written)" == module
+				if !meant then continue
+				for one in items {
+					if one.name is .Some(n) && loaded.interner.resolve(n.sym) == name then
+						spans.push(n.span)
+				}
+			}
+		}
+	}
+	return move spans
+}
+
+/// Every place that names what is at a position.
+pub fn references(
+	programs: &[(Loaded, Program)],
+	open: &[OpenFile],
+	file: &OpenFile,
+	position: &Json,
+	declaration: bool,
+): Json = {
+	val .Some(found) = occurrences(&programs, &open, &file, &position, declaration) else {
+		return .Null
+	}
+	var places: Vec<Json> = Vec()
+	for (uri, range) in move found {
+		places.push(object([("uri", jsonText(uri.toStr())), ("range", move range)]))
+	}
+	return .Array(move places)
+}
+
+/// Every place that names what is at a position, renamed `new`: the edits,
+/// or why it cannot be.
+pub fn rename(
+	programs: &[(Loaded, Program)],
+	open: &[OpenFile],
+	file: &OpenFile,
+	position: &Json,
+	new: str,
+): Result<Json, String> = {
+	var isName = !new.isEmpty()
+	for (i, c) in new.chars().enumerate() {
+		val fits = if i == 0 then c.isLetter() || c == '_' else c.isAlphanumeric() || c == '_'
+		if !fits then isName = false
+	}
+	if !isName || isKeyword(new) then return .Err("`\(new)` is not a name")
+	val .Some(found) = occurrences(&programs, &open, &file, &position, true) else {
+		return .Err(String::of("nothing here can be renamed"))
+	}
+	// A place in the library is named from the home, which may reach the
+	// library through a link: each is asked of as the file it is.
+	for (uri, _) in found {
+		if pathOf(uri.toStr()) is .Some(file) && inStd(file.toStr()) then
+			return .Err(String::of("it is declared in the standard library"))
+	}
+	var changes: Map<String, Vec<Json>> = Map()
+	for (uri, range) in move found {
+		changes.atOrPut(move uri, Vec()).push(
+			object([("range", move range), ("newText", jsonText(new))]),
+		)
+	}
+	return .Ok(object([("changes", byFile(&changes))]))
+}
+
+/// The file laid out by `wip fmt`, as one edit; `null` when it cannot be, so
+/// the editor keeps what it has, and no edits for a file that asks to be
+/// left as written.
+pub fn formatted(file: &OpenFile): Json = {
+	val text = file.text.toStr()
+	if switchedOff(text) then return .Array(Vec())
+	val .Ok(style) = formatStyle(file.path.toStr()) else {
+		return .Null
+	}
+	val package = path::name(file.path.toStr()) == "package.wip"
+	return match formatText(text, style, package) {
+		.Ok(laidOut) =>
+			if laidOut == text then Json::Array(Vec())
+			else .Array(
+				Vec::of(own [
+					object([("range", Lines::of(text).whole()), ("newText", .Text(move laidOut))]),
+				]),
+			)
+		.Err(..) => .Null
+	}
+}
+
+// The protocol's numbers for kinds of symbol.
+val NAMESPACE = 3
+val METHOD = 6
+val FIELD = 8
+val ENUM = 10
+val INTERFACE = 11
+val FUNCTION = 12
+val VARIABLE = 13
+val CONSTANT = 14
+val OBJECT = 19
+val ENUM_MEMBER = 22
+val STRUCT = 23
+val TYPE_PARAMETER = 26
+
+/// The file's declarations, and what each holds: its outline.
+pub fn symbols(file: &OpenFile): Json = {
+	val parsed = parseFile(SourceFile(name: file.path.clone(), text: file.text.clone()))
+	val outline = Outline(
+		lines: Lines::of(file.text.toStr()),
+		interner: &parsed.interner,
+		text: file.text.toStr(),
+	)
+	var found: Vec<Json> = Vec()
+	for item in parsed.ast.items {
+		if outline.item(&item) is .Some(symbol) then found.push(move symbol)
+	}
+	return .Array(move found)
+}
+
+view struct Outline {
+	lines: Lines
+	interner: &Interner
+	text: str
+}
+
+extend Outline {
+	fn name(name: &Name): String = String::of(self.interner.resolve(name.sym))
+
+	fn symbol(name: String, kind: i64, span: Span, at: Span, children: Vec<Json>): Json = {
+		// What is selected must be inside what is shown.
+		val lo = if span.lo < at.lo then span.lo else at.lo
+		val hi = if span.hi > at.hi then span.hi else at.hi
+		return object([
+			("name", Json::Text(move name)),
+			("kind", .Int(kind)),
+			("range", self.lines.range(lo as i64, hi as i64)),
+			("selectionRange", self.lines.range(at.lo as i64, at.hi as i64)),
+			("children", .Array(move children)),
+		])
+	}
+
+	fn function(f: &FnDecl): Json = self.symbol(
+		self.name(&f.sig.name),
+		if f.receiver.isSome() then METHOD else FUNCTION,
+		f.span,
+		f.sig.name.span,
+		Vec(),
+	)
+
+	fn item(item: &Item): Option<Json> = match item {
+		// An assert has no name to list.
+		.Import(..) | .Assert(..) => .None
+		.Fn(f) => .Some(self.function(&f))
+		.Val(v) => .Some(self.symbol(self.name(&v.name), CONSTANT, v.span, v.name.span, Vec()))
+		.Type(t) => .Some(
+			self.symbol(self.name(&t.name), TYPE_PARAMETER, t.span, t.name.span, Vec()),
+		)
+		.Struct(s) => {
+			var children: Vec<Json> = Vec()
+			for f in s.fields {
+				children.push(self.symbol(self.name(&f.name), FIELD, f.span, f.name.span, Vec()))
+			}
+			for m in s.methods {
+				children.push(self.function(&m))
+			}
+			.Some(self.symbol(self.name(&s.name), STRUCT, s.span, s.name.span, move children))
+		}
+		.Enum(e) => {
+			var children: Vec<Json> = Vec()
+			for v in e.variants {
+				children.push(
+					self.symbol(self.name(&v.name), ENUM_MEMBER, v.span, v.name.span, Vec()),
+				)
+			}
+			for m in e.methods {
+				children.push(self.function(&m))
+			}
+			.Some(self.symbol(self.name(&e.name), ENUM, e.span, e.name.span, move children))
+		}
+		.Interface(i) => {
+			var children: Vec<Json> = Vec()
+			for m in i.methods {
+				children.push(
+					self.symbol(self.name(&m.sig.name), METHOD, m.span, m.sig.name.span, Vec()),
+				)
+			}
+			.Some(self.symbol(self.name(&i.name), INTERFACE, i.span, i.name.span, move children))
+		}
+		.Extend(x) => {
+			var parts: Vec<String> = Vec()
+			for n in x.path {
+				parts.push(self.name(&n))
+			}
+			var name = match x.sliceOf {
+				.Some(element) => "extend [\(self.name(&element))]"
+				.None => "extend \(parts.join("::"))"
+			}
+			if x.interfaceName is .Some(implemented) {
+				var named: Vec<String> = Vec()
+				for m in x.interfaceModule {
+					named.push(self.name(&m))
+				}
+				named.push(self.name(&implemented))
+				name.push(": \(named.join("::"))")
+			}
+			val at = if x.path.isEmpty() then x.span else x.path[0].span
+			var children: Vec<Json> = Vec()
+			for m in x.methods {
+				children.push(self.function(&m))
+			}
+			.Some(self.symbol(move name, OBJECT, x.span, at, move children))
+		}
+		.Extern(e) => {
+			var children: Vec<Json> = Vec()
+			for f in e.fns {
+				val at = f.sig.name.span
+				children.push(self.symbol(self.name(&f.sig.name), FUNCTION, at, at, Vec()))
+			}
+			for t in e.types {
+				val at = t.name.span
+				children.push(self.symbol(self.name(&t.name), TYPE_PARAMETER, at, at, Vec()))
+			}
+			for g in e.globals {
+				children.push(self.symbol(self.name(&g.name), VARIABLE, g.span, g.name.span, Vec()))
+			}
+			for s in e.structs {
+				if self.item(Item::Struct(s.clone())) is .Some(symbol) then
+					children.push(move symbol)
+			}
+			val abi =
+				if (e.abi.hi as i64) <= self.text.len() && e.abi.lo <= e.abi.hi then
+					self.text[e.abi.lo as i64..e.abi.hi as i64]
+				else ""
+			.Some(self.symbol("extern \(abi)", NAMESPACE, e.span, e.abi, move children))
+		}
+	}
+}

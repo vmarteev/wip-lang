@@ -15,8 +15,8 @@ impl zed::Extension for Wip {
         worktree: &zed::Worktree,
     ) -> zed::Result<zed::Command> {
         let wip = worktree.which("wip").ok_or(
-            "`wip` is not on your PATH: build the compiler with `cargo build --release` \
-             and put its `target/release` on the PATH",
+            "`wip` is not on your PATH: build the compiler with `scripts/bootstrap.sh \
+             --out ~/wip` in Wip's repository, and put `~/wip/bin` on the PATH",
         )?;
         Ok(zed::Command {
             command: wip,

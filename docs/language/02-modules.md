@@ -78,14 +78,17 @@ pub fn area(square: Square): i64 = square.side * square.side
 pub fn biggest(): i64 = 9
 ```
 
-An import is for the file it is written in, not the module: each file says
-what it uses.
+An item is a function, a type, an interface or a constant, and a path names
+any of them where its kind is expected: `shapes::Square` as a type,
+`shapes::area(…)` as a call, `T: shapes::Area` as an interface ([page
+8](08-interfaces.md)). An import is for the file it is written in, not the
+module: each file says what it uses.
 
 ## What `pub` means
 
 Everything is private to its module unless it says `pub`. That holds for
-functions, types, constants, fields, methods and variants of the types that
-have them. A private name is reachable from every
+functions, types, interfaces, constants, fields, methods and variants of the
+types that have them. A private name is reachable from every
 file of its own module and from nowhere else:
 
 ```wip,error=E0210

@@ -1,0 +1,122 @@
+// The bytes of a constant table, which a program keeps once, in read-only
+// data: laid out as a value of its type is anywhere else, by the layouts
+// every backend shares, with the strings in it left for the backend to point
+// at.
+
+import std::mem
+import hir::{ConstId, ConstValue, Program, Ty}
+import syntax::{Interner, Symbol}
+
+/// A table's bytes, and where in them each string's address goes: a `str` is
+/// its bytes' address and their length, a `cstring` the address of bytes
+/// that end in a NUL, and only the backend knows where those bytes are.
+pub struct TableBytes {
+	pub bytes: Vec<u8>
+	pub strings: Vec<(u32, Symbol)>
+	/// Where the address of each file's bytes goes, the bytes, which the
+	/// backend keeps too, and the constant they were embedded as, which says
+	/// two places hold one file's.
+	pub blobs: Vec<(u32, Vec<u8>, ConstId)>
+}
+
+/// The bytes of `value`, a constant of type `ty`, for a target whose words
+/// are little-endian or not.
+pub fn tableBytes(
+	program: &Program,
+	interner: &Interner,
+	layouts: &var Layouts,
+	value: &ConstValue,
+	ty: Ty,
+	littleEndian: bool,
+): TableBytes = {
+	val size = layouts.of(&program, ty).size
+	var bytes: Vec<u8> = Vec()
+	for _ in 0..size {
+		bytes.push(0)
+	}
+	// The writer keeps the layouts while it writes, and gives them back.
+	var writer = Writer(
+		program: &program,
+		interner: &interner,
+		layouts: mem::replace(&var layouts, Layouts()),
+		littleEndian: littleEndian,
+		table: TableBytes(bytes: move bytes, strings: Vec(), blobs: Vec()),
+	)
+	writer.write(&value, ty, 0)
+	layouts = move writer.layouts
+	return move writer.table
+}
+
+view struct Writer {
+	program: &Program
+	interner: &Interner
+	layouts: Layouts
+	littleEndian: bool
+	table: TableBytes
+}
+
+extend Writer {
+	/// The low `size` bytes of `bits`, at `at`, in the target's order.
+	var fn put(at: u32, size: u32, bits: u128) = {
+		for i in 0..(size as i64) {
+			val shift = if self.littleEndian then i else (size as i64) - 1 - i
+			self.table.bytes[(at as i64) + i] = ((bits >> (8 * shift) as u128) & 0xFF) as u8
+		}
+	}
+
+	/// Writes `value`, of type `ty`, at `offset`.
+	var fn write(value: &ConstValue, ty: Ty, offset: u32) = {
+		val program = self.program
+		match value {
+			.Int(bits) => {
+				val size = self.layouts.of(&program, ty).size
+				self.put(offset, size, bits)
+			}
+			.Bool(on) => self.put(offset, 1, if on then 1 else 0)
+			.Float(number) => match program.types.kind(ty) {
+				.Float(float: .F32) => self.put(offset, 4, (number as f32).toBits() as u128)
+				_ => self.put(offset, 8, number.toBits() as u128)
+			}
+			.Str(symbol) => {
+				self.table.strings.push((offset, symbol))
+				if program.types.kind(ty) is .Str {
+					val len = self.interner.resolve(symbol).len() as u128
+					self.put(offset + 8, 8, len)
+				}
+			}
+			// A file's bytes: their address, left to the backend, and how many
+			// there are.
+			.Bytes(bytes, origin) => {
+				self.table.blobs.push((offset, bytes.clone(), origin))
+				self.put(offset + 8, 8, bytes.len() as u128)
+			}
+			.Array(values) => {
+				val .Array(elem, ..) = program.types.kind(ty) else {
+					panic("an array constant has an array's type")
+				}
+				val stride = self.layouts.of(&program, elem).stride()
+				for (i, part) in values.forwards().enumerate() {
+					self.write(&part, elem, offset + (i as u32) * stride)
+				}
+			}
+			.Struct(values) => {
+				val fields = program.fieldTys(ty)
+				for (i, part) in values.forwards().enumerate() {
+					val at = self.layouts.fieldOffset(&program, ty, i as u32)
+					self.write(&part, fields[i], offset + at)
+				}
+			}
+			.Variant(variant, fields) => {
+				match self.layouts.enumTag(&program, ty) {
+					.Byte(size) => self.put(offset, size, variant as u128)
+					.Niche(..) => panic("a constant holds no `own`, which a niche is")
+				}
+				val tys = program.variantFieldTys(ty)
+				for (i, part) in fields.forwards().enumerate() {
+					val at = self.layouts.variantOffset(&program, ty, variant, i as u32)
+					self.write(&part, tys[variant as i64][i], offset + at)
+				}
+			}
+		}
+	}
+}

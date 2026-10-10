@@ -1,0 +1,757 @@
+// Whether a `match` covers every value, and whether an arm can be reached.
+//
+// Both questions are one question: is a pattern *useful* against the arms
+// before it — is there a value that it matches and they do not. A `match` is
+// exhaustive where `_` is not useful against all of its arms, and an arm is
+// unreachable where it is not useful against the arms before it. What comes
+// back where a pattern is useful is a value that shows why, which the
+// message prints as the pattern that would match it.
+//
+// This is Maranget's algorithm ("Warnings for pattern matching", JFP 2007),
+// over a matrix whose columns carry their types, since a pattern alone does
+// not say how many fields a constructor has here.
+
+import syntax::{Interner, Symbol}
+
+/// What a pattern tests for: one shape a value of its type may have.
+@derive(Eq, Hash, Clone)
+enum Ctor {
+	Variant(index: u32)
+	Bool(value: bool)
+	/// The values of an integer or a character type from one key of its
+	/// order to another, both included: a value is the range of one. A column
+	/// of them is complete where its ranges cover the type.
+	Range(lo: u128, hi: u128)
+	/// A value of a type with no order to cover, so a column of them is never
+	/// complete.
+	Value(bits: u128)
+	Text(symbol: Symbol)
+	/// A struct or a tuple: the one shape every value of the type has.
+	Only
+	/// An array or a slice of exactly this many elements.
+	Length(count: u64)
+	/// Of at least `prefix + suffix` elements, the first `prefix` and the
+	/// last `suffix` of which are its fields. A column of slices is cut into
+	/// the lengths below the longest a row names, and this for the rest, as
+	/// rustc does.
+	AtLeast(prefix: u64, suffix: u64)
+}
+
+/// A pattern, as the algorithm needs it: a constructor with the patterns of
+/// its fields, or anything at all.
+@derive(Clone)
+enum Shape {
+	Wild
+	Ctor(ctor: Ctor, fields: Vec<Shape>)
+	/// `a | b`: rows are split on these before anything else.
+	Any(alternatives: Vec<Shape>)
+}
+
+extend Shape {
+	/// The pattern as the algorithm sees it. `ty` says how many fields each
+	/// constructor has, which the pattern itself does not.
+	static fn of(program: &Program, pattern: &Pattern, ty: Ty): Shape = match pattern {
+		.Wildcard | .Binding(_) | .Error => .Wild
+		// A reference is seen through: its column is its referent's.
+		.Deref(inner) => Shape::of(&program, &inner, seenThrough(&program, ty))
+		.Bool(value) => .Ctor(ctor: .Bool(value), fields: Vec())
+		.Int(bits) => {
+			val ctor: Ctor = match program.types.orderKey(ty, bits) {
+				.Some(key) => .Range(lo: key, hi: key)
+				.None => .Value(bits)
+			}
+			.Ctor(ctor: ctor, fields: Vec())
+		}
+		// An end left off runs to the type's least or greatest value.
+		.Range(lo, hi) => {
+			// Refused where it was checked: only an ordered type has a range.
+			val .Some((least, greatest)) = program.types.orderRange(ty) else {
+				return .Wild
+			}
+			val from = match lo {
+				.Some(bits) => program.types.orderKey(ty, bits).unwrapOr(least)
+				.None => least
+			}
+			val to = match hi {
+				.Some(bits) => program.types.orderKey(ty, bits).unwrapOr(least)
+				.None => greatest
+			}
+			.Ctor(ctor: .Range(lo: from, hi: to), fields: Vec())
+		}
+		.Str(text) => .Ctor(ctor: .Text(text), fields: Vec())
+		// The elements it names from either end.
+		.Slice(prefix, rest, suffix) => {
+			var named: Vec<Binder> = prefix.clone()
+			for b in suffix {
+				named.push(b.clone())
+			}
+			val elem = seenThrough(&program, program.elementTy(ty))
+			var tys: Vec<Ty> = Vec()
+			for _ in 0..named.len() {
+				tys.push(elem)
+			}
+			val ctor: Ctor =
+				if rest.isSome() then
+					.AtLeast(prefix: prefix.len() as u64, suffix: suffix.len() as u64)
+				else .Length(named.len() as u64)
+			.Ctor(ctor: ctor, fields: binderShapes(&program, &named, &tys))
+		}
+		.Any(alternatives, ..) => {
+			var shapes: Vec<Shape> = Vec()
+			for p in alternatives {
+				shapes.push(Shape::of(&program, &p, ty))
+			}
+			.Any(move shapes)
+		}
+		.Fields(binders) => {
+			val tys = columnFieldTys(&program, ty)
+			.Ctor(ctor: .Only, fields: binderShapes(&program, &binders, &tys))
+		}
+		.Variant(variant, binders) => {
+			// A variant pattern on a struct is a struct pattern written with the
+			// type's name.
+			val tys =
+				if program.types.kind(ty) is .Enum(..) then columnVariantTys(&program, ty, variant)
+				else columnFieldTys(&program, ty)
+			.Ctor(ctor: .Variant(variant), fields: binderShapes(&program, &binders, &tys))
+		}
+	}
+}
+
+/// What a column of `ty` is matched as: a reference is seen through, at any
+/// depth, since a pattern tests what it refers to.
+fn seenThrough(program: &Program, start: Ty): Ty = {
+	var ty = start
+	while program.types.kind(ty) is .Ref(inner, ..) {
+		ty = inner
+	}
+	return ty
+}
+
+fn binderShapes(program: &Program, binders: &[Binder], tys: &[Ty]): Vec<Shape> = {
+	var shapes: Vec<Shape> = Vec()
+	var i = 0
+	while i < binders.len() && i < tys.len() {
+		shapes.push(
+			match binders[i] {
+				.Ignored | .Bind(_) => Shape::Wild
+				.Nested(pattern) => Shape::of(&program, &pattern, tys[i])
+			},
+		)
+		i += 1
+	}
+	return move shapes
+}
+
+/// The types of a struct's fields. A type the checker has not interned — a
+/// substitution it never needed — is left unknown: nothing can be listed
+/// for it, so a column of them is never complete, which is what the
+/// algorithm does with a number or a text anyway.
+fn columnFieldTys(program: &Program, ty: Ty): Vec<Ty> = {
+	var tys: Vec<Ty> = Vec()
+	val .Struct(id, args) = program.types.kind(ty) else {
+		return move tys
+	}
+	val list = program.types.list(args)
+	for field in program.structs[id].fields {
+		val found = program.types.trySubstFind(field.ty, &list).unwrapOr(ERROR)
+		tys.push(seenThrough(&program, found))
+	}
+	return move tys
+}
+
+/// The types of a variant's fields, as `columnFieldTys` finds a struct's.
+fn columnVariantTys(program: &Program, ty: Ty, variant: u32): Vec<Ty> = {
+	val .Enum(id, args) = program.types.kind(ty) else {
+		return columnFieldTys(&program, ty)
+	}
+	val list = program.types.list(args)
+	var tys: Vec<Ty> = Vec()
+	for field in program.enums[id].variants[variant as i64].fields {
+		val found = program.types.trySubstFind(field.ty, &list).unwrapOr(ERROR)
+		tys.push(seenThrough(&program, found))
+	}
+	return move tys
+}
+
+/// The lengths an array or a slice may have, as a column of patterns cuts
+/// them: an array's one; a slice's lengths below the longest a pattern of
+/// `matrix`, or `head`, names, each on its own, and every length from there
+/// on as one, whose fields are the most any pattern names from the start
+/// and from the end. Nothing for any other type.
+fn sliceLengths(
+	program: &Program,
+	ty: Ty,
+	matrix: &[Vec<Shape>],
+	head: Option<Ctor>,
+): Option<Vec<Ctor>> = {
+	match program.types.kind(ty) {
+		.Array(len, ..) => return .Some(Vec::of(own [Ctor::Length(len)]))
+		.Slice(..) => {}
+		_ => return .None
+	}
+	var prefix: u64 = 0
+	var suffix: u64 = 0
+	var longest: Option<u64> = .None
+	var heads: Vec<Ctor> = Vec()
+	for row in matrix {
+		if headCtor(&row) is .Some(c) then heads.push(c)
+	}
+	if head is .Some(c) then heads.push(c)
+	for ctor in heads {
+		match ctor {
+			.Length(n) => {
+				if longest is .Some(l) {
+					if n > l then longest = .Some(n)
+				} else {
+					longest = .Some(n)
+				}
+			}
+			.AtLeast(prefix: p, suffix: s) => {
+				if p > prefix then prefix = p
+				if s > suffix then suffix = s
+			}
+			_ => {}
+		}
+	}
+	// Every closed length is below where the open one starts.
+	if longest is .Some(n) && prefix + suffix <= n then prefix = n + 1 - suffix
+	var ctors: Vec<Ctor> = Vec()
+	for n in 0..(prefix + suffix) as i64 {
+		ctors.push(.Length(n as u64))
+	}
+	ctors.push(.AtLeast(prefix: prefix, suffix: suffix))
+	return .Some(move ctors)
+}
+
+/// The constructors a type has, where they can be listed: an enum's
+/// variants, and `true` and `false`. A struct has the one. Numbers and text,
+/// a `str` or a `String`, have too many, and a column of them is complete
+/// only with a `_`.
+fn everyCtor(program: &Program, ty: Ty): Option<Vec<Ctor>> = match program.types.kind(ty) {
+	.Enum(id, ..) => {
+		var ctors: Vec<Ctor> = Vec()
+		for i in 0..program.enums[id].variants.len() {
+			ctors.push(.Variant(i as u32))
+		}
+		.Some(move ctors)
+	}
+	.Bool => .Some(Vec::of(own [Ctor::Bool(false), Ctor::Bool(true)]))
+	// A `String` is matched by the text it holds, of which there are as many
+	// as of a `str`'s.
+	.Struct(..) if program.isString(ty) => .None
+	.Struct(..) => .Some(Vec::of(own [Ctor::Only]))
+	.Array(len, ..) => .Some(Vec::of(own [Ctor::Length(len)]))
+	_ => .None
+}
+
+/// How many fields a constructor has here, and what their types are.
+fn ctorTys(program: &Program, ty: Ty, ctor: Ctor): Vec<Ty> = match ctor {
+	.Variant(variant) => columnVariantTys(&program, ty, variant)
+	.Only => columnFieldTys(&program, ty)
+	.Length(n) => repeatTy(seenThrough(&program, program.elementTy(ty)), n as i64)
+	.AtLeast(prefix: p, suffix: s) => repeatTy(
+		seenThrough(&program, program.elementTy(ty)),
+		(p + s) as i64,
+	)
+	_ => Vec()
+}
+
+/// `count` of one type.
+fn repeatTy(ty: Ty, count: i64): Vec<Ty> = {
+	var tys: Vec<Ty> = Vec()
+	for _ in 0..count {
+		tys.push(ty)
+	}
+	return move tys
+}
+
+/// `count` patterns that match anything.
+fn wilds(count: i64): Vec<Shape> = {
+	var shapes: Vec<Shape> = Vec()
+	for _ in 0..count {
+		shapes.push(.Wild)
+	}
+	return move shapes
+}
+
+/// A value no arm matches, as the pattern that would match it.
+struct Witness {
+	shapes: Vec<Shape>
+}
+
+extend Witness {
+	/// The witness written out: `.Some(.None)`, `(true, _)`, `_`.
+	fn text(program: &Program, ty: Ty, interner: &Interner): String = {
+		if self.shapes.isEmpty() then return String::of("_")
+		return writeShape(&program, &self.shapes[0], ty, &interner)
+	}
+}
+
+/// Each of `fields` written out, with its type.
+fn writeFields(
+	program: &Program,
+	fields: &[Shape],
+	tys: &[Ty],
+	interner: &Interner,
+): Vec<String> = {
+	var parts: Vec<String> = Vec()
+	var i = 0
+	while i < fields.len() && i < tys.len() {
+		parts.push(writeShape(&program, &fields[i], tys[i], &interner))
+		i += 1
+	}
+	return move parts
+}
+
+fn writeShape(program: &Program, shape: &Shape, ty: Ty, interner: &Interner): String = {
+	val .Ctor(ctor, fields) = shape else {
+		return String::of("_")
+	}
+	return match ctor {
+		.Bool(value) => "\(value)"
+		.Range(lo, hi) => writeRange(&program, ty, lo, hi)
+		.Value(bits) => "\(bits)"
+		.Text(text) => "\"\(interner.resolve(text))\""
+		// `[_, _]`, `[_, ..]`, `[]`.
+		.Length(..) | .AtLeast(..) => {
+			val tys = ctorTys(&program, ty, ctor)
+			var parts = writeFields(&program, &fields, &tys, &interner)
+			if ctor is .AtLeast(prefix: p, ..) {
+				val at = if (p as i64) < parts.len() then p as i64 else parts.len()
+				parts.insert(at, String::of(".."))
+			}
+			"[\(parts.join(", "))]"
+		}
+		.Only => match program.types.kind(ty) {
+			// A tuple prints as one.
+			.Struct(id, ..) if program.structs[id].isTuple => {
+				val tys = columnFieldTys(&program, ty)
+				"(\(writeFields(&program, &fields, &tys, &interner).join(", ")))"
+			}
+			.Struct(id, ..) => {
+				val name = interner.resolve(program.structs[id].name)
+				if fields.isEmpty() {
+					String::of(name)
+				} else {
+					val tys = columnFieldTys(&program, ty)
+					"\(name)(\(writeFields(&program, &fields, &tys, &interner).join(", ")))"
+				}
+			}
+			_ => String::of("_")
+		}
+		.Variant(variant) => {
+			val .Enum(id, ..) = program.types.kind(ty) else {
+				return String::of("_")
+			}
+			val name = interner.resolve(program.enums[id].variants[variant as i64].name)
+			if fields.isEmpty() {
+				".\(name)"
+			} else {
+				val tys = ctorTys(&program, ty, ctor)
+				".\(name)(\(writeFields(&program, &fields, &tys, &interner).join(", ")))"
+			}
+		}
+	}
+}
+
+/// The values from `lo` to `hi` of an ordered type, as the pattern that
+/// matches them: `_` for all of them, one value, `lo..`, `..hi` (`..='z'`
+/// for characters) or `lo..=hi`.
+fn writeRange(program: &Program, ty: Ty, lo: u128, hi: u128): String = {
+	val .Some((least, greatest)) = program.types.orderRange(ty) else {
+		return String::of("_")
+	}
+	if lo == least && hi == greatest then return String::of("_")
+	if lo == hi then return writeValue(&program, ty, lo)
+	if hi == greatest then return "\(writeValue(&program, ty, lo)).."
+	if lo == least {
+		// `..0` says "below zero" as a `match` would write it.
+		return if program.types.isInteger(ty) then "..\(writeValue(&program, ty, hi + 1))"
+		else "..=\(writeValue(&program, ty, hi))"
+	}
+	return "\(writeValue(&program, ty, lo))..=\(writeValue(&program, ty, hi))"
+}
+
+/// The value at `key` in a type's order, as a literal: a signed number with
+/// its sign, a character in quotes.
+fn writeValue(program: &Program, ty: Ty, key: u128): String = {
+	val bits = program.types.fromOrderKey(ty, key)
+	return match program.types.kind(ty) {
+		.Int(int: t) if t.signed() => {
+			val shift = (128 - t.bits()) as u128
+			"\((bits << shift) as i128 >> shift as i128)"
+		}
+		.Char => match char::fromInt(bits as i64) {
+			.Some(c) => writeChar(c)
+			.None => "\(bits)"
+		}
+		_ => "\(bits)"
+	}
+}
+
+/// A character as its literal is written, escaped where it would not be
+/// seen.
+fn writeChar(c: char): String = match c {
+	'\n' => String::of("'\\n'")
+	'\t' => String::of("'\\t'")
+	'\r' => String::of("'\\r'")
+	'\u{0}' => String::of("'\\0'")
+	'\\' => String::of("'\\\\'")
+	'\'' => String::of("'\\''")
+	' ' => String::of("' '")
+	_ if c as u32 >= 0x21 && c as u32 <= 0x7E => "'\(c)'"
+	_ => "'\\u{\(c as u32, radix: 16, upper: true)}'"
+}
+
+/// The runs of a type's order that its values fill: an integer's one, a
+/// `char`'s two, either side of the surrogates. Nothing for a type with no
+/// order.
+fn orderDomain(program: &Program, ty: Ty): Option<Vec<(u128, u128)>> = {
+	if program.types.kind(ty) is .Char then
+		return .Some(
+			Vec::of(own [(0 as u128, 0xD7FF as u128), (0xE000 as u128, 0x10_FFFF as u128)]),
+		)
+	return match program.types.orderRange(ty) {
+		.Some(range) => .Some(Vec::of(own [range]))
+		.None => .None
+	}
+}
+
+/// The part of `range` that holds values of the type.
+fn clip(range: (u128, u128), domain: &[(u128, u128)]): Vec<(u128, u128)> = {
+	var parts: Vec<(u128, u128)> = Vec()
+	for (start, end) in domain {
+		val lo = if range.0 > start then range.0 else start
+		val hi = if range.1 < end then range.1 else end
+		if lo <= hi then parts.push((lo, hi))
+	}
+	return move parts
+}
+
+/// `within` cut wherever a range at the head of a row starts or ends: the
+/// pieces each of those ranges holds whole or not at all, in order.
+fn splitPieces(matrix: &[Vec<Shape>], within: &[(u128, u128)]): Vec<Ctor> = {
+	var cuts: Vec<u128> = Vec()
+	for row in matrix {
+		if headCtor(&row) is .Some(.Range(lo, hi)) {
+			cuts.push(lo)
+			if hi.checkedAdd(1) is .Some(next) then cuts.push(next)
+		}
+	}
+	cuts.sortUnstable()
+	cuts.dedup()
+	var pieces: Vec<Ctor> = Vec()
+	for (start, end) in within {
+		var from = start
+		for cut in cuts {
+			if cut > start && cut <= end {
+				pieces.push(.Range(lo: from, hi: cut - 1))
+				from = cut
+			}
+		}
+		pieces.push(.Range(lo: from, hi: end))
+	}
+	return move pieces
+}
+
+/// Whether a pattern testing `outer` matches every value `inner` stands
+/// for: a range the piece lies in, or the one constructor.
+fn covers(outer: Ctor, inner: Ctor): bool = {
+	if outer is .Range(lo, hi) && inner is .Range(lo: from, hi: to) then
+		return lo <= from && to <= hi
+	// A slice of at least so many: every length from there, and the longer
+	// pieces whose fields hold its own.
+	if outer is .AtLeast(prefix: p, suffix: s) {
+		if inner is .Length(n) then return n >= p + s
+		if inner is .AtLeast(prefix: q, suffix: t) then return q >= p && t >= s
+	}
+	return outer == inner
+}
+
+/// Whether `row` matches a value the rows of `matrix` do not, and one such
+/// value where it does. Every row, and `row` itself, has one pattern per
+/// column of `tys`.
+fn useful(program: &Program, matrix: &[Vec<Shape>], row: &[Shape], tys: &[Ty]): Option<Witness> = {
+	// No columns left: the row matches what is left where nothing above it
+	// does.
+	if row.isEmpty() then return if matrix.isEmpty() then .Some(Witness(shapes: Vec())) else .None
+	val head = &row[0]
+	var rest: Vec<Shape> = Vec()
+	for i in 1..row.len() {
+		rest.push(row[i].clone())
+	}
+	var below: Vec<Ty> = Vec()
+	for i in 1..tys.len() {
+		below.push(tys[i])
+	}
+	val ty = seenThrough(&program, tys[0])
+	// `a | b` is useful where either is.
+	if head is .Any(alternatives) {
+		for alternative in alternatives {
+			var split = row.toVec()
+			split[0] = alternative.clone()
+			if useful(&program, &matrix, &split, &tys) is .Some(witness) then
+				return .Some(move witness)
+		}
+		return .None
+	}
+	val flat = flattenRows(&matrix)
+	if head is .Ctor(ctor, fields) {
+		// A range is useful where one of the pieces the column cuts it into
+		// is.
+		val pieces: Vec<Ctor> = match ctor {
+			.Range(lo, hi) => {
+				val domain = orderDomain(&program, ty)?
+				val within = clip((lo, hi), &domain)
+				splitPieces(&flat, &within)
+			}
+			// So is a slice's, where one of the lengths it matches is.
+			.Length(..) | .AtLeast(..) => {
+				val all = sliceLengths(&program, ty, &flat, .Some(ctor))?
+				var kept: Vec<Ctor> = Vec()
+				for piece in all {
+					if covers(ctor, piece) then kept.push(piece)
+				}
+				move kept
+			}
+			_ => Vec::of(own [ctor])
+		}
+		for piece in pieces {
+			var narrowed: Vec<Vec<Shape>> = Vec()
+			for r in flat {
+				if specialize(&program, &r, piece, ty) is .Some(specialized) then
+					narrowed.push(move specialized)
+			}
+			var next = fields.clone()
+			for s in rest {
+				next.push(s.clone())
+			}
+			var tysBelow = ctorTys(&program, ty, piece)
+			for t in below {
+				tysBelow.push(t)
+			}
+			if useful(&program, &narrowed, &next, &tysBelow) is .Some(witness) then
+				return .Some(rebuild(move witness, piece, fields.len()))
+		}
+		return .None
+	}
+	// A `_`: useful where any constructor the column does not cover is, or,
+	// where the column covers them all, where it is useful under one of them.
+	// An ordered type's constructors are the pieces its column's ranges cut
+	// it into.
+	val all: Option<Vec<Ctor>> = match orderDomain(&program, ty) {
+		.Some(domain) => .Some(splitPieces(&flat, &domain))
+		.None => match sliceLengths(&program, ty, &flat, .None) {
+			.Some(lengths) => .Some(move lengths)
+			.None => everyCtor(&program, ty)
+		}
+	}
+	var complete = false
+	if all is .Some(ctors) && !ctors.isEmpty() {
+		complete = true
+		for c in ctors {
+			if !columnCovers(&flat, c) then complete = false
+		}
+	}
+	if complete {
+		for ctor in all.unwrap() {
+			var narrowed: Vec<Vec<Shape>> = Vec()
+			for r in flat {
+				if specialize(&program, &r, ctor, ty) is .Some(specialized) then
+					narrowed.push(move specialized)
+			}
+			val arity = ctorTys(&program, ty, ctor)
+			var next = wilds(arity.len())
+			for s in rest {
+				next.push(s.clone())
+			}
+			var tysBelow = arity.clone()
+			for t in below {
+				tysBelow.push(t)
+			}
+			if useful(&program, &narrowed, &next, &tysBelow) is .Some(witness) then
+				return .Some(rebuild(move witness, ctor, arity.len()))
+		}
+		return .None
+	}
+	// The rows that say nothing about this column.
+	var defaults: Vec<Vec<Shape>> = Vec()
+	for r in flat {
+		if headCtor(&r).isNone() {
+			var tail: Vec<Shape> = Vec()
+			for i in 1..r.len() {
+				tail.push(r[i].clone())
+			}
+			defaults.push(move tail)
+		}
+	}
+	val witness = useful(&program, &defaults, &rest, &below)?
+	// A constructor no row has, where one can be named, says more than `_`:
+	// of an ordered type, the first values no row has, as far as they run.
+	val ctors = all.unwrapOr(Vec())
+	var missing: Option<Ctor> = .None
+	var first = 0
+	while first < ctors.len() && columnCovers(&flat, ctors[first]) {
+		first += 1
+	}
+	if first < ctors.len() {
+		var last = first
+		while last + 1 < ctors.len() && !columnCovers(&flat, ctors[last + 1]) {
+			last += 1
+		}
+		missing = match ctors[last] {
+			.Range(hi, ..) => match ctors[first] {
+				.Range(lo, ..) => .Some(.Range(lo: lo, hi: hi))
+				other => .Some(other)
+			}
+			_ => .Some(ctors[first])
+		}
+	}
+	var shapes: Vec<Shape> = Vec()
+	shapes.push(
+		match missing {
+			.Some(ctor) => Shape::Ctor(ctor: ctor, fields: wilds(ctorTys(&program, ty, ctor).len()))
+			.None => Shape::Wild
+		},
+	)
+	for s in move witness.shapes {
+		shapes.push(move s)
+	}
+	return .Some(Witness(shapes: move shapes))
+}
+
+/// Whether a row of a column has a constructor at its head that covers
+/// `ctor`.
+fn columnCovers(matrix: &[Vec<Shape>], ctor: Ctor): bool = {
+	for r in matrix {
+		if headCtor(&r) is .Some(head) && covers(head, ctor) then return true
+	}
+	return false
+}
+
+/// The runs of an ordered type's values that no row of a one-column
+/// `matrix` matches, each written as the pattern that would: what a `match`
+/// of numbers or characters leaves out. Nothing for a type with no order.
+fn missingRanges(program: &Program, matrix: &[Vec<Shape>], ty: Ty): Vec<String> = {
+	val .Some(domain) = orderDomain(&program, ty) else {
+		return Vec()
+	}
+	val flat = flattenRows(&matrix)
+	// Pieces left out one after another are one run, across the surrogates
+	// too.
+	var runs: Vec<(u128, u128)> = Vec()
+	var open = false
+	for piece in splitPieces(&flat, &domain) {
+		val .Range(lo, hi) = piece else {
+			continue
+		}
+		var covered = false
+		for r in flat {
+			val coversPiece = match r.isEmpty() {
+				true => true
+				false => match r[0] {
+					.Ctor(ctor: head, ..) => covers(head, piece)
+					_ => true
+				}
+			}
+			if coversPiece then covered = true
+		}
+		if covered {
+			open = false
+			continue
+		}
+		if open && !runs.isEmpty() {
+			val last = runs.len() - 1
+			runs[last].1 = hi
+		} else {
+			runs.push((lo, hi))
+		}
+		open = true
+	}
+	var texts: Vec<String> = Vec()
+	for (lo, hi) in runs {
+		texts.push(writeRange(&program, ty, lo, hi))
+	}
+	return move texts
+}
+
+/// Rows with `a | b` in the first column, split into one row each.
+fn flattenRows(matrix: &[Vec<Shape>]): Vec<Vec<Shape>> = {
+	var out: Vec<Vec<Shape>> = Vec()
+	for row in matrix {
+		if !row.isEmpty() && row[0] is .Any(alternatives) {
+			for alternative in alternatives {
+				var split = row.clone()
+				split[0] = alternative.clone()
+				for r in flattenRows([move split]) {
+					out.push(move r)
+				}
+			}
+		} else {
+			out.push(row.clone())
+		}
+	}
+	return move out
+}
+
+fn headCtor(row: &[Shape]): Option<Ctor> = {
+	if row.isEmpty() then return .None
+	return match row[0] {
+		.Ctor(ctor, ..) => .Some(ctor)
+		_ => .None
+	}
+}
+
+/// The row as it stands under `ctor`: its fields, then the other columns, or
+/// nothing where the row tests another constructor.
+fn specialize(program: &Program, row: &[Shape], ctor: Ctor, ty: Ty): Option<Vec<Shape>> = {
+	if row.isEmpty() then return .None
+	var out: Vec<Shape> = match row[0] {
+		.Wild => wilds(ctorTys(&program, ty, ctor).len())
+		// A slice's first and last elements, with what is between them
+		// anything.
+		.Ctor(ctor: .AtLeast(prefix: p, suffix: s), fields) if covers(
+			.AtLeast(prefix: p, suffix: s),
+			ctor,
+		) => {
+			val arity = ctorTys(&program, ty, ctor).len()
+			val named = (p + s) as i64
+			val between = if arity > named then arity - named else 0
+			val cut = if (p as i64) < fields.len() then p as i64 else fields.len()
+			var spread: Vec<Shape> = Vec()
+			for i in 0..cut {
+				spread.push(fields[i].clone())
+			}
+			for _ in 0..between {
+				spread.push(.Wild)
+			}
+			for i in cut..fields.len() {
+				spread.push(fields[i].clone())
+			}
+			move spread
+		}
+		.Ctor(ctor: c, fields) if covers(c, ctor) => fields.clone()
+		_ => return .None
+	}
+	for i in 1..row.len() {
+		out.push(row[i].clone())
+	}
+	return .Some(move out)
+}
+
+/// The witness of the columns under `ctor`, written as one of `ctor`.
+fn rebuild(witness: Witness, ctor: Ctor, arity: i64): Witness = {
+	val shapes = move witness.shapes
+	val taken = if arity < shapes.len() then arity else shapes.len()
+	var fields: Vec<Shape> = Vec()
+	var others: Vec<Shape> = Vec()
+	for (i, s) in shapes.forwards().enumerate() {
+		if i < taken then fields.push(s.clone()) else others.push(s.clone())
+	}
+	var out = Vec::of(own [Shape::Ctor(ctor: ctor, fields: move fields)])
+	for s in move others {
+		out.push(move s)
+	}
+	return Witness(shapes: move out)
+}

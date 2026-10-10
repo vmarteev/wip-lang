@@ -1,0 +1,2793 @@
+// Items: type definitions, function signatures, and the types allowed
+// across the C boundary.
+
+import std::collections::{Map}
+import std::mem
+import syntax as ast
+import syntax::{
+	ALIAS,
+	ANNOTATION,
+	BUILTIN_REDEFINED,
+	CANNOT_BE_GENERIC,
+	DUPLICATE_DEFINITION,
+	Diagnostic,
+	Edit,
+	IMPL_METHODS,
+	IMPL_TARGET,
+	INVALID_DEFAULT,
+	KEEPS,
+	LENDS_FROM,
+	MAX_TUPLE,
+	MIN_TUPLE,
+	NOT_C_COMPATIBLE,
+	PRIVATE_ITEM,
+	SHADOWED_TYPE_PARAMETER,
+	Span,
+	Symbol,
+	TYPE_PARAMETER_DEFAULT,
+	UNKNOWN_TYPE,
+	VARIADIC
+}
+
+/// What a type was declared by: an item of a file, or a `struct` written
+/// inside an `extern "C"` block, which is the same declaration without the
+/// word `extern`.
+@derive(Clone)
+view enum Declared {
+	Item(item: &ast::Item)
+	Struct(decl: &ast::StructDecl)
+}
+
+extend Declared {
+	/// The annotations written before it, which a `@derive` is read from.
+	fn annotationsOf(): Vec<ast::Annotation> = match self {
+		.Struct(s) => s.annotations.clone()
+		.Item(item) => match item {
+			.Struct(s) => s.annotations.clone()
+			.Enum(e) => e.annotations.clone()
+			_ => Vec()
+		}
+	}
+
+	/// The struct it declares, where it declares one.
+	fn structDecl(): Option<&ast::StructDecl> from self = match self {
+		.Struct(s) => .Some(s)
+		.Item(item) => match item {
+			.Struct(s) => .Some(&s)
+			_ => .None
+		}
+	}
+
+	/// The enum it declares, where it declares one.
+	fn enumDecl(): Option<&ast::EnumDecl> from self = match self {
+		.Item(item) => match item {
+			.Enum(e) => .Some(&e)
+			_ => .None
+		}
+		_ => .None
+	}
+
+	/// Whether a field of it, or of one of its variants, has a default.
+	fn hasFieldDefaults(): bool = {
+		if self.structDecl() is .Some(s) {
+			for f in s.fields {
+				if f.default.isSome() then return true
+			}
+			return false
+		}
+		if self.enumDecl() is .Some(e) {
+			for v in e.variants {
+				for f in v.fields {
+					if f.default.isSome() then return true
+				}
+			}
+		}
+		return false
+	}
+}
+
+extend Lowerer {
+	var fn collectTypes(): Vec<(Declared, TypeDef)> = {
+		val file = self.ast
+		var types: Vec<(Declared, TypeDef)> = Vec()
+		for item in file.items {
+			val named: (ast::Name, TypeDef) = match item {
+				// `type name` in an extern block: a C type whose contents Wip
+				// does not know.
+				.Extern(e) => {
+					// The block's `@header` is what its declarations share, and
+					// a struct written inside it takes that one. It is read
+					// rather than checked here: the block's own annotations are
+					// checked where its functions are declared, and checking
+					// them twice would report each mistake twice.
+					val block = self.writtenHeader(&e.annotations)
+					for declared in e.structs {
+						if self.collectStruct(&declared, block) is .Some((name, def)) {
+							self.nameType(name, def)
+							types.push((.Struct(&declared), def))
+						}
+					}
+					for declared in e.types {
+						self.annotations(&declared.annotations, .ExternType)
+						val name = declared.name
+						val id = self.program.opaques.add(OpaqueDef(
+							name: name.sym,
+							module: self.current as u32,
+							isPub: declared.isPub,
+							span: name.span,
+						))
+						if self.opaques().get(&name.sym) is .Some(first) {
+							val previous = self.program.opaques[first].span
+							self.duplicate(name, previous)
+						} else if self.types().get(&name.sym) is .Some((_, previous)) {
+							self.duplicate(name, previous)
+						} else {
+							self.modules[self.current].opaques.put(name.sym, id)
+						}
+					}
+					continue
+				}
+				.Struct(s) => match self.collectStruct(&s, .None) {
+					.Some(pair) => pair
+					.None => continue
+				}
+				.Enum(e) => {
+					self.annotations(&e.annotations, .Enum)
+					val generics = self.typeGenericParams(&e.generics)
+					val id = self.program.enums.add(EnumDef(
+						name: e.name.sym,
+						generics: move generics,
+						variants: Vec(),
+						methods: Vec(),
+						module: self.current as u32,
+						isPub: e.isPub,
+						isView: e.isView,
+						span: e.name.span,
+					))
+					// The enums of the prelude's that the compiler makes values
+					// of, each for what `KnownEnum` says.
+					if self.prelude == .Some(self.current) &&
+						KnownEnum::named(self.text(e.name.sym)) is .Some(known) {
+						self.program.preludeItems.setEnumeration(known, id)
+					}
+					(e.name, .Enum(id))
+				}
+				_ => continue
+			}
+			val (name, def) = named
+			self.nameType(name, def)
+			types.push((.Item(&item), def))
+		}
+		return move types
+	}
+
+	/// The paths an annotation names, each of which must be inside the
+	/// module: where a file is on this machine is the command line's
+	/// business, not a module's.
+	var fn modulePaths(written: &[(Symbol, Span)], what: str): Vec<(String, Span)> = {
+		var paths: Vec<(String, Span)> = Vec()
+		for (text, span) in written {
+			val path = String::of(self.text(text))
+			var outside =
+				path.startsWith("/") ||
+				path.startsWith("\\") ||
+				(path.len() >= 2 && path.toStr()[1] == b':')
+			for piece in path.toStr().split("/") {
+				for part in piece.split("\\") {
+					if part == ".." then outside = true
+				}
+			}
+			if outside {
+				self.report(
+					Diagnostic::error(
+						ANNOTATION,
+						"`\(path)` is not in the module",
+						span,
+						String::of("a path that leaves it"),
+					).withNote("`\(what)` names a file of the module, so that a module carries its own C"),
+				)
+				continue
+			}
+			paths.push((move path, span))
+		}
+		return move paths
+	}
+
+	/// The settings `@define` names, each `NAME` or `NAME=value`, where
+	/// `NAME` is what C could have written after `#define`. A value is what
+	/// follows the `=`, and reaches the C compiler as one argument, so
+	/// nothing in it is read by a shell.
+	var fn cDefines(written: &[(Symbol, Span)]): Vec<String> = {
+		var defines: Vec<String> = Vec()
+		for (text, span) in written {
+			val define = String::of(self.text(text))
+			val name = match define.toStr().splitOnce("=") {
+				.Some((name, _)) => name
+				.None => define.toStr()
+			}
+			var isName = !name.isEmpty() && (name[0] is b'a'..=b'z' | b'A'..=b'Z' | b'_')
+			for i in 0..name.len() {
+				if !(name[i] is b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_') then isName = false
+			}
+			val problem: Option<str> =
+				if !isName then .Some("not a name C could define")
+				else if define.contains("\n") || define.contains("\r") then
+					.Some("a value on more than one line")
+				else .None
+			if problem is .Some(label) {
+				self.report(
+					Diagnostic::error(
+						ANNOTATION,
+						"`\(define)` is not a setting `@define` can pass",
+						span,
+						String::of(label),
+					).withNote(
+						String::of(
+							"`@define` takes `NAME` or `NAME=value`, which each C file of the module is compiled with as `-D` passes it; a setting that needs more than that belongs in the header `@prefix` names",
+						),
+					),
+				)
+				continue
+			}
+			defines.push(move define)
+		}
+		return move defines
+	}
+
+	/// The header an `extern "C"` block names, read without checking the
+	/// block's annotations — that happens where its declarations are.
+	fn writtenHeader(written: &[ast::Annotation]): Option<(Symbol, Span)> = {
+		for annotation in written {
+			if self.text(annotation.name.sym) != "header" then continue
+			if annotation.args.len() == 1 && annotation.args[0].value is .Str(text) then
+				return .Some((text, annotation.span))
+		}
+		return .None
+	}
+
+	/// Puts a type's name in this module's scope, where it is free: the
+	/// prelude's names are reserved, a built-in's cannot be taken, and a name
+	/// declared twice is reported.
+	var fn nameType(name: ast::Name, def: TypeDef) = {
+		if self.preludeName(name, "a type named") {
+			// Reported; it keeps its own place in this module's scope.
+		} else if self.builtin(name.sym).isSome() {
+			self.report(
+				Diagnostic::error(
+					BUILTIN_REDEFINED,
+					"`\(self.text(name.sym))` is a built-in type and cannot be redefined",
+					name.span,
+					String::of("built-in type name"),
+				),
+			)
+		} else if self.types().get(&name.sym) is .Some((_, first)) {
+			self.duplicate(name, first)
+		} else {
+			self.modules[self.current].types.put(name.sym, (def, name.span))
+		}
+	}
+
+	/// Declares a struct or a union, whether it was written at the top level
+	/// or inside an `extern "C"` block, where `block` is that block's
+	/// `@header` — the one its declarations share.
+	var fn collectStruct(
+		s: &ast::StructDecl,
+		block: Option<(Symbol, Span)>,
+	): Option<(ast::Name, TypeDef)> = {
+		var annotations = self.annotations(&s.annotations, .Struct)
+		// A struct in a block takes the block's header where it says none of
+		// its own.
+		if annotations.header.isNone() then annotations.header = block
+		// `@opaque` is C's promise that it knows the layout, so it needs the
+		// header that says so, and a Wip struct is laid out by Wip.
+		val opaque = match (annotations.opaque, s.isExtern, annotations.header) {
+			(.None, _, _) => false
+			(.Some(span), false, _) => {
+				self.report(
+					Diagnostic::error(
+						ANNOTATION,
+						String::of("`@opaque` belongs on an `extern struct`"),
+						span,
+						String::of("not a C type"),
+					).withNote(
+						String::of(
+							"it says C knows where the fields are, which is only true of a struct C declares",
+						),
+					),
+				)
+				false
+			}
+			(.Some(span), true, .None) => {
+				self.report(
+					Diagnostic::error(
+						ANNOTATION,
+						String::of("`@opaque` needs the header that declares the struct"),
+						span,
+						String::of("no header to read it from"),
+					).withHelp(String::of("write `@header(\"config.h\")` beside it")).withNote(
+						String::of(
+							"the C that reaches its fields is compiled against that header, since Wip does not know where they are",
+						),
+					),
+				)
+				false
+			}
+			(.Some(_), true, .Some(_)) => true
+		}
+		// A type the compiler knows is the standard library's to declare.
+		if annotations.intrinsic && !self.inStd() then
+			self.report(
+				Diagnostic::error(
+					ANNOTATION,
+					String::of("`@intrinsic` on a struct is the standard library's"),
+					s.name.span,
+					String::of("a type the compiler would have to know"),
+				).withNote(
+					String::of(
+						"it marks a type whose meaning the compiler knows, as `std::sync::Atomic`, reached only through what the compiler writes",
+					),
+				),
+			)
+		val generics = self.typeGenericParams(&s.generics)
+		// The prelude's tuples, which `(A, B)` is written into.
+		var isTuple = false
+		if self.prelude == .Some(self.current) {
+			for n in MIN_TUPLE..MAX_TUPLE + 1 {
+				if s.name.sym == Symbol::tuple(n) then isTuple = true
+			}
+		}
+		val id = self.program.structs.add(StructDef(
+			name: s.name.sym,
+			isExtern: s.isExtern,
+			isUnion: s.isUnion,
+			isOpaque: opaque,
+			isIntrinsic: annotations.intrinsic && self.inStd(),
+			header: match annotations.header {
+				.Some((h, _)) => .Some(h)
+				.None => .None
+			},
+			accessors: Vec(),
+			generics: move generics,
+			fields: Vec(),
+			methods: Vec(),
+			isEnv: false,
+			isView: s.isView,
+			isTuple: isTuple,
+			generator: .None,
+			module: self.current as u32,
+			isPub: s.isPub,
+			span: s.name.span,
+		))
+		// The structs of the prelude's that the compiler makes values of, each
+		// for what `KnownStruct` says.
+		if self.prelude == .Some(self.current) &&
+			KnownStruct::named(self.text(s.name.sym)) is .Some(known) {
+			self.program.preludeItems.setStructure(known, id)
+		}
+		return .Some((s.name, .Struct(id)))
+	}
+
+	/// The names this file's type aliases declare. The bodies wait until
+	/// every name is known, since one alias may name another.
+	var fn collectAliases() = {
+		val file = self.ast
+		for item in file.items {
+			val .Type(alias) = item else {
+				continue
+			}
+			val name = alias.name
+			if self.preludeName(name, "a type named") then continue
+			if self.builtin(name.sym).isSome() {
+				val text = String::of(self.text(name.sym))
+				self.report(
+					Diagnostic::error(
+						BUILTIN_REDEFINED,
+						"`\(text)` is a built-in type",
+						name.span,
+						String::of("a name of the language"),
+					).withNote(
+						String::of(
+							"the built-in types are the language's, and a program may not take one of their names",
+						),
+					),
+				)
+				continue
+			}
+			if self.types().get(&name.sym) is .Some((_, first)) {
+				self.duplicate(name, first)
+				continue
+			}
+			if self.aliases().get(&name.sym) is .Some(existing) {
+				self.duplicate(name, existing.span)
+				continue
+			}
+			val generics = self.genericParams(&alias.generics)
+			// An alias is another name for a type, and the type it names
+			// carries whatever its own parameters ask of theirs.
+			for i in 0..generics.len() {
+				if generics[i].interfaces.isEmpty() && !generics[i].copy then continue
+				self.report(
+					Diagnostic::error(
+						ALIAS,
+						String::of("an alias's parameters take no constraints"),
+						alias.generics[i].span,
+						String::of("a constraint"),
+					).withNote(
+						String::of(
+							"an alias is another name for a type, and what that type asks of its arguments is written where it is declared",
+						),
+					),
+				)
+			}
+			self.modules[self.current].aliases.put(name.sym, AliasDef(
+				ty: .None,
+				generics: move generics,
+				isPub: alias.isPub,
+				span: name.span,
+			))
+		}
+	}
+
+	/// Where each of this file's aliases is written, so that its body can be
+	/// resolved there when something first names it.
+	var fn recordAliasSources() = {
+		val file = self.ast
+		for item in file.items {
+			val .Type(decl) = item else {
+				continue
+			}
+			self.aliasSources.put(
+				(self.current, decl.name.sym),
+				AliasSource(decl: &decl, ast: file, imports: self.imports.clone()),
+			)
+		}
+	}
+
+	/// The bodies of this file's aliases, each resolved where it was not
+	/// already, when an alias before it named it.
+	var fn resolveAliases() = {
+		val file = self.ast
+		for item in file.items {
+			if item is .Type(decl) then self.aliasBody(self.current, decl.name.sym)
+		}
+	}
+
+	/// The type `module`'s alias `sym` stands for, resolved in the file that
+	/// wrote it the first time it is asked for, as a constant's value is. One
+	/// that is being resolved already names itself, through however many
+	/// others, and each alias of the cycle says so.
+	var fn aliasBody(module: i64, sym: Symbol): Option<Ty> = {
+		val alias = self.modules[module].aliases.get(&sym)?.clone()
+		if alias.ty is .Some(ty) then return .Some(ty)
+		for at in 0..self.aliasStack.len() {
+			if self.aliasStack[at] == (module, sym) {
+				val cycle = self.aliasStack[at..self.aliasStack.len()].toVec()
+				for (m, name) in cycle {
+					self.aliasNamesItself(m, name)
+				}
+				return .Some(ERROR)
+			}
+		}
+		// Taken out while it is read, which changes `self`, and put back.
+		val key = (module, sym)
+		val source = self.aliasSources.remove(&key)?
+		self.aliasSources.put(key, source.clone())
+		// Resolved in its own file, with its own parameters, from wherever it
+		// was asked for: a type being resolved elsewhere, which is put back as
+		// it was.
+		val hereAst = self.ast
+		val hereModule = self.current
+		val hereImports = self.imports.clone()
+		val typeParams = mem::replace(&var self.typeParams, alias.generics.clone())
+		val selfTy = mem::replace(&var self.selfTy, .None)
+		self.aliasStack.push((module, sym))
+		self.enter(module, source.ast, source.imports.clone())
+		val ty = self.resolveTy(source.decl.ty)
+		self.enter(hereModule, hereAst, move hereImports)
+		self.aliasStack.pop()
+		self.typeParams = move typeParams
+		self.selfTy = selfTy
+		// An alias a default type argument names, which leaves out another
+		// type's argument whose default is not read yet, is read again with
+		// that default.
+		if self.defaultWaits then return .Some(ERROR)
+		var updated = match self.modules[module].aliases.get(&sym) {
+			.Some(found) => found.clone()
+			.None => panic("it was found above")
+		}
+		// A cycle through it has said so, and it stands for nothing.
+		if updated.ty is .Some(said) then return .Some(said)
+		updated.ty = .Some(ty)
+		self.modules[module].aliases.put(sym, move updated)
+		return .Some(ty)
+	}
+
+	/// An alias that names itself, through however many others.
+	var fn aliasNamesItself(module: i64, name: Symbol) = {
+		val .Some(alias) = self.modules[module].aliases.get(&name) else {
+			return
+		}
+		if alias.ty.isSome() then return
+		val span = alias.span
+		var updated = alias.clone()
+		val text = String::of(self.text(name))
+		self.report(
+			Diagnostic::error(
+				ALIAS,
+				"`\(text)` is a type alias that names itself",
+				span,
+				String::of("an endless name"),
+			).withNote(
+				String::of(
+					"an alias stands for the type it names, so one that names itself stands for nothing",
+				),
+			),
+		)
+		updated.ty = .Some(ERROR)
+		self.modules[module].aliases.put(name, move updated)
+	}
+
+	/// A use of a type alias: the type it names, with the arguments it was
+	/// given in place of its parameters.
+	var fn aliasType(sym: Symbol, args: &[ast::TypeId], span: Span): Option<Ty> = self.aliasTypeOf(
+		self.current,
+		sym,
+		&args,
+		span,
+	)
+
+	/// The same, for an alias of another module.
+	var fn aliasTypeOf(module: i64, sym: Symbol, args: &[ast::TypeId], span: Span): Option<Ty> = {
+		val alias = self.modules[module].aliases.get(&sym)?.clone()
+		if module != self.current && !alias.isPub then
+			self.privateItem(module, "type alias", ast::Name(sym: sym, span: span))
+		// Resolved here if nothing has asked for it before.
+		val body = self.aliasBody(module, sym).unwrapOr(ERROR)
+		if args.len() != alias.generics.len() {
+			for arg in args {
+				self.resolveTy(arg)
+			}
+			self.typeArgCount(sym, &alias.generics, args.len(), span)
+			return .Some(ERROR)
+		}
+		if alias.generics.isEmpty() then return .Some(body)
+		var tys: Vec<Ty> = Vec()
+		for arg in args {
+			tys.push(self.typeArg(arg))
+		}
+		return .Some(self.program.types.subst(body, &tys))
+	}
+
+	/// Reads the defaults of this file's structs' and enums' type parameters
+	/// that are still to be read. A default that leaves out an argument of a
+	/// type whose own default is not read yet waits for the next round; in
+	/// the `last`, what still waits can only rest on itself, and says so.
+	/// Whether any was read.
+	var fn resolveDefaults(types: &[(Declared, TypeDef)], last: bool): bool = {
+		var read = false
+		for (item, def) in types {
+			val params: Vec<ast::GenericParam> = match (item.structDecl(), item.enumDecl()) {
+				(.Some(s), _) => s.generics.clone()
+				(_, .Some(e)) => e.generics.clone()
+				_ => continue
+			}
+			for index in 0..params.len() {
+				val param = &params[index]
+				val .Some(written) = param.default else {
+					continue
+				}
+				if self.typeGenerics(def)[index].default != .Pending then continue
+				self.typeParams = self.typeGenerics(def)
+				val mark = self.diagnostics.len()
+				self.defaultWaits = false
+				var ty = self.typeArg(written)
+				val waits = self.defaultWaits
+				self.defaultWaits = false
+				self.typeParams.clear()
+				val span = self.ast.types[written].span
+				if waits {
+					self.diagnostics.truncate(mark)
+					if !last then continue
+					val text = String::of(self.text(param.name.sym))
+					self.report(
+						Diagnostic::error(
+							TYPE_PARAMETER_DEFAULT,
+							"the default of `\(text)` rests on itself",
+							span,
+							String::of("leaves out a type argument whose default is this one"),
+						).withNote(
+							String::of(
+								"a default is read in the parameters before it, and so is the default of a type it leaves an argument out of",
+							),
+						),
+					)
+					ty = ERROR
+				}
+				// `K = T` reads the parameters before it, which a use has given
+				// by then; one after it is not known yet.
+				val later = self.program.types.any(ty, (kind) =>
+					kind is .Param(param: p) && p.index as i64 >= index)
+				if later {
+					val text = String::of(self.text(param.name.sym))
+					self.report(
+						Diagnostic::error(
+							TYPE_PARAMETER_DEFAULT,
+							"the default of `\(text)` names a parameter that is not before it",
+							span,
+							String::of("names a later parameter"),
+						).withNote(
+							String::of(
+								"a use leaves out type arguments from the end, so a default is worked out from the ones before it",
+							),
+						),
+					)
+					ty = ERROR
+				}
+				// A default that names no parameter is one type, checked against
+				// what the parameter asks here; one that names some is checked
+				// where a use gives them.
+				if !self.program.types.isGeneric(ty) {
+					val declared = self.typeGenerics(def)[index].clone()
+					self.checkCopy(ty, &declared, span)
+					self.checkConstraints(ty, &declared, span)
+				}
+				match def {
+					.Struct(id) => self.program.structs[id].generics[index].default = .Ty(ty)
+					.Enum(id) => self.program.enums[id].generics[index].default = .Ty(ty)
+					.Builtin(..) => {}
+				}
+				read = true
+			}
+		}
+		return read
+	}
+
+	var fn resolveTypeBodies(types: &[(Declared, TypeDef)]) = {
+		for (item, def) in types {
+			self.typeParams = self.typeGenerics(def)
+			match def {
+				.Struct(id) if item.structDecl().isSome() => {
+					val .Some(s) = item.structDecl() else {
+						panic("just asked")
+					}
+					val fields = self.fields(&s.fields, s.isExtern, s.isView)
+					// C promises a layout for the types it can write, and knows
+					// nothing of a type parameter. A union belongs to C, and
+					// holds what C can write.
+					if s.isUnion && fields.isEmpty() then
+						self.report(
+							Diagnostic::error(
+								NOT_C_COMPATIBLE,
+								String::of("a union needs a field"),
+								s.name.span,
+								String::of("no fields"),
+							).withNote(
+								String::of(
+									"a union is one of its fields at a time, and there is nothing to be one of",
+								),
+							),
+						)
+					if s.isExtern {
+						if !s.generics.isEmpty() then
+							self.report(
+								Diagnostic::error(
+									CANNOT_BE_GENERIC,
+									String::of(
+										if s.isUnion then "an `extern union` cannot be generic"
+										else "an `extern struct` cannot be generic",
+									),
+									s.generics[0].span,
+									String::of("a type parameter"),
+								).withNote(
+									String::of(
+										"it is a layout C writes too, and C has no type parameters",
+									),
+								),
+							)
+						var i = 0
+						while i < fields.len() && i < s.fields.len() {
+							val span = self.ast.types[s.fields[i].ty].span
+							self.checkCField(fields[i].ty, span, s.isUnion)
+							i += 1
+						}
+					}
+					self.program.structs[id].fields = move fields
+					// `@opaque`: C knows where the fields are, so each one is
+					// read and written through C.
+					if self.program.structs[id].isOpaque then self.declareFieldAccessors(id)
+				}
+				.Enum(id) if item.enumDecl().isSome() => {
+					val .Some(e) = item.enumDecl() else {
+						panic("just asked")
+					}
+					var seen: Map<Symbol, Span> = Map()
+					var variants: Vec<VariantDef> = Vec()
+					for v in e.variants {
+						match seen.get(&v.name.sym) {
+							.Some(first) => self.duplicate(v.name, first)
+							.None => seen.put(v.name.sym, v.name.span)
+						}
+						// A `view enum`'s variants borrow as a view's fields do.
+						val fields = self.fields(&v.fields, true, e.isView)
+						variants.push(VariantDef(
+							name: v.name.sym,
+							fields: move fields,
+							span: v.name.span,
+						))
+					}
+					self.program.enums[id].variants = move variants
+				}
+				_ => panic("collectTypes pairs items with their kind")
+			}
+		}
+		self.typeParams.clear()
+	}
+
+	/// The fields of a struct or a variant. `exported` is for the ones that
+	/// are public whatever they say: an `extern struct` is C's layout, and a
+	/// variant's fields are exported with its enum. A view's fields may
+	/// borrow: hold a `str`, a view, or a `&` reference.
+	var fn fields(fields: &[ast::Field], exported: bool, view: bool): Vec<FieldDef> = {
+		var seen: Map<Symbol, Span> = Map()
+		var defs: Vec<FieldDef> = Vec()
+		for f in fields {
+			match seen.get(&f.name.sym) {
+				.Some(first) => self.duplicate(f.name, first)
+				.None => seen.put(f.name.sym, f.name.span)
+			}
+			var ty = self.resolveTy(f.ty)
+			val lent = view && self.kind(ty) is .Ref(kind: .Shared, ..)
+			val refused = if lent {
+				// What the reference refers to is checked as a parameter's
+				// would be.
+				self.noNever(ty, f.ty, "a field")
+			} else if view && self.kind(ty) is .Ref(kind: .Var, ..) {
+				self.varInView(f.ty)
+			} else {
+				self.noVarRef(ty, f.ty, "a field") ||
+					self.noNever(ty, f.ty, "a field") ||
+					self.bareDyn(ty, f.ty) ||
+					self.bareSlice(ty, f.ty, false) ||
+					(!view && self.storedField(ty, f.ty, exported))
+			}
+			if refused then ty = ERROR
+			defs.push(
+				FieldDef(
+					// `pub` exports a field; an `extern struct` is C's layout, and
+					// C hides nothing.
+					isPub: f.isPub || exported,
+					// C writes what it lays out, and a variant's fields are the
+					// enum's.
+					isVar: f.isVar || exported,
+					name: f.name.sym,
+					ty: ty,
+					span: f.span,
+					// Checked once every type's fields are known.
+					default: .None,
+				),
+			)
+		}
+		return move defs
+	}
+
+	/// The defaults of these functions' parameters, once every function is
+	/// declared: each with the function's type parameters in scope, since one
+	/// that is code is generic as the function is.
+	var fn checkParamDefaults(defaults: &[(FnId, i64, ast::ExprId)]) = {
+		for (id, index, value) in defaults {
+			val ty = self.program.fns[id].params[index].ty
+			if self.hasError(ty) then continue
+			self.typeParams = self.program.fns[id].generics.clone()
+			val default = self.defaultOf(value, ty)
+			self.program.fns[id].params[index].default = move default
+		}
+		self.typeParams.clear()
+	}
+
+	/// The defaults of `def`'s fields, checked now where they are not yet: in
+	/// the file that declares them, from wherever they were asked for, which
+	/// is put back as it was. A literal asks before it reads them, so one in
+	/// another type's default finds them however the two are ordered.
+	var fn ensureDefaults(def: TypeDef) = {
+		val .Some(source) = self.defaultSources.remove(&def) else {
+			return
+		}
+		val hereAst = self.ast
+		val hereModule = self.current
+		val hereImports = self.imports.clone()
+		val lambdas = mem::replace(&var self.lambdas, source.lambdas.clone())
+		val lambdaEnvs = mem::replace(&var self.lambdaEnvs, source.lambdaEnvs.clone())
+		val generators = mem::replace(&var self.generators, source.generators.clone())
+		val typeParams = mem::replace(&var self.typeParams, Vec())
+		val selfTy = mem::replace(&var self.selfTy, .None)
+		self.enter(source.module, source.ast, source.imports.clone())
+		self.checkFieldDefaults([(source.item, def)])
+		self.enter(hereModule, hereAst, move hereImports)
+		self.lambdas = move lambdas
+		self.lambdaEnvs = move lambdaEnvs
+		self.generators = move generators
+		self.typeParams = move typeParams
+		self.selfTy = selfTy
+	}
+
+	var fn checkFieldDefaults(types: &[(Declared, TypeDef)]) = {
+		for (item, def) in types {
+			if item.enumDecl() is .Some(e) && def is .Enum(id) {
+				self.checkVariantDefaults(&e, id)
+				continue
+			}
+			val .Some(s) = item.structDecl() else {
+				continue
+			}
+			val .Struct(id) = def else {
+				continue
+			}
+			var any = false
+			for f in s.fields {
+				if f.default.isSome() then any = true
+			}
+			if !any then continue
+			self.typeParams = self.typeGenerics(def)
+			for index in 0..s.fields.len() {
+				val f = &s.fields[index]
+				val .Some(value) = f.default else {
+					continue
+				}
+				val ty = self.program.structs[id].fields[index].ty
+				val refusal: Option<str> =
+					if self.program.structs[id].isUnion then .Some("a union's field has no default")
+					else if self.program.structs[id].isOpaque then
+						.Some("an `@opaque` struct's field has no default")
+					else .None
+				if refusal is .Some(message) {
+					val span = self.ast.exprs[value].span
+					self.report(
+						Diagnostic::error(
+							INVALID_DEFAULT,
+							String::of(message),
+							span,
+							String::of("a default"),
+						).withSecondary(f.name.span, String::of("for this field")),
+					)
+					continue
+				}
+				if self.hasError(ty) then continue
+				val default = self.defaultOf(value, ty)
+				self.program.structs[id].fields[index].default = move default
+			}
+			self.typeParams.clear()
+		}
+	}
+
+	/// The defaults of an enum's variant fields, which each variant built
+	/// without the field copies, or calls.
+	var fn checkVariantDefaults(e: &ast::EnumDecl, id: EnumId) = {
+		var any = false
+		for v in e.variants {
+			for f in v.fields {
+				if f.default.isSome() then any = true
+			}
+		}
+		if !any then return
+		self.typeParams = self.typeGenerics(.Enum(id))
+		for v in 0..e.variants.len() {
+			val variant = &e.variants[v]
+			for index in 0..variant.fields.len() {
+				val .Some(value) = variant.fields[index].default else {
+					continue
+				}
+				val ty = self.program.enums[id].variants[v].fields[index].ty
+				if self.hasError(ty) then continue
+				val default = self.defaultOf(value, ty)
+				self.program.enums[id].variants[v].fields[index].default = move default
+			}
+		}
+		self.typeParams.clear()
+	}
+
+	/// A type this file imported by name.
+	fn importedType(name: ast::Name): Option<TypeDef> = {
+		val .Some(.Item(module, name: item)) = self.imported(name) else {
+			return .None
+		}
+		return match self.modules[module].types.get(&item.sym) {
+			.Some((def, _)) => .Some(def)
+			.None => .None
+		}
+	}
+
+	/// Whether a field may be named here: the module that declares the
+	/// struct sees all of them, another only what is `pub`.
+	fn fieldVisible(id: StructId, index: i64): bool = {
+		val def = &self.program.structs[id]
+		return def.module as i64 == self.current || def.fields[index].isPub
+	}
+
+	/// Whether a field may be written here: the module that declares the
+	/// struct writes all of them, another only what is `pub var`.
+	fn fieldSettable(id: StructId, index: i64): bool = {
+		val def = &self.program.structs[id]
+		return def.module as i64 == self.current || def.fields[index].isVar
+	}
+
+	/// Reports a field that another module may read and not write.
+	var fn readonlyField(id: StructId, index: i64, at: Span, what: str) = {
+		val typeName = String::of(self.text(self.program.structs[id].name))
+		val field = String::of(self.text(self.program.structs[id].fields[index].name))
+		val declared = self.program.structs[id].fields[index].span
+		self.report(
+			Diagnostic::error(
+				PRIVATE_ITEM,
+				"`\(field)` of `\(typeName)` is read here, not written",
+				at,
+				String::of(what),
+			).withSecondary(declared, String::of("declared `pub`, which exports the reading")).
+				withHelp("write `pub var \(field): …` where it is declared, or ask the type to change it").
+				withNote(
+					String::of(
+						"a `pub` field is read by any module and written by the one that declares it; `pub var` is the one anyone writes",
+					),
+				),
+		)
+	}
+
+	/// Reports a field that another module may not name.
+	var fn privateField(id: StructId, index: i64, at: Span) = {
+		val typeName = String::of(self.text(self.program.structs[id].name))
+		val field = String::of(self.text(self.program.structs[id].fields[index].name))
+		val declared = self.program.structs[id].fields[index].span
+		self.report(
+			Diagnostic::error(
+				PRIVATE_ITEM,
+				"`\(field)` of `\(typeName)` is not exported",
+				at,
+				String::of("not `pub`"),
+			).withSecondary(declared, String::of("declared here")).
+				withHelp("write `pub \(field): …` where it is declared, or reach it through a method").
+				withNote(
+					String::of(
+						"a struct's fields belong to the module that declares it unless they say `pub`, so a type can keep what it promises",
+					),
+				),
+		)
+	}
+
+	/// A type named through its module: `list::Node`.
+	var fn namedType(
+		module: i64,
+		name: ast::Name,
+		args: &[ast::TypeId],
+		span: Span,
+		pointee: bool,
+	): Ty = {
+		match self.modules[module].types.get(&name.sym) {
+			.Some((.Builtin(..), _)) => return ERROR
+			.Some((.Struct(s), _)) => {
+				if !self.visible(module, self.program.structs[s].isPub) then
+					self.privateItem(module, "struct", name)
+				return self.appliedType(.Struct(s), &args, span, pointee)
+			}
+			.Some((.Enum(e), _)) => {
+				if !self.visible(module, self.program.enums[e].isPub) then
+					self.privateItem(module, "enum", name)
+				return self.appliedType(.Enum(e), &args, span, pointee)
+			}
+			.None => {}
+		}
+		// A type alias another module declared: `disk::Seen`.
+		if self.aliasTypeOf(module, name.sym, &args, span) is .Some(ty) then return ty
+		// A C type another module declared, which is only ever seen through
+		// `ptr`.
+		val opaque: Option<OpaqueId> = match self.modules[module].opaques.get(&name.sym) {
+			.Some(found) => .Some(found.clone())
+			.None => .None
+		}
+		if opaque is .Some(id) {
+			if !self.visible(module, self.program.opaques[id].isPub) then
+				self.privateItem(module, "C type", name)
+			if !args.isEmpty() {
+				for arg in args {
+					self.resolveTy(arg)
+				}
+				val none: Vec<GenericParamDef> = Vec()
+				self.typeArgCount(name.sym, &none, args.len(), span)
+				return ERROR
+			}
+			if !pointee {
+				self.opaqueAsValue(name.sym, span)
+				return ERROR
+			}
+			return self.intern(.Opaque(id))
+		}
+		val text = String::of(self.text(name.sym))
+		val path = self.modules[module].path.clone()
+		var candidates: Vec<str> = Vec()
+		val types = &self.modules[module].types
+		for i in 0..types.len() {
+			candidates.push(self.text(types.keyAt(i).clone()))
+		}
+		val opaques = &self.modules[module].opaques
+		for i in 0..opaques.len() {
+			candidates.push(self.text(opaques.keyAt(i).clone()))
+		}
+		var diagnostic = Diagnostic::error(
+			UNKNOWN_TYPE,
+			"cannot find type `\(text)` in module `\(path)`",
+			name.span,
+			String::of("unknown type"),
+		)
+		if suggest(text.toStr(), &candidates) is .Some(similar) then
+			diagnostic = diagnostic.withFix(
+				"did you mean `\(similar)`?",
+				own [Edit::replace(name.span, String::of(similar))],
+			)
+		self.report(move diagnostic)
+		return ERROR
+	}
+}
+
+extend Lowerer {
+	var fn collectFns(): Vec<BodyWork> = {
+		val file = self.ast
+		var bodies: Vec<BodyWork> = Vec()
+		for item in file.items {
+			match item {
+				.Fn(f) => {
+					val id = self.declareFn(&f.sig, &f.annotations, false, f.isPub, .None)
+					// An `@intrinsic` has no body to check: the compiler writes
+					// it.
+					if f.body is .Some(body) then
+						bodies.push(BodyWork(body: body, id: id, span: f.span))
+				}
+				.Extern(e) => {
+					// `@link("sqlite3", …)` names the libraries its declarations
+					// come from, in the order the linker is given them.
+					val annotations = self.annotations(&e.annotations, .Extern)
+					for (library, span) in annotations.link {
+						val name = String::of(self.text(library))
+						// It becomes `-lname` on the linker's command line, so it
+						// is a name, not a path.
+						if name.contains("/") || name.contains("\\") || name.contains(" ") then
+							self.report(
+								Diagnostic::error(
+									ANNOTATION,
+									"`\(name)` is not a library name",
+									span,
+									String::of("a path, not a name"),
+								).withNote(
+									String::of(
+										"`@link(\"sqlite3\")` links `-lsqlite3`; a library somewhere else is found with the linker's own search paths",
+									),
+								),
+							)
+						else if !self.program.libraries.contains(&name) then
+							self.program.libraries.push(move name)
+					}
+					// How the module's C is built: where its headers are, and
+					// what an Apple target links.
+					for (framework, _) in annotations.framework {
+						val name = String::of(self.text(framework))
+						if !self.program.frameworks.contains(&name) then
+							self.program.frameworks.push(move name)
+					}
+					for (dir, span) in annotations.include {
+						val path = String::of(self.text(dir))
+						// Where the module is on this machine is the command
+						// line's to say.
+						if path.startsWith("/") ||
+							path.startsWith("\\") ||
+							(path.len() >= 2 && path.toStr()[1] == b':') {
+							self.report(
+								Diagnostic::error(
+									ANNOTATION,
+									"`\(path)` is not a directory in the module",
+									span,
+									String::of("an absolute path"),
+								).withNote(
+									String::of(
+										"`@include` names a directory relative to the module's own; where something is on this machine is given with `-I`",
+									),
+								),
+							)
+						} else {
+							val entry = (self.current, move path)
+							if !self.program.cIncludes.contains(&entry) then
+								self.program.cIncludes.push(move entry)
+						}
+					}
+					// `@source("src/rcore.c")`: a C file of the module, below
+					// its own directory, compiled with the program;
+					// `@prefix("build.h")` is put before each of the module's C
+					// files.
+					for (path, _) in self.modulePaths(&annotations.source, "@source") {
+						val entry = (self.current, move path, annotations.sourceLanguage)
+						if !self.program.cSources.contains(&entry) then
+							self.program.cSources.push(move entry)
+					}
+					var prefixes: Vec<(Symbol, Span)> = Vec()
+					if annotations.prefix is .Some(prefix) then prefixes.push(prefix)
+					for (path, _) in self.modulePaths(&prefixes, "@prefix") {
+						val entry = (self.current, move path)
+						if !self.program.cPrefix.contains(&entry) then
+							self.program.cPrefix.push(move entry)
+					}
+					// `@define("PLATFORM_DESKTOP")`: what the module's C is
+					// compiled with defined.
+					for define in self.cDefines(&annotations.define) {
+						val entry = (self.current, move define)
+						if !self.program.cDefines.contains(&entry) then
+							self.program.cDefines.push(move entry)
+					}
+					for declared in e.globals {
+						self.declareGlobal(&declared)
+					}
+					for declared in e.fns {
+						// An extern declaration names a C symbol, which every
+						// module shares. `pub` exports the declaration, so that a
+						// module of bindings is the unit people share.
+						self.declareFn(
+							&declared.sig,
+							&declared.annotations,
+							true,
+							declared.isPub,
+							.None,
+						)
+					}
+				}
+				// A type's methods belong to it, not to the module.
+				.Struct(s) => {
+					val .Some((owner, _)) = self.types().get(&s.name.sym) else {
+						continue
+					}
+					val typeParams = self.typeGenerics(owner)
+					self.declareMethods(owner, &typeParams, &s.methods, &var bodies)
+				}
+				.Enum(e) => {
+					val .Some((owner, _)) = self.types().get(&e.name.sym) else {
+						continue
+					}
+					val typeParams = self.typeGenerics(owner)
+					self.declareMethods(owner, &typeParams, &e.methods, &var bodies)
+				}
+				// The same methods, written outside the declaration, and the
+				// implementation of an interface.
+				.Extend(block) => {
+					self.annotations(&block.annotations, .Extend)
+					// `extend Iterator<T: Ord> { … }`: methods every implementer
+					// has where its types meet the condition.
+					if self.extendedInterface(&block) is .Some(interfaceId) {
+						self.declareExtension(&block, interfaceId, &var bodies)
+						continue
+					}
+					self.derived = block.derived.isSome()
+					if self.implTarget(&block) is .Some((owner, typeParams)) {
+						match block.interfaceName {
+							.None => self.declareMethods(
+								owner,
+								&typeParams,
+								&block.methods,
+								&var bodies,
+							)
+							.Some(interfaceName) => self.declareImpl(
+								&block,
+								interfaceName,
+								owner,
+								&typeParams,
+								&var bodies,
+							)
+						}
+					}
+					self.derived = false
+				}
+				_ => {}
+			}
+		}
+		return move bodies
+	}
+
+	/// The methods of a type, declared with the type's parameters under the
+	/// names this declaration gives them.
+	var fn declareMethods(
+		owner: TypeDef,
+		typeParams: &[GenericParamDef],
+		methods: &[ast::FnDecl],
+		bodies: &var Vec<BodyWork>,
+	) = self.declareMethodsOf(owner, &typeParams, &methods, &var bodies, false, .None)
+
+	/// The same, for the methods of an `extend` of an interface that takes
+	/// types, where one name may be declared once per implementation.
+	/// `visible` makes a conformance's methods as visible as the interface,
+	/// whatever they say; nothing leaves each method its own word.
+	var fn declareMethodsOf(
+		owner: TypeDef,
+		typeParams: &[GenericParamDef],
+		methods: &[ast::FnDecl],
+		bodies: &var Vec<BodyWork>,
+		overloaded: bool,
+		visible: Option<bool>,
+	) = {
+		for method in methods {
+			val .Some((receiver, keyword)) = method.receiver else {
+				panic("a method has a receiver")
+			}
+			// `lend fn` is a lending pair written once: the reading half as
+			// written, and the writing half from the same body, checked again
+			// with `self` a `&var Self`.
+			val halves: Vec<ast::Receiver> = match receiver {
+				.Lend => Vec::of(own [ast::Receiver::Read, ast::Receiver::Var])
+				.Read => Vec::of(own [ast::Receiver::Read])
+				.Var => Vec::of(own [ast::Receiver::Var])
+				.Move => Vec::of(own [ast::Receiver::Move])
+				.Static => Vec::of(own [ast::Receiver::Static])
+			}
+			for half in halves {
+				val member = Member(
+					receiver: half,
+					keyword: keyword,
+					owner: .Type(owner),
+					typeParams: typeParams.toVec(),
+					overloaded: overloaded,
+					lent: receiver == .Lend && half == .Var,
+				)
+				val id = self.declareFn(
+					&method.sig,
+					&method.annotations,
+					false,
+					visible.unwrapOr(method.isPub),
+					.Some(move member),
+				)
+				val both = receiver != .Lend || self.lentBothWays(id, half, &method)
+				if receiver == .Lend && half == .Var then self.program.lentHalves.add(id)
+				if method.body is .Some(body) then
+					bodies.push(BodyWork(body: body, id: id, span: method.span))
+				if !both then break
+			}
+		}
+	}
+
+	/// One half of a `lend fn`. Its result is a reference, `&T` as written,
+	/// which the writing half lends as `&var T`; a result that is not one
+	/// lends nothing, and is reported once, on the reading half, which is all
+	/// that is then declared.
+	var fn lentBothWays(id: FnId, half: ast::Receiver, method: &ast::FnDecl): bool = {
+		val ret = self.program.fns[id].ret
+		val kind = self.kind(ret)
+		if kind is .Ref(kind: refKind, ..) && (refKind == .Var) == (half == .Var) then return true
+		if self.isPoisoned(ret) then return true
+		val span = match method.sig.ret {
+			.Some(t) => self.ast.types[t].span
+			.None => method.sig.name.span
+		}
+		val writtenVar = kind is .Ref(kind: .Var, ..)
+		var diagnostic = Diagnostic::error(
+			IMPL_METHODS,
+			String::of("a `lend fn` lends a place, and its result is `&T`"),
+			span,
+			String::of(if writtenVar then "written `&var`" else "not a `&` reference"),
+		).withNote(
+			String::of(
+				"`lend fn` declares a projection's reading half and its writing half from one body: the result is `&T` where the call reads and `&var T` where it writes",
+			),
+		)
+		if writtenVar then
+			diagnostic = diagnostic.withHelp(
+				String::of("write `&`: the writing half lends it as `&var` by itself"),
+			)
+		self.report(move diagnostic)
+		// Reported once: a result written `&var` is read as the `&` it should
+		// be, so the body is checked as the reading half it is.
+		if kind is .Ref(inner, kind: .Var) then
+			self.program.fns[id].ret = self.intern(.Ref(inner: inner, kind: .Shared))
+		return false
+	}
+
+	/// The type an `extend` block is for, and its parameters under the names
+	/// the block writes.
+	var fn implTarget(block: &ast::ExtendBlock): Option<(TypeDef, Vec<GenericParamDef>)> = {
+		val name = block.path[block.path.len() - 1]
+		val text = String::of(self.text(name.sym))
+		// What `@derive` wrote is for the type that asked, whatever its name
+		// finds here; a declaration that was refused, and reported, asked for
+		// nothing.
+		if block.derived is .Some(at) {
+			val owner = self.deriveOwners.get(&at)?
+			return self.targetParams(&block, owner, name, text.toStr())
+		}
+		// A built-in type: `extend [T]`, `extend str`, `extend i64` — the
+		// prelude's to give methods to.
+		if block.sliceOf is .Some(elem) {
+			// The element, with what the block asks of it.
+			val param =
+				if block.generics.isEmpty() then
+					ast::GenericParam(
+						decided: .None,
+						name: elem,
+						bounds: Vec(),
+						default: .None,
+						span: elem.span,
+					)
+				else block.generics[0].clone()
+			val generics = self.genericParams([move param])
+			return match self.builtinOwner(&block, .Slice, generics.clone(), elem.span) {
+				.Some(owner) => .Some((owner, move generics))
+				.None => .None
+			}
+		}
+		// `extend Slots<T>`: the prelude's storage, which takes its element as a
+		// parameter.
+		if block.path.len() == 1 && self.text(name.sym) == "Slots" {
+			val generics = self.genericParams(&block.generics)
+			return match self.builtinOwner(&block, .Slots, generics.clone(), name.span) {
+				.Some(owner) => .Some((owner, move generics))
+				.None => .None
+			}
+		}
+		if block.path.len() == 1 &&
+			self.builtin(name.sym) is .Some(ty) &&
+			BuiltinOwner::of(self.kind(ty)) is .Some(builtin) {
+			if !block.generics.isEmpty() {
+				self.report(
+					Diagnostic::error(
+						IMPL_TARGET,
+						"`\(text)` has no type parameters",
+						block.generics[0].span,
+						String::of("type parameters"),
+					),
+				)
+				return .None
+			}
+			return match self.builtinOwner(&block, builtin, Vec(), name.span) {
+				.Some(owner) => .Some((owner, Vec()))
+				.None => .None
+			}
+		}
+		// A path names another module's type.
+		if block.path.len() > 1 {
+			self.report(self.elsewhere(text.toStr(), block.path[0].span.to(name.span)))
+			return .None
+		}
+		val .Some((owner, _)) = self.types().get(&name.sym) else {
+			// `extend Id { … }`, where `Id` is another name for a type: the
+			// methods belong to the type itself.
+			if self.aliases().contains(&name.sym) {
+				self.report(
+					Diagnostic::error(
+						IMPL_TARGET,
+						"`\(text)` is another name for a type, not a type",
+						name.span,
+						String::of("an alias"),
+					).withHelp(String::of("write the block for the type the alias names")).withNote(
+						String::of(
+							"a method belongs to the type it is declared in, and an alias declares nothing",
+						),
+					),
+				)
+				return .None
+			}
+			val diagnostic =
+				if self.imported(name).isSome() then self.elsewhere(text.toStr(), name.span)
+				else self.unknownName(name.sym, name.span)
+			self.report(move diagnostic)
+			return .None
+		}
+		self.program.names.push((name.span, .Owner(owner)))
+		return self.targetParams(&block, owner, name, text.toStr())
+	}
+
+	/// A type declared in another module, which this one may not give
+	/// methods.
+	fn elsewhere(text: str, span: Span): Diagnostic = Diagnostic::error(
+		IMPL_TARGET,
+		"`\(text)` is declared in another module",
+		span,
+		String::of("not a type of this module"),
+	).withNote(String::of("only the module that declares a type may add methods to it"))
+
+	/// The parameters of `owner`, a type of this module, under the names an
+	/// `extend` block of it writes.
+	var fn targetParams(
+		block: &ast::ExtendBlock,
+		owner: TypeDef,
+		name: ast::Name,
+		text: str,
+	): Option<(TypeDef, Vec<GenericParamDef>)> = {
+		val declared = self.typeGenerics(owner)
+		val written = &block.generics
+		if written.len() != declared.len() {
+			var names: Vec<str> = Vec()
+			for p in declared {
+				names.push(self.text(p.name))
+			}
+			val expected =
+				if declared.isEmpty() then "`\(text)` has no type parameters"
+				else "`\(text)` has \(plural(declared.len(), "type parameter", "type parameters")): `<\(names.join(", "))>`"
+			val writtenSpan =
+				if written.isEmpty() then name.span
+				else name.span.to(written[written.len() - 1].span)
+			var diagnostic = Diagnostic::error(
+				IMPL_TARGET,
+				"`extend` of `\(text)` must name its type parameters",
+				writtenSpan,
+				move expected,
+			).withNote(
+				String::of(
+					"an `extend` block binds the type's parameters under the names it writes, one for each",
+				),
+			)
+			// A default is for a use of the type, which may leave it out.
+			var defaulted = false
+			for p in declared {
+				if p.default != .None then defaulted = true
+			}
+			if defaulted then
+				diagnostic = diagnostic.withNote(
+					String::of(
+						"a default type argument is for a use of the type; the block names the parameter it stands for too",
+					),
+				)
+			self.report(move diagnostic)
+			return .None
+		}
+		// The names are binders for the type's own parameters, and a
+		// constraint on one says when the block applies.
+		val writtenParams = self.genericParams(&written)
+		// A conformance's condition is an interface: whether a type owns
+		// memory is worked out as types are completed, and an implementation
+		// is chosen before that. A block of methods chooses nothing, and
+		// `copy` on a method's parameters is checked where it is called, so it
+		// may ask for it.
+		for i in 0..written.len() {
+			if writtenParams[i].copy &&
+				block.interfaceName.isSome() &&
+				!self.typeGenerics(owner).isEmpty() {
+				var copySpan: Option<Span> = .None
+				for b in written[i].bounds {
+					if copySpan.isNone() && self.isCopy(&b) then copySpan = .Some(b.span)
+				}
+				if copySpan is .Some(span) then
+					self.report(
+						Diagnostic::error(
+							IMPL_TARGET,
+							String::of(
+								"`copy` is not a condition an implementation of an interface may ask for",
+							),
+							span,
+							String::of("not a condition"),
+						).withNote(
+							String::of(
+								"an implementation's condition is an interface the argument implements; `copy` is worked out as types are completed, and which implementation applies is decided before that. A block of methods may ask for it",
+							),
+						),
+					)
+			}
+		}
+		var params: Vec<GenericParamDef> = Vec()
+		for i in 0..written.len() {
+			var condition = writtenParams[i].clone()
+			// The type's own constraints hold wherever it is written, so they
+			// are part of what the block may rely on.
+			for c in declared[i].interfaces {
+				if !condition.interfaces.contains(&c) then condition.interfaces.push(c)
+			}
+			params.push(
+				GenericParamDef(
+					decided: false,
+					// The type's parameter, under the name the block writes.
+					name: declared[i].name,
+					written: written[i].name.sym,
+					interfaces: move condition.interfaces,
+					copy: condition.copy || declared[i].copy,
+					// The type's default, which `Pool<i64>::of()` leaves out as
+					// `Pool<i64>` does; the block itself names every one.
+					default: declared[i].default,
+					span: written[i].name.span,
+				),
+			)
+		}
+		return .Some((owner, move params))
+	}
+
+	/// A function the compiler declares and writes the body of in C: an
+	/// accessor of a field or of a variable C owns.
+	fn accessorFn(
+		name: Symbol,
+		nameSpan: Span,
+		symbol: Option<Symbol>,
+		params: Vec<ParamDef>,
+		ret: Ty,
+		header: Option<Symbol>,
+		accesses: Option<Access>,
+		isPub: bool,
+		span: Span,
+	): FnDef = FnDef(
+		name: name,
+		nameSpan: nameSpan,
+		symbol: symbol,
+		receiver: .None,
+		owner: .None,
+		interfaceId: .None,
+		generics: Vec(),
+		instanceOf: .None,
+		params: move params,
+		ret: ret,
+		retSpan: .None,
+		isExtern: true,
+		exportsC: false,
+		header: header,
+		accesses: accesses,
+		isVariadic: false,
+		variadicOf: .None,
+		lendsFrom: .None,
+		keeps: Vec(),
+		keepsAt: .None,
+		isLambda: false,
+		generator: .None,
+		isTailrec: false,
+		isTest: false,
+		isInline: false,
+		generated: .None,
+		intrinsic: .None,
+		body: .None,
+		projects: .None,
+		compileTime: false,
+		module: self.current as u32,
+		isPub: isPub,
+		span: span,
+	)
+
+	/// The pair of functions that read and write each field of an `@opaque`
+	/// struct, whose bodies the compiler writes in C because only C knows
+	/// where the fields are.
+	var fn declareFieldAccessors(id: StructId) = {
+		val fields = self.program.structs[id].fields.clone()
+		val header = self.program.structs[id].header
+		val isPub = self.program.structs[id].isPub
+		val ownerTy = self.intern(.Struct(id: id, args: TyList::empty()))
+		val pointer = self.intern(.Ptr(ownerTy))
+		var accessors: Vec<(FnId, FnId)> = Vec()
+		for (index, field) in fields.forwards().enumerate() {
+			val owner = ParamDef(
+				name: field.name,
+				nameSpan: field.span,
+				ty: pointer,
+				span: field.span,
+				default: .None,
+			)
+			val access: Option<Access> = .Some(.Field(id: id, index: index as u32))
+			val get = self.program.fns.add(
+				self.accessorFn(
+					field.name,
+					field.span,
+					.None,
+					Vec::of(own [owner.clone()]),
+					field.ty,
+					header,
+					access.clone(),
+					isPub,
+					field.span,
+				),
+			)
+			var value = owner.clone()
+			value.ty = field.ty
+			val set = self.program.fns.add(
+				self.accessorFn(
+					field.name,
+					field.span,
+					.None,
+					Vec::of(own [move owner, move value]),
+					UNIT,
+					header,
+					move access,
+					isPub,
+					field.span,
+				),
+			)
+			accessors.push((get, set))
+		}
+		self.program.structs[id].accessors = move accessors
+	}
+
+	/// `val optind: c_int` or `var errno: c_int` in an extern block: a
+	/// variable C owns. Wip reads and writes it through two functions the
+	/// compiler declares for it, whose bodies it writes in C — because the
+	/// name may be a macro rather than a symbol, as `errno` is, and only C
+	/// knows which.
+	var fn declareGlobal(declared: &ast::ExternGlobal) = {
+		val annotations = self.annotations(&declared.annotations, .ExternVar)
+		// Its own `@header` says C has to reach it — `errno` is a macro — so
+		// it is read and written through C the compiler writes. Without one it
+		// is a symbol, which the compiler loads and stores itself.
+		val header: Option<Symbol> = match annotations.header {
+			.Some((h, _)) => .Some(h)
+			.None => .None
+		}
+		val symbol = self.cSymbol(annotations.symbol)
+		val name = declared.name
+		val span = self.ast.types[declared.ty].span
+		var ty = self.resolveTy(declared.ty)
+		// C hands over a copy of what it holds, so the type must be one that
+		// travels: a scalar, a `cstring` or a pointer.
+		if !self.cCompatible(ty, false) || self.kind(ty) is .Str {
+			if !self.isPoisoned(ty) then
+				self.report(
+					Diagnostic::error(
+						NOT_C_COMPATIBLE,
+						"\(self.tyName(ty)) cannot be a variable Wip reads from C",
+						span,
+						String::of("not a value C hands over"),
+					).withNote(
+						String::of(
+							"a variable is read as a copy of what C holds, so it is one of the scalars, a `cstring` or a `ptr<T>`",
+						),
+					),
+				)
+			ty = ERROR
+		}
+		val getter = self.program.fns.add(
+			self.accessorFn(
+				name.sym,
+				name.span,
+				symbol,
+				Vec(),
+				ty,
+				header,
+				.None,
+				declared.isPub,
+				declared.span,
+			),
+		)
+		var setter: Option<FnId> = .None
+		if declared.isMut {
+			val param = ParamDef(
+				name: name.sym,
+				nameSpan: name.span,
+				ty: ty,
+				span: declared.span,
+				default: .None,
+			)
+			setter = .Some(
+				self.program.fns.add(
+					self.accessorFn(
+						name.sym,
+						name.span,
+						symbol,
+						Vec::of(own [move param]),
+						UNIT,
+						header,
+						.None,
+						declared.isPub,
+						declared.span,
+					),
+				),
+			)
+		}
+		val id = self.program.globals.add(GlobalDef(
+			name: name.sym,
+			symbol: symbol,
+			ty: ty,
+			isMut: declared.isMut,
+			header: header,
+			getter: getter,
+			setter: setter,
+			module: self.current as u32,
+			isPub: declared.isPub,
+			span: name.span,
+		))
+		self.program.fns[getter].accesses = .Some(.Global(id))
+		if setter is .Some(setter) then self.program.fns[setter].accesses = .Some(.Global(id))
+		// It takes a name in the module, as a constant does.
+		if self.preludeName(name, "a variable named") {
+			// Reported; it keeps its own place in this module's scope.
+		} else if self.globals().get(&name.sym) is .Some(first) {
+			self.duplicate(name, self.program.globals[first].span)
+		} else if self.consts().get(&name.sym) is .Some(first) {
+			self.duplicate(name, self.program.consts[first].span)
+		} else {
+			self.modules[self.current].globals.put(name.sym, id)
+		}
+	}
+
+	/// `@symbol("sqlite3_open")`: the name C knows, which must be one C could
+	/// have written.
+	var fn cSymbol(written: Option<(Symbol, Span)>): Option<Symbol> = {
+		val (symbol, span) = written?
+		val text = String::of(self.text(symbol))
+		var identifier = !text.isEmpty() && !(text.toStr()[0] is b'0'..=b'9')
+		for i in 0..text.len() {
+			if !(text.toStr()[i] is b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'$') then
+				identifier = false
+		}
+		if !identifier {
+			self.report(
+				Diagnostic::error(
+					ANNOTATION,
+					"`\(text)` is not a name C could have written",
+					span,
+					String::of("not a C name"),
+				).withNote(
+					String::of(
+						"the compiler writes this name into the C it generates, so it is letters, digits and `_`",
+					),
+				),
+			)
+			return .None
+		}
+		return .Some(symbol)
+	}
+
+	/// Declares a function or a method from its signature: its type
+	/// parameters, its parameters and result read with them in scope, what
+	/// its annotations say, and its name where the module or its type keeps
+	/// it. Its body is checked later, once every function is declared.
+	var fn declareFn(
+		sig: &ast::FnSig,
+		written: &[ast::Annotation],
+		isExtern: bool,
+		isPub: bool,
+		member: Option<Member>,
+	): FnId = {
+		// A C declaration takes `@symbol`, a Wip function does not, and the
+		// other way about.
+		val annotations = self.annotations(
+			&written,
+			if isExtern then AnnotationTarget::ExternFn else AnnotationTarget::Fn,
+		)
+		val file = self.ast
+		val generics = self.fnGenerics(&sig, &member, isExtern)
+		// The signature is read with the function's type parameters, and a
+		// method's `Self`, in scope.
+		self.typeParams = generics.clone()
+		self.selfTy = match member {
+			.Some(m) => .Some(self.memberSelfTy(&m))
+			.None => .None
+		}
+		val pins = self.decidedPins(&generics)
+		self.program.types.setPins(move pins)
+		val (params, deferred) = self.fnParams(&sig, &member, isExtern)
+		val (ret, yields, generatorArgs) = self.fnResult(&sig, &member, isExtern)
+		self.program.types.setPins(Vec())
+		self.typeParams.clear()
+		self.selfTy = .None
+		val intrinsic = if annotations.intrinsic then self.fnIntrinsic(&sig, &member) else .None
+		self.checkVariadic(&sig, isExtern)
+		val lendsFrom = self.lendsFrom(&sig, &params)
+		val keeps = self.keepsOf(&sig, &params)
+		val exported = self.fnExported(&annotations, &params, &sig, ret)
+		val symbol = self.cSymbol(annotations.symbol)
+		val def = FnDef(
+			name: sig.name.sym,
+			nameSpan: sig.name.span,
+			symbol: symbol,
+			receiver: match member {
+				.Some(m) => .Some(m.receiver)
+				.None => .None
+			},
+			owner: match member {
+				.Some(m) => match m.owner {
+					.Type(owner) => .Some(owner)
+					.Interface(..) => .None
+				}
+				.None => .None
+			},
+			interfaceId: match member {
+				.Some(m) => match m.owner {
+					.Interface(id) => .Some(id)
+					.Type(..) => .None
+				}
+				.None => .None
+			},
+			generics: move generics,
+			instanceOf: .None,
+			params: move params,
+			ret: ret,
+			retSpan: match sig.ret {
+				.Some(t) => .Some(file.types[t].span)
+				.None => .None
+			},
+			isExtern: isExtern,
+			exportsC: exported,
+			// A declaration's own `@header` says the header defines it — a
+			// macro or a `static inline`, which no symbol answers to — so the
+			// call goes through C that includes that header. A block's
+			// `@header` says where its types are, and does not make a call one
+			// C has to write.
+			header: if isExtern {
+				match annotations.header {
+					.Some((h, _)) => .Some(h)
+					.None => .None
+				}
+			} else {
+				.None
+			},
+			accesses: .None,
+			isVariadic: sig.variadic.isSome(),
+			variadicOf: .None,
+			lendsFrom: move lendsFrom,
+			keeps: move keeps,
+			keepsAt: .Some((sig.span.hi, !sig.keeps.isEmpty())),
+			isLambda: false,
+			generator: .None,
+			isTailrec: annotations.tailrec,
+			isTest: annotations.test.isSome(),
+			isInline: annotations.inline.isSome(),
+			generated: .None,
+			intrinsic: intrinsic,
+			body: .None,
+			// An intrinsic projection has no body to read what it lends from:
+			// `slots.slot(index)` lends a slot of its receiver.
+			projects: if intrinsic is .Some(.SlotsSlot | .OptionAssumed) then .Some(.Param(0))
+			else .None,
+			compileTime: false,
+			module: self.current as u32,
+			isPub: isPub,
+			span: sig.span,
+		)
+		val id = self.program.fns.add(move def)
+		self.checkTestShape(id, annotations.test)
+		for (index, value) in deferred {
+			self.paramDefaults.push((id, index, value))
+		}
+		if yields is .Some(elem) {
+			val receiver: Option<ast::Receiver> = match member {
+				.Some(m) => .Some(m.receiver)
+				.None => .None
+			}
+			self.declareFnGenerator(id, elem, generatorArgs, receiver)
+		}
+		self.checkBuiltinMethod(&sig, &member)
+		self.nameFn(id, &sig, &member, isExtern)
+		return id
+	}
+
+	/// A function's type parameters: a method's type's, then its own, so its
+	/// body may use both. A C function has none.
+	var fn fnGenerics(
+		sig: &ast::FnSig,
+		member: &Option<Member>,
+		isExtern: bool,
+	): Vec<GenericParamDef> = {
+		val generics: Vec<GenericParamDef> = match member {
+			.None => self.genericParams(&sig.generics)
+			.Some(m) => {
+				var all = m.typeParams.clone()
+				// The type's come first, so a constraint on one of the method's
+				// own — `J: Iterator<V>` — names the others where they will be.
+				self.typeParams = all.clone()
+				for param in self.genericParams(&sig.generics) {
+					var shadowed: Option<Span> = .None
+					for p in all {
+						if shadowed.isNone() && p.written == param.written then
+							shadowed = .Some(p.span)
+					}
+					if shadowed is .Some(span) {
+						val name = String::of(self.text(param.written))
+						self.report(
+							Diagnostic::error(
+								SHADOWED_TYPE_PARAMETER,
+								"`\(name)` is already a type parameter of the type",
+								param.span,
+								String::of("a type parameter of the method"),
+							).withSecondary(span, "the type's `\(name)`").withNote(
+								String::of(
+									"a method sees its type's parameters, so one of its own cannot have the same name",
+								),
+							),
+						)
+					}
+					all.push(move param)
+				}
+				move all
+			}
+		}
+		if isExtern && !generics.isEmpty() then
+			self.report(
+				Diagnostic::error(
+					CANNOT_BE_GENERIC,
+					String::of("a C function cannot be generic"),
+					generics[0].span,
+					String::of("a type parameter"),
+				).withNote(
+					String::of(
+						"C has no generics; declare the function once for each type it takes",
+					),
+				),
+			)
+		return move generics
+	}
+
+	/// `Self` in a method: the type it belongs to.
+	var fn memberSelfTy(member: &Member): Ty = match member.owner {
+		// Built from the block's own parameters, which say what the block asks
+		// of them: `extend [T: copy]` is a slice of a `T` that is `copy`.
+		.Type(owner) => self.selfTyOf(owner, &member.typeParams)
+		// In an interface, `Self` is the method's type parameter, which an
+		// implementation substitutes.
+		.Interface(..) => self.intern(
+			.Param(TyParam(index: 0, name: self.interner.selfTypeSymbol(), copy: false)),
+		)
+	}
+
+	/// What `keeps` says a call may keep: the parameters, by index, each one
+	/// that is not `&var`, in a function that has a `&var` parameter to keep
+	/// them in.
+	var fn keepsOf(sig: &ast::FnSig, params: &[ParamDef]): Vec<u32> = {
+		if sig.keeps.isEmpty() then return Vec()
+		val note =
+			"`keeps` names the parameters whose values a call may keep in its `&var` arguments, the receiver of a `var fn` among them"
+		val fnName = String::of(self.text(sig.name.sym))
+		var anyVar = false
+		for p in params {
+			if self.kind(p.ty) is .Ref(kind: .Var, ..) then anyVar = true
+		}
+		if !anyVar {
+			val span = sig.keeps[0].span.to(sig.keeps[sig.keeps.len() - 1].span)
+			self.report(
+				Diagnostic::error(
+					KEEPS,
+					"`\(fnName)` has nothing to keep its arguments in",
+					span,
+					String::of("no `&var` parameter"),
+				).withNote(String::of(note)),
+			)
+			return Vec()
+		}
+		var keeps: Vec<u32> = Vec()
+		for name in sig.keeps {
+			val written = String::of(self.text(name.sym))
+			var index: Option<i64> = .None
+			for (i, p) in params.forwards().enumerate() {
+				if index.isNone() && p.name == name.sym then index = .Some(i)
+			}
+			val .Some(index) = index else {
+				self.report(
+					Diagnostic::error(
+						KEEPS,
+						"`\(written)` is not a parameter of `\(fnName)`",
+						name.span,
+						String::of("not a parameter"),
+					).withNote(String::of(note)),
+				)
+				continue
+			}
+			if self.kind(params[index].ty) is .Ref(kind: .Var, ..) {
+				self.report(
+					Diagnostic::error(
+						KEEPS,
+						"`\(written)` is lent for writing, and what it reaches is not kept",
+						name.span,
+						String::of("a `&var` parameter"),
+					).withNote(
+						String::of(
+							"what a `&var` argument reaches is lent for the call alone: its caller writes it again",
+						),
+					).withNote(String::of(note)),
+				)
+				continue
+			}
+			val kept = index as u32
+			if !keeps.contains(&kept) then keeps.push(kept)
+		}
+		return move keeps
+	}
+
+	/// What `from` names the result as borrowing: a parameter named alone,
+	/// with its place and what it borrows; and what a parameter borrows,
+	/// where a `&` or view field of it is named, `self.ast`.
+	var fn lendsFrom(sig: &ast::FnSig, params: &[ParamDef]): Option<Vec<LendFrom>> = {
+		if sig.lendsFrom.isEmpty() then return .None
+		val note =
+			"`from` names what the result borrows: a parameter that is a `str`, a reference or a view, `self`, or a `&`, `str` or view field reached from one"
+		var lends: Vec<LendFrom> = Vec()
+		for path in sig.lendsFrom {
+			val name = match path.root {
+				.Some(root) => root.sym
+				.None => self.interner.selfSymbol()
+			}
+			val written = String::of(self.text(name))
+			var index: Option<i64> = .None
+			for (i, p) in params.forwards().enumerate() {
+				if index.isNone() && p.name == name then index = .Some(i)
+			}
+			val .Some(index) = index else {
+				self.report(
+					Diagnostic::error(
+						LENDS_FROM,
+						"`\(written)` is not a parameter of `\(self.text(sig.name.sym))`",
+						path.span,
+						String::of("not a parameter"),
+					).withNote(String::of(note)),
+				)
+				continue
+			}
+			if path.fields.isEmpty() {
+				val ty = params[index].ty
+				if !self.program.holdsView(ty) {
+					self.report(
+						Diagnostic::error(
+							LENDS_FROM,
+							"`\(written)` is \(self.tyName(ty)), which a result cannot borrow from",
+							path.span,
+							String::of("borrows nothing"),
+						).withNote(String::of(note)),
+					)
+					continue
+				}
+				lends.push(.Param(index as u32))
+				continue
+			}
+			// Each field is a `&` or a view, which points outside what holds
+			// it; a field held as its own is part of the view.
+			var ty = params[index].ty
+			var reached = written.clone()
+			var lent = true
+			for field in path.fields {
+				val owner = match self.kind(ty) {
+					.Ref(inner, ..) => inner
+					_ => ty
+				}
+				var found: Option<i64> = .None
+				if self.kind(owner) is .Struct(id, ..) {
+					for (i, f) in self.program.structs[id].fields.forwards().enumerate() {
+						if found.isNone() && f.name == field.sym then found = .Some(i)
+					}
+				}
+				val .Some(at) = found else {
+					self.report(
+						Diagnostic::error(
+							LENDS_FROM,
+							"`\(reached)` has no field `\(self.text(field.sym))`",
+							field.span,
+							String::of("no such field"),
+						).withNote(String::of(note)),
+					)
+					lent = false
+					break
+				}
+				ty = self.program.fieldTy(owner, at as u32)
+				reached = "\(reached).\(self.text(field.sym))"
+				// A `str` points outside as a `&` does: its bytes are never what
+				// holds it.
+				val pointsOut =
+					self.kind(ty) is .Ref(..) | .Str ||
+					(self.kind(ty) is .Struct(id, ..) && self.program.structs[id].isView)
+				if !pointsOut {
+					self.report(
+						Diagnostic::error(
+							LENDS_FROM,
+							"`\(reached)` is held by `\(written)`, not borrowed by it",
+							path.span,
+							"\(self.tyName(ty)) of its own",
+						).withHelp("name `\(written)`, which the result then borrows whole").withNote(
+							String::of(
+								"a field names what the result borrows where it is a `&`, a `str` or a view, which points outside what holds it",
+							),
+						),
+					)
+					lent = false
+					break
+				}
+			}
+			if lent then lends.push(.Borrowed(index as u32))
+		}
+		return .Some(move lends)
+	}
+
+	/// A function's parameters, a method's receiver first, and the defaults
+	/// to check once every function is declared, by the parameter's place.
+	var fn fnParams(
+		sig: &ast::FnSig,
+		member: &Option<Member>,
+		isExtern: bool,
+	): (Vec<ParamDef>, Vec<(i64, ast::ExprId)>) = {
+		val file = self.ast
+		var seen: Map<Symbol, Span> = Map()
+		var params: Vec<ParamDef> = Vec()
+		// The receiver is the first parameter, written as a word before `fn`.
+		if member is .Some(m) && m.receiver != .Static {
+			val .Some(selfTy) = self.selfTy else {
+				panic("a method knows its type")
+			}
+			val ty = match m.receiver {
+				.Read => self.intern(.Ref(inner: selfTy, kind: .Shared))
+				.Var => self.intern(.Ref(inner: selfTy, kind: .Var))
+				_ => selfTy
+			}
+			params.push(ParamDef(
+				name: self.interner.selfSymbol(),
+				nameSpan: m.keyword,
+				ty: ty,
+				span: m.keyword,
+				default: .None,
+			))
+		}
+		var deferred: Vec<(i64, ast::ExprId)> = Vec()
+		for p in sig.params {
+			match seen.get(&p.name.sym) {
+				.Some(first) => self.duplicate(p.name, first)
+				.None => seen.put(p.name.sym, p.name.span)
+			}
+			var ty = self.resolveTy(p.ty)
+			if isExtern then self.checkCCompatible(ty, file.types[p.ty].span, false)
+			else ty = self.paramTy(ty, p.ty)
+			// Checked once every function is declared, since it may be code
+			// that calls one.
+			if p.default is .Some(value) && self.defaultAllowed(value, ty, &p, isExtern) then
+				deferred.push((params.len(), value))
+			params.push(ParamDef(
+				name: p.name.sym,
+				nameSpan: p.name.span,
+				ty: ty,
+				span: p.span,
+				default: .None,
+			))
+		}
+		return (move params, move deferred)
+	}
+
+	/// A function's result; for one that answers `Iterator<T>`, the `T` it
+	/// yields, and the type arguments its generator is declared with.
+	var fn fnResult(
+		sig: &ast::FnSig,
+		member: &Option<Member>,
+		isExtern: bool,
+	): (Ty, Option<Ty>, TyList) = {
+		val file = self.ast
+		// `Iterator<T>` as the result: a function that yields, whose generator
+		// is declared once the function is.
+		val yields: Option<Ty> = match sig.ret {
+			.Some(t) if !isExtern => self.generatorElem(t)
+			_ => .None
+		}
+		val generatorArgs = self.ownTypeArgs()
+		val ret = match sig.ret {
+			.Some(_) if yields.isSome() => ERROR
+			.Some(t) => {
+				var ty = self.resolveTy(t)
+				if isExtern {
+					self.checkCCompatible(ty, file.types[t].span, true)
+				} else {
+					// A reference result declares a projection, which lends a
+					// place instead of returning a value. Deeper in the type a
+					// `&` is a view, as in `Option<&V>`, and a `&var` is refused.
+					val inner = match self.kind(ty) {
+						.Ref(inner, ..) => inner
+						_ => ty
+					}
+					if self.noVarRef(inner, t, "a result") ||
+						self.bareDyn(ty, t) ||
+						self.bareSlice(ty, t, false) {
+						ty = ERROR
+					}
+				}
+				// The writing half of a `lend fn` lends what the reading half
+				// does, for writing.
+				if member is .Some(m) && m.lent && self.kind(ty) is .Ref(inner, kind: .Shared) then
+					ty = self.intern(.Ref(inner: inner, kind: .Var))
+				ty
+			}
+			.None => UNIT
+		}
+		return (ret, yields, generatorArgs)
+	}
+
+	/// The body the compiler writes for an `@intrinsic`, which must be one it
+	/// knows.
+	var fn fnIntrinsic(sig: &ast::FnSig, member: &Option<Member>): Option<Intrinsic> = {
+		val name = String::of(self.text(sig.name.sym))
+		val path = self.modules[self.current].path.clone()
+		val known: Option<Intrinsic> = match member {
+			.Some(m) => match m.owner {
+				.Type(.Builtin(.Slots)) => match name.toStr() {
+					"alloc" => .Some(.SlotsAlloc)
+					"moveIn" => .Some(.SlotsMoveIn)
+					"moveOut" => .Some(.SlotsMoveOut)
+					"slot" => .Some(.SlotsSlot)
+					"takeBuffer" => .Some(.SlotsTakeBuffer)
+					"takeFrom" => .Some(.SlotsTakeFrom)
+					"over" => .Some(.SlotsOver)
+					"release" => .Some(.SlotsRelease)
+					_ => .None
+				}
+				.Type(.Builtin(.Str)) => match name.toStr() {
+					"fromBytes" => .Some(.StrFromBytes)
+					"items" => .Some(.StrBytes)
+					"len" => .Some(.Len)
+					_ => .None
+				}
+				// What a float is made of, and what the machine does to one
+				// exactly.
+				.Type(.Builtin(.Float(..))) => match name.toStr() {
+					"toBits" => .Some(.FloatToBits)
+					"fromBits" => .Some(.FloatFromBits)
+					"sqrt" => .Some(.FloatSqrt)
+					"floor" => .Some(.FloatFloor)
+					"ceil" => .Some(.FloatCeil)
+					"trunc" => .Some(.FloatTrunc)
+					"mulAdd" => .Some(.FloatMulAdd)
+					_ => .None
+				}
+				// An integer's bits, as the machine counts and turns them.
+				.Type(.Builtin(.Int(..))) => match name.toStr() {
+					"countOnes" => .Some(.IntCountOnes)
+					"addOverflows" => .Some(.IntAddOverflows)
+					"subOverflows" => .Some(.IntSubOverflows)
+					"mulOverflows" => .Some(.IntMulOverflows)
+					"leadingZeros" => .Some(.IntLeadingZeros)
+					"trailingZeros" => .Some(.IntTrailingZeros)
+					"swapBytes" => .Some(.IntSwapBytes)
+					"reverseBits" => .Some(.IntReverseBits)
+					"rotateLeft" => .Some(.IntRotateLeft)
+					"rotateRight" => .Some(.IntRotateRight)
+					_ => .None
+				}
+				.Type(.Builtin(.Slice)) => match name.toStr() {
+					"swap" => .Some(.SliceSwap)
+					"len" => .Some(.Len)
+					_ => .None
+				}
+				.Type(.Builtin(.Cstring)) =>
+					if name == "fromBytes" then .Some(.CstringFromBytes) else .None
+				.Type(.Builtin(.Char)) =>
+					if name == "fromScalar" then .Some(.CharFromScalar) else .None
+				_ => .None
+			}
+			// An `own` as the address C can hold, and back: how a value crosses
+			// to another thread, for the standard library alone.
+			.None if self.inStd() => match name.toStr() {
+				"intoAddress" => .Some(.OwnIntoAddress)
+				// An option's value, where the library knows it holds one.
+				"assumed" | "assumedVar" => .Some(.OptionAssumed)
+				"fromAddress" => .Some(.OwnFromAddress)
+				"unbox" => .Some(.OwnUnbox)
+				// A value lent to C as a callback's `void *`, and had back.
+				"addressOf" => .Some(.ReferenceAddress)
+				"referenceAt" => .Some(.AddressReference)
+				// C's `sizeof` and `_Alignof`.
+				"sizeOf" => .Some(.SizeOf)
+				// A slice's address, for C to read.
+				"pointerTo" if path == "std::c" || path == "std::prelude" => .Some(.SlicePointer)
+				"alignOf" => .Some(.AlignOf)
+				// What the runtime written in Wip needs of memory C gave it.
+				"atomicAdd" => .Some(.AtomicAdd)
+				"atomicLoad" => .Some(.AtomicLoad)
+				"atomicStore" => .Some(.AtomicStore)
+				// A slice lent in parts, and a closure lent to a thread.
+				"sliceAt" => .Some(.SliceAt)
+				"boxAddress" => .Some(.BoxAddress)
+				"closureCode" => .Some(.ClosureCode)
+				"closureCaptures" => .Some(.ClosureCaptures)
+				// What `std::sync::Atomic` does.
+				"atomicSubtract" => .Some(.AtomicSubtract)
+				"atomicSwap" => .Some(.AtomicSwap)
+				"atomicCompareSwap" => .Some(.AtomicCompareSwap)
+				"offsetBytes" => .Some(.OffsetBytes)
+				"runtimeWords" => .Some(.RuntimeWords)
+				// What a panic reads to say the calls that led to it.
+				"frameTables" => .Some(.FrameTables)
+				// A file's contents, read when the program is compiled.
+				"bytes" if path == "std::embed" => .Some(.EmbedBytes)
+				"text" if path == "std::embed" => .Some(.EmbedText)
+				"textOr" if path == "std::embed" => .Some(.EmbedTextOr)
+				_ => .None
+			}
+			_ => .None
+		}
+		if known.isNone() then
+			self.report(
+				Diagnostic::error(
+					ANNOTATION,
+					"the compiler has no body for `\(name)`",
+					sig.name.span,
+					String::of("not an intrinsic it knows"),
+				).withNote(
+					String::of(
+						"`@intrinsic` says the compiler writes the body, so it must be one of the few it knows",
+					),
+				),
+			)
+		return known
+	}
+
+	/// Whether C calls the function by a plain symbol, `@export("C")`, in
+	/// which case its signature must be one C can write.
+	var fn fnExported(
+		annotations: &Annotations,
+		params: &[ParamDef],
+		sig: &ast::FnSig,
+		ret: Ty,
+	): bool = {
+		val file = self.ast
+		val exported = match annotations.export {
+			.Some((abi, span)) => {
+				val text = String::of(self.text(abi))
+				if text != "C" then
+					self.report(
+						Diagnostic::error(
+							ANNOTATION,
+							"`@export(\"\(text)\")` names no ABI Wip knows",
+							span,
+							String::of("not an ABI"),
+						).withHelp(String::of("the only one is `@export(\"C\")`")),
+					)
+				true
+			}
+			.None => false
+		}
+		if exported {
+			var i = 0
+			while i < params.len() && i < sig.params.len() {
+				self.checkCCompatible(params[i].ty, file.types[sig.params[i].ty].span, false)
+				i += 1
+			}
+			if sig.ret is .Some(t) then self.checkCCompatible(ret, file.types[t].span, true)
+		}
+		return exported
+	}
+
+	/// A method of a built-in type may not take a name the checker answers
+	/// itself, and a type with no value form has no `move fn`.
+	var fn checkBuiltinMethod(sig: &ast::FnSig, member: &Option<Member>) = {
+		if member is .Some(m) && m.owner == .Type(.Builtin(.Slice)) && m.receiver == .Move then
+			self.report(
+				Diagnostic::error(
+					IMPL_TARGET,
+					String::of("a slice has no value to move"),
+					sig.name.span,
+					String::of("a `move fn`"),
+				).withNote(
+					String::of(
+						"`[T]` is only ever behind a reference, so a method of it takes `fn` or `var fn`",
+					),
+				),
+			)
+	}
+
+	/// Keeps a function's name where it is found: a method among its type's
+	/// members, a free function among its module's, and the ones of the
+	/// prelude's the compiler calls in its table.
+	var fn nameFn(id: FnId, sig: &ast::FnSig, member: &Option<Member>, isExtern: bool) = {
+		match member {
+			// A type's members share one set of names. An interface's methods
+			// are collected by its own pass. An `extend X: From<A>` and an
+			// `extend X: From<B>` each declare `from`, and the argument says
+			// which.
+			.Some(m) => match m.owner {
+				.Type(owner) => {
+					var first = self.memberNamed(owner, sig.name.sym)
+					if m.overloaded then first = .None
+					// A lending pair is one name for the accessor that reads and
+					// the one that writes.
+					if self.methodOf(owner, sig.name.sym) is .Some(earlier) &&
+						self.isLendingPair(earlier, id) {
+						first = .None
+					}
+					match first {
+						.Some(first) => self.duplicate(sig.name, first)
+						.None => match owner {
+							.Struct(structId) => {
+								// The methods of the prelude's that the compiler
+								// calls, each for what `KnownFn` says.
+								if self.prelude == .Some(self.current) &&
+									KnownFn::named(
+										KnownStruct::named(
+											self.text(self.program.structs[structId].name),
+										),
+										self.text(sig.name.sym),
+									) is .Some(known) &&
+									known.owner().isSome() {
+									self.program.preludeItems.setFunction(known, id)
+								}
+								self.program.structs[structId].methods.push(id)
+							}
+							.Enum(enumId) => self.program.enums[enumId].methods.push(id)
+							.Builtin(builtin) => {
+								var built = match self.program.builtins.get(&builtin) {
+									.Some(found) => found.clone()
+									.None => BuiltinImpl()
+								}
+								built.methods.push(id)
+								self.program.builtins.put(builtin, move built)
+							}
+						}
+					}
+				}
+				.Interface(..) => {}
+			}
+			.None if !isExtern && self.preludeName(sig.name, "a function named") => {}
+			.None => {
+				if self.fns().get(&sig.name.sym) is .Some(first) {
+					val firstSpan = self.program.fns[first].nameSpan
+					self.duplicate(sig.name, firstSpan)
+				} else if self.structNamed(sig.name.sym) is .Some(first) {
+					// `Row(…)` builds a struct, or what an alias names, so a
+					// function may not take its name.
+					val text = String::of(self.text(sig.name.sym))
+					self.report(
+						Diagnostic::error(
+							DUPLICATE_DEFINITION,
+							"`\(text)` is a type of this module and a function",
+							sig.name.span,
+							String::of("a function of that name"),
+						).withSecondary(first, String::of("the type")).
+							withNote("`\(text)(…)` builds the struct, as a variant is built, so it cannot also call a function").
+							withHelp(
+								String::of(
+									"give the function a name of its own, or make it a `static fn` of the type",
+								),
+							),
+					)
+				} else {
+					// The free functions of the prelude's that the compiler
+					// calls, each for what `KnownFn` says.
+					if self.prelude == .Some(self.current) &&
+						KnownFn::named(.None, self.text(sig.name.sym)) is .Some(known) {
+						self.program.preludeItems.setFunction(known, id)
+					}
+					self.modules[self.current].fns.put(sig.name.sym, id)
+				}
+			}
+		}
+	}
+
+	/// Where this module declares a struct, or an alias, called `sym`, which
+	/// `sym(…)` would build.
+	fn structNamed(sym: Symbol): Option<Span> = {
+		if self.types().get(&sym) is .Some((.Struct(..), span)) then return .Some(span)
+		return match self.aliases().get(&sym) {
+			.Some(alias) => .Some(alias.span)
+			.None => .None
+		}
+	}
+
+	/// What `...` may not do: stand in a Wip function, have anything written
+	/// after it, or be the whole list, since C reads the rest by what the
+	/// first arguments said.
+	var fn checkVariadic(sig: &ast::FnSig, isExtern: bool) = {
+		val .Some(span) = sig.variadic else {
+			return
+		}
+		// Only C takes more arguments than it declares: a Wip function that
+		// wanted to would take a slice.
+		if !isExtern then
+			self.report(
+				Diagnostic::error(
+					VARIADIC,
+					String::of("only a C declaration may be variadic"),
+					span,
+					String::of("`...` outside an extern block"),
+				).withNote(
+					String::of(
+						"a Wip function that takes however many values takes a slice, which needs no C ABI",
+					),
+				),
+			)
+		// `...` is where the declared parameters end, so nothing may be
+		// written after it.
+		var after: Option<Span> = .None
+		for p in sig.params {
+			if after.isNone() && p.span.lo > span.hi then after = .Some(p.span)
+		}
+		if after is .Some(after) then
+			self.report(
+				Diagnostic::error(
+					VARIADIC,
+					String::of("nothing may follow `...`"),
+					after,
+					String::of("a parameter after it"),
+				).withSecondary(span, String::of("the declaration ends here")).withNote(
+					String::of(
+						"what a call passes after the declared parameters is read one at a time, so `...` is last",
+					),
+				),
+			)
+		// C reads the rest by what the first ones said, so there must be a
+		// first one.
+		if isExtern && sig.params.isEmpty() then
+			self.report(
+				Diagnostic::error(
+					VARIADIC,
+					String::of("`...` needs a parameter before it"),
+					span,
+					String::of("nothing declared before it"),
+				).withNote(
+					String::of(
+						"C reads what follows by what the declared arguments said, as `printf` reads its format",
+					),
+				),
+			)
+	}
+
+	/// A function marked `@test` at `test` takes nothing and answers nothing,
+	/// since the runner `wip test` writes calls it by itself.
+	var fn checkTestShape(id: FnId, test: Option<Span>) = {
+		val .Some(at) = test else {
+			return
+		}
+		val def = &self.program.fns[id]
+		val wrong: Option<str> =
+			if def.receiver.isSome() then .Some("a method")
+			else if !def.params.isEmpty() then .Some("parameters")
+			else if !def.generics.isEmpty() then .Some("type parameters")
+			else if def.ret != UNIT then .Some("a result")
+			else .None
+		if wrong is .Some(wrong) {
+			val span = def.span
+			self.report(
+				Diagnostic::error(
+					ANNOTATION,
+					String::of("a test takes nothing and answers nothing"),
+					span,
+					"has \(wrong)",
+				).withSecondary(at, String::of("marked a test here")).withNote(
+					String::of(
+						"`wip test` calls each test by itself: `@test fn theBoardStartsEmpty() = { … }`",
+					),
+				),
+			)
+		}
+	}
+
+	/// Where a type already has a member of this name: a field, a variant, a
+	/// method or a static function.
+	fn memberNamed(owner: TypeDef, name: Symbol): Option<Span> = {
+		var methods: Vec<FnId> = Vec()
+		match owner {
+			.Struct(id) => {
+				for f in self.program.structs[id].fields {
+					if f.name == name then return .Some(f.span)
+				}
+				methods = self.program.structs[id].methods.clone()
+			}
+			.Enum(id) => {
+				for v in self.program.enums[id].variants {
+					if v.name == name then return .Some(v.span)
+				}
+				methods = self.program.enums[id].methods.clone()
+			}
+			// A built-in type has no fields a program declares; the ones the
+			// checker knows are refused where a method is declared.
+			.Builtin(builtin) => {
+				val built = self.program.builtins.get(&builtin)?
+				methods = built.methods.clone()
+			}
+		}
+		for id in methods {
+			if self.program.fns[id].name == name then return .Some(self.program.fns[id].nameSpan)
+		}
+		return .None
+	}
+
+	/// A built-in type an `extend` block names: only the prelude may give one
+	/// methods, since a method is found by the type of its receiver and would
+	/// otherwise appear in files that never asked for it.
+	var fn builtinOwner(
+		block: &ast::ExtendBlock,
+		builtin: BuiltinOwner,
+		generics: Vec<GenericParamDef>,
+		span: Span,
+	): Option<TypeDef> = {
+		// A module may implement its own interface for a built-in type: the
+		// interface is its own, so no two modules can disagree about what the
+		// method means. Methods of its own are the prelude's.
+		var ownInterface = false
+		if block.interfaceName is .Some(name) &&
+			self.interfaceAtQuietly(&block.interfaceModule, name) is .Some(id) {
+			ownInterface = self.program.interfaces[id].module == self.current as u32
+		}
+		// And another module's interface where one of its arguments is a type
+		// of this module, which teaches the built-in type only about this
+		// module's types: `extend f32: Multiply<Vec2, Vec2>`.
+		var namesOwnType = false
+		if block.interfaceName.isSome() && block.interfaceArgs is .Some(args) {
+			for arg in args.args {
+				if self.ast.types[arg].kind is .Named(name, ..) && self.types().contains(&name) then
+					namesOwnType = true
+			}
+		}
+		if !ownInterface && !namesOwnType && self.prelude != .Some(self.current) {
+			val help =
+				if block.interfaceName.isSome() then
+					"implement an interface of this module, or one whose arguments name a type of this module: `extend f32: Multiply<Vec2, Vec2>` in the module of `Vec2`"
+				else "write a function that takes it as a parameter, or an interface of this module and implement that"
+			self.report(
+				Diagnostic::error(
+					IMPL_TARGET,
+					"`\(builtin.text())` is a built-in type",
+					span,
+					String::of("not a type of this module"),
+				).withNote(
+					String::of(
+						"a method is found by the type of its receiver, so a method on a built-in type would appear in every file; only the prelude declares them",
+					),
+				).withHelp(String::of(help)),
+			)
+			return .None
+		}
+		var entry = match self.program.builtins.get(&builtin) {
+			.Some(found) => found.clone()
+			.None => BuiltinImpl()
+		}
+		if entry.generics.isEmpty() then entry.generics = move generics
+		self.program.builtins.put(builtin, move entry)
+		return .Some(.Builtin(builtin))
+	}
+
+	/// The type a method belongs to, with its own type parameters as
+	/// arguments: `Option<T>` inside `enum Option<T>`.
+	var fn ownSelfTy(owner: TypeDef): Ty = {
+		val generics = self.typeGenerics(owner)
+		return self.selfTyOf(owner, &generics)
+	}
+
+	/// `ownSelfTy`, with the parameters as a block names them.
+	var fn selfTyOf(owner: TypeDef, generics: &[GenericParamDef]): Ty = {
+		var args: Vec<Ty> = Vec()
+		for (index, param) in generics.forwards().enumerate() {
+			args.push(
+				self.intern(
+					.Param(TyParam(index: index as u32, name: param.name, copy: param.copy)),
+				),
+			)
+		}
+		val list = self.program.types.internList(&args)
+		val first = if args.isEmpty() then ERROR else args[0]
+		return match owner {
+			.Struct(id) => self.intern(.Struct(id: id, args: list))
+			.Enum(id) => self.intern(.Enum(id: id, args: list))
+			// `Self` inside `extend [T]` is `[T]`, and inside `extend str` is
+			// `str`.
+			.Builtin(builtin) => match builtin {
+				.Int(t) => self.intern(.Int(t))
+				.Float(t) => self.intern(.Float(t))
+				.Bool => BOOL
+				.Char => CHAR
+				.Str => STR
+				.Cstring => CSTRING
+				.Slice => self.intern(.Slice(first))
+				.Slots => self.intern(.Slots(first))
+				.Void => UNIT
+			}
+		}
+	}
+
+	/// The type of a parameter, of a function or of a function type: a `&var`
+	/// can be its whole type, and a `&` its whole type or a view's part,
+	/// `&Option<&Node>`.
+	var fn paramTy(ty: Ty, typeId: ast::TypeId): Ty = {
+		val inner = match self.kind(ty) {
+			.Ref(inner, ..) => inner
+			_ => ty
+		}
+		if self.noVarRef(inner, typeId, "a parameter") ||
+			self.noNever(ty, typeId, "a parameter") ||
+			self.bareDyn(ty, typeId) ||
+			self.bareSlice(ty, typeId, true) {
+			return ERROR
+		}
+		return ty
+	}
+
+	/// Whether a type may cross into C. A result may also be `never`, for a C
+	/// function that does not return — `exit`, `abort` — which a parameter
+	/// may not be, since no value of that type exists. 128-bit integers have
+	/// no standard C type, and `isize` and `usize` are Wip's own; `str` is a
+	/// pointer and a length.
+	fn cCompatible(ty: Ty, isResult: bool): bool = match self.kind(ty) {
+		.Int(int: t) => t.bits() <= 64 && !(t is .Isize | .Usize)
+		.Never => isResult
+		// A C pointer is what C calls a pointer.
+		.Ptr(..) => true
+		// `&T` and `&var T` pass `const T *` and `T *`, which is how C takes
+		// what it reads and what it writes through, and `&[T]` passes the
+		// pointer and the length. An `extern struct` by value crosses through
+		// a shim the compiler writes in C: `cc` then decides how the fields
+		// travel, and Wip never has to. Any other struct is Wip's own layout.
+		.Struct(id, ..) => self.program.structs[id].isExtern
+		.Ref(inner, ..) if !isResult => match self.kind(inner) {
+			// A pointer to a C layout is a C pointer.
+			.Struct(id, ..) if self.program.structs[id].isExtern => true
+			// A slice goes to C as a pointer and a length, two arguments, as a
+			// `str` does.
+			.Slice(elem) => self.cCompatible(elem, false)
+			// An array is passed where it is, as C's `T x[N]` parameter is: the
+			// address of its first element.
+			.Array(..) => self.cElement(inner)
+			.Dyn(..) => false
+			_ => self.cCompatible(inner, false)
+		}
+		// A `str` goes to C as a pointer and a length, two arguments. A result
+		// cannot: C returns one value.
+		.Str => !isResult
+		// A C function pointer: what it points at must be a function C could
+		// have written, so its own types cross too. A `str` and a slice do
+		// not, since they would take two parameters of C's where the
+		// pointer's type says one. A struct by value does not either, nor a
+		// function pointer that may be null, which Wip holds as an `Option`:
+		// C passes either in registers, and a Wip function C calls through a
+		// pointer takes its address.
+		.Fn(params, ret) => {
+			for p in self.program.types.list(params).toVec() {
+				if self.kind(p) is .Str || self.passedByValue(p) || !self.cCompatible(p, false) then
+					return false
+			}
+			ret == UNIT || (!self.passedByValue(ret) && self.cCompatible(ret, true))
+		}
+		.Float(..) | .Bool | .Cstring | .Error => true
+		// A C function pointer that may be null: the pointer, with `.None` as
+		// null.
+		.Enum(args, ..) if self.program.nullableFunction(ty) => self.cCompatible(
+			self.program.types.list(args)[0],
+			false,
+		)
+		_ => false
+	}
+
+	/// A struct, or a function that may be null, which a C function pointer
+	/// cannot take or answer by value.
+	fn passedByValue(ty: Ty): bool =
+		self.kind(ty) is .Struct(..) || self.program.nullableFunction(ty)
+
+	/// What C can hold as the elements of an array it is lent: what crosses
+	/// by itself, an `extern struct`, or an array of those.
+	fn cElement(ty: Ty): bool = match self.kind(ty) {
+		.Array(elem, ..) => self.cElement(elem)
+		.Struct(id, ..) => self.program.structs[id].isExtern
+		.Str | .Fn(..) | .Ref(..) => false
+		_ => self.cCompatible(ty, false)
+	}
+
+	/// A field of an `extern struct`: what C can hold in one. A fixed array
+	/// is C's array, and another `extern struct` is C's struct.
+	var fn checkCField(ty: Ty, span: Span, inUnion: bool) = {
+		val what = if inUnion then "an `extern union`" else "an `extern struct`"
+		val ok = match self.kind(ty) {
+			.Array(elem, ..) => {
+				self.checkCField(elem, span, inUnion)
+				return
+			}
+			.Struct(id, ..) => self.program.structs[id].isExtern
+			_ => self.cCompatible(ty, false) && !(self.kind(ty) is .Str | .Fn(..))
+		}
+		// A function pointer is a field as an `Option`, which may be null as
+		// C's is; `cCompatible` has taken it above.
+		if ok then return
+		self.report(
+			Diagnostic::error(
+				NOT_C_COMPATIBLE,
+				"\(self.tyName(ty)) cannot be a field of \(what)",
+				span,
+				String::of("not a type C can hold"),
+			).withNote("\(what) promises C's layout, so its fields are what C writes: integers of up to 64 bits, `f32`, `f64`, `bool`, `cstring`, `ptr<T>`, fixed arrays of those, other `extern struct`s, and a C function pointer as `Option<(…) => R>`, which may be null as C's is"),
+		)
+	}
+
+	var fn checkCCompatible(ty: Ty, span: Span, isResult: bool) = {
+		if self.cCompatible(ty, isResult) then return
+		var diagnostic = Diagnostic::error(
+			NOT_C_COMPATIBLE,
+			"\(self.tyName(ty)) cannot be passed to or from C",
+			span,
+			String::of("not a C-compatible type"),
+		).withNote(
+			String::of(
+				"extern functions can take and return only integers of up to 64 bits, `f32`, `f64`, `bool`, `cstring`, `ptr<T>` and C's structs; a parameter may also be a `str` or a `&[T]`, which pass as a pointer and a length, an array by reference, which passes as a pointer to its first element, or a function that takes and answers no struct by value, and no function that may be null, and whose own types cross, which passes as a C function pointer; a result may be `never`, for a C function that does not return",
+			),
+		)
+		// An `extern struct` is C's layout; what it cannot do yet is cross by
+		// value.
+		if ty == STR then
+			diagnostic = diagnostic.withHelp(
+				String::of(
+					"C takes strings as `cstring`; a string literal can be passed as either",
+				),
+			)
+		// C's pointer-sized integers are built in under C's names.
+		if self.kind(ty) is .Int(int: .Isize | .Usize) then
+			diagnostic = diagnostic.withHelp(
+				String::of(
+					"`usize` and `isize` are Wip's own; C's are built in as `size_t`, `ssize_t`, `uintptr_t` and `intptr_t`",
+				),
+			)
+		self.report(move diagnostic)
+	}
+}

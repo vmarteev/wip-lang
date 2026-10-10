@@ -482,8 +482,8 @@ read from the signature alone; a helper of a view that owns as well as
 borrows answers what borrows the whole view, and a function of two texts
 answers what borrows both. `from` after the result type says what it
 borrows instead, and nothing else: a parameter, whose place and what it
-borrows, or `self.ast`, a `&` or view field of one, what the parameter
-borrows and not its place. The body is held to it (E0437), so changing the
+borrows, or `self.ast`, a `&`, `str` or view field of one, what the
+parameter borrows and not its place. The body is held to it (E0437), so changing the
 body never breaks a caller, and the caller keeps only what it names:
 
 ```wip,run
@@ -516,6 +516,29 @@ fn main() = {
 }
 ```
 
+A `str` field is named as a `&` field is, since its bytes are never what
+holds it: a reader that holds its source answers the source's text, which
+stays good while the reader changes and goes bad where the source does:
+
+```wip,run
+view struct Reader {
+    source: str
+    notes: Vec<String>
+}
+
+extend Reader {
+    fn text(lo: i64, hi: i64): str from self.source = self.source[lo..hi]
+}
+
+fn main() = {
+    val source = String::of("fn main")
+    var reader = Reader(source: source.toStr(), notes: Vec())
+    val word = reader.text(0, 2)
+    reader.notes.push("the reader changes; the text is the source's")
+    assert(word == "fn")
+}
+```
+
 `from` is a word only after a result type, so a method may still be named
 `from`.
 
@@ -527,7 +550,8 @@ Nor is what a `&var` reaches kept by another argument: a
 call that writes a context — a parser stepped with the machine it fills —
 leaves a view argument borrowing what it borrowed, and the caller goes on
 writing the context. A body that would keep a view of it is refused
-(E0447); a value argument, and what a `&` reaches, may be kept as before:
+(E0447); a value argument, and what a `&` reaches, may be kept where the
+signature says so, as the next section shows:
 
 ```wip,run
 struct Vm {
@@ -555,6 +579,73 @@ fn main() = {
     assert(vm.names.len() == 2)
 }
 ```
+
+## What a call keeps
+
+A call keeps nothing of its arguments unless its signature says `keeps`
+and the parameters whose values it may keep in its `&var` arguments, the
+receiver of a `var fn` among them. A view's method given text it only
+reads leaves the view borrowing what it borrowed, so the text may end
+while the view goes on; a method that keeps says so, and what it is given
+stays borrowed by what keeps it:
+
+```wip,run
+view struct Printer {
+    src: str
+    out: String
+}
+
+extend Printer {
+    var fn line(text: str) = self.out.push(text)
+}
+
+view struct Words {
+    words: Vec<str>
+}
+
+extend Words {
+    var fn add(word: str) keeps word = self.words.push(word)
+}
+
+fn main() = {
+    val source = String::of("a b")
+    var printer = Printer(src: source.toStr(), out: String())
+    var words = Words(words: Vec())
+    for part in source.toStr().split(" ") {
+        // `text` ends with each turn, and nothing kept it.
+        val text = String::of(part)
+        printer.line(text.toStr())
+        // `part` borrows `source`, which lasts.
+        words.add(part)
+    }
+    assert(printer.out == "ab" && words.words.len() == 2)
+}
+```
+
+The body is held to it: one that stores a parameter its `keeps` does not
+name in a `&var` parameter's place, by assignment or by a call that keeps
+it, is refused, with a fix that names it (E0449). A value of a type
+parameter counts, since an instance may make it a `str`, which is why
+`Vec`'s `push` says `keeps value`:
+
+```wip,error=E0449
+struct Bag<T> {
+    items: Vec<T>
+}
+
+extend Bag<T> {
+    var fn put(item: T) = self.items.push(move item)
+}
+
+fn main() = {}
+```
+
+`keeps` names parameters that are not `&var`, in a function that has a
+`&var` parameter to keep them in, and follows the result type and `from`:
+`fn longer(a: str, b: str, into: &var Vec<str>): str from a, b keeps a, b`.
+An interface's method says what it keeps, and an implementation keeps no
+more; a call through a function value says nothing, and is taken to keep
+every argument. As `from` is, `keeps` is a word only there.
 
 ## What a thread may borrow
 
