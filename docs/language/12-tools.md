@@ -21,7 +21,9 @@ tools written in Wip that it builds the first time they are asked for.
 It finds them from where `bin/wip` is, its links followed: the nearest
 directory above it that holds `std/`. `WIP_HOME` names another.
 
-From a checkout of Wip's repository, `scripts/bootstrap.sh --out DIR`
+Each version is published as such a directory for each system, archived:
+unpacked anywhere, with its `bin` on the `PATH`, it is installed. From a
+checkout of Wip's repository, `scripts/bootstrap.sh --out DIR`
 builds it into `DIR` with a `clang` 15 or newer and nothing of Wip's: the
 repository keeps the compiler, which is written in Wip, as LLVM's bitcode
 for each system, and `clang` compiles that into a first `wip`, which
@@ -229,6 +231,8 @@ fn area(s: &Shape): f64 = match s {
 ```
 
 The width is 100 and indentation is a tab, counted as four columns. A
+line's width is the columns a terminal draws it in: a wide character,
+`中`, takes two, and a mark drawn over the letter before it none. A
 package says otherwise in its `package.wip`, and the command line says
 otherwise again:
 

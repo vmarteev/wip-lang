@@ -20,7 +20,7 @@ skip=(--exclude-dir=target --exclude-dir=node_modules --exclude-dir=bench
 # A record by its number. "Answers 1", what a function gives, is not one.
 numbered='[Dd]ecisions?|[Aa]nswer|[Qq]uestions?'
 # The rest, by name or by path.
-named='plan M[0-9]|[Ss]yntax reviews?|syntax-review|[Pp]rototype plan|prototype-plan|code-quality|docs/(decisions|answers|roadmap)|[Rr]oadmap'
+named='plan M[0-9]|[Ss]yntax reviews?|syntax-review|[Pp]rototype plan|prototype-plan|code-quality|language-survey|docs/(decisions|answers|roadmap)|[Rr]oadmap'
 
 found=$(
     grep -rIn -E "\\b($numbered) [0-9]+\\b|$named" "${published[@]}" "${skip[@]}" 2>/dev/null

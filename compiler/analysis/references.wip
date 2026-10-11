@@ -9,13 +9,16 @@ import syntax::{
 	VAR_PARAMETER_LEFT_EMPTY
 }
 
+/// Whether `path` is a part of the place `matched`, and not all of it.
+fn partOf(path: &Path, matched: &Path): bool =
+	path.within(&matched) && path.projs.len() > matched.projs.len()
+
 /// Whether `path` goes into a payload field of the place `matched`, or its
 /// elements. Only the bindings of a `match` on that place, or of one nested
 /// inside it, reach there, so the `match` may write through them.
-fn intoPayload(path: &Path, matched: &Path): bool = {
-	if !path.within(&matched) || path.projs.len() <= matched.projs.len() then return false
-	return path.projs[matched.projs.len()] is .Payload(..) | .Element | .Elements
-}
+fn intoPayload(path: &Path, matched: &Path): bool =
+	partOf(&path, &matched) &&
+	path.projs[matched.projs.len()] is .Payload(..) | .Element | .Elements
 
 /// How a reference argument is said in messages.
 fn referenceLabel(writes: bool): str = if writes then "a `&var` reference" else "a `&` reference"
@@ -291,6 +294,25 @@ extend Checker {
 		_ => .None
 	}
 
+	/// Whether the place `id` is reached through a binding that refers into a
+	/// matched place: `x`, `x.field` or `x[i]`, where `x` is such a binding.
+	fn throughBinding(id: ExprId): bool = match self.body.exprs[id].kind {
+		.Local(local) => self.aliases.contains(&local)
+		.Field(base, ..) | .Index(base, ..) | .SubSlice(base, ..) => self.throughBinding(base)
+		.Deref(inner) => self.throughBinding(inner)
+		_ => false
+	}
+
+	/// Whether the place `id` lies behind a `ptr`: `list[i]` or `p.field`
+	/// where `list` or `p` is one, at any depth. What a `ptr` points to is
+	/// C's memory, or memory the program gave C, which the checker does not
+	/// follow.
+	fn throughPtr(id: ExprId): bool = match self.body.exprs[id].kind {
+		.Field(base, ..) | .Index(base, ..) | .SubSlice(base, ..) | .Deref(base) =>
+			self.program.types.kind(self.ty(base)) is .Ptr(..) || self.throughPtr(base)
+		_ => false
+	}
+
 	/// A place borrowed by an earlier argument of a call whose arguments are
 	/// being evaluated cannot be moved or assigned before the call (E0414).
 	var fn checkNotBorrowed(id: ExprId, ctx: Ctx) = {
@@ -318,15 +340,21 @@ extend Checker {
 		label: str,
 		end: i64,
 	) = {
+		// A change made through a binding is to the part of the place the
+		// binding refers to, which no other binding of its pattern does.
+		val bound = self.throughBinding(id)
 		var found: Option<(Span, Holder)> = .None
 		for i in 0..end {
 			val b = &self.borrows[i]
 			val holds = match b.holder {
 				.Argument | .View | .Assign(..) | .Operand(..) =>
 					path.within(&b.path) || b.path.within(&path)
-				// Bindings may write into the payload they alias.
+				// Bindings may write into the payload they alias, and into the
+				// fields they refer to.
 				.Match | .Test | .Guard | .Loop =>
-					!intoPayload(&path, &b.path) && (path.within(&b.path) || b.path.within(&path))
+					!intoPayload(&path, &b.path) &&
+						!(bound && partOf(&path, &b.path)) &&
+						(path.within(&b.path) || b.path.within(&path))
 			}
 			if holds {
 				found = .Some((b.span, b.holder.clone()))
@@ -342,7 +370,7 @@ extend Checker {
 				CHANGED_WHILE_BORROWED,
 				"cannot \(verb) `\(name)`\(how) while a `match` binding refers to it",
 				span,
-				String::of(label),
+				label,
 			).withSecondary(borrowed, "matched here; the arm's bindings refer to it").withNote(
 				"the bindings of a `match` on a place are aliases for its fields, so the place must not change until the arm ends",
 			)
@@ -350,7 +378,7 @@ extend Checker {
 				CHANGED_WHILE_BORROWED,
 				"cannot \(verb) `\(name)`\(how) while an `is` binding refers to it",
 				span,
-				String::of(label),
+				label,
 			).withSecondary(borrowed, "tested here; the bindings refer to it").withNote(
 				"the bindings of an `is` test on a place are aliases for its fields, so the place must not change until the block ends",
 			)
@@ -358,7 +386,7 @@ extend Checker {
 				CHANGED_WHILE_BORROWED,
 				"cannot \(verb) `\(name)`\(how) while the bindings of a `val` pattern refer to it",
 				span,
-				String::of(label),
+				label,
 			).withSecondary(
 				borrowed,
 				"matched here; the bindings refer to it until the block ends",
@@ -369,7 +397,7 @@ extend Checker {
 				CHANGED_WHILE_BORROWED,
 				"cannot \(verb) `\(name)`\(how) while a `for` loop walks it",
 				span,
-				String::of(label),
+				label,
 			).withSecondary(
 				borrowed,
 				"walked here; the loop's binding refers to its elements",
@@ -380,7 +408,7 @@ extend Checker {
 				CHANGED_WHILE_BORROWED,
 				"cannot \(verb) `\(name)`\(how) while an earlier argument borrows it",
 				span,
-				String::of(label),
+				label,
 			).withSecondary(borrowed, "borrowed here, until the call returns").withNote(
 				"arguments are evaluated left to right, and what an argument borrows must stay as it is until the call starts",
 			)
@@ -388,7 +416,7 @@ extend Checker {
 				CHANGED_WHILE_BORROWED,
 				"cannot \(verb) `\(name)`\(how) in the value assigned to `\(self.display(target))`",
 				span,
-				String::of(label),
+				label,
 			).withSecondary(borrowed, "the place, read before the value").withNote(
 				"`op=` reads its place before it computes the value, so the value must not change what the place is in",
 			)
@@ -396,7 +424,7 @@ extend Checker {
 				CHANGED_WHILE_BORROWED,
 				"cannot \(verb) `\(name)`\(how) in the value assigned to `\(self.display(target))`",
 				span,
-				String::of(label),
+				label,
 			).withSecondary(borrowed, "taken here, before the value").withNote(
 				"the place's index or key is taken before the value, so the value must not change it",
 			)

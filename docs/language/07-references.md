@@ -241,7 +241,9 @@ itself.
 A `str` is a view of bytes that belong to something else, and so is a
 `view struct` — a struct that may hold a `str` or a reference. A view is
 checked against what it borrows: where the owner changes, the view is stale,
-and using it is refused:
+and using it is refused. A C string made from a `String` is checked the
+same way ([page 11](11-c.md)), though it may be held wherever a `cstring`
+may:
 
 ```wip,error=E0436
 fn main() = {

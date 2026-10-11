@@ -13,19 +13,15 @@ shows a call's signature as you type its arguments.
 
 ## The `wip` command
 
-Both editors start the server as `wip lsp`, so `wip` must be on your
-`PATH`. From the repository, with a `clang` 15 or newer:
+Both editors start the server as `wip lsp`, so `wip` must be on the
+`PATH` your editor sees: install it as [the README's "Installing"
+says](../README.md#installing), from a release or from a checkout, and
+check with `wip --version`. Zed takes the `PATH` from your shell, and
+Neovim from the terminal it starts in, so set it in your shell's profile
+rather than in one terminal.
 
-```sh
-scripts/bootstrap.sh --out ~/wip
-export PATH="$HOME/wip/bin:$PATH"
-wip --version
-```
-
-This builds the compiler into `~/wip`, `bin/wip` beside the standard
-library it reads, which is the repository's own: a change to the library
-is seen at once. After the compiler changes, build it again from its
-source, so the editors serve the new one:
+After the compiler changes in a checkout, build it again, so the editors
+serve the new one:
 
 ```sh
 scripts/build.sh --release --out ~/wip

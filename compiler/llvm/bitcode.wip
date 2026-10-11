@@ -169,15 +169,16 @@ fn labelKey(label: &Label): (u8, u32) = match label {
 view struct Writer {
 	module: &Module
 	bits: Bitstream
-	/// The types, by their numbers, and each type's number by its text.
+	/// The types, by their numbers, and each type's number.
 	types: Vec<Type>
-	typeIds: Map<String, u32>
-	/// The attribute groups, each its index and attributes, numbered from 1.
+	typeIds: Map<Type, u32>
+	/// The attribute groups, each its index and attributes, numbered from 1,
+	/// and each group's number by the values its record holds.
 	groups: Vec<(u64, Vec<AttrEntry>)>
-	groupIds: Map<String, u32>
+	groupIds: Map<Vec<u64>, u32>
 	/// The attribute lists, each its groups, numbered from 1.
 	lists: Vec<Vec<u32>>
-	listIds: Map<String, u32>
+	listIds: Map<Vec<u32>, u32>
 	/// Each global and function's value number, by its name's number.
 	globalIds: Map<u32, u32>
 	/// The globals and functions in the order their records are written.
@@ -318,8 +319,7 @@ extend Writer {
 
 	/// A type's number, numbered the first time, after what it is made of.
 	var fn typeId(t: &Type): u32 = {
-		val key = t.text()
-		if self.typeIds.get(&key) is .Some(id) then return id
+		if self.typeIds.get(&t) is .Some(id) then return id
 		match t {
 			.Array(array) => self.typeId(&array.element)
 			.Struct(layout) => {
@@ -337,7 +337,7 @@ extend Writer {
 		}
 		val id = self.types.len() as u32
 		self.types.push(t.clone())
-		self.typeIds.put(move key, id)
+		self.typeIds.put(t.clone(), id)
 		return id
 	}
 
@@ -379,15 +379,10 @@ extend Writer {
 		for entry in entries {
 			entry.push(&var values)
 		}
-		var keyParts: Vec<String> = Vec()
-		for value in values {
-			keyParts.push("\(value)")
-		}
-		val key = keyParts.join(",")
-		if self.groupIds.get(&key) is .Some(id) then return id
+		if self.groupIds.get(&values) is .Some(id) then return id
 		self.groups.push((index, move entries))
 		val id = self.groups.len() as u32
-		self.groupIds.put(move key, id)
+		self.groupIds.put(move values, id)
 		return id
 	}
 
@@ -395,15 +390,10 @@ extend Writer {
 	/// where it is empty.
 	var fn listId(groups: Vec<u32>): u32 = {
 		if groups.isEmpty() then return 0
-		var keyParts: Vec<String> = Vec()
-		for group in groups {
-			keyParts.push("\(group)")
-		}
-		val key = keyParts.join(",")
-		if self.listIds.get(&key) is .Some(id) then return id
+		if self.listIds.get(&groups) is .Some(id) then return id
+		self.listIds.put(groups.clone(), self.lists.len() as u32 + 1)
 		self.lists.push(move groups)
 		val id = self.lists.len() as u32
-		self.listIds.put(move key, id)
 		return id
 	}
 
@@ -682,7 +672,7 @@ extend Writer {
 	/// A global's name in the table of names: where it starts, and how long
 	/// it is.
 	var fn named(name: u32): (u64, u64) = {
-		val raw = rawName(self.module.names[name as i64].toStr())
+		val raw = rawName(self.module.names[name as i64])
 		val at = self.strtab.len() as u64
 		for byte in raw {
 			self.strtab.push(byte)
@@ -832,8 +822,8 @@ fn declareType(): Type = fnOf(
 fn fnAttrEntry(attr: &FnAttr): AttrEntry = match attr {
 	.NoUnwind => .Plain(18)
 	.UwTable => .Number(kind: 33, value: 2)
-	.FramePointer => .Text(key: String::of("frame-pointer"), value: String::of("all"))
-	.DisableTailCalls => .Text(key: String::of("disable-tail-calls"), value: String::of("true"))
+	.FramePointer => .Text(key: "frame-pointer", value: "all")
+	.DisableTailCalls => .Text(key: "disable-tail-calls", value: "true")
 	.NoReturn => .Plain(17)
 	.NoMerge => .Plain(66)
 }
@@ -900,7 +890,7 @@ fn nodeStrings(node: &Node): Vec<str> = match node {
 	.Tuple(items) => {
 		var texts: Vec<str> = Vec()
 		for item in items {
-			if item is .Text(text) then texts.push(text.toStr())
+			if item is .Text(text) then texts.push(text)
 		}
 		move texts
 	}
@@ -1018,13 +1008,7 @@ extend Writer {
 			)
 			.File(filename, directory) => (
 				16,
-				Vec::of(own [
-					0,
-					self.stringRef(filename.toStr()),
-					self.stringRef(directory.toStr()),
-					0,
-					0,
-				]),
+				Vec::of(own [0, self.stringRef(filename), self.stringRef(directory), 0, 0]),
 			)
 			.SubroutineType => (19, Vec::of(own [2, 0, self.emptyTuple as u64 + 1, 0]))
 			.Subprogram(name, file, line, typeNode, artificial, optimized, unit) => (
@@ -1032,7 +1016,7 @@ extend Writer {
 				Vec::of(own [
 					7,
 					self.nodeRef(.Some(file)),
-					self.stringRef(name.toStr()),
+					self.stringRef(name),
 					0,
 					self.nodeRef(.Some(file)),
 					line as u64,
@@ -1075,7 +1059,7 @@ extend Writer {
 				Vec::of(own [
 					2,
 					self.nodeRef(.Some(scope)),
-					self.stringRef(name.toStr()),
+					self.stringRef(name),
 					self.nodeRef(.Some(file)),
 					line as u64,
 					self.nodeRef(.Some(typeNode)),
@@ -1093,7 +1077,7 @@ extend Writer {
 				Vec::of(own [
 					0,
 					0x24,
-					self.stringRef(name.toStr()),
+					self.stringRef(name),
 					size as u64,
 					0,
 					encodingCode(&encoding),
@@ -1106,13 +1090,13 @@ extend Writer {
 			)
 			.Typedef(name, base) => (
 				17,
-				derived(0x16, self.stringRef(name.toStr()), 0, self.nodeRef(.Some(base)), 0, 0),
+				derived(0x16, self.stringRef(name), 0, self.nodeRef(.Some(base)), 0, 0),
 			)
 			.Member(name, scope, base, size, offset) => (
 				17,
 				derived(
 					0x0d,
-					self.stringRef(name.toStr()),
+					self.stringRef(name),
 					self.nodeRef(.Some(scope)),
 					self.nodeRef(.Some(base)),
 					size as u64,
@@ -1121,14 +1105,14 @@ extend Writer {
 			)
 			.Declared(tag, name) => (
 				18,
-				composite(2, tagCode(&tag), self.stringRef(name.toStr()), 0, 0, 4, 0),
+				composite(2, tagCode(&tag), self.stringRef(name), 0, 0, 4, 0),
 			)
 			.Structure(tag, name, size, elements) => (
 				18,
 				composite(
 					3,
 					tagCode(&tag),
-					self.stringRef(name.toStr()),
+					self.stringRef(name),
 					0,
 					size as u64,
 					0,
@@ -1153,7 +1137,7 @@ extend Writer {
 					3,
 					4,
 					match name {
-						.Some(named) => self.stringRef(named.toStr())
+						.Some(named) => self.stringRef(named)
 						.None => 0
 					},
 					self.nodeRef(.Some(base)),
@@ -1169,7 +1153,7 @@ extend Writer {
 			}
 			.Enumerator(name, value) => (
 				14,
-				Vec::of(own [6, 64, self.stringRef(name.toStr()), signedVbr(value)]),
+				Vec::of(own [6, 64, self.stringRef(name), signedVbr(value)]),
 			)
 			.Tuple(items) => {
 				var values: Vec<u64> = Vec()
@@ -1181,7 +1165,7 @@ extend Writer {
 								val key = (bits, value)
 								self.mdValueIds.at(&key) as u64 + 1
 							}
-							.Text(text) => self.stringRef(text.toStr())
+							.Text(text) => self.stringRef(text)
 						},
 					)
 				}
@@ -1530,8 +1514,7 @@ extend Writer {
 	fn valueId(local: &FnValues, value: &Value, t: &Type): u32 = {
 		if value is .Global(index) then return self.globalIds.at(&index)
 		if localKey(&value) is .Some(key) then return local.values.at(&key)
-		val typeKey = t.text()
-		val typeId = self.typeIds.at(&typeKey)
+		val typeId = self.typeIds.at(&t)
 		val keyed: (u8, i64) = match value {
 			.Int(v) => (0, v)
 			.Float(bits) => (1, bits as i64)

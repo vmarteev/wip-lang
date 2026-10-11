@@ -16,7 +16,22 @@
 // temporary, or given to a `&var` parameter — is refused where it would
 // leave (E0437).
 
-import hir::{Block, ExprId, FnId, LocalId, NEVER, Pattern, STR, Ty}
+import std::collections::{Set}
+import hir::{
+	Block,
+	CSTRING,
+	EnumId,
+	ExprId,
+	FnId,
+	LocalId,
+	NEVER,
+	Pattern,
+	Program,
+	STR,
+	StructId,
+	Ty,
+	TyList
+}
 import syntax::{
 	BORROWED_ACROSS_YIELD,
 	Diagnostic,
@@ -54,6 +69,10 @@ view struct Borrowing {
 	leaving: str
 	/// What to keep instead.
 	instead: str
+	/// What to answer instead, where it would leave a function.
+	answer: str = "answer a value that owns its data, as a `String` owns its bytes"
+	/// What to do instead of borrowing a temporary.
+	bind: str = "bind the value with `val` first, then borrow it"
 }
 
 /// A `str` whose roots changed after it was made.
@@ -114,11 +133,77 @@ fn startsWithVowel(text: str): bool = {
 	return false
 }
 
+/// The structs and enums that hold a `cstring`, through their fields, other
+/// structs and enums, arrays and boxes: a value of one borrows what its C
+/// strings do, as a value that holds a view does. Worked out once, for
+/// every body.
+pub struct CstringHolders {
+	structs: Set<StructId> = Set()
+	enums: Set<EnumId> = Set()
+}
+
+extend CstringHolders {
+	/// Those of `program`'s types, each found from what its fields are
+	/// declared as, until no more are found.
+	static fn of(program: &Program): CstringHolders = {
+		var holders = CstringHolders()
+		var grew = true
+		while grew {
+			grew = false
+			for id in program.structs.ids() {
+				if holders.structs.contains(&id) then continue
+				for field in program.structs[id].fields {
+					if holders.holds(&program, field.ty) {
+						holders.structs.add(id)
+						grew = true
+						break
+					}
+				}
+			}
+			for id in program.enums.ids() {
+				if holders.enums.contains(&id) then continue
+				for variant in program.enums[id].variants {
+					if variant.fields.items().any((f) => holders.holds(&program, f.ty)) {
+						holders.enums.add(id)
+						grew = true
+						break
+					}
+				}
+			}
+		}
+		return move holders
+	}
+
+	/// Whether a value of `ty` holds a `cstring`. What is behind a reference
+	/// or a `ptr` is not the value's own.
+	fn holds(program: &Program, ty: Ty): bool = match program.types.kind(ty) {
+		.Cstring => true
+		.Struct(id, args) => self.structs.contains(&id) || self.anyHolds(&program, args)
+		.Enum(id, args) => self.enums.contains(&id) || self.anyHolds(&program, args)
+		.Array(elem: inner, ..) | .Own(inner) | .Slice(elem: inner) | .Slots(inner) => self.holds(
+			&program,
+			inner,
+		)
+		_ => false
+	}
+
+	fn anyHolds(program: &Program, args: TyList): bool = {
+		for a in program.types.list(args) {
+			if self.holds(&program, a) then return true
+		}
+		return false
+	}
+}
+
 extend Checker {
-	/// Whether a value of `ty` borrows: a `str`, a view, or what holds one. A
-	/// reference is a parameter's, and is tracked as a place instead.
+	/// Whether a value of `ty` borrows: a `str`, a view, a `cstring`, or what
+	/// holds one. A reference is a parameter's, and is tracked as a place
+	/// instead. A `cstring` made from the program's memory borrows it, as a
+	/// `str` does; one from C, or a literal, borrows nothing, and is as free
+	/// as a literal `str`.
 	fn isView(ty: Ty): bool =
-		self.program.holdsView(ty) && !(self.program.types.kind(ty) is .Ref(..))
+		(self.program.holdsView(ty) || self.cstrings.holds(self.program, ty)) &&
+		self.program.types.kind(ty) !is .Ref(..)
 
 	/// Whether a value of `ty` borrows as a view does: a view, or a `&`
 	/// reference kept as one. A lent closure is not one; it borrows what it
@@ -127,7 +212,7 @@ extend Checker {
 
 	/// Whether `ty` is a `&` reference to a value, not to a closure.
 	fn isSharedRef(ty: Ty): bool = match self.program.types.kind(ty) {
-		.Ref(inner, kind: .Shared) => !(self.program.types.kind(inner) is .Fn(..))
+		.Ref(inner, kind: .Shared) => self.program.types.kind(inner) !is .Fn(..)
 		_ => false
 	}
 
@@ -239,7 +324,7 @@ extend Checker {
 		val byValue = match callee {
 			.Some(c) => {
 				val params = &self.program.fns[c].params
-				i < params.len() && !(self.program.types.kind(params[i].ty) is .Ref(..))
+				i < params.len() && self.program.types.kind(params[i].ty) !is .Ref(..)
 			}
 			.None => false
 		}
@@ -325,7 +410,7 @@ extend Checker {
 		val body = self.body
 		val ty = self.ty(arg)
 		if self.isView(ty) then return if lends.borrows then self.strRoots(arg, &state) else Roots()
-		if !(self.program.types.kind(ty) is .Ref(..)) || lends.isNothing() then return Roots()
+		if self.program.types.kind(ty) !is .Ref(..) || lends.isNothing() then return Roots()
 		var roots = Roots()
 		var e = arg
 		// The conversions a reference passes through keep what it refers to.
@@ -404,24 +489,21 @@ extend Checker {
 	/// What a value is, for messages: "a `str`", or its type.
 	fn aView(value: ExprId): String = {
 		val ty = self.ty(value)
-		if ty == STR then return String::of("a `str`")
+		if ty == STR then return "a `str`"
+		if ty == CSTRING then return "a C string"
 		val name = self.tyName(ty)
-		val article = if startsWithVowel(name.toStr()) then "an" else "a"
+		val article = if startsWithVowel(name) then "an" else "a"
 		return "\(article) `\(name)`"
 	}
 
 	/// The interface that declares `method`, for messages.
 	fn interfaceName(method: FnId): String = match self.program.fns[method].interfaceId {
-		.Some(interfaceId) => String::of(
-			self.interner.resolve(self.program.interfaces[interfaceId].name),
-		)
-		.None => String::of(self.interner.resolve(self.program.fns[method].name))
+		.Some(interfaceId) => self.interner.resolve(self.program.interfaces[interfaceId].name)
+		.None => self.interner.resolve(self.program.fns[method].name)
 	}
 
 	/// The root, as the programmer wrote it, for messages.
-	fn rootName(path: &Path): String = String::of(
-		self.interner.resolve(self.body.locals[path.local].name),
-	)
+	fn rootName(path: &Path): String = self.interner.resolve(self.body.locals[path.local].name)
 
 	/// The bindings of `pattern` that are values of their own, and views: they
 	/// borrow what `scrutinee` borrows.
@@ -471,7 +553,10 @@ extend Checker {
 					} else {
 						inner
 					}
-					.Some(lendsTo(self.program, &def.generics, &params, pointee))
+					val key = (c, pointee)
+					if !self.lent.contains(&key) then
+						self.lent.put(key, lendsTo(self.program, &def.generics, &params, pointee))
+					Option::Some(self.lent.at(&key).clone())
 				}
 				.None => .None
 			}
@@ -647,8 +732,8 @@ extend Checker {
 				"`\(name)` is borrowed across a `yield`",
 				span,
 				"the generator stops here, with `\(name)` borrowed",
-			).withSecondary(b.span, String::of(by)).
-				withNote(String::of(ACROSS_YIELD_NOTE)).
+			).withSecondary(b.span, by).
+				withNote(ACROSS_YIELD_NOTE).
 				withHelp(move help)
 			self.report(move diagnostic)
 		}
@@ -696,7 +781,7 @@ extend Checker {
 					span,
 					"each pass calls `next()` here, after the generator went on",
 				).withSecondary(stale.change, "the generator stops here").
-					withNote(String::of(ACROSS_YIELD_NOTE)).
+					withNote(ACROSS_YIELD_NOTE).
 					withHelp(move help)
 				self.report(move diagnostic)
 				return
@@ -709,7 +794,7 @@ extend Checker {
 				"used here, after the generator went on",
 			).withSecondary(stale.change, "the generator stops here").
 				withSecondary(def.span, "`\(variable)` borrows `\(root)`, the generator's own").
-				withNote(String::of(ACROSS_YIELD_NOTE)).
+				withNote(ACROSS_YIELD_NOTE).
 				withHelp(move help)
 			self.report(move diagnostic)
 			return
@@ -757,7 +842,7 @@ extend Checker {
 			"used here",
 		).withSecondary(stale.change, "`\(root)` \(stale.how.text()) here").
 			withSecondary(def.span, "`\(variable)` borrows `\(root)`").
-			withNote(String::of(borrowing.stale)).
+			withNote(borrowing.stale).
 			withHelp("use `\(name)` before `\(root)` changes, or \(borrowing.instead)")
 		self.report(move diagnostic)
 	}
@@ -765,7 +850,23 @@ extend Checker {
 	/// How a value of `ty` borrows, for messages: a `str` its bytes, a `&`
 	/// reference its place, a view what its parts borrow.
 	fn borrowing(ty: Ty): Borrowing =
-		if ty == STR then
+		if ty == CSTRING then
+			Borrowing(
+				stale: "a C string made from a `String` points into its bytes, so those must not change while the C string is still used",
+				leaving: "a C string that leaves a function may only borrow what its reference parameters refer to",
+				instead: "make the C string again after the change",
+				answer: "answer the `String`, and make the C string from it where it is used",
+				bind: "keep the `String` in a variable, and make the C string from it where it is used",
+			)
+		else if !self.program.holdsView(ty) && self.cstrings.holds(self.program, ty) then
+			Borrowing(
+				stale: "a C string made from a `String` points into its bytes, so those must not change while what holds the C string is still used",
+				leaving: "a value that holds a C string may leave a function only where the C string borrows what its reference parameters refer to",
+				instead: "make its C string again after the change",
+				answer: "keep the `String` its C string was made from where the value is used, or give it a C string from C or a literal",
+				bind: "keep the `String` in a variable, and make the C string from it",
+			)
+		else if ty == STR then
 			Borrowing(
 				stale: "a `str` points into the bytes of what it borrows, so those must not change while the `str` is still used",
 				leaving: "a `str` that leaves a function may only borrow what its reference parameters refer to",
@@ -835,7 +936,7 @@ extend Checker {
 			"\(self.aView(value)) is kept here",
 		).withSecondary(temporary, "a temporary, dropped at the end of the statement").
 			withNote("a view points into what it borrows, which must live as long as it does").
-			withHelp("bind the value with `val` first, then borrow it")
+			withHelp(self.borrowing(self.ty(value)).bind)
 		self.report(move diagnostic)
 	}
 
@@ -848,7 +949,7 @@ extend Checker {
 			self.checkVarContentsKept(param, &roots.paths, span, "points into `{lent}`")
 		val what = match leaving {
 			.Result => String::of("return")
-			.Yield => String::of("yield")
+			.Yield => "yield"
 			.Param(param) => "give `\(self.interner.resolve(self.body.locals[param].name))`"
 		}
 		if roots.temporary is .Some(temporary) {
@@ -858,8 +959,8 @@ extend Checker {
 				span,
 				"leaves the function here",
 			).withSecondary(temporary, "a temporary, dropped at the end of the statement").
-				withNote(String::of(self.borrowing(self.ty(value)).leaving)).
-				withHelp("answer a value that owns its data, as a `String` owns its bytes")
+				withNote(self.borrowing(self.ty(value)).leaving).
+				withHelp(self.borrowing(self.ty(value)).answer)
 			self.report(move diagnostic)
 			return
 		}
@@ -949,10 +1050,7 @@ extend Checker {
 				"what a generator yields may borrow what it was given, but not what it holds itself, which moves with it",
 				"yield a `String`, which owns its bytes, or make the value outside the generator, which then borrows it",
 			)
-			_ => (
-				self.borrowing(self.ty(value)).leaving,
-				"answer a value that owns its data, as a `String` owns its bytes",
-			)
+			_ => (self.borrowing(self.ty(value)).leaving, self.borrowing(self.ty(value)).answer)
 		}
 		val diagnostic = Diagnostic::error(
 			STR_OUTLIVES_ITS_ROOT,
@@ -960,8 +1058,8 @@ extend Checker {
 			span,
 			move owner,
 		).withSecondary(self.body.locals[root.local].span, "`\(name)` declared here").
-			withNote(String::of(note)).
-			withHelp(String::of(help))
+			withNote(note).
+			withHelp(help)
 		self.report(move diagnostic)
 	}
 

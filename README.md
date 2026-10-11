@@ -62,9 +62,60 @@ What it does not have yet:
   path, and nothing is downloaded.
 - **Asynchronous input and output:** threads and futures are there, an
   event loop is not; nor UDP or TLS.
-- **Parts of the library a program reaches for:** randomness, numbers
-  written to a precision or in a radix, and Unicode's letters and digits
-  beyond ASCII.
+
+## Installing
+
+Wip runs on macOS on Apple silicon and on Linux on arm64 and x86-64. Every
+program it builds goes through a `clang` 15 or newer, which it looks for
+as `clang`, or as `WIP_CLANG` names it, and is linked by the system's C
+compiler, `cc`. On a Mac, the Command Line Tools have both
+(`xcode-select --install`); Debian 12's own `clang` is 14, so install
+`clang-15` or newer there and set `WIP_CLANG=clang-15`.
+
+`wip` is a directory: `bin/wip`, and beside it the standard library,
+`std/`, and the tools, `tools/`, which it finds from where `bin/wip` is.
+Keep the three together; a link to `bin/wip` from elsewhere on the `PATH`
+works, a copy of it alone does not.
+
+**From a release.** Each version has an archive for each system,
+`wip-<version>-<system>.tar.gz`, on [the releases
+page](https://github.com/vmarteev/wip-lang/releases). Unpack it where it
+is to live, and put its `bin` on the `PATH` in your shell's profile:
+
+```sh
+curl -LO https://github.com/vmarteev/wip-lang/releases/download/v0.3.1/wip-0.3.1-macos-arm64.tar.gz
+tar -xzf wip-0.3.1-macos-arm64.tar.gz
+mv wip-0.3.1-macos-arm64 ~/wip
+echo 'export PATH="$HOME/wip/bin:$PATH"' >> ~/.zshrc   # ~/.bashrc for bash
+```
+
+The systems are `macos-arm64`, `linux-arm64` and `linux-x86_64`. A Mac
+refuses to run a program downloaded through a browser until it is told
+otherwise: `xattr -dr com.apple.quarantine ~/wip`. To upgrade, put the
+new version's directory in the old one's place.
+
+**From a checkout of this repository,** with nothing but `clang`:
+
+```sh
+scripts/bootstrap.sh --out ~/wip
+echo 'export PATH="$HOME/wip/bin:$PATH"' >> ~/.zshrc
+```
+
+The compiler is written in Wip, and `bootstrap/` holds it for each system
+as LLVM's bitcode, which `clang` compiles into a first `wip`; that one
+builds the compiler from its source, and the compiler built builds itself
+again, a few minutes in all. The `std/` and `tools/` it leaves beside
+`bin/wip` are links to the checkout's own, so a change to the library is
+seen by the next build of a program, and the checkout must stay where it
+is. After pulling a change to the compiler, build it again from its
+source:
+
+```sh
+scripts/build.sh --release --out ~/wip
+```
+
+`wip --version` says which you have: `wip 0.3.1` for a release, and with
+the commit and its day after it for a build from a checkout.
 
 ## Try it
 
@@ -79,23 +130,12 @@ fn main() = {
 ```
 
 ```sh
-scripts/bootstrap.sh --out ~/wip   # build the compiler, with clang alone
-export PATH="$HOME/wip/bin:$PATH"
-wip run hello.wip                  # compile a program and run it
-wip build hello.wip                # write an executable
-wip test hello.wip                 # run the program's tests
-wip check hello.wip                # report everything wrong, write nothing
-wip fmt hello.wip                  # lay the file out in the one way Wip is written
+wip run hello.wip     # compile a program and run it
+wip build hello.wip   # write an executable
+wip test hello.wip    # run the program's tests
+wip check hello.wip   # report everything wrong, write nothing
+wip fmt hello.wip     # lay the file out in the one way Wip is written
 ```
-
-Building it needs a `clang` 15 or newer and nothing of Wip's: the compiler
-is written in Wip, and `bootstrap/` holds it for each system as LLVM's
-bitcode, which `clang` compiles into the first `wip`; that one builds the
-compiler from its source, and the compiler built builds itself again. What
-it leaves is a directory, as an installed compiler is: `bin/wip`, and
-beside it the standard library, `std/`, and the tools, `tools/`, which
-are this checkout's own, so a change to the library is seen by the next
-build of a program.
 
 The entry file's directory is the program's module, and every directory it
 imports is another: there is no build file, no manifest and no module

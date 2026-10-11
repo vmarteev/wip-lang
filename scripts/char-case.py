@@ -229,6 +229,20 @@ extend str {{
 		return theirs.next().isNone()
 	}}
 
+	/// Whether it begins with `prefix` in any case, character by character
+	/// as `equalsAnyCase` compares: an HTTP header's name, a keyword C
+	/// writes in either case.
+	pub fn startsWithAnyCase(prefix: str): bool = {{
+		var mine = self.chars()
+		for c in prefix.chars() {{
+			val .Some(d) = mine.next() else {{
+				return false
+			}}
+			if c.folded() != d.folded() then return false
+		}}
+		return true
+	}}
+
 	/// Each of its characters folded, for comparing without case:
 	/// `a.folded() == b.folded()`.
 	pub fn folded(): String = {{

@@ -98,6 +98,23 @@ slice — a `Sequence` and an `Items` — is ranged so: a `Set` by the order
 its keys went in, and a type of a program's own. `truncate`, `clear` and
 `reserve` are there, and a `Vec` ends what it holds when it ends.
 
+`last()` answers the last value, or nothing; `atLast()` lends it where it
+lies, to read or to write, as the top of a stack is, and an empty vector
+panics. `takeAll()` hands over everything a vector holds and leaves it
+empty, as `Option`'s `take()` leaves nothing — what a field's values are
+taken out for while `self` changes — and a `String`, a `Map`, a `Set` and
+a `Deque` take theirs the same way:
+
+```wip,run
+fn main() = {
+    var frames = Vec::of(own [(1, 10), (2, 20)])
+    frames.atLast().1 += 5
+    assert(frames[1] == (2, 25) && frames.atLast().0 == 2)
+    val all = frames.takeAll()
+    assert(all.len() == 2 && frames.isEmpty())
+}
+```
+
 Elements that are plain data are copied many at once, in one copy of the
 memory: `pushAll(items)` puts them at the end of a `Vec`,
 and a slice's `copyFrom(source)` makes each element the one at its index
@@ -203,7 +220,9 @@ fn main() = {
 ```
 
 Text is searched from either end — `find` and `findLast` — and compared in
-any case without making anything, `equalsAnyCase`; a `String` takes its
+any case without making anything, `equalsAnyCase` and `startsWithAnyCase`;
+`toAsciiUpper()` and `toAsciiLower()` change the case of its ASCII letters
+alone, as a protocol or a format that is ASCII asks; a `String` takes its
 last character back with `popChar`, as a backspace does:
 
 ```wip,run
@@ -211,6 +230,8 @@ fn main() = {
     val path = "a/b/c.tar.gz"
     assert(path.find(".") == .Some(5) && path.findLast(".") == .Some(9))
     assert("Content-Length".equalsAnyCase("content-length"))
+    assert("Content-Type: text/plain".startsWithAnyCase("content-type"))
+    assert("Grüße".toAsciiUpper() == "GRüßE")
     var typed = String::of("añ")
     assert(typed.popChar() == .Some('ñ') && typed == "a")
 }
@@ -348,12 +369,34 @@ and `isAlphanumeric()` for either. `isDigit()` is `0` to `9` alone, which
 is what a program reading a number asks, and `isAsciiLetter()` `a` to `z`
 and `A` to `Z`; `isAsciiAlphanumeric()`, `isAsciiUppercase()`,
 `isAsciiLowercase()` and `isHexDigit()` are what a lexer asks of ASCII.
+`digitValue(radix)` is what a character is worth as a digit, `0` to `9`
+and then `a` to `z`, or nothing.
 
 ```wip,run
 fn main() = {
     assert('é'.isLetter() && '中'.isLetter() && !'_'.isLetter())
     assert('٣'.isNumeric() && !'٣'.isDigit())
     assert("année2".chars().all((c) => c.isAlphanumeric()))
+    assert('f'.digitValue(16) == .Some(15) && 'g'.digitValue(16) == .None)
+}
+```
+
+A byte is asked the same of what it is as an ASCII character, for a
+program that reads text a byte at a time: `isDigit()`, `isHexDigit()`,
+`isAsciiLetter()`, `isAsciiAlphanumeric()`, `isAsciiUppercase()`,
+`isAsciiLowercase()`, and C's `isspace`, `ispunct` and `isprint` as
+`isAsciiWhitespace()`, `isAsciiPunctuation()` and `isAsciiPrintable()`;
+`digitValue(radix)`, `toAsciiUpper()` and `toAsciiLower()` as a
+character's. A byte past 127 is none of them: it is part of a character
+UTF-8 writes in several.
+
+```wip,run
+fn main() = {
+    val line = "x = 0x1F;"
+    assert(line[0].isAsciiLetter() && line[1].isAsciiWhitespace())
+    assert(line[2].isAsciiPunctuation() && line[6].isHexDigit())
+    assert(line[7].digitValue(16) == .Some(15))
+    assert(!"é"[0].isAsciiPrintable())
 }
 ```
 
@@ -1257,7 +1300,7 @@ the reason both exist.
 | `std::text` | `ParseError`, and the `Split`, `Lines` and `Chars` types the prelude's methods answer |
 | `std::iter` | `Walk`, `Forwards`, `Backwards`, `Taking` (what a `Vec` gives up to `for x in move v`), and the adapter types `Mapped`, `Filtered`, `FilterMapped`, `FlatMapped`, `Chained`, `Enumerated`, `Taken`, `TakenWhile`, `Skipped`, `Zipped`, `Peekable` |
 | `std::collections` | `Map`, `Set`, `MapEntry`, `Deque`, and `Arena` with its `Handle`, `ArenaEntry` and `ArenaValues` |
-| `std::time` | `Duration`, a length of time; `Instant`, a moment on a clock that only goes forward; `sleep`; `now`, the date it is, and `Utc`, a moment as a calendar has it |
+| `std::time` | `Duration`, a length of time; `Instant`, a moment on a clock that only goes forward; `sleep`; `now`, the date it is; `Utc`, a moment as a calendar has it, and `Local`, as it has it where the program runs |
 | `std::libc` | the C library as std calls it: `printf`, `fwrite`, `stdout`, `read`, `open` and its flags, `getentropy`, `errno()` — C's, promising nothing C does not |
 
 ```wip,run
@@ -1313,5 +1356,30 @@ fn main() = {
     assert(moment.iso() == "1994-11-06T08:49:37Z")
     assert(Utc::parseHttpDate("Sun, 06 Nov 1994 08:49:37 GMT") == .Some(moment))
     assert(Utc::parseHttpDate("Sunday, 06-Nov-94 08:49:37 GMT").isNone())
+}
+```
+
+A `Local` is a moment in the time zone the program runs in, as the
+system's database of zones says, `TZ` naming the zone where it is set: the
+moment, the zone's offset from UTC then, in seconds and negative west of
+Greenwich, and the zone's name then, `PDT` or `CET`, which says whether
+summer time is kept. It reads as a `Utc` does, what the zone's clocks read
+at that moment, and is written as ISO 8601 writes a moment with its offset,
+`2026-10-10T11:26:03-07:00`. A date as a person reads it is written with
+interpolation's widths:
+
+```wip,run
+import std::time
+import std::time::{Local, Utc}
+
+fn main() = {
+    val now = time::now()
+    val here = Local::of(now)
+    assert(here.utc() == Utc::of(now))
+    // What the zone's clocks read is UTC's, moved by the offset.
+    val clock = Utc::of(now + here.offset())
+    assert(here.day() == clock.day() && here.hour() == clock.hour())
+    val day = "\(here.year())-\(here.month(), width: 2, fill: '0')-\(here.day(), width: 2, fill: '0')"
+    assert(day.len() == 10 && "\(here)".startsWith(day.toStr()))
 }
 ```

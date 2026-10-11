@@ -1,10 +1,12 @@
 // Checking on several threads gives exactly what checking on one does: the
 // same typed program, down to how its types are numbered, and the same
-// diagnostics in the same order.
+// diagnostics in the same order; and compiling on several gives the same
+// modules, byte for byte.
 
 import std::fs
 import std::future
-import hir::{dump as dumpHir}
+import hir::{FnId, Program, checkMain, dump as dumpHir}
+import llvm
 import syntax::{Span}
 
 /// The program `loaded` holds, checked on `threads` threads, and every
@@ -58,6 +60,77 @@ fn theCasesCheckTheSameOnAnyNumberOfThreads() = {
 	for i in 0..mains.len() {
 		for threads in found[i] {
 			panic("`\(mains[i])` checks differently on \(threads) threads")
+		}
+	}
+}
+
+/// Every module `program` compiles to, as a debug build or a release build,
+/// on `threads` threads, written as text.
+fn compiledOn(
+	loaded: &Loaded,
+	program: &Program,
+	main: FnId,
+	release: bool,
+	threads: i64,
+): String = {
+	val sources = &loaded.sources
+	val ir = llvm::compile(
+		&program,
+		&loaded.interner,
+		.Some(.Main(main)),
+		(span) => sources.locate(span),
+		release,
+		threads,
+	)
+	var out = String()
+	for module in ir.modules {
+		out.push(module.text().toStr())
+	}
+	return move out
+}
+
+/// The builds, debug or release, a case compiles differently on three
+/// threads than on one. Three divides no batch evenly: where a range is cut
+/// wrong, a body is made twice, or not at all.
+fn compilesDifferently(main: &String): Vec<String> = {
+	var timings = Timings()
+	val .Ok(read) = loadMode(main.toStr(), .Program, &var timings, 1) else {
+		return Vec()
+	}
+	var loaded = move read
+	val checked = checkLoaded(&var loaded, &var timings)
+	var different: Vec<String> = Vec()
+	if anyError(&checked.diagnostics) then return move different
+	var program = move checked.program
+	val .Ok(found) = checkMain(&program, &loaded.interner) else {
+		return move different
+	}
+	for release in [false, true] {
+		program.checkMoves = !release
+		program.dropsByCall = !release
+		val one = compiledOn(&loaded, &program, found.main, release, 1)
+		if compiledOn(&loaded, &program, found.main, release, 3) != one then
+			different.push(String::of(if release then "release" else "debug"))
+	}
+	return move different
+}
+
+@test
+fn theCasesCompileTheSameOnAnyNumberOfThreads() = {
+	var mains: Vec<String> = Vec()
+	val .Ok(entries) = fs::readDir("tests/cases/ok") else {
+		panic("the cases are in tests/cases/ok")
+	}
+	for entry in entries {
+		val main = "tests/cases/ok/\(entry.name)/main.wip"
+		if fs::exists(main.toStr()) then mains.push(move main)
+	}
+	mains.sort()
+	assert(mains.len() > 100, "found only \(mains.len()) cases")
+	val found = future::map(&mains, (main) => compilesDifferently(&main))
+	for i in 0..mains.len() {
+		for build in found[i] {
+			panic("`\(mains[i])` compiles differently as a \(build) build on three threads")
 		}
 	}
 }

@@ -2,9 +2,9 @@
 // and waiting. A `Duration` is a length of time, to the nanosecond; an
 // `Instant` is a moment on a clock that only goes forward, whatever the
 // time of day is set to, so the difference of two is how long passed
-// between them. `now` is the date it is, as seconds since 1970, and a
-// `Utc` is such a moment as a calendar has it; time zones
-// are not here.
+// between them. `now` is the date it is, as seconds since 1970; a `Utc` is
+// such a moment as a calendar has it in UTC, and a `Local` as it has it in
+// the time zone the program runs in.
 
 import std::libc
 
@@ -17,6 +17,25 @@ extern "C" {
 
 	fn clock_gettime(clock: c_int, time: &var timespec): c_int
 	fn nanosleep(wanted: &timespec, left: &var timespec): c_int
+
+	/// A moment as C's calendar has it. The last two, the zone's offset and
+	/// its name, are BSD's, which both systems' C libraries have.
+	struct tm {
+		tm_sec: c_int
+		tm_min: c_int
+		tm_hour: c_int
+		tm_mday: c_int
+		tm_mon: c_int
+		tm_year: c_int
+		tm_wday: c_int
+		tm_yday: c_int
+		tm_isdst: c_int
+		tm_gmtoff: c_long
+		tm_zone: ptr<c_char>
+	}
+
+	fn localtime_r(clock: &i64, result: &var tm): ptr<tm>
+	fn tzset()
 }
 
 // `CLOCK_MONOTONIC`, which each system numbers its own way.
@@ -104,7 +123,7 @@ extend Duration: Text {
 			for i in digits.len()..places {
 				out.push("0")
 			}
-			out.push(digits.toStr())
+			out.push(digits)
 		}
 		out.push(unit)
 	}
@@ -315,7 +334,118 @@ extend Utc {
 
 extend Utc: Text {
 	/// As ISO 8601 writes it.
-	fn appendTo(out: &var String) = out.push(self.iso().toStr())
+	fn appendTo(out: &var String) = out.push(self.iso())
+}
+
+/// A moment as a calendar has it in the time zone the program runs in: its
+/// seconds since 1970, the offset from UTC the zone has at that moment, and
+/// the zone's name then, as the system's database of time zones says, `TZ`
+/// naming the zone where it is set. Its date is worked out as a `Utc`'s is,
+/// from the seconds and the offset. Two compare in the order they happen.
+@derive(Eq, Ord, Hash, Clone)
+pub struct Local {
+	since: i64
+	ahead: i64
+	named: String
+}
+
+extend Local {
+	/// The moment `seconds` after the start of 1970 where the program runs,
+	/// with the offset its zone has then: in winter and in summer they may
+	/// differ by an hour. `TZ` is read again each time, so a program that
+	/// sets it sees the zone it set.
+	pub static fn of(seconds: i64): Local = {
+		tzset()
+		var parts = tm(
+			tm_sec: 0,
+			tm_min: 0,
+			tm_hour: 0,
+			tm_mday: 0,
+			tm_mon: 0,
+			tm_year: 0,
+			tm_wday: 0,
+			tm_yday: 0,
+			tm_isdst: 0,
+			tm_gmtoff: 0,
+			tm_zone: null,
+		)
+		// A moment C cannot place, past the years its `int` holds, is read in
+		// UTC.
+		if localtime_r(&seconds, &var parts).isNull then
+			return Local(since: seconds, ahead: 0, named: "UTC")
+		var zone = String()
+		if !parts.tm_zone.isNull {
+			var i = 0
+			while parts.tm_zone[i] != 0 {
+				zone.pushByte(parts.tm_zone[i] as u8)
+				i += 1
+			}
+		}
+		return Local(since: seconds, ahead: parts.tm_gmtoff as i64, named: move zone)
+	}
+
+	/// The seconds since the start of 1970: what `of` was given.
+	pub fn seconds(): i64 = self.since
+
+	/// The seconds the zone is ahead of UTC at this moment, negative west of
+	/// Greenwich: `-25200` in California in summer, `19800` in India.
+	pub fn offset(): i64 = self.ahead
+
+	/// The zone's name at this moment, as the system gives it: `PDT`,
+	/// `CET`, `IST`. It says whether summer time is kept.
+	pub fn zone(): str = self.named.toStr()
+
+	/// The same moment in UTC.
+	pub fn utc(): Utc = Utc(self.since)
+
+	/// The year, which may be before 1 or after 9999.
+	pub fn year(): i64 = self.clock().year()
+
+	/// The month, from 1 for January to 12.
+	pub fn month(): i64 = self.clock().month()
+
+	/// The day of the month, from 1.
+	pub fn day(): i64 = self.clock().day()
+
+	/// The hour, from 0 to 23.
+	pub fn hour(): i64 = self.clock().hour()
+
+	/// The minute, from 0 to 59.
+	pub fn minute(): i64 = self.clock().minute()
+
+	/// The second, from 0 to 59.
+	pub fn second(): i64 = self.clock().second()
+
+	/// The day of the week, from 0 for Sunday to 6 for Saturday.
+	pub fn weekday(): i64 = self.clock().weekday()
+
+	/// As ISO 8601 writes a moment with its offset:
+	/// `2026-10-10T11:26:03-07:00`.
+	pub fn iso(): String = {
+		val clock = self.clock()
+		var out = String()
+		pushPadded(&var out, clock.year(), 4)
+		out.push("-")
+		pushPadded(&var out, clock.month(), 2)
+		out.push("-")
+		pushPadded(&var out, clock.day(), 2)
+		out.push("T")
+		clock.pushTime(&var out)
+		val ahead = if self.ahead < 0 then -self.ahead else self.ahead
+		out.push(if self.ahead < 0 then "-" else "+")
+		pushPadded(&var out, ahead / 3600, 2)
+		out.push(":")
+		pushPadded(&var out, ahead % 3600 / 60, 2)
+		return move out
+	}
+
+	/// What the zone's clocks read at this moment, as a `Utc` reads them.
+	fn clock(): Utc = Utc(self.since + self.ahead)
+}
+
+extend Local: Text {
+	/// As ISO 8601 writes it, with its offset.
+	fn appendTo(out: &var String) = out.push(self.iso())
 }
 
 /// `value` in at least `width` digits, zeroes before; a negative year with
@@ -327,7 +457,7 @@ fn pushPadded(out: &var String, value: i64, width: i64) = {
 	for i in digits.len()..width {
 		out.push("0")
 	}
-	out.push(digits.toStr())
+	out.push(digits)
 }
 
 /// The number written in `count` digits at `at`, or nothing where one of
@@ -336,7 +466,7 @@ fn digits(text: str, at: i64, count: i64): Option<i64> = {
 	var value = 0
 	for i in at..at + count {
 		val byte = text[i]
-		if !(byte is b'0'..=b'9') then return .None
+		if byte !is b'0'..=b'9' then return .None
 		value = value * 10 + ((byte - b'0') as i64)
 	}
 	return .Some(value)

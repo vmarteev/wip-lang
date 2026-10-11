@@ -28,6 +28,7 @@
 
 import std::collections::{Map, Set}
 import std::future
+import std::mem
 import hir::{
 	Binder,
 	Body,
@@ -57,6 +58,8 @@ pub fn check(program: &Program, interner: &Interner, threads: i64): Vec<Diagnost
 	for def in program.fns {
 		signatures.push(signatureLends(&program, &def))
 	}
+	// The types that hold a C string, whose values borrow what it does.
+	val cstrings = CstringHolders::of(&program)
 	// The bodies split by how many expressions they hold, each range checked
 	// on a thread of its own: each body is checked apart, so the result is
 	// the same at any number of threads.
@@ -69,23 +72,38 @@ pub fn check(program: &Program, interner: &Interner, threads: i64): Vec<Diagnost
 		}
 	}
 	val ranges = split(&weights.items(), threads)
-	val found = future::map(&ranges.items(), (range) => {
-		var said: Vec<Diagnostic> = Vec()
-		for i in range.0..range.1 {
-			val id = bodies[i]
-			val .Some(body) = program.fns[id].body else {
-				continue
+	val found = future::map(
+		&ranges.items(),
+		(range) => {
+			var said: Vec<Diagnostic> = Vec()
+			// What a callee lends, worked out once for the bodies this thread
+			// checks.
+			var lent: Map<(FnId, Ty), Vec<Lends>> = Map()
+			for i in range.0..range.1 {
+				val id = bodies[i]
+				val .Some(body) = program.fns[id].body else {
+					continue
+				}
+				val implements = match implemented.get(&id) {
+					.Some(declared) => Option::Some(declared.clone())
+					.None => Option::None
+				}
+				for d in checkBody(
+					&program,
+					&interner,
+					&signatures,
+					&cstrings,
+					&var lent,
+					id,
+					&body,
+					implements,
+				) {
+					said.push(move d)
+				}
 			}
-			val implements = match implemented.get(&id) {
-				.Some(declared) => Option::Some(declared.clone())
-				.None => Option::None
-			}
-			for d in checkBody(&program, &interner, &signatures, id, &body, implements) {
-				said.push(move d)
-			}
-		}
-		return move said
-	})
+			return move said
+		},
+	)
 	var diagnostics: Vec<Diagnostic> = Vec()
 	for part in move found {
 		for d in move part {
@@ -116,11 +134,15 @@ fn implementedMethods(program: &Program): Map<FnId, FnId> = {
 }
 
 /// Checks one body. `implements` is the interface's method it implements,
-/// whose signature its result is held to as well as its own.
+/// whose signature its result is held to as well as its own. `lent` is what
+/// each callee lends to a type, as bodies checked before found it, which
+/// this one adds to.
 fn checkBody(
 	program: &Program,
 	interner: &Interner,
 	signatures: &[Vec<Lends>],
+	cstrings: &CstringHolders,
+	lent: &var Map<(FnId, Ty), Vec<Lends>>,
 	id: FnId,
 	body: &Body,
 	implements: Option<FnId>,
@@ -148,6 +170,7 @@ fn checkBody(
 		interner: &interner,
 		body: &body,
 		signatures: &signatures,
+		cstrings: &cstrings,
 		diagnostics: Vec(),
 		quiet: 0,
 		loops: Vec(),
@@ -158,7 +181,7 @@ fn checkBody(
 		seen: Set(),
 		borrows: Vec(),
 		varParams: move varParams,
-		fnName: String::of(interner.resolve(def.name)),
+		fnName: interner.resolve(def.name),
 		generator: def.generator.isSome(),
 		aliases: Map(),
 		scopes: Vec(),
@@ -172,13 +195,15 @@ fn checkBody(
 		keptElements: Set(),
 		copies: Vec(),
 		copiesRead: Set(),
+		lent: mem::replace(&var lent, Map()),
 	)
 	var state = State()
 	// Where `from` says what the result borrows, what each parameter
 	// borrows is a root of its own, so the body is held to it.
 	if def.lendsFrom.isSome() {
 		for param in body.params {
-			if program.holdsView(body.locals[param].ty) {
+			val ty = body.locals[param].ty
+			if program.holdsView(ty) || cstrings.holds(&program, ty) {
 				var lent: SortedSet<Path> = SortedSet()
 				lent.add(Path(local: param, projs: Vec::of(own [Proj::Lent])))
 				state.roots.put(param, move lent)
@@ -196,6 +221,7 @@ fn checkBody(
 	}
 	checker.checkGenericKeeps()
 	checker.reportCopies()
+	lent = mem::replace(&var checker.lent, Map())
 	return move checker.diagnostics
 }
 
@@ -424,6 +450,8 @@ view struct Checker {
 	body: &Body
 	/// What each function's parameters lend its result, by its number.
 	signatures: &[Vec<Lends>]
+	/// The types that hold a C string.
+	cstrings: &CstringHolders
 	diagnostics: Vec<Diagnostic>
 	/// Nonzero while a loop is being iterated to its fixed point; diagnostics
 	/// are reported only in the final pass over it.
@@ -481,6 +509,10 @@ view struct Checker {
 	copies: Vec<(Span, LocalId)>
 	/// The copies after which the variable was read again.
 	copiesRead: Set<Span>
+	/// What a callee's parameters lend to the value a `&var` argument
+	/// refers to, by the callee and that value's type: a signature lends the
+	/// same at every call.
+	lent: Map<(FnId, Ty), Vec<Lends>>
 }
 
 /// A place that must stay as it is for a while: borrowed by a reference
@@ -551,7 +583,7 @@ extend Checker {
 
 	/// The expression as the programmer wrote it, for messages: `car.engine`.
 	fn display(id: ExprId): String = match self.body.exprs[id].kind {
-		.Local(local) => String::of(self.interner.resolve(self.body.locals[local].name))
+		.Local(local) => self.interner.resolve(self.body.locals[local].name)
 		.Field(base, index) => {
 			val .Struct(id: s, ..) = self.program.types.kind(self.ty(base)) else {
 				return self.display(base)
@@ -560,14 +592,14 @@ extend Checker {
 			val field = def.fields[index as i64].name
 			// A capture is written as the name the lambda used, not as a
 			// field of the environment the compiler built for it.
-			if def.isEnv then return String::of(self.interner.resolve(field))
+			if def.isEnv then return self.interner.resolve(field)
 			"\(self.display(base)).\(self.interner.resolve(field))"
 		}
 		.Deref(inner) | .Ref(inner) | .Move(inner) => self.display(inner)
 		.Index(base, ..) | .SubSlice(base, ..) => "\(self.display(base))[…]"
 		.Call(callee, ..) => "\(self.interner.resolve(self.program.fns[callee].name))(…)"
-		.Table(id: c) => String::of(self.interner.resolve(self.program.consts[c].name))
-		_ => String::of("this value")
+		.Table(id: c) => self.interner.resolve(self.program.consts[c].name)
+		_ => "this value"
 	}
 
 	/// Whether the place is a field of a closure's environment: what it

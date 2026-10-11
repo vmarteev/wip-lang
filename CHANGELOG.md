@@ -2,6 +2,49 @@
 
 Each version published, newest first.
 
+## 0.3.1 — 2026-10-10
+
+Programs written for 0.3.0 may need changes where marked **breaking**.
+
+- **The gate passes on Linux on x86-64.** Its check of `wip check
+  --dump-hir` counted, as the program's own, the line saying C's maths
+  library is linked, which only Linux on x86-64 links; 0.3.0's
+  verification failed there.
+- **A C string made from a `String` is checked as a `str` is.**
+  **Breaking:** `s.toCstring()` borrows `s`, and one used after `s`
+  changed — another `toCstring()` among the changes, since it may move
+  the bytes — kept past a `String` that was a temporary, or returned
+  borrowing a `String` that ends, is refused; each compiled before and
+  read freed memory. One from C, or a literal, is free as before, and
+  a value that holds a C string borrows what it does.
+- **A struct pattern's binding is written through,** as a variant's is:
+  `match p { Point(x, ..) => x += 10 }` writes `p.x`, where it was
+  refused.
+- **A byte answers what C's `<ctype.h>` does,** by the names a `char`
+  has: `isDigit`, `isHexDigit`, `isAsciiLetter`, `isAsciiAlphanumeric`,
+  `isAsciiUppercase`, `isAsciiLowercase`, `isAsciiWhitespace`,
+  `isAsciiPunctuation`, `isAsciiPrintable`, `digitValue(radix)`,
+  `toAsciiUpper` and `toAsciiLower`; a `char` has `digitValue` too.
+  **Breaking:** `isAsciiWhitespace` takes the vertical tab and the form
+  feed, as C's `isspace` and `char.isWhitespace` do, and so does `trim`.
+- **Text and containers:** `str.startsWithAnyCase`, `toAsciiUpper` and
+  `toAsciiLower`; `atLast()`, the last value of a `Vec` or a slice to
+  read or to write; `takeAll()`, everything a `Vec`, `String`, `Map`,
+  `Set` or `Deque` holds, leaving it empty.
+- **Local time:** `time::Local`, a moment in the time zone the program
+  runs in, read as `Utc` is and written as ISO 8601 writes it with its
+  offset.
+- **Text compared for equality by its length first,** so that most
+  comparisons that are false call nothing, and a `match` on text becomes
+  a switch on its length.
+- **The compiler is faster:** checking itself takes a quarter of the time
+  it did, and a debug build after an edit a fifth less, with each
+  function's MIR made on threads ahead of its code.
+- **`wip fmt` counts the columns a line takes,** not its characters, so a
+  line of wide characters is broken where it reaches the width.
+- **The README says how to install Wip,** from a release or from a
+  checkout.
+
 ## 0.3.0 — 2026-10-10
 
 Programs written for 0.2 may need changes where marked **breaking**.

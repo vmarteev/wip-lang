@@ -19,10 +19,12 @@
 // (`frames.wip`).
 
 import std::collections::{Deque, Map, Set}
+import std::future
 import std::io
 import hir::{ConstId, FnDef, FnId, GlobalId, I64, InterfaceId, NEVER, Program, Ty, TyKind}
 import mir::{
 	Arch,
+	Body,
 	CCall,
 	Layout,
 	Layouts,
@@ -41,7 +43,7 @@ import mir::{
 	shimmed,
 	tableBytes
 }
-import syntax::{Interner, Span, Symbol}
+import syntax::{Interner, Span, Symbol, split as splitWork}
 
 /// The number of the runtime's words, the first name a module numbers.
 val RUNTIME_WORDS: u32 = 0
@@ -81,6 +83,7 @@ pub fn compile(
 	entry: Option<Entry>,
 	locations: &(at: Span) => (String, u32, u32),
 	optimize: bool,
+	threads: i64,
 ): Ir = {
 	var llvm = Llvm::new(&program, &interner, locations, optimize)
 	for id in program.fns.ids() {
@@ -91,13 +94,64 @@ pub fn compile(
 		.Some(.Tests(tests)) => llvm.defineTestEntry(&tests)
 		.None => {}
 	}
+	// What is defined is what the queue reaches, one at a time and in its
+	// order, so that names, constants and debug nodes are numbered alike at
+	// any number of threads; what each is defined from is made ahead of it,
+	// on threads.
 	while true {
-		if llvm.queue.popFront() is .Some(id) then llvm.defineFunction(id)
-		else if llvm.pendingDrops.pop() is .Some((ty, inPlace)) then llvm.defineDrop(ty, inPlace)
-		else break
+		if llvm.queue.first() is .Some(id) {
+			if !llvm.madeFns.contains(&id) then llvm.makeAhead(threads)
+			llvm.queue.popFront()
+			llvm.defineFunction(id)
+		} else if !llvm.pendingDrops.isEmpty() {
+			val drop = llvm.pendingDrops[llvm.pendingDrops.len() - 1]
+			if !llvm.madeDrops.contains(&drop) then llvm.makeAhead(threads)
+			llvm.pendingDrops.pop()
+			llvm.defineDrop(drop.0, drop.1)
+		} else {
+			break
+		}
 	}
 	return llvm.finish()
 }
+
+/// What waits to be defined: a function, or the drop of a type, of an
+/// `own` of it or where it lies.
+@derive(Clone)
+enum Waiting {
+	Fn(id: FnId)
+	Drop(ty: Ty, inPlace: bool)
+}
+
+/// The MIR `waiting` is defined from: a function's, with its scalars split
+/// out in a release build, or nothing where it has no body; a drop's. It
+/// reads the program and writes nothing another reads, so it is made on any
+/// thread, at any time before it is defined, and is the same.
+fn bodyOf(
+	program: &Program,
+	interner: &Interner,
+	waiting: &Waiting,
+	optimize: bool,
+): Option<Body> = match waiting {
+	.Fn(id) => {
+		val .Some(lowered) = functionBody(program, interner, id) else {
+			return .None
+		}
+		var body = move lowered
+		// A release build's MIR splits its scalars out; a debug build's
+		// keeps each variable whole, for the debugger.
+		if optimize then scalars(program, &var body)
+		.Some(move body)
+	}
+	.Drop(ty, inPlace) => .Some(
+		if inPlace then lowerDropInPlaceFn(program, interner, ty)
+		else lowerDropFn(program, interner, ty),
+	)
+}
+
+/// At most this many bodies a thread are made ahead at once, so that what
+/// is held is bounded however wide the program is.
+val AHEAD: i64 = 64
 
 /// A parameter or a result as a signature has it: its type, and what C's ABI
 /// asks of it — a narrow integer extended, a struct's address marked as where
@@ -215,6 +269,10 @@ view struct Llvm {
 	blobs: Map<ConstId, u32>
 	drops: Map<(Ty, bool), u32>
 	pendingDrops: Vec<(Ty, bool)>
+	/// What the functions and drops waiting are defined from, made ahead of
+	/// them; a function's is nothing where it has no body.
+	madeFns: Map<FnId, Option<Body>>
+	madeDrops: Map<(Ty, bool), Body>
 	/// The runtime's functions, which C's names reach: `wip_alloc`,
 	/// `wip_panic_index` and the rest.
 	runtimeFns: Map<String, FnId>
@@ -230,8 +288,7 @@ extend Llvm {
 		var runtime: Map<String, FnId> = Map()
 		for id in program.fns.ids() {
 			val def = &program.fns[id]
-			if def.exportsC then
-				runtime.put(String::of(interner.resolve(def.symbol.unwrapOr(def.name))), id)
+			if def.exportsC then runtime.put(interner.resolve(def.symbol.unwrapOr(def.name)), id)
 		}
 		val noalias = match io::env("WIP_LLVM_NOALIAS") {
 			.Some(value) => value != "0"
@@ -266,6 +323,8 @@ extend Llvm {
 			blobs: Map(),
 			drops: Map(),
 			pendingDrops: Vec(),
+			madeFns: Map(),
+			madeDrops: Map(),
 			runtimeFns: move runtime,
 		)
 		llvm.global("@wip_runtime_words")
@@ -309,7 +368,7 @@ extend Llvm {
 		// its DWARF says what is where (`frames.wip`).
 		val globals = Vec::of(own [runtimeWords(RUNTIME_WORDS), frameTables(FRAME_TABLES)])
 		val module = Module(
-			heading: String::of("; Written by wip's LLVM backend."),
+			heading: "; Written by wip's LLVM backend.",
 			names: move self.names,
 			data: move self.data,
 			globals: move globals,
@@ -362,7 +421,7 @@ extend Llvm {
 	/// A constant of the program's, named `written`: bytes, read-only, which
 	/// nothing names outside the module, at `align`. Its name's number.
 	var fn constant(written: str, t: Type, init: Constant, align: u32): u32 = {
-		val name = self.global(globalName(written).toStr())
+		val name = self.global(globalName(written))
 		self.data.push(Global(
 			name: name,
 			linkage: .Private,
@@ -674,9 +733,7 @@ extend Llvm {
 	var fn cGlobal(global: GlobalId): u32 = {
 		if self.cGlobals.get(&global) is .Some(name) then return name
 		val def = &self.program.globals[global]
-		val name = self.global(
-			globalName(self.interner.resolve(def.symbol.unwrapOr(def.name))).toStr(),
-		)
+		val name = self.global(globalName(self.interner.resolve(def.symbol.unwrapOr(def.name))))
 		self.declare(
 			name,
 			.Global(Global(
@@ -711,8 +768,8 @@ extend Llvm {
 		val name = if def.isExtern {
 			val cName =
 				if self.shimmed.contains(&id) then shimName(id)
-				else String::of(self.interner.resolve(def.symbol.unwrapOr(def.name)))
-			val symbol = self.global(globalName(cName.toStr()).toStr())
+				else self.interner.resolve(def.symbol.unwrapOr(def.name))
+			val symbol = self.global(globalName(cName))
 			// One C function may be declared under two names, each with a
 			// signature of its own; a call says its own, and the first is the
 			// declaration's.
@@ -731,12 +788,12 @@ extend Llvm {
 			symbol
 		} else if def.exportsC {
 			self.queue.pushBack(id)
-			self.global(globalName(self.interner.resolve(def.symbol.unwrapOr(def.name))).toStr())
+			self.global(globalName(self.interner.resolve(def.symbol.unwrapOr(def.name))))
 		} else {
 			self.queue.pushBack(id)
 			val written = self.program.fnName(id, self.interner)
 			val symbol = "wip.\(written).\(id.index())"
-			self.global(globalName(symbol.toStr()).toStr())
+			self.global(globalName(symbol))
 		}
 		self.symbols.put(id, name)
 		return name
@@ -758,7 +815,7 @@ extend Llvm {
 		if self.drops.get(&key) is .Some(name) then return name
 		val kind = if inPlace then "drop_in_place" else "drop"
 		val symbol = "wip.\(kind).\(self.drops.len())"
-		val name = self.global(globalName(symbol.toStr()).toStr())
+		val name = self.global(globalName(symbol))
 		self.drops.put(key, name)
 		self.pendingDrops.push(key)
 		return name
@@ -772,7 +829,7 @@ extend Llvm {
 		var withNul = text.items().toVec()
 		withNul.push(0)
 		val name = self.constant(
-			written.toStr(),
+			written,
 			byteArray((text.len() + 1) as u32),
 			.Bytes(move withNul),
 			1,
@@ -788,7 +845,7 @@ extend Llvm {
 		val written = "wip.text.\(self.texts.len())"
 		// An object holds a byte at least; an empty text's is never read.
 		val name = self.constant(
-			written.toStr(),
+			written,
 			byteArray(text.len().max(1) as u32),
 			byteConstant(&text.items()),
 			1,
@@ -803,7 +860,7 @@ extend Llvm {
 		if self.blobs.get(&origin) is .Some(name) then return name
 		val written = "wip.embedded.\(self.blobs.len())"
 		val name = self.constant(
-			written.toStr(),
+			written,
 			byteArray(bytes.len().max(1) as u32),
 			byteConstant(bytes),
 			1,
@@ -851,12 +908,7 @@ extend Llvm {
 			values.push(byteConstant(&bytes[at..bytes.len()]))
 		}
 		val align = self.layout(ty).align.max(1)
-		val name = self.constant(
-			written.toStr(),
-			structOf(move types, true),
-			.Packed(move values),
-			align,
-		)
+		val name = self.constant(written, structOf(move types, true), .Packed(move values), align)
 		self.tables.put(id, name)
 		return name
 	}
@@ -877,7 +929,7 @@ extend Llvm {
 		}
 		if !found then panic("every table a program needs was made with its instances")
 		// Numbered before its methods, which a method's own table may name.
-		val name = self.global(globalName(written.toStr()).toStr())
+		val name = self.global(globalName(written))
 		self.vtables.put(key, name)
 		var entries: Vec<Constant> = Vec()
 		for method in methods {
@@ -899,8 +951,8 @@ extend Llvm {
 	/// C's `abort`, declared once, whether or not the program declares it
 	/// itself.
 	var fn abort(): u32 = {
-		val symbol = self.global(globalName("abort").toStr())
-		if self.cDeclared.add(String::of("abort")) {
+		val symbol = self.global(globalName("abort"))
+		if self.cDeclared.add("abort") {
 			var declaration = Declaration::of(symbol, .Void, Vec())
 			declaration.attrs = Vec::of(own [FnAttr::NoReturn, FnAttr::NoUnwind])
 			self.declare(symbol, .Function(move declaration))
@@ -908,23 +960,74 @@ extend Llvm {
 		return symbol
 	}
 
+	/// The MIR of what waits and has none made — the functions in the queue,
+	/// in its order, then the drops — made at once on `threads` threads, up
+	/// to `AHEAD` a thread, each range of them on a thread of its own.
+	var fn makeAhead(threads: i64) = {
+		val most = AHEAD * threads.max(1)
+		var waiting: Vec<Waiting> = Vec()
+		var weights: Vec<i64> = Vec()
+		var i = 0
+		while i < self.queue.len() && waiting.len() < most {
+			val id = self.queue[i]
+			if !self.madeFns.contains(&id) {
+				waiting.push(.Fn(id))
+				// A body's expressions, which is how long it takes to lower.
+				weights.push(
+					match self.program.fns[id].body {
+						.Some(body) => body.exprs.len() + 1
+						.None => 1
+					},
+				)
+			}
+			i += 1
+		}
+		var d = self.pendingDrops.len()
+		while d > 0 && waiting.len() < most {
+			d -= 1
+			val drop = self.pendingDrops[d]
+			if !self.madeDrops.contains(&drop) {
+				waiting.push(.Drop(ty: drop.0, inPlace: drop.1))
+				weights.push(1)
+			}
+		}
+		val program = self.program
+		val interner = self.interner
+		val optimize = self.optimize
+		val ranges = splitWork(&weights.items(), threads)
+		val made = future::map(&ranges.items(), (range) => {
+			var bodies: Vec<Option<Body>> = Vec()
+			for k in range.0..range.1 {
+				bodies.push(bodyOf(&program, &interner, &waiting[k], optimize))
+			}
+			return move bodies
+		})
+		var k = 0
+		for part in move made {
+			for body in move part {
+				match waiting[k] {
+					.Fn(id) => self.madeFns.put(id, move body)
+					.Drop(ty, inPlace) => self.madeDrops.put((ty, inPlace), body.unwrap())
+				}
+				k += 1
+			}
+		}
+	}
+
 	var fn defineFunction(id: FnId) = {
 		val program = self.program
 		val def = &program.fns[id]
-		val .Some(lowered) = functionBody(program, self.interner, id) else {
+		val .Some(.Some(lowered)) = self.madeFns.remove(&id) else {
 			return
 		}
 		var body = move lowered
-		// A release build's MIR splits its scalars out; a debug build's keeps
-		// each variable whole, for the debugger.
-		if self.optimize then scalars(program, &var body)
 		// For finding what MIR reads before it writes.
 		if io::env("WIP_MIR_UNWRITTEN").isSome() {
 			for (local, block) in readsBeforeWrites(&body) {
 				val decl = body.local(local)
 				val name = match decl.source {
 					.Some(source) => String::of(self.interner.resolve(source.name))
-					.None => String::of("-")
+					.None => "-"
 				}
 				io::eprintln("unwritten: \(program.fnName(id, self.interner)) _\(local.index) (\(name), \(decl.kind), \(program.tyName(decl.ty, self.interner))) read in bb\(block.index)")
 			}
@@ -938,7 +1041,7 @@ extend Llvm {
 		// other.
 		if def.exportsC && self.cCall(id) is .Some(cCall) {
 			val inner = "wip.\(name).\(id.index())"
-			val bodySymbol = self.global(globalName(inner.toStr()).toStr())
+			val bodySymbol = self.global(globalName(inner))
 			val export = self.defineExport(id, symbol, bodySymbol, &cCall)
 			self.define(self.fileOf(def.span), move export)
 			var params: Vec<Ty> = Vec()
@@ -950,7 +1053,7 @@ extend Llvm {
 			linkage = self.ownLinkage()
 		}
 		val at = def.span
-		val subprogram = self.debug.subprogram(name.toStr(), .Some(at))
+		val subprogram = self.debug.subprogram(name, .Some(at))
 		val function = defineFn(
 			&var self,
 			&body,
@@ -966,13 +1069,14 @@ extend Llvm {
 	}
 
 	var fn defineDrop(ty: Ty, inPlace: bool) = {
-		val body =
-			if inPlace then lowerDropInPlaceFn(self.program, self.interner, ty)
-			else lowerDropFn(self.program, self.interner, ty)
+		val key = (ty, inPlace)
+		val .Some(body) = self.madeDrops.remove(&key) else {
+			panic("a drop is defined from what was made ahead of it")
+		}
 		val symbol = self.dropFn(ty, inPlace)
 		val sig = Sig(params: Vec::of(own [Slot::of(.Ptr)]), ret: .None, sret: false, parts: .None)
 		val name = "drop<\(self.program.tyName(ty, self.interner))>"
-		val subprogram = self.debug.subprogram(name.toStr(), .None)
+		val subprogram = self.debug.subprogram(name, .None)
 		val linkage = self.ownLinkage()
 		val function = defineFn(
 			&var self,
@@ -1115,13 +1219,13 @@ extend Llvm {
 		for id in tests {
 			lines.push("test \(self.program.testName(id, self.interner)) ... ")
 		}
-		lines.push(String::of("ok\n"))
+		lines.push("ok\n")
 		lines.push("\n\(tests.len()) \(plural) passed\n")
 		val printer = self.runtime("wip_print_text")
 		val print = Value::Global(self.symbol(printer))
 		var texts: Vec<(u32, i64)> = Vec()
 		for line in lines {
-			texts.push((self.text(line.toStr()), line.len()))
+			texts.push((self.text(line), line.len()))
 		}
 		var callees: Vec<u32> = Vec()
 		for id in tests {
