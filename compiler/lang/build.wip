@@ -257,7 +257,7 @@ pub fn buildTests(
 	program.dropsByCall = profile == Profile::Debug
 	var tests: Vec<FnId> = Vec()
 	for id in program.fns.ids() {
-		if !program.fns[id].isTest then continue
+		if program.fns[id].test.isNone() then continue
 		if filter is .Some(text) && !program.testName(id, &loaded.interner).contains(text) then
 			continue
 		tests.push(id)
@@ -338,7 +338,7 @@ fn cSources(
 		}
 		files.push(move c)
 	}
-	for (module, relative, language) in program.cSources {
+	for (module, relative, language, standard) in program.cSources {
 		val path = path::join(dirs[module], relative)
 		if !(fs::meta(path) is .Ok(meta) && meta.isFile()) {
 			val name =
@@ -351,11 +351,14 @@ fn cSources(
 		match language {
 			.Some(.C) => c.language = .C
 			.Some(.ObjectiveC) => c.language = .ObjectiveC
+			.Some(.CPlusPlus) => c.language = .CPlusPlus
+			.Some(.ObjectiveCPlusPlus) => c.language = .ObjectiveCPlusPlus
 			.None => {}
 		}
-		// Objective-C is Apple's, as it is for a file found beside the
-		// module's own.
-		if c.language == Language::ObjectiveC && TARGET_VENDOR != "apple" then continue
+		c.standard = standard.clone()
+		// Objective-C and Objective-C++ are Apple's, as they are for a file
+		// found beside the module's own.
+		if c.language.isApples() && TARGET_VENDOR != "apple" then continue
 		c.prefix = prefixOf(&program, &dirs, module)
 		c.defines = definesOf(&program, module)
 		files.push(move c)
@@ -415,10 +418,10 @@ fn cIncludeDirs(
 	program: &Program,
 	moduleDirs: &[String],
 	modules: &[String],
-): Result<Vec<String>, BuildError> = {
-	var dirs: Vec<String> = Vec()
+): Result<Includes, BuildError> = {
+	var dirs = Includes()
 	for dir in modules {
-		dirs.push(dir.clone())
+		dirs.quoted.push(dir.clone())
 	}
 	for (module, relative) in program.cIncludes {
 		val path = &program.modules[module]
@@ -429,7 +432,7 @@ fn cIncludeDirs(
 				.Link("`@include(\"\(relative)\")` in \(name): `\(dir)` is not a directory"),
 			)
 		}
-		if !dirs.contains(&dir) then dirs.push(move dir)
+		if !dirs.angled.contains(&dir) then dirs.angled.push(move dir)
 	}
 	return .Ok(move dirs)
 }
@@ -467,8 +470,8 @@ view struct Linking {
 	cFiles: &[CFile]
 	shims: Option<str>
 	/// Where the program's C looks for headers: the modules' directories,
-	/// and those they name with `@include`.
-	includeDirs: &[String]
+	/// for `#include "…"`, and those they name with `@include`.
+	includeDirs: &Includes
 	search: &Search
 	libraries: &[String]
 	frameworks: &[String]
@@ -527,12 +530,15 @@ fn link(
 	// the build was started. An empty path is the current directory, as a
 	// bare file name's parent is: written as it is, it would be a `-I` that
 	// takes the next argument.
-	var includes: Vec<String> = Vec()
-	for dir in linking.includeDirs {
-		addInclude(&var includes, dir)
+	var includes = Includes()
+	for dir in linking.includeDirs.quoted {
+		addInclude(&var includes.quoted, dir)
+	}
+	for dir in linking.includeDirs.angled {
+		addInclude(&var includes.angled, dir)
 	}
 	for dir in linking.search.includes {
-		addInclude(&var includes, dir)
+		addInclude(&var includes.angled, dir)
 	}
 	// Code in a shared library is placed wherever the library is loaded;
 	// Apple's compilers make all code so.
@@ -580,6 +586,14 @@ fn link(
 	for arg in linkArgs(&linking.search.libraryPaths, linking.libraries, linking.frameworks) {
 		args.push(move arg)
 	}
+	// C++ compiled with the program needs the C++ library, which a C
+	// driver does not link: the system's, libc++ on Apple's and libstdc++
+	// on Linux. A program with no C++ links neither.
+	var cxx = false
+	for file in linking.cFiles {
+		if file.language.isCxx() then cxx = true
+	}
+	if cxx then args.push(if TARGET_VENDOR == "apple" then "-lc++" else "-lstdc++")
 	val cc = compiler()
 	run(cc, strs(&args))?
 	// Apple's linker leaves the debug information in the objects and names

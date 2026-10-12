@@ -19,14 +19,42 @@ import std::process::{Command}
 pub enum Language {
 	C
 	ObjectiveC
+	CPlusPlus
+	ObjectiveCPlusPlus
 }
+
+extend Language {
+	/// Whether it is C++, plain or Apple's: what is compiled to a C++
+	/// standard, and what links the C++ library.
+	pub fn isCxx(): bool = self is .CPlusPlus | .ObjectiveCPlusPlus
+
+	/// Whether it is Apple's: Objective-C and Objective-C++, compiled on an
+	/// Apple target and passed over elsewhere.
+	pub fn isApples(): bool = self is .ObjectiveC | .ObjectiveCPlusPlus
+
+	/// What a C compiler's `-x` calls it.
+	fn flag(): str = match self {
+		.C => "c"
+		.ObjectiveC => "objective-c"
+		.CPlusPlus => "c++"
+		.ObjectiveCPlusPlus => "objective-c++"
+	}
+}
+
+/// The C++ standard a file is compiled to where its module does not say:
+/// what the libraries a program is likely to vendor ask for or accept. It
+/// is given, since the compilers Wip builds with default to different ones.
+val CXX_STANDARD = "c++17"
 
 /// One file to compile.
 @derive(Clone)
 pub struct CFile {
 	pub var source: String
-	/// Objective-C for a `.m` file, or what `@source` said.
+	/// Objective-C for a `.m` file, C++ for a `.cpp`, `.cc` or `.cxx`,
+	/// Objective-C++ for a `.mm`, or what `@source` said.
 	pub var language: Language
+	/// The C++ standard, where the module said one; C++17 otherwise.
+	pub var standard: Option<String>
 	/// A header put before this file, which is how a module configures the C
 	/// it vendors: `@prefix("build.h")`. The compiler is given `-include`,
 	/// and what it then reads is a dependency like any other, so a change to
@@ -41,24 +69,34 @@ extend CFile {
 	pub static fn c(source: String): CFile = CFile(
 		source: move source,
 		language: .C,
+		standard: .None,
 		prefix: .None,
 		defines: Vec(),
 	)
 
-	/// A module's file, by its extension.
+	/// A module's file, by its extension, and C where it has none that says.
 	pub static fn of(source: String): CFile = {
-		val language =
-			if implied(source) == .Some(Language::ObjectiveC) then Language::ObjectiveC
-			else Language::C
-		return CFile(source: move source, language: language, prefix: .None, defines: Vec())
+		val language = match implied(source) {
+			.Some(language) => language
+			.None => Language::C
+		}
+		return CFile(
+			source: move source,
+			language: language,
+			standard: .None,
+			prefix: .None,
+			defines: Vec(),
+		)
 	}
 }
 
 /// What a C compiler takes a file to be written in from its extension:
 /// nothing for a header, which it would make a precompiled header of.
-fn implied(source: str): Option<Language> = match path::extension(source) {
+pub fn implied(source: str): Option<Language> = match path::extension(source) {
 	.Some("c") => .Some(.C)
 	.Some("m") => .Some(.ObjectiveC)
+	.Some("cpp") | .Some("cc") | .Some("cxx") => .Some(.CPlusPlus)
+	.Some("mm") => .Some(.ObjectiveCPlusPlus)
 	_ => .None
 }
 
@@ -108,13 +146,9 @@ pub fn cleanCache(): Result<i64, String> = {
 
 /// How many bytes the files under `path` hold, not following a link.
 fn sizeOf(path: str): i64 = {
-	val .Ok(meta) = fs::linkMeta(path) else {
-		return 0
-	}
+	val .Ok(meta) = fs::linkMeta(path) else return 0
 	if !meta.isDirectory() then return meta.size
-	val .Ok(entries) = fs::readDir(path) else {
-		return 0
-	}
+	val .Ok(entries) = fs::readDir(path) else return 0
 	var size = 0
 	for entry in entries {
 		size += sizeOf(path::join(path, entry.name))
@@ -162,12 +196,23 @@ pub fn generated(cache: str, files: &[(str, str)], unique: &Unique): Result<Stri
 	return .Ok(move dir)
 }
 
+/// Where a C file looks for the headers it includes. A module's own
+/// directory is `quoted`, searched for `#include "…"` alone: a system's
+/// header, `<Metal/Metal.h>`, is never a module's file of the same name,
+/// which a disk that ignores case would otherwise find first. `angled` —
+/// what a module names with `@include`, and the command line's `-I` — is
+/// searched for both.
+pub struct Includes {
+	pub var quoted: Vec<String> = Vec()
+	pub var angled: Vec<String> = Vec()
+}
+
 /// Compiles `files` with `includes` on the include path, using what the
 /// cache under `cache` already has. `positionIndependent` is for a shared
 /// library on a system whose compiler does not make all code so.
 pub fn compile(
 	files: &[CFile],
-	includes: &[String],
+	includes: &Includes,
 	cache: str,
 	positionIndependent: bool,
 	optimize: bool,
@@ -220,7 +265,7 @@ pub fn cpuFlag(cpu: &Cpu): String = match cpu.level() {
 /// object goes.
 fn flags(
 	file: &CFile,
-	includes: &[String],
+	includes: &Includes,
 	positionIndependent: bool,
 	optimize: bool,
 	cpu: &Cpu,
@@ -236,11 +281,19 @@ fn flags(
 	// where it does, and no further.
 	args.push(cpuFlag(&cpu))
 	// The language, where the extension does not already say it: a header is
-	// then compiled as the implementation it holds.
-	if implied(file.source) != .Some(file.language.clone()) ||
-		file.language == Language::ObjectiveC {
+	// then compiled as the implementation it holds. A driver named `cc`
+	// compiles a `.cpp` file as C++ only by its extension, so every language
+	// but C is said.
+	if implied(file.source) != .Some(file.language.clone()) || file.language != Language::C {
 		args.push("-x")
-		args.push(if file.language == Language::C then "c" else "objective-c")
+		args.push(file.language.flag())
+	}
+	if file.language.isCxx() {
+		val standard = match file.standard {
+			.Some(said) => said.toStr()
+			.None => CXX_STANDARD
+		}
+		args.push("-std=\(standard)")
 	}
 	// Before the prefix header, which may test them.
 	for define in file.defines {
@@ -250,7 +303,12 @@ fn flags(
 		args.push("-include")
 		args.push(prefix.clone())
 	}
-	for dir in includes {
+	// The modules' directories first, as `"…"` looks in them before `-I`'s.
+	for dir in includes.quoted {
+		args.push("-iquote")
+		args.push(dir.clone())
+	}
+	for dir in includes.angled {
 		args.push("-I\(dir)")
 	}
 	return move args
@@ -323,9 +381,7 @@ fn objectFor(
 			.Ok(path) => move path
 			.Err(..) => header.clone()
 		}
-		val .Some(stamp) = Stamp::of(path) else {
-			continue
-		}
+		val .Some(stamp) = Stamp::of(path) else continue
 		listing.push(stamp.line(path))
 	}
 	// The object first, then what says it is current: a reader that finds
@@ -345,12 +401,8 @@ struct Stamp {
 
 extend Stamp {
 	static fn of(path: str): Option<Stamp> = {
-		val .Ok(meta) = fs::meta(path) else {
-			return .None
-		}
-		val .Ok(text) = fs::readFile(path) else {
-			return .None
-		}
+		val .Ok(meta) = fs::meta(path) else return .None
+		val .Ok(text) = fs::readFile(path) else return .None
 		return .Some(Stamp(size: meta.size, modified: modified(&meta), hash: hexOf(text.toStr())))
 	}
 
@@ -366,27 +418,15 @@ fn modified(meta: &fs::Meta): String = "\(meta.modified * 1_000_000_000 + meta.m
 /// Whether every header an entry was made from is as it was: the same size
 /// and time, or, where the time moved, the same contents.
 fn stillCurrent(deps: str): bool = {
-	val .Ok(listing) = fs::readFile(deps) else {
-		return false
-	}
+	val .Ok(listing) = fs::readFile(deps) else return false
 	for line in listing.toStr().lines() {
-		val .Some((size, afterSize)) = line.splitOnce(" ") else {
-			return false
-		}
-		val .Some((time, afterTime)) = afterSize.splitOnce(" ") else {
-			return false
-		}
-		val .Some((hash, path)) = afterTime.splitOnce(" ") else {
-			return false
-		}
-		val .Ok(meta) = fs::meta(path) else {
-			return false
-		}
+		val .Some((size, afterSize)) = line.splitOnce(" ") else return false
+		val .Some((time, afterTime)) = afterSize.splitOnce(" ") else return false
+		val .Some((hash, path)) = afterTime.splitOnce(" ") else return false
+		val .Ok(meta) = fs::meta(path) else return false
 		if size != "\(meta.size)".toStr() then return false
 		if time == modified(&meta).toStr() then continue
-		val .Ok(text) = fs::readFile(path) else {
-			return false
-		}
+		val .Ok(text) = fs::readFile(path) else return false
 		if hexOf(text.toStr()) != hash then return false
 	}
 	return true
@@ -397,9 +437,7 @@ fn stillCurrent(deps: str): bool = {
 fn dependencies(rule: str): Vec<String> = {
 	val joined = rule.replace("\\\r\n", " ").replace("\\\n", " ")
 	var out: Vec<String> = Vec()
-	val .Some(colon) = joined.toStr().find(": ") else {
-		return move out
-	}
+	val .Some(colon) = joined.toStr().find(": ") else return move out
 	val after = joined.toStr()[colon + 2..joined.len()]
 	var current = String()
 	var i = 0

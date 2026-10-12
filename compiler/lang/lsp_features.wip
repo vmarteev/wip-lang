@@ -4,7 +4,6 @@
 
 import std::collections::{Map, Set}
 import std::fs
-import std::json::{Json}
 import std::path
 import fmt::{format as formatText, switchedOff}
 import hir::{Program}
@@ -14,8 +13,8 @@ import syntax::{Diagnostic, FnDecl, Interner, Item, Name, Span}
 /// the edits, by file.
 pub struct QuickFix {
 	pub title: String
-	pub diagnostic: Json
-	pub changes: Json
+	pub diagnostic: Reported
+	pub edit: WorkspaceEdit
 }
 
 /// A file the editor has open: its URI, its path, and its text.
@@ -27,7 +26,7 @@ pub struct OpenFile {
 
 /// What is wrong, by file, and what can be fixed.
 pub struct Found {
-	pub var diagnostics: Map<String, Vec<Json>> = Map()
+	pub var diagnostics: Map<String, Vec<Reported>> = Map()
 	pub var fixes: Map<String, Vec<QuickFix>> = Map()
 	/// Each program checked, to answer what its names mean.
 	pub var programs: Vec<(Loaded, Program)> = Vec()
@@ -52,9 +51,7 @@ pub fn diagnosticsOf(
 	var reached: Set<String> = Set()
 	var seen: Set<String> = Set()
 	for root in roots {
-		val .Ok(read) = loadOverlaid(root, .Tests, &overlay, threads) else {
-			continue
-		}
+		val .Ok(read) = loadOverlaid(root, .Tests, &overlay, threads) else continue
 		var loaded = move read
 		var timings = Timings()
 		val checked = checkLoaded(&var loaded, &var timings)
@@ -84,9 +81,7 @@ pub fn diagnosticsOf(
 
 extend Found {
 	var fn add(diagnostic: &Diagnostic, sources: &Sources, places: &var Places) = {
-		val .Some((uri, range)) = places.place(&sources, diagnostic.primary.span) else {
-			return
-		}
+		val .Some((uri, range)) = places.place(&sources, diagnostic.primary.span) else return
 		var message = diagnostic.message.clone()
 		val label = &diagnostic.primary.message
 		if !label.isEmpty() && label != message then message.push(": \(label)")
@@ -96,53 +91,38 @@ extend Found {
 		for note in diagnostic.notes {
 			message.push("\nnote: \(note)")
 		}
-		var related: Vec<Json> = Vec()
+		var related: Vec<Related> = Vec()
 		for label in diagnostic.secondary {
 			if places.place(&sources, label.span) is .Some((at, within)) then
-				related.push(
-					object([
-						("location", object([("uri", jsonText(at)), ("range", move within)])),
-						("message", jsonText(label.message)),
-					]),
-				)
+				related.push(Related(
+					location: Location(uri: move at, range: move within),
+					message: label.message.clone(),
+				))
 		}
-		val value = object([
-			("range", range.clone()),
-			("severity", .Int(if diagnostic.severity == .Error then 1 else 2)),
-			("code", jsonText(diagnostic.code.text())),
-			("source", jsonText("wip")),
-			("message", .Text(move message)),
-			("relatedInformation", .Array(move related)),
-		])
+		val value = Reported(
+			range: range.clone(),
+			severity: if diagnostic.severity == .Error then 1 else 2,
+			code: String::of(diagnostic.code.text()),
+			message: move message,
+			relatedInformation: move related,
+		)
 		if diagnostic.fix is .Some(fix) {
-			var changes: Map<String, Vec<Json>> = Map()
+			var changes: Map<String, Vec<TextEdit>> = Map()
 			for edit in fix.edits {
 				if places.place(&sources, edit.span) is .Some((at, within)) then
-					changes.atOrPut(move at, Vec()).push(
-						object([("range", move within), ("newText", jsonText(edit.replacement))]),
-					)
+					changes.atOrPut(move at, Vec()).push(TextEdit(
+						range: move within,
+						newText: edit.replacement.clone(),
+					))
 			}
 			self.fixes.atOrPut(uri.clone(), Vec()).push(QuickFix(
 				title: fix.message.clone(),
 				diagnostic: value.clone(),
-				changes: byFile(&changes),
+				edit: WorkspaceEdit(changes: move changes),
 			))
 		}
 		self.diagnostics.atOrPut(move uri, Vec()).push(move value)
 	}
-}
-
-/// Edits by file, as the protocol writes them: an object of URIs.
-fn byFile(changes: &Map<String, Vec<Json>>): Json = {
-	var fields: Vec<(String, Json)> = Vec()
-	for at in 0..changes.len() {
-		val uri = String::of(changes.keyAt(at))
-		val .Some(edits) = changes.get(&uri) else {
-			continue
-		}
-		fields.push((move uri, .Array(edits.clone())))
-	}
-	return .Object(move fields)
 }
 
 /// Turns spans into URIs and ranges.
@@ -172,12 +152,10 @@ extend Places {
 
 	/// Like `place`, and a span in the standard library is in the home's
 	/// files.
-	var fn locate(sources: &Sources, span: Span): Option<(String, Json)> = {
+	var fn locate(sources: &Sources, span: Span): Option<(String, Range)> = {
 		val (name, text, base) = sources.of(span)?
 		if name.startsWith("/") then return self.place(&sources, span)
-		val .Some(home) = self.home else {
-			return .None
-		}
+		val .Some(home) = self.home else return .None
 		val file = path::join(home, name)
 		if !isFile(file) then return .None
 		return .Some((uriOf(file), rangeIn(text, base, span)))
@@ -186,7 +164,7 @@ extend Places {
 	/// The file a span is in and its range there; nothing for the standard
 	/// library's files, which are named from the home, not where anything
 	/// is on disk.
-	var fn place(sources: &Sources, span: Span): Option<(String, Json)> = {
+	var fn place(sources: &Sources, span: Span): Option<(String, Range)> = {
 		val (name, text, base) = sources.of(span)?
 		val key = String::of(name)
 		if !self.named.contains(&key) {
@@ -202,15 +180,13 @@ extend Places {
 			}
 			self.named.put(key.clone(), move uri)
 		}
-		val .Some(.Some(uri)) = self.named.get(&key) else {
-			return .None
-		}
+		val .Some(.Some(uri)) = self.named.get(&key) else return .None
 		return .Some((uri.clone(), rangeIn(text, base, span)))
 	}
 }
 
 /// The range of `span` in `text`, which begins at `base`.
-fn rangeIn(text: str, base: u32, span: Span): Json = {
+fn rangeIn(text: str, base: u32, span: Span): Range = {
 	val lo = if span.lo > base then (span.lo - base) as i64 else 0
 	val hi = if span.hi > base then (span.hi - base) as i64 else 0
 	return Lines::of(text).range(lo, if hi > lo then hi else lo)
@@ -261,9 +237,7 @@ fn findRoot(file: str, dir: str, overlay: &Overlay, threads: i64): String = {
 
 /// Whether a directory holds a `.wip` file.
 fn holdsWip(dir: str): bool = {
-	val .Ok(entries) = fs::readDir(dir) else {
-		return false
-	}
+	val .Ok(entries) = fs::readDir(dir) else return false
 	for entry in entries {
 		if path::extension(entry.name) == .Some("wip") then return true
 	}
@@ -273,9 +247,7 @@ fn holdsWip(dir: str): bool = {
 /// Whether the program at `root` reads the file whose canonical path is
 /// `file`.
 fn reaches(root: str, file: str, overlay: &Overlay, threads: i64): bool = {
-	val .Ok(loaded) = loadOverlaid(root, .Tests, &overlay, threads) else {
-		return false
-	}
+	val .Ok(loaded) = loadOverlaid(root, .Tests, &overlay, threads) else return false
 	for (name, _, _) in loaded.sources.entries() {
 		if name.startsWith("/") && canonicalFile(name) == file then return true
 	}
@@ -285,9 +257,7 @@ fn reaches(root: str, file: str, overlay: &Overlay, threads: i64): bool = {
 /// Whether a file is one of the standard library's, which is in the home
 /// and no program of its own.
 pub fn inStd(file: str): bool = {
-	val .Some(std) = stdDir() else {
-		return false
-	}
+	val .Some(std) = stdDir() else return false
 	val canonical = canonicalFile(file)
 	return canonical == std || canonical.startsWith("\(std)/")
 }
@@ -319,7 +289,11 @@ fn holding(programs: &[(Loaded, Program)], file: str): Option<(i64, u32)> = {
 }
 
 /// What is at `position` in the open file, in the program that holds it.
-fn hitIn(programs: &[(Loaded, Program)], file: &OpenFile, position: &Json): Option<(i64, Hit)> = {
+fn hitIn(
+	programs: &[(Loaded, Program)],
+	file: &OpenFile,
+	position: &Position,
+): Option<(i64, Hit)> = {
 	val (at, base) = holding(&programs, file.path)?
 	val offset = Lines::of(file.text).offset(&position)
 	val loaded = &programs[at].0
@@ -328,17 +302,50 @@ fn hitIn(programs: &[(Loaded, Program)], file: &OpenFile, position: &Json): Opti
 	return .Some((at, move hit))
 }
 
+/// What each call in the file was given for its implicit parameters, shown
+/// after its last argument as it would be written: `rng: &var rng`. Calls
+/// that fill several show them together.
+pub fn inlayHints(programs: &[(Loaded, Program)], file: &OpenFile): Vec<InlayHint> = {
+	val .Some((at, base)) = holding(&programs, file.path) else return Vec()
+	val text = file.text.toStr()
+	val end = base + text.len() as u32
+	// Each call's place, and what it was given, in the order filled.
+	var given: Vec<(u32, Vec<String>)> = Vec()
+	for (offset, label) in programs[at].1.implicitFills {
+		if offset < base || offset > end then continue
+		var found: Option<i64> = .None
+		for i in 0..given.len() {
+			if given[i].0 == offset then found = .Some(i)
+		}
+		match found {
+			.Some(i) => given[i].1.push(label.clone())
+			.None => given.push((offset, Vec::of(own [label.clone()])))
+		}
+	}
+	val lines = Lines::of(text)
+	var hints: Vec<InlayHint> = Vec()
+	for (offset, labels) in given {
+		val local = (offset - base) as i64
+		val written = labels.join(", ")
+		// After other arguments, a comma, as the call would be written.
+		val open = local > 0 && text[local - 1] == b'('
+		hints.push(InlayHint(
+			position: lines.position(local),
+			label: if open then move written else ", \(written)",
+		))
+	}
+	return move hints
+}
+
 /// What a name is, as Wip would write it, and what its declaration's `///`
 /// comment says.
 pub fn hover(
 	programs: &[(Loaded, Program)],
 	open: &[OpenFile],
 	file: &OpenFile,
-	position: &Json,
-): Json = {
-	val .Some((at, hit)) = hitIn(&programs, &file, &position) else {
-		return .Null
-	}
+	position: &Position,
+): Option<Hover> = {
+	val (at, hit) = hitIn(&programs, &file, &position)?
 	val loaded = &programs[at].0
 	var shown = "```wip\n\(hit.shown)\n```"
 	if hit.declared is .Some(declared) && loaded.sources.of(declared) is .Some((_, text, base)) {
@@ -349,14 +356,11 @@ pub fn hover(
 		if !docs.isEmpty() then shown.push("\n\n\(docs)")
 	}
 	var places = Places::of(&open)
-	val range = match places.place(&loaded.sources, hit.span) {
-		.Some((_, range)) => move range
-		.None => Json::Null
+	val range: Option<Range> = match places.place(&loaded.sources, hit.span) {
+		.Some((_, range)) => .Some(move range)
+		.None => .None
 	}
-	return object([
-		("contents", object([("kind", jsonText("markdown")), ("value", .Text(move shown))])),
-		("range", move range),
-	])
+	return .Some(Hover(contents: Markdown(value: move shown), range: move range))
 }
 
 /// Where a name was declared.
@@ -364,19 +368,13 @@ pub fn definition(
 	programs: &[(Loaded, Program)],
 	open: &[OpenFile],
 	file: &OpenFile,
-	position: &Json,
-): Json = {
-	val .Some((at, hit)) = hitIn(&programs, &file, &position) else {
-		return .Null
-	}
-	val .Some(declared) = hit.declared else {
-		return .Null
-	}
+	position: &Position,
+): Option<Location> = {
+	val (at, hit) = hitIn(&programs, &file, &position)?
+	val declared = hit.declared?
 	var places = Places::of(&open)
-	return match places.locate(&programs[at].0.sources, declared) {
-		.Some((uri, range)) => object([("uri", Json::Text(move uri)), ("range", move range)])
-		.None => .Null
-	}
+	val (uri, range) = places.locate(&programs[at].0.sources, declared)?
+	return .Some(Location(uri: move uri, range: move range))
 }
 
 /// A file as every program names it: its canonical path, or, for one of the
@@ -390,9 +388,9 @@ fn occurrences(
 	programs: &[(Loaded, Program)],
 	open: &[OpenFile],
 	file: &OpenFile,
-	position: &Json,
+	position: &Position,
 	declaration: bool,
-): Option<Vec<(String, Json)>> = {
+): Option<Vec<(String, Range)>> = {
 	val (first, hit) = hitIn(&programs, &file, &position)?
 	val declared = hit.declared?
 	val firstLoaded = &programs[first].0
@@ -413,15 +411,13 @@ fn occurrences(
 		.None => .None
 	}
 	var places = Places::of(&open)
-	var found: Vec<(String, Json)> = Vec()
+	var found: Vec<(String, Range)> = Vec()
 	for (loaded, program) in programs {
 		var start: Option<u32> = .None
 		for (entry, _, at) in loaded.sources.entries() {
 			if start.isNone() && fileIdentity(entry) == identity then start = .Some(at)
 		}
-		val .Some(start) = start else {
-			continue
-		}
+		val .Some(start) = start else continue
 		val here = Span::new(start + lo, start + hi)
 		val sources = &loaded.sources
 		val none: Vec<Span> = Vec()
@@ -451,12 +447,8 @@ fn importedAs(loaded: &Loaded, module: str, name: str): Vec<Span> = {
 	for importer in loaded.modules {
 		for file in importer.files {
 			for item in file.ast.items {
-				val .Import(decl) = item else {
-					continue
-				}
-				val .Some(items) = decl.items else {
-					continue
-				}
+				val .Import(decl) = item else continue
+				val .Some(items) = decl.items else continue
 				var parts: Vec<str> = Vec()
 				for n in decl.path {
 					parts.push(loaded.interner.resolve(n.sym))
@@ -481,17 +473,15 @@ pub fn references(
 	programs: &[(Loaded, Program)],
 	open: &[OpenFile],
 	file: &OpenFile,
-	position: &Json,
+	position: &Position,
 	declaration: bool,
-): Json = {
-	val .Some(found) = occurrences(&programs, &open, &file, &position, declaration) else {
-		return .Null
-	}
-	var places: Vec<Json> = Vec()
+): Option<Vec<Location>> = {
+	val found = occurrences(&programs, &open, &file, &position, declaration)?
+	var places: Vec<Location> = Vec()
 	for (uri, range) in move found {
-		places.push(object([("uri", jsonText(uri)), ("range", move range)]))
+		places.push(Location(uri: move uri, range: move range))
 	}
-	return .Array(move places)
+	return .Some(move places)
 }
 
 /// Every place that names what is at a position, renamed `new`: the edits,
@@ -500,9 +490,9 @@ pub fn rename(
 	programs: &[(Loaded, Program)],
 	open: &[OpenFile],
 	file: &OpenFile,
-	position: &Json,
+	position: &Position,
 	new: str,
-): Result<Json, String> = {
+): Result<WorkspaceEdit, String> = {
 	var isName = !new.isEmpty()
 	for (i, c) in new.chars().enumerate() {
 		val fits = if i == 0 then c.isLetter() || c == '_' else c.isAlphanumeric() || c == '_'
@@ -518,35 +508,24 @@ pub fn rename(
 		if pathOf(uri) is .Some(file) && inStd(file) then
 			return .Err("it is declared in the standard library")
 	}
-	var changes: Map<String, Vec<Json>> = Map()
+	var changes: Map<String, Vec<TextEdit>> = Map()
 	for (uri, range) in move found {
-		changes.atOrPut(move uri, Vec()).push(
-			object([("range", move range), ("newText", jsonText(new))]),
-		)
+		changes.atOrPut(move uri, Vec()).push(TextEdit(range: move range, newText: new))
 	}
-	return .Ok(object([("changes", byFile(&changes))]))
+	return .Ok(WorkspaceEdit(changes: move changes))
 }
 
-/// The file laid out by `wip fmt`, as one edit; `null` when it cannot be, so
-/// the editor keeps what it has, and no edits for a file that asks to be
+/// The file laid out by `wip fmt`, as one edit; nothing when it cannot be,
+/// so the editor keeps what it has, and no edits for a file that asks to be
 /// left as written.
-pub fn formatted(file: &OpenFile): Json = {
+pub fn formatted(file: &OpenFile): Option<Vec<TextEdit>> = {
 	val text = file.text.toStr()
-	if switchedOff(text) then return .Array(Vec())
-	val .Ok(style) = formatStyle(file.path) else {
-		return .Null
-	}
+	if switchedOff(text) then return .Some(Vec())
+	val .Ok(style) = formatStyle(file.path) else return .None
 	val package = path::name(file.path) == "package.wip"
-	return match formatText(text, style, package) {
-		.Ok(laidOut) =>
-			if laidOut == text then Json::Array(Vec())
-			else .Array(
-				Vec::of(own [
-					object([("range", Lines::of(text).whole()), ("newText", .Text(move laidOut))]),
-				]),
-			)
-		.Err(..) => .Null
-	}
+	val .Ok(laidOut) = formatText(text, style, package) else return .None
+	if laidOut == text then return .Some(Vec())
+	return .Some(Vec::of(own [TextEdit(range: Lines::of(text).whole(), newText: move laidOut)]))
 }
 
 // The protocol's numbers for kinds of symbol.
@@ -564,18 +543,18 @@ val STRUCT = 23
 val TYPE_PARAMETER = 26
 
 /// The file's declarations, and what each holds: its outline.
-pub fn symbols(file: &OpenFile): Json = {
+pub fn symbols(file: &OpenFile): Vec<DocumentSymbol> = {
 	val parsed = parseFile(SourceFile(name: file.path.clone(), text: file.text.clone()))
 	val outline = Outline(
 		lines: Lines::of(file.text),
 		interner: &parsed.interner,
 		text: file.text.toStr(),
 	)
-	var found: Vec<Json> = Vec()
+	var found: Vec<DocumentSymbol> = Vec()
 	for item in parsed.ast.items {
 		if outline.item(&item) is .Some(symbol) then found.push(move symbol)
 	}
-	return .Array(move found)
+	return move found
 }
 
 view struct Outline {
@@ -587,20 +566,26 @@ view struct Outline {
 extend Outline {
 	fn name(name: &Name): String = self.interner.resolve(name.sym)
 
-	fn symbol(name: String, kind: i64, span: Span, at: Span, children: Vec<Json>): Json = {
+	fn symbol(
+		name: String,
+		kind: i64,
+		span: Span,
+		at: Span,
+		children: Vec<DocumentSymbol>,
+	): DocumentSymbol = {
 		// What is selected must be inside what is shown.
 		val lo = if span.lo < at.lo then span.lo else at.lo
 		val hi = if span.hi > at.hi then span.hi else at.hi
-		return object([
-			("name", Json::Text(move name)),
-			("kind", .Int(kind)),
-			("range", self.lines.range(lo as i64, hi as i64)),
-			("selectionRange", self.lines.range(at.lo as i64, at.hi as i64)),
-			("children", .Array(move children)),
-		])
+		return DocumentSymbol(
+			name: move name,
+			kind: kind,
+			range: self.lines.range(lo as i64, hi as i64),
+			selectionRange: self.lines.range(at.lo as i64, at.hi as i64),
+			children: move children,
+		)
 	}
 
-	fn function(f: &FnDecl): Json = self.symbol(
+	fn function(f: &FnDecl): DocumentSymbol = self.symbol(
 		self.name(&f.sig.name),
 		if f.receiver.isSome() then METHOD else FUNCTION,
 		f.span,
@@ -608,7 +593,7 @@ extend Outline {
 		Vec(),
 	)
 
-	fn item(item: &Item): Option<Json> = match item {
+	fn item(item: &Item): Option<DocumentSymbol> = match item {
 		// An assert has no name to list.
 		.Import(..) | .Assert(..) => .None
 		.Fn(f) => .Some(self.function(&f))
@@ -617,7 +602,7 @@ extend Outline {
 			self.symbol(self.name(&t.name), TYPE_PARAMETER, t.span, t.name.span, Vec()),
 		)
 		.Struct(s) => {
-			var children: Vec<Json> = Vec()
+			var children: Vec<DocumentSymbol> = Vec()
 			for f in s.fields {
 				children.push(self.symbol(self.name(&f.name), FIELD, f.span, f.name.span, Vec()))
 			}
@@ -627,7 +612,7 @@ extend Outline {
 			.Some(self.symbol(self.name(&s.name), STRUCT, s.span, s.name.span, move children))
 		}
 		.Enum(e) => {
-			var children: Vec<Json> = Vec()
+			var children: Vec<DocumentSymbol> = Vec()
 			for v in e.variants {
 				children.push(
 					self.symbol(self.name(&v.name), ENUM_MEMBER, v.span, v.name.span, Vec()),
@@ -639,7 +624,7 @@ extend Outline {
 			.Some(self.symbol(self.name(&e.name), ENUM, e.span, e.name.span, move children))
 		}
 		.Interface(i) => {
-			var children: Vec<Json> = Vec()
+			var children: Vec<DocumentSymbol> = Vec()
 			for m in i.methods {
 				children.push(
 					self.symbol(self.name(&m.sig.name), METHOD, m.span, m.sig.name.span, Vec()),
@@ -654,6 +639,7 @@ extend Outline {
 			}
 			var name = match x.sliceOf {
 				.Some(element) => "extend [\(self.name(&element))]"
+				.None if x.boxed.isSome() => "extend own<\(parts.join("::"))>"
 				.None => "extend \(parts.join("::"))"
 			}
 			if x.interfaceName is .Some(implemented) {
@@ -665,14 +651,14 @@ extend Outline {
 				name.push(": \(named.join("::"))")
 			}
 			val at = if x.path.isEmpty() then x.span else x.path[0].span
-			var children: Vec<Json> = Vec()
+			var children: Vec<DocumentSymbol> = Vec()
 			for m in x.methods {
 				children.push(self.function(&m))
 			}
 			.Some(self.symbol(move name, OBJECT, x.span, at, move children))
 		}
 		.Extern(e) => {
-			var children: Vec<Json> = Vec()
+			var children: Vec<DocumentSymbol> = Vec()
 			for f in e.fns {
 				val at = f.sig.name.span
 				children.push(self.symbol(self.name(&f.sig.name), FUNCTION, at, at, Vec()))

@@ -263,7 +263,10 @@ structDecl  = ( "extern" | "view" )? "struct" IDENT generics?
                             (* `extern struct` is C's layout, and takes no
                                generics *)
                                          (* a member is a field or a method *)
-field       = ( "pub" "var"? )? IDENT ":" type ( "=" expr )? ;
+field       = annotation* ( "pub" "var"? )? IDENT ":" type ( "=" expr )? ;
+                                         (* a struct's field may carry
+                                            annotations, `@align(16)`; a
+                                            variant's may not *)
                                          (* `pub` exports reading the field and
                                             `pub var` writing it too; without
                                             either it is the module's *)
@@ -284,8 +287,10 @@ extendBlock = "extend" extendType ( ":" path typeArgs? )?
 extendType  = path generics?              (* a type of this module, or an
                                              interface of it, extended under
                                              a condition on its types *)
-            | "[" IDENT bounds? "]" ;     (* a slice, whose element is named
+            | "[" IDENT bounds? "]"       (* a slice, whose element is named
                                              here; the prelude's *)
+            | "own" generics ;            (* a box, whose one parameter is
+                                             what it holds *)
             (* a type's methods, outside its declaration, and after ":" the
                methods of the one interface it implements; the type arguments
                name the type's own parameters *)
@@ -327,9 +332,13 @@ constraint  = path typeArgs? ;           (* `copy`, or an interface with the
                                             module's by its path,
                                             `shapes::Area` *)
 params      = param ( "," param )* ","? ;
-param       = ( IDENT | "_" ) ":" type ( "=" expr )? ;
+param       = "implicit"? ( IDENT | "_" ) ":" type ( "=" expr )? ;
                                           (* a default: a constant;
-                                             `_`: not used *)
+                                             `_`: not used; `implicit`:
+                                             filled, where a call leaves
+                                             it out, from the implicit of
+                                             its name; a word only here
+                                             and before `val`/`var` *)
 
 (* `extern union Name { … }`: C's union. `union` is a word
    only here; elsewhere it is an ordinary identifier. *)
@@ -384,11 +393,12 @@ typeArgs    = "<" type ( "," type )* ","? ">" ;
 block       = "{" sep? ( stmt ( sep stmt )* sep? )? "}" ;
 stmt        = bindStmt | patternStmt | deferStmt | returnStmt
             | yieldStmt | whileStmt | forStmt | breakStmt | continueStmt | expr ;
-bindStmt    = ( "val" | "var" ) IDENT ( ":" type )? "=" expr ;
-patternStmt = ( "val" | "var" ) pattern "=" expr ( "else" block )? ;
+bindStmt    = "implicit"? ( "val" | "var" ) IDENT ( ":" type )? "=" expr ;
+patternStmt = ( "val" | "var" ) pattern "=" expr ( "else" ( block | branch ) )? ;
                                          (* a pattern that can fail needs `else`,
-                                            whose block must leave; after `var`,
-                                            each name is a variable of its own *)
+                                            whose block or branch must leave;
+                                            after `var`, each name is a variable
+                                            of its own *)
 deferStmt   = "defer" expr ;             (* runs when the block exits *)
 returnStmt  = "return" expr? ;           (* a line break after `return` means no value *)
 yieldStmt   = "yield" expr ;             (* to the list being built,
@@ -512,16 +522,20 @@ onePattern  = "_"
                                             two ends, `..=` taking the last;
                                             a bound after the dots is read as
                                             the end *)
-            | "(" pattern ( "," pattern )+ ","? ")"
-                                         (* a tuple taken apart *)
+            | "(" binders ")"
+                                         (* a tuple taken apart by position, or a
+                                            struct by its fields' names, as the
+                                            type being matched says; a tuple's
+                                            binders are patterns, every element
+                                            in its place *)
             | "[" ( sliceElem ( "," sliceElem )* ","? )? "]"
                                          (* an array or a slice, by its
                                             elements; `..` once, for those
                                             between *)
             | "."? path ( "(" binders? ")" )? ;
-                                         (* a path with no leading "." and
-                                            fields after it is a struct taken
-                                            apart *)
+                                         (* a variant; a struct's name with
+                                            fields after it is refused, E0452,
+                                            and taken apart without the name *)
 sliceElem   = pattern | ".." IDENT? ;      (* `..rest` binds the elements
                                             between, as a slice *)
 bound       = "-"? INT | CHAR | BYTE | path ;
@@ -531,7 +545,8 @@ binder      = IDENT ( ":" pattern )? | pattern ;
                                          (* a field, or field: pattern — a name renames
                                             it, and a pattern takes the field apart or
                                             tests it; a pattern alone is the one field
-                                            the variant has *)
+                                            the variant or the struct has, or a
+                                            tuple's element *)
 
 args        = arg ( "," arg )* ( "," ".." expr )? ","?
             | ".." expr ","? ;

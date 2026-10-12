@@ -24,6 +24,8 @@ enum AnnotationTarget {
 	ExternType
 	Val
 	Assert
+	/// A struct's field, which `@align` may be written on.
+	Field
 }
 
 extend AnnotationTarget {
@@ -39,6 +41,7 @@ extend AnnotationTarget {
 		.ExternType => "a C type's declaration"
 		.Val => "a constant"
 		.Assert => "a top-level `assert`"
+		.Field => "a struct's field"
 	}
 }
 
@@ -56,6 +59,10 @@ enum Derived {
 	Text
 	/// `clone`, field by field, written as code.
 	Clone
+	/// `encode`, a record of the fields, written as code.
+	Encode
+	/// `decode`, the fields read by name, written as code.
+	Decode
 }
 
 extend Derived {
@@ -65,6 +72,8 @@ extend Derived {
 		.Hash => "Hash"
 		.Text => "Text"
 		.Clone => "Clone"
+		.Encode => "Encode"
+		.Decode => "Decode"
 	}
 
 	/// The one called `name`, if `@derive` can write it.
@@ -86,7 +95,7 @@ val DERIVED_BEFORE: [(str, str); 4] = [
 ]
 
 /// The annotations the compiler knows, by name.
-val KNOWN_NAMES: [str; 18] = [
+val KNOWN_NAMES: [str; 20] = [
 	"tailrec",
 	"inline",
 	"intrinsic",
@@ -105,14 +114,17 @@ val KNOWN_NAMES: [str; 18] = [
 	"opaque",
 	"comptime",
 	"header",
+	"align",
+	"packed",
 ]
 
-/// One annotation the compiler knows: where it may be written, and what it
-/// takes, for the message when it is given something else; nothing where
-/// it takes no arguments.
+/// One annotation the compiler knows: where it may be written; what it
+/// takes, for the message when it is given something else, nothing where
+/// it takes no arguments; and whether it may be written without them.
 view struct Known {
 	targets: Vec<AnnotationTarget>
 	arguments: Option<str>
+	bare: bool = false
 }
 
 /// What the compiler knows of the annotation called `name`, if it knows one.
@@ -141,7 +153,11 @@ fn known(name: str): Option<Known> = match name {
 		]),
 		arguments: .Some("what it is for, as in `@target(os = \"linux\")`"),
 	))
-	"test" => .Some(Known(targets: Vec::of(own [AnnotationTarget::Fn]), arguments: .None))
+	"test" => .Some(Known(
+		targets: Vec::of(own [AnnotationTarget::Fn]),
+		arguments: .Some("what the test expects, as in `@test(panics = \"out of bounds\")`"),
+		bare: true,
+	))
 	"export" => .Some(Known(
 		targets: Vec::of(own [AnnotationTarget::Fn]),
 		arguments: .Some("one ABI name, as in `@export(\"C\")`"),
@@ -189,6 +205,11 @@ fn known(name: str): Option<Known> = match name {
 		),
 	))
 	"opaque" => .Some(Known(targets: Vec::of(own [AnnotationTarget::Struct]), arguments: .None))
+	"align" => .Some(Known(
+		targets: Vec::of(own [AnnotationTarget::Struct, AnnotationTarget::Field]),
+		arguments: .Some("an alignment in bytes, a power of two up to 4096, as in `@align(16)`"),
+	))
+	"packed" => .Some(Known(targets: Vec::of(own [AnnotationTarget::Struct]), arguments: .None))
 	"comptime" => .Some(Known(targets: Vec::of(own [AnnotationTarget::Val]), arguments: .None))
 	"header" => .Some(Known(
 		targets: Vec::of(own [
@@ -212,8 +233,8 @@ struct Annotations {
 	/// `@inline`: every call to it is spliced, or the program does not
 	/// compile.
 	inline: Option<Span> = .None
-	/// `@test`: `wip test` runs it.
-	test: Option<Span> = .None
+	/// `@test`: `wip test` runs it, and what it expects of the run.
+	test: Option<(Test, Span)> = .None
 	/// `@link("name", …)`: the libraries the declarations, or the C the
 	/// module builds, come from.
 	link: Vec<(Symbol, Span)> = Vec()
@@ -229,6 +250,10 @@ struct Annotations {
 	/// `@opaque`: C knows this struct's layout and Wip does not, so its fields
 	/// are reached through C.
 	opaque: Option<Span> = .None
+	/// `@align(n)`: the alignment, a power of two, and where it was written.
+	align: Option<(u32, Span)> = .None
+	/// `@packed`: no padding between the fields.
+	packed: Option<Span> = .None
 	/// `@comptime`: the constant is worked out by running code while the
 	/// program is compiled.
 	comptime: Option<Span> = .None
@@ -249,6 +274,9 @@ struct Annotations {
 	/// they are written in where their extension does not say.
 	source: Vec<(Symbol, Span)> = Vec()
 	sourceLanguage: Option<CLanguage> = .None
+	/// `standard = "c++20"`: the C++ standard the files are compiled to,
+	/// where it is not C++17.
+	sourceStandard: Option<String> = .None
 	/// `@prefix("build.h")`: a header put before every C file of the module,
 	/// which is how a vendored library is configured.
 	prefix: Option<(Symbol, Span)> = .None
@@ -352,7 +380,7 @@ extend Lowerer {
 					)
 					false
 				}
-				(.Some(takes), .None) => {
+				(.Some(takes), .None) if !knownOne.bare => {
 					self.report(
 						Diagnostic::error(
 							ANNOTATION,
@@ -370,7 +398,7 @@ extend Lowerer {
 				"tailrec" => annotations.tailrec = true
 				"intrinsic" => annotations.intrinsic = true
 				"inline" => annotations.inline = .Some(annotation.span)
-				"test" => annotations.test = .Some(annotation.span)
+				"test" => annotations.test = .Some((self.testExpects(&annotation), annotation.span))
 				// The driver has already read it and dropped what this target
 				// does not take; here it is known so that it is not reported as
 				// an annotation that is not.
@@ -380,14 +408,17 @@ extend Lowerer {
 				"include" => annotations.include = self.strings(&annotation)
 				"framework" => annotations.framework = self.strings(&annotation)
 				"source" => {
-					val (files, language) = self.sources(&annotation)
+					val (files, language, standard) = self.sources(&annotation)
 					annotations.source = move files
 					annotations.sourceLanguage = language
+					annotations.sourceStandard = move standard
 				}
 				"prefix" => annotations.prefix = self.oneString(&annotation)
 				"define" => annotations.define = self.strings(&annotation)
 				"symbol" => annotations.symbol = self.oneString(&annotation)
 				"opaque" => annotations.opaque = .Some(annotation.span)
+				"align" => annotations.align = self.alignment(&annotation)
+				"packed" => annotations.packed = .Some(annotation.span)
 				"comptime" => annotations.comptime = .Some(annotation.span)
 				"derive" => {
 					for d in self.derivedOf(&annotation, &annotations.derive) {
@@ -405,6 +436,30 @@ extend Lowerer {
 			}
 		}
 		return move annotations
+	}
+
+	/// What `@align(n)` says: `n`, one whole number, a power of two up to
+	/// 4096 — an alignment a page holds.
+	var fn alignment(annotation: &ast::Annotation): Option<(u32, Span)> = {
+		if annotation.args.len() == 1 &&
+			annotation.args[0].name.isNone() &&
+			annotation.args[0].value is .Int(value) &&
+			value >= 1 &&
+			value <= 4096 &&
+			(value & (value - 1)) == 0 {
+			return .Some((value as u32, annotation.span))
+		}
+		self.report(
+			Diagnostic::error(
+				ANNOTATION,
+				"`@align` takes one alignment in bytes, a power of two up to 4096",
+				annotation.span,
+				"not an alignment",
+			).withNote(
+				"an address is a multiple of its alignment, which processors and C ask to be a power of two",
+			),
+		)
+		return .None
 	}
 
 	/// The interfaces `@derive` names, each one the compiler can write, and
@@ -485,6 +540,39 @@ extend Lowerer {
 		return move derived
 	}
 
+	/// What `@test` says its test expects: that it returns, where it is
+	/// written alone; that it panics, `@test(panics)`; or that it panics
+	/// with a message holding a text, `@test(panics = "out of bounds")`.
+	var fn testExpects(annotation: &ast::Annotation): Test = {
+		val .Some(parens) = annotation.parens else return .Returns
+		val (span, label) = match annotation.args.len() {
+			0 => (parens, String::of("nothing given"))
+			1 => {
+				val arg = &annotation.args[0]
+				if arg.name.isNone() && arg.value is .Name(sym) && self.text(sym) == "panics" then
+					return .Panics(.None)
+				if arg.name is .Some(name) && self.text(name.sym) == "panics" {
+					if arg.value is .Str(text) then return .Panics(.Some(text))
+					(arg.span, String::of("not a string"))
+				} else {
+					(arg.span, String::of("not `panics`"))
+				}
+			}
+			count => (annotation.span, "\(count) arguments given")
+		}
+		self.report(
+			Diagnostic::error(
+				ANNOTATION,
+				"`@test` takes `panics`, or `panics = \"text\"`",
+				span,
+				move label,
+			).withNote(
+				"`@test(panics)` is a test that must panic, and `@test(panics = \"out of bounds\")` one whose panic's message must hold that text",
+			),
+		)
+		return .Returns
+	}
+
 	/// The methods `@oneOf` names, as names; whether the interface has them
 	/// is asked once its methods are known.
 	var fn oneOf(annotation: &ast::Annotation): Option<OneOf> = {
@@ -527,10 +615,13 @@ extend Lowerer {
 	}
 
 	/// `@source("sokol.h", language = "objective-c")`: the files, each checked
-	/// as `strings` checks its strings, and the language they are written in,
-	/// if it is said.
-	var fn sources(annotation: &ast::Annotation): (Vec<(Symbol, Span)>, Option<CLanguage>) = {
+	/// as `strings` checks its strings, the language they are written in, if
+	/// it is said, and for C++ the standard, if it is said.
+	var fn sources(
+		annotation: &ast::Annotation,
+	): (Vec<(Symbol, Span)>, Option<CLanguage>, Option<String>) = {
 		var language: Option<CLanguage> = .None
+		var standard: Option<(String, Span)> = .None
 		var files: Vec<(Symbol, Span)> = Vec()
 		var wrong = false
 		for arg in annotation.args {
@@ -538,25 +629,44 @@ extend Lowerer {
 				if self.annotationString("source", &arg) is .Some(file) then files.push(file)
 				continue
 			}
-			val said: Option<CLanguage> = match arg.value {
-				.Str(text) if self.text(name.sym) == "language" => match self.text(text) {
+			val said = self.text(name.sym)
+			if said == "standard" && standard.isNone() {
+				if arg.value is .Str(text) && cxxStandard(self.text(text)) {
+					standard = .Some((String::of(self.text(text)), arg.span))
+					continue
+				}
+				self.report(
+					Diagnostic::error(
+						ANNOTATION,
+						"`standard` is a C++ standard: `\"c++11\"`, `\"c++14\"`, `\"c++17\"`, `\"c++20\"` or `\"c++23\"`",
+						arg.span,
+						"not a standard it knows",
+					),
+				)
+				wrong = true
+				continue
+			}
+			val named: Option<CLanguage> = match arg.value {
+				.Str(text) if said == "language" => match self.text(text) {
 					"c" => .Some(.C)
 					"objective-c" => .Some(.ObjectiveC)
+					"c++" => .Some(.CPlusPlus)
+					"objective-c++" => .Some(.ObjectiveCPlusPlus)
 					_ => .None
 				}
 				_ => .None
 			}
-			match said {
-				.Some(said) if language.isNone() => language = .Some(said)
+			match named {
+				.Some(named) if language.isNone() => language = .Some(named)
 				_ => {
 					self.report(
 						Diagnostic::error(
 							ANNOTATION,
-							"`@source` takes files, and `language = \"c\"` or `language = \"objective-c\"` once",
+							"`@source` takes files, `language` once — `\"c\"`, `\"objective-c\"`, `\"c++\"` or `\"objective-c++\"` — and for C++ a `standard`",
 							arg.span,
 							"not a file, nor a language it knows",
 						).withNote(
-							"a file is compiled as its extension says — `.c` as C, `.m` as Objective-C — unless `language` says otherwise, as a header holding a library's implementation needs",
+							"a file is compiled as its extension says — `.c` as C, `.m` as Objective-C, `.cpp`, `.cc` and `.cxx` as C++, `.mm` as Objective-C++ — unless `language` says otherwise, as a header holding a library's implementation needs",
 						),
 					)
 					wrong = true
@@ -572,7 +682,24 @@ extend Lowerer {
 					"no files given",
 				),
 			)
-		return (move files, language)
+		// A standard is C++'s: said of files that are C, or Objective-C, it
+		// would be passed over.
+		if standard is .Some((_, span)) && language is .Some(.C) | .Some(.ObjectiveC) {
+			self.report(
+				Diagnostic::error(
+					ANNOTATION,
+					"`standard` is for C++ files",
+					span,
+					"the files are not C++",
+				).withHelp("say `language = \"c++\"`, or leave `standard` out"),
+			)
+			return (move files, language, .None)
+		}
+		val chosen: Option<String> = match move standard {
+			.Some((text, _)) => .Some(move text)
+			.None => .None
+		}
+		return (move files, language, move chosen)
 	}
 
 	/// `@include("src", "include")`: one string or more, each checked as
@@ -647,3 +774,6 @@ fn oneOfPlaces(places: &[str]): String = {
 	}
 	return "\(rest.join(", ")) or \(places[places.len() - 1])"
 }
+
+/// Whether `text` names a C++ standard a module's C++ may be compiled to.
+fn cxxStandard(text: str): bool = text is "c++11" | "c++14" | "c++17" | "c++20" | "c++23"

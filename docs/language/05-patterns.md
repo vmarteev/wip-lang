@@ -16,8 +16,8 @@ or a `var`, with or without `else`, and a `for` binding.
 | `.Some(n)`, `Shape::Round(radius)` | that variant, binding what it carries |
 | `.Round(..)` | that variant, whatever it carries |
 | `.Some(_)` | a variant of one field, whatever it holds: `..`, for the one field |
-| `Point(x, y)`, `Point(x: across, ..)` | a struct, by field name, renamed or the rest passed over |
-| `(a, b)` | a tuple |
+| `(x, y)`, `(x: across, ..)` | a struct, by field name, renamed or the rest passed over |
+| `(a, b)` | a tuple, by position |
 | `[a, b]`, `[first, ..rest]`, `[.., last]` | an array or a slice, by its elements from either end |
 | `a \| b` | either, each binding the same names |
 | `.Some(.None)`, `(.Int(a), .Float(b))` | a pattern inside a pattern, to any depth |
@@ -205,9 +205,7 @@ fn main() = {
 
     // A `Vec` is matched through the slice it lends.
     val words = Vec::of(own ["a", "b", "c"])
-    val [.., last] = words.items() else {
-        return
-    }
+    val [.., last] = words.items() else return
     assert(last == "c")
 }
 ```
@@ -286,7 +284,11 @@ use.
 ## `val`, and `val … else`
 
 A `val` takes a value apart where the pattern always matches — a struct, a
-tuple, a name:
+tuple, a name. A struct and a tuple are both taken apart in parentheses,
+which the type being matched tells apart: a tuple by position, a struct by
+its fields' names, so reordering its fields changes nothing a pattern binds.
+The struct's name is not written, since there is nothing to test — a struct
+has one shape:
 
 ```wip,run
 struct Point {
@@ -296,10 +298,10 @@ struct Point {
 
 fn main() = {
     val here = Point(x: 1, y: 2)
-    val Point(x, y) = here
+    val (x, y) = here
     assert(x + y == 3)
 
-    val Point(x: across, ..) = here
+    val (x: across, ..) = here
     assert(across == 1)
 
     val (first, second) = (10, 20)
@@ -307,14 +309,43 @@ fn main() = {
 }
 ```
 
-Where the pattern can fail, the binding says where to go instead, and that
-block must leave — `return`, `break`, `continue`, or a panic:
+`self` is a place, and is taken apart as any is; written with its name, a
+struct's pattern is refused, with the fix that drops the name:
+
+```wip,run
+struct Size {
+    width: i64
+    height: i64
+
+    fn area(): i64 = {
+        val (width, height) = self
+        return width * height
+    }
+}
+
+fn main() = {
+    assert(Size(width: 3, height: 4).area() == 12)
+}
+```
+
+```wip,error=E0452
+struct Point {
+    x: i64
+    y: i64
+}
+
+fn main() = {
+    val here = Point(x: 1, y: 2)
+    val Point(x, y) = here
+}
+```
+
+Where the pattern can fail, the binding says after `else` where to go
+instead, and that must leave — `return`, `break`, `continue`, or a panic:
 
 ```wip,run
 fn firstBig(values: &[i64]): i64 = {
-    val .Some(at) = firstIndexOver(&values, 10) else {
-        return -1
-    }
+    val .Some(at) = firstIndexOver(&values, 10) else return -1
     return values[at]
 }
 
@@ -332,6 +363,33 @@ fn main() = {
     assert(firstBig(&numbers) == 99)
     val small = [1, 2]
     assert(firstBig(&small) == -1)
+}
+```
+
+After `else` comes a block, or one jump or expression, as after an `if`'s
+`then`; either way it must leave, and an expression that can go on — a call
+that returns — is refused. `wip fmt` writes the one jump or expression on
+the guard's line where it fits there, and braces where it does not, or
+where there is more than one statement:
+
+```wip,run
+fn firstWord(text: str): str = {
+    val .Some(end) = text.find(" ") else return text
+    return text[0..end]
+}
+
+fn total(lines: &[str]): i64 = {
+    var sum = 0
+    for line in lines {
+        val .Ok(n) = line.toInt() else continue
+        sum += n
+    }
+    return sum
+}
+
+fn main() = {
+    assert(firstWord("two words") == "two" && firstWord("one") == "one")
+    assert(total(["1", "x", "2"]) == 3)
 }
 ```
 
@@ -359,13 +417,11 @@ fn main() = {
     assert(count == 1 && label == "seen once")
 
     val here = Point(x: 1, y: 2)
-    var Point(x, y) = here
+    var (x, y) = here
     x += y
     assert(x == 3 && here.x == 1)
 
-    var .Some(n) = parse("7") else {
-        return
-    }
+    var .Some(n) = parse("7") else return
     n *= 2
     assert(n == 14)
 }
@@ -423,6 +479,34 @@ fn main() = {
         game.score += points
     }
     assert(game.score == 500 && game.fruit.isNone())
+}
+```
+
+So does a binding borrowed where the borrow may be kept — in a view, or by
+a call whose answer borrows — since the borrow points into the place after
+the arm. One lent to a call that answers nothing that borrows is still a
+copy:
+
+```wip,run
+enum Shape {
+    Circle(radius: f64)
+    Square(side: f64)
+}
+
+view struct Size {
+    measure: &f64
+}
+
+extend Shape {
+    fn size(): Size = match self {
+        .Circle(radius) => Size(measure: &radius)
+        .Square(side) => Size(measure: &side)
+    }
+}
+
+fn main() = {
+    val shape = Shape::Square(side: 4.0)
+    assert(shape.size().measure == 4.0)
 }
 ```
 

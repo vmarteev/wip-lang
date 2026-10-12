@@ -1,0 +1,371 @@
+// JSON as a format for `Encode` and `Decode`: a record is an object of its
+// fields, an `Option` that is nothing a field left out (or `null` in a
+// list), a sequence an array, a map an object of its keys as text, and a
+// variant its name, or an object of its name and a record of its fields.
+
+/// Writes a value as a `Json` tree.
+pub struct JsonEncoder {
+	/// The arrays and objects being written, innermost last.
+	open: Vec<Open> = Vec()
+	/// The value, once the outermost is written.
+	done: Option<Json> = .None
+}
+
+/// An array or an object being written: its parts so far, and for an
+/// object the key the next value goes under.
+enum Open {
+	Items(items: Vec<Json>)
+	Fields(fields: Vec<(String, Json)>, key: Option<String>)
+	Entries(fields: Vec<(String, Json)>, key: Option<String>)
+	Variant(name: String, value: Option<Json>)
+}
+
+extend JsonEncoder {
+	/// The tree, once a value has been written; `null` where none was.
+	pub move fn tree(): Json = match move self.done {
+		.Some(tree) => move tree
+		.None => .Null
+	}
+
+	/// `value` put where the innermost array or object is, or the whole tree
+	/// where none is.
+	var fn put(value: Json) = {
+		val .Some(top) = self.open.pop() else {
+			self.done = .Some(move value)
+			return
+		}
+		val next: Open = match move top {
+			.Items(items) => {
+				var all = move items
+				all.push(move value)
+				Open::Items(move all)
+			}
+			.Fields(fields, key) => {
+				var all = move fields
+				if key is .Some(name) then all.push((name.clone(), move value))
+				Open::Fields(fields: move all, key: .None)
+			}
+			// A key, as text, and then its value.
+			.Entries(fields, key) => {
+				var all = move fields
+				match key {
+					.Some(name) => {
+						all.push((name.clone(), move value))
+						Open::Entries(fields: move all, key: .None)
+					}
+					.None => .Entries(fields: move all, key: .Some(keyText(&value)))
+				}
+			}
+			.Variant(name, ..) => .Variant(name: move name, value: .Some(move value))
+		}
+		self.open.push(move next)
+	}
+}
+
+/// A map's key as an object's key: text as it is, anything else as JSON
+/// writes it.
+fn keyText(key: &Json): String = match key {
+	.Text(text) => text.clone()
+	other => "\(other)"
+}
+
+extend JsonEncoder: Encoder {
+	var fn bool(value: bool) = self.put(.Bool(value))
+
+	var fn int(value: i64) = self.put(.Int(value))
+
+	var fn unsigned(value: u64) = self.put(
+		if value <= 9223372036854775807 then .Int(value as i64) else .Float(value as f64),
+	)
+
+	var fn float(value: f64) = self.put(.Float(value))
+
+	/// As few digits as the `f32` needs, which read back as an `f64` and
+	/// rounded to an `f32` are the same `f32`.
+	var fn float32(value: f32) = self.put(.Float("\(value)".toFloat().unwrapOr(value as f64)))
+
+	var fn text(value: str) = self.put(.Text(String::of(value)))
+
+	/// A record's field that is nothing is left out; anywhere else it is
+	/// `null`.
+	var fn nothing() = {
+		if self.open.last() is .Some(top) && top is .Fields(key: .Some(..), ..) {
+			val .Some(.Fields(fields, ..)) = self.open.pop() else return
+			self.open.push(.Fields(fields: move fields, key: .None))
+			return
+		}
+		self.put(.Null)
+	}
+
+	var fn beginSequence(length: i64) = self.open.push(.Items(Vec()))
+
+	var fn endSequence() = {
+		if self.open.pop() is .Some(.Items(items)) then self.put(.Array(move items))
+	}
+
+	var fn beginMap(length: i64) = self.open.push(.Entries(fields: Vec(), key: .None))
+
+	var fn endMap() = {
+		if self.open.pop() is .Some(.Entries(fields, ..)) then self.put(.Object(move fields))
+	}
+
+	var fn beginRecord(name: str, length: i64) = self.open.push(.Fields(fields: Vec(), key: .None))
+
+	var fn field(name: str) = {
+		val .Some(.Fields(fields, ..)) = self.open.pop() else return
+		self.open.push(.Fields(fields: move fields, key: .Some(String::of(name))))
+	}
+
+	var fn endRecord() = {
+		if self.open.pop() is .Some(.Fields(fields, ..)) then self.put(.Object(move fields))
+	}
+
+	var fn beginVariant(enumName: str, name: str, length: i64) = self.open.push(Open::Variant(
+		name: String::of(name),
+		value: .None,
+	))
+
+	/// A variant with fields is an object of its name; one without is its
+	/// name.
+	var fn endVariant() = match self.open.pop() {
+		.Some(.Variant(name, value)) => match move value {
+			.Some(fields) => self.put(.Object(Vec::of(own [(move name, move fields)])))
+			.None => self.put(.Text(move name))
+		}
+		_ => {}
+	}
+}
+
+/// What a value of JSON could not be read as.
+@derive(Eq, Clone, Text)
+pub struct DecodeError {
+	/// What was wrong, in words.
+	pub message: String
+}
+
+/// Reads a value from a `Json` tree.
+pub struct JsonDecoder {
+	/// The values to be read, the next last.
+	values: Vec<Json>
+	/// For each array, object or map being read, what is left of it.
+	reading: Vec<Reading> = Vec()
+	/// The field being read, for what an error says.
+	at: String = String()
+}
+
+/// An array or an object being read: what is left of it, the next last; an
+/// object's fields, which are asked for by name.
+enum Reading {
+	Items(rest: Vec<Json>)
+	Entries(rest: Vec<(String, Json)>)
+	Fields(fields: Vec<(String, Json)>)
+}
+
+extend JsonDecoder {
+	/// A decoder of the value `tree`.
+	pub static fn of(tree: Json): JsonDecoder = JsonDecoder(values: Vec::of(own [move tree]))
+
+	/// The next value.
+	var fn next(): Result<Json, DecodeError> = match self.values.pop() {
+		.Some(value) => .Ok(move value)
+		.None => .Err(self.error("no value is left to read"))
+	}
+
+	fn error(message: str): DecodeError = DecodeError(
+		message: if self.at.isEmpty() then String::of(message) else "at `\(self.at)`: \(message)",
+	)
+
+	/// What a value that is not `what` is said to be.
+	fn mismatch(what: str, found: &Json): DecodeError = {
+		val kind = match found {
+			.Null => "null"
+			.Bool(..) => "a bool"
+			.Int(..) | .Float(..) => "a number"
+			.Text(..) => "text"
+			.Array(..) => "an array"
+			.Object(..) => "an object"
+		}
+		return self.error("\(what) is wanted, and the JSON has \(kind)")
+	}
+}
+
+extend JsonDecoder: Decoder<DecodeError> {
+	var fn bool(): Result<bool, DecodeError> = match self.next()? {
+		.Bool(value) => .Ok(value)
+		other => .Err(self.mismatch("a bool", &other))
+	}
+
+	var fn int(): Result<i64, DecodeError> = match self.next()? {
+		.Int(value) => .Ok(value)
+		// A map's key is text.
+		.Text(text) => match text.toInt() {
+			.Ok(value) => .Ok(value)
+			.Err(..) => .Err(self.error("a whole number is wanted, and the JSON has `\(text)`"))
+		}
+		other => .Err(self.mismatch("a whole number", &other))
+	}
+
+	var fn unsigned(): Result<u64, DecodeError> = match self.next()? {
+		.Int(value) if value >= 0 => .Ok(value as u64)
+		.Float(value) if value >= 0.0 && value == value.trunc() => .Ok(value as u64)
+		.Text(text) => match text.toInt() {
+			.Ok(value) if value >= 0 => .Ok(value as u64)
+			_ => .Err(self.error("a number of no sign is wanted, and the JSON has `\(text)`"))
+		}
+		other => .Err(self.mismatch("a number of no sign", &other))
+	}
+
+	var fn float(): Result<f64, DecodeError> = match self.next()? {
+		.Float(value) => .Ok(value)
+		.Int(value) => .Ok(value as f64)
+		other => .Err(self.mismatch("a number", &other))
+	}
+
+	var fn text(): Result<String, DecodeError> = match self.next()? {
+		.Text(text) => .Ok(move text)
+		other => .Err(self.mismatch("text", &other))
+	}
+
+	var fn nothing(): Result<bool, DecodeError> = {
+		if self.values.last() is .Some(.Null) {
+			self.values.pop()
+			return .Ok(true)
+		}
+		return .Ok(false)
+	}
+
+	var fn beginSequence(): Result<void, DecodeError> = match self.next()? {
+		.Array(items) => {
+			var rest = move items
+			rest.reverse()
+			self.reading.push(.Items(move rest))
+			return .Ok()
+		}
+		other => .Err(self.mismatch("an array", &other))
+	}
+
+	var fn more(): Result<bool, DecodeError> = {
+		val .Some(top) = self.reading.pop() else return .Ok(false)
+		val stepped: (Reading, bool) = match move top {
+			.Items(rest) => {
+				var left = move rest
+				val item = left.pop()
+				val found = item.isSome()
+				if item is .Some(value) then self.values.push(value.clone())
+				(.Items(move left), found)
+			}
+			// The value under the key, and then the key, which is read first.
+			.Entries(rest) => {
+				var left = move rest
+				val entry = left.pop()
+				val found = entry.isSome()
+				if entry is .Some((key, value)) {
+					self.values.push(value.clone())
+					self.values.push(.Text(key.clone()))
+				}
+				(.Entries(move left), found)
+			}
+			other => (move other, false)
+		}
+		val (next, found) = move stepped
+		self.reading.push(move next)
+		return .Ok(found)
+	}
+
+	var fn endSequence(): Result<void, DecodeError> = {
+		self.reading.pop()
+		return .Ok()
+	}
+
+	var fn beginMap(): Result<void, DecodeError> = match self.next()? {
+		.Object(fields) => {
+			var rest = move fields
+			rest.reverse()
+			self.reading.push(.Entries(move rest))
+			return .Ok()
+		}
+		other => .Err(self.mismatch("an object", &other))
+	}
+
+	var fn endMap(): Result<void, DecodeError> = {
+		self.reading.pop()
+		return .Ok()
+	}
+
+	var fn beginRecord(name: str): Result<void, DecodeError> = match self.next()? {
+		.Object(fields) => {
+			self.reading.push(.Fields(move fields))
+			return .Ok()
+		}
+		other => .Err(self.mismatch("an object, `\(name)`", &other))
+	}
+
+	var fn field(name: str): Result<bool, DecodeError> = {
+		val .Some(.Fields(fields)) = self.reading.pop() else return .Ok(false)
+		var all = move fields
+		var at: Option<i64> = .None
+		for i in 0..all.len() {
+			if at.isNone() && all[i].0 == name then at = .Some(i)
+		}
+		if at is .Some(i) {
+			val (_, value) = all.remove(i)
+			self.values.push(move value)
+			self.at = String::of(name)
+		}
+		self.reading.push(.Fields(move all))
+		return .Ok(at.isSome())
+	}
+
+	var fn endRecord(): Result<void, DecodeError> = {
+		self.reading.pop()
+		return .Ok()
+	}
+
+	/// A variant is its name, or an object of one field, its name, whose
+	/// value is a record of the variant's fields.
+	var fn beginVariant(enumName: str): Result<String, DecodeError> = match self.next()? {
+		.Text(name) => .Ok(move name)
+		.Object(fields) => {
+			if fields.len() != 1 then
+				return .Err(self.error("a variant of `\(enumName)` is one field"))
+			var all = move fields
+			val (name, value) = all.remove(0)
+			self.values.push(move value)
+			return .Ok(move name)
+		}
+		other => .Err(self.mismatch("a variant of `\(enumName)`", &other))
+	}
+
+	var fn endVariant(): Result<void, DecodeError> = .Ok()
+
+	fn missing(field: str): DecodeError = self.error("the object has no `\(field)`")
+
+	fn unknown(
+		enumName: str,
+		name: str,
+	): DecodeError = self.error("`\(name)` is no variant of `\(enumName)`")
+
+	fn invalid(what: str): DecodeError = self.error("the value is not \(what)")
+}
+
+/// The value as JSON's text, compact.
+pub fn encode<T: Encode>(value: &T): String = "\(toJson(&value))"
+
+/// The value as a `Json` tree.
+pub fn toJson<T: Encode>(value: &T): Json = {
+	var encoder = JsonEncoder()
+	value.encode(&var encoder)
+	return encoder.tree()
+}
+
+/// A value read from JSON's text: `json::decode<Settings>(text)`.
+pub fn decode<T: Decode>(text: str): Result<T, DecodeError> = match parse(text) {
+	.Ok(tree) => fromJson<T>(move tree)
+	.Err(error) => .Err(DecodeError(message: "\(error)"))
+}
+
+/// A value read from a `Json` tree.
+pub fn fromJson<T: Decode>(tree: Json): Result<T, DecodeError> = {
+	var decoder = JsonDecoder::of(move tree)
+	return T::decode(&var decoder)
+}

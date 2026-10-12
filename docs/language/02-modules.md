@@ -133,6 +133,36 @@ A `pub` type with private fields is made by the module that declares it and
 used by everyone else through its methods, which is how the standard
 library's `Vec`, `Map` and `String` are written.
 
+A private field is often named as the method that reads it. In its module,
+`self.count` is the field; everywhere, `c.count()` is the method. Another
+module has no field to read, so `c.count` is refused there, with the fix to
+call `count()`:
+
+```wip,run
+import counter::{Counter}
+
+fn main() = {
+    var c = Counter::new()
+    c.advance()
+    assert(c.count() == 1)
+}
+
+// file: counter/counter.wip
+pub struct Counter {
+    count: i64
+}
+
+extend Counter {
+    pub static fn new(): Counter = Counter(count: 0)
+
+    pub fn count(): i64 = self.count
+
+    pub var fn advance() = {
+        self.count += 1
+    }
+}
+```
+
 ## Packages
 
 A package is a tree of modules with a `package.wip` at its root, which
@@ -249,6 +279,42 @@ fn main() = {
 }
 ```
 
+A row of a table may hold a list whose length differs from row to row. An
+array written in a constant where a slice is wanted — a view's field, a
+constant of type `&[T]`, an element of an array or a tuple — is kept once,
+beside the table, and the slice points at it. It borrows nothing, as a
+literal's text does, so a row and its list may be lent and walked anywhere.
+A list holds what a constant may, lists among them, and not what owns
+memory:
+
+```wip,run
+view struct Command {
+    name: str
+    keys: &[str]
+}
+
+val COMMANDS: [Command; 3] = [
+    Command(name: "quit", keys: ["q", "Q"]),
+    Command(name: "top", keys: ["g g"]),
+    Command(name: "redraw", keys: []),
+]
+
+val ARROWS: &[str] = ["up", "down", "left", "right"]
+
+fn commandOf(key: str): Option<str> = {
+    for command in COMMANDS {
+        if command.keys.contains(&key) then return .Some(command.name)
+    }
+    return .None
+}
+
+fn main() = {
+    assert(commandOf("Q") == .Some("quit"))
+    assert(commandOf("x") == .None)
+    assert(COMMANDS[2].keys.isEmpty() && ARROWS.len() == 4)
+}
+```
+
 A constant may be computed by the program's own code: one that calls a
 function, loops or builds a value is run by the compiler, once the program
 is checked, and the program keeps what it came to, as it keeps a table. It
@@ -288,5 +354,7 @@ fn main() = {
 ```
 
 What it computes is what a constant may hold: numbers, `bool`, `char`,
-`str`, and tables of them, not what owns memory. Such a constant is not
-known while types are checked, so it cannot be an array's length.
+`str`, and tables of them, not what owns memory, and not a slice, which
+would point into memory the compiler used while it ran; a list is kept only
+where it is written. Such a constant is not known while types are checked,
+so it cannot be an array's length.

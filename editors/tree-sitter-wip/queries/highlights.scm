@@ -188,6 +188,7 @@
 
 "from" @keyword
 "keeps" @keyword
+((modifier) @keyword (#eq? @keyword "implicit"))
 
 [
   "import"

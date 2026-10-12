@@ -1,6 +1,7 @@
 // Matching the arguments of a call, or the values of a variant, to the
-// parameters or fields they are for: by position, by name, or from a
-// default.
+// parameters or fields they are for: by position, by name, from a default,
+// or, for an implicit parameter, from the implicit of its name where the
+// call is.
 
 import std::collections::{Map}
 import std::mem
@@ -12,6 +13,8 @@ import syntax::{
 	Diagnostic,
 	Edit,
 	INVALID_DEFAULT,
+	MISMATCHED_TYPES,
+	NO_IMPLICIT,
 	Span,
 	Symbol,
 	UNKNOWN_ARGUMENT_NAME
@@ -25,6 +28,8 @@ struct Slot {
 	/// Where it is declared.
 	span: Span
 	default: Option<DefaultValue>
+	/// An implicit parameter, filled where no argument gives it a value.
+	implicit: bool = false
 }
 
 /// Where the arguments of one call went.
@@ -49,7 +54,8 @@ extend Matched {
 		var missing: Vec<i64> = Vec()
 		if self.unknown then return move missing
 		for i in 0..slots.len() {
-			if self.slots[i].isNone() && slots[i].default.isNone() then missing.push(i)
+			if self.slots[i].isNone() && slots[i].default.isNone() && !slots[i].implicit then
+				missing.push(i)
 		}
 		return move missing
 	}
@@ -260,6 +266,7 @@ extend Lowerer {
 		matched: &Matched,
 		checked: &[Option<ExprId>],
 		span: Span,
+		callee: str,
 	): (Vec<ExprId>, Vec<u32>) = {
 		var values: Vec<ExprId> = Vec()
 		var written: Vec<(i64, u32)> = Vec()
@@ -274,6 +281,11 @@ extend Lowerer {
 					rest.push(slot as u32)
 					match slots[slot].default {
 						.Some(default) => self.useDefault(&default, span)
+						.None if slots[slot].implicit => self.implicitArgument(
+							&slots[slot],
+							callee,
+							span,
+						)
 						.None => self.errorExpr(span)
 					}
 				}
@@ -289,6 +301,79 @@ extend Lowerer {
 			order.push(slot)
 		}
 		return (move values, orderOf(move order))
+	}
+
+	/// What fills the implicit parameter `slot` of a call to `callee` that
+	/// leaves it out: the implicit of its name where the call is — one of the
+	/// function's own implicit parameters, an `implicit val` or `var` in
+	/// scope, or one a lambda captures from around it — lent as the
+	/// parameter takes it, as if the call had written `rng: &var rng`.
+	var fn implicitArgument(slot: &Slot, callee: str, span: Span): ExprId = {
+		val name = String::of(self.text(slot.name))
+		val wanted = self.tyName(slot.ty)
+		if !self.implicitInScope(slot.name) {
+			var diagnostic = Diagnostic::error(
+				NO_IMPLICIT,
+				"`\(callee)` needs `\(name)`, an implicit \(wanted), and nothing here is one",
+				span,
+				"`\(name)` is not given",
+			).withSecondary(
+				slot.span,
+				"the implicit parameter",
+			).withHelp("add `implicit \(name): \(self.program.tyName(slot.ty, self.interner))` to the parameters of the function around the call, declare `implicit var \(name)` before it, or pass it, `\(name): …`")
+			if self.lookup(slot.name).isSome() || self.namesAround(slot.name) then
+				diagnostic = diagnostic.withNote("a `\(name)` is here, but not implicit: only an implicit fills an implicit, so that declaring a variable never changes what an unrelated call receives")
+			self.report(move diagnostic)
+			return self.errorExpr(span)
+		}
+		// The binding's place: what it holds, or what it refers to.
+		val place = self.name(slot.name, .None, span)
+		val held = self.tyOf(place)
+		// What an editor shows the call to have been given, before its `)`.
+		val at = if span.hi > span.lo then span.hi - 1 else span.hi
+		val given: ExprId = match self.kind(slot.ty) {
+			.Ref(inner, kind) if inner == held => {
+				if kind == .Var then self.requireWritable(place, .Borrow)
+				val lent = if kind == .Var then "&var " else "&"
+				self.program.implicitFills.push((at, "\(name): \(lent)\(name)"))
+				self.alloc(.Ref(place), slot.ty, span)
+			}
+			_ if held == slot.ty => {
+				self.program.implicitFills.push((at, "\(name): \(name)"))
+				place
+			}
+			_ => {
+				self.report(
+					Diagnostic::error(
+						MISMATCHED_TYPES,
+						"`\(callee)` needs `\(name)` as \(wanted), and the implicit here holds \(self.tyName(held))",
+						span,
+						"`\(name)` filled from here",
+					).withSecondary(slot.span, "the implicit parameter").withNote(
+						"an implicit is found by its name, and must then be of the type the parameter takes",
+					),
+				)
+				self.errorExpr(span)
+			}
+		}
+		return given
+	}
+
+	/// Whether `sym` names an implicit: of the body being checked, or of one
+	/// around a lambda, which the lambda captures.
+	fn implicitInScope(sym: Symbol): bool = {
+		if self.lookup(sym) is .Some(local) then return self.state.body.locals[local].implicit
+		var i = self.outer.len()
+		while i > 0 {
+			i -= 1
+			var s = self.outer[i].scopes.len()
+			while s > 0 {
+				s -= 1
+				if self.outer[i].scopes[s].get(&sym) is .Some(local) then
+					return self.outer[i].body.locals[local].implicit
+			}
+		}
+		return false
 	}
 
 	/// What a literal or a call that leaves a field or a parameter out puts
@@ -445,7 +530,7 @@ extend Lowerer {
 			isLambda: false,
 			generator: .None,
 			isTailrec: false,
-			isTest: false,
+			test: .None,
 			isInline: false,
 			generated: .None,
 			intrinsic: .None,
@@ -478,9 +563,7 @@ extend Lowerer {
 /// parameter than its own.
 fn paramElsewhere(params: &[ParamDef], given: &[Option<Symbol>], at: i64): Option<i64> = {
 	if at >= given.len() then return .None
-	val .Some(sym) = given[at] else {
-		return .None
-	}
+	val .Some(sym) = given[at] else return .None
 	for (other, p) in params.forwards().enumerate() {
 		if p.name == sym then return if other != at then .Some(other) else .None
 	}

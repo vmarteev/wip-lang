@@ -14,6 +14,7 @@ import syntax::{
 	Edit,
 	IMPL_METHODS,
 	IMPL_TARGET,
+	IMPLICIT_NOT_ONE_NAME,
 	INVALID_DEFAULT,
 	KEEPS,
 	LENDS_FROM,
@@ -308,6 +309,34 @@ extend Lowerer {
 			}
 			(.Some(_), true, .Some(_)) => true
 		}
+		// `@packed` lays the fields out with no padding, and `@align` raises
+		// the alignment: one struct says one of them, and one whose layout
+		// is C's neither.
+		if annotations.packed is .Some(span) && annotations.align is .Some(_) then
+			self.report(
+				Diagnostic::error(
+					ANNOTATION,
+					"a struct is `@packed` or `@align`ed, not both",
+					span,
+					"packed",
+				).withNote(
+					"`@packed` aligns it to one byte, with no padding between its fields, and `@align` to more",
+				),
+			)
+		if opaque && (annotations.packed.isSome() || annotations.align.isSome()) {
+			val span = match annotations.packed {
+				.Some(at) => at
+				.None => annotations.align.unwrap().1
+			}
+			self.report(
+				Diagnostic::error(
+					ANNOTATION,
+					"an `@opaque` struct's layout is C's",
+					span,
+					"a layout Wip does not make",
+				).withNote("C knows where its fields are, and how it is aligned"),
+			)
+		}
 		// A type the compiler knows is the standard library's to declare.
 		if annotations.intrinsic && !self.inStd() then
 			self.report(
@@ -334,6 +363,11 @@ extend Lowerer {
 			isUnion: s.isUnion,
 			isOpaque: opaque,
 			isIntrinsic: annotations.intrinsic && self.inStd(),
+			align: match annotations.align {
+				.Some((n, _)) if annotations.packed.isNone() && !opaque => .Some(n)
+				_ => .None
+			},
+			packed: annotations.packed.isSome() && !opaque,
 			header: match annotations.header {
 				.Some((h, _)) => .Some(h)
 				.None => .None
@@ -364,9 +398,7 @@ extend Lowerer {
 	var fn collectAliases() = {
 		val file = self.ast
 		for item in file.items {
-			val .Type(alias) = item else {
-				continue
-			}
+			val .Type(alias) = item else continue
 			val name = alias.name
 			if self.preludeName(name, "a type named") then continue
 			if self.builtin(name.sym).isSome() {
@@ -421,9 +453,7 @@ extend Lowerer {
 	var fn recordAliasSources() = {
 		val file = self.ast
 		for item in file.items {
-			val .Type(decl) = item else {
-				continue
-			}
+			val .Type(decl) = item else continue
 			self.aliasSources.put(
 				(self.current, decl.name.sym),
 				AliasSource(decl: &decl, ast: file, imports: self.imports.clone()),
@@ -492,9 +522,7 @@ extend Lowerer {
 
 	/// An alias that names itself, through however many others.
 	var fn aliasNamesItself(module: i64, name: Symbol) = {
-		val .Some(alias) = self.modules[module].aliases.get(&name) else {
-			return
-		}
+		val .Some(alias) = self.modules[module].aliases.get(&name) else return
 		if alias.ty.isSome() then return
 		val span = alias.span
 		var updated = alias.clone()
@@ -559,9 +587,7 @@ extend Lowerer {
 			}
 			for index in 0..params.len() {
 				val param = &params[index]
-				val .Some(written) = param.default else {
-					continue
-				}
+				val .Some(written) = param.default else continue
 				if self.typeGenerics(def)[index].default != .Pending then continue
 				self.typeParams = self.typeGenerics(def)
 				val mark = self.diagnostics.len()
@@ -629,9 +655,7 @@ extend Lowerer {
 			self.typeParams = self.typeGenerics(def)
 			match def {
 				.Struct(id) if item.structDecl().isSome() => {
-					val .Some(s) = item.structDecl() else {
-						panic("just asked")
-					}
+					val .Some(s) = item.structDecl() else panic("just asked")
 					val fields = self.fields(&s.fields, s.isExtern, s.isView)
 					// C promises a layout for the types it can write, and knows
 					// nothing of a type parameter. A union belongs to C, and
@@ -673,9 +697,7 @@ extend Lowerer {
 					if self.program.structs[id].isOpaque then self.declareFieldAccessors(id)
 				}
 				.Enum(id) if item.enumDecl().isSome() => {
-					val .Some(e) = item.enumDecl() else {
-						panic("just asked")
-					}
+					val .Some(e) = item.enumDecl() else panic("just asked")
 					var seen: Map<Symbol, Span> = Map()
 					var variants: Vec<VariantDef> = Vec()
 					for v in e.variants {
@@ -727,6 +749,7 @@ extend Lowerer {
 					(!view && self.storedField(ty, f.ty, exported))
 			}
 			if refused then ty = ERROR
+			val fieldAnnotations = self.annotations(&f.annotations, .Field)
 			defs.push(
 				FieldDef(
 					// `pub` exports a field; an `extern struct` is C's layout, and
@@ -740,10 +763,54 @@ extend Lowerer {
 					span: f.span,
 					// Checked once every type's fields are known.
 					default: .None,
+					align: match fieldAnnotations.align {
+						.Some((n, _)) => .Some(n)
+						.None => .None
+					},
 				),
 			)
 		}
 		return move defs
+	}
+
+	/// The packed structs of a file, once every type's fields are known:
+	/// whether a field owns memory is a question of the types it holds.
+	var fn checkPackedStructs(types: &[(Declared, TypeDef)]) = {
+		for (item, def) in types {
+			val .Some(s) = item.structDecl() else continue
+			val .Struct(id) = def else continue
+			if !self.program.structs[id].packed then continue
+			val fields = self.program.structs[id].fields.clone()
+			self.checkPacked(&s, &fields)
+		}
+	}
+
+	/// A packed struct's fields: each plain data, since what owns memory is
+	/// dropped and lent through a reference, which an unaligned place cannot
+	/// give; and none aligned, since the struct is laid out with none.
+	var fn checkPacked(s: &ast::StructDecl, fields: &[FieldDef]) = {
+		for (i, field) in fields.forwards().enumerate() {
+			if i >= s.fields.len() then break
+			val written = &s.fields[i]
+			for annotation in written.annotations {
+				if self.text(annotation.name.sym) == "align" then
+					self.report(
+						Diagnostic::error(
+							ANNOTATION,
+							"a field of a `@packed` struct is not `@align`ed",
+							annotation.span,
+							"in a packed struct",
+						).withNote("a packed struct lays each field right after the one before"),
+					)
+			}
+			if self.hasError(field.ty) then continue
+			if self.owns(field.ty) || self.program.holdsView(field.ty) then
+				self.report(
+					Diagnostic::error(ANNOTATION, "a `@packed` struct holds plain data", self.ast.types[written.ty].span, "\(self.tyName(field.ty)) owns memory or borrows").withNote(
+						"a field of a packed struct may lie at an address no reference can point at, and what owns memory or borrows is reached through one",
+					),
+				)
+		}
 	}
 
 	/// The defaults of these functions' parameters, once every function is
@@ -765,9 +832,7 @@ extend Lowerer {
 	/// is put back as it was. A literal asks before it reads them, so one in
 	/// another type's default finds them however the two are ordered.
 	var fn ensureDefaults(def: TypeDef) = {
-		val .Some(source) = self.defaultSources.remove(&def) else {
-			return
-		}
+		val .Some(source) = self.defaultSources.remove(&def) else return
 		val hereAst = self.ast
 		val hereModule = self.current
 		val hereImports = self.imports.clone()
@@ -792,12 +857,8 @@ extend Lowerer {
 				self.checkVariantDefaults(&e, id)
 				continue
 			}
-			val .Some(s) = item.structDecl() else {
-				continue
-			}
-			val .Struct(id) = def else {
-				continue
-			}
+			val .Some(s) = item.structDecl() else continue
+			val .Struct(id) = def else continue
 			var any = false
 			for f in s.fields {
 				if f.default.isSome() then any = true
@@ -806,9 +867,7 @@ extend Lowerer {
 			self.typeParams = self.typeGenerics(def)
 			for index in 0..s.fields.len() {
 				val f = &s.fields[index]
-				val .Some(value) = f.default else {
-					continue
-				}
+				val .Some(value) = f.default else continue
 				val ty = self.program.structs[id].fields[index].ty
 				val refusal: Option<str> =
 					if self.program.structs[id].isUnion then .Some("a union's field has no default")
@@ -849,9 +908,7 @@ extend Lowerer {
 		for v in 0..e.variants.len() {
 			val variant = &e.variants[v]
 			for index in 0..variant.fields.len() {
-				val .Some(value) = variant.fields[index].default else {
-					continue
-				}
+				val .Some(value) = variant.fields[index].default else continue
 				val ty = self.program.enums[id].variants[v].fields[index].ty
 				if self.hasError(ty) then continue
 				val default = self.defaultOf(value, ty)
@@ -863,9 +920,7 @@ extend Lowerer {
 
 	/// A type this file imported by name.
 	fn importedType(name: ast::Name): Option<TypeDef> = {
-		val .Some(.Item(module, name: item)) = self.imported(name) else {
-			return .None
-		}
+		val .Some(.Item(module, name: item)) = self.imported(name) else return .None
 		return match self.modules[module].types.get(&item.sym) {
 			.Some((def, _)) => .Some(def)
 			.None => .None
@@ -1068,7 +1123,12 @@ extend Lowerer {
 					// `@prefix("build.h")` is put before each of the module's C
 					// files.
 					for (path, _) in self.modulePaths(&annotations.source, "@source") {
-						val entry = (self.current, move path, annotations.sourceLanguage)
+						val entry = (
+							self.current,
+							move path,
+							annotations.sourceLanguage.clone(),
+							annotations.sourceStandard.clone(),
+						)
 						if !self.program.cSources.contains(&entry) then
 							self.program.cSources.push(move entry)
 					}
@@ -1104,16 +1164,12 @@ extend Lowerer {
 				}
 				// A type's methods belong to it, not to the module.
 				.Struct(s) => {
-					val .Some((owner, _)) = self.types().get(&s.name.sym) else {
-						continue
-					}
+					val .Some((owner, _)) = self.types().get(&s.name.sym) else continue
 					val typeParams = self.typeGenerics(owner)
 					self.declareMethods(owner, &typeParams, &s.methods, &var bodies)
 				}
 				.Enum(e) => {
-					val .Some((owner, _)) = self.types().get(&e.name.sym) else {
-						continue
-					}
+					val .Some((owner, _)) = self.types().get(&e.name.sym) else continue
 					val typeParams = self.typeGenerics(owner)
 					self.declareMethods(owner, &typeParams, &e.methods, &var bodies)
 				}
@@ -1175,9 +1231,7 @@ extend Lowerer {
 		visible: Option<bool>,
 	) = {
 		for method in methods {
-			val .Some((receiver, keyword)) = method.receiver else {
-				panic("a method has a receiver")
-			}
+			val .Some((receiver, keyword)) = method.receiver else panic("a method has a receiver")
 			// `lend fn` is a lending pair written once: the reading half as
 			// written, and the writing half from the same body, checked again
 			// with `self` a `&var Self`.
@@ -1279,11 +1333,20 @@ extend Lowerer {
 				.None => .None
 			}
 		}
-		// `extend Slots<T>`: the prelude's storage, which takes its element as a
-		// parameter.
-		if block.path.len() == 1 && self.text(name.sym) == "Slots" {
+		// `extend own<T>`: a box, whose parameter is what it holds.
+		if block.boxed is .Some(word) {
 			val generics = self.genericParams(&block.generics)
-			return match self.builtinOwner(&block, .Slots, generics.clone(), name.span) {
+			return match self.builtinOwner(&block, .Own, generics.clone(), word) {
+				.Some(owner) => .Some((owner, move generics))
+				.None => .None
+			}
+		}
+		// `extend Slots<T>`: the prelude's storage, which takes its element as a
+		// parameter; and `extend ptr<T>`, a C pointer, what it points at.
+		if block.path.len() == 1 && self.text(name.sym) is "Slots" | "ptr" {
+			val builtin: BuiltinOwner = if self.text(name.sym) == "ptr" then .Ptr else .Slots
+			val generics = self.genericParams(&block.generics)
+			return match self.builtinOwner(&block, builtin, generics.clone(), name.span) {
 				.Some(owner) => .Some((owner, move generics))
 				.None => .None
 			}
@@ -1479,7 +1542,7 @@ extend Lowerer {
 		isLambda: false,
 		generator: .None,
 		isTailrec: false,
-		isTest: false,
+		test: .None,
 		isInline: false,
 		generated: .None,
 		intrinsic: .None,
@@ -1760,7 +1823,7 @@ extend Lowerer {
 			isLambda: false,
 			generator: .None,
 			isTailrec: annotations.tailrec,
-			isTest: annotations.test.isSome(),
+			test: if annotations.test is .Some((test, _)) then .Some(test.clone()) else .None,
 			isInline: annotations.inline.isSome(),
 			generated: .None,
 			intrinsic: intrinsic,
@@ -1775,7 +1838,7 @@ extend Lowerer {
 			span: sig.span,
 		)
 		val id = self.program.fns.add(move def)
-		self.checkTestShape(id, annotations.test)
+		self.checkTestShape(id, if annotations.test is .Some((_, at)) then .Some(at) else .None)
 		for (index, value) in deferred {
 			self.paramDefaults.push((id, index, value))
 		}
@@ -2026,9 +2089,7 @@ extend Lowerer {
 		var params: Vec<ParamDef> = Vec()
 		// The receiver is the first parameter, written as a word before `fn`.
 		if member is .Some(m) && m.receiver != .Static {
-			val .Some(selfTy) = self.selfTy else {
-				panic("a method knows its type")
-			}
+			val .Some(selfTy) = self.selfTy else panic("a method knows its type")
 			val ty = match m.receiver {
 				.Read => self.intern(.Ref(inner: selfTy, kind: .Shared))
 				.Var => self.intern(.Ref(inner: selfTy, kind: .Var))
@@ -2043,6 +2104,9 @@ extend Lowerer {
 			))
 		}
 		var deferred: Vec<(i64, ast::ExprId)> = Vec()
+		// The first implicit parameter, which every parameter after it must be
+		// too.
+		var firstImplicit: Option<Span> = .None
 		for p in sig.params {
 			match seen.get(&p.name.sym) {
 				.Some(first) => self.duplicate(p.name, first)
@@ -2055,15 +2119,76 @@ extend Lowerer {
 			// that calls one.
 			if p.default is .Some(value) && self.defaultAllowed(value, ty, &p, isExtern) then
 				deferred.push((params.len(), value))
+			if p.isImplicit {
+				if firstImplicit.isNone() then firstImplicit = .Some(p.span)
+				self.checkImplicitParam(&p, ty, isExtern)
+			} else if firstImplicit is .Some(first) {
+				self.report(
+					Diagnostic::error(
+						IMPLICIT_NOT_ONE_NAME,
+						"`\(self.text(p.name.sym))` follows an implicit parameter",
+						p.span,
+						"after an implicit",
+					).withSecondary(first, "the first implicit").withNote(
+						"implicit parameters come after the others, as a call that fills them writes the others alone",
+					),
+				)
+			}
 			params.push(ParamDef(
 				name: p.name.sym,
 				nameSpan: p.name.span,
 				ty: ty,
 				span: p.span,
 				default: .None,
+				implicit: p.isImplicit,
 			))
 		}
 		return (move params, move deferred)
+	}
+
+	/// An implicit parameter is lent or copied, of one type a call can find
+	/// by its name, and has no default: what fills it is the caller's.
+	var fn checkImplicitParam(p: &ast::Param, ty: Ty, isExtern: bool) = {
+		val name = String::of(self.text(p.name.sym))
+		val why: Option<(String, str)> =
+			if isExtern then
+				.Some(
+					(
+						"a C function takes no implicit parameter",
+						"C passes every argument it is given",
+					),
+				)
+			else if p.default.isSome() then
+				.Some(
+					(
+						"`\(name)` is implicit and has a default",
+						"a call that passes nothing fills an implicit from its caller; a default would give a value nothing shows",
+					),
+				)
+			else if self.program.types.isGeneric(ty) then
+				.Some(
+					(
+						"`\(name)` is implicit and its type names a type parameter",
+						"a call fills it from the implicit of its name, which has one type; a type parameter would be decided by what is found",
+					),
+				)
+			else if self.kind(ty) !is .Ref(..) && self.owns(ty) then
+				.Some(
+					(
+						"`\(name)` is implicit and owns what it holds",
+						"an implicit is lent, `&` or `&var`, or copied; a value that owns memory would be moved out of the caller at every call",
+					),
+				)
+			else .None
+		val .Some((message, note)) = move why else return
+		self.report(
+			Diagnostic::error(
+				IMPLICIT_NOT_ONE_NAME,
+				move message,
+				p.span,
+				"implicit here",
+			).withNote(note),
+		)
 	}
 
 	/// A function's result; for one that answers `Iterator<T>`, the `T` it
@@ -2189,12 +2314,12 @@ extend Lowerer {
 				// A slice's address, for C to read.
 				"pointerTo" if path == "std::c" || path == "std::prelude" => .Some(.SlicePointer)
 				"alignOf" => .Some(.AlignOf)
+				"offsetOf" => .Some(.OffsetOf)
 				// What the runtime written in Wip needs of memory C gave it.
 				"atomicAdd" => .Some(.AtomicAdd)
 				"atomicLoad" => .Some(.AtomicLoad)
 				"atomicStore" => .Some(.AtomicStore)
-				// A slice lent in parts, and a closure lent to a thread.
-				"sliceAt" => .Some(.SliceAt)
+				// The box an `own` points to, and a closure lent to a thread.
 				"boxAddress" => .Some(.BoxAddress)
 				"closureCode" => .Some(.ClosureCode)
 				"closureCaptures" => .Some(.ClosureCaptures)
@@ -2202,8 +2327,11 @@ extend Lowerer {
 				"atomicSubtract" => .Some(.AtomicSubtract)
 				"atomicSwap" => .Some(.AtomicSwap)
 				"atomicCompareSwap" => .Some(.AtomicCompareSwap)
+				"atomicFence" => .Some(.AtomicFence)
 				"offsetBytes" => .Some(.OffsetBytes)
 				"runtimeWords" => .Some(.RuntimeWords)
+				"threadWords" => .Some(.ThreadWords)
+				"debugBuild" => .Some(.DebugBuild)
 				// What a panic reads to say the calls that led to it.
 				"frameTables" => .Some(.FrameTables)
 				// A file's contents, read when the program is compiled.
@@ -2299,9 +2427,15 @@ extend Lowerer {
 						self.isLendingPair(earlier, id) {
 						first = .None
 					}
-					match first {
-						.Some(first) => self.duplicate(sig.name, first)
-						.None => match owner {
+					// A field is read as `x.name` and a method called as
+					// `x.name(…)`, so the two may share a name; a field that
+					// holds a function is called as a method is, and may not.
+					val callable =
+						if first.isNone() then self.callableField(owner, sig.name.sym) else .None
+					match (first, callable) {
+						(.Some(first), _) => self.duplicate(sig.name, first)
+						(.None, .Some(field)) => self.methodBesideCallable(sig.name, field)
+						(.None, .None) => match owner {
 							.Struct(structId) => {
 								// The methods of the prelude's that the compiler
 								// calls, each for what `KnownFn` says.
@@ -2379,9 +2513,7 @@ extend Lowerer {
 	/// after it, or be the whole list, since C reads the rest by what the
 	/// first arguments said.
 	var fn checkVariadic(sig: &ast::FnSig, isExtern: bool) = {
-		val .Some(span) = sig.variadic else {
-			return
-		}
+		val .Some(span) = sig.variadic else return
 		// Only C takes more arguments than it declares: a Wip function that
 		// wanted to would take a slice.
 		if !isExtern then
@@ -2430,9 +2562,7 @@ extend Lowerer {
 	/// A function marked `@test` at `test` takes nothing and answers nothing,
 	/// since the runner `wip test` writes calls it by itself.
 	var fn checkTestShape(id: FnId, test: Option<Span>) = {
-		val .Some(at) = test else {
-			return
-		}
+		val .Some(at) = test else return
 		val def = &self.program.fns[id]
 		val wrong: Option<str> =
 			if def.receiver.isSome() then .Some("a method")
@@ -2453,17 +2583,13 @@ extend Lowerer {
 		}
 	}
 
-	/// Where a type already has a member of this name: a field, a variant, a
-	/// method or a static function.
+	/// Where a type already has a member a method may not share a name with:
+	/// a variant, a method or a static function. A field is not one: it is
+	/// read without `()` and a method called with them.
 	fn memberNamed(owner: TypeDef, name: Symbol): Option<Span> = {
 		var methods: Vec<FnId> = Vec()
 		match owner {
-			.Struct(id) => {
-				for f in self.program.structs[id].fields {
-					if f.name == name then return .Some(f.span)
-				}
-				methods = self.program.structs[id].methods.clone()
-			}
+			.Struct(id) => methods = self.program.structs[id].methods.clone()
 			.Enum(id) => {
 				for v in self.program.enums[id].variants {
 					if v.name == name then return .Some(v.span)
@@ -2481,6 +2607,35 @@ extend Lowerer {
 			if self.program.fns[id].name == name then return .Some(self.program.fns[id].nameSpan)
 		}
 		return .None
+	}
+
+	/// Where a struct has a field of this name that holds a function: `h.f(…)`
+	/// calls it as a method is called, so a method may not take its name.
+	fn callableField(owner: TypeDef, name: Symbol): Option<Span> = {
+		val .Struct(id) = owner else return .None
+		for f in self.program.structs[id].fields {
+			val held = match self.kind(f.ty) {
+				.Ref(inner, ..) | .Own(inner) => inner
+				_ => f.ty
+			}
+			if f.name == name && self.kind(held) is .Fn(..) then return .Some(f.span)
+		}
+		return .None
+	}
+
+	/// A method named as a field that holds a function.
+	var fn methodBesideCallable(name: ast::Name, field: Span) = {
+		val text = String::of(self.text(name.sym))
+		self.report(
+			Diagnostic::error(
+				DUPLICATE_DEFINITION,
+				"`\(text)` is a field that holds a function and a method",
+				name.span,
+				"a method of that name",
+			).withSecondary(field, "the field").
+				withNote("`x.\(text)(…)` calls a field that holds a function as it calls a method, so it would mean either").
+				withHelp("give the method or the field a name of its own"),
+		)
 	}
 
 	/// A built-in type an `extend` block names: only the prelude may give one
@@ -2570,6 +2725,8 @@ extend Lowerer {
 				.Slice => self.intern(.Slice(first))
 				.Slots => self.intern(.Slots(first))
 				.Void => UNIT
+				.Own => self.intern(.Own(first))
+				.Ptr => self.intern(.Ptr(first))
 			}
 		}
 	}
@@ -2701,6 +2858,12 @@ extend Lowerer {
 			diagnostic = diagnostic.withHelp(
 				"C takes strings as `cstring`; a string literal can be passed as either",
 			)
+		// A reference C may be given a null for is C's own pointer.
+		if self.kind(ty) is .Enum(id, args) &&
+			self.program.preludeItems.enumeration(.Option) == .Some(id) &&
+			self.kind(self.program.types.list(args)[0]) is .Ref(inner, ..) {
+			diagnostic = diagnostic.withHelp("a pointer that may be null is `ptr<\(self.program.tyName(inner, self.interner))>` in C's declarations; a call passes `null` to it, or lends `&x` or `&var x`")
+		}
 		// C's pointer-sized integers are built in under C's names.
 		if self.kind(ty) is .Int(int: .Isize | .Usize) then
 			diagnostic = diagnostic.withHelp(

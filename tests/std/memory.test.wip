@@ -1,0 +1,124 @@
+// Where memory comes from: values made under `mem::using` taken from an
+// arena and freed there whenever they are dropped; a reset with a value
+// alive a panic; `onHeap` inside `using`; calls nested; a thread a body
+// starts allocating from its own heap; and a program's own allocator
+// counting what it gives. The leak check runs over all of it.
+
+import std::future
+import std::libc::{free, malloc}
+import std::mem
+import std::mem::{Allocator, Arena, Custom}
+
+struct Spot {
+	x: i64
+	y: i64
+}
+
+fn point(x: i64): own<Spot> = own Spot(x: x, y: x * 2)
+
+@test
+fn whatAFrameMakesIsTheArenasAndGoesWithItsReset() = {
+	var frame = Arena::of(4096)
+	for round in 0..3 {
+		val total = mem::using(&var frame, () => {
+			var points: Vec<Spot> = Vec()
+			for i in 0..1000 {
+				points.push(Spot(x: i, y: round))
+			}
+			var sum = 0
+			for p in points {
+				sum += p.x + p.y
+			}
+			return sum
+		})
+		assert(total == 499500 + 1000 * round && frame.live() == 0)
+		frame.reset()
+	}
+}
+
+@test
+fn aValueDroppedAfterUsingIsFreedToTheArena() = {
+	var frame = Arena::of(4096)
+	var late = mem::using(&var frame, () => point(1))
+	assert(frame.live() == 1 && late.y == 2)
+	late = point(3)
+	assert(frame.live() == 0 && late.x == 3, "the old value went back to the frame")
+	frame.reset()
+}
+
+@test(panics = "arena reset with 1 value still alive")
+fn aResetWithAValueAlivePanics() = {
+	var frame = Arena::of(4096)
+	val kept = mem::using(&var frame, () => point(1))
+	frame.reset()
+	assert(kept.x == 1)
+}
+
+@test
+fn onHeapMakesWhatOutlivesTheFrame() = {
+	var frame = Arena::of(4096)
+	val kept = mem::using(&var frame, () => mem::onHeap(() => point(7)))
+	assert(frame.live() == 0)
+	frame.reset()
+	assert(kept.y == 14)
+}
+
+@test
+fn callsNestAndAThreadAllocatesFromItsHeap() = {
+	var outer = Arena::of(4096)
+	var inner = Arena::of(4096)
+	val held = mem::using(&var outer, () => {
+		val a = point(1)
+		val b = mem::using(&var inner, () => point(2))
+		var cells = [1, 2, 3, 4]
+		future::each(&var cells, (cell) => {
+			val c = own cell
+			cell = c * 2
+		})
+		return (move a, move b, cells[3])
+	})
+	assert(outer.live() == 1 && inner.live() == 1 && held.2 == 8)
+}
+
+@test
+fn aValueAlignedBeyondSixteenComesFromTheArenaToo() = {
+	var frame = Arena::of(4096)
+	val counters = mem::using(&var frame, () => own Counters(done: 1))
+	assert(frame.live() == 1 && counters.done == 1)
+}
+
+@align(64)
+struct Counters {
+	done: i64
+}
+
+/// Counts what it gives and takes back, from the heap.
+struct Counting {
+	given: i64
+	back: i64
+}
+
+extend Counting: Allocator {
+	var fn allocate(size: i64, align: i64): ptr<u8> = {
+		self.given += 1
+		return malloc(size as size_t)
+	}
+
+	var fn free(at: ptr<u8>) = {
+		self.back += 1
+		free(at)
+	}
+}
+
+@test
+fn aProgramsOwnAllocatorIsUsedAndFreedTo() = {
+	var counting = Custom::of(Counting(given: 0, back: 0))
+	val total = mem::using(&var counting, () => {
+		var numbers: Vec<i64> = Vec()
+		for i in 0..100 {
+			numbers.push(i)
+		}
+		return numbers.len()
+	})
+	assert(total == 100 && counting.live() == 0)
+}

@@ -1,7 +1,14 @@
 // Checking an expression against an expected type, and the coercions.
 
 import syntax as ast
-import syntax::{Diagnostic, Edit, MISMATCHED_TYPES, Span, UNSATISFIED_CONSTRAINT}
+import syntax::{
+	Diagnostic,
+	Edit,
+	INTEGER_OUT_OF_RANGE,
+	MISMATCHED_TYPES,
+	Span,
+	UNSATISFIED_CONSTRAINT
+}
 
 extend Lowerer {
 	var fn check(e: ast::ExprId, expected: Ty): ExprId = self.checkIn(e, expected, .None)
@@ -53,6 +60,108 @@ extend Lowerer {
 		return self.coerceTo(id, expected, context, true)
 	}
 
+	/// Whether `id` is an integer constant: a constant's value or a number
+	/// literal, or an expression of them with the arithmetic, bitwise and
+	/// shift operators. Not an `as`, which says its type already, nor a byte
+	/// literal, which is a `u8` alone.
+	fn constantShaped(id: ExprId): bool = {
+		val expr = &self.state.body.exprs[id]
+		if self.kind(expr.ty) !is .Int(..) then return false
+		return match expr.kind {
+			.Int(..) => !self.state.byteLiterals.contains(&id)
+			.Unary(op: .Neg | .Not, operand) => self.constantShaped(operand)
+			.Binary(op, lhs, rhs, ..) =>
+				op is .Add | .Sub | .Mul | .Div | .Rem | .BitAnd | .BitOr | .BitXor | .Shl | .Shr &&
+					self.constantShaped(lhs) &&
+					self.constantShaped(rhs)
+			_ => false
+		}
+	}
+
+	/// An integer constant of another integer type than `expected`, as the
+	/// literal it stands for: its value, worked out as a constant's is, of
+	/// the type expected where it fits, and E0310 where it does not, as a
+	/// literal's is. Nothing for anything that is not one: what a program
+	/// computes is converted by `as`, where a value could change.
+	var fn constantAs(id: ExprId, expected: Ty): Option<ExprId> = {
+		val .Some(to) = self.program.types.intTy(expected) else return .None
+		val .Some(from) = self.program.types.intTy(self.tyOf(id)) else return .None
+		if !self.constantShaped(id) then return .None
+		val .Ok(.Int(bits)) = self.fold(id) else return .None
+		val span = self.state.body.exprs[id].span
+		val negative = from.signed() && bits >> (from.bits() - 1) as u128 & 1 == 1
+		val magnitude = if negative then (0 -% bits) & from.mask() else bits
+		val fits = if negative then magnitude <= to.minMagnitude() else magnitude <= to.max()
+		if !fits {
+			val text = if negative then "-\(magnitude)" else "\(magnitude)"
+			val name = to.name()
+			val note =
+				if negative && !to.signed() then
+					"`\(name)` is unsigned, so it has no negative values"
+				else if to.signed() then "`\(name)` holds -\(to.minMagnitude()) to \(to.max())"
+				else "`\(name)` holds 0 to \(to.max())"
+			self.report(
+				Diagnostic::error(
+					INTEGER_OUT_OF_RANGE,
+					"this constant is \(text), which is out of range for `\(name)`",
+					span,
+					"does not fit in `\(name)`",
+				).withNote(move note),
+			)
+			return .Some(self.errorExpr(span))
+		}
+		val value = (if negative then 0 -% magnitude else magnitude) & to.mask()
+		return .Some(self.alloc(.Int(value), expected, span))
+	}
+
+	/// The operands of a binary operator, where one is an integer constant of
+	/// another integer type than the other's: the constant as the literal it
+	/// stands for, of the other's type where it fits, the right one first.
+	var fn constantBeside(lhs: ExprId, rhs: ExprId): (ExprId, ExprId) = {
+		val lt = self.tyOf(lhs)
+		val rt = self.tyOf(rhs)
+		if lt == rt || self.kind(lt) !is .Int(..) || self.kind(rt) !is .Int(..) then
+			return (lhs, rhs)
+		if self.constantShaped(rhs) && self.constantFits(rhs, lt) then
+			return (lhs, self.constantAs(rhs, lt).unwrap())
+		if self.constantShaped(lhs) && self.constantFits(lhs, rt) then
+			return (self.constantAs(lhs, rt).unwrap(), rhs)
+		return (lhs, rhs)
+	}
+
+	/// Whether the integer constant `id` holds a value of type `ty`.
+	var fn constantFits(id: ExprId, ty: Ty): bool = {
+		val .Some(to) = self.program.types.intTy(ty) else return false
+		val .Some(from) = self.program.types.intTy(self.tyOf(id)) else return false
+		val .Ok(.Int(bits)) = self.fold(id) else return false
+		val negative = from.signed() && bits >> (from.bits() - 1) as u128 & 1 == 1
+		val magnitude = if negative then (0 -% bits) & from.mask() else bits
+		return if negative then magnitude <= to.minMagnitude() else magnitude <= to.max()
+	}
+
+	/// `&x` or `&var x` where a C function takes a `ptr<T>`, or a C struct's
+	/// field is one: the address of the place, lent for the call as a
+	/// reference argument is, or borrowed by the struct, where `x` is a `T`,
+	/// or an array or a slice of them, whose first element's address it is;
+	/// for a `ptr<void>`, anything. Nothing for anything else.
+	var fn lentToC(e: ast::ExprId, declared: Ty, context: Option<(Span, str)>): Option<ExprId> = {
+		val .Ptr(pointee) = self.kind(declared) else return .None
+		val file = self.ast
+		val expr = &file.exprs[e]
+		val .Unary(op, operand, ..) = expr.kind else return .None
+		if op !is .Ref | .RefVar then return .None
+		val lent = self.reference(op, operand, .None, expr.span, true)
+		val .Ref(inner: target, ..) = self.kind(self.tyOf(lent)) else return .Some(lent)
+		val fits =
+			pointee == UNIT ||
+			target == pointee ||
+			match self.kind(target) {
+				.Array(elem, ..) | .Slice(elem) => elem == pointee
+				_ => false
+			}
+		return .Some(if fits then lent else self.coerceTo(lent, declared, context, true))
+	}
+
 	/// A call's argument, where what it is taken as is not known yet: an
 	/// `&place` is the argument's own.
 	var fn inferArgument(e: ast::ExprId, hint: Option<Ty>): ExprId = {
@@ -79,6 +188,7 @@ extend Lowerer {
 		if actual == expected || self.isPoisoned(actual) || self.hasError(expected) then return id
 		// Where nothing is expected, a value is discarded.
 		if expected == UNIT then return self.discard(id)
+		if self.constantAs(id, expected) is .Some(converted) then return converted
 		if self.derefCoercion(id, expected) is .Some(coerced) then return coerced
 		if self.stringArgument(id, expected, argument) is .Some(coerced) then return coerced
 		if self.textCopied(id, expected) is .Some(copied) then return copied
@@ -86,8 +196,9 @@ extend Lowerer {
 		// A named function is lent as a closure.
 		if self.fnAsClosure(id, expected) is .Some(closure) then return closure
 		// A value with no place of its own is lent where it is used, so a call
-		// takes it without an `&`.
-		if self.lentTemporary(id, expected, argument) is .Some(lent) then
+		// takes it without an `&`; and in a constant, an array written for a
+		// slice is lent, and kept with the constant.
+		if self.lentTemporary(id, expected, argument || self.keptList(id)) is .Some(lent) then
 			return self.coerceTo(lent, expected, context, argument)
 		// A reference becomes a `&dyn Interface`, with the table of the type's
 		// methods beside it.
@@ -133,14 +244,19 @@ extend Lowerer {
 		return id
 	}
 
+	/// Whether `id` is an array written in a constant's value, outside any
+	/// block, which a slice may point at where the constant is kept.
+	fn keptList(id: ExprId): bool =
+		self.state.constant &&
+		self.state.scopes.len() == 1 &&
+		self.state.body.exprs[id].kind is .Array(..) | .ArrayRepeat(..)
+
 	/// A temporary passed where a `&` is expected is lent for the call: it
 	/// has no place of its own to write an `&` in front of, and `move` is
 	/// ruled the same way. A closure keeps its `&`, which is what tells a lent
 	/// one from an owned one.
 	var fn lentTemporary(id: ExprId, expected: Ty, argument: bool): Option<ExprId> = {
-		val .Ref(inner: pointee, kind: .Shared) = self.kind(expected) else {
-			return .None
-		}
+		val .Ref(inner: pointee, kind: .Shared) = self.kind(expected) else return .None
 		val actual = self.state.body.exprs[id].ty
 		// A `&Node` where a `&&Node` is taken is lent as any temporary is:
 		// `refs.contains(&a)` of a `Vec<&Node>`.
@@ -206,9 +322,7 @@ extend Lowerer {
 	/// it. Not where a `&var String` is taken, which may grow it, nor a
 	/// `String` by value, which is the copy asked for.
 	var fn textAsString(id: ExprId, expected: Ty): Option<ExprId> = {
-		val .Ref(inner: string, kind: .Shared) = self.kind(expected) else {
-			return .None
-		}
+		val .Ref(inner: string, kind: .Shared) = self.kind(expected) else return .None
 		if self.tyOf(id) != STR || !self.program.isString(string) then return .None
 		val over = self.program.preludeItems.function(.StringOver)?
 		val span = self.state.body.exprs[id].span
@@ -233,12 +347,8 @@ extend Lowerer {
 	/// call.
 	var fn containerArgument(id: ExprId, expected: Ty, argument: bool): Option<ExprId> = {
 		if !argument then return .None
-		val .Ref(inner: slice, kind) = self.kind(expected) else {
-			return .None
-		}
-		val .Slice(elem) = self.kind(slice) else {
-			return .None
-		}
+		val .Ref(inner: slice, kind) = self.kind(expected) else return .None
+		val .Slice(elem) = self.kind(slice) else return .None
 		// `&c`, or a reference parameter, which stands for what it refers to
 		// where its own type is not what is expected. And a temporary, which is
 		// lent where it is used, as any is.
@@ -250,9 +360,7 @@ extend Lowerer {
 			container = c
 			given = g
 		} else if self.state.body.exprs[id].kind is .Deref(r) {
-			val .Ref(inner: c, kind: g) = self.kind(self.tyOf(r)) else {
-				return .None
-			}
+			val .Ref(inner: c, kind: g) = self.kind(self.tyOf(r)) else return .None
 			reference = r
 			container = c
 			given = g
@@ -276,9 +384,7 @@ extend Lowerer {
 			_ if reference != id || container == self.tyOf(id) => id
 			_ => self.alloc(.Deref(id), container, span)
 		}
-		val .Items(items: place, ..) = self.itemsOf(receiver, container) else {
-			return .None
-		}
+		val .Items(items: place, ..) = self.itemsOf(receiver, container) else return .None
 		// A container that cannot be written was reported where `&var` was
 		// written of it; it is lent all the same, so that it is reported once.
 		if kind == .Var then self.writableForWriting(place)
@@ -294,9 +400,7 @@ extend Lowerer {
 	/// Whether the type is the prelude's `String`, which lends its bytes as a
 	/// `str`.
 	fn lendsText(ty: Ty): bool = {
-		val .Some(owner) = self.stringOwner() else {
-			return false
-		}
+		val .Some(owner) = self.stringOwner() else return false
 		return self.ownerOf(ty) == .Some(owner)
 	}
 
@@ -335,9 +439,7 @@ extend Lowerer {
 	/// An array `[T; N]`, directly or through `own`s, coerces to the slice
 	/// `[T]` of all its elements the same way.
 	var fn derefCoercion(id: ExprId, expected: Ty): Option<ExprId> = {
-		val .Ref(inner: target, kind) = self.kind(expected) else {
-			return .None
-		}
+		val .Ref(inner: target, kind) = self.kind(expected) else return .None
 		val .Ref(inner: pointee, kind: actualKind) = self.kind(self.state.body.exprs[id].ty) else {
 			return .None
 		}
@@ -357,9 +459,7 @@ extend Lowerer {
 				break
 			}
 			if depth > 0 && ty == target then break
-			val .Own(inner) = self.kind(ty) else {
-				return .None
-			}
+			val .Own(inner) = self.kind(ty) else return .None
 			ty = inner
 			depth += 1
 		}
@@ -367,9 +467,7 @@ extend Lowerer {
 		var e = self.alloc(.Deref(id), pointee, span)
 		var at = pointee
 		for _ in 0..depth {
-			val .Own(inner) = self.kind(at) else {
-				panic("looked through above")
-			}
+			val .Own(inner) = self.kind(at) else panic("looked through above")
 			at = inner
 			e = self.alloc(.Deref(e), at, span)
 		}

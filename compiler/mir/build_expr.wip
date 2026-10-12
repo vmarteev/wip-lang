@@ -113,9 +113,7 @@ extend Builder {
 			// A projection lends the place: its address is the result, and it
 			// unwinds like a `return`.
 			.Lend(place) => {
-				val .Some(ret) = self.ret else {
-					panic("a projection has a result")
-				}
+				val .Some(ret) = self.ret else panic("a projection has a result")
 				// A slice is lent as what it already is, a pointer and a length;
 				// anything else is lent by its address.
 				if self.isAggregate(self.localTy(ret)) {
@@ -204,7 +202,17 @@ extend Builder {
 			}
 			.Ref(inner) => {
 				val place = self.place(inner)
-				.Scalar(self.value(expr.ty, .AddressOf(move place)))
+				// A field of a packed struct may lie where no reference can
+				// point. It is plain data, and a `&` writes nothing, so a copy
+				// of it is lent, which nothing can tell from the field.
+				if self.inPacked(inner) &&
+					self.program.types.kind(expr.ty) is .Ref(kind: .Shared, ..) {
+					val copied = Place::of(self.temp(self.ty(inner)))
+					self.assign(copied.clone(), .Use(.Copy(move place)))
+					Value::Scalar(self.value(expr.ty, .AddressOf(move copied)))
+				} else {
+					.Scalar(self.value(expr.ty, .AddressOf(move place)))
+				}
 			}
 			// Only ever lent, which `place` builds; as a value it is the same
 			// `String`, still never dropped.
@@ -402,9 +410,7 @@ extend Builder {
 			val param = Place::of(self.params[i])
 			self.assign(move param, .Use(.Copy(move temp)))
 		}
-		val .Some(top) = self.top else {
-			panic("a body with a tail call has a top")
-		}
+		val .Some(top) = self.top else panic("a body with a tail call has a top")
 		self.terminate(.Goto(top))
 		self.dead = true
 	}
@@ -515,7 +521,7 @@ extend Builder {
 				if operand is .Copy(place) then
 					self.pendingPart(place.clone(), self.ty(args[i]), &var pending)
 			}
-			operands[i] = .Some(move operand)
+			operands[i] = .Some(self.lentToC(&callee, i, args[i], move operand))
 		}
 		for i in lent {
 			val operand = match self.expr(args[i]) {
@@ -523,7 +529,7 @@ extend Builder {
 				.Place(place) => Operand::Copy(move place)
 				.Unit => panic("a reference is a value")
 			}
-			operands[i] = .Some(move operand)
+			operands[i] = .Some(self.lentToC(&callee, i, args[i], move operand))
 		}
 		self.forgetParts(move pending)
 		var given: Vec<Operand> = Vec()
@@ -534,6 +540,23 @@ extend Builder {
 			}
 		}
 		return self.finishCall(move callee, ret, move given, move result)
+	}
+
+	/// What a C function taking a `ptr<T>` is given for a place lent to it: a
+	/// reference is the address already, and a slice is its pointer without
+	/// its length.
+	var fn lentToC(callee: &Callee, i: i64, arg: ExprId, operand: Operand): Operand = {
+		val .Fn(id) = callee else return move operand
+		val def = &self.program.fns[id]
+		if !def.isExtern || i >= def.params.len() then return move operand
+		val param = def.params[i].ty
+		if self.kind(param) !is .Ptr(..) then return move operand
+		val .Ref(inner, ..) = self.kind(self.ty(arg)) else return move operand
+		if self.kind(inner) !is .Slice(..) then return move operand
+		val .Copy(slice) = operand else panic("a slice is a place")
+		val pointer = Place::of(self.temp(param))
+		self.assign(pointer.clone(), .Use(.Copy(slice.project(.Field(0)))))
+		return .Copy(move pointer)
 	}
 
 	/// The call itself, once its arguments are operands: where its result
@@ -585,17 +608,13 @@ extend Builder {
 	/// target's width, as the instruction would. Anything else is left to the
 	/// instruction.
 	fn foldedCast(operand: &Operand, to: Ty): Option<Operand> = {
-		val .Const(.Int(bits, ty: from)) = operand else {
-			return .None
-		}
+		val .Const(.Int(bits, ty: from)) = operand else return .None
 		val (fromBits, signed) = match self.kind(from) {
 			.Int(int) => (int.bits(), int.signed())
 			.Char => (32 as u32, false)
 			_ => return .None
 		}
-		val .Int(target) = self.kind(to) else {
-			return .None
-		}
+		val .Int(target) = self.kind(to) else return .None
 		val toBits = target.bits()
 		var value = bits
 		if signed && fromBits < 128 && (value >> (fromBits - 1) as u128) & 1 == 1 then
@@ -632,9 +651,7 @@ extend Builder {
 		at: Span,
 		dest: Option<Place>,
 	): Value = {
-		val .Some(which) = self.program.fns[callee].intrinsic else {
-			panic("an intrinsic")
-		}
+		val .Some(which) = self.program.fns[callee].intrinsic else panic("an intrinsic")
 		return match which {
 			// `Slots::alloc(count)`: the block, with nothing in it.
 			.SlotsAlloc => {
@@ -742,15 +759,6 @@ extend Builder {
 				val boxed = self.behindReference(args[0])
 				self.answer(.Cast(operand: .Copy(move boxed), ty: ty), ty, move dest)
 			}
-			// A slice made of an address and a count: the pair it is.
-			.SliceAt => {
-				val first = self.scalar(args[0])
-				val count = self.scalar(args[1])
-				val place = self.destOr(move dest, ty)
-				self.assign(place.project(.Field(0)), .Use(move first))
-				self.assign(place.project(.Field(1)), .Use(move count))
-				Value::Place(move place)
-			}
 			// A lent closure is a pair: what it captured, then its code; each is
 			// the address a thread is given.
 			.ClosureCode | .ClosureCaptures => {
@@ -800,7 +808,7 @@ extend Builder {
 			// One step on a value other threads may touch: the runtime's
 			// counters, and `std::sync::Atomic`.
 			.AtomicAdd | .AtomicSubtract | .AtomicSwap | .AtomicCompareSwap | .AtomicLoad
-			| .AtomicStore => self.atomic(which, &args, ty, move dest)
+			| .AtomicStore | .AtomicFence => self.atomic(which, &args, ty, move dest)
 			// A pointer as a number, moved on, and a pointer again: what C
 			// writes `p + n`.
 			.OffsetBytes => {
@@ -821,6 +829,21 @@ extend Builder {
 					if which is .SizeOf then .SizeOf(of: of, ty: ty) else .AlignOf(of: of, ty: ty)
 				self.constantAnswer(move answer, move dest)
 			}
+			// Where a field lies, which the layout answers: the checker made
+			// sure the argument is a literal naming a field of the struct.
+			.OffsetOf => {
+				val .Some((_, typeArgs)) = self.program.fns[callee].instanceOf else {
+					panic("`offsetOf` is generic")
+				}
+				val of = self.program.types.list(typeArgs)[0]
+				val .Str(name) = self.hir.exprs[args[0]].kind else panic("a field's name, written")
+				val .Struct(id, ..) = self.program.types.kind(of) else panic("a struct")
+				var index: u32 = 0
+				for (i, field) in self.program.structs[id].fields.forwards().enumerate() {
+					if field.name == name then index = i as u32
+				}
+				self.constantAnswer(.OffsetOf(of: of, index: index, ty: ty), move dest)
+			}
 			// The checker reads the file and answers the call with the constant
 			// that holds it.
 			.EmbedBytes | .EmbedText | .EmbedTextOr => panic(
@@ -828,6 +851,8 @@ extend Builder {
 			)
 			.FrameTables => self.constantAnswer(.FrameTables, move dest)
 			.RuntimeWords => self.constantAnswer(.RuntimeWords, move dest)
+			.ThreadWords => self.constantAnswer(.ThreadWords, move dest)
+			.DebugBuild => self.constantAnswer(.DebugBuild, move dest)
 			// The value is copied out of the box, which is then freed with
 			// nothing in it dropped: the value is the answer's.
 			.OwnUnbox => {
@@ -924,6 +949,24 @@ extend Builder {
 
 	/// One step on a value other threads may touch.
 	var fn atomic(which: Intrinsic, args: &[ExprId], ty: Ty, dest: Option<Place>): Value = {
+		// The arguments before the order, which follows them where given.
+		val given: i64 = match which {
+			.AtomicFence => 0
+			.AtomicLoad => 1
+			.AtomicCompareSwap => 3
+			_ => 2
+		}
+		val order = if args.len() > given then Option::Some(args[given]) else .None
+		if which is .AtomicFence {
+			val (orders, done) = self.orders(order)
+			for (block, chosen) in orders {
+				self.switchTo(block)
+				self.push(.Fence(chosen))
+				if done is .Some(d) then self.terminate(.Goto(d))
+			}
+			if done is .Some(d) then self.switchTo(d)
+			return .Unit
+		}
 		val address = self.scalar(args[0])
 		var value: Option<Operand> = .None
 		var expected: Option<Operand> = .None
@@ -951,57 +994,70 @@ extend Builder {
 				.Store
 			}
 		}
-		if op == .Store {
-			val stored = self.ty(args[1])
-			self.push(.Atomic(
-				op: op,
-				ty: stored,
-				address: move address,
-				value: move value,
-				expected: move expected,
-				dest: .None,
-			))
-			return .Unit
-		}
-		// A compare-and-swap answers what was there, and the call whether that
-		// was what it expected: then it swapped.
-		if op == .CompareSwap {
-			val held = self.ty(args[1])
-			val before = Place::of(self.temp(held))
-			val wanted = match expected {
-				.Some(e) => e.clone()
-				.None => panic("a compare-and-swap expects")
+		// What it is done to: a store's and a compare-and-swap's the value
+		// given, since what they answer is no value or a `bool`.
+		val held = if op == .Store || op == .CompareSwap then self.ty(args[1]) else ty
+		val answered: Option<Place> = if op == .Store {
+			.None
+		} else {
+			match dest {
+				.Some(p) => Option::Some(p.clone())
+				.None => .Some(Place::of(self.temp(ty)))
 			}
+		}
+		val (orders, done) = self.orders(order)
+		for (block, chosen) in orders {
+			self.switchTo(block)
 			self.push(.Atomic(
 				op: op,
+				order: chosen,
 				ty: held,
-				address: move address,
-				value: move value,
-				expected: move expected,
-				dest: .Some(before.clone()),
+				address: address.clone(),
+				value: value.clone(),
+				expected: expected.clone(),
+				dest: answered.clone(),
 			))
-			return self.answer(
-				.Binary(op: .Eq, lhs: .Copy(move before), rhs: move wanted),
-				ty,
-				move dest,
-			)
+			if done is .Some(d) then self.terminate(.Goto(d))
 		}
-		val place = match dest {
-			.Some(p) => p.clone()
-			.None => Place::of(self.temp(ty))
+		if done is .Some(d) then self.switchTo(d)
+		val written = dest.isSome()
+		return match move answered {
+			.None => .Unit
+			.Some(place) =>
+				if written then Value::Place(move place) else Value::Scalar(.Copy(move place))
 		}
-		self.push(.Atomic(
-			op: op,
-			ty: ty,
-			address: move address,
-			value: move value,
-			expected: move expected,
-			dest: .Some(place.clone()),
-		))
-		return match dest {
-			.Some(p) => Value::Place(p.clone())
-			.None => Value::Scalar(.Copy(move place))
+	}
+
+	/// Where an atomic step is written, and in which order, for the order
+	/// `order` names: where it names none, here and sequentially consistent;
+	/// where it is a value known only when the program runs, a block for each
+	/// of its variants after a switch on it, as C compiles an order that is
+	/// not a constant, and the block they go on to. Inlined into a call that
+	/// names one, the switch is folded away.
+	var fn orders(order: Option<ExprId>): (Vec<(BlockId, AtomicOrder)>, Option<BlockId>) = {
+		val .Some(id) = order else {
+			return (Vec::of(own [(self.current, AtomicOrder::SeqCst)]), .None)
 		}
+		val (place, orderTy) = self.testedPlace(id)
+		val .Enum(id: enumId, ..) = self.kind(orderTy) else panic("an atomic's order is an enum")
+		val variant = self.value(I32, .Variant(move place))
+		val done = self.newBlock()
+		var cases: Vec<(u32, BlockId)> = Vec()
+		var orders: Vec<(BlockId, AtomicOrder)> = Vec()
+		for (v, declared) in self.program.enums[enumId].variants.forwards().enumerate() {
+			val chosen: AtomicOrder = match self.interner.resolve(declared.name) {
+				"Relaxed" => .Relaxed
+				"Acquire" => .Acquire
+				"Release" => .Release
+				"AcqRel" => .AcqRel
+				_ => .SeqCst
+			}
+			val block = self.newBlock()
+			cases.push((v as u32, block))
+			orders.push((block, chosen))
+		}
+		self.terminate(.Switch(value: move variant, cases: move cases, otherwise: done))
+		return (move orders, .Some(done))
 	}
 
 	/// The place of one element of a slice, checked against how many there

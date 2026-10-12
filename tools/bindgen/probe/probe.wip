@@ -66,8 +66,10 @@ pub fn ask(
 			if answers[i].isSome() then continue
 			val name = names[i].toStr()
 
-			answers[i] = match enumerator(&values, "wip_probe_\(name)") {
-				.Some(value) => .Some(.Written(Constant(name: name, ty: "i64", value: "\(value)")))
+			answers[i] = match enumeratorText(&values, "wip_probe_\(name)").flatMap((
+				value,
+			) => integer(name, value)) {
+				.Some(constant) => .Some(.Written(move constant))
 				.None => .Some(.Left("`\(name)`, a `#define` whose value clang did not work out"))
 			}
 		}
@@ -79,6 +81,26 @@ pub fn ask(
 		out.push(answer.unwrap())
 	}
 
+	return .Ok(move out)
+}
+
+/// What each of `asked`, integer expressions in C — `sizeof(Vector3)`,
+/// `offsetof(Vector3, y)` — is worth, as clang works them out, in their
+/// order: nothing for one it did not.
+pub fn integers(
+	header: str,
+	reading: &Reading,
+	asked: &[String],
+): Result<Vec<Option<i64>>, String> = {
+	var lines = "#include <stddef.h>\n#include \"\(path::name(header))\"\n"
+	for i in 0..asked.len() {
+		lines.push("enum { wip_probe_\(i) = (\(asked[i])) };\n")
+	}
+	val values = probed(header, reading, lines)?
+	var out: Vec<Option<i64>> = Vec()
+	for i in 0..asked.len() {
+		out.push(enumerator(&values, "wip_probe_\(i)"))
+	}
 	return .Ok(move out)
 }
 
@@ -96,9 +118,7 @@ fn probed(header: str, reading: &Reading, asked: str): Result<Json, String> = {
 
 /// The value the declaration `name` was given, where clang read it.
 fn valueOf(tree: &Json, name: str): Option<&Json> = {
-	val .Some(nodes) = tree.get("inner")?.asArray() else {
-		return .None
-	}
+	val .Some(nodes) = tree.get("inner")?.asArray() else return .None
 
 	for node in nodes.items() {
 		if textOf(node, "name") == .Some(name) {
@@ -112,32 +132,41 @@ fn valueOf(tree: &Json, name: str): Option<&Json> = {
 }
 
 /// What the enumerator `name` is worth, where clang worked it out.
-fn enumerator(tree: &Json, name: str): Option<i64> = {
-	val .Some(nodes) = tree.get("inner")?.asArray() else {
-		return .None
-	}
+fn enumerator(tree: &Json, name: str): Option<i64> = enumeratorText(tree, name)?.toInt().toOption()
+
+/// What the enumerator `name` is worth, as clang wrote it.
+fn enumeratorText(tree: &Json, name: str): Option<String> = {
+	val .Some(nodes) = tree.get("inner")?.asArray() else return .None
 
 	for node in nodes.items() {
-		val .Some(constants) = node.get("inner").flatMap((inner) => inner.asArray()) else {
-			continue
-		}
+		val .Some(constants) = node.get("inner").flatMap((inner) => inner.asArray()) else continue
 		for constant in constants.items() {
-			if textOf(constant, "name") == .Some(name) then return evaluated(constant)
+			if textOf(constant, "name") == .Some(name) then return evaluatedText(constant)
 		}
 	}
 
 	return .None
 }
 
+/// An integer `#define` worth `value`: an `i64`, or a `u64` where it is
+/// more than an `i64` holds, as `(~0ULL)` is.
+fn integer(name: str, value: str): Option<Constant> = {
+	if value.toInt().isOk() then return .Some(Constant(name: name, ty: "i64", value: value))
+	if value.toU64().isOk() then return .Some(Constant(name: name, ty: "u64", value: value))
+	return .None
+}
+
 /// The value clang worked out for an enumerator, where it wrote one down.
-pub fn evaluated(node: &Json): Option<i64> = {
-	val .Some(nodes) = node.get("inner")?.asArray() else {
-		return .None
-	}
+pub fn evaluated(node: &Json): Option<i64> = evaluatedText(node)?.toInt().toOption()
+
+/// The value clang worked out for an enumerator, or a literal a variable
+/// is given, as it wrote it.
+pub fn evaluatedText(node: &Json): Option<String> = {
+	val .Some(nodes) = node.get("inner")?.asArray() else return .None
 
 	for child in nodes.items() {
-		if textOf(child, "value") is .Some(value) then return value.toInt().toOption()
-		if evaluated(child) is .Some(found) then return .Some(found)
+		if textOf(child, "value") is .Some(value) then return .Some(String::of(value))
+		if evaluatedText(child) is .Some(found) then return .Some(move found)
 	}
 
 	return .None
@@ -158,9 +187,7 @@ fn what(
 	val plain = under(value).unwrapOr(value)
 
 	if textOf(plain, "kind") == .Some("StringLiteral") {
-		val .Some(text) = textOf(plain, "value") else {
-			return move left
-		}
+		val .Some(text) = textOf(plain, "value") else return move left
 
 		return match types::constant(name, text) {
 			.Some(constant) => .Some(.Written(move constant))
@@ -168,9 +195,7 @@ fn what(
 		}
 	}
 
-	val .Some(ty) = types::at(written, .Field, known) else {
-		return move left
-	}
+	val .Some(ty) = types::at(written, .Field, known) else return move left
 
 	match ty {
 		.Named(named) if named == "f32" || named == "f64" => {
@@ -288,14 +313,10 @@ fn structText(value: &Json, record: str, items: &Vec<Item>): Option<String> = {
 
 	if textOf(list, "kind") != .Some("InitListExpr") then return .None
 
-	val .Some(elements) = list.get("inner").flatMap((inner) => inner.asArray()) else {
-		return .None
-	}
+	val .Some(elements) = list.get("inner").flatMap((inner) => inner.asArray()) else return .None
 
 	for item in items.items() {
-		val .Record(name, isUnion, opaque, fields) = item else {
-			continue
-		}
+		val .Record(name, isUnion, opaque, fields, ..) = item else continue
 
 		if name != record then continue
 		if isUnion || opaque || fields.len() != elements.len() then return .None

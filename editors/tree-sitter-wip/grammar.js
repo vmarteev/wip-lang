@@ -65,6 +65,9 @@ module.exports = grammar({
     [$.identifier_pattern, $.variant_pattern],
     [$.identifier_pattern, $.binder],
     [$.variant_pattern],
+    // `implicit val x = …`, or an expression that starts with a name: the
+    // `val` after it says.
+    [$.val_statement, $._expression],
   ],
 
   rules: {
@@ -189,7 +192,13 @@ module.exports = grammar({
 
     variadic: _ => '...',
 
+    // `implicit rng: &var Sampler`: a call that leaves it out fills it from
+    // the implicit of its name. `implicit` is a word only here and before
+    // `val` or `var`, and a name anywhere else — a parameter may be called
+    // `implicit` — so it is read as a name before the parameter's, which
+    // the highlights mark where it says `implicit`.
     parameter: $ => seq(
+      optional(field('modifier', alias($.identifier, $.modifier))),
       optional('var'),
       field('name', $.identifier),
       ':',
@@ -260,7 +269,9 @@ module.exports = grammar({
 
     _list_separators: $ => repeat1(choice(',', ';', $._terminator)),
 
+    // `@align(16) lightDir: Vec3`: a field may carry annotations.
     field_declaration: $ => seq(
+      repeat($.annotation),
       optional(seq($.visibility, optional('var'))),
       field('name', $._field_identifier),
       ':',
@@ -282,7 +293,8 @@ module.exports = grammar({
       field('body', $.declaration_list),
     ),
 
-    // `extend Type: Interface { … }`, `extend [T: Ord] { … }`.
+    // `extend Type: Interface { … }`, `extend [T: Ord] { … }`,
+    // `extend own<T: Clone> { … }`.
     extend_block: $ => seq(
       repeat($.annotation),
       'extend',
@@ -290,6 +302,7 @@ module.exports = grammar({
         seq($.scoped_type_identifier, optional($.type_parameters)),
         seq($._type_identifier, optional($.type_parameters)),
         seq('[', $.type_parameter, ']'),
+        seq('own', $.type_parameters),
       )),
       optional(seq(':', field('interface', $._interface_name), optional($.type_arguments))),
       field('body', $.declaration_list),
@@ -403,6 +416,7 @@ module.exports = grammar({
     ),
 
     val_statement: $ => seq(
+      optional(field('modifier', alias($.identifier, $.modifier))),
       choice('val', 'var'),
       field('name', $.identifier),
       optional(seq(':', field('type', $._type))),
@@ -412,13 +426,14 @@ module.exports = grammar({
 
     // A pattern after `val` or `var` starts with `.` or a path, or is a
     // tuple or a slice, or is alternatives: a bare name is a `val`
-    // (grammar §2). One that can fail has an `else`.
+    // (grammar §2). One that can fail has an `else`, which takes a block,
+    // or one expression or jump as a `then` branch does.
     guard_statement: $ => prec(1, seq(
       choice('val', 'var'),
       field('pattern', choice($.tuple_pattern, $.variant_pattern, $.slice_pattern, $.or_pattern)),
       '=',
       field('value', $._expression),
-      optional(seq('else', field('else', $.block))),
+      optional(seq('else', field('else', choice($.block, $._then_branch)))),
     )),
 
     defer_statement: $ => seq('defer', $._expression),
@@ -771,16 +786,19 @@ module.exports = grammar({
       prec(1, $.scoped_identifier),
     ),
 
-    tuple_pattern: $ => seq('(', $._pattern, repeat1(seq(',', $._pattern)), optional(','), ')'),
+    // `(x, y)`, `(x: across, ..)`: a tuple taken apart by position, or a
+    // struct by its fields' names, as the type being matched says.
+    tuple_pattern: $ => seq('(', commaSep1(choice($.binder, $.rest_pattern)), ')'),
 
     // `[first, ..rest]`, `[.., last]`, `[]`: an array or a slice by its
     // elements. `..rest` reads as a range to the name, which the checker
     // tells apart.
     slice_pattern: $ => seq('[', commaSep(choice($._pattern, $.rest_pattern)), ']'),
 
-    // `.Some(x)`, `Shape::Circle`, `Point(x, y)`. A bare name is an
-    // identifier pattern: whether it names a variant or binds one is the
-    // checker's to say.
+    // `.Some(x)`, `Shape::Circle`; `Point(x, y)`, which the checker refuses
+    // with the fix that drops the name. A bare name is an identifier
+    // pattern: whether it names a variant or binds one is the checker's to
+    // say.
     variant_pattern: $ => choice(
       seq('.', field('name', $.identifier), optional($.binders)),
       seq(field('name', $.scoped_identifier), optional($.binders)),

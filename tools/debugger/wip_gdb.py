@@ -54,13 +54,13 @@ def kind_of(gdbtype):
         return "String"
     if (name.startswith("&[") or name.startswith("&var [")) and names == ["ptr", "len"]:
         return "slice"
-    if name.startswith("Vec<") and names == ["slots", "length"]:
+    if name.startswith("Vec<") and names == ["slots", "len"]:
         return "Vec"
     if name.startswith("Set<") and names == ["table", "keys"]:
         return "Set"
     if name.startswith("Map<") and names == ["table", "row"]:
         return "Map"
-    if name.startswith("Deque<") and names == ["slots", "head", "length"]:
+    if name.startswith("Deque<") and names == ["slots", "head", "len"]:
         return "Deque"
     return _enum_kind(gdbtype, name)
 
@@ -91,7 +91,7 @@ def _enum_kind(gdbtype, name):
 
 def _vec(vec):
     """A `Vec`'s first value and how many it holds."""
-    return vec["slots"]["ptr"], int(vec["length"])
+    return vec["slots"]["ptr"], int(vec["len"])
 
 
 def _text(pointer, length):
@@ -207,7 +207,7 @@ class DequePrinter:
     def __init__(self, value):
         self.slots, self.capacity = _vec(value["slots"])
         self.head = int(value["head"])
-        self.count = int(value["length"])
+        self.count = int(value["len"])
 
     def to_string(self):
         return "len %d" % self.count

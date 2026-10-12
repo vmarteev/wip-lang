@@ -133,27 +133,52 @@ fn startsWithVowel(text: str): bool = {
 	return false
 }
 
-/// The structs and enums that hold a `cstring`, through their fields, other
-/// structs and enums, arrays and boxes: a value of one borrows what its C
-/// strings do, as a value that holds a view does. Worked out once, for
-/// every body.
-pub struct CstringHolders {
+/// The structs and enums that hold what C is given of the program's memory,
+/// through their fields, other structs and enums, arrays and boxes: a
+/// `cstring`, or a C struct's pointer, which its literal may make from
+/// `&x`. A value of one borrows what its C strings and pointers do, as a
+/// value that holds a view does. Worked out once, for every body.
+pub struct CHolders {
+	/// What holds a C string or a C struct's pointer.
+	all: Holders
+	/// What holds a C string.
+	strings: Holders
+}
+
+extend CHolders {
+	static fn of(program: &Program): CHolders = CHolders(
+		all: Holders::of(&program, true),
+		strings: Holders::of(&program, false),
+	)
+
+	/// Whether a value of `ty` holds a `cstring`, or a C struct's pointer.
+	fn holds(program: &Program, ty: Ty): bool = self.all.holds(&program, ty)
+
+	/// Whether a value of `ty` holds a `cstring`.
+	fn holdsString(program: &Program, ty: Ty): bool = self.strings.holds(&program, ty)
+}
+
+/// The structs and enums that hold a `cstring`, and, where `pointers`, the C
+/// structs that hold a `ptr<T>`.
+struct Holders {
 	structs: Set<StructId> = Set()
 	enums: Set<EnumId> = Set()
 }
 
-extend CstringHolders {
+extend Holders {
 	/// Those of `program`'s types, each found from what its fields are
 	/// declared as, until no more are found.
-	static fn of(program: &Program): CstringHolders = {
-		var holders = CstringHolders()
+	static fn of(program: &Program, pointers: bool): Holders = {
+		var holders = Holders()
 		var grew = true
 		while grew {
 			grew = false
 			for id in program.structs.ids() {
 				if holders.structs.contains(&id) then continue
+				val cPointers = pointers && program.structs[id].isExtern
 				for field in program.structs[id].fields {
-					if holders.holds(&program, field.ty) {
+					val pointer = cPointers && program.types.kind(field.ty) is .Ptr(..)
+					if pointer || holders.holds(&program, field.ty) {
 						holders.structs.add(id)
 						grew = true
 						break
@@ -174,8 +199,8 @@ extend CstringHolders {
 		return move holders
 	}
 
-	/// Whether a value of `ty` holds a `cstring`. What is behind a reference
-	/// or a `ptr` is not the value's own.
+	/// Whether a value of `ty` is one, or holds one. What is behind a
+	/// reference or a `ptr` is not the value's own.
 	fn holds(program: &Program, ty: Ty): bool = match program.types.kind(ty) {
 		.Cstring => true
 		.Struct(id, args) => self.structs.contains(&id) || self.anyHolds(&program, args)
@@ -202,8 +227,15 @@ extend Checker {
 	/// `str` does; one from C, or a literal, borrows nothing, and is as free
 	/// as a literal `str`.
 	fn isView(ty: Ty): bool =
-		(self.program.holdsView(ty) || self.cstrings.holds(self.program, ty)) &&
+		(self.program.holdsView(ty) || self.cHolders.holds(self.program, ty)) &&
 		self.program.types.kind(ty) !is .Ref(..)
+
+	/// Whether a value of `ty` borrows only through a C struct's pointers,
+	/// and holds no view and no C string.
+	fn pointersOnly(ty: Ty): bool =
+		!self.program.holdsView(ty) &&
+		!self.cHolders.holdsString(self.program, ty) &&
+		self.cHolders.holds(self.program, ty)
 
 	/// Whether a value of `ty` borrows as a view does: a view, or a `&`
 	/// reference kept as one. A lent closure is not one; it borrows what it
@@ -256,9 +288,7 @@ extend Checker {
 				// What a projection lends lies in the argument it lends from,
 				// `names[0]` in `names`; and `&place` is the place.
 				.Call(callee, args, ..) => {
-					val .Some(.Param(base)) = self.program.fns[callee].projects else {
-						return .None
-					}
+					val .Some(.Param(base)) = self.program.fns[callee].projects else return .None
 					if (base as i64) >= args.len() then return .None
 					e = args[base as i64]
 				}
@@ -369,6 +399,11 @@ extend Checker {
 			// `&place`: the place, or what the reference it lies behind
 			// borrows.
 			.Ref(..) | .LendClosure(..) => roots = self.lentRoots(id, Lends::all(), &state)
+			// A C struct's pointers point at what its literal was given; one a
+			// call answers points at nothing the program made with `&`.
+			.Call(..) | .DynCall(..) | .CallValue(..) | .CallClosure(..) if self.pointersOnly(
+				body.exprs[id].ty,
+			) => {}
 			.Call(callee, args, ..) => roots = self.callRoots(.Some(callee), &args, &state)
 			.DynCall(interfaceId, index, args, ..) => {
 				val method = self.program.interfaces[interfaceId].methods[index as i64].id
@@ -442,8 +477,11 @@ extend Checker {
 						.None => match self.accessPath(inner) {
 							.Some(path) => roots.add(self.placeRoots(move path, &state))
 							.None => {
-								if self.place(inner) is .None | .Some(.Temporary(..)) then
-									roots.temporary = .Some(body.exprs[arg].span)
+								val temporary =
+									(self.place(inner) is .None | .Some(.Temporary(..)) &&
+										!self.inTable(inner)) ||
+									self.lentFromTemporary(inner)
+								if temporary then roots.temporary = .Some(body.exprs[arg].span)
 							}
 						}
 					}
@@ -467,6 +505,32 @@ extend Checker {
 			_ => roots = self.strRoots(e, &state)
 		}
 		return move roots
+	}
+
+	/// Whether the place `id` lies in a constant table, which the program
+	/// keeps once and which nothing ends.
+	fn inTable(id: ExprId): bool = match self.body.exprs[id].kind {
+		.Table(..) => true
+		.Field(base, ..) | .Index(base, ..) | .SubSlice(base, ..) | .Deref(base) => self.inTable(
+			base,
+		)
+		_ => false
+	}
+
+	/// Whether the place `id` is one a projection lends from a temporary, made
+	/// in the statement: `makeVec().items()[0]` lies in the vector the call
+	/// answered, which ends with the statement.
+	fn lentFromTemporary(id: ExprId): bool = match self.body.exprs[id].kind {
+		.Field(base, ..) | .Index(base, ..) | .SubSlice(base, ..) => self.lentFromTemporary(base)
+		.Deref(inner) => {
+			val .Call(callee, args, ..) = self.body.exprs[inner].kind else return false
+			val .Some(.Param(at)) = self.program.fns[callee].projects else return false
+			if (at as i64) >= args.len() then return false
+			val .Ref(from) = self.body.exprs[args[at as i64]].kind else return false
+			return (self.place(from) is .None | .Some(.Temporary(..)) && !self.inTable(from)) ||
+				self.lentFromTemporary(from)
+		}
+		_ => false
 	}
 
 	/// What a place borrows, as a root: the place itself, or, where it lies
@@ -529,13 +593,9 @@ extend Checker {
 	/// the `&var` argument's views refer to.
 	var fn varTakesRoots(args: &[ExprId], callee: Option<FnId>, state: &var State) = {
 		for (i, arg) in args.forwards().enumerate() {
-			val .Ref(inner, kind: .Var) = self.program.types.kind(self.ty(arg)) else {
-				continue
-			}
+			val .Ref(inner, kind: .Var) = self.program.types.kind(self.ty(arg)) else continue
 			if !self.isView(inner) then continue
-			val .Some(path) = self.accessPath(arg) else {
-				continue
-			}
+			val .Some(path) = self.accessPath(arg) else continue
 			// What each parameter lends to the value the `&var` one refers to,
 			// as the callee declares them.
 			val lends: Option<Vec<Lends>> = match callee {
@@ -616,9 +676,7 @@ extend Checker {
 				break
 			}
 		}
-		val .Some(lentLocal) = found else {
-			return
-		}
+		val .Some(lentLocal) = found else return
 		val kept = self.interner.resolve(self.body.locals[param].name)
 		val lent = self.interner.resolve(self.body.locals[lentLocal].name)
 		val diagnostic = Diagnostic::error(
@@ -648,7 +706,13 @@ extend Checker {
 		).withSecondary(self.body.locals[kept].span, "`\(keptName)` is not in `keeps`").withNote(
 			"a call keeps nothing of its arguments but what its `keeps` names, so that its callers know what stays borrowed",
 		)
-		if self.keepsAt is .Some((at, written)) {
+		if self.body.locals[kept].name == self.interner.selfSymbol() {
+			// `keeps` names the parameters a call is given, and the receiver
+			// is not one of them.
+			diagnostic = diagnostic.withHelp(
+				"`keeps` cannot name `self`: take the value as a parameter of a `static fn`, which `keeps` can name",
+			)
+		} else if self.keepsAt is .Some((at, written)) {
 			val text = if written then ", \(keptName)" else " keeps \(keptName)"
 			diagnostic = diagnostic.withFix(
 				"say that `\(self.fnName)` keeps `\(keptName)`",
@@ -683,7 +747,11 @@ extend Checker {
 	/// `local`, a `str` variable, now holds the value of `value`.
 	var fn bindStr(local: LocalId, value: ExprId, state: &var State) = {
 		var roots = self.strRoots(value, &state)
-		if roots.temporary is .Some(temporary) then self.keptTemporary(local, value, temporary)
+		// What a loop walks may borrow what the loop's head made, which lives
+		// as long as the loop.
+		val walked = self.body.locals[local].name == Symbol::walked()
+		if roots.temporary is .Some(temporary) && !walked then
+			self.keptTemporary(local, value, temporary)
 		state.roots.put(local, move roots.paths)
 		state.stale.remove(&local)
 	}
@@ -752,9 +820,7 @@ extend Checker {
 	/// Reports a use of a `str` variable whose roots changed (E0436). `name`
 	/// is the use as written: `words[…]`, or a `for` binding.
 	var fn checkStale(local: LocalId, name: str, span: Span, state: &State) = {
-		val .Some(stale) = state.stale.get(&local) else {
-			return
-		}
+		val .Some(stale) = state.stale.get(&local) else return
 		// One report for each change, however many uses follow it.
 		if self.quiet > 0 || !self.staleReported.add((local, stale.change)) then return
 		val root = &stale.root
@@ -858,13 +924,21 @@ extend Checker {
 				answer: "answer the `String`, and make the C string from it where it is used",
 				bind: "keep the `String` in a variable, and make the C string from it where it is used",
 			)
-		else if !self.program.holdsView(ty) && self.cstrings.holds(self.program, ty) then
+		else if !self.program.holdsView(ty) && self.cHolders.holdsString(self.program, ty) then
 			Borrowing(
 				stale: "a C string made from a `String` points into its bytes, so those must not change while what holds the C string is still used",
 				leaving: "a value that holds a C string may leave a function only where the C string borrows what its reference parameters refer to",
 				instead: "make its C string again after the change",
 				answer: "keep the `String` its C string was made from where the value is used, or give it a C string from C or a literal",
 				bind: "keep the `String` in a variable, and make the C string from it",
+			)
+		else if !self.program.holdsView(ty) && self.cHolders.holds(self.program, ty) then
+			Borrowing(
+				stale: "a C struct's pointer made with `&` points at what it was made from, so that must not change while the struct is still used",
+				leaving: "a C struct that leaves a function may only point at what its reference parameters refer to",
+				instead: "build the struct again after the change",
+				answer: "keep what it points at where the struct is used, and build the struct there",
+				bind: "keep what it points at in a variable, and build the struct from it",
 			)
 		else if ty == STR then
 			Borrowing(
@@ -908,9 +982,7 @@ extend Checker {
 					break
 				}
 			}
-			val .Some(k) = found else {
-				continue
-			}
+			val .Some(k) = found else continue
 			val root = self.rootName(&vars[k].1)
 			val diagnostic = Diagnostic::error(
 				STR_OUTLIVED_ITS_BYTES,
@@ -971,9 +1043,7 @@ extend Checker {
 			var unlent: Option<(Path, i64)> = .None
 			for p in roots.paths {
 				if p.isLent() then continue
-				val .Some(param) = self.body.params.indexOf(&p.local) else {
-					continue
-				}
+				val .Some(param) = self.body.params.indexOf(&p.local) else continue
 				if param >= self.lends.len() then continue
 				if self.isRefParam(p.local) && !self.lends[param].place {
 					unlent = .Some((p.clone(), param))
@@ -1006,9 +1076,7 @@ extend Checker {
 			var unnamed: Option<(Path, i64)> = .None
 			for p in roots.paths {
 				if !p.isLent() then continue
-				val .Some(param) = self.body.params.indexOf(&p.local) else {
-					continue
-				}
+				val .Some(param) = self.body.params.indexOf(&p.local) else continue
 				if param >= self.lends.len() then continue
 				if !self.lends[param].borrows {
 					unnamed = .Some((p.clone(), param))
@@ -1036,9 +1104,7 @@ extend Checker {
 				break
 			}
 		}
-		val .Some(root) = found else {
-			return
-		}
+		val .Some(root) = found else return
 		val name = self.rootName(&root)
 		val owner =
 			if self.generator then "`\(name)` is the generator's own, and moves with it"
@@ -1075,9 +1141,7 @@ extend Checker {
 				break
 			}
 		}
-		val .Some(root) = found else {
-			return
-		}
+		val .Some(root) = found else return
 		val name = self.rootName(&root)
 		val diagnostic = Diagnostic::error(
 			STR_OUTLIVES_ITS_ROOT,

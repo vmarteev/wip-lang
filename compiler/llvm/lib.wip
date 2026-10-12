@@ -30,6 +30,7 @@ import mir::{
 	Layouts,
 	Part,
 	Reg,
+	TableBytes,
 	functionBody,
 	isAggregate,
 	isClosurePointer,
@@ -50,6 +51,9 @@ val RUNTIME_WORDS: u32 = 0
 
 /// The number of the list of the tables a panic reads, the second.
 val FRAME_TABLES: u32 = 1
+
+/// The name of the block of words each thread has.
+val THREAD_WORDS: u32 = 2
 
 /// What the program starts at: its `main`, or the tests `wip test` runs.
 pub enum Entry {
@@ -134,9 +138,7 @@ fn bodyOf(
 	optimize: bool,
 ): Option<Body> = match waiting {
 	.Fn(id) => {
-		val .Some(lowered) = functionBody(program, interner, id) else {
-			return .None
-		}
+		val .Some(lowered) = functionBody(program, interner, id) else return .None
 		var body = move lowered
 		// A release build's MIR splits its scalars out; a debug build's
 		// keeps each variable whole, for the debugger.
@@ -329,6 +331,7 @@ extend Llvm {
 		)
 		llvm.global("@wip_runtime_words")
 		llvm.global("@\"wip.frame_tables\"")
+		llvm.global("@wip_thread_words")
 		return move llvm
 	}
 
@@ -362,19 +365,35 @@ extend Llvm {
 		var panics = returns.clone()
 		panics.push(.NoReturn)
 		panics.push(.NoMerge)
+		// A function in a cycle of calls is inlined nowhere, in a release
+		// build: inlined into another of its cycle, it would make that one
+		// carry both, and every turn of the recursion save the registers
+		// the most demanding needs. A walk of a tree by a `match` over its
+		// kinds keeps each kind's method a function of its own, with its
+		// own frame, as a virtual function has; a leaf, in no cycle, is
+		// still inlined where LLVM finds it pays.
+		var inCycles = returns.clone()
+		inCycles.push(.NoInline)
 		val declared = self.declared()
 		// The runtime's words, and the list of the tables a panic reads its
 		// calls from, which is written once LLVM has compiled the program and
 		// its DWARF says what is where (`frames.wip`).
-		val globals = Vec::of(own [runtimeWords(RUNTIME_WORDS), frameTables(FRAME_TABLES)])
+		val globals = Vec::of(own [
+			runtimeWords(RUNTIME_WORDS),
+			frameTables(FRAME_TABLES),
+			threadWords(THREAD_WORDS),
+		])
+		val optimize = self.optimize
+		var functions = move self.functions
+		if optimize then markCycles(&var functions)
 		val module = Module(
 			heading: "; Written by wip's LLVM backend.",
 			names: move self.names,
 			data: move self.data,
 			globals: move globals,
 			declared: move declared,
-			functions: move self.functions,
-			groups: Vec::of(own [move returns, move panics]),
+			functions: move functions,
+			groups: Vec::of(own [move returns, move panics, move inCycles]),
 			unit: self.debug.unit,
 			flags: self.debug.flags,
 			nodes: move self.debug.nodes,
@@ -473,9 +492,7 @@ extend Llvm {
 	/// A scalar parameter or result: values narrower than 32 bits are extended
 	/// by the caller, as Apple's arm64 ABI requires.
 	fn slot(ty: Ty): Option<Slot> = {
-		val .Some(lt) = self.lt(ty) else {
-			return .None
-		}
+		val .Some(lt) = self.lt(ty) else return .None
 		val attr: Option<Attr> = match self.kind(ty) {
 			// A `&var` argument is the only way to its place while the call
 			// runs, which is what LLVM's `noalias` says. `WIP_LLVM_NOALIAS=0`
@@ -495,9 +512,7 @@ extend Llvm {
 	/// reads it as `malloc`'s promise of memory nothing else reaches, which a
 	/// projection's `&var` into its argument is not.
 	fn result(ty: Ty): Option<Slot> = {
-		val .Some(found) = self.slot(ty) else {
-			return .None
-		}
+		val .Some(found) = self.slot(ty) else return .None
 		var slot = move found
 		val noalias = Attr::NoAlias
 		if slot.attrs.contains(&noalias) then slot.attrs = Vec()
@@ -547,8 +562,11 @@ extend Llvm {
 	}
 
 	/// The signature of a function of `params` and `ret`; `cAbi` where C is on
-	/// the other side, and a `str` is two arguments.
-	var fn signatureWith(params: &[Ty], ret: Ty, cAbi: bool): Sig = {
+	/// the other side, and a `str` is two arguments. `readsItsValues` where the
+	/// function is known, and does not write what it is given by value: every
+	/// function but a `@tailrec` one, whose calls to itself are written into
+	/// its parameters; not a call through a value, which may be to one.
+	var fn signatureWith(params: &[Ty], ret: Ty, cAbi: bool, readsItsValues: bool): Sig = {
 		var slots: Vec<Slot> = Vec()
 		val sret = self.isAggregate(ret)
 		if sret then slots.push(Slot::of(.Ptr))
@@ -568,9 +586,26 @@ extend Llvm {
 			// nothing else reaches while the call runs: a copy the caller made
 			// of a place it keeps, or what it moved or built, which it no
 			// longer names. The callee never assigns to it, and moves out of it
-			// only what the caller gave up.
-			if !cAbi && self.noalias && self.isAggregate(param) then
+			// only what the caller gave up. Where it is plain data nothing is
+			// moved out of it either, so the callee only reads it, and keeps
+			// no pointer to it past the call: which lets LLVM pass the
+			// caller's own place, where it does not change while the call
+			// runs, rather than a copy of it.
+			if !cAbi && self.noalias && self.isAggregate(param) {
 				slot.attrs = Vec::of(own [Attr::NoAlias])
+				if readsItsValues && !self.program.ownsMemory(param) {
+					slot.attrs.push(.ReadOnly)
+					slot.attrs.push(.NoCapture)
+				}
+				// The place is a whole value of the type, aligned as the type
+				// is, as a reference's is.
+				val layout = self.layout(param)
+				if layout.size > 0 {
+					slot.attrs.push(.NonNull)
+					slot.attrs.push(.Dereferenceable(layout.size))
+					slot.attrs.push(.Align(layout.align.max(1)))
+				}
+			}
 			addAttr(&var slot, self.referentAttrs(param))
 			slots.push(move slot)
 		}
@@ -625,7 +660,7 @@ extend Llvm {
 			}
 			self.noalias = keep && named
 		}
-		val sig = self.signatureWith(&params, def.ret, usesCAbi(&def))
+		val sig = self.signatureWith(&params, def.ret, usesCAbi(&def), !def.isTailrec)
 		self.noalias = keep
 		return move sig
 	}
@@ -635,7 +670,7 @@ extend Llvm {
 	var fn indirectSignature(params: &[Ty], ret: Ty, cAbi: bool): Sig = {
 		val keep = self.noalias
 		if io::env("WIP_LLVM_NOALIAS_ONLY").isSome() then self.noalias = false
-		val sig = self.signatureWith(&params, ret, cAbi)
+		val sig = self.signatureWith(&params, ret, cAbi, false)
 		self.noalias = keep
 		return move sig
 	}
@@ -870,23 +905,32 @@ extend Llvm {
 	}
 
 	/// A constant table, kept once, in read-only data: its bytes, with the
-	/// addresses of strings and files where they go.
+	/// addresses of strings, files and lists where they go.
 	var fn table(id: ConstId): u32 = {
 		if self.tables.get(&id) is .Some(name) then return name
-		val written = "wip.table.\(id.index())"
 		val def = &self.program.consts[id]
 		val ty = def.ty
-		val .Some(value) = def.value else {
-			panic("only a table that was worked out is kept")
-		}
+		val .Some(value) = def.value else panic("only a table that was worked out is kept")
 		// Every target Wip builds for keeps its words little-endian.
 		val table = tableBytes(self.program, self.interner, &var self.layouts, &value, ty, true)
+		val align = self.layout(ty).align.max(1)
+		val name = self.kept("wip.table.\(id.index())", &table, align)
+		self.tables.put(id, name)
+		return name
+	}
+
+	/// A table's bytes as a constant named `written`, and each list in it as
+	/// one of its own beside it.
+	var fn kept(written: str, table: &TableBytes, align: u32): u32 = {
 		var addresses: Vec<(u32, u32)> = Vec()
 		for (offset, symbol) in table.strings {
 			addresses.push((offset, self.string(symbol)))
 		}
 		for (offset, bytes, origin) in table.blobs {
 			addresses.push((offset, self.blob(origin, &bytes)))
+		}
+		for (i, (offset, list, listAlign)) in table.lists.forwards().enumerate() {
+			addresses.push((offset, self.kept("\(written).\(i)", &list, listAlign.max(1))))
 		}
 		addresses.sortBy((a, b) => a.0 < b.0)
 		var types: Vec<Type> = Vec()
@@ -907,10 +951,7 @@ extend Llvm {
 			types.push(byteArray((bytes.len() - at).max(1) as u32))
 			values.push(byteConstant(&bytes[at..bytes.len()]))
 		}
-		val align = self.layout(ty).align.max(1)
-		val name = self.constant(written, structOf(move types, true), .Packed(move values), align)
-		self.tables.put(id, name)
-		return name
+		return self.constant(written, structOf(move types, true), .Packed(move values), align)
 	}
 
 	/// A type's table of methods for an interface.
@@ -1017,9 +1058,7 @@ extend Llvm {
 	var fn defineFunction(id: FnId) = {
 		val program = self.program
 		val def = &program.fns[id]
-		val .Some(.Some(lowered)) = self.madeFns.remove(&id) else {
-			return
-		}
+		val .Some(.Some(lowered)) = self.madeFns.remove(&id) else return
 		var body = move lowered
 		// For finding what MIR reads before it writes.
 		if io::env("WIP_MIR_UNWRITTEN").isSome() {
@@ -1048,7 +1087,7 @@ extend Llvm {
 			for p in def.params {
 				params.push(p.ty)
 			}
-			sig = self.signatureWith(&params, def.ret, true)
+			sig = self.signatureWith(&params, def.ret, true, false)
 			symbol = bodySymbol
 			linkage = self.ownLinkage()
 		}
@@ -1211,49 +1250,47 @@ extend Llvm {
 		self.define(String(), move function)
 	}
 
-	/// The runner `wip test` asks for: each test in turn, its name before and
-	/// `ok` after.
+	/// The runner `wip test` asks for: the library's, given each test in
+	/// turn — its name, its function, and for one that must panic, the text
+	/// its message must hold and where it is, for a failure to say.
 	var fn defineTestEntry(tests: &[FnId]) = {
-		val plural = if tests.len() == 1 then "test" else "tests"
-		var lines: Vec<String> = Vec::of(own ["running \(tests.len()) \(plural)\n"])
-		for id in tests {
-			lines.push("test \(self.program.testName(id, self.interner)) ... ")
-		}
-		lines.push("ok\n")
-		lines.push("\n\(tests.len()) \(plural) passed\n")
-		val printer = self.runtime("wip_print_text")
-		val print = Value::Global(self.symbol(printer))
-		var texts: Vec<(u32, i64)> = Vec()
-		for line in lines {
-			texts.push((self.text(line), line.len()))
-		}
-		var callees: Vec<u32> = Vec()
-		for id in tests {
-			callees.push(self.symbol(id))
-		}
 		var code: Vec<(Option<Value>, Op)> = Vec()
-		val say = (code: &var Vec<(Option<Value>, Op)>, said: &(u32, i64)) => code.push(
-			(
-				.None,
-				.Call(own Call::plain(
-					print.clone(),
-					.Void,
-					Vec::of(own [
-						Val::of(.Global(said.0), .Ptr),
-						Val::of(.Int(said.1 as i64), .I(64)),
-					]),
-				)),
-			),
-		)
-		say(&var code, &texts[0])
-		for (index, callee) in callees.forwards().enumerate() {
-			say(&var code, &texts[index + 1])
-			code.push((.None, .Call(own Call::plain(.Global(callee), .Void, Vec()))))
-			say(&var code, &texts[tests.len() + 1])
+		val count = Val::of(.Int(tests.len() as i64), .I(64))
+		self.callRuntime(&var code, "wip_tests_begin", Vec::of(own [count.clone()]))
+		for id in tests {
+			val name = self.program.testName(id, self.interner)
+			var args = Vec::of(own [
+				Val::of(.Global(self.text(name)), .Ptr),
+				Val::of(.Int(name.len() as i64), .I(64)),
+				Val::of(.Global(self.symbol(id)), .Ptr),
+			])
+			val .Some(.Panics(holding)) = self.program.fns[id].test else {
+				self.callRuntime(&var code, "wip_test", move args)
+				continue
+			}
+			val text = match holding {
+				.Some(symbol) => self.interner.resolve(symbol)
+				.None => ""
+			}
+			args.push(Val::of(.Global(self.text(text)), .Ptr))
+			args.push(Val::of(.Int(text.len() as i64), .I(64)))
+			val (file, line, column) = (self.locations)(self.program.fns[id].span)
+			args.push(Val::of(.Global(self.text(file)), .Ptr))
+			args.push(Val::of(.Int(file.len() as i64), .I(64)))
+			args.push(Val::of(.Int(line as i64), .I(64)))
+			args.push(Val::of(.Int(column as i64), .I(64)))
+			self.callRuntime(&var code, "wip_test_panics", move args)
 		}
-		say(&var code, &texts[tests.len() + 2])
+		self.callRuntime(&var code, "wip_tests_end", Vec::of(own [move count]))
 		code.push((.None, .Ret(.Some(Val::of(.Int(0), .I(32))))))
 		self.defineCMain(move code)
+	}
+
+	/// A call to the runtime's function `name`, which answers nothing, with
+	/// `args`, at the end of `code`.
+	var fn callRuntime(code: &var Vec<(Option<Value>, Op)>, name: str, args: Vec<Val>) = {
+		val callee = self.symbol(self.runtime(name))
+		code.push((.None, .Call(own Call::plain(.Global(callee), .Void, move args))))
 	}
 }
 
@@ -1266,6 +1303,19 @@ fn runtimeWords(name: u32): Global = Global(
 	t: arrayOf(8, .I(64)),
 	init: .Some(.Zero),
 	align: .Some(8),
+)
+
+/// The block of words each thread has of its own, named `name`, zeroed in
+/// a new thread: where the runtime keeps the thread's allocator.
+fn threadWords(name: u32): Global = Global(
+	name: name,
+	linkage: .External,
+	unnamedAddr: false,
+	constant: false,
+	t: arrayOf(4, .I(64)),
+	init: .Some(.Zero),
+	align: .Some(8),
+	threadLocal: true,
 )
 
 /// The list of the tables a panic reads, named `name`, which the program's
@@ -1290,9 +1340,7 @@ fn byteArray(size: u32): Type = arrayOf(size as u64, .I(8))
 
 /// `slot`'s attributes, and `more` after them.
 fn addAttr(slot: &var Slot, more: Vec<Attr>) = {
-	for attr in move more {
-		slot.attrs.push(move attr)
-	}
+	slot.attrs.append(move more)
 }
 
 /// Whether C is on the other side of a function's calls.
@@ -1317,4 +1365,84 @@ fn escape(text: str): String = {
 		}
 	}
 	return move out
+}
+
+/// Marks the functions that are in a cycle of their direct calls: each
+/// strongly connected component of the call graph of more than one
+/// function, or of one that calls itself. Tarjan's algorithm, with a stack
+/// of its own rather than recursion, since a program's calls may run deep.
+fn markCycles(functions: &var Vec<Function>) = {
+	var bySymbol: Map<u32, i64> = Map()
+	for (at, function) in functions.forwards().enumerate() {
+		bySymbol.put(function.symbol, at)
+	}
+	// Each function's callees among the functions, by position.
+	var callees: Vec<Vec<i64>> = Vec()
+	for function in functions {
+		var called: Vec<i64> = Vec()
+		for block in function.blocks {
+			for instruction in block.instructions {
+				if instruction.op is .Call(call) &&
+					call.callee is .Global(index) &&
+					bySymbol.get(&index) is .Some(at) {
+					called.push(at)
+				}
+			}
+		}
+		callees.push(move called)
+	}
+	val count = functions.len()
+	var index = Vec::filled(count, -1)
+	var low = Vec::filled(count, 0)
+	var onStack = Vec::filled(count, false)
+	var stack: Vec<i64> = Vec()
+	var next = 0
+	for root in 0..count {
+		if index[root] >= 0 then continue
+		// The walk: each function entered, and how far through its callees.
+		var walk: Vec<(i64, i64)> = Vec::of(own [(root, 0)])
+		index[root] = next
+		low[root] = next
+		next += 1
+		stack.push(root)
+		onStack[root] = true
+		while !walk.isEmpty() {
+			val (v, edge) = walk.atLast()
+			if edge < callees[v].len() {
+				walk.atLast().1 = edge + 1
+				val w = callees[v][edge]
+				if index[w] < 0 {
+					index[w] = next
+					low[w] = next
+					next += 1
+					stack.push(w)
+					onStack[w] = true
+					walk.push((w, 0))
+				} else if onStack[w] && index[w] < low[v] {
+					low[v] = index[w]
+				}
+				continue
+			}
+			walk.pop()
+			if !walk.isEmpty() {
+				val parent = walk.atLast().0
+				if low[v] < low[parent] then low[parent] = low[v]
+			}
+			if low[v] != index[v] then continue
+			// `v` heads a component: what is above it on the stack.
+			var component: Vec<i64> = Vec()
+			while true {
+				val .Some(w) = stack.pop() else break
+				onStack[w] = false
+				component.push(w)
+				if w == v then break
+			}
+			val cycle = component.len() > 1 || callees[v].contains(&v)
+			if cycle {
+				for w in component {
+					functions[w].inCycle = true
+				}
+			}
+		}
+	}
 }

@@ -353,11 +353,11 @@ one, a variant's payload. A local whose whole value is `&place` holds a
 reference without its type written; a `&` that is part of a value — a
 tuple's element — needs the type said. A slice has nothing of fixed size to
 copy, so a local or an array given a slice read through a reference — a
-parameter `bytes: &[u8]`, a constant of embedded bytes, a call that lends
-one — holds the reference: `val all = bytes`, `[bytes, rest]`, `val view =
-list.items()`, which borrows `list` as `&list.items()` would. A `var`
-holding one may be pointed somewhere else. Reading it reads what it refers
-to, as reading a reference parameter does:
+parameter `bytes: &[u8]`, a constant of embedded bytes or a list, a call
+that lends one — holds the reference: `val all = bytes`, `[bytes, rest]`,
+`val view = list.items()`, which borrows `list` as `&list.items()` would. A
+`var` holding one may be pointed somewhere else. Reading it reads what it
+refers to, as reading a reference parameter does:
 
 ```wip,run
 struct Node {
@@ -626,7 +626,12 @@ fn main() = {
 
 The body is held to it: one that stores a parameter its `keeps` does not
 name in a `&var` parameter's place, by assignment or by a call that keeps
-it, is refused, with a fix that names it (E0449). A value of a type
+it, is refused, with a fix that names it (E0449). So is one that stores a
+reference made from what a parameter refers to — `&thing.name` of a
+`thing: &Thing`, a view a method of `thing` answers, an element a `for`
+over it binds — since that borrows what the parameter borrows. `keeps`
+names parameters, and a method's receiver is not one: a function that
+keeps what it is given takes it as a parameter. A value of a type
 parameter counts, since an instance may make it a `str`, which is why
 `Vec`'s `push` says `keeps value`:
 

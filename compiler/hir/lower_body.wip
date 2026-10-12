@@ -1,6 +1,6 @@
 // Function bodies, blocks and statements, and `if`.
 
-import std::collections::{Map}
+import std::collections::{Map, Set}
 import std::mem
 import syntax as ast
 import syntax::{
@@ -31,9 +31,7 @@ fn lacksElse(file: &ast::Ast, e: ast::ExprId): bool = match file.exprs[e].kind {
 
 /// The `-` that an expression statement starts with, if any.
 fn leadingNeg(file: &ast::Ast, stmt: ast::StmtId): Option<Span> = {
-	val .Expr(start) = file.stmts[stmt].kind else {
-		return .None
-	}
+	val .Expr(start) = file.stmts[stmt].kind else return .None
 	var e = start
 	while true {
 		match file.exprs[e].kind {
@@ -130,12 +128,14 @@ extend Lowerer {
 			.None => .None
 		}
 		self.state.body = Body()
+		self.state.byteLiterals = Set()
 		self.state.scopes = Vec::of(own [Map()])
 		self.state.lends = 0
 		self.state.lentParam = .None
 		self.state.lentTable = false
 		for p in params {
 			val local = self.declare(p.name, p.ty, .Param, p.nameSpan)
+			self.state.body.locals[local].implicit = p.implicit
 			self.state.body.params.push(local)
 		}
 		val value =
@@ -374,7 +374,7 @@ extend Lowerer {
 		val stmt = &file.stmts[id]
 		val (kind, diverges) = match stmt.kind {
 			.Yield(value) => (self.yieldStmt(value, stmt.span), false)
-			.Let(mutable, name, ty: written, init) => {
+			.Let(mutable, isImplicit, name, ty: written, init) => {
 				val (checkedInit, checkedTy) = self.letValue(mutable, written, init)
 				// A slice read through a reference is kept as the reference;
 				// any other slice stands for elements that belong to the
@@ -393,9 +393,12 @@ extend Lowerer {
 				} else {
 					keptTy
 				}
+				// The keyword, after `implicit` where that is written.
+				val keyword = stmt.span.lo + (if isImplicit then 9 else 0)
 				val localKind: LocalKind =
-					if mutable then .Var else .Let(Span::new(stmt.span.lo, stmt.span.lo + 3))
+					if mutable then .Var else .Let(Span::new(keyword, keyword + 3))
 				val local = self.declare(name.sym, ty, localKind, name.span)
+				self.state.body.locals[local].implicit = isImplicit
 				(.Let(local: local, init: kept), ty == NEVER)
 			}
 			.Defer(e) => {
@@ -582,12 +585,8 @@ extend Lowerer {
 		}
 		// The element alone is substituted: the slice of it may be a type
 		// nothing has made yet, which a lookup cannot find.
-		val .Ref(inner: slice, ..) = self.kind(self.program.fns[items].ret) else {
-			return .None
-		}
-		val .Slice(elem) = self.kind(slice) else {
-			return .None
-		}
+		val .Ref(inner: slice, ..) = self.kind(self.program.fns[items].ret) else return .None
+		val .Slice(elem) = self.kind(slice) else return .None
 		return self.program.types.trySubstFind(elem, &args)
 	}
 
@@ -596,9 +595,7 @@ extend Lowerer {
 	/// prelude's `Items`, which is a projection, so what the loop visits
 	/// belongs to the container.
 	var fn itemsOf(receiver: ExprId, ty: Ty): Walked = {
-		val .Some(interfaceId) = self.program.preludeItems.interfaceOf(.Items) else {
-			return .No
-		}
+		val .Some(interfaceId) = self.program.preludeItems.interfaceOf(.Items) else return .No
 		// A type parameter lends its elements because a constraint says so,
 		// and the call goes through the interface's own method, which its
 		// instance replaces.
@@ -615,14 +612,10 @@ extend Lowerer {
 					}
 				}
 			}
-			val .Some(elem) = found else {
-				return .No
-			}
+			val .Some(elem) = found else return .No
 			args = Vec::of(own [ty, elem])
 		} else {
-			val .Some(owner) = self.ownerOf(ty) else {
-				return .No
-			}
+			val .Some(owner) = self.ownerOf(ty) else return .No
 			// Its element is what its implementation decides, and it has one.
 			var method: Option<FnId> = .None
 			for i in self.program.impls {
@@ -631,9 +624,7 @@ extend Lowerer {
 					break
 				}
 			}
-			val .Some(m) = method else {
-				return .No
-			}
+			val .Some(m) = method else return .No
 			items = m
 			// A method of a generic container is generic in the container's own
 			// parameters.
@@ -644,12 +635,8 @@ extend Lowerer {
 		}
 		val typeArgs = self.program.types.internList(&args)
 		val ret = self.program.types.subst(self.program.fns[items].ret, &args)
-		val .Ref(inner: slice, ..) = self.kind(ret) else {
-			return .No
-		}
-		val .Slice(elem) = self.kind(slice) else {
-			return .No
-		}
+		val .Ref(inner: slice, ..) = self.kind(ret) else return .No
+		val .Slice(elem) = self.kind(slice) else return .No
 		val span = self.state.body.exprs[receiver].span
 		// The container is lent for the call, as `c.items()` lends it.
 		val borrowed = self.intern(.Ref(inner: ty, kind: .Shared))
@@ -934,11 +921,13 @@ extend Lowerer {
 			self.state.inferringRet = false
 			val .Some(v) = value else {
 				self.state.ret = UNIT
+				self.settlePendingTries(.Some(span))
 				return .None
 			}
 			val e = self.infer(v, .None)
 			val ty = self.tyOf(e)
 			self.state.ret = if ty == NEVER then UNIT else ty
+			self.settlePendingTries(.Some(self.state.body.exprs[e].span))
 			return .Some(e)
 		}
 		val ret = self.state.ret
@@ -991,9 +980,7 @@ extend Lowerer {
 			self.messageText(n, ASSERT_NOTE, "an assert's note") is .Some(value) {
 			if self.state.body.exprs[value].kind !is .Str(..) then built = .Some(value)
 		}
-		val .Some(text) = message else {
-			return self.errorExpr(span)
-		}
+		val .Some(text) = message else return self.errorExpr(span)
 		val negated = self.alloc(.Unary(op: .Not, operand: condition), BOOL, span)
 		val panicked = self.alloc(.Panic(note: built, message: .Some(text)), NEVER, span)
 		val thenBlock = Block(stmts: Vec(), value: .Some(panicked), span: span)
@@ -1031,6 +1018,39 @@ extend Lowerer {
 				span,
 			)
 		}
+		// A `then` branch that takes its type from beside it, `1.0`, takes
+		// the `else` branch's: checked after it, with the condition's
+		// bindings put back in scope for it.
+		if hint.isNone() && self.blockTakesTypeBeside(&thenBlock) && !self.takesTypeBeside(elseAt) {
+			val .Some(bindings) = self.state.scopes.pop() else panic("the condition's scope")
+			val (checkedElse, elseTy) = self.elseBlock(elseAt, .None)
+			self.state.scopes.push(move bindings)
+			val expected: Option<Ty> = if elseTy != NEVER then .Some(elseTy) else .None
+			val reported = self.errorsReported()
+			val (checkedThen, thenTy) = self.checkBlock(&thenBlock, expected)
+			self.state.scopes.pop()
+			// A branch that could not take the other's type has been reported,
+			// and the `if` says nothing more of its type.
+			val ty = if self.errorsReported() > reported || self.isPoisoned(thenTy) {
+				ERROR
+			} else if thenTy == NEVER && elseTy == NEVER {
+				NEVER
+			} else {
+				match expected {
+					.Some(t) => t
+					.None => thenTy
+				}
+			}
+			return self.alloc(
+				.If(
+					cond: condition,
+					thenBlock: move checkedThen,
+					elseBlock: .Some(move checkedElse),
+				),
+				ty,
+				span,
+			)
+		}
 		val (checkedThen, thenTy) = self.checkBlock(&thenBlock, hint)
 		self.state.scopes.pop()
 		// Without an expected type, the `then` branch sets the type of the
@@ -1053,6 +1073,15 @@ extend Lowerer {
 			ty,
 			span,
 		)
+	}
+
+	/// How many errors have been reported so far.
+	fn errorsReported(): i64 = {
+		var count = 0
+		for d in self.diagnostics {
+			if d.isError() then count += 1
+		}
+		return count
 	}
 
 	/// The `else` branch: a block, or an `else if` held as a block's value.

@@ -39,9 +39,7 @@ extend Lowerer {
 	var fn declareConsts() = {
 		val file = self.ast
 		for item in file.items {
-			val .Val(decl) = item else {
-				continue
-			}
+			val .Val(decl) = item else continue
 			val annotations = self.annotations(&decl.annotations, .Val)
 			val id = self.program.consts.add(ConstDef(
 				name: decl.name.sym,
@@ -100,9 +98,7 @@ extend Lowerer {
 	var fn constValue(id: ConstId) = {
 		if self.constsDone.contains(&id) then return
 		// Taken out while it is worked out, which changes `self`, and put back.
-		val .Some(found) = self.constSources.remove(&id) else {
-			return
-		}
+		val .Some(found) = self.constSources.remove(&id) else return
 		// Its file's lambdas and generators are wanted once, now; the rest of
 		// where it was written is read again while it is worked out.
 		var source = move found
@@ -123,13 +119,14 @@ extend Lowerer {
 		self.enter(source.module, source.ast, source.imports.clone())
 		self.outer.push(mem::replace(&var self.state, BodyState()))
 		self.state.scopes = Vec::of(own [Map()])
+		self.state.constant = true
 		val decl = source.decl
 		val (value, ty) = match decl.ty {
 			.Some(t) => {
 				var ty = self.resolveTy(t)
-				// A file's bytes, embedded, are the one reference a constant
-				// holds, alone or in an array.
-				if (!self.bytesRefsOnly(ty) &&
+				// What a slice points at is kept with the constant: a file's
+				// bytes, embedded, and a list written in it.
+				if (!self.holdsKeptOnly(ty) &&
 					self.noRef(ty, t, "a constant cannot hold a reference", .None)) ||
 					self.noNever(ty, t, "a constant") ||
 					self.bareSlice(ty, t, false) {
@@ -152,6 +149,16 @@ extend Lowerer {
 			self.report(
 				Diagnostic::error(NOT_A_CONSTANT, "a top-level `val` cannot hold what owns memory", span, "\(self.tyName(ty)) owns memory").withNote(
 					"each use of a constant is its value, made there; a value that owns memory would be made and freed at every use",
+				),
+			)
+			Result::Err(.Failed)
+		} else if self.ownedInList(ty) is .Some(elem) {
+			// A list is kept once for the whole program, where nothing frees
+			// what it holds.
+			val span = self.state.body.exprs[value].span
+			self.report(
+				Diagnostic::error(NOT_A_CONSTANT, "a list in a constant cannot hold what owns memory", span, "\(self.tyName(elem)) owns memory").withNote(
+					"a list is kept once, where the program keeps the constant, and nothing frees what it holds",
 				),
 			)
 			Result::Err(.Failed)
@@ -194,11 +201,22 @@ extend Lowerer {
 			.Bool(value) => .Ok(.Bool(value))
 			.Str(symbol) => .Ok(.Str(symbol))
 			.Error => .Err(.Failed)
-			// A table's value, where it is known and holds a file's bytes, which
-			// is read where it is kept rather than made again.
+			// A table's value, where it is known and holds what a slice points
+			// at, which is read where it is kept rather than made again.
 			.Deref(address) => match self.state.body.exprs[address].kind {
 				.Table(table) => match self.program.consts[table].value {
-					.Some(value) if value.holdsBytes() => .Ok(value.clone())
+					.Some(value) if value.holdsKept() => .Ok(value.clone())
+					_ => .Err(.Runs)
+				}
+				// What a reference to a value refers to: the value.
+				.Ref(inner) => self.fold(inner)
+				_ => .Err(.Runs)
+			}
+			// A list: an array written where a slice is wanted, lent as all of
+			// it, which the slice points at where the program keeps it.
+			.Ref(inner) => match self.state.body.exprs[inner].kind {
+				.SubSlice(base, lo: .None, hi: .None) => match self.fold(base)? {
+					.Array(values) => .Ok(.List(move values))
 					_ => .Err(.Runs)
 				}
 				_ => .Err(.Runs)
@@ -401,7 +419,7 @@ extend Lowerer {
 		isLambda: false,
 		generator: .None,
 		isTailrec: false,
-		isTest: false,
+		test: .None,
 		isInline: false,
 		generated: .None,
 		intrinsic: .None,
@@ -454,11 +472,39 @@ extend Lowerer {
 		return move folded
 	}
 
-	/// `&[u8]`, what a file embedded as bytes is, or an array of them, which
-	/// are the references a constant holds.
-	fn bytesRefsOnly(ty: Ty): bool = match self.kind(ty) {
-		.Ref(inner, kind: .Shared) => self.kind(inner) is .Slice(elem) && elem == U8
-		.Array(elem, ..) => self.bytesRefsOnly(elem)
+	/// The element of a slice in `ty` that owns memory, which a list kept with
+	/// the constant may not hold.
+	var fn ownedInList(ty: Ty): Option<Ty> = match self.kind(ty) {
+		_ if !self.containsRef(ty) => .None
+		.Ref(inner, ..) => match self.kind(inner) {
+			.Slice(elem) if self.owns(elem) => .Some(elem)
+			.Slice(elem) => self.ownedInList(elem)
+			_ => .None
+		}
+		.Array(elem, ..) => self.ownedInList(elem)
+		.Struct(args, ..) | .Enum(args, ..) => {
+			for arg in self.program.types.list(args).toVec() {
+				if self.ownedInList(arg) is .Some(elem) then return .Some(elem)
+			}
+			.None
+		}
+		_ => .None
+	}
+
+	/// Whether every reference in `ty` is a slice of what a constant may
+	/// hold, which is kept with it: a file's bytes, `&[u8]`, and a list
+	/// written in the constant, alone, in an array, or as a type argument of
+	/// a tuple or another struct or enum.
+	fn holdsKeptOnly(ty: Ty): bool = match self.kind(ty) {
+		_ if !self.containsRef(ty) => true
+		.Ref(inner, kind: .Shared) => self.kind(inner) is .Slice(elem) && self.holdsKeptOnly(elem)
+		.Array(elem, ..) => self.holdsKeptOnly(elem)
+		.Struct(args, ..) | .Enum(args, ..) => {
+			for arg in self.program.types.list(args).toVec() {
+				if !self.holdsKeptOnly(arg) then return false
+			}
+			true
+		}
 		_ => false
 	}
 
@@ -549,9 +595,9 @@ extend Lowerer {
 				.None => false
 			}
 		}
-		// A file's bytes are never made again where they are used, even in a
-		// constant being folded: that one reads them, and folds the read.
-		if value.isTable() && (running || value.holdsBytes()) {
+		// What a slice points at is never made again where it is used, even
+		// in a constant being folded: that one reads it, and folds the read.
+		if value.isTable() && (running || value.holdsKept()) {
 			val reference = self.intern(.Ref(inner: def.ty, kind: .Shared))
 			val address = self.alloc(.Table(id), reference, span)
 			return self.alloc(.Deref(address), def.ty, span)
@@ -563,17 +609,15 @@ extend Lowerer {
 	/// table is in another constant: of its parts, each of its own type.
 	var fn constExpr(value: ConstValue, ty: Ty, span: Span): ExprId = {
 		val kind: ExprKind = match move value {
-			// A file's bytes are read where they are kept, and never made again
-			// here.
-			.Bytes(..) => panic("a use of a file's bytes reads its table")
+			// What a slice points at is read where it is kept, and never made
+			// again here.
+			.Bytes(..) | .List(..) => panic("a use of what a slice points at reads its table")
 			.Int(v) => .Int(v)
 			.Float(v) => .Float(v)
 			.Bool(v) => .Bool(v)
 			.Str(symbol) => .Str(symbol)
 			.Array(values) => {
-				val .Array(elem, ..) = self.kind(ty) else {
-					return self.errorExpr(span)
-				}
+				val .Array(elem, ..) = self.kind(ty) else return self.errorExpr(span)
 				var parts: Vec<ExprId> = Vec()
 				for v in move values {
 					parts.push(self.constExpr(move v, elem, span))
@@ -581,9 +625,7 @@ extend Lowerer {
 				.Array(move parts)
 			}
 			.Struct(values) => {
-				val .Struct(id, ..) = self.kind(ty) else {
-					return self.errorExpr(span)
-				}
+				val .Struct(id, ..) = self.kind(ty) else return self.errorExpr(span)
 				var fields: Vec<ExprId> = Vec()
 				var i = 0
 				for v in move values {
@@ -594,9 +636,7 @@ extend Lowerer {
 				.Struct(id: id, fields: move fields, order: Vec())
 			}
 			.Variant(variant, fields) => {
-				val .Enum(id, ..) = self.kind(ty) else {
-					return self.errorExpr(span)
-				}
+				val .Enum(id, ..) = self.kind(ty) else return self.errorExpr(span)
 				var args: Vec<ExprId> = Vec()
 				var i = 0
 				for v in move fields {

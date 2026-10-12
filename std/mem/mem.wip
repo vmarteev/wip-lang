@@ -4,6 +4,8 @@
 // given a value again before anything can see it empty. A module of its
 // own, since `replace` and `swap` are names a program wants for itself.
 
+import std::libc::{free, malloc}
+
 /// The value at `place`, with `value` left there in its place:
 /// `mem::replace(&var self.state, .Idle)`.
 pub fn replace<T>(place: &var T, value: T): T keeps value = {
@@ -20,3 +22,286 @@ pub fn swap<T>(a: &var T, b: &var T) = {
 	a = move b
 	b = move first
 }
+
+// Where memory comes from: `using(&var allocator, body)` runs `body` with
+// every allocation it makes on this thread — every `own`, `Vec` and
+// `String`, in its own code and in every function it calls — taken from
+// the allocator, and the one before it back when the call ends. Each value
+// remembers where it was made and is freed there, whenever that is.
+//
+// What the runtime keeps of an allocator is its `Ledger`, which lives with
+// the allocator in memory that does not move, as long as anything the
+// allocator made does: an allocator dropped, or an arena reset, while one
+// of its values is alive is a panic, so no value outlives where it lives.
+
+/// What the runtime keeps of an allocator, laid out as
+/// `std/prelude/allocator.wip` reads it, as its `AllocatorLedger`: where the allocator is, the two
+/// functions it allocates and frees with, how many of its values are
+/// alive, and, in a debug build, the list of where each was made.
+extern "C" {
+	struct Ledger {
+		state: ptr<void>
+		allocate: Option<(state: ptr<void>, size: i64, align: i64) => ptr<u8>>
+		release: Option<(state: ptr<void>, at: ptr<u8>) => void>
+		live: i64
+		keepsCalls: i64
+		firstMade: ptr<u8>
+		lastMade: ptr<u8>
+	}
+}
+
+@intrinsic
+fn threadWords(): ptr<i64>
+
+@intrinsic
+fn debugBuild(): bool
+
+@intrinsic
+fn addressOf<T>(value: &var T): ptr<void>
+
+@intrinsic
+fn referenceAt<T>(data: ptr<void>): &var T
+
+extern "C" {
+	/// Prints where the first values still alive in an allocator were made,
+	/// which a debug build keeps.
+	fn wip_allocator_report(ledger: ptr<void>, count: i64)
+}
+
+/// What gives `using` its memory: an `Arena`, or a program's own
+/// allocator, `Custom`. Each keeps its ledger where it does not move.
+pub interface Source {
+	/// The ledger the runtime keeps of it.
+	var fn ledger(): ptr<void>
+}
+
+/// An allocator a program writes: a pool of fixed-size slots, memory a
+/// GPU maps. `Custom::of` keeps it where `using` can reach it.
+pub interface Allocator {
+	/// `size` bytes at a multiple of `align`, a power of two; null where
+	/// there are none.
+	var fn allocate(size: i64, align: i64): ptr<u8>
+
+	/// Gives back what `allocate` gave.
+	var fn free(at: ptr<u8>)
+}
+
+/// Runs `body` with every allocation it makes on this thread taken from
+/// `source`, and answers what it answers. Calls nest, and the innermost
+/// gives; a thread `body` starts allocates from its own heap.
+pub fn using<S: Source, R>(source: &var S, body: &var () => R): R = {
+	val words = threadWords()
+	val before = words[0]
+	words[0] = source.ledger() as i64
+	val answer = body()
+	words[0] = before
+	return move answer
+}
+
+/// Runs `body` with every allocation it makes on this thread taken from
+/// the heap, under any `using`: what a frame loads to keep — an asset, a
+/// level, a cache — is made where it can outlive the frame.
+pub fn onHeap<R>(body: &var () => R): R = {
+	val words = threadWords()
+	val before = words[0]
+	words[0] = 0
+	val answer = body()
+	words[0] = before
+	return move answer
+}
+
+/// How many values `ledger` holds that are alive, and a panic naming them
+/// where there are any: `what` is what happened to their memory.
+fn checkEmpty(ledger: &var Ledger, what: str) = {
+	val live = ledger.live
+	if live == 0 then return
+	if ledger.keepsCalls != 0 then wip_allocator_report(addressOf(&var ledger), live)
+	panic("\(what) with \(live) \(if live == 1 then "value" else "values") still alive")
+}
+
+// --- Arena ----------------------------------------------------------------
+
+/// Memory handed out by moving a pointer forward, in blocks from the heap,
+/// all of it taken back at once by `reset`: a frame's short-lived values,
+/// with no free each and no `malloc` in the frame. A value it holds that is
+/// still alive when it is reset or dropped is a panic, which a debug build
+/// says where it was made.
+pub struct Arena {
+	state: own<ArenaState>
+}
+
+/// An arena's ledger and blocks, on the heap where they do not move with
+/// the `Arena`.
+struct ArenaState {
+	ledger: Ledger
+	/// The block being handed out from, and its first; each block's first
+	/// word is the next block, its second its size.
+	current: ptr<u8>
+	first: ptr<u8>
+	/// How far into the current block is handed out.
+	used: i64
+	/// The size of a block the arena asks the heap for.
+	blockSize: i64
+}
+
+/// A block's bytes before what it hands out: the next block and its size.
+val BLOCK_HEADER: i64 = 16
+
+extend Arena {
+	/// An arena that asks the heap for blocks of `bytes` each, and more where
+	/// one value needs more.
+	pub static fn of(bytes: i64): Arena = {
+		val size = bytes.max(4096)
+		val first = newBlock(size)
+		var state = onHeap(() => own ArenaState(
+			ledger: Ledger(
+				state: 0 as ptr<void>,
+				allocate: .Some(arenaAllocate),
+				release: .Some(arenaFree),
+				live: 0,
+				keepsCalls: if debugBuild() then 1 else 0,
+				firstMade: 0 as ptr<u8>,
+				lastMade: 0 as ptr<u8>,
+			),
+			current: first,
+			first: first,
+			used: BLOCK_HEADER,
+			blockSize: size,
+		))
+		state.ledger.state = addressOf<ArenaState>(&var state)
+		return Arena(state: move state)
+	}
+
+	/// How many of the values it handed out are alive.
+	pub fn live(): i64 = self.state.ledger.live
+
+	/// Takes back everything it handed out, keeping its first block for
+	/// what comes next. A value still alive is a panic.
+	pub var fn reset() = {
+		checkEmpty(&var self.state.ledger, "arena reset")
+		freeBlocksAfter(self.state.first)
+		self.state.current = self.state.first
+		self.state.used = BLOCK_HEADER
+	}
+}
+
+extend Arena: Source {
+	var fn ledger(): ptr<void> = addressOf<Ledger>(&var self.state.ledger)
+}
+
+extend Arena: Destroy {
+	var fn destroy() = {
+		checkEmpty(&var self.state.ledger, "arena dropped")
+		freeBlocksAfter(self.state.first)
+		free(self.state.first)
+	}
+}
+
+/// A block of `size` bytes from the heap, with no next block.
+fn newBlock(size: i64): ptr<u8> = {
+	val block = malloc(size as size_t)
+	if block.isNull then panic("the heap has no \(size) bytes for an arena")
+	(block as ptr<i64>)[0] = 0
+	(block as ptr<i64>)[1] = size
+	return block
+}
+
+/// Frees every block after `block`, which then has none after it.
+fn freeBlocksAfter(block: ptr<u8>) = {
+	var next = (block as ptr<i64>)[0] as ptr<u8>
+	while !next.isNull {
+		val after = (next as ptr<i64>)[0] as ptr<u8>
+		free(next)
+		next = after
+	}
+	(block as ptr<i64>)[0] = 0
+}
+
+/// The arena's allocation: the pointer moved forward, past `align`'s next
+/// multiple, into a new block where this one has no room.
+fn arenaAllocate(state: ptr<void>, size: i64, align: i64): ptr<u8> = bump(
+	&var referenceAt<ArenaState>(state),
+	size,
+	align,
+)
+
+fn bump(arena: &var ArenaState, size: i64, align: i64): ptr<u8> = {
+	var at = alignedFrom(arena.current, arena.used, align)
+	val room = (arena.current as ptr<i64>)[1]
+	if at + size > room {
+		val needed = BLOCK_HEADER + align + size
+		val block = newBlock(arena.blockSize.max(needed))
+		(arena.current as ptr<i64>)[0] = block as i64
+		arena.current = block
+		at = alignedFrom(block, BLOCK_HEADER, align)
+	}
+	arena.used = at + size
+	return ((arena.current as i64) + at) as ptr<u8>
+}
+
+/// The first offset at or after `used` in `block` that is a multiple of
+/// `align` in memory.
+fn alignedFrom(block: ptr<u8>, used: i64, align: i64): i64 = {
+	val address = (block as i64) + used
+	val over = address % align
+	return if over == 0 then used else used + align - over
+}
+
+/// An arena frees nothing until it is reset.
+fn arenaFree(state: ptr<void>, at: ptr<u8>) = {}
+
+// --- A program's own ------------------------------------------------------
+
+/// A program's own allocator, kept on the heap with its ledger so that
+/// `using` can hand it out and what it made can find it again.
+pub struct Custom<A: Allocator> {
+	state: own<CustomState<A>>
+}
+
+struct CustomState<A: Allocator> {
+	ledger: Ledger
+	allocator: A
+}
+
+extend Custom<A: Allocator> {
+	/// Keeps `allocator` where `using` can reach it.
+	pub static fn of(allocator: A): Custom<A> = {
+		// Taken into the state on the heap, whatever allocator is in use here.
+		var given = Option::Some(move allocator)
+		var state = onHeap(() => own CustomState(
+			ledger: Ledger(
+				state: 0 as ptr<void>,
+				allocate: .Some(customAllocate<A>),
+				release: .Some(customFree<A>),
+				live: 0,
+				keepsCalls: if debugBuild() then 1 else 0,
+				firstMade: 0 as ptr<u8>,
+				lastMade: 0 as ptr<u8>,
+			),
+			allocator: given.take().unwrap(),
+		))
+		state.ledger.state = addressOf<CustomState<A>>(&var state)
+		return Custom(state: move state)
+	}
+
+	/// How many of the values it handed out are alive.
+	pub fn live(): i64 = self.state.ledger.live
+}
+
+extend Custom<A: Allocator>: Source {
+	var fn ledger(): ptr<void> = addressOf<Ledger>(&var self.state.ledger)
+}
+
+extend Custom<A: Allocator>: Destroy {
+	var fn destroy() = checkEmpty(&var self.state.ledger, "allocator dropped")
+}
+
+fn customAllocate<A: Allocator>(
+	state: ptr<void>,
+	size: i64,
+	align: i64,
+): ptr<u8> = referenceAt<CustomState<A>>(state).allocator.allocate(size, align)
+
+fn customFree<A: Allocator>(state: ptr<void>, at: ptr<u8>) = referenceAt<CustomState<A>>(
+	state,
+).allocator.free(at)

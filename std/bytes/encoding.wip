@@ -1,0 +1,375 @@
+// A binary format for `Encode` and `Decode`: each value a byte saying its
+// shape, and then the shape's bytes: whole numbers and lengths in as few
+// bytes as they need (LEB128, seven bits a byte, a signed one zigzagged so
+// that a small negative number is small too), floats little-endian. A
+// record keeps its fields' names, so that a save written by one version of
+// a program loads in the next, which may have a field more or one less: it
+// is read by name, in any order, as JSON is, in less room and with no text
+// to parse.
+
+// The byte before each value.
+val NOTHING: u8 = 0
+val FALSE: u8 = 1
+val TRUE: u8 = 2
+val INT: u8 = 3
+val UNSIGNED: u8 = 4
+val FLOAT: u8 = 5
+val FLOAT32: u8 = 6
+val TEXT: u8 = 7
+val SEQUENCE: u8 = 8
+val MAP: u8 = 9
+val RECORD: u8 = 10
+val VARIANT: u8 = 11
+
+/// Writes a value in the binary format.
+pub struct BinaryEncoder {
+	out: Writer = Writer()
+}
+
+extend BinaryEncoder {
+	/// What it has written, handed over.
+	pub move fn take(): Vec<u8> = self.out.take()
+
+	var fn name(text: str) = {
+		self.varint(text.len() as u64)
+		self.out.bytes(&text.items())
+	}
+
+	/// A whole number in as few bytes as it needs: seven bits a byte, low
+	/// first, the top bit set on each but the last.
+	var fn varint(value: u64) = {
+		var left = value
+		while left >= 0x80 {
+			self.out.u8((left & 0x7F) as u8 | 0x80)
+			left = left >> 7
+		}
+		self.out.u8(left as u8)
+	}
+}
+
+extend BinaryEncoder: Encoder {
+	var fn bool(value: bool) = self.out.u8(if value then TRUE else FALSE)
+
+	/// Zigzagged: 0, -1, 1, -2 … are 0, 1, 2, 3 ….
+	var fn int(value: i64) = {
+		self.out.u8(INT)
+		self.varint(((value << 1) ^ (value >> 63)) as u64)
+	}
+
+	var fn unsigned(value: u64) = {
+		self.out.u8(UNSIGNED)
+		self.varint(value)
+	}
+
+	var fn float(value: f64) = {
+		self.out.u8(FLOAT)
+		self.out.f64le(value)
+	}
+
+	var fn float32(value: f32) = {
+		self.out.u8(FLOAT32)
+		self.out.f32le(value)
+	}
+
+	var fn text(value: str) = {
+		self.out.u8(TEXT)
+		self.name(value)
+	}
+
+	var fn nothing() = self.out.u8(NOTHING)
+
+	var fn beginSequence(length: i64) = {
+		self.out.u8(SEQUENCE)
+		self.varint(length as u64)
+	}
+
+	var fn endSequence() = {}
+
+	var fn beginMap(length: i64) = {
+		self.out.u8(MAP)
+		self.varint(length as u64)
+	}
+
+	var fn endMap() = {}
+
+	var fn beginRecord(name: str, length: i64) = {
+		self.out.u8(RECORD)
+		self.varint(length as u64)
+	}
+
+	var fn field(name: str) = self.name(name)
+
+	var fn endRecord() = {}
+
+	/// Its name, and whether a record of its fields follows.
+	var fn beginVariant(enumName: str, name: str, length: i64) = {
+		self.out.u8(VARIANT)
+		self.name(name)
+		self.out.u8(if length > 0 then 1 else 0)
+	}
+
+	var fn endVariant() = {}
+}
+
+/// What bytes could not be read as.
+@derive(Eq, Clone, Text)
+pub struct BinaryError {
+	/// What was wrong, and where, in words.
+	pub message: String
+}
+
+/// Reads a value in the binary format from bytes.
+pub view struct BinaryDecoder {
+	read: Reader
+	/// For each sequence, map or record being read: what is left of it.
+	reading: Vec<Reading> = Vec()
+}
+
+/// A sequence's elements left, a map's entries left, or a record's fields,
+/// each by its name and where its value begins, and where the record ends.
+enum Reading {
+	Items(left: i64)
+	Entries(left: i64)
+	Fields(fields: Vec<(String, i64)>, end: i64)
+}
+
+extend BinaryDecoder {
+	/// A decoder of `bytes`.
+	pub static fn of(bytes: &[u8]): BinaryDecoder = BinaryDecoder(read: Reader::of(bytes))
+
+	fn error(
+		message: str,
+	): BinaryError = BinaryError(message: "\(message), at byte \(self.read.position())")
+
+	/// The byte that says what the next value is.
+	var fn shape(): Result<u8, BinaryError> = match self.read.u8() {
+		.Some(byte) => .Ok(byte)
+		.None => .Err(self.error("the bytes end before a value"))
+	}
+
+	/// The next value's shape, which must be `wanted`, `what` in words.
+	var fn expect(wanted: u8, what: str): Result<void, BinaryError> = {
+		val found = self.shape()?
+		return if found == wanted then .Ok()
+		else .Err(self.error("\(what) is wanted, and the bytes hold another value"))
+	}
+
+	var fn count(): Result<i64, BinaryError> = .Ok(self.varint()? as i64)
+
+	/// A whole number written in as few bytes as it needs.
+	var fn varint(): Result<u64, BinaryError> = {
+		var value: u64 = 0
+		var shift: u64 = 0
+		while true {
+			val .Some(byte) = self.read.u8() else {
+				return .Err(self.error("the bytes end in a number"))
+			}
+			if shift > 63 then return .Err(self.error("a number longer than 64 bits"))
+			value = value | (((byte & 0x7F) as u64) << shift)
+			if byte & 0x80 == 0 then return .Ok(value)
+			shift += 7
+		}
+		return .Ok(value)
+	}
+
+	/// A name or a text: its length, and its bytes.
+	var fn name(): Result<String, BinaryError> = {
+		val length = self.count()?
+		val .Some(bytes) = self.read.bytes(length) else {
+			return .Err(self.error("the bytes end in a text"))
+		}
+		val text = str::fromBytes(&bytes.items())
+		return if text.isValidUtf8() then .Ok(String::of(text))
+		else .Err(self.error("a text is not UTF-8"))
+	}
+
+	/// Passes over the next value, whatever it is.
+	var fn skip(): Result<void, BinaryError> = {
+		val shape = self.shape()?
+		val skipped: Option<void> = match shape {
+			NOTHING | FALSE | TRUE => .Some()
+			INT | UNSIGNED => {
+				self.varint()?
+				Option::Some()
+			}
+			FLOAT => self.read.seek(self.read.position() + 8)
+			FLOAT32 => self.read.seek(self.read.position() + 4)
+			TEXT => {
+				val length = self.count()?
+				self.read.seek(self.read.position() + length)
+			}
+			SEQUENCE => {
+				for _ in 0..self.count()? {
+					self.skip()?
+				}
+				.Some()
+			}
+			MAP => {
+				for _ in 0..self.count()? * 2 {
+					self.skip()?
+				}
+				.Some()
+			}
+			RECORD => {
+				for _ in 0..self.count()? {
+					self.name()?
+					self.skip()?
+				}
+				.Some()
+			}
+			VARIANT => {
+				self.name()?
+				val fields = self.read.u8()
+				if fields == .Some(1) then self.skip()?
+				.Some()
+			}
+			_ => return .Err(self.error("a value of no shape this format writes"))
+		}
+		return if skipped.isSome() then .Ok() else .Err(self.error("the bytes end in a value"))
+	}
+
+	/// One more of what is left of the innermost sequence or map, if any.
+	var fn step(): bool = {
+		val .Some(top) = self.reading.pop() else return false
+		val stepped: (Reading, bool) = match move top {
+			.Items(left) => (.Items(left - 1), left > 0)
+			.Entries(left) => (.Entries(left - 1), left > 0)
+			other => (move other, false)
+		}
+		val (next, more) = move stepped
+		self.reading.push(move next)
+		return more
+	}
+}
+
+extend BinaryDecoder: Decoder<BinaryError> {
+	var fn bool(): Result<bool, BinaryError> = match self.shape()? {
+		TRUE => .Ok(true)
+		FALSE => .Ok(false)
+		_ => .Err(self.error("a bool is wanted, and the bytes hold another value"))
+	}
+
+	var fn int(): Result<i64, BinaryError> = {
+		self.expect(INT, "a whole number")?
+		val zigzag = self.varint()?
+		return .Ok((zigzag >> 1) as i64 ^ -((zigzag & 1) as i64))
+	}
+
+	var fn unsigned(): Result<u64, BinaryError> = {
+		self.expect(UNSIGNED, "a number of no sign")?
+		return self.varint()
+	}
+
+	/// An `f64`, or the `f32` an `f32` field was written as.
+	var fn float(): Result<f64, BinaryError> = match self.shape()? {
+		FLOAT => match self.read.f64le() {
+			.Some(value) => .Ok(value)
+			.None => .Err(self.error("the bytes end in a number"))
+		}
+		FLOAT32 => match self.read.f32le() {
+			.Some(value) => .Ok(value as f64)
+			.None => .Err(self.error("the bytes end in a number"))
+		}
+		_ => .Err(self.error("a number is wanted, and the bytes hold another value"))
+	}
+
+	var fn text(): Result<String, BinaryError> = {
+		self.expect(TEXT, "text")?
+		return self.name()
+	}
+
+	var fn nothing(): Result<bool, BinaryError> = {
+		val at = self.read.position()
+		if self.read.u8() == .Some(NOTHING) then return .Ok(true)
+		self.read.seek(at)
+		return .Ok(false)
+	}
+
+	var fn beginSequence(): Result<void, BinaryError> = {
+		self.expect(SEQUENCE, "a sequence")?
+		val left = self.count()?
+		self.reading.push(.Items(left))
+		return .Ok()
+	}
+
+	var fn more(): Result<bool, BinaryError> = .Ok(self.step())
+
+	var fn endSequence(): Result<void, BinaryError> = {
+		self.reading.pop()
+		return .Ok()
+	}
+
+	var fn beginMap(): Result<void, BinaryError> = {
+		self.expect(MAP, "a map")?
+		val left = self.count()?
+		self.reading.push(.Entries(left))
+		return .Ok()
+	}
+
+	var fn endMap(): Result<void, BinaryError> = {
+		self.reading.pop()
+		return .Ok()
+	}
+
+	/// The fields' names and where each value begins, found by passing over
+	/// each; a field is then read where it is asked for.
+	var fn beginRecord(name: str): Result<void, BinaryError> = {
+		self.expect(RECORD, "a record, `\(name)`")?
+		var fields: Vec<(String, i64)> = Vec()
+		for _ in 0..self.count()? {
+			val field = self.name()?
+			fields.push((move field, self.read.position()))
+			self.skip()?
+		}
+		self.reading.push(.Fields(fields: move fields, end: self.read.position()))
+		return .Ok()
+	}
+
+	var fn field(name: str): Result<bool, BinaryError> = {
+		val .Some(.Fields(fields, ..)) = self.reading.last() else return .Ok(false)
+		for (field, at) in fields {
+			if field == name {
+				self.read.seek(at)
+				return .Ok(true)
+			}
+		}
+		return .Ok(false)
+	}
+
+	var fn endRecord(): Result<void, BinaryError> = {
+		if self.reading.pop() is .Some(.Fields(end, ..)) then self.read.seek(end)
+		return .Ok()
+	}
+
+	var fn beginVariant(enumName: str): Result<String, BinaryError> = {
+		self.expect(VARIANT, "a variant of `\(enumName)`")?
+		val name = self.name()?
+		// Whether a record of its fields follows, which `decode` reads.
+		self.read.u8()
+		return .Ok(move name)
+	}
+
+	var fn endVariant(): Result<void, BinaryError> = .Ok()
+
+	fn missing(field: str): BinaryError = self.error("the record has no `\(field)`")
+
+	fn unknown(
+		enumName: str,
+		name: str,
+	): BinaryError = self.error("`\(name)` is no variant of `\(enumName)`")
+
+	fn invalid(what: str): BinaryError = self.error("the value is not \(what)")
+}
+
+/// The value in the binary format.
+pub fn encode<T: Encode>(value: &T): Vec<u8> = {
+	var encoder = BinaryEncoder()
+	value.encode(&var encoder)
+	return encoder.take()
+}
+
+/// A value read from the binary format: `bytes::decode<Save>(&written)`.
+pub fn decode<T: Decode>(bytes: &[u8]): Result<T, BinaryError> = {
+	var decoder = BinaryDecoder::of(bytes)
+	return T::decode(&var decoder)
+}

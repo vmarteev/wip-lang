@@ -235,7 +235,7 @@ taking an `I::Item`.
 
 ## `@derive`
 
-Five interfaces are written by the compiler, field by field and variant by
+Seven interfaces are written by the compiler, field by field and variant by
 variant, where a type asks for them. What it writes is code of the module's
 own, checked as the program's is:
 
@@ -246,6 +246,8 @@ own, checked as the program's is:
 | `Hash` | a key for `Map` and `Set` |
 | `Text` | what `\(value)` appends, and what printing uses |
 | `Clone` | `clone()`: a copy that owns what it holds |
+| `Encode` | the value written into a format: `json::encode(&value)` |
+| `Decode` | the value read back from one: `json::decode<T>(text)` |
 
 ```wip,run
 @derive(Eq, Ord, Hash, Text)
@@ -309,6 +311,61 @@ fn main() = {
     var copy = row.clone()
     copy.tags.push("changed")
     assert(row.tags.len() == 1 && copy.tags.len() == 2)
+}
+```
+
+### Values written to a format and read back
+
+`Encode` and `Decode`, which the prelude declares, are how a value becomes
+a format and comes back — JSON, a binary one, an editor's panel. A format
+is a type that implements `Encoder` and `Decoder`, and sees a value as a
+few shapes: a number, a `bool`, text, a sequence, a map, a record of named
+fields, and a variant of an enum. `@derive(Encode, Decode)` writes both
+from a type's fields: a struct is a record of its fields, in the order
+written; an enum's variant is its name, and a record of its fields where
+it has any. The prelude's types — the numbers, `bool`, `char`, `String`,
+`Vec`, `Option`, `own` and tuples — and `Map` and `Set` implement both
+where what they hold does.
+
+Decoding reads a record's fields by name, in any order: a field the type
+does not have is passed over, and one the input does not have takes its
+default, or is nothing where it is an `Option`, or else is the format's
+error. Nothing is left out or renamed: a type that needs that writes the
+two methods itself. A field whose type does not encode, or decode, is
+reported where it is written (E0457, E0458); a reference or a view encodes
+and does not decode, since what it borrows has nowhere to come from.
+
+```wip,run
+import std::collections::{Map}
+import std::json
+
+@derive(Encode, Decode, Eq)
+enum Key {
+    Letter(char: char)
+    Mouse(button: i64)
+}
+
+@derive(Encode, Decode, Eq)
+struct Settings {
+    volume: f32 = 0.8
+    bindings: Map<String, Key>
+    player: Option<String>
+}
+
+fn main() = {
+    var bindings: Map<String, Key> = Map()
+    bindings.put("jump", .Letter(char: 'w'))
+    val settings = Settings(bindings: move bindings, player: .None)
+    val text = json::encode(&settings)
+    assert(text.startsWith("{\"volume\":0.8,\"bindings\":{\"jump\":"))
+    assert(text.endsWith("{\"Letter\":{\"char\":\"w\"}}}}"), "no player")
+    assert(json::decode<Settings>(text).unwrap() == settings)
+
+    // What the input lacks takes its default; what it says wrong is an error.
+    val older = json::decode<Settings>("{\"bindings\": {}}").unwrap()
+    assert(older.volume == 0.8 && older.player.isNone())
+    val .Err(wrong) = json::decode<Key>("{\"Kick\": {}}") else return
+    assert(wrong.message == "`Kick` is no variant of `Key`")
 }
 ```
 

@@ -69,9 +69,9 @@ pub struct Program {
 	pub var cIncludes: Vec<(i64, String)>
 	/// The C files a module names with `@source("src/rcore.c")`, which live
 	/// below its own directory and are compiled with the program: the
-	/// module, as an index into `modules`, the path relative to it, and the
-	/// language it said they are, where it said.
-	pub var cSources: Vec<(i64, String, Option<CLanguage>)>
+	/// module, as an index into `modules`, the path relative to it, the
+	/// language it said they are, and the C++ standard, where it said.
+	pub var cSources: Vec<(i64, String, Option<CLanguage>, Option<String>)>
 	/// The header a module puts before every C file of its own, from
 	/// `@prefix("build.h")`: how a vendored library is configured, since its
 	/// settings must reach each of its translation units.
@@ -115,6 +115,9 @@ pub struct Program {
 	/// for an editor: a type written in a signature, a field or an
 	/// annotation, and a constant, whose value takes its place.
 	pub var names: Vec<(Span, Named)>
+	/// The implicits each call filled, for an editor to show: where the
+	/// call's arguments end, and what was filled, `rng: &var rng`.
+	pub var implicitFills: Vec<(u32, String)>
 	/// For every generator type a program ends a value of or walks, the
 	/// instance of its `next`, which its drop calls too.
 	pub var generatorNext: Map<Ty, FnId>
@@ -170,6 +173,7 @@ extend Program {
 		builtins: Map(),
 		dropFns: Map(),
 		names: Vec(),
+		implicitFills: Vec(),
 		generatorNext: Map(),
 		frames: Map(),
 	)
@@ -211,9 +215,7 @@ extend Program {
 		if !symbol {
 			while shown > 0 {
 				if shown - 1 >= generics.len() then break
-				val .Ty(default) = generics[shown - 1].default else {
-					break
-				}
+				val .Ty(default) = generics[shown - 1].default else break
 				if self.types.trySubstFind(default, &all[0..shown - 1]) != .Some(all[shown - 1]) {
 					break
 				}
@@ -382,9 +384,7 @@ extend Program {
 
 	/// The types of the fields of each variant of an enum type.
 	pub fn variantFieldTys(ty: Ty): Vec<Vec<Ty>> = {
-		val .Enum(id, ..) = self.types.kind(ty) else {
-			panic("variants of a type that is not an enum")
-		}
+		val .Enum(id, ..) = self.types.kind(ty) else panic("variants of a type that is not an enum")
 		var all: Vec<Vec<Ty>> = Vec()
 		val variants = &self.enums[id].variants
 		for v in 0..variants.len() {
@@ -404,12 +404,8 @@ extend Program {
 		// stopped at, which its bits cannot say.
 		if self.types.kind(ty) is .Struct(id, ..) && self.structs[id].generator.isSome() then
 			return true
-		val .Some(destroy) = self.preludeItems.interfaceOf(.Destroy) else {
-			return false
-		}
-		val .Some(def) = self.typeDef(ty) else {
-			return false
-		}
+		val .Some(destroy) = self.preludeItems.interfaceOf(.Destroy) else return false
+		val .Some(def) = self.typeDef(ty) else return false
 		for i in self.impls {
 			if i.interfaceId == destroy && i.ty == def then return true
 		}
@@ -504,9 +500,7 @@ extend Program {
 	/// Whether `ty` is an `Option` of a function, laid out as the C function
 	/// pointer with `.None` as null.
 	pub fn nullableFunction(ty: Ty): bool = {
-		val .Enum(id, args) = self.types.kind(ty) else {
-			return false
-		}
+		val .Enum(id, args) = self.types.kind(ty) else return false
 		return self.preludeItems.enumeration(.Option) == .Some(id) &&
 			self.types.kind(self.types.list(args)[0]) is .Fn(..)
 	}
@@ -545,9 +539,7 @@ extend Program {
 		val generics = &self.interfaces[interfaceId].generics
 		val at = index as i64 - 1
 		if at >= generics.len() then return false
-		val .Ty(default) = generics[at].default else {
-			return false
-		}
+		val .Ty(default) = generics[at].default else return false
 		return self.types.any(default, (kind) => kind is .Param(p) && p.index == 0)
 	}
 
@@ -780,6 +772,11 @@ pub enum BuiltinOwner {
 	Slots
 	/// `void`, whose one value compares, hashes and is written.
 	Void
+	/// `own<T>`, a box, which the prelude makes clone where what it holds
+	/// does.
+	Own
+	/// `ptr<T>`, a C pointer, which `std::sync` lets an `Atomic` hold.
+	Ptr
 }
 
 extend BuiltinOwner {
@@ -794,6 +791,8 @@ extend BuiltinOwner {
 		.Slice(..) => .Some(.Slice)
 		.Slots(..) => .Some(.Slots)
 		.Unit => .Some(.Void)
+		.Own(..) => .Some(.Own)
+		.Ptr(..) => .Some(.Ptr)
 		_ => .None
 	}
 
@@ -809,6 +808,8 @@ extend BuiltinOwner {
 		.Slice => "slice"
 		.Slots => "Slots"
 		.Void => "void"
+		.Own => "own"
+		.Ptr => "ptr"
 	}
 }
 
@@ -839,6 +840,12 @@ pub struct StructDef {
 	/// `@header("config.h")` on the declaration, which the C that reaches its
 	/// fields includes.
 	pub header: Option<Symbol>
+	/// `@align(n)`: the struct is aligned to `n` bytes at least, and its size
+	/// is a multiple of it.
+	pub align: Option<u32> = .None
+	/// `@packed`: each field right after the one before, with no padding, and
+	/// the struct aligned to one byte.
+	pub packed: bool = false
 	/// For an `@opaque` struct, the pair of functions that read and write
 	/// each field, in the fields' order.
 	pub var accessors: Vec<(FnId, FnId)>
@@ -892,6 +899,9 @@ pub struct FieldDef {
 	pub span: Span
 	/// What a literal that leaves the field out puts there.
 	pub var default: Option<DefaultValue>
+	/// `@align(n)` on the field: it lies at a multiple of `n` bytes, and the
+	/// struct is aligned to `n` at least.
+	pub align: Option<u32> = .None
 }
 
 @derive(Clone)
@@ -968,10 +978,10 @@ pub struct FnDef {
 	/// `@inline`: every call to it is spliced into its caller, or the program
 	/// does not compile.
 	pub isInline: bool
-	/// `@test`: a test `wip test` runs. It takes nothing, answers nothing,
-	/// and is compiled only by `wip test`, since it lives in a `.test.wip`
-	/// file.
-	pub isTest: bool
+	/// `@test`: a test `wip test` runs, and what it expects of its run. It
+	/// takes nothing, answers nothing, and is compiled only by `wip test`,
+	/// since it lives in a `.test.wip` file.
+	pub test: Option<Test>
 	/// A body the compiler writes rather than a program.
 	pub generated: Option<Generated>
 	/// `@intrinsic`: what the compiler writes in place of its body.
@@ -1002,6 +1012,17 @@ pub struct FnDef {
 	pub isPub: bool
 	/// The signature.
 	pub span: Span
+}
+
+/// What a test expects of its run.
+@derive(Eq, Clone)
+pub enum Test {
+	/// That it returns: `@test`.
+	Returns
+	/// That it panics, with a message that holds the text where there is
+	/// one: `@test(panics)`, `@test(panics = "out of bounds")`. It runs in a
+	/// process of its own, since nothing catches a panic.
+	Panics(holding: Option<Symbol>)
 }
 
 /// A body the compiler writes. Each is a method of `Slots<T>`, the one type
@@ -1113,6 +1134,9 @@ pub enum Intrinsic {
 	/// answer for `T`, which the layout decides.
 	SizeOf
 	AlignOf
+	/// `offsetOf<T>("field")`: where the field lies in `T`, as C's `offsetof`
+	/// answers, which the layout decides.
+	OffsetOf
 	/// `atomicAdd(at, amount)`: the integer at an address — a C pointer, or a
 	/// `&` to an `Atomic`'s value — added to as one step that no other thread
 	/// sees half of; answers what it held before.
@@ -1124,10 +1148,6 @@ pub enum Intrinsic {
 	/// `boxAddress(value)`: the address of the box an `own` points to, which
 	/// the `own` keeps: what C is given of a `c::Pinned`.
 	BoxAddress
-	/// `sliceAt(first, count)`: the slice of `count` elements from an
-	/// address, lent for writing: how a slice is lent in two parts that do
-	/// not overlap, for the standard library alone.
-	SliceAt
 	/// `closureCode(work)` and `closureCaptures(work)`: a closure lent for a
 	/// call, as the address of its code and of what it captured, which a
 	/// thread the call waits for is given.
@@ -1138,9 +1158,16 @@ pub enum Intrinsic {
 	/// `atomicSwap(at, value)`: written, answering what was there.
 	AtomicSwap
 	/// `atomicCompareSwap(at, expected, value)`: written only where it held
-	/// `expected`; answers what it held, so that it was written where that is
-	/// `expected`.
+	/// `expected`, bit for bit; answers whether it was.
 	AtomicCompareSwap
+	/// `atomicFence(order)`: this thread's reads and writes ordered against
+	/// other threads' atomics, with nothing read or written.
+	///
+	/// Each atomic intrinsic may take an order after its other arguments, a
+	/// value of an enum whose variants are named as C's orders are —
+	/// `Relaxed`, `Acquire`, `Release`, `AcqRel`, `SeqCst` — and is
+	/// sequentially consistent where it takes none.
+	AtomicFence
 	/// `offsetBytes(pointer, bytes)`: the address that many bytes on from a C
 	/// pointer, which C writes `p + n`.
 	OffsetBytes
@@ -1157,6 +1184,12 @@ pub enum Intrinsic {
 	/// `runtimeWords()`: the address of a block of zeroed words the program
 	/// has once, which the allocator keeps its counters in.
 	RuntimeWords
+	/// `threadWords()`: the address of a block of zeroed words each thread
+	/// has of its own, which the allocator keeps the thread's allocator in.
+	ThreadWords
+	/// `debugBuild()`: whether the program is built for debugging rather
+	/// than optimised, for what the library keeps only while debugging.
+	DebugBuild
 }
 
 /// A C type whose contents Wip does not know: `type sqlite3` in an extern
@@ -1177,6 +1210,10 @@ pub struct OpaqueDef {
 pub enum CLanguage {
 	C
 	ObjectiveC
+	/// C++, which Wip calls through the C interface it declares.
+	CPlusPlus
+	/// Objective-C++, Apple's, as a `.mm` file is.
+	ObjectiveCPlusPlus
 }
 
 /// What a projection lends from, which is what a call to it holds.
@@ -1267,22 +1304,26 @@ pub enum ConstValue {
 	/// constant they were embedded as, which every copy of them names, so
 	/// that the program keeps each file's bytes once.
 	Bytes(bytes: Vec<u8>, origin: ConstId)
+	/// An array written where a slice is wanted: a `&[T]`, pointing at the
+	/// values where the program keeps them, beside the table that holds it.
+	List(values: Vec<ConstValue>)
 }
 
 extend ConstValue {
-	/// Whether it holds a file's bytes, which are read where the program
-	/// keeps them, never made again where it is used.
-	pub fn holdsBytes(): bool = match self {
-		.Bytes(..) => true
+	/// Whether it holds what a slice points at, a file's bytes or a list,
+	/// which is read where the program keeps it, never made again where it
+	/// is used.
+	pub fn holdsKept(): bool = match self {
+		.Bytes(..) | .List(..) => true
 		.Array(parts) | .Struct(parts) => {
 			for part in parts {
-				if part.holdsBytes() then return true
+				if part.holdsKept() then return true
 			}
 			false
 		}
 		.Variant(fields, ..) => {
 			for field in fields {
-				if field.holdsBytes() then return true
+				if field.holdsKept() then return true
 			}
 			false
 		}
@@ -1294,7 +1335,7 @@ extend ConstValue {
 	/// number, a `bool`, a string or a bare variant is written where it is
 	/// used.
 	pub fn isTable(): bool = match self {
-		.Array(..) | .Struct(..) | .Bytes(..) => true
+		.Array(..) | .Struct(..) | .Bytes(..) | .List(..) => true
 		.Variant(fields, ..) => !fields.isEmpty()
 		.Int(..) | .Float(..) | .Bool(..) | .Str(..) => false
 	}
@@ -1319,6 +1360,9 @@ pub struct ParamDef {
 	pub span: Span
 	/// The value a call that gives the parameter nothing passes.
 	pub var default: Option<DefaultValue>
+	/// `implicit`: a call that does not pass it fills it from the implicit
+	/// of its name where the call is.
+	pub implicit: bool = false
 }
 
 /// A field's or a parameter's default.
@@ -1428,6 +1472,9 @@ pub struct Local {
 	pub kind: LocalKind
 	/// The name where it is declared.
 	pub span: Span
+	/// An implicit parameter, or an `implicit val` or `var`: what a call
+	/// fills a missing implicit parameter of its name from.
+	pub var implicit: bool = false
 }
 
 @derive(Eq, Clone)
@@ -1547,7 +1594,7 @@ pub enum ExprKind {
 	/// `extern struct` that a literal leaves out is, as C's designated
 	/// initializer leaves it.
 	Zeroed
-	/// `p.isNull`: whether a C pointer points at nothing.
+	/// `p.isNull`: whether a C pointer, or a C string, points at nothing.
 	IsNull(inner: ExprId)
 	/// Two strings compared by their bytes: negative, zero or positive, as
 	/// C's `memcmp` is.
@@ -1766,6 +1813,7 @@ pub struct Arm {
 	pub span: Span
 }
 
+@derive(Clone)
 pub enum Pattern {
 	Wildcard
 	Binding(local: LocalId)
@@ -1798,27 +1846,6 @@ pub enum Pattern {
 	/// and take nothing.
 	Deref(inner: own<Pattern>)
 	Error
-}
-
-extend Pattern: Clone {
-	fn clone(): Pattern = match self {
-		.Wildcard => .Wildcard
-		.Binding(local) => .Binding(local)
-		.Variant(variant, binders) => .Variant(variant: variant, binders: binders.clone())
-		.Fields(binders) => .Fields(binders.clone())
-		.Int(value) => .Int(value)
-		.Bool(value) => .Bool(value)
-		.Str(symbol) => .Str(symbol)
-		.Range(lo, hi) => .Range(lo: lo, hi: hi)
-		.Any(alternatives, binding) => .Any(alternatives: alternatives.clone(), binding: binding)
-		.Slice(prefix, rest, suffix) => .Slice(
-			prefix: prefix.clone(),
-			rest: rest.clone(),
-			suffix: suffix.clone(),
-		)
-		.Deref(inner) => .Deref(own inner.clone())
-		.Error => .Error
-	}
 }
 
 /// The `..` of a slice pattern.

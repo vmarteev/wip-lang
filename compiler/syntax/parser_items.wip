@@ -149,9 +149,7 @@ extend Parser {
 		// `view enum Name { … }`: an enum whose variants borrow.
 		if kind is .Ident(..) && self.nthText(0) == "view" && self.nth(1) == .Enum {
 			val view = self.bump()
-			var .Some(decl) = self.enumDecl(isPub, move annotations) else {
-				return .None
-			}
+			var .Some(decl) = self.enumDecl(isPub, move annotations) else return .None
 			decl.isView = true
 			decl.span = view.to(decl.span)
 			return .Some(.Enum(decl: move decl))
@@ -351,7 +349,7 @@ extend Parser {
 			body,
 			list,
 			(kind) => startsMember(kind),
-			(p) => p.member((q, _) => q.noMember()),
+			(p) => p.member((q, _, annotations) => q.noMember(&annotations)),
 		)
 		val (_, methods) = splitMembers(move members)
 		val param = GenericParam(
@@ -364,6 +362,7 @@ extend Parser {
 		return .Some(ExtendBlock(
 			annotations: move annotations,
 			sliceOf: .Some(elem),
+			boxed: .None,
 			interfaceName: interfaceName,
 			interfaceModule: move interfaceModule,
 			interfaceArgs: move interfaceArgs,
@@ -375,9 +374,53 @@ extend Parser {
 		))
 	}
 
+	/// `extend own<T> { … }`, at `own`. The one type parameter is the type
+	/// of the value the box holds.
+	var fn boxExtend(start: Span, annotations: Vec<Annotation>): Option<ExtendBlock> = {
+		val word = self.bump()
+		val generics = self.genericParams()
+		if generics.len() != 1 {
+			val diagnostic = Diagnostic::error(
+				EXPECTED,
+				"a box is extended with one type parameter, the type of what it holds",
+				word.to(self.prevSpan()),
+				if generics.isEmpty() then "no type parameter" else "more than one",
+			).withHelp("write `extend own<T>`")
+			self.report(move diagnostic)
+		}
+		// The block is read to its end either way, so that what follows it
+		// is read as items.
+		val (interfaceModule, interfaceName, interfaceArgs) = self.extendedInterface()?
+		val body = self.itemBodyOpen()?
+		val list = BraceList(sep: .Comma, what: "a method", items: "methods", code: SEPARATOR)
+		val (members, close) = self.braceList(
+			body,
+			list,
+			(kind) => startsMember(kind),
+			(p) => p.member((q, _, annotations) => q.noMember(&annotations)),
+		)
+		val (_, methods) = splitMembers(move members)
+		if generics.len() != 1 then return .None
+		val held = generics[0].name
+		return .Some(ExtendBlock(
+			annotations: move annotations,
+			sliceOf: .None,
+			boxed: .Some(word),
+			interfaceName: interfaceName,
+			interfaceModule: move interfaceModule,
+			interfaceArgs: move interfaceArgs,
+			path: Vec::of(own [held]),
+			generics: move generics,
+			methods: move methods,
+			derived: .None,
+			span: start.to(close),
+		))
+	}
+
 	/// What an `extend` block's body holds where a method should be:
 	/// reported, and the rest of the line skipped.
-	var fn noMember(): Option<Field> = {
+	var fn noMember(annotations: &[Annotation]): Option<Field> = {
+		self.noAnnotations(&annotations, "a field or a variant")
 		val diagnostic = self.expected("a method")
 		self.report(move diagnostic)
 		self.skipUntil((k, lineBreak) => lineBreak || k == .Comma)
@@ -428,6 +471,9 @@ extend Parser {
 		// `extend [T] { … }`: methods of a slice, whose element the block
 		// declares.
 		if self.at(.LBracket) then return self.sliceExtend(start, move annotations)
+		// `extend own<T> { … }`: methods of a box, whose value's type the
+		// block declares.
+		if self.at(.Own) then return self.boxExtend(start, move annotations)
 		val .Some(name) = self.name("a type name") else {
 			self.skipToItem()
 			return .None
@@ -453,12 +499,13 @@ extend Parser {
 			open,
 			list,
 			(kind) => startsMember(kind),
-			(p) => p.member((q, _) => q.noMember()),
+			(p) => p.member((q, _, annotations) => q.noMember(&annotations)),
 		)
 		val (_, methods) = splitMembers(move members)
 		return .Some(ExtendBlock(
 			annotations: move annotations,
 			sliceOf: .None,
+			boxed: .None,
 			interfaceName: interfaceName,
 			interfaceModule: move interfaceModule,
 			interfaceArgs: move interfaceArgs,
@@ -554,7 +601,7 @@ extend Parser {
 			open,
 			list,
 			(kind) => startsMember(kind),
-			(p) => p.member((q, pubSpan) => q.structField(pubSpan)),
+			(p) => p.member((q, pubSpan, annotations) => q.structField(pubSpan, move annotations)),
 		)
 		val (fields, methods) = splitMembers(move members)
 		return .Some(StructDecl(
@@ -573,11 +620,12 @@ extend Parser {
 
 	/// A struct's field: `name: T = value`, where the value is what a
 	/// literal that leaves the field out puts there.
-	var fn structField(pubSpan: Option<Span>): Option<Field> = {
+	var fn structField(pubSpan: Option<Span>, annotations: Vec<Annotation>): Option<Field> = {
 		// `pub var x: i64` is written by anyone; `pub x: i64` is
 		// read by anyone and written where it is declared.
 		val varSpan: Option<Span> = if self.at(.Var) then .Some(self.bump()) else .None
 		var field = self.field("a field name")?
+		field.annotations = move annotations
 		field.isPub = pubSpan.isSome()
 		field.isVar = varSpan.isSome()
 		if varSpan is .Some(at) && pubSpan.isNone() {
@@ -636,7 +684,8 @@ extend Parser {
 			list,
 			(kind) => startsMember(kind),
 			(p) => p.member(
-				(q, pubSpan) => {
+				(q, pubSpan, annotations) => {
+					q.noAnnotations(&annotations, "a variant")
 					// A variant is exported with its enum: there is nothing
 					// for `pub` to say.
 					if pubSpan is .Some(at) {
@@ -670,9 +719,10 @@ extend Parser {
 	/// A member of a struct or an enum: a field or a variant, or a method.
 	/// They may be written in any order.
 	var fn member<E>(
-		elem: &var (p: &var Parser, pubSpan: Option<Span>) => Option<E>,
+		elem: &var (p: &var Parser, pubSpan: Option<Span>, annotations: Vec<Annotation>) => Option<E>,
 	): Option<Member<E>> = {
-		// A method may carry annotations; a field or a variant may not.
+		// A method may carry annotations, and so may a struct's field, which
+		// `elem` is given them for; a variant may not.
 		val annotations = self.annotations()
 		val isPub = self.at(.Pub)
 		val pubSpan: Option<Span> = if isPub then .Some(self.bump()) else .None
@@ -691,10 +741,9 @@ extend Parser {
 		if receiver == .Some(.Var) && isIdent(self.nth(1)) && self.nth(2) == .Colon then
 			receiver = .None
 		val .Some(declared) = receiver else {
-			self.noAnnotations(&annotations, "a field or a variant")
 			// `pub` on a field exports it; what the
-			// element is decides whether it may carry one.
-			return match elem(&var self, pubSpan) {
+			// element is decides whether it may carry one, and annotations.
+			return match elem(&var self, pubSpan, move annotations) {
 				.Some(item) => .Some(.Item(item: move item))
 				.None => .None
 			}
@@ -747,9 +796,7 @@ extend Parser {
 						unnamed.push(p.ast.types[ty].span)
 						return .None
 					}
-					var .Some(field) = p.field("a field name") else {
-						return .None
-					}
+					var field = p.field("a field name")?
 					p.fieldDefault(&var field)
 					return .Some(move field)
 				},
@@ -836,9 +883,21 @@ extend Parser {
 			self.variadic = .Some(self.bump())
 			return .None
 		}
+		// `implicit rng: &var Sampler`; a parameter named `implicit` is
+		// followed by its colon instead.
+		var implicitWord: Option<Span> = .None
+		if isIdent(self.peek()) &&
+			self.nthText(0) == "implicit" &&
+			self.nth(1) is .Ident(..) | .Underscore {
+			implicitWord = .Some(self.bump())
+		}
 		val name = self.paramName("a parameter name")?
 		var param = self.fieldAfter(name)?
 		self.fieldDefault(&var param)
+		if implicitWord is .Some(word) {
+			param.isImplicit = true
+			param.span = word.to(param.span)
+		}
 		return .Some(move param)
 	}
 
@@ -946,9 +1005,7 @@ extend Parser {
 			var fields: Vec<Name> = Vec()
 			while self.at(.Dot) {
 				self.bump()
-				val .Some(field) = self.name("a field") else {
-					break
-				}
+				val .Some(field) = self.name("a field") else break
 				fields.push(field)
 			}
 			val end = if fields.isEmpty() then start else fields[fields.len() - 1].span
@@ -1042,7 +1099,7 @@ extend Parser {
 				annotation.span,
 				"nothing here takes an annotation",
 			).withNote(
-				"an annotation belongs on a function, a struct, an enum, an interface or an `extend` block",
+				"an annotation belongs on a function, a struct or a struct's field, an enum, an interface or an `extend` block",
 			)
 			self.report(move diagnostic)
 		}
@@ -1169,24 +1226,20 @@ extend Parser {
 			open,
 			list,
 			(kind) => isIdent(kind) || kind == .SelfKw,
-			(p): Option<ImportItem> => {
+			(p) => {
 				// `self` in the list binds the module itself.
 				var name: Option<Name> = .None
 				var span = p.span()
 				if p.at(.SelfKw) {
 					span = p.bump()
 				} else {
-					val .Some(named) = p.name("a name to import") else {
-						return .None
-					}
+					val named = p.name("a name to import")?
 					name = .Some(named)
 					span = named.span
 				}
 				var alias: Option<Name> = .None
 				if p.eat(.As) {
-					val .Some(given) = p.name("a name for it") else {
-						return .None
-					}
+					val given = p.name("a name for it")?
 					alias = .Some(given)
 				}
 				return .Some(ImportItem(name: name, span: span, alias: alias))

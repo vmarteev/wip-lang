@@ -8,6 +8,7 @@ import syntax::{
 	ArrayLen,
 	Ast,
 	BinaryOp,
+	Binder,
 	Block,
 	Bound,
 	EnumDecl,
@@ -411,9 +412,16 @@ extend Printer {
 	}
 
 	var fn field(f: &Field): Doc = {
-		var parts = Vec::of(own [
-			text("\(pubWord(f.isPub))\(if f.isVar then "var " else "")\(self.sym(f.name.sym)): "),
-		])
+		// A field's annotations stand before it on its line: `@align(16)
+		// lightDir: Vec3`.
+		var parts: Vec<Doc> = Vec()
+		for annotation in f.annotations {
+			parts.push(self.annotation(&annotation))
+			parts.push(text(" "))
+		}
+		parts.push(
+			text("\(if f.isImplicit then "implicit " else "")\(pubWord(f.isPub))\(if f.isVar then "var " else "")\(self.sym(f.name.sym)): "),
+		)
 		parts.push(self.ty(f.ty))
 		if f.default is .Some(default) {
 			parts.push(text(" = "))
@@ -592,6 +600,11 @@ extend Printer {
 					}
 				}
 				head.push("]")
+			}
+			// `extend own<T: Clone>`.
+			.None if block.boxed.isSome() => {
+				head.push("own")
+				head.push(self.generics(&block.generics))
 			}
 			.None => {
 				for (i, name) in block.path.forwards().enumerate() {
@@ -803,24 +816,16 @@ extend Printer {
 	var fn stmt(id: StmtId): Doc = {
 		val stmt = &self.ast.stmts[id]
 		return match stmt.kind {
-			.Let(mutable, name, ty, init) => concat(
+			.Let(mutable, isImplicit, name, ty, init) => concat(
 				Vec::of(own [
-					text("\(if mutable then "var" else "val") \(self.sym(name.sym))"),
+					text("\(if isImplicit then "implicit " else "")\(if mutable then "var" else "val") \(self.sym(name.sym))"),
 					self.typeAnnotation(ty),
 					self.assigned(init),
 				]),
 			)
-			.Guard(mutable, pattern, value, elseBlock) => {
-				var parts = Vec::of(own [
-					text(if mutable then "var " else "val "),
-					self.pattern(&pattern),
-					self.assigned(value),
-				])
-				if elseBlock is .Some(block) {
-					parts.push(text(" else "))
-					parts.push(self.blockAs(&block, false))
-				}
-				concat(move parts)
+			.Guard(mutable, pattern, value, elseBlock) => match elseBlock {
+				.Some(block) => self.guard(mutable, &pattern, value, &block)
+				.None => self.guardHead(mutable, &pattern, value)
 			}
 			.Defer(value) => concat(Vec::of(own [text("defer "), self.expr(value)]))
 			.Return(value) => match value {
@@ -868,6 +873,50 @@ extend Printer {
 			.Expr(value) => self.expr(value)
 		}
 	}
+
+	/// `val pattern = value`, or `var`: a guard before its `else`.
+	var fn guardHead(mutable: bool, pattern: &Pattern, value: ExprId): Doc = concat(
+		Vec::of(own [
+			text(if mutable then "var " else "val "),
+			self.pattern(&pattern),
+			self.assigned(value),
+		]),
+	)
+
+	/// A guard and its `else`: the jump or the expression after `else` on
+	/// the guard's line, where the block is one that a `then` form would
+	/// hold and the whole guard fits; the block in braces otherwise, so
+	/// that a guard too long for its line breaks where it always has.
+	var fn guard(mutable: bool, pattern: &Pattern, value: ExprId, block: &Block): Doc = {
+		val next = self.next
+		if self.thenBranch(&block) {
+			val head = self.guardHead(mutable, &pattern, value)
+			val only = block.stmts[0]
+			val branch = match self.ast.stmts[only].kind {
+				.Expr(e) => self.expr(e)
+				_ => self.stmt(only)
+			}
+			val short = concat(Vec::of(own [move head, text(" else "), move branch]))
+			self.next = next
+			val braced = self.bracedGuard(mutable, &pattern, value, &block)
+			if flat(&short).isSome() then return choice(rigid(move short), move braced)
+			return move braced
+		}
+		return self.bracedGuard(mutable, &pattern, value, &block)
+	}
+
+	var fn bracedGuard(
+		mutable: bool,
+		pattern: &Pattern,
+		value: ExprId,
+		block: &Block,
+	): Doc = concat(
+		Vec::of(own [
+			self.guardHead(mutable, &pattern, value),
+			text(" else "),
+			self.blockAs(&block, false),
+		]),
+	)
 
 	/// `if … { } else if … { } else { }`, as one: flat only where it is one
 	/// `if` and one `else`, each a single expression, that fit on the line
@@ -1156,6 +1205,8 @@ extend Printer {
 		return match e.kind {
 			.Str(..) if self.isText(id) => self.textBlock(self.source(e.span))
 			.Int(..) | .Float(..) | .Str(..) | .Char(..) | .Byte(..) => text(self.source(e.span))
+			// What `@derive` writes, which no source holds.
+			.FieldDefault(..) => text("/* a field's default */")
 			// `for x in xs { value }`, an element of a list literal:
 			// its body is a value, so it may be one line.
 			.ForElement(binding, source, body) => {
@@ -1382,9 +1433,7 @@ extend Printer {
 		names: &[Option<Name>],
 		rest: Option<ExprId>,
 	): bool = {
-		val .Name(symbol) = self.ast.exprs[callee].kind else {
-			return false
-		}
+		val .Name(symbol) = self.ast.exprs[callee].kind else return false
 		if tupleArity(symbol) != .Some(args.len()) || rest.isSome() then return false
 		for name in names {
 			if name.isSome() then return false
@@ -1465,9 +1514,7 @@ extend Printer {
 				.Call(callee, ..) if self.ast.exprs[callee].kind is .Field(..) => {
 					segments.push((callee, .Some(at)))
 					calls += 1
-					val .Field(base, ..) = self.ast.exprs[callee].kind else {
-						panic("a field")
-					}
+					val .Field(base, ..) = self.ast.exprs[callee].kind else panic("a field")
 					at = base
 				}
 				.Field(base, ..) => {
@@ -1486,24 +1533,18 @@ extend Printer {
 		var fields: Vec<String> = Vec()
 		var written = 0
 		for (field, call) in segments {
-			val .Field(name, ..) = self.ast.exprs[field].kind else {
-				panic("a segment is a field")
-			}
+			val .Field(name, ..) = self.ast.exprs[field].kind else panic("a segment is a field")
 			fields.push(
 				match tupleFieldIndex(name.sym) {
 					.Some(index) => "\(index)"
 					.None => self.sym(name.sym)
 				},
 			)
-			val .Some(call) = call else {
-				continue
-			}
+			val .Some(call) = call else continue
 			val named = text(fields.join("."))
 			fields.clear()
 			val callSpan = self.ast.exprs[call].span
-			val .Call(args, names, rest, ..) = self.ast.exprs[call].kind else {
-				panic("a call")
-			}
+			val .Call(args, names, rest, ..) = self.ast.exprs[call].kind else panic("a call")
 			val segment = self.callRest(callSpan, move named, &args, &names, rest)
 			if written == 0 {
 				first.push(text("."))
@@ -1527,9 +1568,7 @@ extend Printer {
 	/// The `return`, `break` or `continue` an arm's block holds and
 	/// nothing else — no comment either, which the bare jump would lose.
 	fn loneJump(body: ExprId): Option<StmtId> = {
-		val .Block(block) = self.ast.exprs[body].kind else {
-			return .None
-		}
+		val .Block(block) = self.ast.exprs[body].kind else return .None
 		if block.stmts.len() != 1 then return .None
 		val only = block.stmts[0]
 		val jumps = self.ast.stmts[only].kind is .Return(..) | .Break(..) | .Continue(..)
@@ -1579,9 +1618,7 @@ extend Printer {
 	/// go one deeper: not where the chain is a whole value that an `=` has
 	/// moved to its own line, one deeper already.
 	var fn binaryAs(id: ExprId, deeper: bool): Doc = {
-		val .Binary(op, ..) = self.ast.exprs[id].kind else {
-			panic("a binary expression")
-		}
+		val .Binary(op, ..) = self.ast.exprs[id].kind else panic("a binary expression")
 		val level = precedence(op)
 		var operands: Vec<ExprId> = Vec()
 		var ops: Vec<String> = Vec()
@@ -1640,6 +1677,30 @@ extend Printer {
 
 	// ---- Patterns ------------------------------------------------------
 
+	/// Binders in parentheses, a variant's, a struct's or a tuple's, and
+	/// `..` after them where it was written.
+	var fn binders(listed: &[Binder], rest: bool): Doc = {
+		var parts: Vec<Doc> = Vec()
+		for b in listed {
+			parts.push(
+				match b.pattern {
+					// A pattern where no field is named: by position.
+					.Some(inner) if b.field.sym == Symbol::positional() => self.pattern(&inner)
+					// `field: pattern`, or the field's name on its own
+					// where it binds that name.
+					.Some(inner) if !(inner.kind is .Binding(symbol) &&
+						symbol == b.field.sym &&
+						inner.span == b.field.span) => concat(
+						Vec::of(own [text("\(self.sym(b.field.sym)): "), self.pattern(&inner)]),
+					)
+					_ => text(self.sym(b.field.sym))
+				},
+			)
+		}
+		if rest then parts.push(text(".."))
+		return self.list("(", move parts, ")")
+	}
+
 	var fn pattern(p: &Pattern): Doc = match p.kind {
 		.Wildcard => text("_")
 		.Binding(symbol) => text(self.sym(symbol))
@@ -1679,51 +1740,17 @@ extend Printer {
 			return group(join(move parts, concat(Vec::of(own [.Line, text("| ")]))))
 		}
 		.Variant(leadingDot, segments, binders, rest) => {
-			if !leadingDot &&
-				segments.len() == 1 &&
-				binders is .Some(listed) &&
-				tupleArity(segments[0].sym) == .Some(listed.len()) {
-				var parts: Vec<Doc> = Vec()
-				for b in listed {
-					parts.push(
-						match b.pattern {
-							.Some(inner) => self.pattern(&inner)
-							.None => text(self.sym(b.field.sym))
-						},
-					)
-				}
-				return self.list("(", move parts, ")")
-			}
 			var path = String::of(if leadingDot then "." else "")
 			for (i, segment) in segments.forwards().enumerate() {
 				if i > 0 then path.push("::")
 				path.push(self.sym(segment.sym))
 			}
 			val head = text(path)
-			val .Some(listed) = binders else {
-				return move head
-			}
-			var parts: Vec<Doc> = Vec()
-			for b in listed {
-				parts.push(
-					match b.pattern {
-						// A pattern where the variant's one field is: by
-						// position.
-						.Some(inner) if b.field.sym == Symbol::positional() => self.pattern(&inner)
-						// `field: pattern`, or the field's name on its own
-						// where it binds that name.
-						.Some(inner) if !(inner.kind is .Binding(symbol) &&
-							symbol == b.field.sym &&
-							inner.span == b.field.span) => concat(
-							Vec::of(own [text("\(self.sym(b.field.sym)): "), self.pattern(&inner)]),
-						)
-						_ => text(self.sym(b.field.sym))
-					},
-				)
-			}
-			if rest then parts.push(text(".."))
-			return concat(Vec::of(own [move head, self.list("(", move parts, ")")]))
+			val .Some(listed) = binders else return move head
+			return concat(Vec::of(own [move head, self.binders(&listed, rest)]))
 		}
+		// `(x, y)`, `(x: across, ..)`: a tuple or a struct taken apart.
+		.Parens(binders, rest) => self.binders(&binders, rest)
 		// `[first, ..rest]`.
 		.Slice(elements) => {
 			var parts: Vec<Doc> = Vec()

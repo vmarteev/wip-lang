@@ -1,0 +1,154 @@
+// `--type Vector3=std::math::Vec3`: a C struct declared as a Wip type that
+// already exists, so a value crosses as it is. It is allowed only where the
+// two are laid out alike — the same size and alignment, and each of C's
+// fields at the same offset, of the same type, in the Wip type — which
+// clang is asked of the C type, and `wip` of the Wip one. Layout is all
+// that is checked: two matrices of sixteen floats, one stored a row at a
+// time and one a column, are alike here and mean different things.
+
+import std::fs
+import std::io
+import std::path
+import std::process
+import std::process::{Command}
+import declared::{Reading, Typed}
+import probe
+import types::{Ty, wipName}
+
+/// A C type to be declared as a Wip one: `c` is the header's name for it,
+/// and `wip` the Wip type's path, `std::math::Vec3`.
+pub struct Mapping {
+	pub c: String
+	pub wip: String
+}
+
+extend Mapping {
+	/// `Vector3=std::math::Vec3`, as the command line writes one.
+	pub static fn parse(written: str): Result<Mapping, String> = {
+		val .Some((c, wip)) = written.splitOnce("=") else {
+			return .Err("`--type \(written)` names no Wip type: write `--type CName=module::Type`")
+		}
+		val .Some((_, name)) = wip.rsplitOnce("::") else {
+			return .Err("`--type \(written)`: `\(wip)` is not a path, `module::Type`")
+		}
+		if c.trim().isEmpty() || name.isEmpty() then
+			return .Err("`--type \(written)` needs a C name and a Wip type")
+		return .Ok(Mapping(c: String::of(c.trim()), wip: String::of(wip.trim())))
+	}
+
+	/// The Wip type's own name, which the module writes: `Vec3`.
+	pub fn name(): String = match self.wip.rsplitOnce("::") {
+		.Some((_, name)) => String::of(name)
+		.None => self.wip.clone()
+	}
+
+	/// The module that declares it: `std::math`.
+	pub fn module(): String = match self.wip.rsplitOnce("::") {
+		.Some((module, _)) => String::of(module)
+		.None => String()
+	}
+}
+
+/// Whether the C struct `mapping` names, whose fields are `fields` and
+/// which C spells `spelled` (`Vector3`, or `struct Vector3` where no
+/// typedef names it), is laid out as its Wip type is; why not, where it is
+/// not. `mappings` are every mapping, whose Wip types a field may be.
+pub fn check(
+	header: str,
+	reading: &Reading,
+	mapping: &Mapping,
+	spelled: str,
+	fields: &[Typed],
+	mappings: &[Mapping],
+): Result<void, String> = {
+	val what = "`\(mapping.c)` as `\(mapping.wip)`"
+
+	// What C says.
+	var asked: Vec<String> = Vec::of(own ["sizeof(\(spelled))", "_Alignof(\(spelled))"])
+	for field in fields {
+		asked.push("offsetof(\(spelled), \(field.name))")
+	}
+	val c = probe::integers(header, reading, &asked)?
+	var cNumbers: Vec<i64> = Vec()
+	for i in 0..c.len() {
+		val .Some(number) = c[i] else return .Err("\(what): clang did not work out `\(asked[i])`")
+		cNumbers.push(number)
+	}
+
+	// What the Wip type says, from a program that asks it the same.
+	val wip = wipLayout(mapping, fields, mappings)?
+
+	if wip[0] != cNumbers[0] then
+		return .Err("\(what): it is \(cNumbers[0]) bytes in C and \(wip[0]) in Wip")
+	if wip[1] != cNumbers[1] then
+		return .Err("\(what): it is aligned to \(cNumbers[1]) in C and \(wip[1]) in Wip, so a value C hands over may lie where the Wip type cannot")
+	for i in 0..fields.len() {
+		if wip[i + 2] != cNumbers[i + 2] then
+			return .Err("\(what): the field `\(fields[i].name)` is at \(cNumbers[i + 2]) in C and \(wip[i + 2]) in Wip")
+	}
+	return .Ok()
+}
+
+/// The Wip type's size, alignment and the offset of each of `fields`, in
+/// that order, as `wip` compiles a program that asks for them; why not,
+/// naming the field, where the program does not compile.
+fn wipLayout(
+	mapping: &Mapping,
+	fields: &[Typed],
+	mappings: &[Mapping],
+): Result<Vec<i64>, String> = {
+	val name = mapping.name()
+	var lines: Vec<String> = Vec::of(own [
+		String::of("import std::c"),
+		String::of("import std::io"),
+	])
+	for other in mappings {
+		lines.push("import \(other.module())::{\(other.name())}")
+	}
+	lines.push(String())
+	lines.push(String::of("// Each field read as the type C gives it."))
+	lines.push("fn fields(value: &\(name)) = {")
+	// The line each field's read is on, to name it where it fails.
+	val first = lines.len() + 1
+	for field in fields {
+		lines.push("    val _\(field.name): \(field.ty.text()) = value.\(wipName(field.name))")
+	}
+	lines.push(String::of("}"))
+	lines.push(String())
+	lines.push(String::of("fn main() = {"))
+	lines.push("    io::println(\"\\(c::sizeOf<\(name)>())\")")
+	lines.push("    io::println(\"\\(c::alignOf<\(name)>())\")")
+	for field in fields {
+		lines.push("    io::println(\"\\(c::offsetOf<\(name)>(\"\(wipName(field.name))\"))\")")
+	}
+	lines.push(String::of("}"))
+	val program = "\(lines.join("\n"))\n"
+
+	val dir = path::join(io::env("TMPDIR").unwrapOr("/tmp"), "wip-bindgen-\(process::id())")
+	if fs::makeDirs(dir) is .Err(error) then
+		return .Err("cannot make a directory to ask `wip` in: \(error)")
+	val source = path::join(dir, "main.wip")
+	if fs::writeFile(source, program) is .Err(error) then
+		return .Err("cannot write the program that asks `wip`: \(error)")
+	val wip = io::env("WIP").unwrapOr("wip")
+	val ran = Command::of(wip).args(["run", "main.wip"]).directory(dir).output()
+	fs::removeAll(dir)
+	val output = match move ran {
+		.Ok(output) => move output
+		.Err(error) => return .Err("cannot run `\(wip)`: \(error)")
+	}
+	if !output.exit.success() {
+		// The first line the compiler names, which is a field's.
+		for i in 0..fields.len() {
+			if output.stderr.contains("main.wip:\(first + i):") then
+				return .Err("`\(mapping.c)` as `\(mapping.wip)`: its field `\(fields[i].name)` is a `\(fields[i].ty.text())`, and `\(name)` has no such field")
+		}
+		return .Err("`\(mapping.c)` as `\(mapping.wip)`: `wip` could not ask about it:\n\(output.stderr)")
+	}
+	var numbers: Vec<i64> = Vec()
+	for line in output.stdout.lines() {
+		val .Ok(number) = line.toInt() else return .Err("`wip` answered `\(line)`")
+		numbers.push(number)
+	}
+	return .Ok(move numbers)
+}

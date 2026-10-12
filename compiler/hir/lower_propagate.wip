@@ -2,9 +2,12 @@
 //
 // It lowers to what a reader would write: a `match` whose first arm takes the
 // value and whose second returns, so the move checker, the MIR and code
-// generation see nothing new.
+// generation see nothing new. In a lambda whose result is not known yet,
+// what the second arm returns waits for the first `return`, or the body's
+// value, to say it, and is checked then.
 
 import std::collections::{Map}
+import std::mem
 import syntax as ast
 import syntax::{CANNOT_PROPAGATE, Diagnostic, Span}
 
@@ -19,6 +22,26 @@ struct Tried {
 	alias: Option<RefKind>
 	scrutinee: ExprId
 	span: Span
+}
+
+/// A `?` met in a lambda whose result was not known yet: the type it is
+/// on, and the value its second arm returns, whose type is the result's
+/// once that is said, and whose error is converted then where it must be.
+@derive(Clone)
+struct PendingTry {
+	ty: Ty
+	id: EnumId
+	kind: Propagated
+	returned: ExprId
+	span: Span
+}
+
+/// What a `?` returns from, for its message: a function, or a lambda, with
+/// where its result was said where something said it.
+@derive(Clone)
+enum ReturnsFrom {
+	Function
+	Lambda(said: Option<Span>)
 }
 
 /// The two types `?` knows.
@@ -43,24 +66,22 @@ extend Lowerer {
 			self.report(move diagnostic)
 			return self.errorExpr(span)
 		}
-		// The function must return the same one, with the same error type.
-		val ret = self.state.ret
-		val matchesResult = match self.kind(ret) {
-			.Enum(id: retId, args: retArgs) if retId == id => match kind {
-				.Option => true
-				.Result =>
-					secondArg(&self.program.types, args) == secondArg(&self.program.types, retArgs)
+		// The function must return the same one, with the same error type,
+		// or one that says how it is made from this one; a lambda whose
+		// result is not known yet is held to it once the result is said.
+		val waits = self.state.inferringRet
+		val ret = if waits then ty else self.state.ret
+		var conversion: Option<FnId> = .None
+		if !waits {
+			match self.resultFits(ty, ret, id, kind) {
+				.Some(from) => conversion = from
+				.None => {
+					val from = if self.state.lambda then ReturnsFrom::Lambda(.None) else .Function
+					val diagnostic = self.wrongResult(ty, ret, kind, span, from)
+					self.report(move diagnostic)
+					return self.errorExpr(span)
+				}
 			}
-			_ => false
-		}
-		// Where the error types differ, the function's error type may say how
-		// it is made from this one.
-		val conversion: Option<FnId> =
-			if !matchesResult && kind == .Result then self.errorConversion(ty, ret, id) else .None
-		if !matchesResult && conversion.isNone() {
-			val diagnostic = self.wrongResult(ty, ret, kind, span)
-			self.report(move diagnostic)
-			return self.errorExpr(span)
 		}
 		// `.Some` is the first variant, `.None` the second; `.Ok` and `.Err`
 		// likewise.
@@ -95,7 +116,16 @@ extend Lowerer {
 			span: span,
 		)
 		// The arm that returns what was not taken.
-		val otherArm = self.returningArm(&tried, other, ret, conversion)
+		val (otherArm, returned) = self.returningArm(&tried, other, ret)
+		if conversion is .Some(from) then self.convertReturned(returned, from)
+		if waits then
+			self.state.pendingTries.push(PendingTry(
+				ty: ty,
+				id: id,
+				kind: kind,
+				returned: returned,
+				span: span,
+			))
 		self.state.scopes.pop()
 		return self.alloc(
 			.Match(scrutinee: scrutinee, arms: Vec::of(own [move takenArm, move otherArm])),
@@ -104,22 +134,63 @@ extend Lowerer {
 		)
 	}
 
-	/// The arm that returns: `.None` as it is, and `.Err(error)` with the
-	/// error it was given.
-	var fn returningArm(tried: &Tried, variant: u32, ret: Ty, conversion: Option<FnId>): Arm = {
-		val id = tried.id
-		val span = tried.span
-		val fields = self.program.enums[id].variants[variant as i64].fields.len()
-		var binders: Vec<Binder> = Vec()
-		var args: Vec<ExprId> = Vec()
-		if fields != 0 {
-			val (local, read) = self.fieldBinding(&tried, variant)
-			var error = read
-			// `extend TheirError: From<ThisError>`: the error is made into the one
-			// the function returns.
-			if conversion is .Some(from) {
-				val made = self.program.fns[from].ret
-				error = self.alloc(
+	/// Whether a `?` on `ty` fits a function that returns `ret`: nothing
+	/// where it does not; where it does, the `from` that makes the error the
+	/// function returns from this one, where they differ.
+	var fn resultFits(ty: Ty, ret: Ty, id: EnumId, kind: Propagated): Option<Option<FnId>> = {
+		val .Enum(args, ..) = self.kind(ty) else return .None
+		val same = match self.kind(ret) {
+			.Enum(id: retId, args: retArgs) if retId == id => match kind {
+				.Option => true
+				.Result =>
+					secondArg(&self.program.types, args) == secondArg(&self.program.types, retArgs)
+			}
+			_ => false
+		}
+		if same then return .Some(.None)
+		// Where the error types differ, the function's error type may say how
+		// it is made from this one.
+		if kind != .Result then return .None
+		return .Some(.Some(self.errorConversion(ty, ret, id)?))
+	}
+
+	/// The `?`s that waited for the lambda's result, now that it is said,
+	/// at `said` where something said it: each one's returned value takes
+	/// the result's type, and its error is converted where it must be, or
+	/// the `?` is refused.
+	var fn settlePendingTries(said: Option<Span>) = {
+		val pending = mem::replace(&var self.state.pendingTries, Vec())
+		val ret = self.state.ret
+		for waiting in pending {
+			match self.resultFits(waiting.ty, ret, waiting.id, waiting.kind) {
+				.Some(conversion) => {
+					self.state.body.exprs[waiting.returned].ty = ret
+					if conversion is .Some(from) then self.convertReturned(waiting.returned, from)
+				}
+				.None => {
+					val diagnostic = self.wrongResult(
+						waiting.ty,
+						ret,
+						waiting.kind,
+						waiting.span,
+						.Lambda(said),
+					)
+					self.report(move diagnostic)
+				}
+			}
+		}
+	}
+
+	/// `extend TheirError: From<ThisError>`: the error the returning arm's
+	/// `returned` holds made into the one the function returns, by `from`.
+	var fn convertReturned(returned: ExprId, from: FnId) = {
+		val span = self.state.body.exprs[returned].span
+		val made = self.program.fns[from].ret
+		var kind = self.state.body.exprs[returned].kind.clone()
+		match kind {
+			.Variant(args, ..) => {
+				val error = args[0]
+				args[0] = self.alloc(
 					.Call(
 						callee: from,
 						args: Vec::of(own [error]),
@@ -130,8 +201,23 @@ extend Lowerer {
 					span,
 				)
 			}
+			_ => return
+		}
+		self.state.body.exprs[returned].kind = move kind
+	}
+
+	/// The arm that returns `ret`: `.None` as it is, and `.Err(error)` with
+	/// the error it was given; and the value it returns.
+	var fn returningArm(tried: &Tried, variant: u32, ret: Ty): (Arm, ExprId) = {
+		val id = tried.id
+		val span = tried.span
+		val fields = self.program.enums[id].variants[variant as i64].fields.len()
+		var binders: Vec<Binder> = Vec()
+		var args: Vec<ExprId> = Vec()
+		if fields != 0 {
+			val (local, read) = self.fieldBinding(&tried, variant)
 			binders.push(.Bind(local))
-			args.push(error)
+			args.push(read)
 		}
 		val returned = self.alloc(
 			.Variant(id: id, variant: variant, args: move args, order: Vec()),
@@ -145,12 +231,13 @@ extend Lowerer {
 			NEVER,
 			span,
 		)
-		return Arm(
+		val arm = Arm(
 			pattern: .Variant(variant: variant, binders: move binders),
 			guard: .None,
 			body: body,
 			span: span,
 		)
+		return (move arm, returned)
 	}
 
 	/// The binding of a variant's one field, `value` or `error`, and the value
@@ -183,9 +270,7 @@ extend Lowerer {
 
 	/// The error type of a `Result`, which is its second type argument.
 	fn errorOf(ty: Ty): Option<Ty> = {
-		val .Enum(id, args) = self.kind(ty) else {
-			return .None
-		}
+		val .Enum(id, args) = self.kind(ty) else return .None
 		if self.propagatedEnum(id) != .Some(.Result) then return .None
 		return secondArg(&self.program.types, args)
 	}
@@ -194,13 +279,9 @@ extend Lowerer {
 	/// returns a `Result` whose error type says how it is made from this one.
 	var fn errorConversion(ty: Ty, ret: Ty, result: EnumId): Option<FnId> = {
 		val interfaceId = self.program.preludeItems.interfaceOf(.From)?
-		val .Enum(id: retId, args: retArgs) = self.kind(ret) else {
-			return .None
-		}
+		val .Enum(id: retId, args: retArgs) = self.kind(ret) else return .None
 		if retId != result then return .None
-		val .Enum(args, ..) = self.kind(ty) else {
-			return .None
-		}
+		val .Enum(args, ..) = self.kind(ty) else return .None
 		val source = secondArg(&self.program.types, args)?
 		val target = secondArg(&self.program.types, retArgs)?
 		val owner = self.ownerOf(target)?
@@ -240,15 +321,36 @@ extend Lowerer {
 		"not an `Option` or a `Result`",
 	).withNote("`?` takes the value, or returns the other variant to the caller")
 
-	fn wrongResult(ty: Ty, ret: Ty, kind: Propagated, span: Span): Diagnostic = {
+	fn wrongResult(ty: Ty, ret: Ty, kind: Propagated, span: Span, from: ReturnsFrom): Diagnostic = {
 		val value = self.tyName(ty)
 		val result = self.tyName(ret)
-		val diagnostic = Diagnostic::error(
-			CANNOT_PROPAGATE,
-			"`?` on \(value) needs the function to return one too",
-			span,
-			"this function returns \(result)",
-		)
+		val diagnostic = match from {
+			.Function => Diagnostic::error(
+				CANNOT_PROPAGATE,
+				"`?` on \(value) needs the function to return one too",
+				span,
+				"this function returns \(result)",
+			)
+			.Lambda(said) => {
+				val answers =
+					if ret == UNIT then String::of("this lambda answers nothing")
+					else "this lambda answers \(result)"
+				match said {
+					.Some(at) if ret != UNIT => Diagnostic::error(
+						CANNOT_PROPAGATE,
+						"`?` on \(value) needs the lambda to answer one too",
+						span,
+						"returns from the lambda",
+					).withSecondary(at, move answers)
+					_ => Diagnostic::error(
+						CANNOT_PROPAGATE,
+						"`?` on \(value) needs the lambda to answer one too",
+						span,
+						move answers,
+					)
+				}
+			}
+		}
 		return match kind {
 			.Result => {
 				// Where the two error types are known, the help names the
@@ -263,11 +365,15 @@ extend Lowerer {
 					_ => "convert it first, with `mapErr`"
 				}
 				diagnostic.withNote(
-					"`?` returns the error as it is, unless the function's error type says how it is made from this one",
+					if from is .Lambda(..) then
+						"`?` returns the error as it is, unless the lambda's error type says how it is made from this one"
+					else "`?` returns the error as it is, unless the function's error type says how it is made from this one",
 				).withHelp(move help)
 			}
 			.Option => diagnostic.withNote(
-				"`?` on an `Option` returns `.None`, so the function must return an `Option`",
+				if from is .Lambda(..) then
+					"`?` on an `Option` returns `.None`, so the lambda must answer an `Option`"
+				else "`?` on an `Option` returns `.None`, so the function must return an `Option`",
 			)
 		}
 	}

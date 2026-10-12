@@ -47,9 +47,7 @@ val FUNCTION_INDEX: u64 = 0xFFFFFFFF
 /// A call's flags: its type is written in it.
 val CALL_EXPLICIT_TYPE: u64 = 1 << 15
 
-/// Sequentially consistent, the ordering of every atomic the backend writes,
-/// and the scope of the whole system.
-val SEQ_CST: u64 = 6
+/// The scope of every atomic the backend writes: the whole system.
 val SYSTEM_SCOPE: u64 = 1
 
 // The kinds of metadata a function or an instruction carries, as LLVM
@@ -424,6 +422,7 @@ extend Writer {
 					.SignExt => AttrEntry::Plain(24)
 					.NoAlias => AttrEntry::Plain(9)
 					.ReadOnly => AttrEntry::Plain(21)
+					.NoCapture => AttrEntry::Plain(11)
 					.NonNull => AttrEntry::Plain(39)
 					.Dereferenceable(bytes) => AttrEntry::Number(kind: 41, value: bytes as u64)
 					.Align(bytes) => AttrEntry::Number(kind: 1, value: bytes as u64)
@@ -479,9 +478,7 @@ extend Writer {
 			else self.moduleConst(t, .Data(bytes.clone()))
 		}
 		.Packed(fields) => {
-			val .Struct(layout) = t else {
-				panic("a packed constant is a struct's")
-			}
+			val .Struct(layout) = t else panic("a packed constant is a struct's")
 			var elements: Vec<u32> = Vec()
 			for (i, field) in fields.forwards().enumerate() {
 				elements.push(self.constant(&field, &layout.fields[i]))
@@ -489,9 +486,7 @@ extend Writer {
 			self.moduleConst(t, .Aggregate(move elements))
 		}
 		.Array(items) => {
-			val .Array(array) = t else {
-				panic("an array constant is an array's")
-			}
+			val .Array(array) = t else panic("an array constant is an array's")
 			var elements: Vec<u32> = Vec()
 			for item in items {
 				elements.push(self.constant(&item, &array.element))
@@ -698,27 +693,31 @@ extend Writer {
 				.Some(id) => id as u64 + 1
 				.None => 0
 			}
-			val values = Vec::of(own [
-				at,
-				length,
-				self.typeId(&global.t) as u64,
-				(if global.constant then 1 as u64 else 0) | 2,
-				init,
-				linkageCode(&global.linkage),
-				match global.align {
-					.Some(align) => alignCode(align)
-					.None => 0
-				},
-				0,
-				visibility(&global.linkage),
-				0,
-				if global.unnamedAddr then 1 as u64 else 0,
-				0,
-				0,
-				0,
-				0,
-				dsoLocal(&global.linkage),
-			])
+			val values = Vec::of(
+				own [
+					at,
+					length,
+					self.typeId(&global.t) as u64,
+					(if global.constant then 1 as u64 else 0) | 2,
+					init,
+					linkageCode(&global.linkage),
+					match global.align {
+						.Some(align) => alignCode(align)
+						.None => 0
+					},
+					0,
+					visibility(&global.linkage),
+					// The general-dynamic model, which a program and a library
+					// alike may use.
+					if global.threadLocal then 1 as u64 else 0,
+					if global.unnamedAddr then 1 as u64 else 0,
+					0,
+					0,
+					0,
+					0,
+					dsoLocal(&global.linkage),
+				],
+			)
 			self.bits.record(7, &values.items())
 		}
 		for declared in module.declared {
@@ -826,6 +825,7 @@ fn fnAttrEntry(attr: &FnAttr): AttrEntry = match attr {
 	.DisableTailCalls => .Text(key: "disable-tail-calls", value: "true")
 	.NoReturn => .Plain(17)
 	.NoMerge => .Plain(66)
+	.NoInline => .Plain(14)
 }
 
 /// What a global or a function's record says it is seen by.
@@ -1602,14 +1602,14 @@ extend Writer {
 					]),
 				)
 			}
-			.LoadAtomic(t, address, align) => (
+			.LoadAtomic(t, address, align, order) => (
 				41,
 				Vec::of(own [
 					self.rel(&local, inst, &address, &ptr),
 					self.typeId(&t) as u64,
 					alignCode(align),
 					0,
-					SEQ_CST,
+					orderingCode(&order),
 					SYSTEM_SCOPE,
 				]),
 			)
@@ -1622,14 +1622,14 @@ extend Writer {
 					0,
 				]),
 			)
-			.StoreAtomic(value, address, align) => (
+			.StoreAtomic(value, address, align, order) => (
 				45,
 				Vec::of(own [
 					self.rel(&local, inst, &address, &ptr),
 					self.relVal(&local, inst, &value),
 					alignCode(align),
 					0,
-					SEQ_CST,
+					orderingCode(&order),
 					SYSTEM_SCOPE,
 				]),
 			)
@@ -1712,14 +1712,14 @@ extend Writer {
 				}
 				(34, move values)
 			}
-			.AtomicRmw(op, address, value, align) => (
+			.AtomicRmw(op, address, value, align, order) => (
 				59,
 				Vec::of(own [
 					self.rel(&local, inst, &address, &ptr),
 					self.relVal(&local, inst, &value),
 					rmwCode(&op),
 					0,
-					SEQ_CST,
+					orderingCode(&order),
 					SYSTEM_SCOPE,
 					alignCode(align),
 				]),
@@ -1731,13 +1731,14 @@ extend Writer {
 					self.relVal(&local, inst, &swap.expected),
 					self.relVal(&local, inst, &swap.replacement),
 					0,
-					SEQ_CST,
+					orderingCode(&swap.order),
 					SYSTEM_SCOPE,
-					SEQ_CST,
+					failingCode(&swap.order),
 					0,
 					alignCode(swap.align),
 				]),
 			)
+			.Fence(order) => (36, Vec::of(own [orderingCode(&order), SYSTEM_SCOPE]))
 			.Declare(address, variable, expression) => {
 				val callee = self.declareFn
 				val address = self.valueId(&local, &address, &ptr)
@@ -1854,6 +1855,24 @@ fn rmwCode(op: &Rmw): u64 = match op {
 	.Xchg => 0
 	.Add => 1
 	.Sub => 2
+	.FAdd => 11
+	.FSub => 12
+}
+
+/// What a compare-and-swap that does not swap orders, as bitcode numbers
+/// it.
+fn failingCode(order: &AtomicOrdering): u64 = {
+	val failing = order.failing()
+	return orderingCode(&failing)
+}
+
+/// An ordering as LLVM's bitcode numbers it.
+fn orderingCode(order: &AtomicOrdering): u64 = match order {
+	.Monotonic => 2
+	.Acquire => 3
+	.Release => 4
+	.AcqRel => 5
+	.SeqCst => 6
 }
 
 /// A constant's record: a `float`'s where `float32` says so.

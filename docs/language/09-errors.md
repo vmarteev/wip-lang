@@ -21,9 +21,7 @@ enum ParseTrouble {
 
 fn double(text: str): Result<i64, ParseTrouble> = {
     if text.isEmpty() then return .Err(.Empty)
-    val .Ok(number) = text.toInt() else {
-        return .Err(.NotANumber)
-    }
+    val .Ok(number) = text.toInt() else return .Err(.NotANumber)
     return .Ok(number * 2)
 }
 
@@ -109,6 +107,40 @@ fn main() = {
     assert(port("8080") == .Ok(8080))
     assert(port("").isErr())
     assert(port("http").isErr())
+}
+```
+
+A `?` in a lambda leaves the lambda, and is held to what the lambda
+answers. Where nothing says that — no result written, and none expected of
+it — the lambda answers what it first returns, or its body's value, and each
+`?` before that is checked once it is said:
+
+```wip,run
+fn half(n: i64): Option<i64> = if n % 2 == 0 then .Some(n / 2) else .None
+
+fn apply<E>(n: i64, f: (n: i64) => Option<E>): Option<E> = f(n)
+
+fn main() = {
+    assert(apply(4, (n) => .Some(half(n)? + 1)) == .Some(3))
+    val quarter = (n: i64) => {
+        val h = half(n)?
+        return half(h)
+    }
+    assert(quarter(8) == .Some(2) && quarter(6) == .None)
+}
+```
+
+A lambda found to answer another kind, or nothing, is refused where the `?`
+is, with what said the lambda's result:
+
+```wip,error=E0348
+fn half(n: i64): Option<i64> = if n % 2 == 0 then .Some(n / 2) else .None
+
+fn main() = {
+    val plusOne = (n: i64) => {
+        val h = half(n)?
+        return h + 1
+    }
 }
 ```
 

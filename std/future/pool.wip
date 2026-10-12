@@ -1,0 +1,203 @@
+// Threads that stay: a `Pool` starts its threads once and hands them work
+// for as long as it lives, where `future::each` and `future::map` start a
+// thread for each part of every call — some tens of microseconds a call,
+// which a game that splits its work every frame pays every frame. What
+// `each` and `map` take and answer is theirs, and so are the rules on what
+// the closures borrow: each call answers once every part is done.
+
+import std::sync::{Atomic, Mutex}
+
+/// Threads that stay between calls: `pool.each(&var items, work)` and
+/// `pool.map(&items, work)`, as `future::each` and `future::map` are. Its
+/// end tells its threads to stop, and waits for them.
+pub struct Pool {
+	/// The threads' slots and what they share, on the heap where the
+	/// threads find them while the `Pool` moves.
+	state: own<PoolState>
+	threads: Vec<ptr<Thread>>
+}
+
+struct PoolState {
+	/// One for each thread, which only it waits on.
+	slots: Vec<Slot>
+	/// How many parts given out are not yet done.
+	running: Atomic<i64>
+	/// What the caller sleeps on, where spinning did not see the parts
+	/// done: told by the thread that finishes the last.
+	finished: Mutex<bool>
+}
+
+/// A thread's slot: how many parts it has been given, which it watches
+/// while it spins, and the part itself, which it sleeps on.
+struct Slot {
+	given: Atomic<i64>
+	job: Mutex<Part>
+}
+
+struct Part {
+	lent: Option<Lent> = .None
+	stopping: bool = false
+}
+
+/// Where a thread of a pool starts: its pool's state, and its number.
+struct Start {
+	state: ptr<PoolState>
+	index: i64
+}
+
+/// How many times a thread looks for work before it sleeps, and the
+/// caller for the parts' end: some microseconds, about one call's gap in a
+/// frame's work.
+val SPINS: i64 = 20000
+
+extend Pool {
+	/// A pool of `threads` threads, which with the thread that calls it work
+	/// on a call's parts: `future::cores() - 1` is one for each processor.
+	pub static fn of(threads: i64): Pool = {
+		val count = threads.max(0)
+		var slots: Vec<Slot> = Vec()
+		for _ in 0..count {
+			slots.push(Slot(given: Atomic::of(0), job: Mutex::of(Part())))
+		}
+		var state = own PoolState(
+			slots: move slots,
+			running: Atomic::of(0),
+			finished: Mutex::of(false),
+		)
+		val at = addressOf<PoolState>(&var state) as ptr<PoolState>
+		var threads: Vec<ptr<Thread>> = Vec()
+		for index in 0..count {
+			val start = intoAddress(own Start(state: at, index: index))
+			threads.push(startThread(poolWorker, start))
+		}
+		return Pool(state: move state, threads: move threads)
+	}
+
+	/// How many threads it has.
+	pub fn threads(): i64 = self.threads.len()
+
+	/// Runs `work` on every element, the elements split among the pool's
+	/// threads and this one, each changing its own part; answers once every
+	/// element is done.
+	pub fn each<T>(items: &var [T], work: &(item: &var T) => void) = self.spread(
+		&var items,
+		work,
+		0,
+	)
+
+	/// What `work` answers for every element, in the elements' order, the
+	/// elements split among the pool's threads and this one.
+	pub fn map<T, R>(items: &[T], work: &(item: &T) => R): Vec<R> = {
+		// Each element's index and its answer, filled in where it is.
+		var answers: Vec<(i64, Option<R>)> = Vec()
+		for i in 0..items.len() {
+			answers.push((i, .None))
+		}
+		self.each(&var answers.items(), (answer) => { answer.1 = .Some(work(&items[answer.0])) })
+		var all: Vec<R> = Vec()
+		for (_, answer) in move answers {
+			all.push(answer.unwrap())
+		}
+		return move all
+	}
+
+	/// The part of `items` for thread `from` and those after it: the first
+	/// part given to thread `from`, the rest spread among the others, and
+	/// the last done here; answers once all are done.
+	fn spread<T>(items: &var [T], work: &(item: &var T) => void, from: i64) = {
+		val left = self.threads.len() - from
+		if left <= 0 || items.len() <= 1 {
+			for item in items {
+				work(&var item)
+			}
+			if from > 0 then self.waitForAll()
+			return
+		}
+		items.split(
+			items.len() / (left + 1),
+			(first, second) => self.handOver(
+				from,
+				() => {
+					for item in first {
+						work(&var item)
+					}
+				},
+				() => self.spread(&var second, work, from + 1),
+			),
+		)
+	}
+
+	/// Gives `mine` to thread `index`, and runs `rest`, which waits for every
+	/// thread before it answers: `mine` is lent until then.
+	fn handOver(index: i64, mine: &var () => void, rest: &var () => void) = {
+		val lent = Lent(code: closureCode(mine), captures: closureCaptures(mine))
+		val slot = &self.state.slots[index]
+		self.state.running.add(1)
+		slot.job.lock((job) => { job.lent = .Some(lent) })
+		slot.given.add(1, order: .Release)
+		rest()
+	}
+
+	/// Waits until every thread given a part has finished it: spinning a
+	/// while, then asleep until the last to finish says so.
+	fn waitForAll() = {
+		for _ in 0..SPINS {
+			if self.state.running.load(order: .Acquire) == 0 then return
+		}
+		val running = &self.state.running
+		self.state.finished.lockWhen((_) => running.load() == 0, (_) => {})
+	}
+}
+
+extend Pool: Destroy {
+	/// Tells the threads to stop, and waits for them.
+	var fn destroy() = {
+		for slot in self.state.slots {
+			slot.job.lock((job) => { job.stopping = true })
+			slot.given.add(1)
+		}
+		for thread in self.threads {
+			joinThread(thread)
+		}
+	}
+}
+
+// Where a thread of a pool starts: it runs what it is given until it is
+// told to stop, spinning a while for the next part before it sleeps.
+fn poolWorker(argument: ptr<u8>): ptr<u8> = {
+	val thread = argument as ptr<Thread>
+	val start: own<Start> = fromAddress(thread.job)
+	work(&referenceAt<PoolState>(start.state as ptr<void>), start.index)
+	atomicStore(finishedFlag(thread), 1)
+	return null
+}
+
+fn work(state: &PoolState, index: i64) = {
+	val slot = &state.slots[index]
+	var seen = 0
+	while true {
+		for _ in 0..SPINS {
+			if slot.given.load(order: .Acquire) != seen then break
+		}
+		val job = slot.job.lockWhen(
+			(job) => job.lent.isSome() || job.stopping,
+			(job) => {
+				val stop = job.lent.isNone()
+				return (job.lent.take(), stop)
+			},
+		)
+		seen = slot.given.load()
+		val (given, stop) = job
+		val .Some(lent) = given else return
+		val code = lent.code
+		code(lent.captures)
+		// The last part done tells the caller, which may be asleep.
+		if state.running.subtract(1, order: .AcqRel) == 1 then
+			state.finished.lock((done) => { done = true })
+		if stop then return
+	}
+}
+
+/// What is at an address, lent for writing.
+@intrinsic
+fn referenceAt<T>(data: ptr<void>): &var T

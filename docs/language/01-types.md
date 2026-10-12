@@ -1,8 +1,8 @@
 # 1. Values and types
 
 Every value has a type, and every type is known where the value is written.
-Nothing is converted on its own: a number becomes another kind of number
-only where the program says `as`.
+Nothing is converted on its own: a number the program computes becomes
+another kind of number only where the program says `as`.
 
 ## Numbers
 
@@ -10,8 +10,9 @@ The integers are `i8`, `i16`, `i32`, `i64`, `i128` and `isize`, and `u8`,
 `u16`, `u32`, `u64`, `u128` and `usize`. The floats are `f32` and `f64`.
 None of the names is a keyword.
 
-A literal takes the type expected of it, and `i64` where nothing expects
-anything:
+A literal takes the type expected of it — the other operand's beside an
+operator, the other branch's in an `if` ([page 4](04-expressions.md)) —
+and `i64` where nothing expects anything:
 
 ```wip,run
 val count = 3 // i64, since nothing says otherwise
@@ -20,6 +21,29 @@ val ratio: f32 = 1.0 / 60.0
 assert(count == 3)
 assert(small == 3)
 assert(ratio > 0.0)
+```
+
+An integer constant is as the literal it stands for: where an integer of
+another type is expected, or beside one in an operator, it is that type,
+if its value fits, and an error if it does not. A constant is a top-level
+`val`, or an expression of constants and literals with the arithmetic,
+bitwise and shift operators — not one `@comptime` code works out, and not
+an `as`, which says its type already. Its value cannot change, so nothing
+can be lost, and it says nothing a reader needs; where the program
+computes a value, `as` still says where it changes type. A constant
+where nothing is expected keeps its own type:
+
+```wip,run
+val GRAPHICS: i32 = 1
+val TRANSFER: i32 = 4
+
+fn main() = {
+    val usage: u32 = GRAPHICS | TRANSFER
+    val queues: u32 = 5
+    assert(usage == 5 && queues & GRAPHICS != 0)
+    val plain = GRAPHICS // an i32
+    assert(plain as i64 == 1)
+}
 ```
 
 Arithmetic that cannot hold its answer panics. Where wrapping
@@ -342,7 +366,9 @@ assert(number == 2 && name == "two")
 ```
 
 A tuple is a struct the prelude declares — `Tuple2<A, B>` and its siblings —
-so anything true of a struct is true of it.
+so anything true of a struct is true of it, but for one: a pattern takes a
+tuple apart by position, and a struct by its fields' names
+([page 5](05-patterns.md)).
 
 ## Structs
 
@@ -421,6 +447,69 @@ fn main() = {
 
 A `view struct` and an `extern struct` keep their braces: a struct with no
 fields borrows nothing, and C has no struct without members.
+
+A struct is laid out as C lays it out: its fields in the order written,
+each at a multiple of its own alignment, the struct as aligned as its most
+aligned field and its size a multiple of that. Two annotations say another
+layout, for what reads the bytes — a GPU, a file, a protocol — and change
+nothing a program computes from the fields. `@align(n)` on a field puts it
+at a multiple of `n`, and on a struct gives the struct alignment `n`; `n`
+is a power of two up to 4096, and wherever the value lives — a local, a
+field, an element of a `Vec`, an `own` — it lies at a multiple of it.
+`@packed` puts each field right after the one before, with no padding, and
+gives the struct alignment 1:
+
+```wip,run
+import std::c
+
+// What a shader reads: a matrix, a direction and an intensity, and a colour
+// at 80, where its rules put a three-float vector at a multiple of 16.
+struct Uniforms {
+    model: [f32; 16]
+    @align(16) lightDir: [f32; 3]
+    intensity: f32
+    @align(16) color: [f32; 4]
+}
+
+@packed
+struct ChunkHeader {
+    kind: u8
+    length: u32
+}
+
+fn main() = {
+    assert(c::offsetOf<Uniforms>("color") == 80 && c::sizeOf<Uniforms>() == 96)
+
+    var header = ChunkHeader(kind: 1, length: 5)
+    header.length += 1
+    assert(c::sizeOf<ChunkHeader>() == 5 && header.length == 6)
+}
+```
+
+A field of a packed struct may lie at any address, and a reference is
+always aligned, so it is not lent to be written: `&var header.length` is
+refused, and the field is copied out, changed and written back. A shared
+`&header.length` lends a copy. A packed struct holds plain data — numbers,
+`bool`, `char`, pointers and structs of them — since what owns memory or
+borrows it is reached by reference. `@packed` and `@align` are not written
+on one struct.
+
+```wip,error=E0453
+@packed
+struct ChunkHeader {
+    kind: u8
+    length: u32
+}
+
+fn grow(length: &var u32) = {
+    length += 1
+}
+
+fn main() = {
+    var header = ChunkHeader(kind: 1, length: 5)
+    grow(&var header.length)
+}
+```
 
 ## Enums
 

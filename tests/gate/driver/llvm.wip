@@ -2,6 +2,8 @@
 // each program first runs as it should, and then its IR says what may be
 // assumed, and no more.
 
+import std::io
+import std::process::{Command}
 import check::{Gate, read, run, wrong, write}
 
 /// The release build's IR of the program in `root`, or why there is none.
@@ -29,21 +31,70 @@ fn defined(ir: str, name: str): String = {
 	return String()
 }
 
+/// The attributes of the group `line`, a function's definition, names.
+fn attributesOf(ir: str, line: str): String = {
+	val .Some(at) = line.findLast(" #") else return String()
+	val rest = line[at + 2..line.len()]
+	var end = 0
+	while end < rest.len() && rest[end] >= b'0' && rest[end] <= b'9' {
+		end += 1
+	}
+	val head = "attributes #\(rest[0..end]) = "
+	for candidate in ir.lines() {
+		if candidate.startsWith(head) then return String::of(candidate)
+	}
+	return String()
+}
+
+/// In a release build, a function in a cycle of calls is `noinline`: the
+/// method of a walk of an enum's tree, and the container's function that
+/// calls it again, each keep a frame of their own; so does a function that
+/// calls itself. The leaf's function and `main`, in no cycle, are inlined
+/// where LLVM finds it pays.
+fn cyclesNotInlined(gate: &Gate, root: str): Option<String> = {
+	write(
+		root,
+		"main.wip",
+		"import std::io\n\nenum Node {\n    Leaf(value: i64)\n    Pair(left: own<Node>, right: own<Node>)\n}\n\nextend Node {\n    fn total(): i64 = match self {\n        .Leaf(value) => leafValue(value)\n        .Pair(left, right) => pairTotal(&left, &right)\n    }\n}\n\nfn pairTotal(left: &Node, right: &Node): i64 = left.total() + right.total()\n\nfn leafValue(value: i64): i64 = value * 2\n\nfn countDown(n: i64): i64 = if n == 0 then 0 else 1 + countDown(n - 1)\n\nfn main() = {\n    val tree = Node::Pair(\n        left: own .Leaf(value: 1),\n        right: own .Pair(left: own .Leaf(value: 2), right: own .Leaf(value: 3)),\n    )\n    io::println(\"\\(tree.total()) \\(countDown(5))\")\n}\n",
+	)
+	val ran = gate.wip(root, ["run", "--release", "main.wip"])
+	if !ran.exit.success() || ran.stdout != "12 5\n" then
+		return wrong("`wip run --release main.wip`", &ran)
+	val ir = match irOf(gate, root) {
+		.Ok(ir) => move ir
+		.Err(why) => return .Some(move why)
+	}
+	for (name, inCycle) in [
+		("Node.total", true),
+		("pairTotal", true),
+		("countDown", true),
+		("leafValue", false),
+		("main", false),
+	] {
+		val line = defined(ir, name)
+		val attributes = attributesOf(ir, line)
+		if line.isEmpty() || attributes.isEmpty() || attributes.contains("noinline") != inCycle then
+			return .Some("`\(name)` is defined as\n  \(line)\nwith\n  \(attributes)")
+	}
+	return .None
+}
+
 /// A `&` parameter is `noalias readonly` to LLVM where nothing changes its
 /// place while the call runs: not where the place holds an `Atomic` by
 /// value, which changes through a `&`, but where one is only reached
 /// through an `own`, which is other memory. An aggregate taken by value is
-/// `noalias`, and a closure given one place both by value and by `&` still
-/// reads it right. A reference is `nonnull`, and reaches its whole value,
-/// aligned.
+/// `noalias`, and `readonly` where the function does not write it, which is
+/// every function but a `@tailrec` one; a closure given one place both by
+/// value and by `&` still reads it right. A reference is `nonnull`, and
+/// reaches its whole value, aligned.
 fn sharedReadOnly(gate: &Gate, root: str): Option<String> = {
 	write(
 		root,
 		"main.wip",
-		"import std::io\nimport std::sync::{Atomic}\n\nstruct Plain {\n    a: i64\n    b: i64\n}\n\nstruct Counted {\n    hits: Atomic<i64>\n}\n\nenum Maybe {\n    Counting(counted: Counted)\n    Not\n}\n\nstruct Boxed {\n    counted: own<Counted>\n}\n\nstruct Wide {\n    a: i64\n    b: i64\n    c: i64\n    d: i64\n}\n\nfn spanOf(w: Wide): i64 = w.d - w.a\n\nfn sumOf(p: &Plain): i64 = p.a + p.b\n\nfn hitsOf(c: &Counted): i64 = {\n    c.hits.add(1)\n    return c.hits.load()\n}\n\nfn hitsIn(m: &Maybe): i64 = match m {\n    .Counting(counted) => hitsOf(&counted)\n    .Not => 0\n}\n\nfn boxedHits(b: &Boxed): i64 = hitsOf(&b.counted)\n\nfn main() = {\n    val plain = Plain(a: 2, b: 3)\n    val counted = Counted(hits: Atomic::of(0))\n    val maybe = Maybe::Counting(counted: Counted(hits: Atomic::of(10)))\n    val boxed = Boxed(counted: own Counted(hits: Atomic::of(20)))\n    val wide = Wide(a: 1, b: 2, c: 3, d: 7)\n    val both = (w: Wide, at: &Wide) => w.c + at.d\n    io::println(\"\\(sumOf(&plain)) \\(hitsOf(&counted)) \\(hitsOf(&counted)) \\(hitsIn(&maybe)) \\(boxedHits(&boxed)) \\(spanOf(wide)) \\(both(wide, &wide))\")\n}\n",
+		"import std::io\nimport std::sync::{Atomic}\n\nstruct Plain {\n    a: i64\n    b: i64\n}\n\nstruct Counted {\n    hits: Atomic<i64>\n}\n\nenum Maybe {\n    Counting(counted: Counted)\n    Not\n}\n\nstruct Boxed {\n    counted: own<Counted>\n}\n\nstruct Wide {\n    a: i64\n    b: i64\n    c: i64\n    d: i64\n}\n\nfn spanOf(w: Wide): i64 = w.d - w.a\n\n@tailrec\nfn spanAfter(w: Wide, steps: i64): i64 = if steps == 0 then w.d - w.a else spanAfter(Wide(a: w.a, b: w.b, c: w.c, d: w.d + 1), steps - 1)\n\nfn sumOf(p: &Plain): i64 = p.a + p.b\n\nfn hitsOf(c: &Counted): i64 = {\n    c.hits.add(1)\n    return c.hits.load()\n}\n\nfn hitsIn(m: &Maybe): i64 = match m {\n    .Counting(counted) => hitsOf(&counted)\n    .Not => 0\n}\n\nfn boxedHits(b: &Boxed): i64 = hitsOf(&b.counted)\n\nfn main() = {\n    val plain = Plain(a: 2, b: 3)\n    val counted = Counted(hits: Atomic::of(0))\n    val maybe = Maybe::Counting(counted: Counted(hits: Atomic::of(10)))\n    val boxed = Boxed(counted: own Counted(hits: Atomic::of(20)))\n    val wide = Wide(a: 1, b: 2, c: 3, d: 7)\n    val both = (w: Wide, at: &Wide) => w.c + at.d\n    io::println(\"\\(sumOf(&plain)) \\(hitsOf(&counted)) \\(hitsOf(&counted)) \\(hitsIn(&maybe)) \\(boxedHits(&boxed)) \\(spanOf(wide)) \\(both(wide, &wide)) \\(spanAfter(wide, 3))\")\n}\n",
 	)
 	val ran = gate.wip(root, ["run", "--release", "main.wip"])
-	if !ran.exit.success() || ran.stdout != "5 1 2 11 21 6 10\n" then
+	if !ran.exit.success() || ran.stdout != "5 1 2 11 21 6 10 9\n" then
 		return wrong("`wip run --release main.wip`", &ran)
 	val ir = match irOf(gate, root) {
 		.Ok(ir) => move ir
@@ -62,8 +113,15 @@ fn sharedReadOnly(gate: &Gate, root: str): Option<String> = {
 		if line.isEmpty() || line.contains("readonly") then
 			return .Some("`\(name)` is defined as\n  \(line)")
 	}
+	// A struct taken by value is only read, which lets LLVM pass the caller's
+	// own place; but a `@tailrec` function's calls to itself are written into
+	// its parameters.
 	val span = defined(ir, "spanOf")
-	if !span.contains("ptr noalias %p0") then return .Some("`spanOf` is defined as\n  \(span)")
+	if !span.contains("ptr noalias readonly nocapture nonnull dereferenceable(32) align 8 %p0") then
+		return .Some("`spanOf` is defined as\n  \(span)")
+	val after = defined(ir, "spanAfter")
+	if after.isEmpty() || after.contains("readonly") then
+		return .Some("`spanAfter` is defined as\n  \(after)")
 	return .None
 }
 
@@ -157,4 +215,41 @@ fn body(ir: str, name: str): String = {
 		return rest[0..end]
 	}
 	return String()
+}
+
+/// An atomic's order is the instruction's: on x86-64, which orders every
+/// store by itself, a release store is a plain `mov`, and a sequentially
+/// consistent one the locked exchange it needs. Asked of the IR as `clang`
+/// compiles it for x86-64, which any `clang` can, whatever this machine is.
+fn atomicOrdersOnX86(gate: &Gate, root: str): Option<String> = {
+	write(
+		root,
+		"main.wip",
+		"import std::future\nimport std::io\nimport std::sync::{Atomic}\n\nfn main() = {\n    val published = Atomic::of(0)\n    val strongly = Atomic::of(0)\n    future::together(\n        () => {\n            published.store(7, order: .Release)\n            strongly.store(9)\n        },\n        () => {},\n    )\n    io::println(\"\\(published.load(order: .Acquire)) \\(strongly.load())\")\n}\n",
+	)
+	val ran = gate.wip(root, ["run", "--release", "main.wip"])
+	if !ran.exit.success() || ran.stdout != "7 9\n" then
+		return wrong("`wip run --release main.wip`", &ran)
+	val ir = match irOf(gate, root) {
+		.Ok(ir) => move ir
+		.Err(why) => return .Some(move why)
+	}
+	if !ir.contains(" release, align 8") then return .Some("the IR has no release store:\n\(ir)")
+	val clang = io::env("WIP_CLANG").unwrapOr("clang")
+	val compiled = run(
+		Command::of(clang).directory(root).args([
+			"--target=x86_64-unknown-linux-gnu",
+			"-O2",
+			"-S",
+			"-Wno-override-module",
+			"program.ll",
+			"-o",
+			"program.s",
+		]),
+	)
+	if !compiled.exit.success() then return wrong("`clang` for x86-64", &compiled)
+	val assembly = read(root, "program.s")
+	if !assembly.contains("movq\t$7, (") || assembly.contains("movq\t$9, (") then
+		return .Some("on x86-64 the release store is not a plain `mov`, or the other is:\n\(assembly)")
+	return .None
 }

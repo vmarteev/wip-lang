@@ -4,11 +4,14 @@
 // runtime, so it is asked instead: `clang -Xclang -ast-dump=json` for the
 // declarations, and `cc -E -dD` for the constants a header `#define`s.
 
+import std::collections::{Set}
 import std::json::{Json}
 import std::path
 import clang
-import clang::{children, flag, inner, qualType, textOf, writtenType}
+import clang::{children, flag, inner, only, qualType, textOf, writtenType}
 import declared::{Header, Item, Reading, Typed}
+import mapped::{Mapping}
+import mapped
 import probe
 import types::{Constant, Known, Ty}
 import types
@@ -20,6 +23,8 @@ pub fn read(
 	include: str,
 	link: Option<String>,
 	reading: &Reading,
+	mappings: &[Mapping],
+	pointers: &[String],
 ): Result<Header, String> = {
 	val tree = syntaxTree(header, reading)?
 
@@ -31,10 +36,177 @@ pub fn read(
 	definedRecords(&tree, &var known)
 	enumNames(&tree, &var known)
 	aliases(&tree, &var known)
+	for mapping in mappings {
+		known.mapped.put(recordOf(&known, mapping.c), mapping.name())
+	}
+	for name in pointers {
+		known.pointers.add(name.clone())
+	}
 	declarations(&tree, path::name(header), &var known, &var read)
+	declaredElsewhere(&var read)
+	declaredAs(header, reading, &known, mappings, &var read)?
 	constants(header, reading, &known, &var read)?
 
 	return .Ok(move read)
+}
+
+/// A struct the header names and another header declares — Vulkan's name
+/// its video codecs', which `vulkan_core.h` includes — is a type of its own
+/// to the binding, whose contents it does not know: where it is only
+/// pointed at, it is declared as one. What holds one by value is left out,
+/// since its fields are the other header's, and so is what holds a struct
+/// C alone lays out, of bitfields, which Wip has no value of; and then what
+/// holds what was left out, until nothing more is.
+fn declaredElsewhere(out: &var Header) = {
+	var leftOut: Set<String> = Set()
+	var leaving = true
+	while leaving {
+		leaving = false
+		var holdable: Set<String> = Set()
+		var opaque: Set<String> = Set()
+		for item in out.items {
+			if item is .Record(name, opaque: laidOutByC, ..) {
+				if laidOutByC then opaque.add(name.clone()) else holdable.add(name.clone())
+			}
+		}
+		var kept: Vec<Item> = Vec()
+		for item in move out.items {
+			var held: Vec<String> = Vec()
+			var pointed: Vec<String> = Vec()
+			for ty in typesOf(&item) {
+				namedIn(ty, false, &var held, &var pointed)
+			}
+			match held.find((name) => !holdable.contains(name)) {
+				.Some(name) => {
+					val why =
+						if opaque.contains(name) then "a struct C alone lays out"
+						else if leftOut.contains(name) then "a struct left out"
+						else "a struct another header declares"
+					out.skipped.push("`\(nameOf(&item))`, which holds \(why), `\(name)`")
+					leftOut.add(nameOf(&item))
+					leaving = true
+				}
+				.None => kept.push(move item)
+			}
+		}
+		out.items = move kept
+	}
+	var declared: Set<String> = Set()
+	for item in out.items {
+		match item {
+			.Record(name, ..) | .Opaque(name) => declared.add(name.clone())
+			_ => {}
+		}
+	}
+	var pointedAt: Vec<String> = Vec()
+	for item in out.items {
+		var held: Vec<String> = Vec()
+		var pointed: Vec<String> = Vec()
+		for ty in typesOf(&item) {
+			namedIn(ty, false, &var held, &var pointed)
+		}
+		for name in pointed {
+			if !declared.contains(&name) && !pointedAt.contains(&name) then
+				pointedAt.push(name.clone())
+		}
+	}
+	for name in pointedAt {
+		out.items.push(.Opaque(name.clone()))
+	}
+}
+
+/// The types an item is written with.
+fn typesOf(item: &Item): Vec<&Ty> = {
+	var tys: Vec<&Ty> = Vec()
+	match item {
+		.Function(params, ret, ..) => {
+			for param in params {
+				tys.push(&param.ty)
+			}
+			if ret is .Some(ty) then tys.push(&ty)
+		}
+		.Record(fields, ..) => {
+			for field in fields {
+				tys.push(&field.ty)
+			}
+		}
+		.Variable(ty, ..) => tys.push(&ty)
+		.Opaque(..) | .Constant(..) => {}
+	}
+	return move tys
+}
+
+/// The structs `ty` names: in `pointed` those behind a pointer, and in
+/// `held` those it holds.
+fn namedIn(ty: &Ty, behind: bool, held: &var Vec<String>, pointed: &var Vec<String>) = match ty {
+	.Tag(name) => if behind then pointed.push(name.clone()) else held.push(name.clone())
+	.Pointer(target) | .Ref(target, ..) => namedIn(&target, true, &var held, &var pointed)
+	.Array(element, ..) => namedIn(&element, behind, &var held, &var pointed)
+	.Nullable(target) => namedIn(&target, behind, &var held, &var pointed)
+	.Function(params, result) => {
+		for param in params {
+			namedIn(&param, behind, &var held, &var pointed)
+		}
+		namedIn(&result, behind, &var held, &var pointed)
+	}
+	.Named(..) | .Mapped(..) | .Void => {}
+}
+
+/// What an item is called.
+fn nameOf(item: &Item): String = match item {
+	.Function(name, ..) | .Record(name, ..) | .Opaque(name) | .Variable(name, ..) => name.clone()
+	.Constant(constant) => constant.name.clone()
+}
+
+/// The struct a C name is: itself, or the struct a `typedef` of it names.
+fn recordOf(known: &Known, name: str): String = match known.aliases.get(name) {
+	.Some(target) if known.records.contains(&target) => target.clone()
+	_ => String::of(name)
+}
+
+/// Each struct `--type` declares as a Wip type: checked to be laid out as
+/// it, and left out of what the module declares, which imports the Wip
+/// type instead.
+fn declaredAs(
+	header: str,
+	reading: &Reading,
+	known: &Known,
+	mappings: &[Mapping],
+	out: &var Header,
+): Result<void, String> = {
+	// Each module, and the types imported from it, in the order named.
+	var imported: Vec<(String, Vec<String>)> = Vec()
+	for mapping in mappings {
+		val name = recordOf(&known, mapping.c)
+		var found: Option<i64> = .None
+		for i in 0..out.items.len() {
+			if out.items[i] is .Record(name: declared, ..) && declared == name then found = .Some(i)
+		}
+		val .Some(at) = found else {
+			return .Err("`--type \(mapping.c)=\(mapping.wip)`: the header declares no struct `\(mapping.c)` with its fields")
+		}
+		val .Record(isUnion, opaque, fields, ..) = out.items.remove(at) else panic("just found")
+		if isUnion || opaque then
+			return .Err("`--type \(mapping.c)=\(mapping.wip)`: `\(mapping.c)` is laid out by C alone, a union or a struct of bitfields")
+		// C spells it by a `typedef` where one names it, and as a struct
+		// where none does.
+		val spelled =
+			if known.typedefs.contains(&mapping.c) then mapping.c.clone() else "struct \(name)"
+		mapped::check(header, reading, mapping, spelled, &fields, mappings)?
+		val module = mapping.module()
+		var at: Option<i64> = .None
+		for i in 0..imported.len() {
+			if imported[i].0 == module then at = .Some(i)
+		}
+		match at {
+			.Some(i) => imported[i].1.push(mapping.name())
+			.None => imported.push((move module, Vec::of(own [mapping.name()])))
+		}
+	}
+	for (module, names) in imported {
+		out.imports.push("\(module)::{\(names.join(", "))}")
+	}
+	return .Ok()
 }
 
 /// The compiler's own view of the header, as JSON. It is clang's, and
@@ -84,13 +256,9 @@ fn constants(
 
 		if !here then continue
 
-		val .Some(rest) = line.stripPrefix("#define ") else {
-			continue
-		}
+		val .Some(rest) = line.stripPrefix("#define ") else continue
 
-		val .Some((defined, value)) = rest.splitOnce(" ") else {
-			continue
-		}
+		val .Some((defined, value)) = rest.splitOnce(" ") else continue
 
 		// A macro that takes arguments is not a constant, and what it
 		// means depends on what is passed.
@@ -170,6 +338,8 @@ fn enumNames(node: &Json, known: &var Known) = {
 /// `typedef struct { … } Color;` — names the struct itself and is not one
 /// of these.
 fn aliases(node: &Json, known: &var Known) = {
+	if textOf(node, "kind") == .Some("TypedefDecl") && textOf(node, "name") is .Some(name) then
+		known.typedefs.add(name)
 	if textOf(node, "kind") == .Some("TypedefDecl") &&
 		textOf(node, "name") is .Some(name) &&
 		writtenType(node) is .Some(written) {
@@ -195,9 +365,7 @@ fn aliases(node: &Json, known: &var Known) = {
 /// clang writes a declaration's file only when it changes, so the file it
 /// last named is the one that holds what follows.
 fn declarations(tree: &Json, header: str, known: &var Known, out: &var Header) = {
-	val .Some(nodes) = inner(tree) else {
-		return
-	}
+	val .Some(nodes) = inner(tree) else return
 
 	var file = String()
 
@@ -210,7 +378,7 @@ fn declarations(tree: &Json, header: str, known: &var Known, out: &var Header) =
 			.Some("FunctionDecl") => function(node, &known, &var out)
 			.Some("RecordDecl") => record(node, &var known, &var out)
 			.Some("VarDecl") => variable(node, &known, &var out)
-			.Some("EnumDecl") => enumeration(node, &var out)
+			.Some("EnumDecl") => enumeration(node, &known, &var out)
 			// A typedef of a struct is the struct, which is declared beside
 			// it; a typedef of a scalar is a name for a type Wip has.
 			.Some("TypedefDecl" | "EmptyDecl" | "StaticAssertDecl") => {}
@@ -221,9 +389,7 @@ fn declarations(tree: &Json, header: str, known: &var Known, out: &var Header) =
 }
 
 fn function(node: &Json, known: &Known, out: &var Header) = {
-	val .Some(name) = textOf(node, "name") else {
-		return
-	}
+	val .Some(name) = textOf(node, "name") else return
 
 	// A `static` function that is not `inline` belongs to one translation
 	// unit, so nothing outside the header could call it.
@@ -244,11 +410,14 @@ fn function(node: &Json, known: &Known, out: &var Header) = {
 
 	var params: Vec<Typed> = Vec()
 	var i = 0
+	// The parameter before, by name: a struct pointer after a count is an
+	// array.
+	var before = String()
 
 	for param in children(node, "ParmVarDecl") {
 		val written = qualType(param)
 
-		val .Some(ty) = types::at(written, .Parameter, known) else {
+		val .Some(read) = types::at(written, .Parameter, known) else {
 			out.skipped.push("`\(name)`, whose parameter \(i) is `\(written)`")
 			return
 		}
@@ -258,6 +427,18 @@ fn function(node: &Json, known: &Known, out: &var Header) = {
 			_ => "a\(i)"
 		}
 
+		// A struct pointer right after a count is an array, which may be
+		// empty and null, and so is one the command line names: a pointer,
+		// whatever the header says it points at.
+		val counted = before == "count" || before.endsWith("Count")
+		val ty = match move read {
+			.Ref(target) =>
+				if counted || known.pointers.contains(&given) then Ty::Pointer(move target)
+				else Ty::Ref(move target)
+			other => move other
+		}
+
+		before = given.clone()
 		params.push(Typed(name: move given, ty: move ty))
 		i += 1
 	}
@@ -292,6 +473,11 @@ fn record(node: &Json, known: &var Known, out: &var Header) = {
 
 	var fields: Vec<Typed> = Vec()
 	var opaque = false
+	// `#pragma pack(n)`, whose `n` clang's tree does not say: the layout is
+	// C's, as a bitfield's is.
+	if !children(node, "MaxFieldAlignmentAttr").isEmpty() then opaque = true
+	val packed = !children(node, "PackedAttr").isEmpty()
+	val align = alignment(node)
 
 	for field in children(node, "FieldDecl") {
 		// A bitfield's place in the storage unit differs between ABIs, so
@@ -308,19 +494,52 @@ fn record(node: &Json, known: &var Known, out: &var Header) = {
 			return
 		}
 
-		fields.push(Typed(name: given, ty: types::stored(found.unwrap())))
+		fields.push(Typed(name: given, ty: types::stored(found.unwrap()), align: alignment(field)))
 	}
 
-	out.items.push(.Record(name: name, isUnion: isUnion, opaque: opaque, fields: move fields))
+	// A layout C keeps to itself says nothing of how it is packed.
+	out.items.push(.Record(
+		name: name,
+		isUnion: isUnion,
+		opaque: opaque,
+		packed: packed && !opaque,
+		align: if opaque then .None else align,
+		fields: move fields,
+	))
+}
+
+/// What an `__attribute__((aligned(n)))` or an `alignas(n)` on the
+/// declaration says `n` is, where it says one: the value clang worked out.
+fn alignment(node: &Json): Option<i64> = {
+	for attr in children(node, "AlignedAttr") {
+		if only(attr) is .Some(value) && textOf(value, "value") is .Some(text) then
+			return text.toInt().toOption()
+	}
+	return .None
 }
 
 fn variable(node: &Json, known: &Known, out: &var Header) = {
-	val .Some(name) = textOf(node, "name") else {
-		return
-	}
+	val .Some(name) = textOf(node, "name") else return
 
 	val written = qualType(node)
 	val found = types::at(written, .Field, known)
+
+	// A `static const` number the header gives a value is a constant, as a
+	// `#define` is: Vulkan's 64-bit flags are written so, being past what
+	// an enum holds.
+	if textOf(node, "storageClass") == .Some("static") &&
+		written.startsWith("const ") &&
+		found is .Some(.Named(scalar)) &&
+		scalar != "cstring" &&
+		scalar != "bool" &&
+		probe::evaluatedText(node) is .Some(value) {
+		out.items.push(.Constant(constant: Constant(
+			name: name,
+			ty: scalar.clone(),
+			value: move value,
+		)))
+		return
+	}
 
 	if found.all((ty) => !ty.isVoid()) && found.isSome() then
 		out.items.push(.Variable(name: name, ty: types::stored(found.unwrap())))
@@ -329,15 +548,18 @@ fn variable(node: &Json, known: &Known, out: &var Header) = {
 
 /// C's enums are integers, and a value outside the listed ones is legal
 /// C, so each enumerator becomes a constant rather than a Wip enum.
-fn enumeration(node: &Json, out: &var Header) = {
+fn enumeration(node: &Json, known: &Known, out: &var Header) = {
 	var next = 0
 
 	for constant in children(node, "EnumConstantDecl") {
-		val .Some(name) = textOf(constant, "name") else {
-			continue
-		}
+		val .Some(name) = textOf(constant, "name") else continue
 		val value = probe::evaluated(constant).unwrapOr(next)
 		next = value + 1
-		out.items.push(.Constant(constant: types::enumerator(name, value)))
+		// The type C gives it: an `int`, unless one of the enum's is past one.
+		val ty = match types::at(qualType(constant), .Field, known) {
+			.Some(.Named(scalar)) => move scalar
+			_ => String::of("c_int")
+		}
+		out.items.push(.Constant(constant: types::enumerator(name, value, ty)))
 	}
 }

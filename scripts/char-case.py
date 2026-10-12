@@ -221,9 +221,7 @@ extend str {{
 	pub fn equalsAnyCase(other: str): bool = {{
 		var theirs = other.chars()
 		for c in self.chars() {{
-			val .Some(d) = theirs.next() else {{
-				return false
-			}}
+			val .Some(d) = theirs.next() else return false
 			if c.folded() != d.folded() then return false
 		}}
 		return theirs.next().isNone()
@@ -235,9 +233,7 @@ extend str {{
 	pub fn startsWithAnyCase(prefix: str): bool = {{
 		var mine = self.chars()
 		for c in prefix.chars() {{
-			val .Some(d) = mine.next() else {{
-				return false
-			}}
+			val .Some(d) = mine.next() else return false
 			if c.folded() != d.folded() then return false
 		}}
 		return true

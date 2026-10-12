@@ -99,6 +99,26 @@ fn main() = {
 }
 ```
 
+An `if`'s branches are one type: what is expected of the `if`, or, where
+nothing is, the type of the first branch that says one. A branch that
+takes the type expected of it — a number, `.None`, a constant — takes the
+other's, whichever comes first, as a literal takes the other operand's;
+so do a `match`'s arms and an array's elements:
+
+```wip,run
+fn main() = {
+    val width: i64 = 3
+    val height: i64 = 2
+    val aspect = if height == 0 then 1.0 else width as f32 / height as f32
+    val small: u8 = 7
+    val bound = if width > 5 then 0 else small
+    val pair = [1.0, aspect]
+    val f: f32 = pair[0] + aspect
+    val b: u8 = bound
+    assert(f == 2.5 && b == 7)
+}
+```
+
 `if c then { … }` is refused, with the fix that drops `then`; so is a
 `then` form whose `else` is a block, a braced `if` whose `else` is an
 expression without braces, and a chain that changes form (E0101). A
@@ -512,6 +532,29 @@ for word in move words {
     kept.push(move word)
 }
 assert(kept.len() == 2 && kept[0] == "one")
+```
+
+What a loop's head makes lives until the loop ends, whatever the loop
+walks: a list a call answered, and an iterator over it, or over what a
+method of it lends. An iterator kept in a variable has no loop to live
+for, and borrowing a temporary there is refused (E0437):
+
+```wip,run
+val PRIMES: [i64; 4] = [2, 3, 5, 7]
+
+fn names(): Vec<String> = Vec::of(own [String::of("ada"), String::of("bob")])
+
+fn main() = {
+    var sum = 0
+    for (i, p) in PRIMES.forwards().enumerate() {
+        sum += i * p
+    }
+    var letters = 0
+    for (i, name) in names().items().forwards().enumerate() {
+        letters += i + name.len()
+    }
+    assert(sum == 34 && letters == 7)
+}
 ```
 
 ## Generators

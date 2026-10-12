@@ -13,7 +13,7 @@
 
 import std::collections::{Map, Set}
 import std::shared::{Shared}
-import hir::{ConstId, ConstValue, FnId, InterfaceId, Program, Ty, UnaryOp}
+import hir::{BOOL, ConstId, ConstValue, FnId, InterfaceId, Program, Ty, UnaryOp}
 import syntax::{
 	ASSERTION_FAILED,
 	BinaryOp,
@@ -41,6 +41,9 @@ val CODE: u64 = 0x7F00000000000000
 val POISON: u64 = 0xA5A5A5A5A5A5A5A5
 /// The words the runtime keeps its counters in.
 val RUNTIME_WORDS: u64 = 8
+
+/// How many words each thread has, as `threadWords()` answers.
+val THREAD_WORDS: u64 = 4
 
 /// Works out every constant that is to be run, and sets its value, then checks
 /// every top-level `assert`; answers what went wrong, each at the constant or
@@ -209,6 +212,8 @@ view struct Machine {
 	tables: Map<ConstId, u64>
 	vtables: Map<(InterfaceId, Ty), u64>
 	words: Option<u64>
+	/// The words of the one thread a constant is computed on.
+	threadWordsAt: Option<u64>
 	steps: u64
 	/// How many steps a constant may take.
 	budget: u64
@@ -234,6 +239,7 @@ extend Machine {
 			tables: Map(),
 			vtables: Map(),
 			words: .None,
+			threadWordsAt: .None,
 			steps: 0,
 			budget: budget,
 			calls: Vec(),
@@ -296,10 +302,16 @@ extend Machine {
 	/// it, with its strings where the pool has them.
 	var fn table(id: ConstId): Result<u64, Stop> = {
 		val def = &self.program.consts[id]
-		val .Some(value) = def.value else {
-			return .Err(.Quiet)
-		}
+		val .Some(value) = def.value else return .Err(.Quiet)
 		val table = tableBytes(self.program, self.interner, &var self.layouts, &value, def.ty, true)
+		val address = self.placed(&table)?
+		self.tables.put(id, address)
+		return .Ok(address)
+	}
+
+	/// A table's bytes in memory of their own, with the address of each
+	/// string, file and list where it goes.
+	var fn placed(table: &TableBytes): Result<u64, Stop> = {
 		val address = self.alloc(table.bytes.len().max(1) as u64)?
 		self.writeBytes(address, &table.bytes)?
 		for (offset, sym) in table.strings {
@@ -312,7 +324,11 @@ extend Machine {
 			self.writeBytes(blob, &bytes)?
 			self.writeWord(address + offset as u64, blob)?
 		}
-		self.tables.put(id, address)
+		// A list, written in the constant.
+		for (offset, list, _) in table.lists {
+			val values = self.placed(&list)?
+			self.writeWord(address + offset as u64, values)?
+		}
 		return .Ok(address)
 	}
 
@@ -514,9 +530,7 @@ extend Machine {
 			}
 			frame.locals.push(address)
 			if decl.kind == .Param && !aggregate {
-				val .Scalar(bits) = args[next] else {
-					panic("a scalar argument is passed by value")
-				}
+				val .Scalar(bits) = args[next] else panic("a scalar argument is passed by value")
 				next += 1
 				self.store(address, decl.ty, bits)?
 			}
@@ -696,9 +710,7 @@ extend Machine {
 			.AllocBuffer(dest, elem, count) => {
 				val n = self.scalar(&frame, &count)? as u64 as i64
 				val stride = self.layouts.of(program, elem).stride() as i64
-				val .Some(size) = n.checkedMul(stride) else {
-					return .Err(.Budget("much memory"))
-				}
+				val .Some(size) = n.checkedMul(stride) else return .Err(.Budget("much memory"))
 				val pointer = self.alloc((size as u64).max(1))?
 				val address = self.place(&frame, &dest)?
 				self.writeWord(address, pointer)?
@@ -724,19 +736,14 @@ extend Machine {
 				self.store(address, ty, value)?
 			}
 			// One thread computes a constant, so each is a plain step.
-			.Atomic(op, ty, address, value, expected, dest) => {
+			.Atomic(op, ty, address, value, expected, dest, ..) => {
 				val at = self.scalar(&frame, &address)? as u64
 				val (bits, _) = intOf(program, ty)
 				val before = self.load(at, ty)?
 				val answer: Option<u128> = match op {
-					.Add => {
+					.Add | .Subtract => {
 						val amount = self.atomicOperand(&frame, &value)?
-						self.store(at, ty, (before +% amount) & mask(bits))?
-						Option::Some(before)
-					}
-					.Subtract => {
-						val amount = self.atomicOperand(&frame, &value)?
-						self.store(at, ty, (before -% amount) & mask(bits))?
+						self.store(at, ty, atomicSum(program, ty, op == .Add, before, amount))?
 						Option::Some(before)
 					}
 					.Swap => {
@@ -744,12 +751,14 @@ extend Machine {
 						self.store(at, ty, stored & mask(bits))?
 						Option::Some(before)
 					}
+					// It answers whether it swapped: the bits held were the
+					// bits expected.
 					.CompareSwap => {
 						val wanted = self.atomicOperand(&frame, &expected)?
 						val stored = self.atomicOperand(&frame, &value)?
-						if before == wanted & mask(bits) then
-							self.store(at, ty, stored & mask(bits))?
-						.Some(before)
+						val swapped = before == wanted & mask(bits)
+						if swapped then self.store(at, ty, stored & mask(bits))?
+						.Some(if swapped then 1 else 0)
 					}
 					.Load => .Some(before)
 					.Store => {
@@ -760,9 +769,11 @@ extend Machine {
 				}
 				if dest is .Some(d) && answer is .Some(bits) {
 					val address = self.place(&frame, &d)?
-					self.store(address, ty, bits)?
+					val answered = if op == .CompareSwap then BOOL else ty
+					self.store(address, answered, bits)?
 				}
 			}
+			.Fence(..) => {}
 			.Check(fails, kind, at) => {
 				if self.scalar(&frame, &fails)? == 0 then return .Ok()
 				val message: String = match kind {
@@ -776,6 +787,7 @@ extend Machine {
 						"a buffer cannot have length \(n)"
 					}
 					.Division => "divided by zero"
+					.NullText => "a null C string read as text"
 					.Overflow(op) => overflowMessage(op)
 				}
 				return .Err(.Panic(message: move message, at: at))
@@ -798,9 +810,7 @@ extend Machine {
 		val body: &Body = &frame.body.value()
 		val ty = operandTy(self.program, &body, &operand)
 		if isAggregate(self.program, ty) {
-			val .Copy(place) = operand else {
-				panic("an aggregate operand is a place")
-			}
+			val .Copy(place) = operand else panic("an aggregate operand is a place")
 			return .Ok(.Address(self.place(&frame, &place)?))
 		}
 		return .Ok(.Scalar(self.scalar(&frame, &operand)?))
@@ -899,9 +909,7 @@ extend Machine {
 				.VariantField(variant, field) =>
 					address + self.layouts.variantOffset(program, ty, variant, field) as u64
 				.Index(..) | .ConstIndex(..) => {
-					val .Some(elem) = elementTy(program, ty) else {
-						panic("elements")
-					}
+					val .Some(elem) = elementTy(program, ty) else panic("elements")
 					// An array's elements are where the array is; any other's are
 					// where its pointer points.
 					val first =
@@ -954,11 +962,17 @@ extend Machine {
 			.DropFn(ty) => self.codeAddress(.Drop(ty)) as u128
 			.VTable(interfaceId, ty) => self.vtable(interfaceId, ty)? as u128
 			.RuntimeWords => self.runtimeWords()? as u128
+			// One thread computes a constant: its words are the program's.
+			.ThreadWords => self.threadWords()? as u128
+			// A constant computes what the program would where it is not
+			// optimised.
+			.DebugBuild => 1
 			.FrameTables => return .Err(
 				.Cannot("reads the tables a panic walks, which the program has only once it runs"),
 			)
 			.SizeOf(of, ..) => self.layouts.of(self.program, of).stride() as u128
 			.AlignOf(of, ..) => self.layouts.of(self.program, of).align as u128
+			.OffsetOf(of, index, ..) => self.layouts.fieldOffset(self.program, of, index) as u128
 		},
 	)
 
@@ -1142,6 +1156,13 @@ extend Machine {
 		if self.words is .Some(address) then return .Ok(address)
 		val address = self.alloc(RUNTIME_WORDS * 8)?
 		self.words = .Some(address)
+		return .Ok(address)
+	}
+
+	var fn threadWords(): Result<u64, Stop> = {
+		if self.threadWordsAt is .Some(address) then return .Ok(address)
+		val address = self.alloc(THREAD_WORDS * 8)?
+		self.threadWordsAt = .Some(address)
 		return .Ok(address)
 	}
 
@@ -1371,6 +1392,28 @@ fn signed(program: &Program, ty: Ty, bits: u128): i128 = {
 	if !isSigned || width >= 128 then return bits as i128
 	val shift = 128 - width
 	return ((bits << shift) as i128) >> shift
+}
+
+/// What an atomic add or subtract leaves: integers wrap, and floats are
+/// added as floats.
+fn atomicSum(
+	program: &Program,
+	ty: Ty,
+	adds: bool,
+	before: u128,
+	amount: u128,
+): u128 = match program.types.kind(ty) {
+	.Float(float: .F32) => {
+		val a = f32::fromBits(before as u32)
+		val b = f32::fromBits(amount as u32)
+		(if adds then a + b else a - b).toBits() as u128
+	}
+	.Float(..) => {
+		val a = f64::fromBits(before as u64)
+		val b = f64::fromBits(amount as u64)
+		(if adds then a + b else a - b).toBits() as u128
+	}
+	_ => (if adds then before +% amount else before -% amount) & mask(intOf(program, ty).0)
 }
 
 fn overflowMessage(op: BinaryOp): str = match op {

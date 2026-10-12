@@ -7,7 +7,7 @@
 // and the backends never see a type parameter.
 
 import std::collections::{Map, Set}
-import syntax::{Diagnostic, INSTANTIATION_DEPTH, Interner, Span, Symbol}
+import syntax::{Diagnostic, INSTANTIATION_DEPTH, Interner, OPAQUE_VALUE, Span, Symbol}
 
 /// How deeply instances may be made from instances before they are taken to
 /// be an endless series, as with `f<T>` calling `f<Pair<T, T>>`.
@@ -30,9 +30,7 @@ pub fn instantiate(program: &var Program, interner: &Interner): Vec<Diagnostic> 
 fn fnValues(program: &Program): Set<FnId> = {
 	var values: Set<FnId> = Set()
 	for def in program.fns {
-		val .Some(body) = def.body else {
-			continue
-		}
+		val .Some(body) = def.body else continue
 		for expr in body.exprs {
 			if expr.kind is .FnRef(id, ..) then values.add(id)
 		}
@@ -46,6 +44,9 @@ fn fnValues(program: &Program): Set<FnId> = {
 struct Instances {
 	made: Map<(FnId, TyList, u32), FnId> = Map()
 	work: Vec<(FnId, u32)> = Vec()
+	/// Where each instance was first called or named, for a message about
+	/// what it does with its type arguments.
+	origins: Map<FnId, Span> = Map()
 }
 
 extend Instances {
@@ -87,6 +88,11 @@ fn makeInstances(program: &var Program, interner: &Interner): Vec<Diagnostic> = 
 		program.entryReport = .Some(instance)
 	}
 	var reported: Set<FnId> = Set()
+	// The opaque C types a value of was reported: a program's own code is
+	// reported wherever it holds one, and an instance only where nothing has
+	// said so of its type, since one value in a library's generic code makes
+	// many instances that hold it.
+	var opaqueReported: Set<Ty> = Set()
 	// The types whose parts were walked for drops, in any body: a drop found
 	// in one was made then, so a type is walked once.
 	var walked: Set<Ty> = Set()
@@ -101,19 +107,26 @@ fn makeInstances(program: &var Program, interner: &Interner): Vec<Diagnostic> = 
 		}
 		// An `@intrinsic` has no body to walk: the compiler writes it where it
 		// is called.
-		val .Some(taken) = program.fns[id].body.take() else {
-			continue
-		}
+		val .Some(taken) = program.fns[id].body.take() else continue
 		var body = move taken
+		val origin: Option<Span> = match instances.origins.get(&id) {
+			.Some(span) => .Some(span)
+			.None => .None
+		}
+		opaqueValues(
+			&var program,
+			id,
+			&body,
+			origin,
+			&interner,
+			&var opaqueReported,
+			&var diagnostics,
+		)
 		// The tables of methods this body needs, with every method concrete.
 		var dynRefs: Vec<(InterfaceId, Ty)> = Vec()
 		for expr in body.exprs {
-			val .DynRef(value, interfaceId) = expr.kind else {
-				continue
-			}
-			val .Ref(inner: pointee, ..) = program.types.kind(body.exprs[value].ty) else {
-				continue
-			}
+			val .DynRef(value, interfaceId) = expr.kind else continue
+			val .Ref(inner: pointee, ..) = program.types.kind(body.exprs[value].ty) else continue
 			dynRefs.push((interfaceId, program.types.subst(pointee, &args)))
 		}
 		// The drop of every type this body ends a value of, made concrete. A
@@ -142,7 +155,7 @@ fn makeInstances(program: &var Program, interner: &Interner): Vec<Diagnostic> = 
 			for method in methods {
 				val .Some(
 					(implementation, methodArgs),
-				) = implementationOf(&program, interfaceId, method.id, [ty]) else {
+				) = implementationOf(&var program, interfaceId, method.id, [ty]) else {
 					continue
 				}
 				if methodArgs.isEmpty() {
@@ -206,7 +219,7 @@ fn makeInstances(program: &var Program, interner: &Interner): Vec<Diagnostic> = 
 				}
 				tys[0] = base
 				val .Some((implementation, rest)) = implementationOf(
-					&program,
+					&var program,
 					interfaceId,
 					callee,
 					&tys,
@@ -247,6 +260,37 @@ fn makeInstances(program: &var Program, interner: &Interner): Vec<Diagnostic> = 
 				continue
 			} else {
 				instance = instances.of(&var program, callee, concrete, module, depth)
+				// What an instance makes is made where it was.
+				if !instances.origins.contains(&instance) {
+					val made: Span = match instances.origins.get(&id) {
+						.Some(span) => span
+						.None => body.exprs[at].span
+					}
+					instances.origins.put(instance, made)
+				}
+			}
+			// What C lays out has no size Wip knows to answer.
+			if program.fns[callee].intrinsic is .Some(.SizeOf | .AlignOf | .OffsetOf) {
+				for arg in program.types.list(concrete).toVec() {
+					var seen: Set<Ty> = Set()
+					if holdsOpaque(&var program, arg, &var seen) is .Some(opaque) &&
+						(opaqueReported.add(opaque) || args.isEmpty()) {
+						val made = match instances.origins.get(&id) {
+							.Some(origin) => .Some((origin, program.fnName(id, &interner)))
+							.None => .None
+						}
+						diagnostics.push(
+							opaqueValue(
+								&program,
+								opaque,
+								"the size of `\(program.tyName(arg, &interner))`",
+								body.exprs[at].span,
+								move made,
+								&interner,
+							),
+						)
+					}
+				}
 			}
 			body.exprs[at].kind = withCallee(move kind, instance, TyList::empty())
 		}
@@ -304,7 +348,7 @@ fn instanceDrop(
 		panic("a drop needs its interface")
 	}
 	val method = program.interfaces[interfaceId].methods[0].id
-	val .Some((implementation, methodArgs)) = implementationOf(&program, interfaceId, method, [
+	val .Some((implementation, methodArgs)) = implementationOf(&var program, interfaceId, method, [
 		ty,
 	]) else {
 		return
@@ -351,9 +395,7 @@ fn dropsWalk(program: &Program, ty: Ty, out: &var Vec<Ty>, seen: &var Set<Ty>) =
 /// Whether a parameter is `&Self`, which `Self` the method's first type
 /// parameter is.
 fn takesSelf(program: &Program, param: &ParamDef): Option<RefKind> = {
-	val .Ref(inner: target, kind) = program.types.kind(param.ty) else {
-		return .None
-	}
+	val .Ref(inner: target, kind) = program.types.kind(param.ty) else return .None
 	return if program.types.kind(target) is .Param(param: p) && p.index == 0 then .Some(kind)
 	else .None
 }
@@ -370,24 +412,18 @@ fn lendAsSlices(
 	method: FnId,
 	elem: Ty,
 ) = {
-	val .Call(args: callArgs, ..) = body.exprs[call].kind.clone() else {
-		return
-	}
+	val .Call(args: callArgs, ..) = body.exprs[call].kind.clone() else return
 	val slice = program.types.intern(.Slice(elem))
 	var lent = callArgs.clone()
 	val params = program.fns[method].params.clone()
 	for (i, param) in params.forwards().enumerate() {
 		// `Self` is the method's first type parameter.
-		val .Some(kind) = takesSelf(&program, &param) else {
-			continue
-		}
+		val .Some(kind) = takesSelf(&program, &param) else continue
 		if i >= callArgs.len() then continue
 		val arg = callArgs[i]
 		val span = body.exprs[arg].span
 		val argTy = program.types.subst(body.exprs[arg].ty, &args)
-		val .Ref(inner: array, ..) = program.types.kind(argTy) else {
-			continue
-		}
+		val .Ref(inner: array, ..) = program.types.kind(argTy) else continue
 		// `&place` lends the place itself; any other reference is followed.
 		val place = match body.exprs[arg].kind {
 			.Ref(p) => p
@@ -433,9 +469,7 @@ fn readThroughReferences(
 	method: FnId,
 	depth: u32,
 ) = {
-	val .Call(args: callArgs, ..) = body.exprs[call].kind.clone() else {
-		return
-	}
+	val .Call(args: callArgs, ..) = body.exprs[call].kind.clone() else return
 	var read = callArgs.clone()
 	val params = program.fns[method].params.clone()
 	for (i, param) in params.forwards().enumerate() {
@@ -447,9 +481,7 @@ fn readThroughReferences(
 		var ty = program.types.subst(body.exprs[arg].ty, &args)
 		var e = arg
 		for _ in 0..depth as i64 {
-			val .Ref(inner, ..) = program.types.kind(ty) else {
-				break
-			}
+			val .Ref(inner, ..) = program.types.kind(ty) else break
 			e = body.exprs.add(Expr(kind: .Deref(e), ty: inner, span: span))
 			ty = inner
 		}
@@ -467,9 +499,7 @@ fn readThroughReferences(
 /// `clone` of plain data: what the receiver refers to, copied — a `&T` as a
 /// view is, and a value that owns no memory.
 fn copyReference(program: &var Program, body: &var Body, args: &[Ty], call: ExprId) = {
-	val .Call(args: callArgs, ..) = body.exprs[call].kind.clone() else {
-		return
-	}
+	val .Call(args: callArgs, ..) = body.exprs[call].kind.clone() else return
 	if callArgs.isEmpty() then return
 	val receiver = callArgs[0]
 	val ty = program.types.subst(body.exprs[call].ty, &args)
@@ -480,7 +510,7 @@ fn copyReference(program: &var Program, body: &var Body, args: &[Ty], call: Expr
 /// The function that implements `method` for the type `Self` stands for, and
 /// the type arguments left for it: the method's own.
 fn implementationOf(
-	program: &Program,
+	program: &var Program,
 	interfaceId: InterfaceId,
 	method: FnId,
 	args: &[Ty],
@@ -512,7 +542,12 @@ fn implementationOf(
 		// slice's.
 		.Slice(elem) | .Array(elem, ..) => {
 			owner = .Builtin(.Slice)
-			ownerArgs = program.types.findList([elem])?
+			ownerArgs = program.types.internList([elem])
+		}
+		// A box: what it holds is its argument.
+		.Own(inner) => {
+			owner = .Builtin(.Own)
+			ownerArgs = program.types.internList([inner])
 		}
 		kind => owner = .Builtin(BuiltinOwner::of(kind)?)
 	}
@@ -565,9 +600,7 @@ fn implementationOf(
 /// runs later; here it is simply left alone.
 fn entryReport(program: &Program, interner: &Interner): Option<(FnId, Ty)> = {
 	val main = mainFn(&program, &interner)?
-	val .Enum(id, args) = program.types.kind(program.fns[main].ret) else {
-		return .None
-	}
+	val .Enum(id, args) = program.types.kind(program.fns[main].ret) else return .None
 	if program.preludeItems.enumeration(.Result) != .Some(id) then return .None
 	val list = program.types.list(args)
 	val value = list[0]
@@ -583,6 +616,93 @@ fn entryReport(program: &Program, interner: &Interner): Option<(FnId, Ty)> = {
 		return .Some((f, error))
 	}
 	return .None
+}
+
+/// The C type, whose contents Wip does not know, that a value of `ty`
+/// holds, if one does: the type itself, a field's, an element's, or what an
+/// `own` holds. Behind a pointer or a reference it is only pointed at.
+fn holdsOpaque(program: &var Program, ty: Ty, seen: &var Set<Ty>): Option<Ty> = {
+	if !seen.add(ty) then return .None
+	val kind = program.types.kind(ty)
+	return match kind {
+		.Opaque(..) => .Some(ty)
+		.Struct(id, ..) if program.structs[id].isOpaque => .Some(ty)
+		.Own(inner) | .Array(elem: inner, ..) | .Slice(elem: inner) | .Slots(inner) => holdsOpaque(
+			&var program,
+			inner,
+			&var seen,
+		)
+		.Struct(..) | .Enum(..) => {
+			var found: Option<Ty> = .None
+			for child in children(&var program, ty) {
+				if found.isNone() then found = holdsOpaque(&var program, child, &var seen)
+			}
+			move found
+		}
+		_ => .None
+	}
+}
+
+/// Reports a value in `body` of a type that holds an opaque C type: each
+/// one where the body is a program's own, and the first where it is an
+/// instance and nothing has said so of that type before.
+fn opaqueValues(
+	program: &var Program,
+	id: FnId,
+	body: &Body,
+	origin: Option<Span>,
+	interner: &Interner,
+	reported: &var Set<Ty>,
+	diagnostics: &var Vec<Diagnostic>,
+) = {
+	val instance = program.fns[id].instanceOf.isSome()
+	// One value for each place, the last found there: what is built of the
+	// others, as a `Vec` is of its slots.
+	var found: Map<Span, (Ty, Ty)> = Map()
+	var places: Vec<Span> = Vec()
+	for expr in body.exprs {
+		// Only a type that mentions one can hold one.
+		if !program.types.any(expr.ty, (kind) => kind is .Opaque(..) | .Struct(..)) then continue
+		var seen: Set<Ty> = Set()
+		val .Some(opaque) = holdsOpaque(&var program, expr.ty, &var seen) else continue
+		if !found.contains(&expr.span) then places.push(expr.span)
+		found.put(expr.span, (expr.ty, opaque))
+	}
+	for span in places {
+		val (ty, opaque) = found.at(&span)
+		if !reported.add(opaque) && instance then continue
+		val what = "a value of `\(program.tyName(ty, &interner))`"
+		val made = match origin {
+			.Some(at) => .Some((at, program.fnName(id, &interner)))
+			.None => .None
+		}
+		diagnostics.push(opaqueValue(&program, opaque, what, span, move made, &interner))
+		if instance then return
+	}
+}
+
+/// What is said of a value, or a size, of an opaque C type: where it is,
+/// and the instance that holds it and where that was made.
+fn opaqueValue(
+	program: &Program,
+	opaque: Ty,
+	what: str,
+	span: Span,
+	made: Option<(Span, String)>,
+	interner: &Interner,
+): Diagnostic = {
+	val name = program.tyName(opaque, &interner)
+	var diagnostic = Diagnostic::error(
+		OPAQUE_VALUE,
+		"`\(name)` is a C type whose contents are not known, and this needs \(what)",
+		span,
+		"needs how large a `\(name)` is",
+	).withNote(
+		"an opaque C type says only that the type exists; how large one is, and what is in it, are C's business",
+	).withHelp("a pointer to one is written `ptr<\(name)>`, which a generic takes as `ptr<T>`")
+	if made is .Some((at, instance)) then
+		diagnostic = diagnostic.withSecondary(at, "`\(instance)` is made here")
+	return move diagnostic
 }
 
 /// A copy of `generic` for the type arguments `args`, in `module`.

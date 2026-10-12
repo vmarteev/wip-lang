@@ -129,40 +129,11 @@ extend Parser {
 					PatternKind::Binding(symbol: symbol)
 				}
 			}
-			// `(x, y)`: a tuple taken apart, which is the prelude's
-			// `Tuple2(_0: x, _1: y)`.
+			// `(x, y)`: a tuple taken apart by position, or a struct by its
+			// fields' names, which the checker tells apart by the type.
 			.LParen => {
-				val open = self.bump()
-				val (elems, _) = self.list(
-					open,
-					.RParen,
-					"a pattern",
-					(kind) => canStartPattern(kind),
-					(p) => .Some(p.pattern()),
-				)
-				val span = start.to(self.prevSpan())
-				match self.tupleName(elems.len(), span, "pattern") {
-					.Some(name) => {
-						var binders: Vec<Binder> = Vec()
-						var i = 0
-						for pattern in move elems {
-							val at = pattern.span
-							binders.push(Binder(
-								field: Name(sym: Symbol::tupleField(i), span: at),
-								pattern: .Some(move pattern),
-								span: at,
-							))
-							i += 1
-						}
-						.Variant(
-							leadingDot: false,
-							segments: Vec::of(own [Name(sym: name, span: span)]),
-							binders: .Some(move binders),
-							rest: false,
-						)
-					}
-					.None => .Error
-				}
+				val (binders, rest) = self.binders()
+				PatternKind::Parens(binders: move binders, rest: rest)
 			}
 			// `[first, ..rest]`: the elements of an array or a slice.
 			.LBracket => self.slicePattern()
@@ -314,6 +285,18 @@ extend Parser {
 				binders: .None,
 				rest: false,
 			)
+		val (binders, rest) = self.binders()
+		return .Variant(
+			leadingDot: leadingDot,
+			segments: move segments,
+			binders: .Some(move binders),
+			rest: rest,
+		)
+	}
+
+	/// The binders in parentheses, at the `(`, and whether they end with
+	/// `..`: a variant's, a struct's or a tuple's.
+	var fn binders(): (Vec<Binder>, bool) = {
 		val open = self.bump()
 		val (elems, _) = self.list(
 			open,
@@ -345,17 +328,24 @@ extend Parser {
 				.Rest(span) => if rest.isNone() then rest = .Some(span)
 			}
 		}
-		return .Variant(
-			leadingDot: leadingDot,
-			segments: move segments,
-			binders: .Some(move binders),
-			rest: rest.isSome(),
-		)
+		return (move binders, rest.isSome())
 	}
 
-	/// A field name, `field: name`, or `..`.
+	/// A field name, `field: name`, `..`, or a pattern where no name is
+	/// written.
 	var fn binderElem(): Option<BinderElem> = match self.peek() {
 		.DotDot if !canStartBound(self.nth(1)) => .Some(.Rest(span: self.bump()))
+		// `MIN..0`: a range, whose first end may be a constant's name.
+		_ if self.startsRange() => {
+			val start = self.span()
+			val pattern = self.pattern()
+			val span = pattern.span
+			return .Some(.Field(binder: Binder(
+				field: Name(sym: Symbol::positional(), span: start),
+				pattern: .Some(move pattern),
+				span: span,
+			)))
+		}
 		// `_` alone stands for the one field, as any pattern there does;
 		// the checker refuses it where the variant has more.
 		.Underscore if self.nth(1) is .Comma | .RParen => {

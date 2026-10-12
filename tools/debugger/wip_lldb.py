@@ -52,13 +52,13 @@ def kind_of(sbtype):
         return "String"
     if (name.startswith("&[") or name.startswith("&var [")) and names == ["ptr", "len"]:
         return "slice"
-    if name.startswith("Vec<") and names == ["slots", "length"]:
+    if name.startswith("Vec<") and names == ["slots", "len"]:
         return "Vec"
     if name.startswith("Set<") and names == ["table", "keys"]:
         return "Set"
     if name.startswith("Map<") and names == ["table", "row"]:
         return "Map"
-    if name.startswith("Deque<") and names == ["slots", "head", "length"]:
+    if name.startswith("Deque<") and names == ["slots", "head", "len"]:
         return "Deque"
     return _enum_kind(sbtype, name)
 
@@ -205,7 +205,7 @@ def string_summary(value, _internal_dict):
         return GONE
     bytes_ = value.GetNonSyntheticValue().GetChildMemberWithName("bytes")
     pointer = bytes_.GetChildMemberWithName("slots").GetChildMemberWithName("ptr")
-    return _text(pointer, _int(bytes_.GetChildMemberWithName("length")))
+    return _text(pointer, _int(bytes_.GetChildMemberWithName("len")))
 
 
 def length_summary(value, _internal_dict):
@@ -275,7 +275,7 @@ class SliceChildren(_Elements):
 def _vec_where(vec):
     vec = vec.GetNonSyntheticValue()
     pointer = vec.GetChildMemberWithName("slots").GetChildMemberWithName("ptr")
-    return pointer, _int(vec.GetChildMemberWithName("length"))
+    return pointer, _int(vec.GetChildMemberWithName("len"))
 
 
 class VecChildren(_Elements):
@@ -318,7 +318,7 @@ class DequeChildren(_Elements):
         plain = self.value.GetNonSyntheticValue()
         self.slots, self.capacity = _vec_where(plain.GetChildMemberWithName("slots"))
         self.head = _int(plain.GetChildMemberWithName("head"))
-        return self.slots, _int(plain.GetChildMemberWithName("length"))
+        return self.slots, _int(plain.GetChildMemberWithName("len"))
 
     def get_child_at_index(self, index):
         if index < 0 or index >= self.count or self.capacity <= 0:

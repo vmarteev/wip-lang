@@ -72,12 +72,16 @@ extend Lowerer {
 			// A character is its number, in 32 bits.
 			.Char(c) => self.alloc(.Int(c as u128), CHAR, span)
 			// A byte is the number it is, a `u8`.
-			.Byte(b) => self.alloc(.Int(b as u128), U8, span)
+			.Byte(b) => {
+				val byte = self.alloc(.Int(b as u128), U8, span)
+				self.state.byteLiterals.add(byte)
+				byte
+			}
 			// `null`: a C pointer that points at nothing. Which pointer it is
-			// comes from what is expected.
+			// comes from what is expected, and a C string is one.
 			.Null => {
 				val ty = match hint {
-					.Some(h) if self.kind(h) is .Ptr(..) => h
+					.Some(h) if self.kind(h) is .Ptr(..) | .Cstring => h
 					_ => {
 						self.report(
 							Diagnostic::error(
@@ -86,7 +90,7 @@ extend Lowerer {
 								span,
 								"no pointer type",
 							).withNote(
-								"`null` is a C pointer that points at nothing, so what it points at comes from what is expected",
+								"`null` is a C pointer, or a C string, that points at nothing, so what it points at comes from what is expected",
 							).withHelp("write the type, as in `val handle: ptr<sqlite3> = null`"),
 						)
 						return self.errorExpr(span)
@@ -154,6 +158,7 @@ extend Lowerer {
 			.Assign(target, op, wrapping, value) => self.assign(target, op, wrapping, value, span)
 			.Field(base, name) => self.field(base, name, span)
 			.Lend(value) => self.lendExpr(value, span)
+			.FieldDefault(variant, field) => self.fieldDefault(variant, field, span)
 			.Call(callee, args, names, rest) => self.callExpr(
 				callee,
 				&args,
@@ -261,12 +266,8 @@ extend Lowerer {
 	/// the reference, since there is nothing of fixed size to copy. Anything
 	/// else is not a slice read so.
 	fn keptReference(e: ExprId): Option<ExprId> = {
-		val .Deref(inner) = self.state.body.exprs[e].kind else {
-			return .None
-		}
-		val .Ref(inner: referent, kind: .Shared) = self.kind(self.tyOf(inner)) else {
-			return .None
-		}
+		val .Deref(inner) = self.state.body.exprs[e].kind else return .None
+		val .Ref(inner: referent, kind: .Shared) = self.kind(self.tyOf(inner)) else return .None
 		return if self.kind(referent) is .Slice(..) then .Some(inner) else .None
 	}
 
@@ -327,6 +328,38 @@ extend Lowerer {
 				"the wrapping operators say what an integer does when it overflows; a type of a program's own answers only the plain ones",
 			).withHelp("write `\(text)\(suffix)`, which the type answers where it implements its interface"),
 		)
+	}
+
+	/// The default of a field of the type the code is for — of one of its
+	/// variants, for an enum — as a literal that left the field out would
+	/// have it: what `@derive(Decode)` puts where the input has no value.
+	var fn fieldDefault(variant: Option<ast::Name>, field: ast::Name, span: Span): ExprId = {
+		val .Some(selfTy) = self.selfTy else return self.errorExpr(span)
+		var fields: Vec<FieldDef> = Vec()
+		var args = TyList::empty()
+		match self.kind(selfTy) {
+			.Struct(id, args: list) => {
+				fields = self.program.structs[id].fields.clone()
+				args = list
+			}
+			.Enum(id, args: list) => {
+				for v in self.program.enums[id].variants {
+					if variant is .Some(name) && v.name == name.sym then fields = v.fields.clone()
+				}
+				args = list
+			}
+			_ => return self.errorExpr(span)
+		}
+		for f in fields {
+			if f.name != field.sym then continue
+			val .Some(default) = f.default else break
+			val mark = self.state.unsettledDefaults.len()
+			val value = self.useDefault(&default, span)
+			val tys = self.program.types.list(args).toVec()
+			self.settleDefaults(mark, &tys)
+			return value
+		}
+		return self.errorExpr(span)
 	}
 
 	var fn name(sym: Symbol, hint: Option<Ty>, span: Span): ExprId = {
@@ -446,11 +479,10 @@ extend Lowerer {
 				return self.errorExpr(span)
 			}
 		}
-		// An array is expected, or a slice it becomes, as `own<[View]>` takes
-		// `own [.Text(…), .Space()]`.
-		var elemHint: Option<Ty> = .None
-		if hint is .Some(h) && self.kind(h) is .Array(elem: t, ..) | .Slice(elem: t) then
-			elemHint = .Some(t)
+		// An array is expected, or a slice it becomes: kept, as `own<[View]>`
+		// takes `own [.Text(…), .Space()]`, or lent, as `&[str]` takes `["q",
+		// "Q"]`.
+		val elemHint = self.elementHint(hint)
 		if elems.isEmpty() {
 			val .Some(elem) = elemHint else {
 				self.report(
@@ -466,10 +498,19 @@ extend Lowerer {
 			val ty = self.intern(.Array(elem: elem, len: 0))
 			return self.alloc(.Array(Vec()), ty, span)
 		}
+		// Where nothing says the elements' type, the first element that says
+		// its own does: a literal before it, `[1.0, x]`, takes it.
+		var deciding = 0
+		if elemHint.isNone() {
+			while deciding < elems.len() && self.takesTypeBeside(elems[deciding]) {
+				deciding += 1
+			}
+			if deciding == elems.len() then deciding = 0
+		}
 		val first = match elemHint {
-			.Some(t) => self.check(elems[0], t)
+			.Some(t) => self.arrayElement(elems[deciding], t)
 			.None => {
-				val inferred = self.infer(elems[0], .None)
+				val inferred = self.infer(elems[deciding], .None)
 				self.keptReference(inferred).unwrapOr(inferred)
 			}
 		}
@@ -477,18 +518,42 @@ extend Lowerer {
 			.Some(t) => t
 			.None => self.tyOf(first)
 		}
-		var checked = Vec::of(own [first])
-		for i in 1..elems.len() {
-			checked.push(self.check(elems[i], elem))
+		var checked: Vec<ExprId> = Vec()
+		for i in 0..elems.len() {
+			checked.push(if i == deciding then first else self.arrayElement(elems[i], elem))
 		}
 		val ty = self.intern(.Array(elem: elem, len: elems.len() as u64))
 		return self.alloc(.Array(move checked), ty, span)
 	}
 
+	/// An element of an array that holds `elem`: where that is a reference,
+	/// a slice read through one is that reference, as it is where nothing is
+	/// expected.
+	var fn arrayElement(e: ast::ExprId, elem: Ty): ExprId = {
+		val inferred = self.infer(e, .Some(elem))
+		val kept =
+			if self.kind(elem) is .Ref(..) then self.keptReference(inferred).unwrapOr(inferred)
+			else inferred
+		return self.coerce(kept, elem, .None)
+	}
+
+	/// The element an array literal is expected to have: its own, or the one
+	/// of the slice it becomes, kept or lent.
+	fn elementHint(hint: Option<Ty>): Option<Ty> = {
+		val .Some(h) = hint else return .None
+		val wanted = match self.kind(h) {
+			.Ref(inner, ..) => inner
+			_ => h
+		}
+		return match self.kind(wanted) {
+			.Array(elem, ..) | .Slice(elem) => .Some(elem)
+			_ => .None
+		}
+	}
+
 	/// `[elem; count]` with its count known.
 	var fn arrayRepeat(elem: ast::ExprId, count: u64, hint: Option<Ty>, span: Span): ExprId = {
-		var elemHint: Option<Ty> = .None
-		if hint is .Some(h) && self.kind(h) is .Array(elem: t, ..) then elemHint = .Some(t)
+		val elemHint = self.elementHint(hint)
 		val checked = match elemHint {
 			.Some(t) => self.check(elem, t)
 			.None => self.infer(elem, .None)
@@ -500,9 +565,7 @@ extend Lowerer {
 	/// The name of a repeat count that is a constant, not a variable.
 	fn constantCount(count: ast::ExprId): Option<ast::Name> = {
 		val expr = &self.ast.exprs[count]
-		val .Name(sym) = expr.kind else {
-			return .None
-		}
+		val .Name(sym) = expr.kind else return .None
 		if self.lookup(sym).isSome() then return .None
 		val name = ast::Name(sym: sym, span: expr.span)
 		return if self.constNamed(name).isSome() then .Some(name) else .None
@@ -672,7 +735,7 @@ extend Lowerer {
 		// nothing of what is shifted, whose type is the answer's — `1 << n` of
 		// a `u32` amount is the `1` expected, or an `i64`.
 		val shift = op is .Shl | .Shr
-		val (l0, r0) = if self.takesOther(lhs) && !self.takesOther(rhs) && !shift {
+		val (left, right) = if self.takesOther(lhs) && !self.takesOther(rhs) && !shift {
 			val r = self.comparedOperand(op, rhs, hint)
 			val rt = self.tyOf(r)
 			var left: Option<Ty> = .None
@@ -694,8 +757,23 @@ extend Lowerer {
 			val r = self.comparedOperand(op, rhs, .Some(right.unwrapOr(lt)))
 			(l, r)
 		}
+		// A constant beside an integer of another type is as the literal it
+		// stands for: `flags & VK_QUEUE_GRAPHICS_BIT`. Not a shift's amount,
+		// which may be of any type already.
+		val (l0, r0) = if shift then (left, right) else self.constantBeside(left, right)
 		val lt0 = self.tyOf(l0)
 		val rt0 = self.tyOf(r0)
+		// `name == null` asks whether a C string is null: `null` has no text
+		// to compare.
+		val nullOnLeft = self.ast.exprs[lhs].kind is .Null
+		if op is .Eq | .Ne &&
+			(nullOnLeft || self.ast.exprs[rhs].kind is .Null) &&
+			self.kind(lt0) is .Cstring &&
+			self.kind(rt0) is .Cstring {
+			val test = self.alloc(.IsNull(if nullOnLeft then r0 else l0), BOOL, span)
+			return if op == .Eq then test
+			else self.alloc(.Unary(op: .Not, operand: test), BOOL, span)
+		}
 		val result = if arithmetic then lt0 else BOOL
 		if self.isPoisoned(lt0) || self.isPoisoned(rt0) then
 			return self.alloc(.Binary(op: op, lhs: l0, rhs: r0, wrapping: wrapping), result, span)
@@ -994,9 +1072,7 @@ extend Lowerer {
 	/// which say what a number written there is.
 	var fn operatorRhsTys(which: KnownInterface, lt: Ty): Vec<Ty> = {
 		var found: Vec<Ty> = Vec()
-		val .Some(interfaceId) = self.program.preludeItems.interfaceOf(which) else {
-			return move found
-		}
+		val .Some(interfaceId) = self.program.preludeItems.interfaceOf(which) else return move found
 		if self.kind(lt) is .Param(param) {
 			if param.index as i64 >= self.typeParams.len() then return move found
 			for c in self.typeParams[param.index as i64].interfaces {
@@ -1005,9 +1081,7 @@ extend Lowerer {
 			}
 			return move found
 		}
-		val .Some(owner) = self.ownerOf(lt) else {
-			return move found
-		}
+		val .Some(owner) = self.ownerOf(lt) else return move found
 		val ownerArgs = self.ownerArgs(lt)
 		for at in 0..self.program.impls.len() {
 			if self.program.impls[at].interfaceId != interfaceId ||
@@ -1025,9 +1099,7 @@ extend Lowerer {
 	/// type of a program's own is, `2.0 * v`.
 	var fn operatorLhsBuiltins(which: KnownInterface, rt: Ty): Vec<Ty> = {
 		var tys: Vec<Ty> = Vec()
-		val .Some(interfaceId) = self.program.preludeItems.interfaceOf(which) else {
-			return move tys
-		}
+		val .Some(interfaceId) = self.program.preludeItems.interfaceOf(which) else return move tys
 		var owners: Vec<TypeDef> = Vec()
 		for i in self.program.impls {
 			val list = self.program.types.list(i.args)

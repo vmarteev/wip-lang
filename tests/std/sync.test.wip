@@ -1,0 +1,140 @@
+import std::c
+import std::future
+import std::sync
+import std::sync::{Atomic, LoadOrder, Order, StoreOrder}
+
+@test
+fn everyOrderReadsAndWritesTheValue() = {
+	val n = Atomic::of(1)
+	for order in [StoreOrder::Relaxed, .Release, .SeqCst] {
+		n.store(2, order: order)
+		assert(n.load() == 2)
+		n.store(1)
+	}
+	for order in [LoadOrder::Relaxed, .Acquire, .SeqCst] {
+		assert(n.load(order: order) == 1)
+	}
+	for order in [Order::Relaxed, .Acquire, .Release, .AcqRel, .SeqCst] {
+		assert(n.add(2, order: order) == 1)
+		assert(n.subtract(2, order: order) == 3)
+		assert(n.swap(5, order: order) == 1)
+		assert(n.replaceIf(5, 1, order: order) && !n.replaceIf(5, 6, order: order))
+		assert(n.load() == 1)
+	}
+}
+
+@test
+fn floatsAddedFromEightThreadsLoseNothing() = {
+	val total = Atomic::of(0.0)
+	val small = Atomic::of(0.0 as f32)
+	var workers = [0, 1, 2, 3, 4, 5, 6, 7]
+	future::each(&var workers, (worker) => {
+		for _ in 0..1000 {
+			total.add(0.5)
+			small.add(1.0)
+		}
+		worker = 0
+	})
+	assert(total.load() == 4000.0 && small.load() == 8000.0)
+	total.subtract(1000.0, order: .AcqRel)
+	assert(total.swap(1.5) == 3000.0 && total.load() == 1.5)
+}
+
+@test
+fn aFloatIsReplacedWhereItsBitsAreExpected() = {
+	val nan = 0.0 / 0.0
+	val held = Atomic::of(nan)
+	assert(held.replaceIf(nan, 1.0), "a NaN is the NaN it was, though it is not `==` to itself")
+	val zero = Atomic::of(0.0)
+	assert(!zero.replaceIf(-0.0, 1.0), "`-0.0` is `==` to `0.0`, but its bits are not")
+	assert(zero.load() == 0.0)
+}
+
+/// A queue of one writer and one reader, how a real-time thread hears from
+/// another without a lock: the writer fills a slot, then publishes it with a
+/// release store; the reader acquires the count, then reads the slot.
+struct Ring {
+	slots: Vec<Atomic<i64>>
+	written: Atomic<i64> = Atomic::of(0)
+	taken: Atomic<i64> = Atomic::of(0)
+}
+
+extend Ring {
+	static fn of(size: i64): Ring = {
+		var slots: Vec<Atomic<i64>> = Vec()
+		for _ in 0..size {
+			slots.push(Atomic::of(0))
+		}
+		return Ring(slots: move slots)
+	}
+
+	fn push(value: i64) = {
+		val at = self.written.load(order: .Relaxed)
+		while at - self.taken.load(order: .Acquire) == self.slots.len() {}
+		self.slots[at % self.slots.len()].store(value, order: .Relaxed)
+		self.written.store(at + 1, order: .Release)
+	}
+
+	fn pop(): i64 = {
+		val at = self.taken.load(order: .Relaxed)
+		while self.written.load(order: .Acquire) == at {}
+		val value = self.slots[at % self.slots.len()].load(order: .Relaxed)
+		self.taken.store(at + 1, order: .Release)
+		return value
+	}
+}
+
+@test
+fn aQueueInAcquireAndReleaseKeepsAMillionValuesInOrder() = {
+	val ring = Ring::of(1024)
+	val count = 1_000_000
+	val (_, inOrder) = future::together(
+		() => {
+			for i in 0..count {
+				ring.push(i)
+			}
+		},
+		() => {
+			var ordered = true
+			for i in 0..count {
+				if ring.pop() != i then ordered = false
+			}
+			return ordered
+		},
+	)
+	assert(inOrder)
+}
+
+@test
+fn aPointerIsSwappedAsOneStep() = {
+	val slots: [i64; 2] = [4, 8]
+	val first = c::pointerTo(&slots[0..1])
+	val second = c::pointerTo(&slots[1..2])
+	val held = Atomic::of(first)
+	assert(!held.replaceIf(second, first) && held.replaceIf(first, second, order: .AcqRel))
+	assert(held.swap(first) == second && held.load(order: .Acquire) == first)
+	held.store(second, order: .Release)
+	assert(held.load() == second)
+}
+
+@test
+fn fencesOrderRelaxedOperations() = {
+	val data = Atomic::of(0)
+	val ready = Atomic::of(false)
+	val (_, seen) = future::together(
+		() => {
+			data.store(42, order: .Relaxed)
+			sync::fence(.Release)
+			ready.store(true, order: .Relaxed)
+		},
+		() => {
+			while !ready.load(order: .Relaxed) {}
+			sync::fence(.Acquire)
+			return data.load(order: .Relaxed)
+		},
+	)
+	assert(seen == 42)
+	for order in [Order::Relaxed, .Acquire, .Release, .AcqRel, .SeqCst] {
+		sync::fence(order)
+	}
+}

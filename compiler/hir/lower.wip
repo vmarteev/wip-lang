@@ -350,6 +350,10 @@ pub fn lower(modules: &[ModuleAst], interner: &Interner, threads: i64): Lowered 
 		lowerer.enterFile(i, &files, &imports, &lambdas, &envs, &generators)
 		lowerer.resolveTypeBodies(&types[i])
 	}
+	for i in 0..files.len() {
+		lowerer.enterFile(i, &files, &imports, &lambdas, &envs, &generators)
+		lowerer.checkPackedStructs(&types[i])
+	}
 	lowerer.checkRecursiveTypes()
 	lowerer.flushCopyChecks()
 	// An interface's methods before anything implements it.
@@ -479,6 +483,7 @@ pub fn lower(modules: &[ModuleAst], interner: &Interner, threads: i64): Lowered 
 				var worker = Lowerer::new(files[0].1, &interner, declared.clone(), scopes.clone())
 				worker.phase = phase.clone()
 				worker.program.names.clear()
+				worker.program.implicitFills.clear()
 				worker.checkBodies(
 					&work[range.0..range.1],
 					&files.items(),
@@ -566,6 +571,8 @@ struct CheckedBodies {
 	generators: Vec<GeneratorChecked>
 	/// The names it read that left no expression.
 	names: Vec<(Span, Named)>
+	/// The implicits its calls filled.
+	implicitFills: Vec<(u32, String)>
 	diagnostics: Vec<Diagnostic>
 }
 
@@ -732,11 +739,17 @@ view struct Lowerer {
 /// behind would be a body checked against another one's locals.
 struct BodyState {
 	body: Body = Body()
+	/// The byte literals, `b'x'`: a `u8`, compared with a `u8` alone, which
+	/// a constant of another type is not.
+	byteLiterals: Set<ExprId> = Set()
 	/// The names in scope, innermost last.
 	scopes: Vec<Map<Symbol, LocalId>> = Vec()
 	/// The result type, and where it was written.
 	ret: Ty = UNIT
 	retSpan: Option<Span> = .None
+	/// Checking a constant's value, where an array written for a slice,
+	/// outside any block, is kept with the constant.
+	constant: bool = false
 	/// The keywords of the `defer`s being checked, innermost last.
 	defers: Vec<(Span, i64)> = Vec()
 	/// The loops around the statement being lowered, innermost last: the name
@@ -790,6 +803,11 @@ struct BodyState {
 	/// A lambda whose result nothing expected, and no `return` has said yet:
 	/// the first `return value` says it.
 	inferringRet: bool = false
+	/// The `?`s met while `inferringRet`, which wait for the result to be
+	/// said to be checked against it.
+	pendingTries: Vec<PendingTry> = Vec()
+	/// Whether the body is a lambda's, which a message names as one.
+	lambda: bool = false
 }
 
 extend Lowerer {
@@ -950,9 +968,7 @@ extend Lowerer {
 		var generators: Vec<GeneratorChecked> = Vec()
 		for next in self.program.fns.ids() {
 			val def = &self.program.fns[next]
-			val .Some(id) = def.generator else {
-				continue
-			}
+			val .Some(id) = def.generator else continue
 			if def.body.isNone() then continue
 			var copy = def.clone()
 			var strukt = self.program.structs[id].clone()
@@ -1007,6 +1023,7 @@ extend Lowerer {
 			envStructs: move envStructs,
 			generators: move generators,
 			names: move names,
+			implicitFills: mem::replace(&var self.program.implicitFills, Vec()),
 			diagnostics: mem::replace(&var self.diagnostics, Vec()),
 		)
 	}
@@ -1031,12 +1048,9 @@ extend Lowerer {
 				self.program.impls[index].conditions = conditions.clone()
 			}
 		}
-		for name in move checked.names {
-			self.program.names.push(move name)
-		}
-		for d in move checked.diagnostics {
-			self.diagnostics.push(move d)
-		}
+		self.program.names.append(move checked.names)
+		self.program.implicitFills.append(move checked.implicitFills)
+		self.diagnostics.append(move checked.diagnostics)
 	}
 
 	var fn enterFile(

@@ -55,26 +55,42 @@ extend Layouts {
 	pub var fn structLayout(program: &Program, ty: Ty): Layout = {
 		if self.structs.get(&ty) is .Some(s) then return s.layout.clone()
 		// A union's fields are all at 0, over the same bytes, and it is as
-		// large as the largest of them.
-		val union = match program.types.kind(ty) {
-			.Struct(id, ..) => program.structs[id].isUnion
-			_ => false
+		// large as the largest of them. `@packed` puts each field right after
+		// the one before, and `@align` raises the alignment of a field or of
+		// the struct, never lowering one below its own.
+		var union = false
+		var packed = false
+		var raised: u32 = 1
+		var fieldAligns: Vec<Option<u32>> = Vec()
+		if program.types.kind(ty) is .Struct(id, ..) {
+			val def = &program.structs[id]
+			union = def.isUnion
+			packed = def.packed
+			if def.align is .Some(n) then raised = n
+			for f in def.fields {
+				fieldAligns.push(f.align)
+			}
 		}
 		var size: u32 = 0
 		var align: u32 = 1
 		var offsets: Vec<u32> = Vec()
-		for fieldTy in program.fieldTys(ty) {
+		val fieldTys = program.fieldTys(ty)
+		for (i, fieldTy) in fieldTys.forwards().enumerate() {
 			val field = self.of(&program, fieldTy)
+			var fieldAlign: u32 = if packed then 1 else field.align
+			if i < fieldAligns.len() && fieldAligns[i] is .Some(n) then
+				fieldAlign = fieldAlign.max(n)
 			if union {
 				offsets.push(0)
 				size = size.max(field.size)
 			} else {
-				size = nextMultiple(size, field.align)
+				size = nextMultiple(size, fieldAlign)
 				offsets.push(size)
 				size += field.size
 			}
-			align = align.max(field.align)
+			align = align.max(fieldAlign)
 		}
+		align = align.max(raised)
 		val layout = Layout(size: nextMultiple(size, align), align: align)
 		self.structs.put(ty, StructLayout(layout: layout.clone(), offsets: move offsets))
 		return layout
@@ -118,6 +134,14 @@ extend Layouts {
 		}
 		.Enum(..) => self.enumLayout(&program, ty)
 		.Param(..) | .Assoc(..) => panic("only instances of generic items are laid out")
+	}
+
+	/// Whether a place inside a value of `ty` at field `index` may lie at an
+	/// address its type's alignment does not promise: a field of a packed
+	/// struct.
+	pub fn packedAt(program: &Program, ty: Ty): bool = match program.types.kind(ty) {
+		.Struct(id, ..) => program.structs[id].packed
+		_ => false
 	}
 
 	pub var fn fieldOffset(program: &Program, ty: Ty, index: u32): u32 = {
@@ -221,9 +245,7 @@ fn nicheOf(program: &Program, variants: &[Vec<Ty>]): Option<(i64, i64, i64)> = {
 			break
 		}
 	}
-	val .Some(field) = found else {
-		return .None
-	}
+	val .Some(field) = found else return .None
 	for (i, f) in fields.forwards().enumerate() {
 		if i != field && program.ownsMemory(f) then return .None
 	}

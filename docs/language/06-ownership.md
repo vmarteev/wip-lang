@@ -62,6 +62,43 @@ fn main() = {
 `Option<own<T>>` is one word wide: nothing is the null pointer. The memory
 is freed when the value that owns it ends.
 
+A box clones where what it holds does: its clone is a box of its own,
+holding a clone of the value, so `@derive(Clone)` clones a recursive type
+whose children are boxed, and nothing is shared between the two.
+
+A method called on an `own<T>` is `T`'s, and a field read through it is
+`T`'s, as through a reference. An interface is another matter: an
+`own<T>` is not a `T`, so it implements what an `extend own<T>` block
+implements for a box, and nothing of `T`'s. A module may write one for an
+interface of its own, which holds where its condition on `T` does:
+
+```wip,run
+interface Describe {
+    fn describe(): String
+}
+
+struct Leaf {
+    name: String
+}
+
+extend Leaf: Describe {
+    fn describe(): String = "leaf \(self.name)"
+}
+
+extend own<T: Describe>: Describe {
+    fn describe(): String = "boxed \(self.describe())"
+}
+
+fn told<T: Describe>(x: &T): String = x.describe()
+
+fn main() = {
+    val boxed = own Leaf(name: String::of("a"))
+    assert(told(&boxed) == "boxed leaf a")
+    // Called on the box, the method is the leaf's.
+    assert(boxed.describe() == "leaf a")
+}
+```
+
 ## Ending: `Destroy`
 
 A type that must do something when its values end implements `Destroy`,
@@ -117,6 +154,71 @@ since that runs wherever the value ends rather than only here.
 
 A `return` may not stand inside a deferred expression, and neither may
 `break` or `continue` leaving the loop it is in.
+
+## Where memory comes from: `mem::using`
+
+Every `own`, `Vec` and `String` takes its memory from the heap, unless a
+call says otherwise. `std::mem::using(&var allocator, body)` runs `body`
+with every allocation it makes on this thread — in its own code and in
+every function it calls, the library's included — taken from the
+allocator, and the one before it back when the call ends. Each value
+remembers where it was made and is freed there, whenever that is: a value
+made under `using` and dropped after it is still given back to its
+allocator.
+
+A game keeps a frame's short-lived values — what is visible, the draw
+commands, the text of an overlay — in an `Arena`: memory handed out by
+moving a pointer forward, and taken back all at once by `reset`. A value
+the arena holds that is still alive when it is reset or dropped is a
+panic, so no value outlives the memory it lives in; in a debug build the
+panic first says where the first few such values were made. What a frame
+makes to keep is made under `mem::onHeap`, which is `using` with the heap —
+and growing a list that outlives the frame is making something to keep:
+
+```wip,run
+import std::mem
+import std::mem::{Arena}
+
+struct Asset {
+    name: String
+}
+
+/// Kept past the frame: the asset, and the list's room for it.
+fn load(into: &var Vec<own<Asset>>) = {
+    mem::onHeap(() => into.push(own Asset(name: "box")))
+}
+
+fn main() = {
+    var frame = Arena::of(65536)
+    var loaded: Vec<own<Asset>> = Vec()
+    for round in 0..3 {
+        val drawn = mem::using(&var frame, () => {
+            var visible: Vec<i64> = Vec()
+            for i in 0..100 {
+                if i % 3 == 0 then visible.push(i)
+            }
+            if round == 1 then load(&var loaded)
+            return visible.len()
+        })
+        assert(drawn == 34 && frame.live() == 0)
+        frame.reset()
+    }
+    assert(loaded.len() == 1 && loaded[0].name == "box")
+}
+```
+
+- **A thread has its own:** `using` reaches the allocations of the thread
+  that calls it. A thread its body starts — `future::each`, `together` —
+  allocates from the heap, since an arena reached from two threads at
+  once would need a lock on every allocation.
+- **Calls nest,** and the innermost gives.
+- **A program's own allocator** implements `mem::Allocator` —
+  `allocate(size, align)` and `free(at)` — and is kept by `mem::Custom::of`
+  where `using` can reach it: a pool of fixed-size slots, or memory a GPU
+  maps. Dropping it while something it made is alive is a panic, as an
+  arena's is.
+- **It costs code that never says `using` one load** of a word the thread
+  keeps, before `malloc` as before.
 
 ## What this adds up to
 

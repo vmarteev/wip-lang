@@ -16,6 +16,7 @@ its tests run, with every change to the compiler.
 | [parallel-sum](parallel-sum) | work on several threads three ways: `future::map`, `together` and `each` |
 | [shapes-package](shapes-package) | a program that is a package, depending on a library package, with `internal/` |
 | [sqlite](sqlite) | calling a C library directly: `@link`, `extern "C"`, opaque types, `defer` |
+| [scene](scene) | a camera and a cube with `std::math`: vectors, a rotation, the matrices a GPU multiplies, and pixels |
 
 Run one with `wip run examples/<name>/main.wip`, and its tests with
 `wip test examples/<name>/main.wip`.

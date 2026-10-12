@@ -70,6 +70,78 @@ something else, is not a swap, and is not reported: `binary(.Mul, rhs,
 size)`, for `binary(kind, lhs, rhs)`, puts `rhs` in `lhs` and a size in
 `rhs`.
 
+## Implicit parameters
+
+A parameter marked `implicit` is filled, where a call leaves it out, from
+the caller's implicit of the same name: one of the caller's own implicit
+parameters, or an `implicit val` or `implicit var` in scope. What a
+function needs is still said in its signature; what is not written again
+is the same name at every call that only passes it on. An implicit
+`&var` is lent as an argument is, and a shared one shared, so the borrow
+rules see the call as if it were written; it may always be passed by
+name:
+
+```wip,run
+struct Dice {
+    next: i64
+}
+
+extend Dice {
+    var fn roll(): i64 = {
+        self.next = (self.next * 7 + 3) % 10
+        return self.next
+    }
+}
+
+fn twice(implicit dice: &var Dice): i64 = dice.roll() + dice.roll()
+
+// Only passes it on: the calls write nothing for it.
+fn round(implicit dice: &var Dice): i64 = twice() + twice()
+
+fn main() = {
+    implicit var dice = Dice(next: 1)
+    val first = round()
+    var other = Dice(next: 1)
+    assert(round(dice: &var other) == first, "given by name")
+}
+```
+
+- **By name and type.** An implicit is found by its name, and must then
+  be of the type the parameter takes. Two implicits of one type do not
+  collide, and a reader looking for where `dice` comes from looks for
+  `dice`.
+- **Only implicits fill implicits.** An ordinary variable of the name is
+  not used, so that declaring one never changes what an unrelated call
+  receives. Where nothing implicit has the name, the call is refused
+  (E0455), with the two ways to declare one.
+- **Implicit parameters come after the others,** and are a reference, `&`
+  or `&var`, or plain data, copied; a value that owns memory would be
+  moved out of the caller at every call. Their type names none of the
+  function's type parameters, and they have no default (E0454).
+- **A lambda sees the implicits where it is written,** as it captures
+  anything around it, and declares none of its own. A function with
+  implicit parameters is not a value (E0456): it would be called somewhere
+  else and filled from there, where a lambda that calls it, `(x) =>
+  f(x)`, is filled where it is written.
+- **An interface's method says its implicits,** and an implementation
+  declares the same ones; a call through the interface, a constraint or a
+  `&dyn` fills what the interface says.
+- **`implicit` is a word only there,** before a parameter and before
+  `val` or `var`. Elsewhere it is a name.
+
+```wip,error=E0455
+struct Log {
+    lines: i64
+}
+
+fn say(text: str, implicit log: &Log): i64 = log.lines + text.len()
+
+fn main() = {
+    val log = Log(lines: 0)
+    say("not implicit, so not used")
+}
+```
+
 ## Methods
 
 Methods are declared in the type's own body or in an `extend` block for it;
@@ -93,7 +165,7 @@ struct Counter {
 extend Counter {
     static fn by(step: i64): Counter = Counter(count: 0, step: step)
 
-    fn value(): i64 = self.count
+    fn count(): i64 = self.count
 
     var fn advance() = {
         self.count += self.step
@@ -106,7 +178,7 @@ fn main() = {
     var counter = Counter::by(3)
     counter.advance()
     counter.advance()
-    assert(counter.value() == 6)
+    assert(counter.count() == 6)
     assert(counter.total() == 6)
 }
 ```
@@ -114,6 +186,10 @@ fn main() = {
 A method is called with a dot; a `static fn` is called through the type,
 `Counter::by(3)`. A method may be `pub`, which exports it from the module
 as any other name is exported.
+
+A field and a method may share a name, as `count` does here: `counter.count`
+reads the field, and `counter.count()` calls the method. A field that holds
+a function is called as a method is, so it may not share a method's name.
 
 A `var fn` changes the place it is called on, which must be one that can be
 written: a `var`, or one behind a `&var`. It may also be called on a value
@@ -228,7 +304,8 @@ fn main() = {
 
 What a lambda answers is what is expected of it, where something is; where
 nothing is — the `R` of a generic function — it is what the lambda first
-`return`s, or else its body's value:
+`return`s, or else its body's value, and a `?` before that is checked once
+it is said ([page 9](09-errors.md)):
 
 ```wip,run
 fn apply<R>(f: &() => R): R = f()
@@ -363,8 +440,30 @@ fn main() = {
 }
 ```
 
-Type arguments are inferred from the arguments; where they cannot be, they
-are written at the call: `firstEqual<i64>(…)`.
+Type arguments are inferred from the arguments, and from what the
+arguments hold — a `T` from a `ptr<T>` or a `&[T]`; where they cannot be,
+they are written at the call: `firstEqual<i64>(…)`. A generic type's static
+function is called through the type, and the type's arguments are written
+after its name, `Pair<i64>::zero()`; the function's own are still inferred.
+
+```wip,run
+struct Pair<T> {
+    first: T
+    second: T
+}
+
+extend Pair<T> {
+    static fn of<U: copy>(a: T, b: T, tag: U): (Pair<T>, U) = (
+        Pair(first: move a, second: move b),
+        tag,
+    )
+}
+
+fn main() = {
+    val (pair, tag) = Pair<i64>::of(1, 2, 'x')
+    assert(pair.first + pair.second == 3 && tag == 'x')
+}
+```
 
 ## `@tailrec` and `@inline`
 

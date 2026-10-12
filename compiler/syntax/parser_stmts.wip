@@ -46,12 +46,8 @@ extend Parser {
 	/// there. It means what it says, so this is a warning and not an error
 	/// (E0126).
 	var fn variantUnderExpression(previous: StmtId, last: StmtId) = {
-		val .Expr(value) = self.ast.stmts[last].kind else {
-			return
-		}
-		val .Some(name) = self.dotName(value) else {
-			return
-		}
+		val .Expr(value) = self.ast.stmts[last].kind else return
+		val .Some(name) = self.dotName(value) else return
 		// A name in lower case is a method's or a field's:
 		// a chain meant to go on, which a `val`'s value can be too.
 		val text = self.text(name.span)
@@ -67,9 +63,7 @@ extend Parser {
 		// Only what a `.` could have carried on: a binding, a loop, an
 		// assignment and an `if` without `else` have no value to take one,
 		// so nothing there can be misread.
-		val .Expr(value: above) = self.ast.stmts[previous].kind else {
-			return
-		}
+		val .Expr(value: above) = self.ast.stmts[previous].kind else return
 		if self.ast.exprs[above].kind is .Assign(..) | .If(elseBranch: .None, ..) then return
 		val (aboveSpan, below) = (self.ast.stmts[previous].span, self.ast.stmts[last].span)
 		if !self.src[self.local(aboveSpan.hi)..self.local(below.lo)].contains("\n") then return
@@ -144,13 +138,19 @@ extend Parser {
 	}
 
 	/// `val pattern = value else { … }`, after the keyword,
-	/// or `var`, whose names are variables.
+	/// or `var`, whose names are variables. The `else` takes a block, or one
+	/// jump or expression, as a `then` form's branch is, held as a block of
+	/// that one statement.
 	var fn guardStmt(mutable: bool, start: Span, refutable: bool): StmtId = {
 		val pattern = self.pattern()
 		val value = if self.expect(.Eq) then self.expr() else self.errorExpr()
 		var elseBlock: Option<Block> = .None
-		if self.eat(.Else) {
-			elseBlock = .Some(self.block())
+		if self.at(.Else) {
+			val elseSpan = self.bump()
+			elseBlock = .Some(
+				if self.at(.LBrace) then self.block()
+				else self.oneExpressionBranch(elseSpan, "`else`"),
+			)
 		} else if refutable {
 			val diagnostic = Diagnostic::error(
 				GUARD_SYNTAX,
@@ -182,6 +182,13 @@ extend Parser {
 
 	var fn stmt(): Option<StmtId> = {
 		val start = self.span()
+		// `implicit val` and `implicit var`; anywhere else `implicit` is a
+		// name.
+		var isImplicit = false
+		if isIdent(self.peek()) && self.nthText(0) == "implicit" && self.nth(1) is .Val | .Var {
+			self.bump()
+			isImplicit = true
+		}
 		val kind: StmtKind = match self.peek() {
 			.Let | .Val | .Var => {
 				if self.at(.Let) {
@@ -196,9 +203,9 @@ extend Parser {
 				}
 				val mutable = self.at(.Var)
 				self.bump()
-				// `val .Some(x) = value else { … }`, and
-				// `val Point(x, y) = value` or `val (x, y) = value`, which
-				// cannot fail; `var` for each.
+				// `val .Some(x) = value else { … }`, and `val (x, y) =
+				// value`, which cannot fail; `var` for each. `val Point(x, y)`
+				// is parsed too, for the checker to refuse with its fix.
 				val refutable =
 					self.at(.Dot) || (isIdent(self.peek()) && self.nth(1) == .ColonColon)
 				// `val [a, b] = pair`, or `val [first, ..] = xs else { … }`,
@@ -207,15 +214,27 @@ extend Parser {
 					self.at(.LParen) ||
 					self.at(.LBracket) ||
 					(isIdent(self.peek()) && self.nth(1) == .LParen)
-				if refutable || takesApart then
+				if refutable || takesApart {
+					if isImplicit {
+						val diagnostic = Diagnostic::error(
+							IMPLICIT_NOT_ONE_NAME,
+							"an implicit is one name",
+							Span::new(start.lo, start.lo + 8),
+							"`implicit` before a pattern",
+						).withNote(
+							"a call fills an implicit parameter from the binding of its name, so an implicit binds one name and nothing else",
+						)
+						self.report(move diagnostic)
+					}
 					return .Some(self.guardStmt(mutable, start, refutable))
+				}
 				val .Some(name) = self.name("a variable name") else {
 					self.skipStmt()
 					return .None
 				}
 				val ty: Option<TypeId> = if self.eat(.Colon) then .Some(self.ty()) else .None
 				val init = if self.expect(.Eq) then self.expr() else self.errorExpr()
-				.Let(mutable: mutable, name: name, ty: ty, init: init)
+				.Let(mutable: mutable, isImplicit: isImplicit, name: name, ty: ty, init: init)
 			}
 			.Defer => {
 				self.bump()
@@ -300,7 +319,8 @@ extend Parser {
 	/// `None` where there is no binding.
 	var fn forHeader(): Option<(Pattern, ForSource)> = {
 		// `for x in …`, `for _ in …`, or a value taken apart,
-		// `for MapEntry(key, value) in …` and `for (a, b) in …`.
+		// `for (key, value) in …`; `for MapEntry(key, value)` is parsed
+		// too, for the checker to refuse with its fix.
 		// An array's elements too, `for [a, b] in pairs`.
 		var binding = Pattern(kind: .Wildcard, span: self.span())
 		if self.at(.LParen) ||

@@ -29,6 +29,9 @@ view struct GenericOperand {
 	context: Option<(Span, str)>
 	/// A call argument, which may be a reference.
 	isArg: bool
+	/// An argument of a C function, which lends a place where the function
+	/// takes a pointer.
+	toC: bool = false
 }
 
 /// The type arguments of one use of a generic item, as they become known.
@@ -425,9 +428,11 @@ extend Lowerer {
 
 	/// A type argument written in the source. Like a field's type, it cannot
 	/// be a bare slice. It may be a `str`, a view or a `&` reference, which
-	/// makes the type given it a view, but not a `&var`.
+	/// makes the type given it a view, but not a `&var`. It may be an opaque
+	/// C type, as what a `ptr` points at may: what is refused is a value of
+	/// one, where an instance holds it.
 	var fn typeArg(id: ast::TypeId): Ty = {
-		val ty = self.resolveTy(id)
+		val ty = self.resolvePointee(id)
 		if self.noVarRef(ty, id, "a type argument") || self.bareSlice(ty, id, false) then
 			return ERROR
 		return ty
@@ -507,9 +512,7 @@ extend Lowerer {
 
 	/// The type of field `index` of a struct type.
 	var fn structFieldTy(ty: Ty, index: i64): Ty = {
-		val .Struct(id, args) = self.kind(ty) else {
-			return ERROR
-		}
+		val .Struct(id, args) = self.kind(ty) else return ERROR
 		val declared = self.program.structs[id].fields[index].ty
 		val list = self.program.types.list(args).toVec()
 		return self.program.types.subst(declared, &list)
@@ -517,9 +520,7 @@ extend Lowerer {
 
 	/// The type of a field of a variant of an enum type.
 	var fn variantFieldTy(ty: Ty, variant: i64, field: i64): Ty = {
-		val .Enum(id, args) = self.kind(ty) else {
-			return ERROR
-		}
+		val .Enum(id, args) = self.kind(ty) else return ERROR
 		val declared = self.program.enums[id].variants[variant].fields[field].ty
 		val list = self.program.types.list(args).toVec()
 		return self.program.types.subst(declared, &list)
@@ -540,9 +541,7 @@ extend Lowerer {
 			unknown.push(.None)
 			broken.push(.Some(ERROR))
 		}
-		val .Some(typeArgs) = typeArgs else {
-			return move unknown
-		}
+		val .Some(typeArgs) = typeArgs else return move unknown
 		if typeArgs.after != expectedAfter {
 			for arg in typeArgs.args {
 				self.resolveTy(arg)
@@ -717,6 +716,14 @@ extend Lowerer {
 		}
 	}
 
+	/// The reference a parameter or a local holds, where `id` is what it
+	/// refers to, as a reference parameter's name is read.
+	fn heldReference(id: ExprId): Option<ExprId> = {
+		val .Deref(inner) = self.state.body.exprs[id].kind else return .None
+		if self.state.body.exprs[inner].kind !is .Local(..) then return .None
+		return if self.kind(self.tyOf(inner)) is .Ref(..) then .Some(inner) else .None
+	}
+
 	/// Whether every type parameter `ty` mentions has a type argument.
 	fn resolved(ty: Ty, solution: &[Option<Ty>]): bool =
 		!self.program.types.any(ty, (kind) =>
@@ -747,7 +754,67 @@ extend Lowerer {
 				}
 				true
 			}
+			// An `if` or a `match` all of whose parts take it.
+			.If(thenBlock, elseBranch, ..) => match elseBranch {
+				.Some(other) =>
+					self.blockTakesExpectedType(&thenBlock) && self.takesExpectedType(other)
+				.None => false
+			}
+			.Block(block) => self.blockTakesExpectedType(&block)
+			.Match(arms, ..) => {
+				for arm in arms {
+					if !self.takesExpectedType(arm.body) then return false
+				}
+				!arms.isEmpty()
+			}
 			_ => false
+		}
+	}
+
+	/// Whether a block's value takes the type expected of it.
+	fn blockTakesExpectedType(block: &ast::Block): bool = match blockValue(self.ast, &block) {
+		.Some(value) => self.takesExpectedType(value)
+		.None => false
+	}
+
+	/// Whether `e` takes its type from a part beside it — an `if`'s other
+	/// branch, a `match`'s other arms, an array's other elements — where
+	/// nothing outside says one: what takes the type expected of it, or a
+	/// constant, which takes another integer type where its value fits.
+	fn takesTypeBeside(e: ast::ExprId): bool = {
+		val file = self.ast
+		return match file.exprs[e].kind {
+			.Block(block) => match blockValue(&file, &block) {
+				.Some(value) => self.takesTypeBeside(value)
+				.None => false
+			}
+			.Name(sym) => self.namesConstant(sym, file.exprs[e].span)
+			// A variant takes its type from beside it where what it holds
+			// does: `.None`, `.Some(1)`, but not `.Some(x)`.
+			.Call(callee, args, ..) if file.exprs[callee].kind is .Path(leadingDot: true, ..) => {
+				for arg in args {
+					if !self.takesTypeBeside(arg) then return false
+				}
+				true
+			}
+			_ => self.takesExpectedType(e)
+		}
+	}
+
+	/// Whether a block's value takes its type from beside it.
+	fn blockTakesTypeBeside(block: &ast::Block): bool = match blockValue(self.ast, &block) {
+		.Some(value) => self.takesTypeBeside(value)
+		.None => false
+	}
+
+	/// Whether `sym` is a constant, and no variable of the function or of one
+	/// around it.
+	fn namesConstant(sym: Symbol, span: Span): bool = {
+		if self.lookup(sym).isSome() || self.namesAround(sym) then return false
+		return match self.imported(ast::Name(sym: sym, span: span)) {
+			.Some(.Item(module, name)) => self.modules[module].consts.contains(&name.sym)
+			.Some(.Broken) => false
+			.None => self.consts().contains(&sym)
 		}
 	}
 
@@ -782,9 +849,14 @@ extend Lowerer {
 				val id = if known {
 					val args = solved(&solution)
 					val declared = self.program.types.subst(operand.declared, &args)
-					if operand.isArg then
+					if operand.toC &&
+						self.lentToC(operand.expr, declared, operand.context) is .Some(lent) {
+						lent
+					} else if operand.isArg {
 						self.checkArgument(operand.expr, declared, operand.context)
-					else self.checkIn(operand.expr, declared, operand.context)
+					} else {
+						self.checkIn(operand.expr, declared, operand.context)
+					}
 				} else {
 					// A lambda takes its parameters' types from what is expected,
 					// so it is given what is known of the declared type; what is
@@ -799,12 +871,15 @@ extend Lowerer {
 						if operand.isArg then self.inferArgument(operand.expr, hint)
 						else self.infer(operand.expr, hint)
 					// A value with no place of its own is lent where it is used,
-					// so a `&T` parameter is answered by a `T`.
+					// so a `&T` parameter is answered by a `T`; and so is a
+					// reference parameter, which stands for what it refers to,
+					// passed on as the reference it is. A `&var` is written.
 					var declared = operand.declared
 					if operand.isArg &&
 						self.kind(declared) is .Ref(inner, kind: .Shared) &&
 						self.kind(self.tyOf(inferred)) !is .Ref(..) &&
-						self.placeRoot(inferred) == .NotAPlace {
+						(self.placeRoot(inferred) == .NotAPlace ||
+							self.heldReference(inferred).isSome()) {
 						declared = inner
 					}
 					self.unify(declared, self.tyOf(inferred), &var solution)
@@ -817,8 +892,13 @@ extend Lowerer {
 		val args = solved(&solution)
 		for i in unconverted {
 			val declared = self.program.types.subst(operands[i].declared, &args)
-			val .Some(id) = done[i] else {
-				panic("every operand was checked")
+			val .Some(id) = done[i] else panic("every operand was checked")
+			// A reference parameter passed on is the reference it holds.
+			if operands[i].isArg &&
+				self.kind(declared) is .Ref(kind: .Shared, ..) &&
+				self.heldReference(id) is .Some(reference) {
+				done[i] = .Some(self.coerceTo(reference, declared, operands[i].context, true))
+				continue
 			}
 			// Still the argument, though its type was worked out after it was
 			// lowered: a `&` and a `String` need to know.
@@ -845,12 +925,8 @@ extend Lowerer {
 			val param = &generics[i]
 			if param.interfaces.isEmpty() then continue
 			if i >= solution.len() then continue
-			val .Some(ty) = solution[i] else {
-				continue
-			}
-			val .Array(elem, ..) = self.kind(ty) else {
-				continue
-			}
+			val .Some(ty) = solution[i] else continue
+			val .Array(elem, ..) = self.kind(ty) else continue
 			// The same question the constraint check asks, with the arguments
 			// known so far; one that is not known yet asks only whether the
 			// type implements the interface at all.
@@ -966,9 +1042,7 @@ extend Lowerer {
 		span: Span,
 	) = {
 		for i in 0..generics.len() {
-			val .Some(ty) = solution[i] else {
-				continue
-			}
+			val .Some(ty) = solution[i] else continue
 			if self.isPoisoned(ty) then continue
 			for constraint in generics[i].interfaces.clone() {
 				val declared = self.program.types.list(constraint.args).toVec()
@@ -1050,9 +1124,7 @@ extend Lowerer {
 		for _ in 0..count {
 			unknown.push(.None)
 		}
-		val .Some(expected) = expected else {
-			return move unknown
-		}
+		val .Some(expected) = expected else return move unknown
 		val list: TyList = match (def, self.kind(expected)) {
 			(.Struct(a), .Struct(id: b, args)) if a == b => args
 			(.Enum(a), .Enum(id: b, args)) if a == b => args
@@ -1070,9 +1142,7 @@ extend Lowerer {
 	var fn completeTypes(from: i64) = {
 		var diagnostics: Vec<Diagnostic> = Vec()
 		completeTypes(&var self.program, from, self.interner, &var diagnostics)
-		for d in move diagnostics {
-			self.diagnostics.push(move d)
-		}
+		self.diagnostics.append(move diagnostics)
 	}
 }
 
@@ -1096,4 +1166,13 @@ fn requiredTypeArgs(generics: &[GenericParamDef]): i64 = {
 		if generics[i].default == .None then return i + 1
 	}
 	return 0
+}
+
+/// A block's value: its last statement, where that is an expression.
+fn blockValue(file: &ast::Ast, block: &ast::Block): Option<ast::ExprId> = {
+	val .Some(last) = block.stmts.last() else return .None
+	return match file.stmts[last].kind {
+		.Expr(value) => .Some(value)
+		_ => .None
+	}
 }

@@ -1,0 +1,139 @@
+// Rotations as quaternions: an axis and an angle folded into four numbers,
+// composed by `*` and turned smoothly by `slerp`, with no lock at ninety
+// degrees as angles about three axes have. A rotation is a quaternion of
+// length one; `x`, `y`, `z` are the axis times the sine of half the angle,
+// and `w` its cosine.
+
+extern "C" {
+	/// A rotation. Aligned to 16, as a GPU's `vec4` and a SIMD register.
+	@align(16)
+	@derive(Eq, Text)
+	pub struct Quat {
+		pub var x: f32
+		pub var y: f32
+		pub var z: f32
+		pub var w: f32
+	}
+}
+
+extend Quat {
+	/// The rotation that turns nothing.
+	pub static fn identity(): Quat = Quat(x: 0.0, y: 0.0, z: 0.0, w: 1.0)
+
+	/// The rotation by `angle` radians about `axis`, a vector of length one,
+	/// counterclockwise looking down the axis toward the origin.
+	pub static fn axisAngle(axis: Vec3, angle: f32): Quat = {
+		val half = angle * 0.5
+		val sine = half.sin()
+		return Quat(x: axis.x * sine, y: axis.y * sine, z: axis.z * sine, w: half.cos())
+	}
+
+	/// The shortest rotation that turns the direction `from` to `to`, both of
+	/// length one. Turned half a circle, any axis at right angles to both
+	/// will do, and one is chosen.
+	pub static fn fromRotationArc(from: Vec3, to: Vec3): Quat = {
+		val cosine = from.dot(to)
+		if cosine < -0.999999 {
+			val across = Vec3::unitX().cross(from)
+			val axis =
+				if across.lengthSquared() > 0.000001 then across.normalized()
+				else Vec3::unitY().cross(from).normalized()
+			return Quat::axisAngle(axis, PI_F32)
+		}
+		val axis = from.cross(to)
+		return Quat(x: axis.x, y: axis.y, z: axis.z, w: 1.0 + cosine).normalized()
+	}
+
+	/// Its axis times the sine of half its angle.
+	pub fn xyz(): Vec3 = Vec3(x: self.x, y: self.y, z: self.z)
+
+	/// The sum of the products of the two quaternions' numbers: how alike two
+	/// rotations are, near 1 or -1 where they are nearly one.
+	pub fn dot(other: Quat): f32 =
+		self.x * other.x + self.y * other.y + self.z * other.z + self.w * other.w
+
+	/// Its length, 1 for a rotation.
+	pub fn length(): f32 = self.dot(self).sqrt()
+
+	/// It made a rotation again, of length one, where arithmetic has let it
+	/// drift.
+	pub fn normalized(): Quat = {
+		val inverse = 1.0 / self.length()
+		return Quat(
+			x: self.x * inverse,
+			y: self.y * inverse,
+			z: self.z * inverse,
+			w: self.w * inverse,
+		)
+	}
+
+	/// The rotation the other way about the same axis; for a rotation, its
+	/// inverse.
+	pub fn conjugate(): Quat = Quat(x: -self.x, y: -self.y, z: -self.z, w: self.w)
+
+	/// What undoes it: `q * q.inverse()` is the identity. For a rotation it is
+	/// the conjugate, and cheaper so.
+	pub fn inverse(): Quat = {
+		val scale = 1.0 / self.dot(self)
+		return Quat(x: -self.x * scale, y: -self.y * scale, z: -self.z * scale, w: self.w * scale)
+	}
+
+	/// The rotation `t` of the way from it to `to` along the shortest arc,
+	/// turning at a steady rate: itself at 0, `to` at 1.
+	pub fn slerp(to: Quat, t: f32): Quat = {
+		var cosine = self.dot(to)
+		// `q` and `-q` are one rotation; the nearer of the two is the short
+		// way round.
+		var end = to
+		if cosine < 0.0 {
+			end = Quat(x: -to.x, y: -to.y, z: -to.z, w: -to.w)
+			cosine = -cosine
+		}
+		// Nearly one rotation: the arc is a line, and a sine of nearly zero
+		// would divide badly.
+		if cosine > 0.9995 then
+			return Quat(
+				x: self.x + (end.x - self.x) * t,
+				y: self.y + (end.y - self.y) * t,
+				z: self.z + (end.z - self.z) * t,
+				w: self.w + (end.w - self.w) * t,
+			).normalized()
+		val angle = cosine.acos()
+		val sine = angle.sin()
+		val a = ((1.0 - t) * angle).sin() / sine
+		val b = (t * angle).sin() / sine
+		return Quat(
+			x: self.x * a + end.x * b,
+			y: self.y * a + end.y * b,
+			z: self.z * a + end.z * b,
+			w: self.w * a + end.w * b,
+		)
+	}
+
+	/// Whether every number is within `tolerance` of `other`'s. `q` and `-q`
+	/// are one rotation, and not alike here.
+	pub fn approxEquals(other: Quat, tolerance: f32): bool =
+		(self.x - other.x).abs() <= tolerance &&
+		(self.y - other.y).abs() <= tolerance &&
+		(self.z - other.z).abs() <= tolerance &&
+		(self.w - other.w).abs() <= tolerance
+}
+
+/// One rotation after another: `a * b` turns by `b`, then by `a`.
+extend Quat: Multiply {
+	fn multiply(other: &Quat): Quat = Quat(
+		x: self.w * other.x + self.x * other.w + self.y * other.z - self.z * other.y,
+		y: self.w * other.y - self.x * other.z + self.y * other.w + self.z * other.x,
+		z: self.w * other.z + self.x * other.y - self.y * other.x + self.z * other.w,
+		w: self.w * other.w - self.x * other.x - self.y * other.y - self.z * other.z,
+	)
+}
+
+/// A vector turned by the rotation: `q * v`.
+extend Quat: Multiply<Vec3, Vec3> {
+	fn multiply(other: &Vec3): Vec3 = {
+		val axis = self.xyz()
+		val twice = axis.cross(other) * 2.0
+		return other + twice * self.w + axis.cross(twice)
+	}
+}

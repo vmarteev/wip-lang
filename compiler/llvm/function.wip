@@ -8,6 +8,7 @@ import mir::{
 	Layout,
 	Part,
 	AtomicOp,
+	AtomicOrder,
 	Body,
 	CCall,
 	Callee,
@@ -177,9 +178,7 @@ extend FnGen {
 		val body = self.body
 		var variables: Vec<(Local, Source, Option<i64>)> = Vec()
 		for (i, decl) in body.locals.forwards().enumerate() {
-			val .Some(source) = decl.source else {
-				continue
-			}
+			val .Some(source) = decl.source else continue
 			val local = Local::of(i as u32)
 			var param: Option<i64> = .None
 			for (p, candidate) in body.params.forwards().enumerate() {
@@ -202,9 +201,7 @@ extend FnGen {
 			val ty =
 				if source.byAddress && m.kind(decl.ty) is .Ref(inner, ..) then refInner(&m, decl.ty)
 				else decl.ty
-			val .Some(diType) = m.diType(ty) else {
-				continue
-			}
+			val .Some(diType) = m.diType(ty) else continue
 			val (file, line, column) = m.debug.at(source.at)
 			val scope = if param.isSome() {
 				self.subprogram.node
@@ -324,6 +321,23 @@ extend FnGen {
 
 	fn align(m: &var Llvm, ty: Ty): u32 = m.layout(ty).align.max(1)
 
+	/// The alignment a place of type `ty` is read and written with: its
+	/// type's, unless it lies inside a packed struct, where it may be at any
+	/// address, until a reference is followed.
+	fn placeAlign(m: &var Llvm, place: &Place, ty: Ty): u32 = {
+		var container = self.body.local(place.local).ty
+		var packed = false
+		for projection in place.projections {
+			match projection {
+				.Deref => packed = false
+				.Field(..) => if m.layouts.packedAt(m.program, container) then packed = true
+				_ => {}
+			}
+			container = projectTy(m.program, container, projection.clone())
+		}
+		return if packed then 1 else self.align(&var m, ty)
+	}
+
 	/// Where each local lives, and the parameters put there. In a debug build
 	/// this code is at no line, as a C compiler's is, so that a debugger stops
 	/// after it, at the first statement, where every parameter is where it
@@ -400,9 +414,7 @@ extend FnGen {
 			if m.isAggregate(ty) then continue
 			if m.lt(ty).isSome() {
 				// As the signature has it, which a `usize` is a pointer in.
-				val .Param(index) = values[0] else {
-					panic("a parameter")
-				}
+				val .Param(index) = values[0] else panic("a parameter")
 				val given = Val(v: values[0].clone(), t: sig.params[index as i64].t.clone())
 				val slot = self.storage[local.index as i64].clone()
 				self.writeAt(&var m, &given, ty, move slot)
@@ -482,9 +494,7 @@ extend FnGen {
 			self.gep(move addr, offset as i64)
 		}
 		.Index(..) | .ConstIndex(..) => {
-			val .Some(elem) = elementTy(m.program, ty) else {
-				panic("elements")
-			}
+			val .Some(elem) = elementTy(m.program, ty) else panic("elements")
 			val first =
 				if m.kind(ty) is .Array(..) then move addr else self.load(move addr, .Ptr, 8).take()
 			val stride = m.layout(elem).stride() as i64
@@ -514,6 +524,21 @@ extend FnGen {
 	/// value differ only in that — a `bool` compared, a shift's amount. An
 	/// address and a number are never taken for each other here: MIR types an
 	/// address as one, and only a cast converts.
+	/// A float's or a pointer's bits as the integer `bits` is, for an
+	/// instruction that takes integers; an integer as it is.
+	var fn asBits(value: Val, bits: &Type): Val = {
+		if value.t == bits then return move value
+		val cast: Cast = if value.t is .Ptr then .PtrToInt else .Bitcast
+		return self.value(.Cast(cast: cast, value: move value, to: bits.clone()), bits.clone())
+	}
+
+	/// What `asBits` made, as the type `to` again.
+	var fn fromBits(value: Val, to: &Type): Val = {
+		if value.t == to then return move value
+		val cast: Cast = if to is .Ptr then .IntToPtr else .Bitcast
+		return self.value(.Cast(cast: cast, value: move value, to: to.clone()), to.clone())
+	}
+
 	var fn coerce(value: &Val, to: Type): Value = {
 		if value.t == to then return value.v.clone()
 		if value.t is .I(..) && to is .I(bits) then return self.intResize(&value, bits)
@@ -546,9 +571,7 @@ extend FnGen {
 
 	/// An integer to another width: its low bits, or extended with zeros.
 	var fn intResize(value: &Val, bits: u32): Value = {
-		val .I(from) = value.t else {
-			panic("\(value.t.text()) is not an integer")
-		}
+		val .I(from) = value.t else panic("\(value.t.text()) is not an integer")
 		if from == bits then return value.v.clone()
 		val cast: Cast = if from < bits then .ZExt else .Trunc
 		return self.value(.Cast(cast: cast, value: value.clone(), to: .I(bits)), .I(bits)).take()
@@ -559,10 +582,8 @@ extend FnGen {
 		.Const(constant) => self.constant(&var m, &constant)
 		.Copy(place) => {
 			val ty = self.placeTy(&m, &place)
-			val .Some(lt) = m.lt(ty) else {
-				panic("an aggregate operand is passed by address")
-			}
-			val align = self.align(&var m, ty)
+			val .Some(lt) = m.lt(ty) else panic("an aggregate operand is passed by address")
+			val align = self.placeAlign(&var m, &place, ty)
 			val addr = self.placeAddr(&var m, &place)
 			match m.referent(ty) {
 				.Some(layout) => self.loadReference(&var m, move addr, layout)
@@ -591,21 +612,24 @@ extend FnGen {
 		.SizeOf(of, ty) | .AlignOf(of, ty) => {
 			val layout = m.layout(of)
 			val bytes = if constant is .SizeOf(..) then layout.stride() else layout.align
-			val .Some(.I(width)) = m.lt(ty) else {
-				panic("a size is an integer")
-			}
+			val .Some(.I(width)) = m.lt(ty) else panic("a size is an integer")
+			Val::of(.Int(bytes as i64), .I(width))
+		}
+		.OffsetOf(of, index, ty) => {
+			val bytes = m.layouts.fieldOffset(m.program, of, index)
+			val .Some(.I(width)) = m.lt(ty) else panic("an offset is an integer")
 			Val::of(.Int(bytes as i64), .I(width))
 		}
 		.FrameTables => Val::of(.Global(FRAME_TABLES), .Ptr)
 		.RuntimeWords => Val::of(.Global(RUNTIME_WORDS), .Ptr)
+		.ThreadWords => Val::of(.Global(THREAD_WORDS), .Ptr)
+		.DebugBuild => Val::of(.Int(if m.optimize then 0 else 1), .I(8))
 		.DropFn(ty) => Val::of(.Global(m.dropFn(ty, false)), .Ptr)
 	}
 
 	/// Stores a scalar in a local's own slot, as its type.
 	var fn writeAt(m: &var Llvm, value: &Val, ty: Ty, slot: Value) = {
-		val .Some(lt) = m.lt(ty) else {
-			return
-		}
+		val .Some(lt) = m.lt(ty) else return
 		val v = self.coerce(&value, lt.clone())
 		val align = self.align(&var m, ty)
 		val stored = Val(v: move v, t: move lt)
@@ -615,11 +639,9 @@ extend FnGen {
 	/// Stores a scalar in a place, as the place's type.
 	var fn write(m: &var Llvm, place: &Place, value: &Val) = {
 		val ty = self.placeTy(&m, &place)
-		val .Some(lt) = m.lt(ty) else {
-			return
-		}
+		val .Some(lt) = m.lt(ty) else return
 		val v = self.coerce(&value, lt.clone())
-		val align = self.align(&var m, ty)
+		val align = self.placeAlign(&var m, &place, ty)
 		val addr = self.placeAddr(&var m, &place)
 		val stored = Val(v: move v, t: move lt)
 		self.store(&stored, move addr, align)
@@ -693,13 +715,18 @@ extend FnGen {
 		.CheckMoved(place, at) => self.checkMoved(&var m, &place, at)
 		.Call(callee, args, dest) => self.call(&var m, &callee, &args, &dest)
 		.Alloc(dest, ty) => {
-			val size = m.layout(ty).size.max(1)
-			val alloc = m.runtime("wip_alloc")
-			val .Some(ptr) = self.callValues(
-				&var m,
-				alloc,
-				Vec::of(own [Val::of(.Int(size as i64), .I(64))]),
-			) else {
+			val layout = m.layout(ty)
+			val size = layout.size.max(1)
+			// Every allocation is aligned to sixteen bytes; a type aligned
+			// beyond it, `@align(64)`, asks for more.
+			var values = Vec::of(own [Val::of(.Int(size as i64), .I(64))])
+			val alloc = if layout.align > 16 {
+				values.push(Val::of(.Int(layout.align as i64), .I(64)))
+				m.runtime("wip_alloc_aligned")
+			} else {
+				m.runtime("wip_alloc")
+			}
+			val .Some(ptr) = self.callValues(&var m, alloc, move values) else {
 				panic("an allocation's address")
 			}
 			self.write(&var m, &dest, &ptr)
@@ -718,8 +745,15 @@ extend FnGen {
 			val size = self.value(.ExtractValue(aggregate: both.clone(), index: 0), .I(64))
 			val over = self.value(.ExtractValue(aggregate: move both, index: 1), .I(1))
 			self.trapIf(&var m, move over.v)
-			val alloc = m.runtime("wip_alloc")
-			val .Some(ptr) = self.callValues(&var m, alloc, Vec::of(own [move size])) else {
+			val elemAlign = m.layout(elem).align
+			var values = Vec::of(own [move size])
+			val alloc = if elemAlign > 16 {
+				values.push(Val::of(.Int(elemAlign as i64), .I(64)))
+				m.runtime("wip_alloc_aligned")
+			} else {
+				m.runtime("wip_alloc")
+			}
+			val .Some(ptr) = self.callValues(&var m, alloc, move values) else {
 				panic("an allocation's address")
 			}
 			val addr = self.placeAddr(&var m, &dest)
@@ -773,24 +807,31 @@ extend FnGen {
 			)
 			self.write(&var m, &dest, &answer)
 		}
-		.Atomic(op, ty, address, value, expected, dest) => {
+		.Atomic(op, order, ty, address, value, expected, dest) => {
 			val given = self.operand(&var m, &address)
 			val at = self.coerce(&given, .Ptr)
-			val .Some(lt) = m.lt(ty) else {
-				panic("an atomic's value is a scalar")
-			}
+			val .Some(lt) = m.lt(ty) else panic("an atomic's value is a scalar")
 			val align = self.align(&var m, ty)
+			val ordering = orderingOf(&order)
+			// An exchange and a compare-and-swap are written on integers, which
+			// every LLVM Wip builds with takes: a float or a pointer goes as the
+			// integer of its bits, and comes back.
+			val bits: Type = match lt {
+				.F32 => .I(32)
+				.F64 | .Ptr => .I(64)
+				other => other.clone()
+			}
 			val answer: Option<Val> = match op {
-				.Add | .Subtract | .Swap => {
-					val .Some(operand) = value else {
-						panic("an atomic's value")
-					}
+				.Add | .Subtract => {
+					val .Some(operand) = value else panic("an atomic's value")
 					val read = self.operand(&var m, &operand)
 					val amount = self.coerce(&read, lt.clone())
+					val floats = lt is .F32 | .F64
 					val rmw: Rmw = match op {
+						.Add if floats => .FAdd
 						.Add => .Add
-						.Subtract => .Sub
-						_ => .Xchg
+						_ if floats => .FSub
+						_ => .Sub
 					}
 					.Some(
 						self.value(
@@ -799,55 +840,72 @@ extend FnGen {
 								address: move at,
 								value: Val::of(move amount, lt.clone()),
 								align: align,
+								order: ordering,
 							),
 							lt.clone(),
 						),
 					)
 				}
+				.Swap => {
+					val .Some(operand) = value else panic("an atomic's value")
+					val read = self.operand(&var m, &operand)
+					val stored = self.coerce(&read, lt.clone())
+					val swapped = self.value(
+						.AtomicRmw(
+							op: .Xchg,
+							address: move at,
+							value: self.asBits(Val::of(move stored, lt.clone()), &bits),
+							align: align,
+							order: ordering,
+						),
+						bits.clone(),
+					)
+					.Some(self.fromBits(move swapped, &lt))
+				}
+				// It answers whether it swapped, the flag LLVM gives: the bits
+				// held were the bits expected, which for a float is not `==`.
 				.CompareSwap => {
-					val .Some(expect) = expected else {
-						panic("an expected value")
-					}
+					val .Some(expect) = expected else panic("an expected value")
 					val read = self.operand(&var m, &expect)
 					val wanted = self.coerce(&read, lt.clone())
-					val .Some(operand) = value else {
-						panic("an atomic's value")
-					}
+					val .Some(operand) = value else panic("an atomic's value")
 					val given = self.operand(&var m, &operand)
 					val stored = self.coerce(&given, lt.clone())
 					val both = self.value(
 						.CmpXchg(own CmpXchg(
 							address: move at,
-							expected: Val::of(move wanted, lt.clone()),
-							replacement: Val::of(move stored, lt.clone()),
+							expected: self.asBits(Val::of(move wanted, lt.clone()), &bits),
+							replacement: self.asBits(Val::of(move stored, lt.clone()), &bits),
 							align: align,
+							order: ordering,
 						)),
-						withFlag(lt.clone()),
+						withFlag(bits.clone()),
 					)
-					.Some(self.value(.ExtractValue(aggregate: move both, index: 0), lt.clone()))
+					.Some(self.value(.ExtractValue(aggregate: move both, index: 1), .I(1)))
 				}
 				.Load => .Some(
 					self.value(
-						.LoadAtomic(t: lt.clone(), address: move at, align: align),
+						.LoadAtomic(t: lt.clone(), address: move at, align: align, order: ordering),
 						lt.clone(),
 					),
 				)
 				.Store => {
-					val .Some(operand) = value else {
-						panic("a store has a value")
-					}
+					val .Some(operand) = value else panic("a store has a value")
 					val given = self.operand(&var m, &operand)
 					val stored = self.coerce(&given, lt.clone())
 					self.emit(.StoreAtomic(
 						value: Val::of(move stored, lt.clone()),
 						address: move at,
 						align: align,
+						order: ordering,
 					))
 					Option::None
 				}
 			}
 			if dest is .Some(d) && answer is .Some(a) then self.write(&var m, &d, &a)
 		}
+		// A relaxed fence orders nothing, and LLVM has no such instruction.
+		.Fence(order) => if order != .Relaxed then self.emit(.Fence(orderingOf(&order)))
 		.Check(fails, kind, at) => {
 			val failing = self.operand(&var m, &fails)
 			self.check(&var m, &failing, .Check(kind: kind.clone(), at: at))
@@ -906,6 +964,7 @@ extend FnGen {
 					("wip_panic_length", Vec::of(own [move n]))
 				}
 				.Division => ("wip_panic_division", Vec())
+				.NullText => ("wip_panic_null_text", Vec())
 				.Overflow(op) => (
 					"wip_panic_overflow",
 					Vec::of(own [Val::of(.Int(overflowCode(op) as i64), .I(64))]),
@@ -1022,9 +1081,7 @@ extend FnGen {
 	var fn assign(m: &var Llvm, place: &Place, rvalue: &Rvalue) = {
 		val ty = self.placeTy(&m, &place)
 		if m.isAggregate(ty) {
-			val .Use(.Copy(src)) = rvalue else {
-				panic("an aggregate is assigned by copying a place")
-			}
+			val .Use(.Copy(src)) = rvalue else panic("an aggregate is assigned by copying a place")
 			val size = m.layout(ty).size
 			val dest = self.placeAddr(&var m, &place)
 			val from = self.placeAddr(&var m, &src)
@@ -1179,9 +1236,7 @@ extend FnGen {
 		}
 		.Bits(operand) => {
 			val value = self.operand(&var m, &operand)
-			val .Some(target) = m.lt(ty) else {
-				panic("bits are a scalar's")
-			}
+			val .Some(target) = m.lt(ty) else panic("bits are a scalar's")
 			self.value(.Cast(cast: .Bitcast, value: move value, to: target.clone()), move target)
 		}
 		.CstrLen(operand) => {
@@ -1253,9 +1308,7 @@ extend FnGen {
 			)
 			return self.value(.Cast(cast: .ZExt, value: move answer, to: .I(8)), .I(8))
 		}
-		val .I(bits) = t else {
-			panic("arithmetic on \(t.text())")
-		}
+		val .I(bits) = t else panic("arithmetic on \(t.text())")
 		// MIR checks the most negative number divided by -1 only to 64 bits;
 		// past them the program aborts here, where LLVM's `sdiv` and `srem`
 		// would be undefined.
@@ -1314,9 +1367,7 @@ extend FnGen {
 	/// `operand as to`.
 	var fn cast(m: &var Llvm, operand: &Operand, to: Ty): Val = {
 		val from = asNumber(m.kind(self.operandTy(&m, &operand)))
-		val .Some(target) = m.lt(to) else {
-			panic("casts are between scalar types")
-		}
+		val .Some(target) = m.lt(to) else panic("casts are between scalar types")
 		val value = self.operand(&var m, &operand)
 		val toKind = asNumber(m.kind(to))
 		if from is .Int(int: a) && toKind is .Int(int: b) {
@@ -1381,9 +1432,7 @@ extend FnGen {
 			if def.accesses is .Some(.Global(id: global)) && !m.shimmed.contains(&id) {
 				val symbol = Value::Global(m.cGlobal(global))
 				val ty = program.globals[global].ty
-				val .Some(lt) = m.lt(ty) else {
-					panic("C's variable is a scalar")
-				}
+				val .Some(lt) = m.lt(ty) else panic("C's variable is a scalar")
 				val align = self.align(&var m, ty)
 				if args.len() == 1 {
 					val given = self.operand(&var m, &args[0])
@@ -1392,9 +1441,7 @@ extend FnGen {
 					self.store(&stored, move symbol, align)
 				} else {
 					val value = self.load(move symbol, move lt, align)
-					val .Some(d) = dest else {
-						panic("a read has a destination")
-					}
+					val .Some(d) = dest else panic("a read has a destination")
 					self.write(&var m, &d, &value)
 				}
 				return
@@ -1446,17 +1493,13 @@ extend FnGen {
 		}
 		var values: Vec<Val> = Vec()
 		if sig.sret {
-			val .Some(d) = dest else {
-				panic("an aggregate result has a destination")
-			}
+			val .Some(d) = dest else panic("an aggregate result has a destination")
 			values.push(Val(v: self.placeAddr(&var m, &d), t: .Ptr))
 		}
 		for arg in args {
 			val ty = self.operandTy(&m, &arg)
 			if cAbi && m.isCPair(ty) {
-				val .Copy(place) = arg else {
-					panic("a pointer-and-length operand is a place")
-				}
+				val .Copy(place) = arg else panic("a pointer-and-length operand is a place")
 				val addr = self.placeAddr(&var m, &place)
 				val pointer = self.load(addr.clone(), .Ptr, 8)
 				val at = self.gep(move addr, 8)
@@ -1464,9 +1507,7 @@ extend FnGen {
 				values.push(move pointer)
 				values.push(move length)
 			} else if m.isAggregate(ty) {
-				val .Copy(place) = arg else {
-					panic("an aggregate operand is a place")
-				}
+				val .Copy(place) = arg else panic("an aggregate operand is a place")
 				values.push(Val(v: self.placeAddr(&var m, &place), t: .Ptr))
 			} else if m.lt(ty) == .None {
 				// A value with no size, `void`, which a generic function takes
@@ -1503,9 +1544,7 @@ extend FnGen {
 		val defRet = m.program.fns[id].ret
 		var values: Vec<Val> = Vec()
 		if cCall.ret == Answer::Hidden {
-			val .Some(d) = dest else {
-				panic("an aggregate result has a destination")
-			}
+			val .Some(d) = dest else panic("an aggregate result has a destination")
 			values.push(Val(v: self.placeAddr(&var m, &d), t: .Ptr))
 		}
 		for (i, pass) in cCall.params.forwards().enumerate() {
@@ -1592,9 +1631,7 @@ extend FnGen {
 					val at = self.gep(scratch.clone(), part.offset as i64)
 					self.store(&piece, move at, 1)
 				}
-				val .Some(d) = dest else {
-					panic("an aggregate result has a destination")
-				}
+				val .Some(d) = dest else panic("an aggregate result has a destination")
 				val to = self.placeAddr(&var m, &d)
 				val size = m.layout(defRet).size
 				self.memmove(&var m, move to, move scratch, size)
@@ -1642,9 +1679,7 @@ extend FnGen {
 			val arg = &args[i]
 			val ty = self.operandTy(&m, &arg)
 			if m.isCPair(ty) {
-				val .Copy(place) = arg else {
-					panic("a pointer-and-length operand is a place")
-				}
+				val .Copy(place) = arg else panic("a pointer-and-length operand is a place")
 				val addr = self.placeAddr(&var m, &place)
 				val pointer = self.load(addr.clone(), .Ptr, 8)
 				val at = self.gep(move addr, 8)
@@ -1780,9 +1815,7 @@ extend FnGen {
 				val ty = body.local(ret).ty
 				val read = Operand::Copy(Place::of(ret))
 				val value = self.operand(&var m, &read)
-				val .Some(slot) = m.slot(ty) else {
-					panic("a scalar result")
-				}
+				val .Some(slot) = m.slot(ty) else panic("a scalar result")
 				val v = self.coerce(&value, slot.t.clone())
 				self.emit(.Ret(.Some(Val::of(move v, slot.t.clone()))))
 			} else {
@@ -1807,9 +1840,7 @@ extend FnGen {
 					val atLength = self.gep(move addr, 8)
 					val length = self.load(move atLength, .I(64), 8)
 					var numbers = Vec::of(own [move pointer, move length])
-					for v in move said {
-						numbers.push(move v)
-					}
+					numbers.append(move said)
 					self.panicCall(&var m, "wip_panic_noted", move numbers, at)
 				}
 				.Some(.Const(..)) => panic("a note is a place")
@@ -1853,6 +1884,15 @@ fn signed(bits: u128, width: u32): i128 = {
 /// The struct an intrinsic answers a value of type `t` in, with a flag: an
 /// overflow's, or a compare-and-swap's.
 fn withFlag(t: Type): Type = structOf(Vec::of(own [move t, Type::I(1)]), false)
+
+/// An order of the MIR's as LLVM names it.
+fn orderingOf(order: &AtomicOrder): AtomicOrdering = match order {
+	.Relaxed => .Monotonic
+	.Acquire => .Acquire
+	.Release => .Release
+	.AcqRel => .AcqRel
+	.SeqCst => .SeqCst
+}
 
 /// A float's LLVM type and the suffix its intrinsics take.
 fn floatNames(t: Type): (str, str) = if t is .F32 then ("float", "f32") else ("double", "f64")

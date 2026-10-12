@@ -43,6 +43,17 @@ fn wipAloneCompilesNoC(gate: &Gate, root: str): Option<String> = {
 	return .None
 }
 
+/// `-o` into a directory that is not there yet makes it, as a fresh
+/// checkout's `target` is not.
+fn outputDirectoryMade(gate: &Gate, root: str): Option<String> = {
+	write(root, "main.wip", "import std::io\n\nfn main() = io::println(\"made\")\n")
+	val built = run(gate.command(root, ["build", "main.wip", "-o", "target/deeper/made"]))
+	if !built.exit.success() then return wrong("`wip build main.wip -o target/deeper/made`", &built)
+	val ran = run(Command::of(path::join(root, "target/deeper/made")))
+	if ran.stdout != "made\n" then return wrong("the program built", &ran)
+	return .None
+}
+
 /// A debug build compiles a module's C unoptimised and with debug
 /// information, and a release build optimised; `--release` is taken by
 /// `build`, `run` and `test`, and the program does the same built either
@@ -259,12 +270,8 @@ fn builtForProcessor(gate: &Gate, root: str): Option<String> = {
 /// `features`, as Linux names them; where that cannot be asked, not.
 fn x86Has(features: &[str]): bool = {
 	if TARGET_ARCH != "x86_64" then return false
-	val .Ok(info) = fs::readFile("/proc/cpuinfo") else {
-		return false
-	}
-	val .Some(flags) = info.lines().find((line) => line.startsWith("flags")) else {
-		return false
-	}
+	val .Ok(info) = fs::readFile("/proc/cpuinfo") else return false
+	val .Some(flags) = info.lines().find((line) => line.startsWith("flags")) else return false
 	val had: Vec<str> = flags.split(" ").toVec()
 	for feature in features {
 		if !had.contains(&feature) then return false
@@ -305,6 +312,109 @@ fn objectiveC(gate: &Gate, root: str): Option<String> = {
 	val cache = path::join(root, "cache")
 	val ran = run(gate.command(root, ["run", "main.wip"]).env("WIP_CACHE_DIR", cache))
 	if ran.stdout != "true\n" then return wrong("`wip run main.wip`", &ran)
+	return .None
+}
+
+/// A module's C++ is built as its C is: a `.cpp` file beside it compiled
+/// as C++17, its static constructors run before `main` and its exceptions
+/// kept inside, and a header `@source` names compiled to the standard it
+/// says; the C++ library linked where C++ was compiled, and not where none
+/// was; a second build compiling nothing.
+fn cPlusPlus(gate: &Gate, root: str): Option<String> = {
+	write(
+		root,
+		"main.wip",
+		"import std::io\nimport sums\nimport single\n\nfn main() = io::println(\"\\(sums::sums_total(100)) \\(sums::sums_started()) \\(sums::sums_caught()) \\(single::twice(21))\")\n",
+	)
+	write(
+		root,
+		"sums/sums.wip",
+		"extern \"C\" {\n    pub fn sums_total(n: i64): i64\n    pub fn sums_started(): i64\n    pub fn sums_caught(): i32\n}\n",
+	)
+	write(
+		root,
+		"sums/sums.cpp",
+		"#include <numeric>\n#include <stdexcept>\n#include <vector>\n\nstatic std::vector<long> made;\nstatic struct Start { Start() { made.push_back(7); } } start;\n\nextern \"C\" long sums_total(long n) {\n    std::vector<long> v(n);\n    std::iota(v.begin(), v.end(), 1);\n    return std::accumulate(v.begin(), v.end(), 0L);\n}\n\nextern \"C\" long sums_started(void) { return made.empty() ? 0 : made[0]; }\n\nextern \"C\" int sums_caught(void) {\n    try { throw std::runtime_error(\"inside\"); } catch (const std::exception &) { return 1; }\n    return 0;\n}\n",
+	)
+	write(
+		root,
+		"single/single.wip",
+		"@source(\"twice.h\", language = \"c++\", standard = \"c++20\")\n@define(\"TWICE_IMPL\")\nextern \"C\" {\n    pub fn twice(x: i64): i64\n}\n",
+	)
+	write(
+		root,
+		"single/twice.h",
+		"#ifdef __cplusplus\nextern \"C\" {\n#endif\nlong twice(long x);\n#ifdef __cplusplus\n}\n#endif\n#ifdef TWICE_IMPL\n#if __cplusplus < 202002L\n#error \"needs C++20\"\n#endif\n#include <array>\nextern \"C\" long twice(long x) { std::array<long, 1> a{x}; return a[0] * 2; }\n#endif\n",
+	)
+	val cc = recordingCompiler(root)
+	val cache = path::join(root, "cache")
+	val ran = run(
+		gate.command(root, ["run", "main.wip"]).
+			env("CC", cc).
+			env("WIP_CACHE_DIR", cache).
+			env("WIP_CHECK_LEAKS", "1"),
+	)
+	if !ran.exit.success() || ran.stdout != "5050 7 1 42\n" then
+		return wrong("`wip run main.wip`, with C++", &ran)
+	val calls = linesOf(read(root, "calls.txt"))
+	var cpp = false
+	var header = false
+	var linked = false
+	for call in calls {
+		if call.contains("sums.cpp") && call.contains("-x c++") && call.contains("-std=c++17") then
+			cpp = true
+		if call.contains("twice.h") && call.contains("-x c++") && call.contains("-std=c++20") then
+			header = true
+		if call.startsWith("-o ") then
+			linked = call.contains(if TARGET_VENDOR == "apple" then "-lc++" else "-lstdc++")
+	}
+	if !cpp || !header || !linked then
+		return .Some("the C++ was not compiled or linked as said: \(calls.join(" | "))")
+	// Again: the objects are kept, and nothing is compiled; the compiler is
+	// asked who it is, for the cache's key, and links.
+	fs::removeFile(path::join(root, "calls.txt"))
+	val again = run(
+		gate.command(root, ["run", "main.wip"]).env("CC", cc).env("WIP_CACHE_DIR", cache),
+	)
+	if again.stdout != "5050 7 1 42\n" then return wrong("`wip run main.wip`, again", &again)
+	for call in linesOf(read(root, "calls.txt")) {
+		if call.startsWith("-c ") then return .Some("the C++ was compiled again: \(call)")
+	}
+	// A program with no C++ links no C++ library.
+	val plainDir = path::join(root, "plain")
+	write(plainDir, "main.wip", "fn main() = {}\n")
+	fs::removeFile(path::join(root, "calls.txt"))
+	val plain = run(
+		gate.command(plainDir, ["run", "main.wip"]).env("CC", cc).env("WIP_CACHE_DIR", cache),
+	)
+	if !plain.exit.success() then return wrong("`wip run main.wip`, with no C++", &plain)
+	val third = read(root, "calls.txt")
+	if third.contains("-lc++") || third.contains("-lstdc++") then
+		return .Some("a program with no C++ linked the C++ library: \(third)")
+	return .None
+}
+
+/// A module's `.mm` file is compiled as Objective-C++ on a Mac.
+fn objectiveCPlusPlus(gate: &Gate, root: str): Option<String> = {
+	if TARGET_VENDOR != "apple" then return .None
+	write(
+		root,
+		"main.wip",
+		"import std::io\nimport glue\n\nfn main() = io::println(\"\\(glue::glue_length())\")\n",
+	)
+	write(
+		root,
+		"glue/glue.wip",
+		"@framework(\"Foundation\")\nextern \"C\" {\n    pub fn glue_length(): i64\n}\n",
+	)
+	write(
+		root,
+		"glue/glue.mm",
+		"#import <Foundation/Foundation.h>\n#include <string>\n\nextern \"C\" long glue_length(void) {\n    std::string s = \"objective\";\n    NSString *n = [NSString stringWithUTF8String:s.c_str()];\n    return (long)[n length] + (long)s.size();\n}\n",
+	)
+	val cache = path::join(root, "cache")
+	val ran = run(gate.command(root, ["run", "main.wip"]).env("WIP_CACHE_DIR", cache))
+	if ran.stdout != "18\n" then return wrong("`wip run main.wip`, with Objective-C++", &ran)
 	return .None
 }
 

@@ -10,6 +10,7 @@
 import std::collections::{Map, Set}
 import std::future::{Future, Receiver, channel}
 import std::io
+import std::json
 import std::json::{Json}
 import std::libc
 import hir::{Program}
@@ -74,62 +75,12 @@ extend Server {
 	var fn handle(message: Json): Option<i64> = {
 		val method = textAt(&message, ["method"])
 		val params = fieldAt(&message, ["params"])
-		val .Some(id) = message.get("id") else {
-			return self.notified(method, &params)
-		}
+		val .Some(id) = message.get("id") else return self.notified(method, &params)
 		// A response to a request of ours; the server makes none.
 		if method.isEmpty() then return .None
 		// A request is answered from what the editor has sent so far.
 		if self.dirty then self.recheck()
-		val answer: Result<Json, (i64, String)> = match method.toStr() {
-			"initialize" => .Ok(capabilities())
-			"shutdown" => {
-				self.shutDown = true
-				.Ok(.Null)
-			}
-			"textDocument/formatting" => .Ok(
-				match self.document(&params) {
-					.Some(at) => formatted(&self.documents[at])
-					.None => .Null
-				},
-			)
-			"textDocument/documentSymbol" => .Ok(
-				match self.document(&params) {
-					.Some(at) => symbols(&self.documents[at])
-					.None => .Null
-				},
-			)
-			"textDocument/codeAction" => .Ok(self.codeActions(&params))
-			"textDocument/hover" => .Ok(self.atPosition(&params, .Hover))
-			"textDocument/completion" => .Ok(self.complete(&params))
-			"textDocument/signatureHelp" => .Ok(self.signature(&params))
-			"textDocument/references" => {
-				val declaration = match fieldAt(&params, ["context", "includeDeclaration"]) {
-					.Bool(value) => value
-					_ => true
-				}
-				.Ok(self.atPosition(&params, .References(declaration)))
-			}
-			"textDocument/rename" => {
-				val new = textAt(&params, ["newName"])
-				match self.document(&params) {
-					.Some(at) => match rename(
-						&self.programs,
-						&self.documents,
-						&self.documents[at],
-						fieldAt(&params, ["position"]),
-						new,
-					) {
-						.Ok(edit) => .Ok(move edit)
-						.Err(why) => .Err((-32803, move why))
-					}
-					.None => .Ok(.Null)
-				}
-			}
-			"textDocument/definition" => .Ok(self.atPosition(&params, .Definition))
-			_ => .Err((-32601, "`wip lsp` does not answer `\(method)`"))
-		}
-		val response = match move answer {
+		val response = match self.answer(method, &params) {
 			.Ok(result) => object([
 				("jsonrpc", jsonText("2.0")),
 				("id", id.clone()),
@@ -145,20 +96,89 @@ extend Server {
 		return .None
 	}
 
-	var fn notified(method: str, params: &Json): Option<i64> = {
-		val uri = textAt(&params, ["textDocument", "uri"])
-		match method {
-			"exit" => return .Some(if self.shutDown then 0 else 1)
-			"textDocument/didOpen" => self.opened(uri, textAt(&params, ["textDocument", "text"]))
-			"textDocument/didChange" => {
-				// The whole text, as `initialize` asked for.
-				if fieldAt(&params, ["contentChanges"]) is .Array(changes) &&
-					!changes.isEmpty() &&
-					changes[changes.len() - 1].get("text") is .Some(.Text(text)) {
-					self.opened(uri, text.clone())
+	/// The result of a request, or the code and the words of its error.
+	var fn answer(method: str, params: &Json): Result<Json, (i64, String)> = {
+		val result: Json = match method {
+			"initialize" => json::toJson(capabilities())
+			"shutdown" => {
+				self.shutDown = true
+				Json::Null
+			}
+			"textDocument/formatting" => {
+				val asked = paramsOf<DocumentParams>(&params)?
+				match self.document(asked.textDocument.uri) {
+					.Some(at) => json::toJson(formatted(&self.documents[at]))
+					.None => .Null
 				}
 			}
+			"textDocument/documentSymbol" => {
+				val asked = paramsOf<DocumentParams>(&params)?
+				match self.document(asked.textDocument.uri) {
+					.Some(at) => json::toJson(symbols(&self.documents[at]))
+					.None => .Null
+				}
+			}
+			"textDocument/codeAction" => json::toJson(
+				self.codeActions(paramsOf<CodeActionParams>(&params)?),
+			)
+			"textDocument/hover" => {
+				val asked = paramsOf<PositionParams>(&params)?
+				self.atPosition(asked.textDocument.uri, &asked.position, .Hover)
+			}
+			"textDocument/inlayHint" => json::toJson(self.hints(paramsOf<DocumentParams>(&params)?))
+			"textDocument/completion" => json::toJson(
+				self.complete(paramsOf<PositionParams>(&params)?),
+			)
+			"textDocument/signatureHelp" => json::toJson(
+				self.signature(paramsOf<PositionParams>(&params)?),
+			)
+			"textDocument/references" => {
+				val asked = paramsOf<ReferenceParams>(&params)?
+				val declaration = match asked.context {
+					.Some(context) => context.includeDeclaration
+					.None => true
+				}
+				self.atPosition(asked.textDocument.uri, &asked.position, .References(declaration))
+			}
+			"textDocument/rename" => {
+				val asked = paramsOf<RenameParams>(&params)?
+				val .Some(at) = self.document(asked.textDocument.uri) else return .Ok(.Null)
+				match rename(
+					&self.programs,
+					&self.documents,
+					&self.documents[at],
+					&asked.position,
+					asked.newName,
+				) {
+					.Ok(edit) => json::toJson(&edit)
+					.Err(why) => return .Err((-32803, move why))
+				}
+			}
+			"textDocument/definition" => {
+				val asked = paramsOf<PositionParams>(&params)?
+				self.atPosition(asked.textDocument.uri, &asked.position, .Definition)
+			}
+			_ => return .Err((-32601, "`wip lsp` does not answer `\(method)`"))
+		}
+		return .Ok(move result)
+	}
+
+	var fn notified(method: str, params: &Json): Option<i64> = {
+		match method {
+			"exit" => return .Some(if self.shutDown then 0 else 1)
+			"textDocument/didOpen" => {
+				val .Ok(given) = json::fromJson<DidOpen>(params.clone()) else return .None
+				self.opened(given.textDocument.uri, given.textDocument.text.clone())
+			}
+			"textDocument/didChange" => {
+				// The whole text, as `initialize` asked for.
+				val .Ok(given) = json::fromJson<DidChange>(params.clone()) else return .None
+				if given.contentChanges.last() is .Some(change) then
+					self.opened(given.textDocument.uri, change.text.clone())
+			}
 			"textDocument/didClose" => {
+				val .Ok(given) = json::fromJson<DocumentParams>(params.clone()) else return .None
+				val uri = &given.textDocument.uri
 				var i = 0
 				while i < self.documents.len() {
 					if self.documents[i].uri == uri {
@@ -182,9 +202,7 @@ extend Server {
 	}
 
 	var fn opened(uri: str, text: String) = {
-		val .Some(path) = pathOf(uri) else {
-			return
-		}
+		val .Some(path) = pathOf(uri) else return
 		self.overlay.set(path, text.clone())
 		for document in self.documents {
 			if document.uri == uri {
@@ -197,9 +215,8 @@ extend Server {
 		self.dirty = true
 	}
 
-	/// Where among the open files is the document a request names.
-	fn document(params: &Json): Option<i64> = {
-		val uri = textAt(&params, ["textDocument", "uri"])
+	/// Where among the open files is the document `uri` names.
+	fn document(uri: str): Option<i64> = {
 		for (at, document) in self.documents.forwards().enumerate() {
 			if document.uri == uri then return .Some(at)
 		}
@@ -208,14 +225,9 @@ extend Server {
 
 	/// What could be written at the position a request names: the program is
 	/// checked with a placeholder written there, so that it parses.
-	var fn complete(params: &Json): Json = {
-		val empty = object([("isIncomplete", Json::Bool(false)), ("items", Json::Array(Vec()))])
-		val .Some((at, cursor)) = self.requestAt(&params) else {
-			return move empty
-		}
-		val .Some(patched) = self.patched(at, cursor, "") else {
-			return move empty
-		}
+	var fn complete(asked: &PositionParams): CompletionList = {
+		val .Some((at, cursor)) = self.requestAt(&asked) else return CompletionList(items: Vec())
+		val .Some(patched) = self.patched(at, cursor, "") else return CompletionList(items: Vec())
 		return completionItems(
 			&patched.loaded,
 			&patched.program,
@@ -227,13 +239,9 @@ extend Server {
 
 	/// The signature of the call the cursor is in the arguments of, and which
 	/// argument it is at.
-	var fn signature(params: &Json): Json = {
-		val .Some((at, cursor)) = self.requestAt(&params) else {
-			return .Null
-		}
-		val .Some(call) = callAt(self.documents[at].text, cursor) else {
-			return .Null
-		}
+	var fn signature(asked: &PositionParams): Option<SignatureHelp> = {
+		val (at, cursor) = self.requestAt(&asked)?
+		val call = callAt(self.documents[at].text, cursor)?
 		// The call may not be closed yet: then it is closed after the
 		// placeholder.
 		for close in ["", ")"] {
@@ -241,20 +249,20 @@ extend Server {
 				if signatureHelp(&patched.loaded, &patched.program, patched.base, &call) is .Some(
 					help,
 				) {
-					return move help
+					return .Some(move help)
 				}
 			}
 		}
-		return .Null
+		return .None
 	}
 
 	/// The open file a request names, and the byte offset of the position it
 	/// names; nothing for a file of the standard library.
-	fn requestAt(params: &Json): Option<(i64, i64)> = {
-		val at = self.document(&params)?
+	fn requestAt(asked: &PositionParams): Option<(i64, i64)> = {
+		val at = self.document(asked.textDocument.uri)?
 		val document = &self.documents[at]
 		if inStd(document.path) then return .None
-		val cursor = Lines::of(document.text).offset(fieldAt(&params, ["position"]))
+		val cursor = Lines::of(document.text).offset(&asked.position)
 		return .Some((at, cursor))
 	}
 
@@ -280,31 +288,30 @@ extend Server {
 			if base.isNone() && name.startsWith("/") && canonicalFile(name) == file then
 				base = .Some(start)
 		}
-		val .Some(start) = base else {
-			return .None
-		}
+		val .Some(start) = base else return .None
 		return .Some(Patched(loaded: move loaded, program: move checked.program, base: start))
 	}
 
 	/// Answers a request at a position, from the programs that hold the
-	/// document it names.
-	fn atPosition(params: &Json, asked: PositionRequest): Json = {
-		val .Some(at) = self.document(&params) else {
-			return .Null
-		}
+	/// document `uri` names.
+	fn atPosition(uri: str, position: &Position, asked: PositionRequest): Json = {
+		val .Some(at) = self.document(uri) else return .Null
 		val file = &self.documents[at]
-		val position = fieldAt(&params, ["position"])
 		return match asked {
-			.Hover => hover(&self.programs, &self.documents, &file, &position)
-			.Definition => definition(&self.programs, &self.documents, &file, &position)
-			.References(declaration) => references(
-				&self.programs,
-				&self.documents,
-				&file,
-				&position,
-				declaration,
+			.Hover => json::toJson(hover(&self.programs, &self.documents, &file, &position))
+			.Definition => json::toJson(
+				definition(&self.programs, &self.documents, &file, &position),
+			)
+			.References(declaration) => json::toJson(
+				references(&self.programs, &self.documents, &file, &position, declaration),
 			)
 		}
+	}
+
+	/// The implicits the calls in the file a request names were given.
+	fn hints(asked: &DocumentParams): Vec<InlayHint> = {
+		val .Some(at) = self.document(asked.textDocument.uri) else return Vec()
+		return inlayHints(&self.programs, &self.documents[at])
 	}
 
 	/// Checks every program an open file belongs to, and shows what is wrong
@@ -314,10 +321,8 @@ extend Server {
 		val found = diagnosticsOf(&self.documents, &self.overlay, &var self.roots, self.threads)
 		for at in 0..found.diagnostics.len() {
 			val uri = String::of(found.diagnostics.keyAt(at))
-			val .Some(shown) = found.diagnostics.get(&uri) else {
-				continue
-			}
-			publish(uri, .Array(shown.clone()))
+			val .Some(shown) = found.diagnostics.get(&uri) else continue
+			publish(uri, shown.clone())
 		}
 		// An open file with nothing wrong is told so, and one that had
 		// something wrong is cleared.
@@ -329,7 +334,7 @@ extend Server {
 			cleared.add(document.uri.clone())
 		}
 		for uri in cleared {
-			if !found.diagnostics.contains(&uri) then publish(uri, .Array(Vec()))
+			if !found.diagnostics.contains(&uri) then publish(uri, Vec())
 		}
 		var published: Vec<String> = Vec()
 		for at in 0..found.diagnostics.len() {
@@ -341,30 +346,21 @@ extend Server {
 	}
 
 	/// The fixes of the diagnostics in the range asked about.
-	fn codeActions(params: &Json): Json = {
-		val uri = textAt(&params, ["textDocument", "uri"])
-		val .Some(fixes) = self.fixes.get(&uri) else {
-			return .Array(Vec())
-		}
-		val start = fieldAt(&params, ["range", "start"])
-		val end = fieldAt(&params, ["range", "end"])
-		var actions: Vec<Json> = Vec()
+	fn codeActions(asked: &CodeActionParams): Vec<CodeAction> = {
+		val .Some(fixes) = self.fixes.get(&asked.textDocument.uri) else return Vec()
+		val range = &asked.range
+		var actions: Vec<CodeAction> = Vec()
 		for fix in fixes {
-			if !before(fieldAt(&fix.diagnostic, ["range", "start"]), &end) ||
-				!before(&start, fieldAt(&fix.diagnostic, ["range", "end"])) {
+			val shown = &fix.diagnostic.range
+			if !shown.start.atOrBefore(&range.end) || !range.start.atOrBefore(&shown.end) then
 				continue
-			}
-			actions.push(
-				object([
-					("title", jsonText(fix.title)),
-					("kind", jsonText("quickfix")),
-					("diagnostics", .Array(Vec::of(own [fix.diagnostic.clone()]))),
-					("isPreferred", .Bool(true)),
-					("edit", object([("changes", fix.changes.clone())])),
-				]),
-			)
+			actions.push(CodeAction(
+				title: fix.title.clone(),
+				diagnostics: Vec::of(own [fix.diagnostic.clone()]),
+				edit: fix.edit.clone(),
+			))
 		}
-		return .Array(move actions)
+		return move actions
 	}
 }
 
@@ -375,67 +371,42 @@ enum PositionRequest {
 	References(declaration: bool)
 }
 
-/// Whether one position is at or before another.
-fn before(a: &Json, b: &Json): bool = {
-	val (aLine, aCharacter) = (positionPart(&a, "line"), positionPart(&a, "character"))
-	val (bLine, bCharacter) = (positionPart(&b, "line"), positionPart(&b, "character"))
-	return aLine < bLine || aLine == bLine && aCharacter <= bCharacter
-}
-
-/// A position's line or character, `-1` where it has none, as a missing
-/// number compares before every other.
-fn positionPart(position: &Json, name: str): i64 = match position.get(name) {
-	.Some(.Int(n)) => n
-	_ => -1
+/// What the editor sent, read as a `T`; an error that says so where it is
+/// not one.
+fn paramsOf<T: Decode>(params: &Json): Result<T, (i64, String)> = match json::fromJson<T>(
+	params.clone(),
+) {
+	.Ok(value) => .Ok(move value)
+	.Err(error) => .Err((-32602, "the request's parameters: \(error.message)"))
 }
 
 /// What the server can do, as `initialize` answers.
-fn capabilities(): Json = object([
-	(
-		"capabilities",
-		object([
-			(
-				"textDocumentSync",
-				object([
-					("openClose", Json::Bool(true)),
-					("change", .Int(1)),
-					("save", .Bool(true)),
-				]),
-			),
-			("documentFormattingProvider", .Bool(true)),
-			("documentSymbolProvider", .Bool(true)),
-			("hoverProvider", .Bool(true)),
-			("completionProvider", object([("triggerCharacters", texts([".", ":"]))])),
-			(
-				"signatureHelpProvider",
-				object([
-					("triggerCharacters", texts(["(", ","])),
-					("retriggerCharacters", texts([","])),
-				]),
-			),
-			("definitionProvider", .Bool(true)),
-			("referencesProvider", .Bool(true)),
-			("renameProvider", .Bool(true)),
-			("codeActionProvider", object([("codeActionKinds", texts(["quickfix"]))])),
-		]),
+fn capabilities(): InitializeResult = InitializeResult(
+	capabilities: ServerCapabilities(
+		completionProvider: CompletionOptions(triggerCharacters: texts([".", ":"])),
+		signatureHelpProvider: SignatureHelpOptions(
+			triggerCharacters: texts(["(", ","]),
+			retriggerCharacters: texts([","]),
+		),
+		codeActionProvider: CodeActionOptions(codeActionKinds: texts(["quickfix"])),
 	),
-	("serverInfo", object([("name", jsonText("wip")), ("version", jsonText(described()))])),
-])
+	serverInfo: ServerInfo(name: "wip", version: described()),
+)
 
 /// A list of texts.
-fn texts(items: &[str]): Json = {
-	var list: Vec<Json> = Vec()
+fn texts(items: &[str]): Vec<String> = {
+	var list: Vec<String> = Vec()
 	for item in items {
-		list.push(jsonText(item))
+		list.push(String::of(item))
 	}
-	return .Array(move list)
+	return move list
 }
 
 /// The diagnostics of `uri`, shown.
-fn publish(uri: str, diagnostics: Json) = writeMessage(
+fn publish(uri: str, diagnostics: Vec<Reported>) = writeMessage(
 	object([
 		("jsonrpc", jsonText("2.0")),
 		("method", jsonText("textDocument/publishDiagnostics")),
-		("params", object([("uri", jsonText(uri)), ("diagnostics", move diagnostics)])),
+		("params", json::toJson(PublishDiagnostics(uri: uri, diagnostics: move diagnostics))),
 	]),
 )

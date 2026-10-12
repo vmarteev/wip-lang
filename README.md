@@ -35,9 +35,7 @@ fn main() = {
     board.at(0) = 7
     assert(board.at(0) == 7)
 
-    val .Some(free) = board.firstEmpty() else {
-        panic("a fresh board has room")
-    }
+    val .Some(free) = board.firstEmpty() else panic("a fresh board has room")
     assert(free == 1)
 }
 ```

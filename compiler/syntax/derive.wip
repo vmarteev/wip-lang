@@ -9,7 +9,8 @@
 // the checker reports what keeps a derive from applying where the field is
 // written, and an editor passes over what the programmer did not write.
 //
-// All five are written here: `Eq` and `Ord`, `Hash`, `Text` and `Clone`.
+// All seven are written here: `Eq` and `Ord`, `Hash`, `Text`, `Clone`,
+// `Encode` and `Decode`.
 
 import std::mem
 
@@ -25,7 +26,10 @@ pub fn expand(files: &[Parsed], interner: &var Interner): Ast = {
 		names: names,
 		at: Span::new(0, 0),
 	)
+	// The imports copied so far, each by its path and the name it binds.
+	var imported: Vec<String> = Vec()
 	for file in files {
+		val decodes = builder.decodes
 		for item in file.ast.items {
 			match item {
 				// An `extern union`'s fields lie over the same bytes, so
@@ -35,16 +39,37 @@ pub fn expand(files: &[Parsed], interner: &var Interner): Ast = {
 					decl.name.sym,
 					&decl.generics,
 					&item,
+					&file.ast,
 				)
 				.Enum(decl) => builder.derives(
 					&decl.annotations,
 					decl.name.sym,
 					&decl.generics,
 					&item,
+					&file.ast,
 				)
+				// A struct inside an `extern "C"` block is C's layout, and asks
+				// for what it compares, writes and clones as any struct does.
+				.Extern(block) => {
+					for decl in block.structs {
+						if decl.isUnion then continue
+						val inside = Item::Struct(decl.clone())
+						builder.derives(
+							&decl.annotations,
+							decl.name.sym,
+							&decl.generics,
+							&inside,
+							&file.ast,
+						)
+					}
+				}
 				_ => {}
 			}
 		}
+		// `Decode` names each field's type, as the file that asked imports
+		// it: the file's imports, one name at a time, are the derived code's
+		// too.
+		if builder.decodes > decodes then builder.copyImports(&file.ast, &var imported)
 	}
 	interner = move builder.interner
 	return move builder.out
@@ -58,6 +83,8 @@ enum Derive {
 	Hash
 	Text
 	Clone
+	Encode
+	Decode
 }
 
 extend Derive {
@@ -67,6 +94,8 @@ extend Derive {
 		.Hash => names.hash
 		.Text => names.text
 		.Clone => names.cloneInterface
+		.Encode => names.encodeInterface
+		.Decode => names.decodeInterface
 	}
 }
 
@@ -101,6 +130,34 @@ struct Names {
 	/// `Self`, which names the type without looking its name up: a type
 	/// whose name was refused is still the one that asked.
 	selfType: Symbol
+	encodeInterface: Symbol
+	decodeInterface: Symbol
+	encode: Symbol
+	decode: Symbol
+	encoder: Symbol
+	decoder: Symbol
+	/// The derived methods' own type parameters, `E#` and `D#`, which no
+	/// type's parameter can be called.
+	encoderParam: Symbol
+	decoderParam: Symbol
+	into: Symbol
+	from: Symbol
+	result: Symbol
+	error: Symbol
+	ok: Symbol
+	err: Symbol
+	none: Symbol
+	beginRecord: Symbol
+	field: Symbol
+	endRecord: Symbol
+	beginVariant: Symbol
+	endVariant: Symbol
+	missing: Symbol
+	unknown: Symbol
+	toStr: Symbol
+	option: Symbol
+	made: Symbol
+	variantName: Symbol
 }
 
 extend Names {
@@ -130,6 +187,32 @@ extend Names {
 		other: interner.intern("other"),
 		order: interner.intern("order#"),
 		selfType: interner.selfTypeSymbol(),
+		encodeInterface: interner.intern("Encode"),
+		decodeInterface: interner.intern("Decode"),
+		encode: interner.intern("encode"),
+		decode: interner.intern("decode"),
+		encoder: interner.intern("Encoder"),
+		decoder: interner.intern("Decoder"),
+		encoderParam: interner.intern("E#"),
+		decoderParam: interner.intern("D#"),
+		into: interner.intern("into"),
+		from: interner.intern("from"),
+		result: interner.intern("Result"),
+		error: interner.intern("Error"),
+		ok: interner.intern("Ok"),
+		err: interner.intern("Err"),
+		none: interner.intern("None"),
+		beginRecord: interner.intern("beginRecord"),
+		field: interner.intern("field"),
+		endRecord: interner.intern("endRecord"),
+		beginVariant: interner.intern("beginVariant"),
+		endVariant: interner.intern("endVariant"),
+		missing: interner.intern("missing"),
+		unknown: interner.intern("unknown"),
+		toStr: interner.intern("toStr"),
+		option: interner.intern("Option"),
+		made: interner.intern("made#"),
+		variantName: interner.intern("variant#"),
 	)
 }
 
@@ -165,6 +248,8 @@ struct Builder {
 	interner: Interner
 	names: Names
 	at: Span
+	/// How many `decode`s it has written.
+	decodes: i64 = 0
 }
 
 extend Builder {
@@ -175,15 +260,24 @@ extend Builder {
 		name: Symbol,
 		generics: &[GenericParam],
 		item: &Item,
+		source: &Ast,
 	) = {
-		for derive in [Derive::Eq, Derive::Ord, Derive::Hash, Derive::Text, Derive::Clone] {
+		for derive in [
+			Derive::Eq,
+			Derive::Ord,
+			Derive::Hash,
+			Derive::Text,
+			Derive::Clone,
+			Derive::Encode,
+			Derive::Decode,
+		] {
 			// An enum with no variants has no value to clone from.
 			if derive == .Clone && item is .Enum(decl) && decl.variants.isEmpty() then continue
 			val .Some(at) = asks(&annotations, &self.names, derive.interfaceOf(&self.names)) else {
 				continue
 			}
 			self.at = at
-			val block = self.block(derive, name, &generics, &item)
+			val block = self.block(derive, name, &generics, &item, &source)
 			self.out.items.push(.Extend(move block))
 		}
 	}
@@ -197,8 +291,13 @@ extend Builder {
 		ty: Symbol,
 		generics: &[GenericParam],
 		item: &Item,
+		source: &Ast,
 	): ExtendBlock = {
 		val names = self.names
+		// What the method takes that the other derives' do not: type
+		// parameters of its own, and no receiver.
+		var ownGenerics: Vec<GenericParam> = Vec()
+		var receiver = Receiver::Read
 		val made: (Symbol, Vec<Param>, Option<TypeId>, ExprId) = match derive {
 			// `fn equals(other: &Self): bool`
 			.Eq => {
@@ -261,6 +360,53 @@ extend Builder {
 				val ret = self.namedType(names.selfType)
 				(names.clone, Vec(), .Some(ret), body)
 			}
+			// `fn encode<E#: Encoder>(into: &var E#)`
+			.Encode => {
+				val body = match item {
+					.Struct(decl) => self.encodeStruct(ty, &decl.fields)
+					.Enum(decl) => self.encodeVariants(ty, &decl.variants)
+					_ => panic("a struct or an enum")
+				}
+				ownGenerics.push(self.ownParam(names.encoderParam, names.encoder))
+				(
+					names.encode,
+					Vec::of(own [self.lentParam(names.into, names.encoderParam)]),
+					.None,
+					body,
+				)
+			}
+			// `static fn decode<D#: Decoder>(from: &var D#): Result<Self, D#::Error>`
+			.Decode => {
+				val body = match item {
+					.Struct(decl) => self.decodeStruct(ty, &decl.fields, &source)
+					.Enum(decl) => self.decodeVariants(ty, &decl.variants, &source)
+					_ => panic("a struct or an enum")
+				}
+				ownGenerics.push(self.ownParam(names.decoderParam, names.decoder))
+				receiver = .Static
+				self.decodes += 1
+				val decoded = self.namedType(names.selfType)
+				val failed = self.out.types.add(Type(
+					kind: .Path(
+						segments: Vec::of(own [
+							self.name(names.decoderParam),
+							self.name(names.error),
+						]),
+						args: Vec(),
+					),
+					span: self.at,
+				))
+				val ret = self.out.types.add(Type(
+					kind: .Named(name: names.result, args: Vec::of(own [decoded, failed])),
+					span: self.at,
+				))
+				(
+					names.decode,
+					Vec::of(own [self.lentParam(names.from, names.decoderParam)]),
+					.Some(ret),
+					body,
+				)
+			}
 		}
 		val (method, params, ret, body) = move made
 		val implemented = derive.interfaceOf(&names)
@@ -280,7 +426,7 @@ extend Builder {
 			annotations: Vec(),
 			sig: FnSig(
 				name: self.name(method),
-				generics: Vec(),
+				generics: move ownGenerics,
 				params: move params,
 				variadic: .None,
 				ret: ret,
@@ -291,12 +437,13 @@ extend Builder {
 			body: .Some(body),
 			isPub: false,
 			pubSpan: .None,
-			receiver: .Some((.Read, self.at)),
+			receiver: .Some((receiver, self.at)),
 			span: self.at,
 		)
 		return ExtendBlock(
 			annotations: Vec(),
 			sliceOf: .None,
+			boxed: .None,
 			interfaceName: .Some(self.name(implemented)),
 			interfaceModule: Vec(),
 			interfaceArgs: .None,
@@ -612,7 +759,417 @@ extend Builder {
 		))
 	}
 
-	// ---- what they share ----
+	// ---- Encode ----
+
+	/// `{ into.beginRecord("Name", 2)  into.field("x")  self.x.encode(&var into)  …  into.endRecord() }`.
+	var fn encodeStruct(ty: Symbol, fields: &[Field]): ExprId = {
+		var stmts: Vec<StmtId> = Vec()
+		val typeName = self.text(ty)
+		val count = self.expr(.Int(fields.len() as u128))
+		stmts.push(
+			self.stmt(
+				self.callOn(
+					self.names.into,
+					self.names.beginRecord,
+					Vec::of(own [typeName, count]),
+				),
+			),
+		)
+		for field in fields {
+			val this = self.expr(.SelfRef)
+			val value = self.field(this, field.name.sym)
+			self.encodeField(field.name.sym, value, &var stmts)
+		}
+		stmts.push(self.stmt(self.callOn(self.names.into, self.names.endRecord, Vec())))
+		return self.expr(.Block(Block(stmts: move stmts, span: self.at)))
+	}
+
+	/// `match self { .Letter(char: self#char) => { into.beginVariant("Key", "Letter", 1)  into.beginRecord("Letter", 1)  …  into.endRecord()  into.endVariant() } … }`:
+	/// a variant's fields as a record of its name, inside the variant.
+	var fn encodeVariants(ty: Symbol, variants: &[Variant]): ExprId = {
+		var arms: Vec<Arm> = Vec()
+		for variant in variants {
+			var stmts: Vec<StmtId> = Vec()
+			val count = variant.fields.len()
+			val typeName = self.text(ty)
+			val variantName = self.text(variant.name.sym)
+			val counted = self.expr(.Int(count as u128))
+			stmts.push(
+				self.stmt(
+					self.callOn(
+						self.names.into,
+						self.names.beginVariant,
+						Vec::of(own [typeName, variantName, counted]),
+					),
+				),
+			)
+			if count > 0 {
+				val recordName = self.text(variant.name.sym)
+				val fieldCount = self.expr(.Int(count as u128))
+				stmts.push(
+					self.stmt(
+						self.callOn(
+							self.names.into,
+							self.names.beginRecord,
+							Vec::of(own [recordName, fieldCount]),
+						),
+					),
+				)
+				for field in variant.fields {
+					val bound = self.binding(field.name.sym, .This)
+					val value = self.expr(.Name(bound))
+					self.encodeField(field.name.sym, value, &var stmts)
+				}
+				stmts.push(self.stmt(self.callOn(self.names.into, self.names.endRecord, Vec())))
+			}
+			stmts.push(self.stmt(self.callOn(self.names.into, self.names.endVariant, Vec())))
+			val body = self.expr(.Block(Block(stmts: move stmts, span: self.at)))
+			val pattern = self.bound(&variant, .This)
+			arms.push(self.arm(move pattern, body))
+		}
+		val this = self.expr(.SelfRef)
+		return self.expr(.Match(scrutinee: this, arms: move arms))
+	}
+
+	/// `into.field("x")  value.encode(&var into)`.
+	var fn encodeField(name: Symbol, value: ExprId, stmts: &var Vec<StmtId>) = {
+		val named = self.text(name)
+		stmts.push(self.stmt(self.callOn(self.names.into, self.names.field, Vec::of(own [named]))))
+		val callee = self.field(value, self.names.encode)
+		val into = self.expr(.Name(self.names.into))
+		val lent = self.expr(.Unary(op: .RefVar, opSpan: self.at, operand: into))
+		stmts.push(self.stmt(self.call(callee, Vec::of(own [lent]))))
+	}
+
+	// ---- Decode ----
+
+	/// `{ from.beginRecord("Name")?  val made#: Self = Self(x: …, …)  from.endRecord()?  return .Ok(move made#) }`.
+	var fn decodeStruct(ty: Symbol, fields: &[Field], source: &Ast): ExprId = {
+		var stmts: Vec<StmtId> = Vec()
+		val typeName = self.text(ty)
+		stmts.push(
+			self.stmt(
+				self.tried(
+					self.callOn(self.names.from, self.names.beginRecord, Vec::of(own [typeName])),
+				),
+			),
+		)
+		var args: Vec<ExprId> = Vec()
+		var names: Vec<Option<Name>> = Vec()
+		for field in fields {
+			args.push(self.fieldRead(&field, .None, &source))
+			names.push(.Some(self.name(field.name.sym)))
+		}
+		val callee = self.expr(.Name(self.names.selfType))
+		val literal = self.expr(.Call(
+			callee: callee,
+			args: move args,
+			names: move names,
+			rest: .None,
+		))
+		self.finishDecoded(literal, &var stmts, true, false)
+		return self.expr(.Block(Block(stmts: move stmts, span: self.at)))
+	}
+
+	/// `{ val variant#: String = from.beginVariant("Key")?  match variant#.toStr() { "Letter" => { … } … _ => return .Err(from.unknown("Key", variant#)) } }`:
+	/// a variant by its name, its fields a record of that name.
+	var fn decodeVariants(ty: Symbol, variants: &[Variant], source: &Ast): ExprId = {
+		var stmts: Vec<StmtId> = Vec()
+		val typeName = self.text(ty)
+		val begun = self.tried(
+			self.callOn(self.names.from, self.names.beginVariant, Vec::of(own [typeName])),
+		)
+		stmts.push(
+			self.out.stmts.add(Stmt(
+				kind: .Let(
+					mutable: false,
+					isImplicit: false,
+					name: self.name(self.names.variantName),
+					ty: .None,
+					init: begun,
+				),
+				span: self.at,
+			)),
+		)
+		var arms: Vec<Arm> = Vec()
+		for variant in variants {
+			var armStmts: Vec<StmtId> = Vec()
+			val path = self.variant(variant.name.sym)
+			var made = path
+			if !variant.fields.isEmpty() {
+				val recordName = self.text(variant.name.sym)
+				armStmts.push(
+					self.stmt(
+						self.tried(
+							self.callOn(
+								self.names.from,
+								self.names.beginRecord,
+								Vec::of(own [recordName]),
+							),
+						),
+					),
+				)
+				var args: Vec<ExprId> = Vec()
+				var names: Vec<Option<Name>> = Vec()
+				for field in variant.fields {
+					args.push(self.fieldRead(&field, .Some(variant.name.sym), &source))
+					names.push(.Some(self.name(field.name.sym)))
+				}
+				made = self.expr(.Call(
+					callee: path,
+					args: move args,
+					names: move names,
+					rest: .None,
+				))
+			}
+			self.finishDecoded(made, &var armStmts, !variant.fields.isEmpty(), true)
+			val body = self.expr(.Block(Block(stmts: move armStmts, span: self.at)))
+			arms.push(self.arm(Pattern(kind: .Str(variant.name.sym), span: self.at), body))
+		}
+		// Another name is the format's error.
+		val typeAgain = self.text(ty)
+		val found = self.expr(.Name(self.names.variantName))
+		val unknown = self.callOn(
+			self.names.from,
+			self.names.unknown,
+			Vec::of(own [typeAgain, found]),
+		)
+		arms.push(self.arm(self.wildcard(), self.returned(self.result(self.names.err, unknown))))
+		val held = self.expr(.Name(self.names.variantName))
+		val text = self.call(self.field(held, self.names.toStr), Vec())
+		stmts.push(self.stmt(self.expr(.Match(scrutinee: text, arms: move arms))))
+		return self.expr(.Block(Block(stmts: move stmts, span: self.at)))
+	}
+
+	/// `val made#: Self = value  from.endRecord()?  from.endVariant()?  return .Ok(move made#)`:
+	/// the record ended where there is one, and the variant where the value
+	/// is one.
+	var fn finishDecoded(value: ExprId, stmts: &var Vec<StmtId>, record: bool, variant: bool) = {
+		val selfTy = self.namedType(self.names.selfType)
+		stmts.push(
+			self.out.stmts.add(Stmt(
+				kind: .Let(
+					mutable: false,
+					isImplicit: false,
+					name: self.name(self.names.made),
+					ty: .Some(selfTy),
+					init: value,
+				),
+				span: self.at,
+			)),
+		)
+		if record then
+			stmts.push(
+				self.stmt(self.tried(self.callOn(self.names.from, self.names.endRecord, Vec()))),
+			)
+		if variant then
+			stmts.push(
+				self.stmt(self.tried(self.callOn(self.names.from, self.names.endVariant, Vec()))),
+			)
+		val made = self.expr(.Name(self.names.made))
+		val moved = self.expr(.Unary(op: .Move, opSpan: self.at, operand: made))
+		stmts.push(
+			self.out.stmts.add(Stmt(
+				kind: .Return(value: .Some(self.result(self.names.ok, moved))),
+				span: self.at,
+			)),
+		)
+	}
+
+	/// A field's value as decoding reads it: `if from.field("x")? { T::decode(&var from)? } else { … }`,
+	/// what is not there its default, `.None` where it is an `Option`, and
+	/// otherwise the format's error, `return .Err(from.missing("x"))`.
+	var fn fieldRead(field: &Field, variant: Option<Symbol>, source: &Ast): ExprId = {
+		val named = self.text(field.name.sym)
+		val asked = self.tried(self.callOn(self.names.from, self.names.field, Vec::of(own [named])))
+		val read = self.decodeOf(field.ty, &source)
+		val thenBlock = Block(stmts: Vec::of(own [self.stmt(read)]), span: self.at)
+		val isOption = source.types[field.ty].kind is .Named(name, ..) && name == self.names.option
+		val missing: ExprId = if field.default.isSome() {
+			val inVariant: Option<Name> = match variant {
+				.Some(v) => .Some(self.name(v))
+				.None => .None
+			}
+			self.expr(.FieldDefault(variant: inVariant, field: self.name(field.name.sym)))
+		} else if isOption {
+			self.variant(self.names.none)
+		} else {
+			val absent = self.text(field.name.sym)
+			val error = self.callOn(self.names.from, self.names.missing, Vec::of(own [absent]))
+			self.returned(self.result(self.names.err, error))
+		}
+		return self.expr(.If(cond: asked, thenBlock: move thenBlock, elseBranch: .Some(missing)))
+	}
+
+	/// `T::decode(&var from)?` for a field of type `T`, written as the
+	/// field's type is, `Map<String, Key>::decode`, and `own` around the
+	/// decoding of what an `own<T>` holds. A type with no name to call it by
+	/// — an array, a reference — has none, which the checker reports at the
+	/// field as one that does not decode.
+	var fn decodeOf(ty: TypeId, source: &Ast): ExprId = match source.types[ty].kind {
+		.Named(name, args) => self.decodeCall(Vec::of(own [self.name(name)]), &args, &source)
+		.Path(segments, args) => self.decodeCall(segments.clone(), &args, &source)
+		.Own(inner) => {
+			val held = self.decodeOf(inner, &source)
+			self.expr(.Unary(op: .Own, opSpan: self.at, operand: held))
+		}
+		_ => self.expr(.Error)
+	}
+
+	/// `segments<args>::decode(&var from)?`.
+	var fn decodeCall(segments: Vec<Name>, args: &[TypeId], source: &Ast): ExprId = {
+		var path: Vec<Name> = Vec()
+		for segment in segments {
+			path.push(self.name(segment.sym))
+		}
+		// After the type's own segment, which the type arguments are of.
+		val after = path.len() - 1
+		path.push(self.name(self.names.decode))
+		var copied: Vec<TypeId> = Vec()
+		for arg in args {
+			copied.push(self.copyType(arg, &source))
+		}
+		val typeArgs: Option<TypeArgs> =
+			if copied.isEmpty() then .None
+			else .Some(TypeArgs(after: after as i64, args: move copied, span: self.at))
+		val callee = self.expr(.Path(
+			leadingDot: false,
+			segments: move path,
+			typeArgs: move typeArgs,
+		))
+		val from = self.expr(.Name(self.names.from))
+		val lent = self.expr(.Unary(op: .RefVar, opSpan: self.at, operand: from))
+		return self.tried(self.call(callee, Vec::of(own [lent])))
+	}
+
+	/// The type `ty` of `source`, written again in what is derived.
+	var fn copyType(ty: TypeId, source: &Ast): TypeId = {
+		val kind: TypeKind = match source.types[ty].kind {
+			.Named(name, args) => .Named(name: name, args: self.copyTypes(&args, &source))
+			.Path(segments, args) => {
+				var named: Vec<Name> = Vec()
+				for segment in segments {
+					named.push(self.name(segment.sym))
+				}
+				.Path(segments: move named, args: self.copyTypes(&args, &source))
+			}
+			.Own(inner) => .Own(self.copyType(inner, &source))
+			.Ref(isVar, inner) => .Ref(isVar: isVar, inner: self.copyType(inner, &source))
+			.Slice(elem) => .Slice(self.copyType(elem, &source))
+			_ => .Error
+		}
+		return self.out.types.add(Type(kind: move kind, span: self.at))
+	}
+
+	var fn copyTypes(types: &[TypeId], source: &Ast): Vec<TypeId> = {
+		var copied: Vec<TypeId> = Vec()
+		for t in types {
+			copied.push(self.copyType(t, &source))
+		}
+		return move copied
+	}
+
+	/// The imports of `source` not already copied, one name each.
+	var fn copyImports(source: &Ast, imported: &var Vec<String>) = {
+		for item in source.items {
+			val .Import(decl) = item else continue
+			var path: Vec<String> = Vec()
+			for segment in decl.path {
+				path.push(String::of(self.interner.resolve(segment.sym)))
+			}
+			val module = path.join("::")
+			match decl.items {
+				.Some(names) => {
+					for name in names {
+						val bound = match name.alias {
+							.Some(alias) => alias.sym
+							.None => match name.name {
+								.Some(n) => n.sym
+								.None => decl.path[decl.path.len() - 1].sym
+							}
+						}
+						val key = "\(module) \(self.interner.resolve(bound))"
+						if imported.contains(&key) then continue
+						imported.push(move key)
+						self.out.items.push(
+							.Import(ImportDecl(
+								path: decl.path.clone(),
+								alias: .None,
+								items: .Some(Vec::of(own [name.clone()])),
+								span: decl.span,
+							)),
+						)
+					}
+				}
+				.None => {
+					val key = "\(module) \(if decl.alias is .Some(a) then self.interner.resolve(a.sym) else "")"
+					if imported.contains(&key) then continue
+					imported.push(move key)
+					self.out.items.push(.Import(decl.clone()))
+				}
+			}
+		}
+	}
+
+	// ---- what Encode and Decode share ----
+
+	/// `"text"`, a literal of a name: the symbol is the text.
+	var fn text(sym: Symbol): ExprId = self.expr(.Str(sym))
+
+	/// `receiver.method(args)`, the receiver a name.
+	var fn callOn(receiver: Symbol, method: Symbol, args: Vec<ExprId>): ExprId = {
+		val named = self.expr(.Name(receiver))
+		return self.call(self.field(named, method), move args)
+	}
+
+	/// `callee(args)`, each by position.
+	var fn call(callee: ExprId, args: Vec<ExprId>): ExprId = {
+		var names: Vec<Option<Name>> = Vec()
+		for _ in args {
+			names.push(.None)
+		}
+		return self.expr(.Call(callee: callee, args: move args, names: move names, rest: .None))
+	}
+
+	/// `value?`.
+	var fn tried(value: ExprId): ExprId = self.expr(.Try(value))
+
+	/// `.Ok(value)` or `.Err(value)`.
+	var fn result(which: Symbol, value: ExprId): ExprId = self.call(
+		self.variant(which),
+		Vec::of(own [value]),
+	)
+
+	/// `{ return value }`.
+	var fn returned(value: ExprId): ExprId = {
+		val leave = self.out.stmts.add(Stmt(kind: .Return(value: .Some(value)), span: self.at))
+		return self.expr(.Block(Block(stmts: Vec::of(own [leave]), span: self.at)))
+	}
+
+	/// `E#: Encoder`: a derived method's own type parameter.
+	var fn ownParam(name: Symbol, bound: Symbol): GenericParam = GenericParam(
+		decided: .None,
+		name: self.name(name),
+		bounds: Vec::of(own [
+			Bound(module: Vec(), name: self.name(bound), args: Vec(), span: self.at),
+		]),
+		default: .None,
+		span: self.at,
+	)
+
+	/// `into: &var E#`.
+	var fn lentParam(name: Symbol, ty: Symbol): Param = {
+		val inner = self.namedType(ty)
+		val lent = self.out.types.add(Type(kind: .Ref(isVar: true, inner: inner), span: self.at))
+		return Field(
+			isPub: false,
+			isVar: false,
+			name: self.name(name),
+			ty: lent,
+			default: .None,
+			span: self.at,
+		)
+	}
 
 	/// `other: &Self`.
 	var fn otherParam(): Param = {

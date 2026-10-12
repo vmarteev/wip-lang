@@ -15,11 +15,14 @@ pub enum Ty {
 	/// A type the header declared: a struct, a union, or one whose
 	/// contents are not known.
 	Tag(name: String)
+	/// A struct the header declared, written as a Wip type that is laid out
+	/// as it is: `--type Vector3=std::math::Vec3`.
+	Mapped(name: String)
 	Pointer(target: own<Ty>)
-	/// `const T *` and `T *` where the header says what a `T` holds: passed
-	/// as a reference, since a `ptr<T>` to a struct Wip can hold has no way
-	/// of being made.
-	Ref(target: own<Ty>, writable: bool)
+	/// `const T *`, a parameter, where the header says what a `T` holds and
+	/// not that it may be null: one struct, which C reads, lent as a
+	/// reference.
+	Ref(target: own<Ty>)
 	/// A fixed array, which is a field's type rather than a parameter's.
 	Array(element: own<Ty>, length: i64)
 	/// A C function pointer: a Wip function type, which is one address
@@ -36,9 +39,9 @@ extend Ty {
 
 	/// How Wip writes it.
 	pub fn text(): String = match self {
-		.Named(name) | .Tag(name) => name.clone()
+		.Named(name) | .Tag(name) | .Mapped(name) => name.clone()
 		.Pointer(target) => "ptr<\(target.text())>"
-		.Ref(target, writable) => if writable then "&var \(target.text())" else "&\(target.text())"
+		.Ref(target) => "&\(target.text())"
 		.Array(element, length) => "[\(element.text()); \(length)]"
 		.Function(params, result) => {
 			var written: Vec<String> = Vec()
@@ -68,11 +71,13 @@ pub struct Constant {
 	pub var value: String
 }
 
-/// An enumerator of a C enum, which is a `c_int`.
+/// An enumerator of a C enum, of the type C gives it: a `c_int`, or a
+/// `c_uint` where an enumerator is past an `int`.
 pub fn enumerator(
 	name: str,
 	value: i64,
-): Constant = Constant(name: name, ty: "c_int", value: "\(value)")
+	ty: str,
+): Constant = Constant(name: name, ty: ty, value: "\(value)")
 
 /// C's scalar spellings, and the name Wip has for each.
 val SCALARS: [(str, str); 36] = [
@@ -141,6 +146,15 @@ pub struct Known {
 	pub var enums: Set<String> = Set()
 	/// The structs the binding leaves out, which what uses them is too.
 	pub var left: Set<String> = Set()
+	/// The C structs declared as Wip types that exist already, `--type`:
+	/// each C name, and the Wip type's.
+	pub var mapped: Map<String, String> = Map()
+	/// Every name a `typedef` gives, by which C spells a type without
+	/// `struct`.
+	pub var typedefs: Set<String> = Set()
+	/// The parameters, by name, that are pointers whatever they point at,
+	/// for what the header does not say: `--pointer`.
+	pub var pointers: Set<String> = Set()
 }
 
 extend Known {
@@ -161,23 +175,55 @@ pub fn at(written: str, position: Where, known: &Known): Option<Ty> = atDepth(
 	0,
 )
 
+/// How clang spells what a header says of a pointer's null, each with
+/// whether it says the pointer may be null.
+val NULLABILITY: [(str, bool); 5] = [
+	("_Nullable", true),
+	("__nullable", true),
+	("_Nonnull", false),
+	("__nonnull", false),
+	("_Null_unspecified", false),
+]
+
+/// `T * _Nullable` without what it says of the null, and whether that is
+/// that the pointer may be null; `char *const` without its own `const`,
+/// since what it points at is what a binding says.
+fn unqualifiedPointer(text: str): (str, bool) = {
+	var written = text.trim()
+	var mayBeNull = false
+	var stripping = true
+	while stripping {
+		stripping = false
+		for (word, nullable) in NULLABILITY {
+			if written.stripSuffix(word) is .Some(rest) && rest.trimEnd().endsWith("*") {
+				written = rest.trimEnd()
+				if nullable then mayBeNull = true
+				stripping = true
+			}
+		}
+		if written.stripSuffix("const") is .Some(pointer) && pointer.trimEnd().endsWith("*") {
+			written = pointer.trimEnd()
+			stripping = true
+		}
+	}
+	return (written, mayBeNull)
+}
+
 fn atDepth(text: str, position: Where, known: &Known, depth: i64): Option<Ty> = {
-	val written = text.trim()
+	val (written, mayBeNull) = unqualifiedPointer(text)
 	// A function pointer is a Wip function type; anything
 	// else with a parenthesis in it is not a type the tool writes.
 	if written.contains("(") then return functionPointer(written, known, depth)
 
-	// `char name[8]`, as a field's type is written.
-	if written.splitOnce("[") is .Some((before, rest)) && rest.stripSuffix("]") is .Some(count) {
-		val .Ok(length) = count.trim().toInt() else {
-			return .None
-		}
+	// `char name[8]`, as a field's type is written; `float m[3][4]` is three
+	// of `float[4]`.
+	if written.splitOnce("[") is .Some((before, rest)) &&
+		rest.splitOnce("]") is .Some((count, inner)) {
+		val .Ok(length) = count.trim().toInt() else return .None
 
 		if length < 0 then return .None
 
-		val .Some(element) = atDepth(before, position, known, depth) else {
-			return .None
-		}
+		val .Some(element) = atDepth("\(before)\(inner)", position, known, depth) else return .None
 
 		return .Some(.Array(element: own (move element), length: length))
 	}
@@ -186,27 +232,30 @@ fn atDepth(text: str, position: Where, known: &Known, depth: i64): Option<Ty> = 
 	if written == "const char *" || written == "const char*" then return .Some(.Named("cstring"))
 
 	if written.stripSuffix("*") is .Some(pointee) {
-		val writable = !pointee.trimStart().startsWith("const ")
+		val reads = pointee.trimStart().startsWith("const ")
 
 		// Only the outermost pointer of a parameter may be a reference:
-		// `Rectangle **` is a pointer to pointers, and a `ptr<&var T>`
-		// would hold a reference, which nothing may.
-		val .Some(inner) = atDepth(pointee.trim(), .Field, known, depth) else {
-			return .None
-		}
+		// `Rectangle **` is a pointer to pointers, and a `ptr<&T>` would
+		// hold a reference, which nothing may.
+		val .Some(inner) = atDepth(pointee.trim(), .Field, known, depth) else return .None
 
-		// A pointer to a struct the header defines is a reference, which
-		// is how Wip lends a value to C. Anything
-		// else — a handle, a scalar, `void` — stays a pointer, since it
-		// may be null, an array, or something C keeps.
+		// A `const` pointer to a struct the header defines, which it does
+		// not say may be null, is one struct C reads: a reference, which a
+		// call lends a value to. Anything else — a struct C writes, a
+		// handle, a scalar, `void` — stays a pointer, since it may be null,
+		// an array, or something C keeps; a call lends `&var x` to one all
+		// the same.
 		val lendable =
 			position is .Parameter &&
+			reads &&
+			!mayBeNull &&
 			match inner {
 				.Tag(name) => known.records.contains(&name)
+				.Mapped(..) => true
 				_ => false
 			}
 
-		if lendable then return .Some(.Ref(target: own (move inner), writable: writable))
+		if lendable then return .Some(.Ref(target: own (move inner)))
 
 		return .Some(.Pointer(own (move inner)))
 	}
@@ -248,6 +297,10 @@ fn atDepth(text: str, position: Where, known: &Known, depth: i64): Option<Ty> = 
 	// binding left out.
 	if !isName(tag) || tag.startsWith("__builtin_") || known.left.contains(tag) then return .None
 
+	// A struct declared as a Wip type, `--type`: the Wip type's name, which
+	// the binding imports.
+	if known.mapped.get(tag) is .Some(name) then return .Some(.Mapped(name.clone()))
+
 	return .Some(.Tag(tag))
 }
 
@@ -282,6 +335,7 @@ fn functionPointer(written: str, known: &Known, depth: i64): Option<Ty> = {
 /// Whether `ty` is a struct or a union the header defines, by value.
 fn byValue(ty: &Ty, known: &Known): bool = match ty {
 	.Tag(name) => known.records.contains(&name)
+	.Mapped(..) => true
 	_ => false
 }
 
@@ -330,13 +384,9 @@ pub fn isName(text: str): bool = {
 /// string. Anything else — an expression, a cast, a call — is left out.
 pub fn constant(name: str, value: str): Option<Constant> = {
 	if value.stripPrefix("\"") is .Some(quoted) {
-		val .Some(text) = quoted.stripSuffix("\"") else {
-			return .None
-		}
+		val .Some(text) = quoted.stripSuffix("\"") else return .None
 
-		val .Some(escaped) = wipEscapes(text) else {
-			return .None
-		}
+		val .Some(escaped) = wipEscapes(text) else return .None
 
 		return .Some(Constant(name: name, ty: "str", value: "\"\(escaped)\""))
 	}
@@ -358,9 +408,7 @@ pub fn constant(name: str, value: str): Option<Constant> = {
 		.None => digits.toInt()
 	}
 
-	val .Ok(number) = number else {
-		return .None
-	}
+	val .Ok(number) = number else return .None
 
 	return .Some(Constant(name: name, ty: "i64", value: "\(number)"))
 }
@@ -405,9 +453,7 @@ pub fn wipEscapes(text: str): Option<String> = {
 
 				if i == start then return .None
 
-				val .Ok(code) = text[start..i].toInt(radix: 16) else {
-					return .None
-				}
+				val .Ok(code) = text[start..i].toInt(radix: 16) else return .None
 
 				if code > 0xFFFFFFFF then return .None
 				out.push("\\u{\(hex(code))}")
@@ -426,9 +472,7 @@ pub fn wipEscapes(text: str): Option<String> = {
 					i += 1
 				}
 
-				val .Ok(code) = text[start..i].toInt(radix: 8) else {
-					return .None
-				}
+				val .Ok(code) = text[start..i].toInt(radix: 8) else return .None
 
 				out.push("\\u{\(hex(code))}")
 			}

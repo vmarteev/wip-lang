@@ -18,8 +18,29 @@
 // A future's thread allocates too, so what changes, changes
 // by atomic steps. Nothing here may allocate, and nothing here panics but
 // on memory C has none of.
+//
+// Where a thread has been given an allocator, `std::mem::using`, its
+// allocations are taken from it instead: the thread's first word holds
+// the allocator's ledger, and each allocation's second header word holds
+// the ledger it came from, so that it is freed there whenever that is,
+// and the ledger counts what is alive. In a debug build, an allocation
+// from an allocator has room before its header for the calls that made
+// it, linked in a list of those alive, which an arena reset too soon
+// prints.
 
-import std::libc::{abort, atexit, exitAtOnce, fflush, fprintf, free, getenv, malloc, stderr, stdout}
+import std::libc::{
+	_Unwind_Backtrace,
+	abort,
+	atexit,
+	exitAtOnce,
+	fflush,
+	fprintf,
+	free,
+	getenv,
+	malloc,
+	stderr,
+	stdout
+}
 
 @intrinsic
 fn atomicAdd(at: ptr<i64>, amount: i64): i64
@@ -38,6 +59,44 @@ fn offsetBytes(pointer: ptr<u8>, bytes: i64): ptr<u8>
 
 @intrinsic
 fn runtimeWords(): ptr<i64>
+
+@intrinsic
+fn threadWords(): ptr<i64>
+
+/// The thread's word that holds the ledger of the allocator its
+/// allocations come from, or 0 for the heap.
+val CURRENT: i64 = 0
+
+/// What the runtime keeps of an allocator `std::mem::using` hands out,
+/// laid out as `std::mem`'s `Ledger` is: where the allocator is, the two
+/// functions it allocates and frees with, how many of its allocations are
+/// alive, and, in a debug build, the first and last of the list of those
+/// with the calls that made them.
+extern "C" {
+	struct AllocatorLedger {
+		state: ptr<void>
+		allocate: Option<(state: ptr<void>, size: i64, align: i64) => ptr<u8>>
+		release: Option<(state: ptr<void>, at: ptr<u8>) => void>
+		live: i64
+		keepsCalls: i64
+		firstMade: ptr<u8>
+		lastMade: ptr<u8>
+	}
+}
+
+/// The words before a traced allocation's header: the allocations alive
+/// before and after it, how many calls it keeps, and those calls'
+/// addresses.
+val TRACE_WORDS: i64 = 16
+val TRACE: i64 = 128
+val KEPT_CALLS: i64 = 13
+
+/// The runtime's frames above the code that allocated, in a debug build.
+val RUNTIME_FRAMES: i64 = 4
+
+/// A block's first word holds this where room for its calls lies before
+/// its header.
+val TRACED: i64 = 0x2000_0000_0000_0000
 
 // The runtime's words, one per counter: allocations not yet freed, those
 // made so far, whether the first has been made, whether each is printed,
@@ -101,37 +160,226 @@ fn counted(): bool = {
 	return atomicLoad(word(COUNTING)) == COUNTED
 }
 
+/// The number a new allocation is given where allocations are counted,
+/// counting it in; 0 where they are not.
+fn numbered(): i64 = {
+	if !counted() then return 0
+	val number = atomicAdd(word(MADE), 1) + 1
+	atomicAdd(word(LIVE), 1)
+	if atomicLoad(word(TRACING)) != 0 then fprintf(stdout, "alloc #%lld\n", number)
+	return number
+}
+
+fn outOfMemory(wanted: i64): never = {
+	fflush(stdout)
+	fprintf(stderr, "wip: out of memory (failed to allocate %lld bytes)\n", wanted)
+	abort()
+}
+
 @export("C")
 fn wip_alloc(size: i64): ptr<u8> = {
-	val counting = counted()
 	val wanted = if size <= 0 then 1 else size
+	val current = threadWords()[CURRENT]
+	if current != 0 then return fromLedger(current as ptr<void>, wanted)
 	val block = malloc((wanted + HEADER) as size_t)
+	if block.isNull then outOfMemory(wanted)
+	val header = block as ptr<i64>
+	header[0] = numbered()
+	header[1] = 0
+	return offsetBytes(block, HEADER)
+}
+
+/// An allocation from the allocator whose ledger is at `at`, counted alive
+/// in it, and in a debug build noted with the calls that made it.
+fn fromLedger(at: ptr<void>, wanted: i64): ptr<u8> = allocateFrom(
+	&var referenceAt<AllocatorLedger>(at),
+	at,
+	wanted,
+)
+
+fn allocateFrom(ledger: &var AllocatorLedger, at: ptr<void>, wanted: i64): ptr<u8> = {
+	val traced = ledger.keepsCalls != 0
+	val extra = if traced then TRACE else 0
+	val .Some(allocate) = ledger.allocate else outOfMemory(wanted)
+	val block = allocate(ledger.state, wanted + HEADER + extra, HEADER)
+	if block.isNull then outOfMemory(wanted)
+	val header = offsetBytes(block, extra) as ptr<i64>
+	header[0] = numbered() | (if traced then TRACED else 0)
+	header[1] = at as i64
+	atomicAdd(liveOf(at), 1)
+	if traced then noteMade(&var ledger, block)
+	return offsetBytes(block, extra + HEADER)
+}
+
+/// The count of a ledger's allocations alive.
+fn liveOf(ledger: ptr<void>): ptr<i64> = offsetBytes(ledger as ptr<u8>, 24) as ptr<i64>
+
+/// Notes the calls that made the traced allocation `block`, and links it
+/// last in its ledger's list of those alive.
+fn noteMade(ledger: &var AllocatorLedger, block: ptr<u8>) = {
+	var frames = Frames(addresses: [0; 256], count: 0)
+	_Unwind_Backtrace(noteFrame, addressOf<Frames>(&var frames))
+	val trace = block as ptr<i64>
+	// The runtime's own frames come first: this function, `allocateFrom`,
+	// `fromLedger` and `wip_alloc`, which a debug build does not inline.
+	val first = RUNTIME_FRAMES.min(frames.count)
+	val kept = (frames.count - first).min(KEPT_CALLS)
+	trace[0] = ledger.lastMade as i64
+	trace[1] = 0
+	trace[2] = kept
+	for i in 0..kept {
+		trace[3 + i] = frames.addresses[first + i]
+	}
+	if ledger.lastMade.isNull then ledger.firstMade = block
+	else (ledger.lastMade as ptr<i64>)[1] = block as i64
+	ledger.lastMade = block
+}
+
+/// Unlinks the traced allocation `block` from its ledger's list.
+fn forgetMade(ledger: &var AllocatorLedger, block: ptr<u8>) = {
+	val trace = block as ptr<i64>
+	val before = trace[0] as ptr<u8>
+	val after = trace[1] as ptr<u8>
+	if before.isNull then ledger.firstMade = after else (before as ptr<i64>)[1] = after as i64
+	if after.isNull then ledger.lastMade = before else (after as ptr<i64>)[0] = before as i64
+}
+
+/// Prints where the first allocations still alive in the ledger at `at`
+/// were made, up to three of `live`: what an arena reset or dropped too
+/// soon says before it panics, in a debug build.
+@export("C")
+fn wip_allocator_report(at: ptr<void>, live: i64) = reportMade(
+	&var referenceAt<AllocatorLedger>(at),
+	live,
+)
+
+fn reportMade(ledger: &var AllocatorLedger, live: i64) = {
+	fflush(stdout)
+	var block = ledger.firstMade
+	var shown = 0
+	while !block.isNull && shown < 3 {
+		val trace = block as ptr<i64>
+		val ordinal: cstring = match shown {
+			0 => "first"
+			1 => "second"
+			_ => "third"
+		}
+		fprintf(stderr, "the %s of the %lld still alive was made\n", ordinal, live)
+		var calls = Shown(count: 0, throughC: false)
+		for i in 0..trace[2] {
+			val address = trace[3 + i] -% 1
+			val found = lookUp(address)
+			if found.entry.isNull then calls.throughC = calls.count > 0
+			else printFrame(&var calls, found, address -% found.entry[0])
+		}
+		block = trace[1] as ptr<u8>
+		shown += 1
+	}
+}
+
+/// From an allocator, memory aligned beyond what `wip_alloc` gives: a block
+/// at a multiple of `align` with `align` bytes before the memory, for the
+/// header and the distance back to the block.
+fn alignedFrom(ledger: &var AllocatorLedger, at: i64, wanted: i64, align: i64): ptr<u8> = {
+	val .Some(allocate) = ledger.allocate else outOfMemory(wanted)
+	val block = allocate(ledger.state, wanted + align, align)
+	if block.isNull then outOfMemory(wanted)
+	val memory = offsetBytes(block, align)
+	(offsetBytes(memory, -HEADER - 8) as ptr<i64>)[0] = align
+	val header = offsetBytes(memory, -HEADER) as ptr<i64>
+	header[0] = numbered() | ALIGNED
+	header[1] = at
+	atomicAdd(liveOf(at as ptr<void>), 1)
+	return memory
+}
+
+/// A block's first word holds this where the block was made aligned beyond
+/// what `malloc` gives, `wip_alloc_aligned`: the eight bytes before its
+/// header then say how far back the block `malloc` made begins. The rest of
+/// the word is the allocation's number, as for any block.
+val ALIGNED: i64 = 0x4000_0000_0000_0000
+
+/// Memory for a value whose type is aligned beyond the sixteen bytes every
+/// allocation is: `@align(64)`. `malloc` is asked for room to round up in,
+/// and the header and the distance back to what it gave lie before the
+/// memory handed out, which `wip_free` reads.
+@export("C")
+fn wip_alloc_aligned(size: i64, align: i64): ptr<u8> = {
+	if align <= HEADER then return wip_alloc(size)
+	val wanted = if size <= 0 then 1 else size
+	// From an allocator: a block at a multiple of `align` with `align` bytes
+	// before the memory, for the header and the distance back.
+	val current = threadWords()[CURRENT]
+	if current != 0 then
+		return alignedFrom(
+			&var referenceAt<AllocatorLedger>(current as ptr<void>),
+			current,
+			wanted,
+			align,
+		)
+	val counting = counted()
+	val block = malloc((wanted + align + HEADER + 8) as size_t)
 	if block.isNull {
 		fflush(stdout)
 		fprintf(stderr, "wip: out of memory (failed to allocate %lld bytes)\n", wanted)
 		abort()
 	}
+	// The first multiple of `align` past room for the header and the
+	// distance.
+	val start = block as usize
+	val wantedAt = start + ((HEADER + 8) as usize)
+	val remainder = wantedAt % (align as usize)
+	val at = if remainder == 0 then wantedAt else wantedAt + (align as usize) - remainder
+	val memory = at as ptr<u8>
+	(offsetBytes(memory, -HEADER - 8) as ptr<i64>)[0] = (at - start) as i64
+	val header = offsetBytes(memory, -HEADER) as ptr<i64>
+	header[1] = 0
 	if !counting {
-		(block as ptr<i64>)[0] = 0
-		return offsetBytes(block, HEADER)
+		header[0] = ALIGNED
+		return memory
 	}
 	val number = atomicAdd(word(MADE), 1) + 1
-	(block as ptr<i64>)[0] = number
+	header[0] = number | ALIGNED
 	atomicAdd(word(LIVE), 1)
 	if atomicLoad(word(TRACING)) != 0 then fprintf(stdout, "alloc #%lld\n", number)
-	return offsetBytes(block, HEADER)
+	return memory
 }
 
 @export("C")
 fn wip_free(memory: ptr<u8>) = {
 	if memory.isNull then return
-	val block = offsetBytes(memory, -HEADER)
+	val header = offsetBytes(memory, -HEADER)
+	val first = (header as ptr<i64>)[0]
+	val from = (header as ptr<i64>)[1]
+	// A block made aligned says how far back the block begins, and one with
+	// its calls kept has them before its header.
+	val block =
+		if (first & ALIGNED) != 0 then
+			offsetBytes(memory, -((offsetBytes(memory, -HEADER - 8) as ptr<i64>)[0]))
+		else if (first & TRACED) != 0 then offsetBytes(header, -TRACE)
+		else header
 	// A block that was counted says its number; one made before counting
 	// began was not, and is not counted out.
-	val number = (block as ptr<i64>)[0]
+	val number = first & (TRACED - 1)
 	if number != 0 {
 		if atomicLoad(word(TRACING)) != 0 then fprintf(stdout, "free #%lld\n", number)
 		atomicAdd(word(LIVE), -1)
 	}
-	free(block)
+	if from == 0 {
+		free(block)
+		return
+	}
+	// Given back to the allocator it came from, whenever that is.
+	releaseTo(
+		&var referenceAt<AllocatorLedger>(from as ptr<void>),
+		from,
+		(first & TRACED) != 0,
+		block,
+	)
+}
+
+fn releaseTo(ledger: &var AllocatorLedger, at: i64, traced: bool, block: ptr<u8>) = {
+	if traced then forgetMade(&var ledger, block)
+	atomicAdd(liveOf(at as ptr<void>), -1)
+	if ledger.release is .Some(release) then release(ledger.state, block)
 }

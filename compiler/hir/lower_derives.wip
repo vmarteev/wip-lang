@@ -10,7 +10,16 @@
 
 import std::mem
 import syntax as ast
-import syntax::{Code, Diagnostic, NOT_CLONEABLE, NOT_COMPARABLE, Span, Symbol}
+import syntax::{
+	Code,
+	Diagnostic,
+	NOT_CLONEABLE,
+	NOT_COMPARABLE,
+	NOT_DECODABLE,
+	NOT_ENCODABLE,
+	Span,
+	Symbol
+}
 
 /// How a field that lacks what `@derive` asks of it is reported: the code,
 /// what the field cannot do, the label, what `@derive` writes, and the rule.
@@ -62,14 +71,25 @@ extend Lowerer {
 			val hash = self.derives(&annotations, .Hash)
 			val text = self.derives(&annotations, .Text)
 			val clone = self.derives(&annotations, .Clone)
-			if eq.isNone() && ord.isNone() && hash.isNone() && text.isNone() && clone.isNone() then
+			val encode = self.derives(&annotations, .Encode)
+			val decode = self.derives(&annotations, .Decode)
+			if eq.isNone() &&
+				ord.isNone() &&
+				hash.isNone() &&
+				text.isNone() &&
+				clone.isNone() &&
+				encode.isNone() &&
+				decode.isNone() {
 				continue
+			}
 			self.typeParams = self.typeGenerics(def)
 			if eq is .Some(at) then self.checkDerivedFields(def, at, .Eq)
 			if ord is .Some(at) then self.checkOrderable(def, at, eq.isSome())
 			if hash is .Some(at) then self.checkHashable(def, at, eq.isSome())
 			if text is .Some(at) then self.checkDerivedFields(def, at, .Text)
 			if clone is .Some(at) then self.checkDerivedFields(def, at, .Clone)
+			if encode is .Some(at) then self.checkDerivedFields(def, at, .Encode)
+			if decode is .Some(at) then self.checkDerivedFields(def, at, .Decode)
 		}
 		self.typeParams.clear()
 	}
@@ -86,15 +106,13 @@ extend Lowerer {
 			.Hash => .Hash
 			.Text => .Text
 			.Clone => .Clone
+			.Encode => .Encode
+			.Decode => .Decode
 		}
-		val .Some(interfaceId) = self.program.preludeItems.interfaceOf(known) else {
-			return
-		}
+		val .Some(interfaceId) = self.program.preludeItems.interfaceOf(known) else return
 		// Nothing was written where the implementation was refused, as a
 		// second one of the type's, and reported.
-		val .Some(written) = self.derivedImpl(owner, interfaceId) else {
-			return
-		}
+		val .Some(written) = self.derivedImpl(owner, interfaceId) else return
 		// Each field is asked where the method is written, whose type
 		// parameters are bound by the interface too: a `Vec<T>` field has it
 		// where `T` does.
@@ -107,13 +125,26 @@ extend Lowerer {
 			val kind = self.kind(ty)
 			// What an `own<T>` or a reference points at may have it, which a
 			// call looks through to; the field itself does not. A clone is
-			// asked of the field's own type, whose `clone` a `&T` has.
-			val pointer = wanted != .Clone && kind is .Own(..) | .Ref(..)
+			// asked of the field's own type, whose `clone` a `&T` has; so is
+			// decoding, which a reference cannot be read into.
+			val pointer = wanted != .Clone && wanted != .Decode && kind is .Own(..) | .Ref(..)
 			// Whether it is plain data is read from its fields' types.
 			completeType(&var self.program, ty)
 			// Two pointers compare by where they point.
 			val compared = wanted == .Eq && kind is .Ptr(..)
-			if self.isPoisoned(ty) || compared || (!pointer && self.implements(ty, interfaceId)) {
+			// A format is given an `own<T>` as the prelude's implementation for
+			// it says, and a reference as what it refers to.
+			val formatted = match wanted {
+				.Encode =>
+					self.implements(ty, interfaceId) ||
+						(kind is .Ref(inner, ..) && self.implements(inner, interfaceId))
+				.Decode => self.implements(ty, interfaceId)
+				_ => false
+			}
+			if self.isPoisoned(ty) ||
+				compared ||
+				formatted ||
+				(wanted !is .Encode | .Decode && !pointer && self.implements(ty, interfaceId)) {
 				continue
 			}
 			applies = false
@@ -175,6 +206,20 @@ extend Lowerer {
 				writes: "`@derive(Clone)` writes the clone field by field",
 				note: "a field clones when its type implements `Clone`: plain data, which owns no memory, is its own clone, and so are a `String`, a `Vec`, an `Option` or a tuple of what clones, and a type that asks for `@derive(Clone)` or writes `extend …: Clone`",
 			)
+			.Encode => Lacking(
+				code: NOT_ENCODABLE,
+				lacks: "does not encode",
+				label: "not a field that encodes",
+				writes: "`@derive(Encode)` writes the value field by field",
+				note: "a field encodes when its type implements `Encode`: the numbers, `bool`, `char`, the text types, a `Vec`, a `Map`, a `Set`, an `Option`, an `own` or a tuple of what encodes, and a type that asks for `@derive(Encode)` or writes `extend …: Encode`",
+			)
+			.Decode => Lacking(
+				code: NOT_DECODABLE,
+				lacks: "does not decode",
+				label: "not a field that decodes",
+				writes: "`@derive(Decode)` reads the value field by field",
+				note: "a field decodes when its type implements `Decode`, as the types that encode do but a reference and a view, whose borrowed value would have nowhere to come from",
+			)
 		}
 		var diagnostic = Diagnostic::error(
 			words.code,
@@ -228,12 +273,8 @@ extend Lowerer {
 	/// Leaves what `@derive` wrote for `owner`'s implementation of
 	/// `interfaceId` unchecked, where it has been refused and reported.
 	var fn withholdDerived(owner: TypeDef, interfaceId: Option<InterfaceId>) = {
-		val .Some(id) = interfaceId else {
-			return
-		}
-		val .Some(written) = self.derivedImpl(owner, id) else {
-			return
-		}
+		val .Some(id) = interfaceId else return
+		val .Some(written) = self.derivedImpl(owner, id) else return
 		for m in written {
 			self.withheld.add(m)
 		}
@@ -271,12 +312,8 @@ extend Lowerer {
 	/// a method of one of those names keeps its own.
 	var fn declareEnumNumbers(types: &[(Declared, TypeDef)]) = {
 		for (item, def) in types {
-			val .Some(e) = item.enumDecl() else {
-				continue
-			}
-			val .Enum(id) = def else {
-				continue
-			}
+			val .Some(e) = item.enumDecl() else continue
+			val .Enum(id) = def else continue
 			var carries = false
 			for v in self.program.enums[id].variants {
 				if !v.fields.isEmpty() then carries = true
@@ -359,7 +396,7 @@ extend Lowerer {
 			isLambda: false,
 			generator: .None,
 			isTailrec: false,
-			isTest: false,
+			test: .None,
 			isInline: false,
 			generated: .Some(generated),
 			intrinsic: .None,

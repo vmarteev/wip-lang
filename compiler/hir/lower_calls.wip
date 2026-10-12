@@ -4,12 +4,16 @@
 import syntax as ast
 import syntax::{
 	ARGUMENT_COUNT,
+	CANNOT_INFER,
 	CANNOT_INLINE,
 	Code,
 	Diagnostic,
 	Edit,
+	IMPLICIT_AS_VALUE,
+	MISMATCHED_TYPES,
 	NAMED_ARGUMENT_TO_VALUE,
 	NAMED_VARIADIC_ARGUMENT,
+	NO_SUCH_FIELD,
 	NOT_A_VALUE,
 	NOT_CALLABLE,
 	NOT_C_COMPATIBLE,
@@ -217,12 +221,93 @@ extend Lowerer {
 
 	/// A call of `callee`, with the type arguments written in its path, if
 	/// any, and arguments given by position, by name or by default.
+	/// Whether a call of `offsetOf` names what it can answer: a struct whose
+	/// layout Wip makes, written as its type argument, and one of its fields,
+	/// written as a string literal. Each way it does not is reported.
+	var fn offsetOfFits(item: &ItemUse): bool = {
+		val span = item.span
+		val .Some(written) = item.typeArgs else {
+			self.report(
+				Diagnostic::error(
+					CANNOT_INFER,
+					"`offsetOf` names the struct whose field it asks about",
+					span,
+					"no struct named",
+				).withHelp("write it as the type argument: `c::offsetOf<Vertex>(\"color\")`"),
+			)
+			return false
+		}
+		if written.args.len() != 1 then return true
+		val ty = self.resolveTy(written.args[0])
+		if self.isPoisoned(ty) then return false
+		val .Struct(id, ..) = self.kind(ty) else {
+			self.report(
+				Diagnostic::error(
+					MISMATCHED_TYPES,
+					"`offsetOf` asks where a struct's field lies, and \(self.tyName(ty)) is no struct",
+					written.span,
+					"not a struct",
+				),
+			)
+			return false
+		}
+		if self.program.structs[id].isOpaque {
+			self.report(
+				Diagnostic::error(
+					MISMATCHED_TYPES,
+					"\(self.tyName(ty)) is `@opaque`, and where its fields lie is C's",
+					written.span,
+					"a layout Wip does not make",
+				),
+			)
+			return false
+		}
+		if item.args.isNone() || item.args.unwrap().len() != 1 then return true
+		val fieldArg = item.args.unwrap()[0]
+		val .Str(name) = self.ast.exprs[fieldArg].kind else {
+			self.report(
+				Diagnostic::error(
+					MISMATCHED_TYPES,
+					"`offsetOf` takes the field's name as a string literal",
+					self.ast.exprs[fieldArg].span,
+					"not a literal",
+				).withNote(
+					"the name is checked against the struct's fields while the program is compiled",
+				),
+			)
+			return false
+		}
+		var names: Vec<str> = Vec()
+		for field in self.program.structs[id].fields {
+			if field.name == name then return true
+			names.push(self.text(field.name))
+		}
+		val text = String::of(self.text(name))
+		var diagnostic = Diagnostic::error(
+			NO_SUCH_FIELD,
+			"\(self.tyName(ty)) has no field `\(text)`",
+			self.ast.exprs[fieldArg].span,
+			"no such field",
+		)
+		if suggest(text, &names) is .Some(similar) then
+			diagnostic = diagnostic.withFix(
+				"did you mean `\(similar)`?",
+				own [Edit::replace(self.ast.exprs[fieldArg].span, "\"\(similar)\"")],
+			)
+		self.report(move diagnostic)
+		return false
+	}
+
 	var fn call(callee: FnId, item: ItemUse): ExprId = {
 		// A file's contents, which the checker reads now: no call is made.
 		if self.program.fns[callee].intrinsic is .Some(which) &&
 			which is .EmbedBytes | .EmbedText | .EmbedTextOr {
 			return self.embed(which, item)
 		}
+		// `offsetOf<T>("field")`: the struct and the field are checked here,
+		// and the layout answers once the program is laid out.
+		if self.program.fns[callee].intrinsic is .Some(.OffsetOf) && !self.offsetOfFits(&item) then
+			return self.errorExpr(item.span)
 		// A call to a C function that takes more than it declares is made
 		// through C of the compiler's writing, with the types this call
 		// passes.
@@ -244,9 +329,9 @@ extend Lowerer {
 			if n.isSome() then plain = false
 		}
 		for p in self.program.fns[callee].params {
-			if p.default.isSome() then plain = false
+			if p.default.isSome() || p.implicit then plain = false
 		}
-		val explicit = self.explicitTypeArgs(nameSym, &generics, item.typeArgs, item.nameSegment)
+		val explicit = self.callTypeArgs(callee, nameSym, &generics, &item)
 		var inference = Inference::new(move explicit)
 		if item.ownerTy is .Some(ownerTy) then
 			self.ownerTypeArgs(callee, &generics, ownerTy, &var inference)
@@ -306,6 +391,7 @@ extend Lowerer {
 					declared: params[i].ty,
 					context: .Some((params[i].span, "parameter declared here")),
 					isArg: true,
+					toC: self.program.fns[callee].isExtern,
 				))
 			}
 			hirArgs = self.genericOperands(&operands, &var inference.tys)
@@ -473,6 +559,7 @@ extend Lowerer {
 				ty: all[i].ty,
 				span: all[i].span,
 				default: all[i].default.clone(),
+				implicit: all[i].implicit,
 			))
 		}
 		val matched = self.matchArguments(&slots, &args, &names, "parameter", name)
@@ -497,6 +584,7 @@ extend Lowerer {
 				declared: slots[slot].ty,
 				context: .Some((slots[slot].span, "parameter declared here")),
 				isArg: true,
+				toC: self.program.fns[callee].isExtern,
 			))
 		}
 		val values = self.genericOperands(&operands, &var inference.tys)
@@ -510,7 +598,7 @@ extend Lowerer {
 		for arg in matched.unmatched {
 			self.inferArgument(args[arg], .None)
 		}
-		return self.arrangeArguments(&slots, &matched, &checked, item.span)
+		return self.arrangeArguments(&slots, &matched, &checked, item.span, name)
 	}
 
 	/// Reports arguments left over, and parameters given no value. A call
@@ -532,7 +620,7 @@ extend Lowerer {
 			if n.isSome() then plain = false
 		}
 		for s in slots {
-			if s.default.isSome() then plain = false
+			if s.default.isSome() || s.implicit then plain = false
 		}
 		val diagnostic = if plain || matched.extra > 0 {
 			Diagnostic::error(
@@ -832,9 +920,7 @@ extend Lowerer {
 		ownerTy: Ty,
 		inference: &var Inference,
 	) = {
-		val .Some(owner) = self.program.ownerOfFn(id) else {
-			return
-		}
+		val .Some(owner) = self.program.ownerOfFn(id) else return
 		var params: Vec<Ty> = Vec()
 		for (index, param) in generics.forwards().enumerate() {
 			params.push(
@@ -846,6 +932,38 @@ extend Lowerer {
 		val list = self.program.types.internList(&params)
 		if self.program.typeOf(owner, list) is .Some(declared) then
 			self.unify(declared, ownerTy, &var inference.tys)
+	}
+
+	/// The type arguments a call writes. After a generic type's name, as
+	/// `Pair<i64>::decode(…)`, as many as the type takes are the type's, and
+	/// the method's own are inferred, as they are where none are written.
+	var fn callTypeArgs(
+		callee: FnId,
+		name: Symbol,
+		generics: &[GenericParamDef],
+		item: &ItemUse,
+	): Vec<Option<Ty>> = {
+		val ownerCount = match self.program.ownerOfFn(callee) {
+			.Some(owner) => self.typeGenerics(owner).len()
+			.None => 0
+		}
+		val writesTheType =
+			item.typeArgs is .Some(written) &&
+			written.args.len() == ownerCount &&
+			ownerCount > 0 &&
+			ownerCount < generics.len()
+		if !writesTheType then
+			return self.explicitTypeArgs(name, &generics, item.typeArgs, item.nameSegment)
+		var given = self.explicitTypeArgs(
+			name,
+			&generics[0..ownerCount],
+			item.typeArgs,
+			item.nameSegment,
+		)
+		while given.len() < generics.len() {
+			given.push(.None)
+		}
+		return move given
 	}
 
 	/// A function named as a value: its address, of a function type. A
@@ -876,6 +994,23 @@ extend Lowerer {
 						"`@inline` promises that every call to it is spliced into its caller, and a call through a value has no callee to splice",
 					).
 					withHelp("write a lambda that calls it, or remove `@inline`"),
+			)
+			return self.errorExpr(span)
+		}
+		// A value is called somewhere else, which would fill the implicits from
+		// there; a lambda fills them where it is written.
+		if self.program.fns[id].params.any((p) => p.implicit) {
+			self.report(
+				Diagnostic::error(
+					IMPLICIT_AS_VALUE,
+					"`\(name)` takes implicit parameters, so it cannot be a value",
+					span,
+					"taken as a value here",
+				).withSecondary(self.program.fns[id].span, "declared here").
+					withNote(
+						"a function value is called somewhere else, which would fill its implicits from there",
+					).
+					withHelp("write a lambda that calls it, `(x) => \(name)(x)`, which fills them where it is written"),
 			)
 			return self.errorExpr(span)
 		}

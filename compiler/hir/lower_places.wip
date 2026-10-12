@@ -28,8 +28,10 @@ fn writingCode(how: Writing): Code = match how {
 extend Lowerer {
 	fn placeRoot(id: ExprId): PlaceRoot = match self.state.body.exprs[id].kind {
 		.Local(local) => .Local(local)
-		// `p[i]`: C's memory, reached through the pointer the place holds.
-		.Index(base, ..) if self.kind(self.tyOf(base)) is .Ptr(..) => .ThroughPointer
+		// `p[i]` and `p[lo..hi]`: C's memory, reached through the pointer
+		// the place holds.
+		.Index(base, ..) | .SubSlice(base, ..) if self.kind(self.tyOf(base)) is .Ptr(..) =>
+			.ThroughPointer
 		.Field(base, ..) | .Index(base, ..) | .SubSlice(base, ..) => self.placeRoot(base)
 		.Deref(inner) => {
 			if self.state.body.exprs[inner].kind is .Table(id) then return .Table(id)
@@ -157,9 +159,7 @@ extend Lowerer {
 	/// writing half of the pair is missing, and the message says so.
 	fn noWritingTwin(place: ExprId, how: Writing): Option<Diagnostic> = {
 		val call = self.lendingCall(place)?
-		val .Call(callee, ..) = self.state.body.exprs[call].kind else {
-			return .None
-		}
+		val .Call(callee, ..) = self.state.body.exprs[call].kind else return .None
 		val def = &self.program.fns[callee]
 		if def.receiver != .Some(.Read) || self.writingTwin(callee).isSome() then return .None
 		val owner = self.typeName(def.owner?)
@@ -168,9 +168,7 @@ extend Lowerer {
 		for i in 1..def.params.len() {
 			params.push("\(self.text(def.params[i].name)): \(self.program.tyName(def.params[i].ty, self.interner))")
 		}
-		val .Ref(inner: pointee, ..) = self.kind(def.ret) else {
-			return .None
-		}
+		val .Ref(inner: pointee, ..) = self.kind(def.ret) else return .None
 		val lends = self.program.tyName(pointee, self.interner)
 		val diagnostic = Diagnostic::error(
 			writingCode(how),
@@ -198,16 +196,12 @@ extend Lowerer {
 		val .Call(callee, args, typeArgs, order) = self.state.body.exprs[call].kind.clone() else {
 			return false
 		}
-		val .Some(writer) = self.writingTwin(callee) else {
-			return false
-		}
+		val .Some(writer) = self.writingTwin(callee) else return false
 		// The receiver is lent for the call; it must be writable itself, and
 		// may be lent by an accessor in turn.
 		if !args.isEmpty() {
 			val arg = args[0]
-			val .Ref(inner) = self.state.body.exprs[arg].kind else {
-				return false
-			}
+			val .Ref(inner) = self.state.body.exprs[arg].kind else return false
 			if !self.writable(inner) && !self.retargetToWriter(inner) then return false
 			if !self.writable(inner) then return false
 			val innerTy = self.tyOf(inner)
@@ -215,9 +209,7 @@ extend Lowerer {
 			self.state.body.exprs[arg].ty = lent
 		}
 		// What the call lends is the same place, written rather than read.
-		val .Ref(inner: pointee, kind: .Shared) = self.kind(self.tyOf(call)) else {
-			return false
-		}
+		val .Ref(inner: pointee, kind: .Shared) = self.kind(self.tyOf(call)) else return false
 		val lent = self.intern(.Ref(inner: pointee, kind: .Var))
 		self.state.body.exprs[call].ty = lent
 		self.state.body.exprs[call].kind = .Call(
@@ -426,9 +418,7 @@ extend Lowerer {
 	/// The reference an assignment to `target` points somewhere else, where it
 	/// is one: a `var` holding a `&`, or what a `&var &T` parameter refers to.
 	var fn repointed(target: ast::ExprId): Option<ExprId> = {
-		val .Name(sym) = self.ast.exprs[target].kind else {
-			return .None
-		}
+		val .Name(sym) = self.ast.exprs[target].kind else return .None
 		val local = self.lookup(sym)?
 		val kind = self.state.body.locals[local].kind
 		val ty = self.state.body.locals[local].ty
@@ -494,7 +484,17 @@ extend Lowerer {
 			tys.retain((t) => t != placeTy)
 			if tys.len() == 1 then hint = tys[0]
 		}
-		val operand = self.operand(value, .Some(hint))
+		val given = self.operand(value, .Some(hint))
+		// A constant of another integer type is as the literal it stands for,
+		// as it is beside the place in `a + b`.
+		val operand = if binary !is .Shl | .Shr &&
+			self.tyOf(given) != placeTy &&
+			self.constantShaped(given) &&
+			self.constantFits(given, placeTy) {
+			self.constantAs(given, placeTy).unwrap()
+		} else {
+			given
+		}
 		// `<<=` and `>>=` take an amount of any integer type, as `<<` does.
 		val amount = self.shiftAmount(binary, place, operand)
 		val valueTy = self.tyOf(amount)
@@ -554,12 +554,8 @@ extend Lowerer {
 		span: Span,
 	): Option<ExprId> = {
 		val pointer = self.operand(base, .None)
-		val .Ptr(pointee) = self.kind(self.tyOf(pointer)) else {
-			return .None
-		}
-		val .Struct(id, ..) = self.kind(pointee) else {
-			return .None
-		}
+		val .Ptr(pointee) = self.kind(self.tyOf(pointer)) else return .None
+		val .Struct(id, ..) = self.kind(pointee) else return .None
 		if !self.program.structs[id].isOpaque then return .None
 		var found: Option<i64> = .None
 		for (i, f) in self.program.structs[id].fields.forwards().enumerate() {
@@ -704,14 +700,21 @@ extend Lowerer {
 		}
 		val b = self.operand(base, .None)
 		val ty = self.tyOf(b)
-		// A method is not a value yet, so `x.name` is not one either.
-		if self.ownerOf(ty) is .Some(owner) && self.methodOf(owner, name.sym) is .Some(method) {
+		// A method is not a value, so `x.name` is not one either. It is the
+		// field of that name where this module may read one: a field and a
+		// method may share a name, the method called with `()`.
+		if self.ownerOf(ty) is .Some(owner) &&
+			self.methodOf(owner, name.sym) is .Some(method) &&
+			!self.readsField(ty, name.sym) {
 			self.methodAsField(ty, owner, method, name)
 			return self.errorExpr(span)
 		}
 		// A block of slots says how many it has.
 		if self.kind(ty) is .Slots(..) && self.text(name.sym) == "count" then
 			return self.alloc(.Len(b), I64, span)
+		// A C string says whether it points at nothing, as a pointer does.
+		if self.kind(ty) is .Cstring && self.text(name.sym) == "isNull" then
+			return self.alloc(.IsNull(b), BOOL, span)
 		// A C pointer says whether it points at nothing.
 		if self.kind(ty) is .Ptr(pointee) {
 			if self.text(name.sym) == "isNull" then return self.alloc(.IsNull(b), BOOL, span)
@@ -755,6 +758,15 @@ extend Lowerer {
 			return self.errorExpr(span)
 		}
 		return self.fieldOf(b, ty, name, span)
+	}
+
+	/// Whether a value of type `ty` has a field `name` this module may read.
+	fn readsField(ty: Ty, name: Symbol): bool = {
+		val .Struct(id, ..) = self.kind(ty) else return false
+		for (i, f) in self.program.structs[id].fields.forwards().enumerate() {
+			if f.name == name then return self.fieldVisible(id, i)
+		}
+		return false
 	}
 
 	/// `x.name` where `name` is a method: not a value.
@@ -987,9 +999,7 @@ extend Lowerer {
 	var fn indexValue(e: ast::ExprId): ExprId = {
 		val id = self.operand(e, .Some(I64))
 		val ty = self.tyOf(id)
-		val .Int(int) = self.kind(ty) else {
-			return self.coerce(id, I64, .None)
-		}
+		val .Int(int) = self.kind(ty) else return self.coerce(id, I64, .None)
 		if ty == I64 then return id
 		val span = self.state.body.exprs[id].span
 		if int.bits() < 64 then return self.alloc(.Cast(id), I64, span)
@@ -999,9 +1009,7 @@ extend Lowerer {
 		if self.prelude is .Some(prelude) && self.modules[prelude].fns.get(&name) is .Some(found) {
 			callee = .Some(found)
 		}
-		val .Some(function) = callee else {
-			return self.coerce(id, I64, .None)
-		}
+		val .Some(function) = callee else return self.coerce(id, I64, .None)
 		val widened = if ty == wide then id else self.alloc(.Cast(id), wide, span)
 		return self.alloc(
 			.Call(
@@ -1100,10 +1108,31 @@ extend Lowerer {
 		// It is a value, so it needs no borrow.
 		if self.kind(ty) == .Str then
 			return self.alloc(.SubSlice(base: b, lo: low, hi: high), STR, span)
+		// A range of what a C pointer points at is as many elements as the
+		// program says, as `p[i]` is the one it says: C says nothing of how
+		// many there are, so the range says where it ends.
+		if self.kind(ty) is .Ptr(pointee) {
+			if !self.pointeeSized(pointee, ty, self.state.body.exprs[b].span) then
+				return self.errorExpr(span)
+			if high.isNone() {
+				self.report(
+					Diagnostic::error(
+						INVALID_INDEX,
+						"a range of what a pointer points at needs its end",
+						span,
+						"no end",
+					).withNote(
+						"C says nothing of how many elements a pointer points at, so only the program knows where they end: `p[0..count]`",
+					),
+				)
+				return self.errorExpr(span)
+			}
+		}
 		// A container whose `x[i]` is a position and which lends its elements
 		// as one slice is ranged as that slice: `v[a..b]` is
 		// `v.items()[a..b]`.
-		if self.kind(ty) !is .Array(..) | .Slice(..) | .Slots(..) && !self.isPoisoned(ty) {
+		if self.kind(ty) !is .Array(..) | .Slice(..) | .Slots(..) | .Ptr(..) &&
+			!self.isPoisoned(ty) {
 			match self.rangedItems(b, ty) {
 				.Ok(items) => {
 					b = items
@@ -1123,7 +1152,7 @@ extend Lowerer {
 			}
 		}
 		val elem = match self.kind(ty) {
-			.Array(elem: t, ..) | .Slice(elem: t) | .Slots(inner: t) => t
+			.Array(elem: t, ..) | .Slice(elem: t) | .Slots(inner: t) | .Ptr(inner: t) => t
 			_ => return self.errorExpr(span)
 		}
 		if !borrowed {

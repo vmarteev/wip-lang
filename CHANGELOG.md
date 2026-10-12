@@ -2,6 +2,106 @@
 
 Each version published, newest first.
 
+## 0.4.0 — 2026-10-12
+
+Programs written for 0.3 may need changes where marked **breaking**.
+
+**The language**
+
+- **Implicit parameters.** `fn roll(implicit dice: &var Dice)` is given,
+  where a call leaves it out, the caller's own implicit of that name: one
+  of its implicit parameters, or an `implicit val` or `var` in scope. What
+  a function needs is still in its signature; what is no longer written
+  is the same name at every call that only passes it on.
+- **A struct taken apart without its name,** by its fields' names in
+  parentheses, `val (x, y) = here`, as a tuple is by position.
+- **A field and a method may share a name:** `x.name` is the field, and
+  `x.name()` the method.
+- **A guard's `else` may be one jump or expression,** as an `if`'s
+  `then`: `val .Some(x) = found else return .None`.
+- **A literal takes the type of what is beside it** in an `if`'s other
+  branch, a `match`'s other arms and an array's other elements, as it
+  already did beside an operator: `if h == 0 then 1.0 else w as f32 / h
+  as f32` is an `f32`.
+- **An integer constant takes the integer type expected of it** where its
+  value fits, and is refused where it does not: a C library's `c_int`
+  flags are given where a field takes a `u32`.
+- **What a `for` loop's head makes lives as long as the loop,** whatever
+  it walks: `for (i, x) in TABLE.forwards().enumerate()` and
+  `for w in words().forwards()`. **Breaking:** an iterator over a
+  temporary, or over what a method of one lends, kept in a variable past
+  its statement is refused; it compiled before, and walked freed memory.
+- **A test may expect a panic:** `@test(panics)`, or `@test(panics =
+  "text")` for one whose message holds the text.
+- **`@align(n)` and `@packed`** lay out a struct, or a field, as a GPU's
+  buffers or a file's format do, and `c::offsetOf<T>("field")` says where
+  a field lies.
+- **A list in a constant** is kept once beside it, where a slice is
+  wanted.
+- **A reference parameter passed to a generic function** says what its
+  type argument is, as it does to any other function.
+- **Soundness. Breaking:** each of these compiled before, and read or
+  wrote memory it did not own. A `&` of a place behind a reference
+  parameter, stored in a `&var` one, holds what that reference holds; a
+  `var` method called on what a call answered through a `&` is refused,
+  and through a `&var` lends it again.
+
+**C**
+
+- **A call lends a place where C takes a pointer:** `&var count` for C to
+  write, `&x` for it to read, an array or a slice as its first element's
+  address, and `null` where C allows none. Out-parameters need no array
+  of one.
+- **A C struct's pointer field takes `&x` in its literal,** and the
+  struct borrows `x`: one used after `x` changed, or returned pointing at
+  a local, is refused.
+- **A `cstring` may be null,** as C's may: `null` is one, `isNull` and
+  `== null` ask, and reading a null one as text panics. **Breaking:**
+  `libc::getenv` answers a `cstring`.
+- **`&p[a..b]` is a slice of what a pointer points at,** as many elements
+  as the range says: memory a GPU maps, an image a decoder answers.
+- **An opaque C type may be a type argument,** of a generic that only
+  points at it; an instance that would hold a value of it is refused.
+- **C++ is built with a module:** a module's `.cpp` files are compiled as
+  C++, and `.mm` files as Objective-C++ on Apple's systems, with the C++
+  library linked.
+- **C is written only for what a program calls or names,** so a binding
+  of a newer header builds against an older one.
+- **A module's directory is searched for `#include "…"` alone.**
+  **Breaking:** C that included a module's own header with `<…>` names it
+  with quotes; a system's header is never a module's file of the same
+  name.
+- **`wip bindgen`** reads a pointer that is itself `const`, arrays of
+  arrays, a `#define` past an `i64`, `_Nullable` and `_Nonnull`, and the
+  structs another header declares; takes `-I` for the header's own
+  includes and `--pointer NAME` for a parameter that is a pointer for a
+  reason the header does not say; and writes an enumerator past an `int`
+  and a `static const` number as constants. **Breaking:** a binding
+  written again takes a struct C writes, or an array after its count, as
+  a `ptr<T>`, which a call gives `&var x`, an array or `null`.
+
+**The library**
+
+- **Encoding:** `@derive(Encode, Decode)` writes a value to JSON or to
+  `std::bytes`' binary format, and reads it back by its fields' names.
+- **Maths:** `std::math`'s vectors, matrices and quaternions, laid out as
+  a GPU reads them, with projections for each depth range; `Noise`;
+  `lerp`, `smoothstep` and the rest on `f32` and `f64`; `Random` draws
+  floats, directions, points, weighted choices and gaussians.
+- **A game's loop:** `time::FixedStep`, updates at a fixed rate whatever
+  the frames are; `future::Pool`, threads started once.
+- **Memory:** an allocator for a call, `mem::using`, and `mem::Arena`, a
+  frame's arena; `mem::onHeap`.
+- **Atomics** in every order, of floats and of pointers, and fences.
+- **`own<T>`** is extended as `T` is, and clones where `T` does;
+  `Vec.splitOff` and `Vec.append`.
+
+**Tools**
+
+- **`wip build -o`** makes the directory it writes into.
+- **The compiler is faster** in a release build: a cycle of calls is not
+  inlined into itself, and a struct taken by value is read where it is.
+
 ## 0.3.1 — 2026-10-10
 
 Programs written for 0.3.0 may need changes where marked **breaking**.

@@ -115,6 +115,23 @@ fn main() = {
 }
 ```
 
+Values that own memory are moved many at once: `splitOff(at)` answers the
+values from `at` on, in a vector of their own, and keeps those before it,
+and `append(values)` moves every value of another vector to the end, in
+order, leaving nothing behind it. Nothing is copied or cloned, and a
+`splitOff` past the end panics:
+
+```wip,run
+fn main() = {
+    var words = Vec::of(own [String::of("a"), String::of("b"), String::of("c")])
+    var rest = words.splitOff(1)
+    assert(words.len() == 1 && rest[0] == "b")
+    rest.append(Vec::of(own [String::of("d")]))
+    words.append(move rest)
+    assert(words.len() == 4 && words[3] == "d")
+}
+```
+
 Elements that are plain data are copied many at once, in one copy of the
 memory: `pushAll(items)` puts them at the end of a `Vec`,
 and a slice's `copyFrom(source)` makes each element the one at its index
@@ -299,9 +316,7 @@ fn main() = {
     assert(line.stripPrefix("#define ") == .Some("WIDTH 32"))
     assert(line.stripPrefix("#undef ").isNone())
     assert("shapes.h".stripSuffix(".h") == .Some("shapes"))
-    val .Some((name, value)) = "WIDTH 32".splitOnce(" ") else {
-        return
-    }
+    val .Some((name, value)) = "WIDTH 32".splitOnce(" ") else return
     assert(name == "WIDTH" && value == "32")
     assert("==title==".trimMatches("=") == "title")
     assert("k=v=w".splitn(2, "=").toVec() == Vec::of(own ["k", "v=w"]))
@@ -608,8 +623,8 @@ one writes, no other touches, and several may read one place.
 
 Two types change through a `&`, safely from any number of threads:
 `std::sync::Atomic<T>` — `load`, `store`, `swap`, `add`, `subtract` and
-`replaceIf`, each one step no thread sees half of — for `bool` and the
-integers, and `Mutex<T>`, whose `lock` lends what is inside as a `&var`
+`replaceIf`, each one step no thread sees half of — for `bool`, the
+integers and floats, and C pointers, and `Mutex<T>`, whose `lock` lends what is inside as a `&var`
 for its call alone, and whose `lockWhen` waits until it is ready:
 
 ```wip,run
@@ -650,8 +665,112 @@ fn main() = {
 }
 ```
 
+An atomic operation is sequentially consistent unless it is given an
+order: every thread agrees on one order of every such operation, which is
+what a counter or a flag needs and the easiest to get right. Code written
+lock-free names the weaker order it relies on, which costs less where the
+processor orders less by itself — on x86-64 a sequentially consistent
+store is a locked exchange, and a release store a plain one. A load takes
+a `LoadOrder` — `.Relaxed`, `.Acquire` or `.SeqCst` — a store a
+`StoreOrder` — `.Relaxed`, `.Release` or `.SeqCst` — and the rest an
+`Order`, any of the five, `.AcqRel` among them; an order an operation
+cannot take is a type error. `sync::fence(order)` orders this thread's
+reads and writes against other threads' atomics with nothing read or
+written. An `Atomic` also holds `f32` and `f64`, added to and taken from
+as floats, and a C pointer, `ptr<T>`; `replaceIf` compares what it holds
+bit for bit, so a NaN is the NaN it was:
+
+```wip,run
+import std::future
+import std::sync::{Atomic}
+
+// One writer and one reader: the writer fills the slot, then publishes it
+// with a release store; the reader acquires the count, then reads the slot.
+struct Mailbox {
+    slot: Atomic<i64> = Atomic::of(0)
+    sent: Atomic<i64> = Atomic::of(0)
+    read: Atomic<i64> = Atomic::of(0)
+}
+
+extend Mailbox {
+    fn send(value: i64) = {
+        val count = self.sent.load(order: .Relaxed)
+        while self.read.load(order: .Acquire) != count {}
+        self.slot.store(value, order: .Relaxed)
+        self.sent.store(count + 1, order: .Release)
+    }
+
+    fn receive(): i64 = {
+        val count = self.read.load(order: .Relaxed)
+        while self.sent.load(order: .Acquire) == count {}
+        val value = self.slot.load(order: .Relaxed)
+        self.read.store(count + 1, order: .Release)
+        return value
+    }
+}
+
+fn main() = {
+    val mailbox = Mailbox()
+    val (_, total) = future::together(
+        () => {
+            for i in 1..101 {
+                mailbox.send(i)
+            }
+        },
+        () => {
+            var total = 0
+            for _ in 0..100 {
+                total += mailbox.receive()
+            }
+            return total
+        },
+    )
+    assert(total == 5050)
+
+    val seconds = Atomic::of(0.0)
+    var frames = [0.25, 0.5, 0.25, 1.0]
+    future::each(&var frames, (frame) => { seconds.add(frame) })
+    assert(seconds.load() == 2.0)
+    assert(!seconds.replaceIf(-2.0, 0.0) && seconds.replaceIf(2.0, 0.0))
+}
+```
+
 A slice lends two parts of itself at once, which do not overlap, with
 `split(at, (first, second) => …)`: what `each` gives each thread.
+
+`future::each` and `future::map` start a thread for each part of every
+call, some tens of microseconds a call, which a game that splits its work
+every frame pays every frame. A `future::Pool` starts its threads once and
+keeps them: its `each` and `map` take and answer what the functions do,
+under the same rules on what the closures borrow, and hand the parts to
+threads that are already waiting, spinning a while before they sleep. Its
+end tells its threads to stop, and waits for them:
+
+```wip,run
+import std::future
+import std::future::{Pool}
+
+struct Body {
+    height: f64
+    speed: f64
+}
+
+fn main() = {
+    val pool = Pool::of(future::cores() - 1)
+    var bodies: Vec<Body> = Vec()
+    for i in 0..100 {
+        bodies.push(Body(height: i as f64, speed: 0.0))
+    }
+    for _ in 0..60 {
+        pool.each(&var bodies.items(), (body) => {
+            body.speed -= 9.8 / 60.0
+            body.height += body.speed / 60.0
+        })
+    }
+    val heights = pool.map(&bodies.items(), (body) => body.height)
+    assert(heights.len() == 100 && heights[99] < 99.0)
+}
+```
 
 ## A program's arguments: `std::args`
 
@@ -688,9 +807,7 @@ fn options(args: &[cstring]): Result<Options, ArgumentError> = {
 fn main() = {
     // What `main` would be given for `lines -vn 5 a.txt --lines=3`.
     val given: [cstring; 5] = ["lines", "-vn", "5", "a.txt", "--lines=3"]
-    val .Ok(read) = options(&given) else {
-        return
-    }
+    val .Ok(read) = options(&given) else return
     assert(read.count == 3 && read.verbose && read.files.len() == 1)
     val wrong: [cstring; 2] = ["lines", "-x"]
     assert(options(&wrong) is .Err(.UnknownOption(..)))
@@ -747,6 +864,32 @@ number is as likely as any other, and an empty range panics. `next()` is
 64 random bits, `float()` is from 0.0 up to 1.0, `bool()` is either, and
 `shuffle` puts a slice's elements in any order, each as likely. The
 generator is xoshiro256\*\*, with a seed spread through SplitMix64.
+
+What a game draws is there too: `floatIn(low, high)`, `f32()` and
+`f32In(low, high)`; `onCircle()` and `inDisk()` as `std::math`'s `Vec2`,
+and `onSphere()` and `inSphere()` as its `Vec3`, each point as likely as
+any other; `pick(&items)`, one of them, `.None` where there are none;
+`weighted(&weights)`, an index chosen as often as its weight is of their
+sum; and `gaussian(mean, deviation)`, a number from the bell curve:
+
+```wip,run
+import std::random::{Random}
+
+fn main() = {
+    var rng = Random::seeded(7)
+    val spark = rng.onSphere()
+    assert((spark.length() - 1.0).abs() < 0.0001, "a direction")
+    val drop = rng.f32In(-0.5, 0.5)
+    assert(drop >= -0.5 && drop < 0.5)
+    val loot = ["coin", "gem", "map"]
+    val .Some(found) = rng.pick(&loot) else panic("there is loot")
+    assert(found.len() >= 3)
+    val rare = rng.weighted([90.0, 9.0, 1.0]).unwrap()
+    assert(rare >= 0 && rare < 3)
+    val height = rng.gaussian(mean: 170.0, deviation: 8.0)
+    assert(height > 100.0 && height < 240.0)
+}
+```
 
 ## Other programs: `std::process`
 
@@ -1011,9 +1154,7 @@ import std::net::{Address, Listener, Stream}
 fn main() = {
     // Port 0: the system chooses one, and `localAddress` says which.
     val listener = Listener::tcp(.Some("127.0.0.1"), 0).unwrap()
-    val .Ok(.V4(port: port, ..)) = listener.localAddress() else {
-        return
-    }
+    val .Ok(.V4(port: port, ..)) = listener.localAddress() else return
     val (_, answer) = future::together(
         () => {
             val (stream, from) = listener.accept().unwrap()
@@ -1053,14 +1194,10 @@ either holds: no pattern backtracks without end.
 import std::regex::{Regex}
 
 fn main() = {
-    val .Ok(numbered) = Regex::new("(\\d+)") else {
-        return
-    }
+    val .Ok(numbered) = Regex::new("(\\d+)") else return
     assert(numbered.isMatch("img12.jpg"))
     assert(numbered.replaceAll("img12-3.jpg", "<$1>") == "img<12>-<3>.jpg")
-    val .Some(found) = numbered.find("a1b22") else {
-        return
-    }
+    val .Some(found) = numbered.find("a1b22") else return
     assert(found.start == 1 && found.group(1) == .Some((1, 2)))
     assert(Regex::new("(unclosed").isErr())
 }
@@ -1091,15 +1228,11 @@ fn main() = {
         return
     }
     assert("\(doc)" == "{\"name\":\"wip\",\"tags\":[1,2.5,null]}")
-    val .Object(fields) = doc else {
-        return
-    }
+    val .Object(fields) = doc else return
     assert(fields[0].0 == "name" && fields[0].1 == .Text(String::of("wip")))
     assert(fields[1].0 == "tags" && "\(fields[1].1)" == "[1,2.5,null]")
 
-    val .Err(error) = json::parse("[1,\n 2,]") else {
-        return
-    }
+    val .Err(error) = json::parse("[1,\n 2,]") else return
     assert("\(error)" == "expected a value, at line 2, column 4")
 
     // A field and an element, by reference, and what a value is.
@@ -1109,6 +1242,14 @@ fn main() = {
     assert(doc.get("size").isNone())
 }
 ```
+
+`json::encode(&value)` writes any value that implements `Encode` as JSON's
+text, and `json::decode<T>(text)` reads one that implements `Decode`,
+answering a `json::DecodeError` that says what was wrong and at which
+field ([page 8](08-interfaces.md)); `toJson` and `fromJson` do the same
+with a `Json` tree. A record is an object of its fields, an `Option` that
+is nothing a field left out, a map an object of its keys as text, and a
+variant its name, or an object of its name and its fields.
 
 A number is an `Int` where it is written without a fraction or an
 exponent and fits an `i64`, and a `Float` otherwise; a `Float` is written
@@ -1123,6 +1264,55 @@ What is there is read with `get(name)`, a field of an object, and
 and with `asText`, `asInt`, `asFloat`, `asBool`,
 `asArray` and `isNull`, which answer where the value is of that kind. A
 name written twice answers the one written last.
+
+## Bytes: `std::bytes`
+
+A model's file, a texture's header, a save and a packet are numbers laid
+out in bytes in a known order. A `bytes::Reader` reads them from a slice,
+`u8`, `i16le`, `u32be`, `f32le` and the rest, each answering nothing past
+the end, and `seek`s; a `bytes::Writer` appends them to a `Vec<u8>`, which
+`take()` hands over.
+
+`bytes::encode(&value)` writes any value that implements `Encode` in a
+binary format of its own, and `bytes::decode<T>(&bytes)` reads it back,
+answering a `BinaryError` that says what was wrong and at which byte. It
+holds what JSON does — a record keeps its fields' names, read in any
+order, so a save written by one version of a program loads in the next,
+which has a field more or one less — in less room, with whole numbers and
+lengths in as few bytes as they need, and with no text to parse:
+
+```wip,run
+import std::bytes
+import std::bytes::{Reader, Writer}
+
+@derive(Encode)
+struct SaveBefore {
+    name: String
+    lives: i64
+}
+
+@derive(Decode)
+struct Save {
+    name: String
+    level: i64 = 1
+}
+
+fn main() = {
+    var out = Writer()
+    out.u32le(0x46424C47)
+    out.f32le(0.5)
+    out.u16be(300)
+    val written = out.take()
+    var read = Reader::of(&written.items())
+    assert(read.u32le() == .Some(0x46424C47) && read.f32le() == .Some(0.5))
+    assert(read.u16be() == .Some(300) && read.u8().isNone())
+
+    val old = bytes::encode(SaveBefore(name: "ann", lives: 3))
+    val loaded = bytes::decode<Save>(&old.items()).unwrap()
+    assert(loaded.name == "ann" && loaded.level == 1)
+    assert(bytes::decode<Save>(&old.items()[0..4]).isErr())
+}
+```
 
 ## Files and directories
 
@@ -1144,9 +1334,7 @@ fn main() = {
         assert(entry.kind == .File || entry.isDirectory())
     }
 
-    val .Ok(about) = fs::meta("std/prelude/option.wip") else {
-        return
-    }
+    val .Ok(about) = fs::meta("std/prelude/option.wip") else return
     assert(about.isFile())
     assert(about.size > 0)
     assert(about.modified > 0) // seconds since 1970
@@ -1280,6 +1468,102 @@ the difference is worth. The branch that cannot be taken is folded away,
 but it still has to compile — which is the opposite trade to `@target`, and
 the reason both exist.
 
+## Vectors, matrices and rotations: `std::math`
+
+`std::math` has the geometry every game and every program that draws
+writes for itself. `Vec2`, `Vec3` and `Vec4` are vectors of `f32`, `x`,
+`y`, `z` and `w`, added, subtracted and negated, scaled by an `f32` on
+either side, and multiplied axis by axis; `dot`, `cross`, `length`,
+`normalized`, `lerp`, `reflect` and the rest are methods. `Quat` is a
+rotation, `Mat3` and `Mat4` matrices, and `Aabb`, `Ray`, `Plane` and
+`Sphere` the shapes they are tested against, a ray's `hit` answering how
+far along it a shape is first met.
+
+The conventions are OpenGL's, glam's and GLM's: right-handed, `y` up,
+angles in radians, a matrix stored a column at a time as a shader takes
+it, and multiplying a vector on its right, so that `a * b` does `b` first.
+A projection names the depth range it gives, since a wrong one draws
+nothing and says nothing: `perspective` and `orthographic` give OpenGL's
+`-1` to `1`, and `perspectiveZeroToOne` and `orthographicZeroToOne`
+Vulkan's, Metal's and Direct3D's `0` to `1`. Equality is exact;
+`approxEquals(other, tolerance)` is the comparison a test wants. A zero
+vector's `normalized()` is NaN, as IEEE's division answers, and
+`normalizedOr(fallback)` answers the fallback instead.
+
+Each type is laid out as C lays out its fields, so a value crosses to a C
+library as it is. `Vec2` and `Vec3` are aligned as their `f32`s are, a
+`Vec3` twelve bytes, as a vertex's position; `Vec4`, `Quat` and `Mat4` are
+aligned to 16, as a GPU's `vec4` and `mat4` and a SIMD register.
+
+`Noise` is Ken Perlin's improved noise, values that change smoothly from
+point to point, which terrain and clouds are made of: `Noise::perlin()`
+over his own permutation, or `Noise::seeded(seed)`, the same world for the
+same seed; `at2(x, y)` and `at3(x, y, z)` from -1 to 1, and `fractal2` and
+`fractal3`, the sum of octaves each finer and fainter than the last. The
+helpers a game writes are methods of `f64` and `f32` in the prelude:
+`lerp(to, t)`, `smoothstep(edge0, edge1)` and `fract()` as GLSL has them,
+`sign()`, `toRadians()` and `toDegrees()`; `PI_F32` and `TAU_F32` are `PI`
+and `TAU` for code in `f32`:
+
+```wip,run
+import std::math::{Noise, PI_F32}
+
+fn main() = {
+    val world = Noise::seeded(2026)
+    val ground = world.fractal2(12.5, 3.25, 5)
+    assert(ground >= -1.0 && ground <= 1.0)
+    assert(Noise::perlin().at3(3.14, 42.0, 7.0) == 0.13691995878400012)
+
+    val fade: f32 = 0.25
+    assert(fade.smoothstep(0.0, 1.0) == 0.15625)
+    assert((90.0 as f32).toRadians() == PI_F32 / 2.0)
+    assert(2.75.fract() == 0.75 && (2.0 as f32).lerp(10.0, 0.25) == 4.0)
+}
+```
+
+`Vec2d`, `Vec3d`, `Vec4d` and `Mat4d` are the same in `f64`, for a world
+larger than an `f32` keeps exact — a millimetre to about eight kilometres
+from the origin. A renderer takes positions `relativeTo` the camera, in
+`f32`, where they are exact again:
+
+```wip,run
+import std::math::{Aabb, Mat4, Mat4d, Quat, Ray, Vec3, Vec3d, Vec4}
+
+fn main() = {
+    val eye = Vec3::of(0.0, 2.0, 6.0)
+    val view = Mat4::lookAt(eye, target: Vec3::zero(), up: Vec3::unitY())
+    val aspect: f32 = 16.0 / 9.0
+    val projection = Mat4::perspectiveZeroToOne(1.0, aspect, 0.1, 100.0)
+    val spin = Quat::axisAngle(Vec3::unitY(), 0.5)
+    val moved = Mat4::translation(Vec3::unitX())
+    val model = moved * Mat4::rotation(spin)
+
+    // The origin, seen by the camera: straight ahead, down `-z`.
+    val ahead = Vec3::of(0.0, 0.0, -eye.length())
+    assert(view.transformPoint(Vec3::zero()).approxEquals(ahead, 0.0001))
+    val clip = projection * view * model * Vec4::unitW()
+    val depth = clip.z / clip.w
+    assert(depth > 0.0 && depth < 1.0, "between the near and far planes")
+
+    var position = Vec3::zero()
+    val velocity = Vec3::of(2.0, 0.0, -1.0)
+    position += velocity * 0.5
+    assert(position == Vec3::of(1.0, 0.0, -0.5))
+    val turned = spin * Vec3::unitX()
+    assert((turned.length() - 1.0).abs() < 0.0001, "it keeps lengths")
+
+    val crate = Aabb::of(Vec3::splat(-1.0), Vec3::splat(1.0))
+    val ray = Ray::of(Vec3::of(0.0, 0.0, 5.0), -Vec3::unitZ())
+    assert(crate.hit(ray) == .Some(4.0))
+
+    val ship = Vec3d::of(4.2e9, 0.0, 0.0)
+    val camera = Vec3d::of(4.2e9 - 3.5, 0.0, 0.0)
+    assert(ship.relativeTo(camera) == Vec3::of(3.5, 0.0, 0.0))
+    val placed = Mat4d::translation(ship).relativeTo(camera)
+    assert(placed.transformPoint(Vec3::zero()) == Vec3::of(3.5, 0.0, 0.0))
+}
+```
+
 ## The other modules
 
 | Module | What is in it |
@@ -1296,11 +1580,12 @@ the reason both exist.
 | `std::shared` | `Shared<T>` and `Weak<T>`: a value several owners hold and read |
 | `std::random` | `Random`: numbers seeded or from the system, not for cryptography |
 | `std::net` | `Listener`, `Stream` and `Address`: TCP and Unix-domain connections |
-| `std::math` | `PI`, `TAU` and `E`; the functions are methods of `f64` and `f32`, `x.sin()`, written in Wip so that a `@comptime` constant computes the program's bits |
+| `std::math` | `PI`, `TAU` and `E`, and the vectors, matrices, rotations and shapes above; the functions are methods of `f64` and `f32`, `x.sin()`, written in Wip so that a `@comptime` constant computes the program's bits |
 | `std::text` | `ParseError`, and the `Split`, `Lines` and `Chars` types the prelude's methods answer |
 | `std::iter` | `Walk`, `Forwards`, `Backwards`, `Taking` (what a `Vec` gives up to `for x in move v`), and the adapter types `Mapped`, `Filtered`, `FilterMapped`, `FlatMapped`, `Chained`, `Enumerated`, `Taken`, `TakenWhile`, `Skipped`, `Zipped`, `Peekable` |
 | `std::collections` | `Map`, `Set`, `MapEntry`, `Deque`, and `Arena` with its `Handle`, `ArenaEntry` and `ArenaValues` |
-| `std::time` | `Duration`, a length of time; `Instant`, a moment on a clock that only goes forward; `sleep`; `now`, the date it is; `Utc`, a moment as a calendar has it, and `Local`, as it has it where the program runs |
+| `std::time` | `Duration`, a length of time; `Instant`, a moment on a clock that only goes forward; `sleep`; `FixedStep`, a game's updates at a steady rate; `now`, the date it is; `Utc`, a moment as a calendar has it, and `Local`, as it has it where the program runs |
+| `std::bytes` | `Reader` and `Writer`, numbers read from bytes and written to them in a known order, and a binary format for `Encode` and `Decode` |
 | `std::libc` | the C library as std calls it: `printf`, `fwrite`, `stdout`, `read`, `open` and its flags, `getentropy`, `errno()` — C's, promising nothing C does not |
 
 ```wip,run
@@ -1333,6 +1618,38 @@ fn main() = {
     sleep(Duration::millis(5))
     assert(start.elapsed() >= Duration::millis(5))
     assert("\(Duration::millis(1500))" == "1.5s")
+}
+```
+
+A game updates its world at a steady rate, whatever rate it draws at, so
+that its physics is the same on a fast machine and a slow one. A
+`FixedStep` adds up real time with `advance()` once a frame; `due()`
+answers whether another update fits in what it has added up, and takes it;
+and `alpha()` is how far the frame is into the next update, from 0 to 1,
+which the drawing goes between the last two by. A frame adds at most a
+quarter of a second, so a stall — a breakpoint, a window dragged — runs
+no long catch-up after it. `advanceBy(duration)` adds a given time, as a
+test or a replay does:
+
+```wip,run
+import std::time::{Duration, FixedStep}
+
+fn main() = {
+    var step = FixedStep::of(60)
+    var height = 10.0
+    var updates = 0
+    step.advanceBy(Duration::millis(40))
+    while step.due() {
+        height -= 9.8 * step.seconds() * step.seconds()
+        updates += 1
+    }
+    assert(updates == 2 && step.alpha() > 0.39 && step.alpha() < 0.41)
+    step.advanceBy(Duration::seconds(3))
+    var caught = 0
+    while step.due() {
+        caught += 1
+    }
+    assert(caught == 15, "a quarter of a second, and no more")
 }
 ```
 

@@ -179,7 +179,7 @@ that led there, and a debugger sees only the names of functions.
 
 | Option | For |
 |---|---|
-| `-o name` | where to write it |
+| `-o name` | where to write it, making its directory if there is none |
 | `-I dir`, `-L dir` | where C headers and libraries are on this machine |
 | `--emit program\|static\|dynamic\|llvm-ir\|llvm-bc` | an executable, a library C links against, or the program's LLVM IR, as text or as bitcode |
 | `--header board.h` | write the C declarations of what the library exports |
@@ -372,6 +372,36 @@ the package's wherever the command is typed; a program without a
 `package.wip` runs them where the command is typed. A test that fails
 panics, which prints the message and ends the run: the unfinished line names
 the test, and the exit code is 101.
+
+A test may expect a panic. `@test(panics)` is one that must panic, and
+`@test(panics = "out of bounds")` one whose panic's message must hold that
+text, which a message built with numbers in it, `index 3 is out of bounds
+for length 3`, still does:
+
+```wip
+fn main() = {}
+
+@test(panics = "out of bounds")
+fn aVectorIsNotReadPastItsEnd() = {
+    val numbers = Vec::of(own [1, 2, 3])
+    numbers[3]
+}
+
+@test(panics)
+fn nothingIsNotUnwrapped() = {
+    val nothing: Option<i64> = .None
+    nothing.unwrap()
+}
+```
+
+Nothing catches a panic, so such a test runs in a process of its own: the
+test program, run again with the test's name in `WIP_TEST`, which runs that
+one test alone and prints nothing of its own. It passes where that process
+panicked as the test said, and what it printed there is not shown. It fails
+where the test returned, ended another way, or panicked with another
+message; the failure shows what the test printed and its panic, then why
+it failed and where the test is, and ends the run as any failure does. The
+tests around it run as the rest do, one after another in the one program.
 
 Tests check more than a program does. The program they are built into
 checks its moves: a value whose type has a `destroy` of its own is left

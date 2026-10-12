@@ -1,0 +1,152 @@
+// The runner a program built by `wip test` starts in. Its entry calls
+// `wip_tests_begin`, then `wip_test` or `wip_test_panics` for each test in
+// order, then `wip_tests_end`. A test runs where it is called, and a
+// failure ends the run, as a panic ends any program.
+//
+// A test that must panic runs in a process of its own, since nothing
+// catches a panic: this program, run again with the test's name in
+// `WIP_TEST`, which runs that test alone and prints nothing of its own.
+// The run goes on where that process panicked as the test said it would,
+// and fails where it returned, ended another way, or panicked with another
+// message. What it printed is shown where it fails.
+
+import std::io
+import std::libc::{exit}
+import std::process
+import std::process::{Command}
+
+/// The variable of the environment that names the one test a run runs.
+val ONLY: str = "WIP_TEST"
+
+/// The status a panic ends a program with.
+val PANICKED: i64 = 101
+
+/// The run's first line, where it runs every test.
+@export("C")
+fn wip_tests_begin(count: i64) = {
+	if only().isNone() then io::println("running \(count) \(tests(count))")
+}
+
+/// The run's last line, where every test held. Where one test was named,
+/// and none had its name, the run says so and fails.
+@export("C")
+fn wip_tests_end(count: i64) = {
+	if only() is .Some(name) {
+		io::eprintln("error: there is no test named `\(name)`")
+		exit(2)
+	}
+	io::println("\n\(count) \(tests(count)) passed")
+}
+
+/// A test that must return: run here, between its name and `ok`.
+@export("C")
+fn wip_test(name: str, run: () => void) = {
+	if only() is .Some(named) {
+		if named == name then alone(run)
+		return
+	}
+	io::print("test \(name) ... ")
+	run()
+	io::println("ok")
+}
+
+/// A test that must panic, with a message holding `holding`, which an
+/// empty text always does: run in a process of its own. A failure says
+/// where the test is, `file`, `line` and `column`.
+@export("C")
+fn wip_test_panics(name: str, run: () => void, holding: str, file: str, line: i64, column: i64) = {
+	if only() is .Some(named) {
+		if named == name then alone(run)
+		return
+	}
+	io::print("test \(name) ... ")
+	// What the program printed goes out before the test's process starts,
+	// so that the run shows where it is.
+	io::flush()
+	val expected =
+		if holding.isEmpty() then String::of("to panic")
+		else "to panic with a message holding \"\(holding)\""
+	val ran = match process::executable() {
+		.Ok(exe) => Command::of(exe).env(ONLY, name).unset("WIP_CHECK_LEAKS").output()
+		.Err(error) => .Err(error)
+	}
+	val output = match move ran {
+		.Ok(output) => move output
+		.Err(error) => failed(
+			"cannot run the test, \(expected), in a process of its own: \(error)",
+			file,
+			line,
+			column,
+		)
+	}
+	match output.exit {
+		.Code(code) if code == PANICKED => {
+			if panicMessage(output.stderr).contains(holding) {
+				io::println("ok")
+				return
+			}
+			shown(&output)
+			failed(
+				"the test was \(expected), and it panicked with another message",
+				file,
+				line,
+				column,
+			)
+		}
+		.Code(0) => {
+			shown(&output)
+			failed("the test was \(expected), and it returned", file, line, column)
+		}
+		ended => {
+			shown(&output)
+			failed("the test was \(expected), and it \(ended)", file, line, column)
+		}
+	}
+}
+
+/// The test the environment names, where it names one.
+fn only(): Option<String> = {
+	val named = io::env(ONLY)?
+	return if named.isEmpty() then .None else .Some(move named)
+}
+
+/// A test run by itself, in the process run for it, which ends with it: as
+/// a panic ends a program, where the test panics, and well where it
+/// returns.
+fn alone(run: () => void): never = {
+	run()
+	exit(0)
+}
+
+/// What a test's process printed, where the test failed: its standard
+/// output, then its standard error, the panic among it.
+fn shown(output: &process::Output) = {
+	io::print(output.stdout)
+	io::eprint(output.stderr)
+}
+
+/// A test that failed, and the run ended as a panic ends it: the message,
+/// and where the test is.
+fn failed(message: str, file: str, line: i64, column: i64): never = {
+	io::eprintln("panicked: \(message)\n  at \(file):\(line):\(column)")
+	exit(PANICKED as c_int)
+}
+
+/// A panic's message, from what its program wrote on its standard error:
+/// the text after the last `panicked: ` that begins a line, up to the line
+/// that says where. Nothing where no panic was written.
+fn panicMessage(written: str): str = {
+	val start = match written.findLast("\npanicked: ") {
+		.Some(at) => at + "\npanicked: ".len()
+		.None if written.startsWith("panicked: ") => "panicked: ".len()
+		.None => return ""
+	}
+	val rest = written[start..written.len()]
+	return match rest.find("\n  at ") {
+		.Some(end) => rest[0..end]
+		.None => rest
+	}
+}
+
+/// "test" or "tests", as `count` says.
+fn tests(count: i64): str = if count == 1 then "test" else "tests"

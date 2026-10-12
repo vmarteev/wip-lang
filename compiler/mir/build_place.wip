@@ -1,6 +1,6 @@
 // Places, and writing aggregates into memory.
 
-import hir::{BOOL, ExprId, I64, LocalId, PTR_U8, Ty, U64, evaluationOrder}
+import hir::{BOOL, ExprId, I64, LocalId, PTR_U8, StructId, Ty, U64, evaluationOrder}
 import syntax::{BinaryOp, Span}
 
 extend Builder {
@@ -47,6 +47,26 @@ extend Builder {
 
 	/// The place an expression denotes. Anything that is not a place is
 	/// evaluated into a temporary first, so `&f()` and `(Point { … }).x` work.
+	/// Whether the place `id` lies inside a packed struct before a reference
+	/// is followed, where its address may not be its type's alignment.
+	fn inPacked(id: ExprId): bool = {
+		var at = id
+		while true {
+			match self.hir.exprs[at].kind {
+				.Field(base, ..) => {
+					if self.program.types.kind(self.ty(base)) is .Struct(id: structId, ..) &&
+						self.program.structs[structId].packed {
+						return true
+					}
+					at = base
+				}
+				.Index(base, ..) | .SubSlice(base, ..) => at = base
+				_ => return false
+			}
+		}
+		return false
+	}
+
 	var fn place(id: ExprId): Place = {
 		val hir = self.hir
 		val expr = &hir.exprs[id]
@@ -69,6 +89,38 @@ extend Builder {
 				val local = self.localOf(move operand, I64)
 				self.checkUnsigned(.Ge, .Copy(Place::of(local)), move len, at)
 				elements.project(.Index(local))
+			}
+			// `&p[lo..hi]` through a C pointer: as many as the range says,
+			// which is checked only to be one, `0 <= lo <= hi`.
+			.SubSlice(base, lo, hi) if self.kind(self.ty(base)) is .Ptr(..) => {
+				val elements = self.place(base)
+				val low = match lo {
+					.Some(e) => self.scalar(e)
+					.None => Builder::int(0, I64)
+				}
+				val .Some(end) = hi else panic("a range of a pointer has its end")
+				val high = self.scalar(end)
+				// Unsigned, a negative start is after any end; an end below
+				// zero is checked as a signed number.
+				val startsAtZero = low is .Const(.Int(bits: 0, ..))
+				if !startsAtZero then self.checkUnsigned(.Gt, low.clone(), high.clone(), at)
+				val below = self.value(BOOL, .Binary(
+					op: .Lt,
+					lhs: high.clone(),
+					rhs: Builder::int(0, I64),
+				))
+				self.push(.Check(
+					fails: move below,
+					kind: .Bounds(index: high.clone(), length: Builder::int(0, I64)),
+					at: at,
+				))
+				val lowLocal = self.localOf(low.clone(), I64)
+				val start = self.value(PTR_U8, .AddressOf(elements.project(.Index(lowLocal))))
+				val count = self.value(I64, .Binary(op: .Sub, lhs: move high, rhs: move low))
+				val slice = Place::of(self.temp(expr.ty))
+				self.assign(slice.project(.Field(0)), .Use(move start))
+				self.assign(slice.project(.Field(1)), .Use(move count))
+				move slice
 			}
 			// `&xs[lo..hi]`: a new pointer and length, checked against the
 			// elements they are taken from.
@@ -194,6 +246,15 @@ extend Builder {
 		self.early.put(id, move value)
 	}
 
+	/// Whether the field `index` of the struct `id` is a C struct's pointer
+	/// that `value`, a slice, is lent to.
+	fn lentSliceToC(id: StructId, index: i64, value: ExprId): bool = {
+		val def = &self.program.structs[id]
+		if !def.isExtern || self.kind(def.fields[index].ty) !is .Ptr(..) then return false
+		val .Ref(inner, ..) = self.kind(self.ty(value)) else return false
+		return self.kind(inner) is .Slice(..)
+	}
+
 	/// The place of an array's or slice's elements, and how many there are.
 	var fn elements(base: ExprId): (Place, Operand) = match self.kind(self.ty(base)) {
 		.Array(len, ..) => (self.projectionBase(base), Builder::int(len as u128, I64))
@@ -239,12 +300,19 @@ extend Builder {
 				if field is .Some((index, value)) then
 					self.storeExpr(value, dest.project(.Field(index)))
 			}
-			.Struct(fields, order, ..) => {
+			.Struct(id: structId, fields, order) => {
 				var pending: Vec<i64> = Vec()
 				val ordered = evaluationOrder(&order, fields.len())
 				for (n, i) in ordered.forwards().enumerate() {
 					val part = dest.project(.Field(i as u32))
-					self.storeExpr(fields[i], part.clone())
+					// A slice lent to a C struct's pointer is its pointer,
+					// without its length.
+					if self.lentSliceToC(structId, i, fields[i]) {
+						val slice = self.aggregate(fields[i])
+						self.assign(part.clone(), .Use(.Copy(slice.project(.Field(0)))))
+					} else {
+						self.storeExpr(fields[i], part.clone())
+					}
 					if n + 1 < fields.len() then
 						self.pendingPart(move part, self.ty(fields[i]), &var pending)
 				}
@@ -329,9 +397,12 @@ extend Builder {
 				self.assign(move dest, .Use(.Copy(move src)))
 			}
 			// `s.toStr()`: C's pointer, and the length found by walking to the
-			// NUL.
+			// NUL, which a null one has none of.
 			.CstrToStr(inner) => {
 				val pointer = self.scalar(inner)
+				val zero = Builder::int(0, self.ty(inner))
+				val fails = self.value(BOOL, .Binary(op: .Eq, lhs: pointer.clone(), rhs: move zero))
+				self.push(.Check(fails: move fails, kind: .NullText, at: expr.span))
 				val length = self.value(I64, .CstrLen(pointer.clone()))
 				self.assign(dest.project(.Field(0)), .Use(move pointer))
 				self.assign(dest.project(.Field(1)), .Use(move length))
