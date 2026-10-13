@@ -21,6 +21,11 @@ pub enum Language {
 	ObjectiveC
 	CPlusPlus
 	ObjectiveCPlusPlus
+	/// Assembly, a `.s` file, assembled as it is written.
+	Assembly
+	/// Assembly that goes through the C preprocessor first, a `.S` file:
+	/// `#include`, `#define` and `#if`, with the module's `@define`s.
+	PreprocessedAssembly
 }
 
 extend Language {
@@ -32,12 +37,17 @@ extend Language {
 	/// Apple target and passed over elsewhere.
 	pub fn isApples(): bool = self is .ObjectiveC | .ObjectiveCPlusPlus
 
+	/// Whether it is assembly, which knows no C header and no standard.
+	pub fn isAssembly(): bool = self is .Assembly | .PreprocessedAssembly
+
 	/// What a C compiler's `-x` calls it.
 	fn flag(): str = match self {
 		.C => "c"
 		.ObjectiveC => "objective-c"
 		.CPlusPlus => "c++"
 		.ObjectiveCPlusPlus => "objective-c++"
+		.Assembly => "assembler"
+		.PreprocessedAssembly => "assembler-with-cpp"
 	}
 }
 
@@ -51,7 +61,8 @@ val CXX_STANDARD = "c++17"
 pub struct CFile {
 	pub var source: String
 	/// Objective-C for a `.m` file, C++ for a `.cpp`, `.cc` or `.cxx`,
-	/// Objective-C++ for a `.mm`, or what `@source` said.
+	/// Objective-C++ for a `.mm`, assembly for a `.s` or a `.S`, or what
+	/// `@source` said.
 	pub var language: Language
 	/// The C++ standard, where the module said one; C++17 otherwise.
 	pub var standard: Option<String>
@@ -67,7 +78,7 @@ pub struct CFile {
 
 extend CFile {
 	pub static fn c(source: String): CFile = CFile(
-		source: move source,
+		source: source,
 		language: .C,
 		standard: .None,
 		prefix: .None,
@@ -81,7 +92,7 @@ extend CFile {
 			.None => Language::C
 		}
 		return CFile(
-			source: move source,
+			source: source,
 			language: language,
 			standard: .None,
 			prefix: .None,
@@ -97,6 +108,8 @@ pub fn implied(source: str): Option<Language> = match path::extension(source) {
 	.Some("m") => .Some(.ObjectiveC)
 	.Some("cpp") | .Some("cc") | .Some("cxx") => .Some(.CPlusPlus)
 	.Some("mm") => .Some(.ObjectiveCPlusPlus)
+	.Some("s") => .Some(.Assembly)
+	.Some("S") => .Some(.PreprocessedAssembly)
 	_ => .None
 }
 
@@ -109,7 +122,7 @@ pub struct Compiled {
 
 /// Where the cache is: `$WIP_CACHE_DIR`, or the platform's cache directory.
 pub fn cacheDir(): String = {
-	if io::env("WIP_CACHE_DIR") is .Some(dir) && !dir.isEmpty() then return move dir
+	if io::env("WIP_CACHE_DIR") is .Some(dir) && !dir.isEmpty() then return dir
 	val home = io::env("HOME")
 	if TARGET_OS == "macos" && home is .Some(home) then
 		return path::join(home, "Library/Caches/wip")
@@ -158,13 +171,13 @@ fn sizeOf(path: str): i64 = {
 
 /// The system's temporary directory: `$TMPDIR`, or `/tmp`.
 fn temporaryRoot(): String = {
-	if io::env("TMPDIR") is .Some(dir) && !dir.isEmpty() then return move dir
+	if io::env("TMPDIR") is .Some(dir) && !dir.isEmpty() then return dir
 	return "/tmp"
 }
 
 /// The C compiler: `$CC`, or `cc`.
 pub fn compiler(): String = match io::env("CC") {
-	.Some(cc) => move cc
+	.Some(cc) => cc
 	.None => "cc"
 }
 
@@ -174,7 +187,7 @@ pub fn toolIdentity(cc: str): Vec<u8> = {
 	var id: Vec<u8> = Vec()
 	id.pushAll(&cc)
 	if Command::of(cc).arg("--version").output() is .Ok(output) then id.pushAll(&output.stdout)
-	return move id
+	return id
 }
 
 /// Writes generated C where its path depends only on what it says, so that
@@ -193,7 +206,7 @@ pub fn generated(cache: str, files: &[(str, str)], unique: &Unique): Result<Stri
 		if fs::makeDirs(dir) is .Err(error) then return .Err("cannot create `\(dir)`: \(error)")
 		writeAtomically(path, text, &unique)?
 	}
-	return .Ok(move dir)
+	return .Ok(dir)
 }
 
 /// Where a C file looks for the headers it includes. A module's own
@@ -241,10 +254,10 @@ pub fn compile(
 	var compiled = 0
 	for result in move results {
 		val (object, fresh) = result?
-		objects.push(move object)
+		objects.push(object)
 		if fresh then compiled += 1
 	}
-	return .Ok(Compiled(objects: move objects, compiled: compiled))
+	return .Ok(Compiled(objects: objects, compiled: compiled))
 }
 
 /// What tells a C compiler the processor a program is for, as GCC and Clang
@@ -295,11 +308,15 @@ fn flags(
 		}
 		args.push("-std=\(standard)")
 	}
-	// Before the prefix header, which may test them.
-	for define in file.defines {
-		args.push("-D\(define)")
+	// Before the prefix header, which may test them. Assembly that is not
+	// preprocessed has no use for either, and the header is C, which no
+	// assembly reads.
+	if file.language != Language::Assembly {
+		for define in file.defines {
+			args.push("-D\(define)")
+		}
 	}
-	if file.prefix is .Some(prefix) {
+	if file.prefix is .Some(prefix) && !file.language.isAssembly() {
 		args.push("-include")
 		args.push(prefix.clone())
 	}
@@ -311,7 +328,7 @@ fn flags(
 	for dir in includes.angled {
 		args.push("-I\(dir)")
 	}
-	return move args
+	return args
 }
 
 /// The object for `file`: the one kept, if what made it is unchanged, or a
@@ -325,11 +342,11 @@ fn objectFor(
 	unique: &Unique,
 ): Result<(String, bool), String> = {
 	val source = match fs::realPath(file.source) {
-		.Ok(source) => move source
+		.Ok(source) => source
 		.Err(error) => return .Err("cannot read `\(file.source)`: \(error)")
 	}
 	val text = match fs::readFile(source) {
-		.Ok(text) => move text
+		.Ok(text) => text
 		.Err(error) => return .Err("cannot read `\(source)`: \(error)")
 	}
 	var key = Sha256()
@@ -342,7 +359,7 @@ fn objectFor(
 	val key = hex(key.finish())
 	val object = path::join(objectsDir, "\(key).o")
 	val deps = path::join(objectsDir, "\(key).deps")
-	if isFile(object) && stillCurrent(deps) then return .Ok((move object, false))
+	if isFile(object) && stillCurrent(deps) then return .Ok((object, false))
 
 	// Compiled beside the entry under a name of its own, then renamed into
 	// place: a build running at the same time sees the old entry or the new
@@ -350,7 +367,7 @@ fn objectFor(
 	val suffix = unique.next()
 	val fresh = path::join(objectsDir, "\(key).\(suffix).o")
 	val made = path::join(objectsDir, "\(key).\(suffix).d")
-	var args = move flags
+	var args = flags
 	args.push(source.clone())
 	args.push("-o")
 	args.push(fresh.clone())
@@ -362,7 +379,7 @@ fn objectFor(
 		given.push(arg)
 	}
 	val result = match Command::of(cc).args(&given).output() {
-		.Ok(result) => move result
+		.Ok(result) => result
 		.Err(error) => return .Err("cannot run `\(cc)`: \(error)")
 	}
 	if !result.exit.success() {
@@ -378,7 +395,7 @@ fn objectFor(
 	var listing = String()
 	for header in headers {
 		val path = match fs::realPath(header) {
-			.Ok(path) => move path
+			.Ok(path) => path
 			.Err(..) => header.clone()
 		}
 		val .Some(stamp) = Stamp::of(path) else continue
@@ -389,7 +406,7 @@ fn objectFor(
 	if fs::rename(fresh, object) is .Err(error) then
 		return .Err("cannot keep `\(object)`: \(error)")
 	writeAtomically(deps, listing, &unique)?
-	return .Ok((move object, true))
+	return .Ok((object, true))
 }
 
 /// What a header was when an object was made from it.
@@ -437,30 +454,33 @@ fn stillCurrent(deps: str): bool = {
 fn dependencies(rule: str): Vec<String> = {
 	val joined = rule.replace("\\\r\n", " ").replace("\\\n", " ")
 	var out: Vec<String> = Vec()
-	val .Some(colon) = joined.toStr().find(": ") else return move out
+	val .Some(colon) = joined.toStr().find(": ") else return out
 	val after = joined.toStr()[colon + 2..joined.len()]
 	var current = String()
 	var i = 0
 	while i < after.len() {
 		val byte = after[i]
 		i += 1
-		if byte == b'\\' && i < after.len() && after[i] == b' ' {
-			current.pushByte(b' ')
-			i += 1
-		} else if byte == b'$' && i < after.len() && after[i] == b'$' {
-			current.pushByte(b'$')
-			i += 1
-		} else if byte is b' ' | b'\t' | b'\n' | b'\r' | 0x0B | 0x0C {
-			if !current.isEmpty() {
-				out.push(move current)
-				current = String()
+		when {
+			byte == b'\\' && i < after.len() && after[i] == b' ' => {
+				current.pushByte(b' ')
+				i += 1
 			}
-		} else {
-			current.pushByte(byte)
+			byte == b'$' && i < after.len() && after[i] == b'$' => {
+				current.pushByte(b'$')
+				i += 1
+			}
+			byte is b' ' | b'\t' | b'\n' | b'\r' | 0x0B | 0x0C => {
+				if !current.isEmpty() {
+					out.push(current)
+					current = String()
+				}
+			}
+			else => current.pushByte(byte)
 		}
 	}
-	if !current.isEmpty() then out.push(move current)
-	return move out
+	if !current.isEmpty() then out.push(current)
+	return out
 }
 
 /// Writes `text` to `path` by way of a name of its own, so a reader never

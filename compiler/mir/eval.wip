@@ -13,7 +13,19 @@
 
 import std::collections::{Map, Set}
 import std::shared::{Shared}
-import hir::{BOOL, ConstId, ConstValue, FnId, InterfaceId, Program, Ty, UnaryOp}
+import hir::{
+	BOOL,
+	ConstId,
+	ConstValue,
+	FnId,
+	InterfaceId,
+	Layouts,
+	Program,
+	Tag,
+	Ty,
+	UnaryOp,
+	isAggregate
+}
 import syntax::{
 	ASSERTION_FAILED,
 	BinaryOp,
@@ -79,16 +91,16 @@ pub fn evaluateWithin(
 				.Ok(address) => {
 					val ty = program.consts[id].ty
 					match machine.built(address, ty) {
-						.Ok(built) => values.push((id, move built))
+						.Ok(built) => values.push((id, built))
 						.Err(stop) => {
-							val failure = Failure(stop: move stop, calls: Vec())
-							if machine.report(.Constant(id), move failure, locate) is .Some(d) then
+							val failure = Failure(stop: stop, calls: Vec())
+							if machine.report(.Constant(id), failure, locate) is .Some(d) then
 								diagnostics.push(d.clone())
 						}
 					}
 				}
 				.Err(failure) => {
-					if machine.report(.Constant(id), move failure, locate) is .Some(d) then
+					if machine.report(.Constant(id), failure, locate) is .Some(d) then
 						diagnostics.push(d.clone())
 				}
 			}
@@ -100,7 +112,7 @@ pub fn evaluateWithin(
 			if machine.call(.Fn(id), Vec(), .None) is .Err(stop) {
 				val failure = Failure(stop: stop.clone(), calls: machine.stack())
 				machine.calls.clear()
-				if machine.report(.Assert(id), move failure, locate) is .Some(d) then
+				if machine.report(.Assert(id), failure, locate) is .Some(d) then
 					diagnostics.push(d.clone())
 			}
 		}
@@ -108,7 +120,7 @@ pub fn evaluateWithin(
 	for (id, built) in move values {
 		program.consts[id].value = .Some(built.intoValue(&var interner))
 	}
-	return move diagnostics
+	return diagnostics
 }
 
 /// A constant's value as the machine read it back, its strings not yet
@@ -144,7 +156,7 @@ fn allValues(parts: &[Built], interner: &var Interner): Vec<ConstValue> = {
 	for part in parts {
 		values.push(part.intoValue(&var interner))
 	}
-	return move values
+	return values
 }
 
 /// What was being run when something went wrong.
@@ -189,6 +201,13 @@ enum Callable {
 enum Arg {
 	Scalar(bits: u128)
 	Address(address: u64)
+}
+
+/// How a body's run ended: with its answer's bits, where it is a scalar, or
+/// by `become`, with the call that takes its place.
+enum Ran {
+	Answered(bits: Option<u128>)
+	Became(callee: FnId, args: Vec<Arg>)
 }
 
 /// One call being run: its body, and the address of each local.
@@ -260,7 +279,7 @@ extend Machine {
 		val .Some(code) = def.code else {
 			return match self.table(id) {
 				.Ok(address) => .Ok(address)
-				.Err(stop) => .Err(Failure(stop: move stop, calls: Vec()))
+				.Err(stop) => .Err(Failure(stop: stop, calls: Vec()))
 			}
 		}
 		if self.evaluating.contains(&id) {
@@ -285,7 +304,7 @@ extend Machine {
 				val calls = self.stack()
 				self.calls.truncate(depth)
 				self.failed.add(id)
-				Result::Err(Failure(stop: move stop, calls: move calls))
+				Result::Err(Failure(stop: stop, calls: calls))
 			}
 		}
 	}
@@ -394,12 +413,12 @@ extend Machine {
 				"stopped while the program was compiled",
 			).withNote("a constant or an assert may run \(self.budget) steps and use \(BYTES >> 20) MiB")
 		}
-		var noted = move diagnostic
+		var noted = diagnostic
 		for (function, at) in failure.calls {
 			val (file, line, _) = locate(at)
 			noted = noted.withNote("in \(function) (\(file):\(line))")
 		}
-		return .Some(move noted)
+		return .Some(noted)
 	}
 
 	/// The calls being run, innermost first.
@@ -408,7 +427,7 @@ extend Machine {
 		for call in self.calls.backwards() {
 			calls.push(call.clone())
 		}
-		return move calls
+		return calls
 	}
 
 	// --- Reading a value back --------------------------------------------
@@ -438,7 +457,7 @@ extend Machine {
 					for i in 0..count {
 						parts.push(self.built(address + i * stride, elem)?)
 					}
-					.Array(move parts)
+					.Array(parts)
 				}
 				.Struct(..) => {
 					val fields = program.fieldTys(ty)
@@ -447,7 +466,7 @@ extend Machine {
 						val offset = self.layouts.fieldOffset(program, ty, i as u32)
 						parts.push(self.built(address + offset as u64, field)?)
 					}
-					.Struct(move parts)
+					.Struct(parts)
 				}
 				.Enum(..) => {
 					val variant = self.variant(address, ty)?
@@ -457,7 +476,7 @@ extend Machine {
 						val offset = self.layouts.variantOffset(program, ty, variant, i as u32)
 						fields.push(self.built(address + offset as u64, field)?)
 					}
-					.Variant(variant: variant, fields: move fields)
+					.Variant(variant: variant, fields: fields)
 				}
 				.Ptr(..) if self.readWord(address)? == 0 => .Int(0)
 				_ => return .Err(
@@ -473,7 +492,7 @@ extend Machine {
 		if self.bodies.get(&callable) is .Some(body) then return .Ok(body.share())
 		val body = match callable {
 			.Fn(id) => match functionBody(self.program, self.interner, id) {
-				.Some(found) => move found
+				.Some(found) => found
 				.None => return .Err(
 					.Cannot("calls `\(self.program.fnName(id, self.interner))`, which has no body to run"),
 				)
@@ -481,9 +500,9 @@ extend Machine {
 			.Drop(ty) => lowerDropFn(self.program, self.interner, ty)
 			.DropInPlace(ty) => lowerDropInPlaceFn(self.program, self.interner, ty)
 		}
-		val shared = Shared::of(move body)
+		val shared = Shared::of(body)
 		self.bodies.put(callable.clone(), shared.share())
-		return .Ok(move shared)
+		return .Ok(shared)
 	}
 
 	fn nameOf(callable: &Callable): String = match callable {
@@ -498,53 +517,70 @@ extend Machine {
 		args: Vec<Arg>,
 		ret: Option<u64>,
 	): Result<Option<u128>, Stop> = {
-		if callable is .Fn(id) {
-			val def = &self.program.fns[id]
-			if def.isExtern || def.accesses.isSome() || def.variadicOf.isSome() then
-				return self.cCall(id, &args)
-		}
-		val body = self.body(callable.clone())?
-		val name = self.nameOf(&callable)
-		val at = match callable {
-			.Fn(id) => self.program.fns[id].span
-			_ => Span::at(0)
-		}
-		self.calls.push((move name, at))
-		var frame = Frame(body: body.share(), locals: Vec(), owned: Vec())
-		var next = 0
-		for decl in body.value().locals {
-			val aggregate = isAggregate(self.program, decl.ty)
-			val address = if decl.kind == .Param && aggregate {
-				val .Address(given) = args[next] else {
-					panic("an aggregate argument is passed by address")
+		var calling = callable
+		var given = args
+		while true {
+			if calling is .Fn(id) {
+				val def = &self.program.fns[id]
+				if def.isExtern || def.accesses.isSome() || def.variadicOf.isSome() then
+					return self.cCall(id, &given)
+			}
+			val body = self.body(calling.clone())?
+			val name = self.nameOf(&calling)
+			val at = match calling {
+				.Fn(id) => self.program.fns[id].span
+				_ => Span::at(0)
+			}
+			self.calls.push((name, at))
+			var frame = Frame(body: body.share(), locals: Vec(), owned: Vec())
+			var next = 0
+			for decl in body.value().locals {
+				val aggregate = isAggregate(self.program, decl.ty)
+				val address = when {
+					decl.kind == .Param && aggregate => {
+						val .Address(address) = given[next] else {
+							panic("an aggregate argument is passed by address")
+						}
+						next += 1
+						address
+					}
+					decl.kind == .Return && aggregate && ret.isSome() => ret.unwrap()
+					else => {
+						val size = self.size(decl.ty).max(1)
+						val made = self.alloc(size)?
+						frame.owned.push((made, size))
+						made
+					}
 				}
-				next += 1
-				given
-			} else if decl.kind == .Return && aggregate && ret.isSome() {
-				ret.unwrap()
-			} else {
-				val size = self.size(decl.ty).max(1)
-				val made = self.alloc(size)?
-				frame.owned.push((made, size))
-				made
+				frame.locals.push(address)
+				if decl.kind == .Param && !aggregate {
+					val .Scalar(bits) = given[next] else {
+						panic("a scalar argument is passed by value")
+					}
+					next += 1
+					self.store(address, decl.ty, bits)?
+				}
 			}
-			frame.locals.push(address)
-			if decl.kind == .Param && !aggregate {
-				val .Scalar(bits) = args[next] else panic("a scalar argument is passed by value")
-				next += 1
-				self.store(address, decl.ty, bits)?
+			val ran = self.run(&frame)?
+			for (address, size) in frame.owned {
+				self.release(address, size)
+			}
+			self.calls.pop()
+			match move ran {
+				.Answered(bits) => return .Ok(bits)
+				// The call that takes this one's place, its frame gone: its
+				// answer is this call's, into the same place.
+				.Became(callee, args: next) => {
+					calling = .Fn(callee)
+					given = next
+				}
 			}
 		}
-		val answer = self.run(&frame)?
-		for (address, size) in frame.owned {
-			self.release(address, size)
-		}
-		self.calls.pop()
-		return .Ok(answer)
+		return .Ok(.None)
 	}
 
-	/// Runs a body from its first block to a `return`.
-	var fn run(frame: &Frame): Result<Option<u128>, Stop> = {
+	/// Runs a body from its first block to a `return`, or to a `become`.
+	var fn run(frame: &Frame): Result<Ran, Stop> = {
 		val body: &Body = &frame.body.value()
 		var block = BlockId(0)
 		while true {
@@ -573,9 +609,16 @@ extend Machine {
 				.Return => {
 					if body.ret is .Some(ret) && !isAggregate(self.program, body.local(ret).ty) {
 						val ty = body.local(ret).ty
-						return .Ok(.Some(self.load(frame.locals[ret.index as i64], ty)?))
+						return .Ok(.Answered(.Some(self.load(frame.locals[ret.index as i64], ty)?)))
 					}
-					return .Ok(.None)
+					return .Ok(.Answered(.None))
+				}
+				.TailCall(callee, args) => {
+					var values: Vec<Arg> = Vec()
+					for arg in args {
+						values.push(self.arg(&frame, &arg)?)
+					}
+					return .Ok(.Became(callee: callee, args: values))
 				}
 				.Panic(note, message, at) => {
 					var text = String()
@@ -586,12 +629,12 @@ extend Machine {
 						text.push(self.text(pointer, length)?)
 					}
 					if message is .Some(m) then text.push(self.interner.resolve(m))
-					return .Err(.Panic(message: move text, at: at))
+					return .Err(.Panic(message: text, at: at))
 				}
 				.Unreachable => return .Err(.Cannot("reached code that no path was to reach"))
 			}
 		}
-		return .Ok(.None)
+		return .Ok(.Answered(.None))
 	}
 
 	var fn step(): Result<void, Stop> = {
@@ -687,11 +730,11 @@ extend Machine {
 				val answer = match callee {
 					.StrCmp => Option::Some(self.strCmp(&values)?)
 					.StrEq => Option::Some(self.strEq(&values)?)
-					.Fn(id) => self.call(.Fn(id), move values, ret)?
+					.Fn(id) => self.call(.Fn(id), values, ret)?
 					.Value(value) => {
 						val address = self.scalar(&frame, &value)? as u64
 						val callable = self.callable(address)?
-						self.call(move callable, move values, ret)?
+						self.call(move callable, values, ret)?
 					}
 				}
 				if !aggregate &&
@@ -790,7 +833,7 @@ extend Machine {
 					.NullText => "a null C string read as text"
 					.Overflow(op) => overflowMessage(op)
 				}
-				return .Err(.Panic(message: move message, at: at))
+				return .Err(.Panic(message: message, at: at))
 			}
 		}
 		return .Ok()
@@ -1322,7 +1365,7 @@ fn hex(value: u64): String = {
 		i -= 1
 		text.pushByte(reversed[i])
 	}
-	return move text
+	return text
 }
 
 /// Bytes as text, each run of them that is not UTF-8 read as one U+FFFD: the
@@ -1369,7 +1412,7 @@ fn lossy(bytes: &[u8]): String = {
 		if valid then text.pushBytes(&bytes[i..(i + taken)]) else text.pushChar('\u{FFFD}')
 		i += taken
 	}
-	return move text
+	return text
 }
 
 // --- Arithmetic, as the code generator does it -----------------------------

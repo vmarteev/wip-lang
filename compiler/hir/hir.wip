@@ -148,7 +148,7 @@ extend Program {
 		impls: Vec(),
 		vtables: Vec(),
 		asserts: Vec(),
-		modules: move modules,
+		modules: modules,
 		structs: Arena(),
 		enums: Arena(),
 		fns: Arena(),
@@ -370,7 +370,7 @@ extend Program {
 				tys.push(t)
 			}
 		}
-		return move tys
+		return tys
 	}
 
 	/// The type of field `field` of variant `variant` of an enum type.
@@ -392,9 +392,9 @@ extend Program {
 			for f in 0..variants[v].fields.len() {
 				tys.push(self.variantFieldTy(ty, v as u32, f as u32))
 			}
-			all.push(move tys)
+			all.push(tys)
 		}
-		return move all
+		return all
 	}
 
 	/// Whether a type cleans up after itself: it implements `Destroy`, and
@@ -430,6 +430,41 @@ extend Program {
 		}
 		for i in self.impls {
 			if i.interfaceId == interfaceId && i.ty == owner then return true
+		}
+		return false
+	}
+
+	/// Whether `ty` implements `interfaceId` where the implementation's
+	/// conditions on its parameters hold too: `own<T>` is `Clone` where `T`
+	/// is. A condition's own arguments are not looked at.
+	pub fn implementsWhere(ty: Ty, interfaceId: InterfaceId): bool = {
+		if self.isClone(interfaceId) && self.clonesByCopy(ty) then return true
+		if self.referred(ty) is .Some(inner) then
+			return self.answeredThroughReferences(interfaceId) &&
+				self.implementsWhere(inner, interfaceId)
+		val args: Vec<Ty> = match self.types.kind(ty) {
+			.Struct(args, ..) | .Enum(args, ..) => self.types.list(args).toVec()
+			.Own(inner) | .Slice(elem: inner) | .Slots(inner) => Vec::of(own [inner])
+			_ => Vec()
+		}
+		val owner: TypeDef = match self.typeDef(ty) {
+			.Some(def) => def
+			.None => match BuiltinOwner::of(self.types.kind(ty)) {
+				.Some(builtin) => .Builtin(builtin)
+				.None => return false
+			}
+		}
+		for i in self.impls {
+			if i.interfaceId != interfaceId || i.ty != owner then continue
+			var holds = true
+			for (at, condition) in i.conditions.forwards().enumerate() {
+				if at >= args.len() then break
+				if condition.copy && !self.clonesByCopy(args[at]) then holds = false
+				for constraint in condition.interfaces {
+					if !self.implementsWhere(args[at], constraint.interfaceId) then holds = false
+				}
+			}
+			if holds then return true
 		}
 		return false
 	}
@@ -1069,6 +1104,9 @@ pub enum Intrinsic {
 	/// `c::pointerTo(values)`: the address of a slice's first element, for C
 	/// to read.
 	SlicePointer
+	/// `c::bytesOf(&value)`: a value's bytes, as a slice of its address and
+	/// its size, which the layout decides.
+	ValueBytes
 	/// `x.toBits()` and `f64::fromBits(bits)`: a float's bits as the unsigned
 	/// integer of its width, and back.
 	FloatToBits
@@ -1404,6 +1442,9 @@ pub struct Body {
 	/// The calls of a `@tailrec` function to itself, which are compiled as a
 	/// jump back to the top rather than a call.
 	pub var tailCalls: Vec<ExprId> = Vec()
+	/// The calls a `become` makes, each of which takes this function's frame:
+	/// it leaves the function, and calls in its place.
+	pub var becomes: Vec<ExprId> = Vec()
 }
 
 extend Body {
@@ -1411,6 +1452,14 @@ extend Body {
 	pub fn valueId(): ExprId = match self.value {
 		.Some(value) => value
 		.None => panic("a checked body has a value")
+	}
+
+	/// Makes the place `id` a move of what it was: a place given away where
+	/// it is used, which empties it as `move` does. Whatever held `id` now
+	/// holds the move.
+	pub var fn moveAt(id: ExprId) = {
+		val place = self.exprs.add(self.exprs[id].clone())
+		self.exprs[id].kind = .Move(place)
 	}
 
 	/// Renumbers every type in the body. Only locals and expressions hold
@@ -1430,15 +1479,15 @@ extend Body {
 			self.exprs[id].kind = match self.exprs[id].kind.clone() {
 				.Call(callee, args, typeArgs, order) => .Call(
 					callee: callee,
-					args: move args,
+					args: args,
 					typeArgs: mapList(typeArgs),
-					order: move order,
+					order: order,
 				)
 				.FnRef(id: fnId, typeArgs) => .FnRef(id: fnId, typeArgs: mapList(typeArgs))
 				// The code's type as it is called.
 				.CallClosure(callee, args, codeTy) => .CallClosure(
 					callee: callee,
-					args: move args,
+					args: args,
 					codeTy: map(codeTy),
 				)
 				// The environment whose drop function this is.
@@ -1448,10 +1497,10 @@ extend Body {
 					interfaceId: interfaceId,
 					index: index,
 					fnTy: map(fnTy),
-					args: move args,
-					order: move order,
+					args: args,
+					order: order,
 				)
-				other => move other
+				other => other
 			}
 		}
 	}
@@ -1564,7 +1613,7 @@ extend StmtKind {
 		.ForElements(binding, ..) => {
 			var locals: Vec<LocalId> = Vec()
 			binding.locals(&var locals)
-			move locals
+			locals
 		}
 		_ => Vec()
 	}
@@ -1718,14 +1767,14 @@ pub fn evaluationOrder(order: &[u32], len: i64): Vec<i64> = {
 	for i in 0..len {
 		indices.push(if i < order.len() then order[i] as i64 else i)
 	}
-	return move indices
+	return indices
 }
 
 /// The `order` of operands evaluated in the sequence `written`, a list of
 /// their indices: empty when that is already `0, 1, …`.
 pub fn orderOf(written: Vec<u32>): Vec<u32> = {
 	for (i, j) in written.forwards().enumerate() {
-		if i as u32 != j then return move written
+		if i as u32 != j then return written
 	}
 	return Vec()
 }
@@ -1764,7 +1813,7 @@ extend ExprKind {
 			var parts = Vec::of(own [base])
 			if lo is .Some(lo) then parts.push(lo)
 			if hi is .Some(hi) then parts.push(hi)
-			move parts
+			parts
 		}
 		.Union(field, ..) => match field {
 			.Some((_, e)) => Vec::of(own [e])
@@ -1777,7 +1826,7 @@ extend ExprKind {
 			for a in args {
 				parts.push(a)
 			}
-			move parts
+			parts
 		}
 		.Block(..) => Vec()
 	}
@@ -1906,7 +1955,7 @@ extend Pattern {
 				}
 			}
 		}
-		return move out
+		return out
 	}
 
 	/// The locals this pattern declares, at any depth.

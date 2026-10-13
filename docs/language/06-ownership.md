@@ -15,10 +15,15 @@ its fields, and nothing in it cleans up after itself. Numbers, `bool`,
 data.
 
 Everything else **moves**: giving it to something else hands over the
-ownership, and the place it came from no longer holds it. A move out of a
-place is written `move`, so that reading a name never quietly empties it:
+ownership, and the place it came from no longer holds it. A place that is
+not plain data, used as a value — given as an argument, a field or an
+element, returned, assigned, or the value of a block or an arm — is moved
+there. Nothing marks it, since nothing else could be meant: such a value is
+never copied.
 
 ```wip,run
+fn kept(text: String): String = text
+
 fn main() = {
     // Plain data is copied, and both names hold a value.
     val first = [1, 2, 3]
@@ -26,15 +31,32 @@ fn main() = {
     assert(first[0] == second[0])
 
     // A `String` owns its bytes, so handing it over is a move.
-    var text = String::of("held")
-    val taken = move text
+    val text = String::of("held")
+    val taken = kept(text)
     assert(taken == "held")
 }
 ```
 
-Reading a moved-out place is refused, and the message says where it was
-moved. A temporary — the result of a call, a literal — is already moved
-where it is used, so `move` is not written on one.
+So a place given away is used there for the last time. Using it again is
+refused, and the message says where it was given:
+
+```wip,error=E0404
+fn main() = {
+    val text = String::of("held")
+    val taken = text
+    assert(text.len() == 4) // `text` was given to `taken` above
+}
+```
+
+Where a place alone is read rather than given, nothing moves: a method's
+receiver, an operand, an interpolation, and `&place`, which lends it. A
+`match`, a `for` and a pattern look into the place they are given, binding
+its parts and walking its elements where they are; `match move v`, `for x
+in move v` and `val pattern = move v` take it apart instead
+([page 5](05-patterns.md)). Those are where `move` is written. Anywhere
+else, on a place that owns memory, it says what happens anyway, and is a
+warning (E0451) whose fix removes it. A temporary — the result of a call, a
+literal — is moved where it is used, as a place is.
 
 ## `own<T>`
 
@@ -124,9 +146,9 @@ fn main() = {
 }
 ```
 
-A value may be ended early with `destroy(move value)`, and what it holds is
+A value may be ended early with `destroy(value)`, and what it holds is
 ended then and there. A type with a `Destroy` is never plain data, so it is
-moved rather than copied, and it cannot be copied out of a place that is
+moved rather than copied, and it cannot be moved out of a place that is
 only borrowed.
 
 ## `defer`
@@ -193,7 +215,7 @@ fn main() = {
     var loaded: Vec<own<Asset>> = Vec()
     for round in 0..3 {
         val drawn = mem::using(&var frame, () => {
-            var visible: Vec<i64> = Vec()
+            var visible = Vec()
             for i in 0..100 {
                 if i % 3 == 0 then visible.push(i)
             }

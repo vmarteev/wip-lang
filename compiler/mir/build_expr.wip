@@ -10,14 +10,14 @@ extend Builder {
 	/// A scalar expression's value, read now: a place is copied into a
 	/// temporary, so that a later operand cannot change what this one read.
 	var fn scalar(id: ExprId): Operand = match self.expr(id) {
-		.Scalar(operand) => move operand
+		.Scalar(operand) => operand
 		_ => panic("expected a scalar expression")
 	}
 
 	var fn expr(id: ExprId): Value = {
 		// Worked out already, where its place was written.
 		match self.early.remove(&id) {
-			.Some(value) => return move value
+			.Some(value) => return value
 			.None => {}
 		}
 		val hir = self.hir
@@ -33,7 +33,7 @@ extend Builder {
 			.Zeroed => {
 				val zero = Place::of(self.temp(expr.ty))
 				self.push(.Zero(zero.clone()))
-				Value::Scalar(.Copy(move zero))
+				Value::Scalar(.Copy(zero))
 			}
 			// Two strings, compared by their bytes in the runtime.
 			.StrCmp(lhs, rhs) => {
@@ -50,7 +50,7 @@ extend Builder {
 					]),
 					dest: .Some(order.clone()),
 				))
-				Value::Scalar(.Copy(move order))
+				Value::Scalar(.Copy(order))
 			}
 			// Whether two strings hold the same bytes, in the runtime.
 			.StrEq(lhs, rhs) => {
@@ -67,25 +67,30 @@ extend Builder {
 					]),
 					dest: .Some(same.clone()),
 				))
-				Value::Scalar(.Copy(move same))
+				Value::Scalar(.Copy(same))
 			}
 			.IsNull(inner) => {
 				val ty = self.ty(inner)
 				val pointer = self.scalar(inner)
 				val zero = Builder::int(0, ty)
-				.Scalar(self.value(BOOL, .Binary(op: .Eq, lhs: move pointer, rhs: move zero)))
+				.Scalar(self.value(BOOL, .Binary(op: .Eq, lhs: pointer, rhs: zero)))
 			}
 			.Str(symbol) => .Scalar(.Const(.CStr(symbol)))
 			.Table(id: table) => .Scalar(.Const(.Table(id: table, ty: expr.ty)))
 			.Local(..) | .Field(..) | .Index(..) | .Deref(..) => {
 				if !self.isScalar(expr.ty) then return .Unit
 				val place = self.place(id)
-				.Scalar(self.value(expr.ty, .Use(.Copy(move place))))
+				.Scalar(self.value(expr.ty, .Use(.Copy(place))))
 			}
 			// A `@tailrec` function's call to itself: the arguments become the
 			// parameters, and control goes back to the top.
 			.Call(args, order, ..) if self.hir.tailCalls.contains(&id) => {
 				self.tailCall(&args, &order)
+				Value::Unit
+			}
+			// `become f(x)`: the call takes this function's place.
+			.Call(callee, args, order, ..) if self.hir.becomes.contains(&id) => {
+				self.becomeCall(callee, &args, &order)
 				Value::Unit
 			}
 			// A body the compiler writes.
@@ -107,7 +112,7 @@ extend Builder {
 			// The function value is found first, then the arguments.
 			.CallValue(callee, args) => {
 				val function = self.scalar(callee)
-				self.call(.Value(move function), expr.ty, &args, &NO_ORDER, .None)
+				self.call(.Value(function), expr.ty, &args, &NO_ORDER, .None)
 			}
 			.FnRef(id: function, ..) => .Scalar(.Const(.Fn(id: function, ty: expr.ty)))
 			// A projection lends the place: its address is the result, and it
@@ -120,7 +125,7 @@ extend Builder {
 					self.storeExpr(place, Place::of(ret))
 				} else {
 					val found = self.place(place)
-					self.assign(Place::of(ret), .AddressOf(move found))
+					self.assign(Place::of(ret), .AddressOf(found))
 				}
 				self.dropTemps(0)
 				self.dropAllScopes()
@@ -136,18 +141,14 @@ extend Builder {
 					// Nothing but zero may be negated unsigned.
 					val mostNegative: u128 = if int.signed() then 1 << (int.bits() - 1) else 1
 					val edge = Builder::int(mostNegative, expr.ty)
-					val fails = self.value(BOOL, .Binary(
-						op: .Eq,
-						lhs: value.clone(),
-						rhs: move edge,
-					))
-					self.push(.Check(fails: move fails, kind: .Overflow(.Sub), at: at))
+					val fails = self.value(BOOL, .Binary(op: .Eq, lhs: value.clone(), rhs: edge))
+					self.push(.Check(fails: fails, kind: .Overflow(.Sub), at: at))
 				}
-				.Scalar(self.value(expr.ty, .Unary(op: .Neg, operand: move value)))
+				.Scalar(self.value(expr.ty, .Unary(op: .Neg, operand: value)))
 			}
 			.Unary(op, operand) => {
 				val value = self.scalar(operand)
-				.Scalar(self.value(expr.ty, .Unary(op: op, operand: move value)))
+				.Scalar(self.value(expr.ty, .Unary(op: op, operand: value)))
 			}
 			.Binary(op, lhs, rhs, wrapping) => .Scalar(self.binary(op, lhs, rhs, wrapping, expr.ty))
 			// `place = value`: what the place's expression computes, then the
@@ -168,15 +169,8 @@ extend Builder {
 						val at = self.span(value)
 						val old = self.value(placeTy, .Use(.Copy(dest.clone())))
 						val given = self.scalar(value)
-						val answer = self.arithmetic(
-							operator,
-							move old,
-							move given,
-							wrapping,
-							placeTy,
-							at,
-						)
-						self.assign(move dest, .Use(move answer))
+						val answer = self.arithmetic(operator, old, given, wrapping, placeTy, at)
+						self.assign(dest, .Use(answer))
 					}
 					.None if self.isAggregate(placeTy) => {
 						self.placeOperands(place)
@@ -184,7 +178,7 @@ extend Builder {
 						self.storeExpr(value, temp.clone())
 						val dest = self.place(place)
 						self.dropReplaced(place, &dest, placeTy)
-						self.assign(move dest, .Use(.Copy(move temp)))
+						self.assign(dest, .Use(.Copy(temp)))
 						self.assignedTo(place)
 					}
 					.None => {
@@ -192,7 +186,7 @@ extend Builder {
 						val given = self.scalar(value)
 						val dest = self.place(place)
 						self.dropReplaced(place, &dest, placeTy)
-						self.assign(move dest, .Use(move given))
+						self.assign(dest, .Use(given))
 						self.assignedTo(place)
 					}
 				}
@@ -208,10 +202,10 @@ extend Builder {
 				if self.inPacked(inner) &&
 					self.program.types.kind(expr.ty) is .Ref(kind: .Shared, ..) {
 					val copied = Place::of(self.temp(self.ty(inner)))
-					self.assign(copied.clone(), .Use(.Copy(move place)))
-					Value::Scalar(self.value(expr.ty, .AddressOf(move copied)))
+					self.assign(copied.clone(), .Use(.Copy(place)))
+					Value::Scalar(self.value(expr.ty, .AddressOf(copied)))
 				} else {
-					.Scalar(self.value(expr.ty, .AddressOf(move place)))
+					.Scalar(self.value(expr.ty, .AddressOf(place)))
 				}
 			}
 			// Only ever lent, which `place` builds; as a value it is the same
@@ -235,16 +229,15 @@ extend Builder {
 				// A constant integer or character made another integer type is
 				// the constant it becomes: `'-' as u8` is `45_u8`, which is how
 				// the standard library writes a byte.
-				if self.foldedCast(&operand, expr.ty) is .Some(folded) then
-					return .Scalar(move folded)
-				.Scalar(self.value(expr.ty, .Cast(operand: move operand, ty: expr.ty)))
+				if self.foldedCast(&operand, expr.ty) is .Some(folded) then return .Scalar(folded)
+				.Scalar(self.value(expr.ty, .Cast(operand: operand, ty: expr.ty)))
 			}
 			// `colour as i64`: the tag, read where the value lies, and widened to
 			// the type that was asked for.
 			.VariantIndex(inner) => {
 				val place = self.aggregate(inner)
-				val index = self.value(I32, .Variant(move place))
-				.Scalar(self.value(expr.ty, .Cast(operand: move index, ty: expr.ty)))
+				val index = self.value(I32, .Variant(place))
+				.Scalar(self.value(expr.ty, .Cast(operand: index, ty: expr.ty)))
 			}
 			.Len(base) => .Scalar(self.len(base))
 			// A panic ends the path: nothing after it runs.
@@ -253,7 +246,7 @@ extend Builder {
 					.Some(n) => Option::Some(Operand::Copy(self.aggregate(n)))
 					.None => Option::None
 				}
-				self.terminate(.Panic(note: move text, message: message, at: expr.span))
+				self.terminate(.Panic(note: text, message: message, at: expr.span))
 				self.dead = true
 				Value::Unit
 			}
@@ -262,7 +255,7 @@ extend Builder {
 				val closure = self.place(callee)
 				val code = self.value(codeTy, .Use(.Copy(closure.project(.Field(1)))))
 				val captures = Operand::Copy(closure.project(.Field(0)))
-				self.closureCall(move code, move captures, &args, expr.ty, .None)
+				self.closureCall(code, captures, &args, expr.ty, .None)
 			}
 			// A call through a `&dyn`: the method's address comes from the table
 			// the reference carries.
@@ -270,20 +263,20 @@ extend Builder {
 				val receiver = self.place(args[0])
 				val table = Operand::Copy(receiver.project(.Field(1)))
 				val function = self.value(fnTy, .VTableFn(
-					table: move table,
+					table: table,
 					index: index,
 					methods: true,
 				))
 				val pointer = Operand::Copy(receiver.project(.Field(0)))
-				self.dynCall(move function, move pointer, &args, &order, expr.ty, .None)
+				self.dynCall(function, pointer, &args, &order, expr.ty, .None)
 			}
 			.Move(operand) => {
 				val place = self.place(operand)
 				val ty = self.ty(operand)
 				val value = self.value(ty, .Use(.Copy(place.clone())))
-				self.vacate(move place, ty)
+				self.vacate(place, ty)
 				self.movedFrom(operand)
-				Value::Scalar(move value)
+				Value::Scalar(value)
 			}
 			// A value that could jump out while it is built is built first, so
 			// that nothing is allocated for it until it is complete.
@@ -293,15 +286,15 @@ extend Builder {
 				self.storeExpr(inner, value.clone())
 				val ptr = Place::of(self.temp(expr.ty))
 				self.push(.Alloc(dest: ptr.clone(), ty: ty))
-				self.assign(ptr.project(.Deref), .Use(.Copy(move value)))
-				Value::Scalar(.Copy(move ptr))
+				self.assign(ptr.project(.Deref), .Use(.Copy(value)))
+				Value::Scalar(.Copy(ptr))
 			}
 			.Own(inner) => {
 				val ptr = Place::of(self.temp(expr.ty))
 				val ty = self.ty(inner)
 				self.push(.Alloc(dest: ptr.clone(), ty: ty))
 				self.storeExpr(inner, ptr.project(.Deref))
-				Value::Scalar(.Copy(move ptr))
+				Value::Scalar(.Copy(ptr))
 			}
 			.Match(scrutinee, arms) => self.matchExpr(scrutinee, &arms, expr.ty, .None)
 			.Is(scrutinee, pattern) => .Scalar(self.isTest(scrutinee, &pattern))
@@ -333,7 +326,7 @@ extend Builder {
 		val at = self.span(rhs)
 		val left = self.scalar(lhs)
 		val right = self.scalar(rhs)
-		return self.arithmetic(op, move left, move right, wrapping, ty, at)
+		return self.arithmetic(op, left, right, wrapping, ty, at)
 	}
 
 	/// `lhs op rhs` of two operands already worked out, with the checks the
@@ -349,30 +342,26 @@ extend Builder {
 		// Dividing by zero panics, with the place it happened.
 		if op is .Div | .Rem && self.kind(ty) is .Int(..) {
 			val zero = Builder::int(0, ty)
-			val fails = self.value(BOOL, .Binary(op: .Eq, lhs: rhs.clone(), rhs: move zero))
-			self.push(.Check(fails: move fails, kind: .Division, at: at))
+			val fails = self.value(BOOL, .Binary(op: .Eq, lhs: rhs.clone(), rhs: zero))
+			self.push(.Check(fails: fails, kind: .Division, at: at))
 			// The most negative number divided by -1 is one more than the
 			// largest, which does not fit.
 			if self.kind(ty) is .Int(int) && int.signed() && int.bits() <= 64 {
 				val mostNegative = Builder::int(1 << (int.bits() - 1) as u128, ty)
 				val minusOne = Builder::int(ALL_ONES, ty)
-				val edge = self.value(BOOL, .Binary(
-					op: .Eq,
-					lhs: lhs.clone(),
-					rhs: move mostNegative,
-				))
-				val by = self.value(BOOL, .Binary(op: .Eq, lhs: rhs.clone(), rhs: move minusOne))
-				val fails = self.value(BOOL, .Binary(op: .BitAnd, lhs: move edge, rhs: move by))
-				self.push(.Check(fails: move fails, kind: .Overflow(op), at: at))
+				val edge = self.value(BOOL, .Binary(op: .Eq, lhs: lhs.clone(), rhs: mostNegative))
+				val by = self.value(BOOL, .Binary(op: .Eq, lhs: rhs.clone(), rhs: minusOne))
+				val fails = self.value(BOOL, .Binary(op: .BitAnd, lhs: edge, rhs: by))
+				self.push(.Check(fails: fails, kind: .Overflow(op), at: at))
 			}
 		}
 		// `+`, `-` and `*` on integers panic if the answer does not fit.
 		if op is .Add | .Sub | .Mul && !wrapping && self.checksOverflow(ty) {
 			val dest = Place::of(self.temp(ty))
-			self.push(.Arith(dest: dest.clone(), op: op, lhs: move lhs, rhs: move rhs, at: at))
-			return .Copy(move dest)
+			self.push(.Arith(dest: dest.clone(), op: op, lhs: lhs, rhs: rhs, at: at))
+			return .Copy(dest)
 		}
-		return self.value(ty, .Binary(op: op, lhs: move lhs, rhs: move rhs))
+		return self.value(ty, .Binary(op: op, lhs: lhs, rhs: rhs))
 	}
 
 	/// Whether an answer of this type is checked: the integers, up to the
@@ -391,7 +380,7 @@ extend Builder {
 		args: &[ExprId],
 		order: &[u32],
 		dest: Option<Place>,
-	): Value = self.callWith(move callee, ret, &args, &order, move dest, .None)
+	): Value = self.callWith(callee, ret, &args, &order, dest, .None)
 
 	/// A `@tailrec` function's call to itself. The arguments are built in
 	/// temporaries first, as any call's are, so a parameter that one of them
@@ -404,15 +393,46 @@ extend Builder {
 			val ty = self.ty(args[i])
 			val temp = Place::of(self.temp(ty))
 			self.storeExpr(args[i], temp.clone())
-			values.push((i, move temp))
+			values.push((i, temp))
 		}
 		for (i, temp) in move values {
 			val param = Place::of(self.params[i])
-			self.assign(move param, .Use(.Copy(move temp)))
+			self.assign(param, .Use(.Copy(temp)))
 		}
 		val .Some(top) = self.top else panic("a body with a tail call has a top")
 		self.terminate(.Goto(top))
 		self.dead = true
+	}
+
+	/// `become f(args)`: the arguments are built as any call's are, and the
+	/// call takes this function's place. An aggregate is a parameter passed
+	/// on, at the address this function was given it. Nothing of this frame
+	/// is left to drop: the checkers made sure of it.
+	var fn becomeCall(callee: FnId, args: &[ExprId], order: &[u32]) = {
+		var operands: Vec<Option<Operand>> = Vec()
+		for _ in args {
+			operands.push(.None)
+		}
+		for i in evaluationOrder(&order, args.len()) {
+			val arg = args[i]
+			operands[i] = .Some(
+				if self.isAggregate(self.ty(arg)) then .Copy(self.place(self.passedOn(arg)))
+				else self.argument(arg),
+			)
+		}
+		var given: Vec<Operand> = Vec()
+		for operand in move operands {
+			given.push(operand.unwrap())
+		}
+		self.terminate(.TailCall(callee: callee, args: given))
+		self.dead = true
+	}
+
+	/// The parameter an aggregate argument of a `become` passes on: the
+	/// place under the move that gives it.
+	fn passedOn(arg: ExprId): ExprId = match self.hir.exprs[arg].kind {
+		.Move(inner) => inner
+		_ => arg
 	}
 
 	/// A call through a closure: the code from the pair, and what it captured
@@ -424,11 +444,11 @@ extend Builder {
 		ret: Ty,
 		dest: Option<Place>,
 	): Value = {
-		var operands = Vec::of(own [move captures])
+		var operands = Vec::of(own [captures])
 		for arg in args {
 			operands.push(self.argument(arg))
 		}
-		return self.finishCall(.Value(move code), ret, move operands, move dest)
+		return self.finishCall(.Value(code), ret, operands, dest)
 	}
 
 	/// An argument's operand. A `void` argument, as a generic function called
@@ -437,8 +457,8 @@ extend Builder {
 	/// nothing: its parameter, taken as an aggregate is, by address, gets a
 	/// null one it never reads.
 	var fn argument(arg: ExprId): Operand = match self.expr(arg) {
-		.Scalar(operand) => move operand
-		.Place(place) => .Copy(move place)
+		.Scalar(operand) => operand
+		.Place(place) => .Copy(place)
 		.Unit => Builder::int(0, PTR_U8)
 	}
 
@@ -451,14 +471,7 @@ extend Builder {
 		order: &[u32],
 		ret: Ty,
 		dest: Option<Place>,
-	): Value = self.callWith(
-		.Value(move function),
-		ret,
-		&args,
-		&order,
-		move dest,
-		.Some(move pointer),
-	)
+	): Value = self.callWith(.Value(function), ret, &args, &order, dest, .Some(pointer))
 
 	/// A call whose first argument may already be an operand: the receiver of
 	/// a call through a `&dyn`.
@@ -473,7 +486,7 @@ extend Builder {
 		val aggregate = self.isAggregate(ret)
 		val result: Option<Place> = if aggregate {
 			match move dest {
-				.Some(place) => Option::Some(move place)
+				.Some(place) => Option::Some(place)
 				.None => Option::Some(Place::of(self.temp(ret)))
 			}
 		} else {
@@ -487,7 +500,7 @@ extend Builder {
 		}
 		var pending: Vec<i64> = Vec()
 		val skip = if first.isSome() then 1 else 0
-		if skip == 1 then operands[0] = move first
+		if skip == 1 then operands[0] = first
 		// A place lent to the call is lent when the call begins: what its
 		// expression computes is worked out where it is written, and the
 		// place is found once every argument is.
@@ -514,49 +527,49 @@ extend Builder {
 				if copied is .Some(place) {
 					val temp = Place::of(self.temp(ty))
 					self.assign(temp.clone(), .Use(.Copy(place.clone())))
-					operand = .Copy(move temp)
+					operand = .Copy(temp)
 				}
 			}
 			if n + 1 < args.len() {
 				if operand is .Copy(place) then
 					self.pendingPart(place.clone(), self.ty(args[i]), &var pending)
 			}
-			operands[i] = .Some(self.lentToC(&callee, i, args[i], move operand))
+			operands[i] = .Some(self.lentToC(&callee, i, args[i], operand))
 		}
 		for i in lent {
 			val operand = match self.expr(args[i]) {
-				.Scalar(o) => move o
-				.Place(place) => Operand::Copy(move place)
+				.Scalar(o) => o
+				.Place(place) => Operand::Copy(place)
 				.Unit => panic("a reference is a value")
 			}
-			operands[i] = .Some(self.lentToC(&callee, i, args[i], move operand))
+			operands[i] = .Some(self.lentToC(&callee, i, args[i], operand))
 		}
-		self.forgetParts(move pending)
+		self.forgetParts(pending)
 		var given: Vec<Operand> = Vec()
 		for operand in move operands {
 			match move operand {
-				.Some(o) => given.push(move o)
+				.Some(o) => given.push(o)
 				.None => panic("every argument was evaluated")
 			}
 		}
-		return self.finishCall(move callee, ret, move given, move result)
+		return self.finishCall(callee, ret, given, result)
 	}
 
 	/// What a C function taking a `ptr<T>` is given for a place lent to it: a
 	/// reference is the address already, and a slice is its pointer without
 	/// its length.
 	var fn lentToC(callee: &Callee, i: i64, arg: ExprId, operand: Operand): Operand = {
-		val .Fn(id) = callee else return move operand
+		val .Fn(id) = callee else return operand
 		val def = &self.program.fns[id]
-		if !def.isExtern || i >= def.params.len() then return move operand
+		if !def.isExtern || i >= def.params.len() then return operand
 		val param = def.params[i].ty
-		if self.kind(param) !is .Ptr(..) then return move operand
-		val .Ref(inner, ..) = self.kind(self.ty(arg)) else return move operand
-		if self.kind(inner) !is .Slice(..) then return move operand
+		if self.kind(param) !is .Ptr(..) then return operand
+		val .Ref(inner, ..) = self.kind(self.ty(arg)) else return operand
+		if self.kind(inner) !is .Slice(..) then return operand
 		val .Copy(slice) = operand else panic("a slice is a place")
 		val pointer = Place::of(self.temp(param))
 		self.assign(pointer.clone(), .Use(.Copy(slice.project(.Field(0)))))
-		return .Copy(move pointer)
+		return .Copy(pointer)
 	}
 
 	/// The call itself, once its arguments are operands: where its result
@@ -568,36 +581,28 @@ extend Builder {
 		dest: Option<Place>,
 	): Value = {
 		val result: Option<Place> = match move dest {
-			.Some(place) => Option::Some(move place)
+			.Some(place) => Option::Some(place)
 			.None if self.isAggregate(ret) => Option::Some(Place::of(self.temp(ret)))
 			.None => Option::None
 		}
 		if self.tyIsNever(ret) {
-			self.push(.Call(callee: move callee, args: move operands, dest: .None))
+			self.push(.Call(callee: callee, args: operands, dest: .None))
 			self.terminate(.Unreachable)
 			self.dead = true
 			return .Unit
 		}
 		return match move result {
 			.Some(place) => {
-				self.push(.Call(
-					callee: move callee,
-					args: move operands,
-					dest: .Some(place.clone()),
-				))
-				Value::Place(move place)
+				self.push(.Call(callee: callee, args: operands, dest: .Some(place.clone())))
+				Value::Place(place)
 			}
 			.None if self.isScalar(ret) => {
 				val temp = Place::of(self.temp(ret))
-				self.push(.Call(
-					callee: move callee,
-					args: move operands,
-					dest: .Some(temp.clone()),
-				))
-				Value::Scalar(.Copy(move temp))
+				self.push(.Call(callee: callee, args: operands, dest: .Some(temp.clone())))
+				Value::Scalar(.Copy(temp))
 			}
 			.None => {
-				self.push(.Call(callee: move callee, args: move operands, dest: .None))
+				self.push(.Call(callee: callee, args: operands, dest: .None))
 				Value::Unit
 			}
 		}
@@ -629,15 +634,15 @@ extend Builder {
 	/// for it, and a temporary of its own otherwise.
 	var fn answer(rvalue: Rvalue, ty: Ty, dest: Option<Place>): Value = match move dest {
 		.Some(place) => {
-			self.assign(place.clone(), move rvalue)
-			Value::Place(move place)
+			self.assign(place.clone(), rvalue)
+			Value::Place(place)
 		}
-		.None => Value::Scalar(self.value(ty, move rvalue))
+		.None => Value::Scalar(self.value(ty, rvalue))
 	}
 
 	/// The place an aggregate answer is built in: `dest`, or a temporary.
 	var fn destOr(dest: Option<Place>, ty: Ty): Place = match move dest {
-		.Some(place) => move place
+		.Some(place) => place
 		.None => Place::of(self.temp(ty))
 	}
 
@@ -659,15 +664,15 @@ extend Builder {
 				val .Some(elem) = elementTy(self.program, ty) else {
 					panic("a block of slots has elements")
 				}
-				val place = self.destOr(move dest, ty)
-				self.push(.AllocBuffer(dest: place.clone(), elem: elem, count: move count))
-				Value::Place(move place)
+				val place = self.destOr(dest, ty)
+				self.push(.AllocBuffer(dest: place.clone(), elem: elem, count: count))
+				Value::Place(place)
 			}
 			// `slots.moveIn(index, value)`: the slot held nothing, so nothing is
 			// dropped.
 			.SlotsMoveIn => {
 				val slot = self.slotPlace(args[0], args[1], at)
-				self.storeExpr(args[2], move slot)
+				self.storeExpr(args[2], slot)
 				Value::Unit
 			}
 			// `slots.moveOut(index)`: the value comes out and the slot is left
@@ -677,17 +682,17 @@ extend Builder {
 				val value = match move dest {
 					.Some(place) => {
 						self.assign(place.clone(), .Use(.Copy(slot.clone())))
-						Value::Place(move place)
+						Value::Place(place)
 					}
 					.None if self.isAggregate(ty) => {
 						val temp = Place::of(self.temp(ty))
 						self.assign(temp.clone(), .Use(.Copy(slot.clone())))
-						Value::Place(move temp)
+						Value::Place(temp)
 					}
 					.None => Value::Scalar(self.value(ty, .Use(.Copy(slot.clone()))))
 				}
-				self.push(.Zero(move slot))
-				move value
+				self.push(.Zero(slot))
+				value
 			}
 			// `assumed(&option)`: the address of what `.Some` holds, which a
 			// projection lends. Not checked: the library calls it where what it
@@ -695,7 +700,7 @@ extend Builder {
 			.OptionAssumed => {
 				val option = self.behindReference(args[0])
 				val payload = option.project(.VariantField(variant: 0, field: 0))
-				self.answer(.AddressOf(move payload), ty, move dest)
+				self.answer(.AddressOf(payload), ty, dest)
 			}
 			// `slots.slot(index)`: the slot's address, which a projection lends.
 			// Not checked: `Vec` checked the index against its length, which is
@@ -703,8 +708,8 @@ extend Builder {
 			.SlotsSlot => {
 				val block = self.behindReference(args[0])
 				val index = self.scalar(args[1])
-				val local = self.localOf(move index, I64)
-				self.answer(.AddressOf(block.project(.Index(local))), ty, move dest)
+				val local = self.localOf(index, I64)
+				self.answer(.AddressOf(block.project(.Index(local))), ty, dest)
 			}
 			// `slots.takeBuffer(length)`: a block of slots and a buffer are both
 			// a pointer and a count, so the buffer is the block's pointer and
@@ -713,67 +718,67 @@ extend Builder {
 			.SlotsTakeBuffer => {
 				val block = self.behindReference(args[0])
 				val length = self.scalar(args[1])
-				val place = self.destOr(move dest, ty)
+				val place = self.destOr(dest, ty)
 				self.assign(place.project(.Field(0)), .Use(.Copy(block.project(.Field(0)))))
-				self.assign(place.project(.Field(1)), .Use(move length))
-				self.push(.Zero(move block))
-				Value::Place(move place)
+				self.assign(place.project(.Field(1)), .Use(length))
+				self.push(.Zero(block))
+				Value::Place(place)
 			}
 			// `Slots::takeFrom(&var buffer)`: the buffer's pointer and length
 			// are the block's, and the buffer, zeroed, frees nothing when it is
 			// dropped.
 			.SlotsTakeFrom => {
 				val buffer = self.behindReference(args[0])
-				val place = self.destOr(move dest, ty)
+				val place = self.destOr(dest, ty)
 				self.assign(place.clone(), .Use(.Copy(buffer.clone())))
-				self.push(.Zero(move buffer))
-				Value::Place(move place)
+				self.push(.Zero(buffer))
+				Value::Place(place)
 			}
 			// `Slots::over(elements)`: a slice and a block of slots are both a
 			// pointer and a count, so the slots are the slice's pair. They own
 			// nothing, and what holds them is never dropped.
 			.SlotsOver => {
 				val elements = self.aggregate(args[0])
-				val place = self.destOr(move dest, ty)
-				self.assign(place.clone(), .Use(.Copy(move elements)))
-				Value::Place(move place)
+				val place = self.destOr(dest, ty)
+				self.assign(place.clone(), .Use(.Copy(elements)))
+				Value::Place(place)
 			}
 			// `slots.release()`: zeroed, the slots free nothing when they are
 			// dropped, and the block stays its owner's.
 			.SlotsRelease => {
 				val block = self.behindReference(args[0])
-				self.push(.Zero(move block))
+				self.push(.Zero(block))
 				Value::Unit
 			}
 			// `str::fromBytes(bytes)`: the same pointer and the same length,
 			// read as text. Nothing is copied but the pair itself.
 			.StrFromBytes => {
 				val bytes = self.aggregate(args[0])
-				val place = self.destOr(move dest, ty)
+				val place = self.destOr(dest, ty)
 				self.assign(place.project(.Field(0)), .Use(.Copy(bytes.project(.Field(0)))))
 				self.assign(place.project(.Field(1)), .Use(.Copy(bytes.project(.Field(1)))))
-				Value::Place(move place)
+				Value::Place(place)
 			}
 			// An `own` is its box's address, which it keeps.
 			.BoxAddress => {
 				val boxed = self.behindReference(args[0])
-				self.answer(.Cast(operand: .Copy(move boxed), ty: ty), ty, move dest)
+				self.answer(.Cast(operand: .Copy(boxed), ty: ty), ty, dest)
 			}
 			// A lent closure is a pair: what it captured, then its code; each is
 			// the address a thread is given.
 			.ClosureCode | .ClosureCaptures => {
 				val closure = self.place(args[0])
 				val field: u32 = if which is .ClosureCaptures then 0 else 1
-				self.answer(.Use(.Copy(closure.project(.Field(field)))), ty, move dest)
+				self.answer(.Use(.Copy(closure.project(.Field(field)))), ty, dest)
 			}
 			// `text.items()`: the pointer and the length a `str` already is,
 			// read as a slice.
 			.StrBytes => {
 				val text = self.behindReference(args[0])
-				val place = self.destOr(move dest, ty)
+				val place = self.destOr(dest, ty)
 				self.assign(place.project(.Field(0)), .Use(.Copy(text.project(.Field(0)))))
 				self.assign(place.project(.Field(1)), .Use(.Copy(text.project(.Field(1)))))
-				Value::Place(move place)
+				Value::Place(place)
 			}
 			// `values.swap(i, j)`: the two elements change places, through a
 			// temporary. Nothing is dropped and no place is left holding
@@ -785,38 +790,38 @@ extend Builder {
 					panic("a slice has elements")
 				}
 				val first = self.elementPlace(slice.clone(), args[1], at)
-				val second = self.elementPlace(move slice, args[2], at)
+				val second = self.elementPlace(slice, args[2], at)
 				val temp = Place::of(self.temp(elem))
 				self.assign(temp.clone(), .Use(.Copy(first.clone())))
 				self.assign(first.clone(), .Use(.Copy(second.clone())))
-				self.assign(move second, .Use(.Copy(move temp)))
+				self.assign(second, .Use(.Copy(temp)))
 				Value::Unit
 			}
 			// `values.len()`, `text.len()`: the second half of the pair a slice
 			// and a `str` are.
 			.Len => {
 				val pair = self.behindReference(args[0])
-				self.answer(.Use(.Copy(pair.project(.Field(1)))), ty, move dest)
+				self.answer(.Use(.Copy(pair.project(.Field(1)))), ty, dest)
 			}
 			// An `own` and a `ptr<u8>` are both one word: the address. What
 			// moved into the call is the answer's now. A `&var` is that word
 			// too.
 			.OwnIntoAddress | .OwnFromAddress | .ReferenceAddress | .AddressReference => {
 				val address = self.scalar(args[0])
-				self.answer(.Use(move address), ty, move dest)
+				self.answer(.Use(address), ty, dest)
 			}
 			// One step on a value other threads may touch: the runtime's
 			// counters, and `std::sync::Atomic`.
 			.AtomicAdd | .AtomicSubtract | .AtomicSwap | .AtomicCompareSwap | .AtomicLoad
-			| .AtomicStore | .AtomicFence => self.atomic(which, &args, ty, move dest)
+			| .AtomicStore | .AtomicFence => self.atomic(which, &args, ty, dest)
 			// A pointer as a number, moved on, and a pointer again: what C
 			// writes `p + n`.
 			.OffsetBytes => {
 				val pointer = self.scalar(args[0])
 				val bytes = self.scalar(args[1])
-				val number = self.value(I64, .Cast(operand: move pointer, ty: I64))
-				val moved = self.value(I64, .Binary(op: .Add, lhs: move number, rhs: move bytes))
-				self.answer(.Cast(operand: move moved, ty: ty), ty, move dest)
+				val number = self.value(I64, .Cast(operand: pointer, ty: I64))
+				val moved = self.value(I64, .Binary(op: .Add, lhs: number, rhs: bytes))
+				self.answer(.Cast(operand: moved, ty: ty), ty, dest)
 			}
 			// C's `sizeof` and `_Alignof` of the type the call names, which the
 			// layout answers.
@@ -827,7 +832,7 @@ extend Builder {
 				val of = self.program.types.list(typeArgs)[0]
 				val answer: Const =
 					if which is .SizeOf then .SizeOf(of: of, ty: ty) else .AlignOf(of: of, ty: ty)
-				self.constantAnswer(move answer, move dest)
+				self.constantAnswer(move answer, dest)
 			}
 			// Where a field lies, which the layout answers: the checker made
 			// sure the argument is a literal naming a field of the struct.
@@ -842,44 +847,44 @@ extend Builder {
 				for (i, field) in self.program.structs[id].fields.forwards().enumerate() {
 					if field.name == name then index = i as u32
 				}
-				self.constantAnswer(.OffsetOf(of: of, index: index, ty: ty), move dest)
+				self.constantAnswer(.OffsetOf(of: of, index: index, ty: ty), dest)
 			}
 			// The checker reads the file and answers the call with the constant
 			// that holds it.
 			.EmbedBytes | .EmbedText | .EmbedTextOr => panic(
 				"a file embedded is a constant, never a call",
 			)
-			.FrameTables => self.constantAnswer(.FrameTables, move dest)
-			.RuntimeWords => self.constantAnswer(.RuntimeWords, move dest)
-			.ThreadWords => self.constantAnswer(.ThreadWords, move dest)
-			.DebugBuild => self.constantAnswer(.DebugBuild, move dest)
+			.FrameTables => self.constantAnswer(.FrameTables, dest)
+			.RuntimeWords => self.constantAnswer(.RuntimeWords, dest)
+			.ThreadWords => self.constantAnswer(.ThreadWords, dest)
+			.DebugBuild => self.constantAnswer(.DebugBuild, dest)
 			// The value is copied out of the box, which is then freed with
 			// nothing in it dropped: the value is the answer's.
 			.OwnUnbox => {
 				val boxed = self.scalar(args[0])
 				val boxedTy = self.ty(args[0])
-				val pointer = self.localOf(move boxed, boxedTy)
+				val pointer = self.localOf(boxed, boxedTy)
 				val inside = Place::of(pointer).project(.Deref)
 				val value = match move dest {
 					.Some(place) => {
-						self.assign(place.clone(), .Use(.Copy(move inside)))
-						Value::Place(move place)
+						self.assign(place.clone(), .Use(.Copy(inside)))
+						Value::Place(place)
 					}
 					.None if self.isAggregate(ty) => {
 						val temp = Place::of(self.temp(ty))
-						self.assign(temp.clone(), .Use(.Copy(move inside)))
-						Value::Place(move temp)
+						self.assign(temp.clone(), .Use(.Copy(inside)))
+						Value::Place(temp)
 					}
-					.None => Value::Scalar(self.value(ty, .Use(.Copy(move inside))))
+					.None => Value::Scalar(self.value(ty, .Use(.Copy(inside))))
 				}
 				self.push(.Free(.Copy(Place::of(pointer))))
-				move value
+				value
 			}
 			// Where the caller has a place for it, such as a variant's payload,
 			// it goes there.
 			.CharFromScalar => {
 				val code = self.scalar(args[0])
-				self.answer(.Cast(operand: move code, ty: ty), ty, move dest)
+				self.answer(.Cast(operand: code, ty: ty), ty, dest)
 			}
 			// What a float is made of, what the machine does to one exactly, and
 			// what it counts and turns of an integer's bits.
@@ -891,31 +896,31 @@ extend Builder {
 					if which is .FloatFromBits then self.scalar(args[0])
 					else Operand::Copy(self.behindReference(args[0]))
 				val rvalue: Rvalue = match which {
-					.FloatToBits | .FloatFromBits => .Bits(move operand)
-					.FloatSqrt => .Float(op: .Sqrt, operand: move operand)
-					.FloatFloor => .Float(op: .Floor, operand: move operand)
-					.FloatCeil => .Float(op: .Ceil, operand: move operand)
-					.FloatTrunc => .Float(op: .Trunc, operand: move operand)
+					.FloatToBits | .FloatFromBits => .Bits(operand)
+					.FloatSqrt => .Float(op: .Sqrt, operand: operand)
+					.FloatFloor => .Float(op: .Floor, operand: operand)
+					.FloatCeil => .Float(op: .Ceil, operand: operand)
+					.FloatTrunc => .Float(op: .Trunc, operand: operand)
 					.FloatMulAdd => {
 						val by = self.scalar(args[1])
 						val plus = self.scalar(args[2])
-						.MulAdd(first: move operand, second: move by, third: move plus)
+						.MulAdd(first: operand, second: by, third: plus)
 					}
-					.IntCountOnes => .Integer(op: .CountOnes, operand: move operand)
-					.IntLeadingZeros => .Integer(op: .LeadingZeros, operand: move operand)
-					.IntTrailingZeros => .Integer(op: .TrailingZeros, operand: move operand)
-					.IntSwapBytes => .Integer(op: .SwapBytes, operand: move operand)
-					.IntReverseBits => .Integer(op: .ReverseBits, operand: move operand)
+					.IntCountOnes => .Integer(op: .CountOnes, operand: operand)
+					.IntLeadingZeros => .Integer(op: .LeadingZeros, operand: operand)
+					.IntTrailingZeros => .Integer(op: .TrailingZeros, operand: operand)
+					.IntSwapBytes => .Integer(op: .SwapBytes, operand: operand)
+					.IntReverseBits => .Integer(op: .ReverseBits, operand: operand)
 					.IntRotateLeft => {
 						val amount = self.scalar(args[1])
-						.Rotate(turn: .Left, lhs: move operand, rhs: move amount)
+						.Rotate(turn: .Left, lhs: operand, rhs: amount)
 					}
 					_ => {
 						val amount = self.scalar(args[1])
-						.Rotate(turn: .Right, lhs: move operand, rhs: move amount)
+						.Rotate(turn: .Right, lhs: operand, rhs: amount)
 					}
 				}
-				self.answer(move rvalue, ty, move dest)
+				self.answer(rvalue, ty, dest)
 			}
 			// Whether the answer would not fit: the receiver is lent.
 			.IntAddOverflows | .IntSubOverflows | .IntMulOverflows => {
@@ -926,13 +931,26 @@ extend Builder {
 				}
 				val lhs = Operand::Copy(self.behindReference(args[0]))
 				val rhs = self.scalar(args[1])
-				self.answer(.Overflows(op: op, lhs: move lhs, rhs: move rhs), BOOL, move dest)
+				self.answer(.Overflows(op: op, lhs: lhs, rhs: rhs), BOOL, dest)
+			}
+			// `c::bytesOf(&value)`: the value's address and its size, a slice
+			// of bytes that the checker made sure are all the value's.
+			.ValueBytes => {
+				val .Some((_, typeArgs)) = self.program.fns[callee].instanceOf else {
+					panic("`bytesOf` is generic")
+				}
+				val of = self.program.types.list(typeArgs)[0]
+				val value = self.behindReference(args[0])
+				val place = self.destOr(dest, ty)
+				self.assign(place.project(.Field(0)), .AddressOf(value))
+				self.assign(place.project(.Field(1)), .Use(.Const(.SizeOf(of: of, ty: I64))))
+				Value::Place(place)
 			}
 			// Both are the slice's pointer, alone: a C string's first byte, and
 			// the first element C is lent to read.
 			.CstringFromBytes | .SlicePointer => {
 				val bytes = self.aggregate(args[0])
-				self.answer(.Use(.Copy(bytes.project(.Field(0)))), ty, move dest)
+				self.answer(.Use(.Copy(bytes.project(.Field(0)))), ty, dest)
 			}
 		}
 	}
@@ -942,7 +960,7 @@ extend Builder {
 	var fn constantAnswer(constant: Const, dest: Option<Place>): Value = match move dest {
 		.Some(place) => {
 			self.assign(place.clone(), .Use(.Const(move constant)))
-			Value::Place(move place)
+			Value::Place(place)
 		}
 		.None => Value::Scalar(.Const(move constant))
 	}
@@ -1023,8 +1041,7 @@ extend Builder {
 		val written = dest.isSome()
 		return match move answered {
 			.None => .Unit
-			.Some(place) =>
-				if written then Value::Place(move place) else Value::Scalar(.Copy(move place))
+			.Some(place) => if written then Value::Place(place) else Value::Scalar(.Copy(place))
 		}
 	}
 
@@ -1040,7 +1057,7 @@ extend Builder {
 		}
 		val (place, orderTy) = self.testedPlace(id)
 		val .Enum(id: enumId, ..) = self.kind(orderTy) else panic("an atomic's order is an enum")
-		val variant = self.value(I32, .Variant(move place))
+		val variant = self.value(I32, .Variant(place))
 		val done = self.newBlock()
 		var cases: Vec<(u32, BlockId)> = Vec()
 		var orders: Vec<(BlockId, AtomicOrder)> = Vec()
@@ -1056,8 +1073,8 @@ extend Builder {
 			cases.push((v as u32, block))
 			orders.push((block, chosen))
 		}
-		self.terminate(.Switch(value: move variant, cases: move cases, otherwise: done))
-		return (move orders, .Some(done))
+		self.terminate(.Switch(value: variant, cases: cases, otherwise: done))
+		return (orders, .Some(done))
 	}
 
 	/// The place of one element of a slice, checked against how many there
@@ -1065,8 +1082,8 @@ extend Builder {
 	var fn elementPlace(slice: Place, index: ExprId, at: Span): Place = {
 		val operand = self.scalar(index)
 		val length = Operand::Copy(slice.project(.Field(1)))
-		self.checkUnsigned(.Ge, operand.clone(), move length, at)
-		val local = self.localOf(move operand, I64)
+		self.checkUnsigned(.Ge, operand.clone(), length, at)
+		val local = self.localOf(operand, I64)
 		return slice.project(.Index(local))
 	}
 
@@ -1076,8 +1093,8 @@ extend Builder {
 		val block = self.behindReference(slots)
 		val operand = self.scalar(index)
 		val length = Operand::Copy(block.project(.Field(1)))
-		self.checkUnsigned(.Ge, operand.clone(), move length, at)
-		val local = self.localOf(move operand, I64)
+		self.checkUnsigned(.Ge, operand.clone(), length, at)
+		val local = self.localOf(operand, I64)
 		return block.project(.Index(local))
 	}
 
@@ -1087,7 +1104,7 @@ extend Builder {
 		if self.hir.exprs[id].kind is .Ref(inner) then return self.place(inner)
 		val ty = self.ty(id)
 		val reference = self.scalar(id)
-		val local = self.localOf(move reference, ty)
+		val local = self.localOf(reference, ty)
 		return Place::of(local).project(.Deref)
 	}
 }

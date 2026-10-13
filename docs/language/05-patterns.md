@@ -68,7 +68,7 @@ fn sizeOf(view: &View): i64 = match view {
 }
 
 fn textOf(view: View): String = match move view {
-    .Text(text, ..) | .Label(text, ..) => move text
+    .Text(text, ..) | .Label(text, ..) => text
     _ => String()
 }
 
@@ -399,8 +399,8 @@ fn main() = {
 part, as `var x = …` holds its value, and can be written without writing
 anything else. A value made where it is bound gives its
 parts up, a place copies plain data out and keeps its own, and a part that
-owns memory is taken from a place with `move`, as `var x = move place`
-takes it. `else` works as it does for `val`:
+owns memory, which is never copied, is given up by the place, as `var x =
+place` gives it. `else` works as it does for `val`:
 
 ```wip,run
 struct Point {
@@ -428,13 +428,24 @@ fn main() = {
 ```
 
 Every name of the pattern is a variable; where only some are written, the
-others are variables that never change.
+others are variables that never change. A part that owns memory is never
+copied, so the variables take it, and the place gives it up as `var x =
+place` does:
+
+```wip,run
+fn main() = {
+    val pair = (1, String::of("a"))
+    var (n, text) = pair // `pair` is given to the variables
+    n += text.len()
+    assert(n == 2)
+}
+```
 
 ```wip,error=E0404
 fn main() = {
     val pair = (1, String::of("a"))
     var (n, text) = pair
-    n += text.len()
+    assert(pair.1 == "a") // given above
 }
 ```
 

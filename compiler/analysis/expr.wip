@@ -1,15 +1,14 @@
 // Expressions, and how each use of a place is checked.
 
 import std::collections::{Map}
-import hir::{ExprId, LocalId, NEVER, Pattern, evaluationOrder}
+import hir::{ExprId, LocalId, NEVER, Pattern, Ty, evaluationOrder}
 import syntax::{
-	CANNOT_COPY_OWN,
 	CANNOT_MOVE_OUT_OF_ARRAY,
 	CANNOT_MOVE_OUT_OF_BORROW,
 	CANNOT_MOVE_OUT_OF_TEMPORARY,
 	CANNOT_REPEAT_OWN,
+	DROP_RULES,
 	Diagnostic,
-	Edit,
 	Span,
 	TAIL_CALL_LEAVES_WORK
 }
@@ -24,6 +23,9 @@ extend Checker {
 		match expr.kind {
 			.Local(..) | .Field(..) | .Deref(..) | .Index(..) => self.usePlace(id, ctx, &var state)
 			.Move(inner) => {
+				// A move the checker made where nothing was written, as a `var`
+				// pattern's of its place: a later use is told where it was given.
+				if body.exprs[inner].span == expr.span then self.givenAt.put(expr.span, expr.ty)
 				// The type checker has already rejected `move` of a non-place.
 				val innerCtx =
 					if self.place(inner).isSome() then Ctx::Move(expr.span) else Ctx::Value
@@ -63,7 +65,20 @@ extend Checker {
 				self.recordCopy(id, callee, &args, &var state)
 				// A call that is a jump leaves this frame in place, so nothing
 				// of it may still need cleaning up.
-				if body.tailCalls.contains(&id) then self.checkTailCall(expr.span, &state)
+				if body.tailCalls.contains(&id) then
+					self.checkTailCall(
+						expr.span,
+						"be a jump",
+						"a `@tailrec` function's call to itself reuses its frame",
+						&state,
+					)
+				else if body.becomes.contains(&id) then
+					self.checkTailCall(
+						expr.span,
+						"take this frame",
+						"`become` gives this frame to the call",
+						&state,
+					)
 			}
 			// The function value is read first: it is plain data.
 			.CallValue(callee, args) => {
@@ -93,7 +108,7 @@ extend Checker {
 					val diagnostic = Diagnostic::error(CANNOT_REPEAT_OWN, "cannot repeat a value that contains `own`", body.exprs[elem].span, "would give \(count) owners to one allocation").withHelp(
 						"write each element out, so each gets its own allocation",
 					)
-					self.report(move diagnostic)
+					self.report(diagnostic)
 				}
 			}
 			.OwnRepeat(elem, count) => {
@@ -108,7 +123,7 @@ extend Checker {
 						body.exprs[elem].span,
 						"would give every element of the buffer the same allocation",
 					).withHelp("fill the buffer with a value that owns nothing")
-					self.report(move diagnostic)
+					self.report(diagnostic)
 				}
 			}
 			.Unsize(inner) => self.expr(inner, .Value, &var state)
@@ -169,10 +184,10 @@ extend Checker {
 						var element = path.clone()
 						element.projs.push(.Element)
 						var binders: Vec<(LocalId, Option<Path>)> = Vec()
-						bindingsOf(&arm.pattern, .Some(move element), &var binders)
+						bindingsOf(&arm.pattern, .Some(element), &var binders)
 						for (local, place) in move binders {
 							match move place {
-								.Some(found) => self.aliases.put(local, move found)
+								.Some(found) => self.aliases.put(local, found)
 								.None => {}
 							}
 						}
@@ -203,7 +218,7 @@ extend Checker {
 					self.armEnds(&arm.pattern, arm.body, &var armState)
 					self.borrows.truncate(mark)
 					val returns = self.ty(arm.body) == NEVER
-					if !returns then joined = .Some(joinStates(&joined, move armState))
+					if !returns then joined = .Some(joinStates(&joined, armState))
 				}
 				if joined is .Some(j) then state = j.clone()
 			}
@@ -225,7 +240,7 @@ extend Checker {
 					self.armEnds(&arm.pattern, arm.body, &var armState)
 					self.borrows.truncate(mark)
 					val returns = self.ty(arm.body) == NEVER
-					if !returns then joined = .Some(joinStates(&joined, move armState))
+					if !returns then joined = .Some(joinStates(&joined, armState))
 				}
 				if joined is .Some(j) then state = j.clone()
 			}
@@ -259,7 +274,7 @@ extend Checker {
 				self.bindPattern(&patterns[i], element, .Match, &var bound)
 				self.bindViews(&patterns[i], element, &var bound)
 			}
-			return move bound
+			return bound
 		}
 		var locals: Vec<LocalId> = Vec()
 		pattern.locals(&var locals)
@@ -277,12 +292,12 @@ extend Checker {
 					.None => Option::None
 				}
 				val shared = match places.remove(&local) {
-					.Some(earlier) => commonPath(move earlier, move place)
-					.None => move place
+					.Some(earlier) => commonPath(earlier, place)
+					.None => place
 				}
-				places.put(local, move shared)
+				places.put(local, shared)
 			}
-			joined = .Some(joinStates(&joined, move bound))
+			joined = .Some(joinStates(&joined, bound))
 		}
 		for entry in places {
 			match entry.value {
@@ -291,7 +306,7 @@ extend Checker {
 			}
 		}
 		return match move joined {
-			.Some(j) => move j
+			.Some(j) => j
 			.None => state.clone()
 		}
 	}
@@ -325,7 +340,7 @@ extend Checker {
 		val body = self.body
 		self.placeParts(place, &var state)
 		val found = match self.place(place) {
-			.Some(found) => move found
+			.Some(found) => found
 			.None => panic("an assignment's target is a place")
 		}
 		if compound {
@@ -339,7 +354,7 @@ extend Checker {
 		if compound {
 			match self.accessPath(place) {
 				.Some(path) => self.borrows.push(Borrow(
-					path: move path,
+					path: path,
 					span: body.exprs[place].span,
 					writes: true,
 					holder: .Assign(place),
@@ -351,7 +366,7 @@ extend Checker {
 			val held = self.operandBorrows(place, &state)
 			for (path, span, writes) in move held {
 				self.borrows.push(Borrow(
-					path: move path,
+					path: path,
 					span: span,
 					writes: writes,
 					holder: .Operand(place),
@@ -391,11 +406,13 @@ extend Checker {
 		}
 	}
 
-	/// A `@tailrec` function's call to itself is compiled as a jump back to
-	/// the top, so what the frame would have dropped or deferred at its exit
-	/// never runs. Both are errors here rather than silent leaks: drops are
-	/// not reordered to make a call fit.
-	var fn checkTailCall(span: Span, state: &State) = {
+	/// A tail call — a `@tailrec` function's call to itself, compiled as a
+	/// jump back to the top, or a `become` — takes the frame, so what the
+	/// frame would have dropped or deferred at its exit never runs. Both are
+	/// errors here rather than silent leaks: drops are not reordered to make
+	/// a call fit. `can` says what the call does with the frame, and `why`
+	/// whose frame it is.
+	var fn checkTailCall(span: Span, can: str, why: str, state: &State) = {
 		var live = self.body.params.clone()
 		for scope in self.scopes {
 			for local in scope {
@@ -413,27 +430,23 @@ extend Checker {
 			val name = self.interner.resolve(self.body.locals[local].name)
 			val diagnostic = Diagnostic::error(
 				TAIL_CALL_LEAVES_WORK,
-				"`\(name)` is still owned here, so this call cannot be a jump",
+				"`\(name)` is still owned here, so this call cannot \(can)",
 				span,
 				"`\(name)` would be freed after this call returns",
 			).withSecondary(self.body.locals[local].span, "`\(name)` declared here").
-				withNote(
-					"a `@tailrec` function's call to itself reuses its frame, so nothing of the frame may be left to drop",
-				).
-				withHelp("move `\(name)` into the call, or end its scope before it")
-			self.report(move diagnostic)
+				withNote("\(why), so nothing of the frame may be left to drop").
+				withHelp("give `\(name)` to the call, or end its scope before it")
+			self.report(diagnostic)
 			return
 		}
 		if self.deferred.items().any((defers) => !defers.isEmpty()) {
 			val diagnostic = Diagnostic::error(
 				TAIL_CALL_LEAVES_WORK,
-				"a `defer` is waiting here, so this call cannot be a jump",
+				"a `defer` is waiting here, so this call cannot \(can)",
 				span,
 				"the `defer` would run after this call returns",
-			).withNote(
-				"a `@tailrec` function's call to itself reuses its frame, and a `defer` runs where the frame exits",
-			)
-			self.report(move diagnostic)
+			).withNote("\(why), and a `defer` runs where the frame exits")
+			self.report(diagnostic)
 		}
 	}
 
@@ -479,7 +492,7 @@ extend Checker {
 								}
 							}
 							.Ref(inner) => match self.accessPath(inner) {
-								.Some(path) => held.push((move path, body.exprs[arg].span, writes))
+								.Some(path) => held.push((path, body.exprs[arg].span, writes))
 								.None => {}
 							}
 							_ if self.borrowsAsView(body.exprs[arg].ty) => {
@@ -499,15 +512,67 @@ extend Checker {
 			}
 			_ => {}
 		}
-		return move held
+		return held
 	}
 
 	/// Checks a use of a place. The parts of an assignment's target were
 	/// evaluated before its value, so they are not evaluated again.
-	var fn usePlace(id: ExprId, ctx: Ctx, state: &var State) = {
+	var fn usePlace(id: ExprId, written: Ctx, state: &var State) = {
+		// A place that owns memory, used as a value, is given away: moved, as
+		// `move` would move it.
+		val ctx = if written == .Value && self.givenAway(id) {
+			val span = self.body.exprs[id].span
+			if self.partOfDropped(id) is .Some(owner) then self.cannotTakePart(owner, span)
+			self.given.add(id)
+			self.givenAt.put(span, self.body.exprs[id].ty)
+			Ctx::Move(span)
+		} else {
+			written
+		}
 		if ctx is .Move(..) | .Assign then self.checkNotBorrowed(id, ctx)
 		if ctx != .Assign then self.placeParts(id, &var state)
 		self.useFound(id, ctx, &var state)
+	}
+
+	/// The type with a `destroy` of its own that a place is a part of, which
+	/// nothing may be moved out of.
+	fn partOfDropped(id: ExprId): Option<Ty> = {
+		var at = id
+		while true {
+			val base = match self.body.exprs[at].kind {
+				.Field(base, ..) | .Index(base, ..) => base
+				.Deref(inner) => inner
+				_ => return .None
+			}
+			var ty = self.body.exprs[base].ty
+			while self.program.types.kind(ty) is .Ref(inner, ..) | .Own(inner) {
+				ty = inner
+			}
+			if self.program.hasDrop(ty) then return .Some(ty)
+			at = base
+		}
+		return .None
+	}
+
+	/// A part of a value whose `destroy` runs over the whole of it, given
+	/// away: E0426, as for a part moved with `move`.
+	var fn cannotTakePart(owner: Ty, span: Span) = {
+		val diagnostic = Diagnostic::error(
+			DROP_RULES,
+			"cannot move out of `\(self.tyName(owner))`, which cleans up after itself",
+			span,
+			"a part of it",
+		).withNote(
+			"its `destroy` runs over the whole value, so a part that was taken out would be ended twice or not at all",
+		).withHelp("move the whole value, or give the type a method that hands out what it holds")
+		self.report(diagnostic)
+	}
+
+	/// Whether a place used as a value is moved there: it owns memory, and
+	/// is a variable or a field of one, which a move can empty.
+	fn givenAway(id: ExprId): bool = {
+		val ty = self.body.exprs[id].ty
+		return self.owns(ty) && self.place(id) is .Some(.Path(..))
 	}
 
 	/// Checks a use of a place whose parts are checked already: where it is
@@ -519,7 +584,7 @@ extend Checker {
 		val ty = body.exprs[id].ty
 		val name = self.display(id)
 		val found = match self.place(id) {
-			.Some(found) => move found
+			.Some(found) => found
 			.None => panic("usePlace is called on places")
 		}
 		if found is .Path(path) then self.readAfterCopy(path.local, ctx == .Assign, &var state)
@@ -549,35 +614,17 @@ extend Checker {
 		match move found {
 			.Path(path) => match ctx {
 				.Inspect => { self.checkLive(&path, &name, span, &state) }
-				.Value => {
-					if self.checkLive(&path, &name, span, &state) && self.owns(ty) {
-						// An atomic holds no memory, and is moved all the same.
-						val note =
-							if self.program.isIntrinsicType(ty) then
-								"`\(self.tyName(ty))` is moved, never copied: a copy would read it in more than one step, which another thread could see half of"
-							else "a value that contains `own` has exactly one owner, so it is never copied"
-						val diagnostic = Diagnostic::error(
-							CANNOT_COPY_OWN,
-							"cannot copy `\(name)`",
-							span,
-							"`\(name)` has type `\(self.tyName(ty))`",
-						).withNote(move note).withFix(
-							"to transfer ownership, write `move \(name)`",
-							own [Edit::insert(span.lo, "move ")],
-						)
-						self.report(move diagnostic)
-					}
-				}
+				.Value => { self.checkLive(&path, &name, span, &state) }
 				.Move(moveSpan) => {
 					if self.checkLive(&path, &name, span, &state) then
-						state.recordMove(move path, moveSpan, name.clone(), self.exit.isSome())
+						state.recordMove(path, moveSpan, name.clone(), self.exit.isSome())
 				}
-				.Assign => self.assign(move path, &name, span, &var state)
+				.Assign => self.assign(path, &name, span, &var state)
 			}
 			.ThroughRef(reference) => {
 				val taken: Option<str> = match ctx {
 					.Move(..) => .Some("move")
-					.Value if self.owns(ty) => .Some("copy")
+					.Value if self.owns(ty) => .Some("move")
 					_ => .None
 				}
 				val .Some(verb) = taken else return
@@ -606,46 +653,48 @@ extend Checker {
 					).withNote(
 						"a closure may be called again, so what it captured stays where it is",
 					).withHelp("take what is used up as a parameter of the closure")
-					self.report(move diagnostic)
+					self.report(diagnostic)
 					return
 				}
 				val message =
 					if lent then "cannot \(verb) what a projection lends"
 					else "cannot \(verb) `\(name)`, which is behind a reference"
-				val label =
-					if element then "a `for` binding, which refers to an element"
-					else if binding then
-						"a `match` binding, which refers to part of the matched value"
-					else if lent then "lent by a projection, and owned by the caller"
-					else "behind a `&` reference"
+				val label = when {
+					element => "a `for` binding, which refers to an element"
+					binding => "a `match` binding, which refers to part of the matched value"
+					lent => "lent by a projection, and owned by the caller"
+					else => "behind a `&` reference"
+				}
 				var diagnostic = Diagnostic::error(
 					CANNOT_MOVE_OUT_OF_BORROW,
-					move message,
+					message,
 					span,
 					label,
 				).withNote("a reference can read a value but cannot take ownership of it")
-				if kept then
-					diagnostic = diagnostic.withHelp(
-						"it lies behind a reference, which neither `move` nor `match move` takes from; copy it with `clone()`",
-					)
-				else if element then
-					diagnostic = diagnostic.withHelp(
-						"elements stay where they are while a loop walks them; to take one out, move the whole array",
-					)
-				else if binding then
-					diagnostic = diagnostic.withHelp(
-						"to take the value apart, match it with `match move …`",
-					)
-				else if lent then
-					diagnostic = diagnostic.withHelp(
-						"a projection lends a place that belongs to its caller; nothing is taken out of it",
-					)
-				self.report(move diagnostic)
+				when {
+					kept =>
+						diagnostic = diagnostic.withHelp(
+							"it lies behind a reference, which neither `move` nor `match move` takes from; copy it with `clone()`",
+						)
+					element =>
+						diagnostic = diagnostic.withHelp(
+							"elements stay where they are while a loop walks them; to take one out, move the whole array",
+						)
+					binding =>
+						diagnostic = diagnostic.withHelp(
+							"to take the value apart, match it with `match move …`",
+						)
+					lent =>
+						diagnostic = diagnostic.withHelp(
+							"a projection lends a place that belongs to its caller; nothing is taken out of it",
+						)
+				}
+				self.report(diagnostic)
 			}
 			.Element(..) => {
 				val taken: Option<str> = match ctx {
 					.Move(..) => .Some("move out of")
-					.Value if self.owns(ty) => .Some("copy")
+					.Value if self.owns(ty) => .Some("move out of")
 					_ => .None
 				}
 				if taken is .Some(verb) {
@@ -657,7 +706,7 @@ extend Checker {
 					).withNote(
 						"taking one element would leave a hole in the array; an array of `own` values is moved as a whole",
 					)
-					self.report(move diagnostic)
+					self.report(diagnostic)
 				}
 			}
 			.Temporary(..) => {
@@ -667,8 +716,8 @@ extend Checker {
 						"cannot take `\(name)` out of a temporary",
 						span,
 						"part of a temporary value",
-					).withHelp("bind the temporary with `val`, then `move` this part out of it")
-					self.report(move diagnostic)
+					).withHelp("bind the temporary with `val`, and give this part of it from there")
+					self.report(diagnostic)
 				}
 			}
 		}
@@ -723,7 +772,7 @@ extend Checker {
 			if body.aliasBindings.contains(&local) {
 				match move path {
 					.Some(found) => {
-						self.aliases.put(local, move found)
+						self.aliases.put(local, found)
 						aliased = true
 					}
 					.None => {}
@@ -736,7 +785,7 @@ extend Checker {
 		if aliased {
 			match move scrutPath {
 				.Some(path) => self.borrows.push(Borrow(
-					path: move path,
+					path: path,
 					span: scrutSpan,
 					writes: false,
 					holder: holder,

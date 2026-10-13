@@ -81,8 +81,10 @@ pub fn biggest(): i64 = 9
 An item is a function, a type, an interface or a constant, and a path names
 any of them where its kind is expected: `shapes::Square` as a type,
 `shapes::area(…)` as a call, `T: shapes::Area` as an interface ([page
-8](08-interfaces.md)). An import is for the file it is written in, not the
-module: each file says what it uses.
+8](08-interfaces.md)). A full path needs no import: `std::math::PI_F32`
+names the constant in any file, and the module is read for it as an
+imported one is. An import binds names for the file it is written in, not
+the module: each file says what it uses by a shorter name.
 
 ## What `pub` means
 

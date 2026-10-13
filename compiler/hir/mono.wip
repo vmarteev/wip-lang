@@ -7,7 +7,15 @@
 // and the backends never see a type parameter.
 
 import std::collections::{Map, Set}
-import syntax::{Diagnostic, INSTANTIATION_DEPTH, Interner, OPAQUE_VALUE, Span, Symbol}
+import syntax::{
+	Diagnostic,
+	INSTANTIATION_DEPTH,
+	Interner,
+	NOT_PLAIN_BYTES,
+	OPAQUE_VALUE,
+	Span,
+	Symbol
+}
 
 /// How deeply instances may be made from instances before they are taken to
 /// be an endless series, as with `f<T>` calling `f<Pair<T, T>>`.
@@ -23,7 +31,7 @@ val MAX_TYPE_DEPTH: u32 = 64
 pub fn instantiate(program: &var Program, interner: &Interner): Vec<Diagnostic> = {
 	val diagnostics = makeInstances(&var program, &interner)
 	program.fnValues = fnValues(&program)
-	return move diagnostics
+	return diagnostics
 }
 
 /// The functions some body uses as a value, by the instance it names.
@@ -35,7 +43,7 @@ fn fnValues(program: &Program): Set<FnId> = {
 			if expr.kind is .FnRef(id, ..) then values.add(id)
 		}
 	}
-	return move values
+	return values
 }
 
 /// The instances made so far, by the generic function, its type arguments
@@ -70,7 +78,7 @@ fn makeInstances(program: &var Program, interner: &Interner): Vec<Diagnostic> = 
 	for f in program.fns {
 		if !f.generics.isEmpty() then anyGeneric = true
 	}
-	if !anyGeneric && program.impls.isEmpty() then return move diagnostics
+	if !anyGeneric && program.impls.isEmpty() then return diagnostics
 	val start = program.types.len()
 	var instances = Instances()
 	for id in program.fns.ids() {
@@ -93,6 +101,10 @@ fn makeInstances(program: &var Program, interner: &Interner): Vec<Diagnostic> = 
 	// said so of its type, since one value in a library's generic code makes
 	// many instances that hold it.
 	var opaqueReported: Set<Ty> = Set()
+	// The types whose bytes were asked for and are not all their values',
+	// reported once each; and the layouts that say where their gaps are.
+	var bytesReported: Set<Ty> = Set()
+	var layouts = Layouts::new()
 	// The types whose parts were walked for drops, in any body: a drop found
 	// in one was made then, so a type is walked once.
 	var walked: Set<Ty> = Set()
@@ -108,7 +120,7 @@ fn makeInstances(program: &var Program, interner: &Interner): Vec<Diagnostic> = 
 		// An `@intrinsic` has no body to walk: the compiler writes it where it
 		// is called.
 		val .Some(taken) = program.fns[id].body.take() else continue
-		var body = move taken
+		var body = taken
 		val origin: Option<Span> = match instances.origins.get(&id) {
 			.Some(span) => .Some(span)
 			.None => .None
@@ -165,11 +177,7 @@ fn makeInstances(program: &var Program, interner: &Interner): Vec<Diagnostic> = 
 				val list = program.types.internList(&methodArgs)
 				concrete.push(instances.of(&var program, implementation, list, module, depth))
 			}
-			program.vtables.push(VTableDef(
-				interfaceId: interfaceId,
-				ty: ty,
-				methods: move concrete,
-			))
+			program.vtables.push(VTableDef(interfaceId: interfaceId, ty: ty, methods: concrete))
 		}
 		// Calls whose `Self` is an array, which the slice's implementation
 		// answers: the call, and the element.
@@ -235,38 +243,40 @@ fn makeInstances(program: &var Program, interner: &Interner): Vec<Diagnostic> = 
 				callee = implementation
 				concrete = program.types.internList(&rest)
 				if concrete == TyList::empty() {
-					body.exprs[at].kind = withCallee(move kind, callee, TyList::empty())
+					body.exprs[at].kind = withCallee(kind, callee, TyList::empty())
 					continue
 				}
 			}
 			val key = (callee, concrete, module)
 			var instance: FnId = callee
-			if instances.made.get(&key) is .Some(found) {
-				instance = found
-			} else if depth >= MAX_INSTANCE_DEPTH {
-				if reported.add(callee) {
-					val generic = &program.fns[callee]
-					val name = interner.resolve(generic.name)
-					diagnostics.push(
-						Diagnostic::error(
-							INSTANTIATION_DEPTH,
-							"the instances of `\(name)` never end",
-							generic.nameSpan,
-							"each instance calls a larger one",
-						).withNote("instances made from instances more than \(MAX_INSTANCE_DEPTH) deep are taken to be an endless series"),
-					)
-				}
-				body.exprs[at].kind = withCallee(move kind, callee, typeArgs)
-				continue
-			} else {
-				instance = instances.of(&var program, callee, concrete, module, depth)
-				// What an instance makes is made where it was.
-				if !instances.origins.contains(&instance) {
-					val made: Span = match instances.origins.get(&id) {
-						.Some(span) => span
-						.None => body.exprs[at].span
+			when {
+				instances.made.get(&key) is .Some(found) => instance = found
+				depth >= MAX_INSTANCE_DEPTH => {
+					if reported.add(callee) {
+						val generic = &program.fns[callee]
+						val name = interner.resolve(generic.name)
+						diagnostics.push(
+							Diagnostic::error(
+								INSTANTIATION_DEPTH,
+								"the instances of `\(name)` never end",
+								generic.nameSpan,
+								"each instance calls a larger one",
+							).withNote("instances made from instances more than \(MAX_INSTANCE_DEPTH) deep are taken to be an endless series"),
+						)
 					}
-					instances.origins.put(instance, made)
+					body.exprs[at].kind = withCallee(kind, callee, typeArgs)
+					continue
+				}
+				else => {
+					instance = instances.of(&var program, callee, concrete, module, depth)
+					// What an instance makes is made where it was.
+					if !instances.origins.contains(&instance) {
+						val made: Span = match instances.origins.get(&id) {
+							.Some(span) => span
+							.None => body.exprs[at].span
+						}
+						instances.origins.put(instance, made)
+					}
 				}
 			}
 			// What C lays out has no size Wip knows to answer.
@@ -285,14 +295,29 @@ fn makeInstances(program: &var Program, interner: &Interner): Vec<Diagnostic> = 
 								opaque,
 								"the size of `\(program.tyName(arg, &interner))`",
 								body.exprs[at].span,
-								move made,
+								made,
 								&interner,
 							),
 						)
 					}
 				}
 			}
-			body.exprs[at].kind = withCallee(move kind, instance, TyList::empty())
+			// A value's bytes, which must all be its own: no gap a field leaves,
+			// and no address.
+			if program.fns[callee].intrinsic is .Some(.ValueBytes) {
+				val arg = program.types.list(concrete)[0]
+				if notPlainBytes(&program, &var layouts, arg, &interner) is .Some(fault) &&
+					(bytesReported.add(arg) || args.isEmpty()) {
+					val made = match instances.origins.get(&id) {
+						.Some(origin) => .Some((origin, program.fnName(id, &interner)))
+						.None => .None
+					}
+					diagnostics.push(
+						notPlainValue(&program, arg, fault, body.exprs[at].span, made, &interner),
+					)
+				}
+			}
+			body.exprs[at].kind = withCallee(kind, instance, TyList::empty())
 		}
 		for (call, method, elem) in lentAsSlices {
 			lendAsSlices(&var program, &var body, &args, call, method, elem)
@@ -303,24 +328,19 @@ fn makeInstances(program: &var Program, interner: &Interner): Vec<Diagnostic> = 
 		for call in copiedReferences {
 			copyReference(&var program, &var body, &args, call)
 		}
-		program.fns[id].body = .Some(move body)
+		program.fns[id].body = .Some(body)
 	}
 	// Runaway instances leave runaway types behind, which say nothing more.
 	if diagnostics.isEmpty() then completeTypes(&var program, start, &interner, &var diagnostics)
-	return move diagnostics
+	return diagnostics
 }
 
 /// A call or a function value, pointed at another function with these type
 /// arguments.
 fn withCallee(kind: ExprKind, callee: FnId, typeArgs: TyList): ExprKind = match move kind {
-	.Call(args, order, ..) => .Call(
-		callee: callee,
-		args: move args,
-		typeArgs: typeArgs,
-		order: move order,
-	)
+	.Call(args, order, ..) => .Call(callee: callee, args: args, typeArgs: typeArgs, order: order)
 	.FnRef(..) => .FnRef(id: callee, typeArgs: typeArgs)
-	other => move other
+	other => other
 }
 
 /// The drop of a type a body ends a value of, made concrete, or a
@@ -438,12 +458,7 @@ fn lendAsSlices(
 		lent[i] = body.exprs.add(Expr(kind: .Ref(whole), ty: reference, span: span))
 	}
 	if body.exprs[call].kind.clone() is .Call(callee, typeArgs, order, ..) then
-		body.exprs[call].kind = .Call(
-			callee: callee,
-			args: move lent,
-			typeArgs: typeArgs,
-			order: move order,
-		)
+		body.exprs[call].kind = .Call(callee: callee, args: lent, typeArgs: typeArgs, order: order)
 }
 
 /// `ty` without the `&` references around it, and how many there were: a
@@ -488,12 +503,7 @@ fn readThroughReferences(
 		read[i] = e
 	}
 	if body.exprs[call].kind.clone() is .Call(callee, typeArgs, order, ..) then
-		body.exprs[call].kind = .Call(
-			callee: callee,
-			args: move read,
-			typeArgs: typeArgs,
-			order: move order,
-		)
+		body.exprs[call].kind = .Call(callee: callee, args: read, typeArgs: typeArgs, order: order)
 }
 
 /// `clone` of plain data: what the receiver refers to, copied — a `&T` as a
@@ -591,7 +601,7 @@ fn implementationOf(
 			}
 		}
 	}
-	return .Some((found, move methodArgs))
+	return .Some((found, methodArgs))
 }
 
 /// The prelude's `exitCode` or `exitVoid`, and the error type to make it for,
@@ -676,7 +686,7 @@ fn opaqueValues(
 			.Some(at) => .Some((at, program.fnName(id, &interner)))
 			.None => .None
 		}
-		diagnostics.push(opaqueValue(&program, opaque, what, span, move made, &interner))
+		diagnostics.push(opaqueValue(&program, opaque, what, span, made, &interner))
 		if instance then return
 	}
 }
@@ -702,7 +712,120 @@ fn opaqueValue(
 	).withHelp("a pointer to one is written `ptr<\(name)>`, which a generic takes as `ptr<T>`")
 	if made is .Some((at, instance)) then
 		diagnostic = diagnostic.withSecondary(at, "`\(instance)` is made here")
-	return move diagnostic
+	return diagnostic
+}
+
+/// Why a value of `ty` has bytes that are not all its value's — a gap no
+/// field fills, or an address — where it has any: what `c::bytesOf` refuses.
+fn notPlainBytes(
+	program: &Program,
+	layouts: &var Layouts,
+	ty: Ty,
+	interner: &Interner,
+): Option<Fault> = {
+	val name = program.tyName(ty, &interner)
+	match program.types.kind(ty) {
+		.Unit | .Int(..) | .Float(..) | .Bool | .Char => return .None
+		.Array(elem, ..) => return notPlainBytes(&program, &var layouts, elem, &interner)
+		.Struct(id, ..) => {
+			val def = &program.structs[id]
+			if def.isOpaque then return .Some(.Address(field: "", what: name))
+			val size = layouts.of(&program, ty).size
+			var end: u32 = 0
+			var last = String()
+			for (i, fieldTy) in program.fieldTys(ty).forwards().enumerate() {
+				val field = interner.resolve(def.fields[i].name)
+				match notPlainBytes(&program, &var layouts, fieldTy, &interner) {
+					// Said of the field that holds it, the innermost.
+					.Some(.Address(field: inner, what)) => {
+						val holder = if inner.isEmpty() then "`\(field)` of `\(name)`" else inner
+						return .Some(.Address(field: holder, what: what))
+					}
+					.Some(fault) => return .Some(fault)
+					.None => {}
+				}
+				val fieldSize = layouts.of(&program, fieldTy).size
+				// A union's fields lie over the same bytes, so each must fill
+				// them all.
+				if def.isUnion {
+					if fieldSize != size then
+						return .Some(
+							.Padding("`\(field)` of the union `\(name)` fills \(fieldSize) of its \(size) bytes"),
+						)
+					continue
+				}
+				val offset = layouts.fieldOffset(&program, ty, i as u32)
+				if offset != end then
+					return .Some(
+						.Padding("`\(name)` has \(offset - end) bytes of padding before `\(field)`"),
+					)
+				end = offset + fieldSize
+				last = String::of(field)
+			}
+			if !def.isUnion && end != size then
+				return .Some(
+					.Padding("`\(name)` has \(size - end) bytes of padding after `\(last)`"),
+				)
+			return .None
+		}
+		.Enum(..) => {
+			for fields in program.variantFieldTys(ty) {
+				if !fields.isEmpty() then return .Some(.Variants(name))
+			}
+			return .None
+		}
+		_ => return .Some(.Address(field: "", what: name))
+	}
+}
+
+/// What makes a value's bytes not all its own.
+enum Fault {
+	/// Bytes no field writes, and why.
+	Padding(why: String)
+	/// An enum whose variants hold values, over the same bytes.
+	Variants(name: String)
+	/// A number that means something only inside the program: of a type
+	/// `what`, in a `field` where one holds it.
+	Address(field: String, what: String)
+}
+
+/// What is said of `c::bytesOf` asked for the bytes of a `ty`, which `fault`
+/// keeps from being all its value's: where it is asked, and the instance
+/// that asks and where that was made.
+fn notPlainValue(
+	program: &Program,
+	ty: Ty,
+	fault: Fault,
+	span: Span,
+	made: Option<(Span, String)>,
+	interner: &Interner,
+): Diagnostic = {
+	val name = program.tyName(ty, &interner)
+	val message = "the bytes of `\(name)` are not all its value's"
+	var diagnostic = match fault {
+		.Padding(why) => Diagnostic::error(NOT_PLAIN_BYTES, message, span, why.toStr()).withNote(
+			"a gap between fields, or after the last, holds bytes nothing writes",
+		).withHelp(
+			"write a field where the gap is, or say `@packed`, which lays the fields one after another",
+		)
+		.Variants(
+			enumName,
+		) => Diagnostic::error(NOT_PLAIN_BYTES, message, span, "`\(enumName)` is an enum whose variants hold values").withNote(
+			"an enum's variants lie over the same bytes, and one that holds less leaves the rest unwritten",
+		)
+		.Address(field, what) => Diagnostic::error(
+			NOT_PLAIN_BYTES,
+			message,
+			span,
+			if field.isEmpty() then "a `\(what)` is an address, or holds one"
+			else "\(field) is a `\(what)`, an address or what holds one",
+		).withNote(
+			"an address — a reference, a `str`, a C string, a pointer, a function — means nothing outside the program that holds it",
+		)
+	}
+	if made is .Some((at, instance)) then
+		diagnostic = diagnostic.withSecondary(at, "`\(instance)` is made here")
+	return diagnostic
 }
 
 /// A copy of `generic` for the type arguments `args`, in `module`.
@@ -718,7 +841,7 @@ fn makeInstance(program: &var Program, generic: FnId, args: TyList, module: u32)
 	}
 	def.ret = program.types.subst(def.ret, &tys)
 	if def.body.take() is .Some(taken) {
-		var body = move taken
+		var body = taken
 		for id in body.locals.ids() {
 			body.locals[id].ty = program.types.subst(body.locals[id].ty, &tys)
 		}
@@ -732,7 +855,7 @@ fn makeInstance(program: &var Program, generic: FnId, args: TyList, module: u32)
 				.CallClosure(callee, args: callArgs, codeTy) => {
 					body.exprs[id].kind = .CallClosure(
 						callee: callee,
-						args: move callArgs,
+						args: callArgs,
 						codeTy: program.types.subst(codeTy, &tys),
 					)
 				}
@@ -741,17 +864,17 @@ fn makeInstance(program: &var Program, generic: FnId, args: TyList, module: u32)
 						interfaceId: interfaceId,
 						index: index,
 						fnTy: program.types.subst(fnTy, &tys),
-						args: move callArgs,
-						order: move order,
+						args: callArgs,
+						order: order,
 					)
 				}
 				.DropRef(ty) => body.exprs[id].kind = .DropRef(program.types.subst(ty, &tys))
 				_ => {}
 			}
 		}
-		def.body = .Some(move body)
+		def.body = .Some(body)
 	}
-	return program.fns.add(move def)
+	return program.fns.add(def)
 }
 
 /// The types of every field of a struct or enum type, with its type
@@ -781,7 +904,7 @@ fn children(program: &var Program, ty: Ty): Vec<Ty> = {
 	for t in declared {
 		out.push(program.types.subst(t, &tys))
 	}
-	return move out
+	return out
 }
 
 /// Interns the field types of the instances inside `ty`, and of those inside
@@ -874,10 +997,10 @@ extend Program {
 		// A method is named after the type it belongs to.
 		val name = match self.ownerOfFn(id) {
 			.Some(owner) => "\(self.ownerName(owner, &interner)).\(plain)"
-			.None => move plain
+			.None => plain
 		}
 		val path = &self.modules[module as i64]
-		return if path.isEmpty() then move name else "\(path)::\(name)"
+		return if path.isEmpty() then name else "\(path)::\(name)"
 	}
 
 	/// The type a function belongs to, for an instance the type its generic

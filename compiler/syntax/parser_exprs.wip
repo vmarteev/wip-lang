@@ -79,7 +79,7 @@ extend Parser {
 			]).withNote(
 				"`yield` is a statement that hands a value to the list being built, `own [for x in xs { yield x }]`, or to whoever asks a generator for it; in a `match` arm, it is written in braces, `{ yield x }`. A projection lends a place and stops, with `lend`",
 			)
-			self.report(move diagnostic)
+			self.report(diagnostic)
 			self.bump()
 			val value = self.expr()
 			val whole = span.to(self.exprSpan(value))
@@ -115,15 +115,12 @@ extend Parser {
 						).withFix("write `!is`", own [Edit::replace(between, "")]).withNote(
 							"`x !is P` is `!(x is P)`, one operator, as `!=` is",
 						)
-						self.report(move diagnostic)
+						self.report(diagnostic)
 					}
 				}
 				val pattern = self.pattern()
 				val span = self.exprSpan(lhs).to(pattern.span)
-				lhs = self.allocExpr(
-					.Is(scrutinee: lhs, pattern: move pattern, negated: negated),
-					span,
-				)
+				lhs = self.allocExpr(.Is(scrutinee: lhs, pattern: pattern, negated: negated), span)
 				continue
 			}
 			if op == .As {
@@ -179,7 +176,7 @@ extend Parser {
 					wrapping: wrapping,
 				)
 			}
-			lhs = self.allocExpr(move kind, span)
+			lhs = self.allocExpr(kind, span)
 		}
 		return lhs
 	}
@@ -288,88 +285,94 @@ extend Parser {
 			// or inside brackets, where line breaks do not separate.
 			// `expr?`: the value, or an early return of the other
 			// variant.
-			if next == .Question && !self.lineBreak() {
-				self.bump()
-				kind = .Some(.Try(inner: e))
-			} else if next == .Dot && !self.lineBreak() {
-				self.bump()
-				// `pair.0`: a tuple's element, which lies in the field
-				// the prelude calls `_0`.
-				if self.peek() is .Int | .Float {
-					kind = self.tupleIndex(e)
-					if kind.isNone() then break
-				} else {
-					val .Some(name) = self.name("a field name") else break
-					kind = .Some(.Field(base: e, name: name))
+			when {
+				next == .Question && !self.lineBreak() => {
+					self.bump()
+					kind = .Some(.Try(inner: e))
 				}
-			} else if next == .LParen && !self.lineBreak() {
-				val open = self.bump()
-				val (args, _) = self.inParens(
-					(p) => p.list(
-						open,
-						.RParen,
-						"an argument",
-						(kind) => canStartExpr(kind) || kind == .DotDot,
-						(q) => {
-							// `..base`: the fields a struct built by the call
-							// does not name.
-							if q.at(.DotDot) {
-								val dots = q.bump()
-								val value = q.expr()
-								return .Some(CallArg::Rest(value: value, dots: dots))
+				next == .Dot && !self.lineBreak() => {
+					self.bump()
+					// `pair.0`: a tuple's element, which lies in the field
+					// the prelude calls `_0`.
+					if self.peek() is .Int | .Float {
+						kind = self.tupleIndex(e)
+						if kind.isNone() then break
+					} else {
+						val .Some(name) = self.name("a field name") else break
+						kind = .Some(.Field(base: e, name: name))
+					}
+				}
+				next == .LParen && !self.lineBreak() => {
+					val open = self.bump()
+					val (args, _) = self.inParens(
+						(p) => p.list(
+							open,
+							.RParen,
+							"an argument",
+							(kind) => canStartExpr(kind) || kind == .DotDot,
+							(q) => {
+								// `..base`: the fields a struct built by the call
+								// does not name.
+								if q.at(.DotDot) {
+									val dots = q.bump()
+									val value = q.expr()
+									return .Some(CallArg::Rest(value: value, dots: dots))
+								}
+								// `name: value`.
+								var name: Option<Name> = .None
+								if isIdent(q.peek()) && q.nth(1) == .Colon {
+									name = q.name("a parameter name")
+									if name.isSome() then q.bump()
+								}
+								return .Some(CallArg::Plain(name: name, value: q.expr()))
+							},
+						),
+					)
+					val (plain, rest) = self.restLast(args)
+					self.positionalAfterNamed(&plain)
+					var names: Vec<Option<Name>> = Vec()
+					var values: Vec<ExprId> = Vec()
+					for (name, value) in plain {
+						names.push(name)
+						values.push(value)
+					}
+					kind = .Some(.Call(callee: e, args: values, names: names, rest: rest))
+				}
+				next == .LBracket && !self.lineBreak() => {
+					val open = self.bump()
+					// `xs[i]`, or a range of elements `xs[lo..hi]` with
+					// either bound optional.
+					val indexed = self.inParens(
+						(p) => {
+							val lo: Option<ExprId> =
+								if !p.at(.DotDot) && !p.at(.DotDotEq) then .Some(p.expr())
+								else .None
+							if p.eat(.DotDot) {
+								val hi: Option<ExprId> =
+									if !p.at(.RBracket) then .Some(p.expr()) else .None
+								return ExprKind::SubSlice(base: e, lo: lo, hi: hi, inclusive: false)
 							}
-							// `name: value`.
-							var name: Option<Name> = .None
-							if isIdent(q.peek()) && q.nth(1) == .Colon {
-								name = q.name("a parameter name")
-								if name.isSome() then q.bump()
+							if p.eat(.DotDotEq) {
+								// `..=` takes its end too, so it needs one.
+								val hi = p.expr()
+								return ExprKind::SubSlice(
+									base: e,
+									lo: lo,
+									hi: .Some(hi),
+									inclusive: true,
+								)
 							}
-							return .Some(CallArg::Plain(name: name, value: q.expr()))
+							val .Some(index) = lo else panic("an index was parsed")
+							return ExprKind::Index(base: e, index: index)
 						},
-					),
-				)
-				val (plain, rest) = self.restLast(move args)
-				self.positionalAfterNamed(&plain)
-				var names: Vec<Option<Name>> = Vec()
-				var values: Vec<ExprId> = Vec()
-				for (name, value) in plain {
-					names.push(name)
-					values.push(value)
+					)
+					self.expectClosing(.RBracket, open)
+					kind = .Some(indexed)
 				}
-				kind = .Some(.Call(callee: e, args: move values, names: move names, rest: rest))
-			} else if next == .LBracket && !self.lineBreak() {
-				val open = self.bump()
-				// `xs[i]`, or a range of elements `xs[lo..hi]` with
-				// either bound optional.
-				val indexed = self.inParens(
-					(p) => {
-						val lo: Option<ExprId> =
-							if !p.at(.DotDot) && !p.at(.DotDotEq) then .Some(p.expr()) else .None
-						if p.eat(.DotDot) {
-							val hi: Option<ExprId> =
-								if !p.at(.RBracket) then .Some(p.expr()) else .None
-							return ExprKind::SubSlice(base: e, lo: lo, hi: hi, inclusive: false)
-						}
-						if p.eat(.DotDotEq) {
-							// `..=` takes its end too, so it needs one.
-							val hi = p.expr()
-							return ExprKind::SubSlice(
-								base: e,
-								lo: lo,
-								hi: .Some(hi),
-								inclusive: true,
-							)
-						}
-						val .Some(index) = lo else panic("an index was parsed")
-						return ExprKind::Index(base: e, index: index)
-					},
-				)
-				self.expectClosing(.RBracket, open)
-				kind = .Some(move indexed)
 			}
 			val .Some(made) = move kind else break
 			val span = self.exprSpan(e).to(self.prevSpan())
-			e = self.allocExpr(move made, span)
+			e = self.allocExpr(made, span)
 		}
 		return e
 	}
@@ -439,7 +442,7 @@ extend Parser {
 		val moved = self.allocExpr(.Unary(op: .Move, opSpan: span, operand: built), span)
 		val last = self.allocStmt(.Expr(value: moved), span)
 		stmts.push(last)
-		return self.allocExpr(.Block(block: Block(stmts: move stmts, span: span)), span)
+		return self.allocExpr(.Block(block: Block(stmts: stmts, span: span)), span)
 	}
 
 	/// `var text# = String::withCapacity(capacity)`.
@@ -449,7 +452,7 @@ extend Parser {
 			Name(sym: Symbol::withCapacity(), span: span),
 		])
 		val callee = self.allocExpr(
-			.Path(leadingDot: false, segments: move segments, typeArgs: .None),
+			.Path(leadingDot: false, segments: segments, typeArgs: .None),
 			span,
 		)
 		val count = self.allocExpr(.Int(value: capacity as u128), span)
@@ -530,7 +533,7 @@ extend Parser {
 				).withNote(
 					"`\\(value, width: 4, fill: '0', align: .Right)` pads the text to a width; `precision: 3` writes a float with three digits after its point, `radix: 16` an integer in hexadecimal, and `upper: true` its digits above 9 in upper case",
 				)
-				self.report(move diagnostic)
+				self.report(diagnostic)
 				continue
 			}
 			if given[which] is .Some((first, _)) {
@@ -540,7 +543,7 @@ extend Parser {
 					name.span,
 					"given again",
 				).withSecondary(first, "first given here")
-				self.report(move diagnostic)
+				self.report(diagnostic)
 				continue
 			}
 			given[which] = .Some((name.span, value))
@@ -556,7 +559,7 @@ extend Parser {
 			).withNote(
 				"`\\(byte, radix: 16, upper: true)` writes an integer in hexadecimal with `A` to `F`",
 			)
-			self.report(move diagnostic)
+			self.report(diagnostic)
 		}
 		// A precision is a float's and a radix an integer's, so no value
 		// takes both.
@@ -569,7 +572,7 @@ extend Parser {
 			).withSecondary(first, "a precision").withNote(
 				"a precision is the digits after a float's point, and a radix the base an integer is written in",
 			)
-			self.report(move diagnostic)
+			self.report(diagnostic)
 		}
 		if precisionGiven is .Some((span, value)) then
 			options.written = .Some(Written(
@@ -604,7 +607,7 @@ extend Parser {
 				start.to(self.prevSpan()),
 				"no `width:`",
 			).withNote("the fill makes up the text to the width, and the alignment says where")
-			self.report(move diagnostic)
+			self.report(diagnostic)
 		}
 		return move options
 	}
@@ -624,10 +627,7 @@ extend Parser {
 			args.push(upper)
 			names.push(.Some(Name(sym: Symbol::upper(), span: nameSpan)))
 		}
-		return self.allocExpr(
-			.Call(callee: callee, args: move args, names: move names, rest: .None),
-			span,
-		)
+		return self.allocExpr(.Call(callee: callee, args: args, names: names, rest: .None), span)
 	}
 
 	/// `value.appendFitted(&var text#, width: …, fill: …, align: .Some(…))`:
@@ -672,7 +672,7 @@ extend Parser {
 			names.push(.Some(Name(sym: align, span: span)))
 		}
 		val call = self.allocExpr(
-			.Call(callee: callee, args: move args, names: move names, rest: .None),
+			.Call(callee: callee, args: args, names: names, rest: .None),
 			span,
 		)
 		stmts.push(self.allocStmt(.Expr(value: call), span))
@@ -776,6 +776,7 @@ extend Parser {
 			.If => return self.ifExpr()
 			.Assert(message) => return self.assertExpr(message)
 			.Match => return self.matchExpr()
+			.When => return self.whenExpr()
 			.LParen if self.looksLikeLambda() => return self.lambda()
 			.LParen => {
 				val open = self.bump()
@@ -783,7 +784,7 @@ extend Parser {
 				// one expression.
 				val (elems, comma) = self.inParens((p) => {
 					var elems: Vec<ExprId> = Vec()
-					if p.at(.RParen) then return (move elems, false)
+					if p.at(.RParen) then return (elems, false)
 					elems.push(p.expr())
 					var comma = false
 					while p.eat(.Comma) {
@@ -791,7 +792,7 @@ extend Parser {
 						if p.at(.RParen) then break
 						elems.push(p.expr())
 					}
-					return (move elems, comma)
+					return (elems, comma)
 				})
 				self.expectClosing(.RParen, open)
 				if elems.len() == 1 && !comma {
@@ -799,19 +800,19 @@ extend Parser {
 				} else {
 					val span = start.to(self.prevSpan())
 					match self.tupleName(elems.len(), span, "expression") {
-						.Some(name) => self.tupleLit(name, move elems, span)
+						.Some(name) => self.tupleLit(name, elems, span)
 						.None => .Error
 					}
 				}
 			}
 			_ => {
 				val diagnostic = self.expected("an expression")
-				self.report(move diagnostic)
+				self.report(diagnostic)
 				return self.errorExpr()
 			}
 		}
 		val span = start.to(self.prevSpan())
-		return self.allocExpr(move kind, span)
+		return self.allocExpr(kind, span)
 	}
 
 	/// Whether the `<` `n` tokens ahead starts type arguments rather than a
@@ -910,7 +911,7 @@ extend Parser {
 						).withSecondary(dots, "the remaining fields").withHelp(
 							"`..base` stands for every field the call does not name",
 						)
-						self.report(move diagnostic)
+						self.report(diagnostic)
 					}
 					plain.push((name, value))
 				}
@@ -922,7 +923,7 @@ extend Parser {
 							dots,
 							"a second `..`",
 						).withSecondary(first, "the first one")
-						self.report(move diagnostic)
+						self.report(diagnostic)
 					}
 					.None => rest = .Some((value, dots))
 				}
@@ -932,7 +933,7 @@ extend Parser {
 			.Some((value, _)) => .Some(value)
 			.None => .None
 		}
-		return (move plain, restValue)
+		return (plain, restValue)
 	}
 
 	/// Reports a positional argument after a named one (E0122).
@@ -957,7 +958,7 @@ extend Parser {
 				).withSecondary(named.span, "named").
 					withHelp("name this argument too, or move it before the named ones").
 					withNote("positional arguments come first, then named ones in any order")
-				self.report(move diagnostic)
+				self.report(diagnostic)
 				return
 			}
 		}
@@ -1019,7 +1020,7 @@ extend Parser {
 					diagnostic = diagnostic.withHelp(
 						"write the two positions in parentheses: `(pair.0).1`",
 					)
-				self.report(move diagnostic)
+				self.report(diagnostic)
 				return .None
 			}
 			if kind is .Some(made) {
@@ -1028,7 +1029,7 @@ extend Parser {
 			}
 			kind = .Some(.Field(base: at, name: Name(sym: Symbol::tupleField(index), span: span)))
 		}
-		return move kind
+		return kind
 	}
 
 	/// `(a, b)`, which is the prelude's `Tuple2(a, b)`. The sugar is written
@@ -1037,7 +1038,7 @@ extend Parser {
 	var fn tupleLit(name: Symbol, elems: Vec<ExprId>, span: Span): ExprKind = {
 		val callee = self.allocExpr(.Name(symbol: name), span)
 		val names: Vec<Option<Name>> = Vec::filled(elems.len(), .None)
-		return .Call(callee: callee, args: move elems, names: move names, rest: .None)
+		return .Call(callee: callee, args: elems, names: names, rest: .None)
 	}
 
 	/// The prelude's `TupleN` for a tuple of `n` elements, or a report that
@@ -1055,10 +1056,8 @@ extend Parser {
 			"a tuple has \(MIN_TUPLE) to \(MAX_TUPLE) elements",
 			span,
 			label,
-		).withHelp(move help).withNote(
-			"the prelude declares the tuples, and `(a, b)` is their sugar",
-		)
-		self.report(move diagnostic)
+		).withHelp(help).withNote("the prelude declares the tuples, and `(a, b)` is their sugar")
+		self.report(diagnostic)
 		return .None
 	}
 
@@ -1080,7 +1079,7 @@ extend Parser {
 		val ret: Option<TypeId> = if self.eat(.Colon) then .Some(self.ty()) else .None
 		val body = if self.expect(.FatArrow) then self.expr() else self.errorExpr()
 		val span = open.to(self.exprSpan(body))
-		return self.allocExpr(.Lambda(params: move params, ret: ret, body: body), span)
+		return self.allocExpr(.Lambda(params: params, ret: ret, body: body), span)
 	}
 
 	/// An expression starting with an identifier: a name, a struct literal or
@@ -1152,12 +1151,12 @@ extend Parser {
 		).withNote(
 			"a struct is built as a variant is: its name, and its fields as a call's arguments, by position and then by name",
 		).withFix("write `\(call)`", own [Edit::replace(span, call.clone())])
-		self.report(move diagnostic)
+		self.report(diagnostic)
 		val callee =
 			if path.len() == 1 && typeArgs.isNone() then
 				self.allocExpr(.Name(symbol: path[0].sym), path[0].span)
 			else self.allocExpr(
-				.Path(leadingDot: false, segments: move path, typeArgs: move typeArgs),
+				.Path(leadingDot: false, segments: path, typeArgs: typeArgs),
 				start.to(headEnd),
 			)
 		var names: Vec<Option<Name>> = Vec()
@@ -1166,10 +1165,7 @@ extend Parser {
 			names.push(.Some(field.name))
 			args.push(field.value)
 		}
-		return self.allocExpr(
-			.Call(callee: callee, args: move args, names: move names, rest: rest),
-			span,
-		)
+		return self.allocExpr(.Call(callee: callee, args: args, names: names, rest: rest), span)
 	}
 
 	/// One element inside a struct literal's braces: a field, or `..value`.
@@ -1191,7 +1187,7 @@ extend Parser {
 		} else {
 			if !shorthand {
 				val diagnostic = self.expected("`:` and a value")
-				self.report(move diagnostic)
+				self.report(diagnostic)
 			}
 			self.allocExpr(.Name(symbol: name.sym), name.span)
 		}
@@ -1225,7 +1221,7 @@ extend Parser {
 				).withNote(
 					"after a name, `<` starts type arguments when `(`, `{` or `::` follows the matching `>`",
 				).withFix("remove the `::`", own [Edit::replace(colons, "")])
-				self.report(move diagnostic)
+				self.report(diagnostic)
 				self.pathTypeArgs(&var typeArgs, segments.len() - 1)
 				if !self.eat(.ColonColon) then break
 			}
@@ -1236,10 +1232,10 @@ extend Parser {
 		}
 		// `pkg::Point { … }`, as an unqualified one.
 		if self.at(.LBrace) && !self.noStruct && !self.lineBreak() then
-			return self.braceLiteral(move segments, move typeArgs)
+			return self.braceLiteral(segments, typeArgs)
 		val span = start.to(self.prevSpan())
 		return self.allocExpr(
-			.Path(leadingDot: false, segments: move segments, typeArgs: move typeArgs),
+			.Path(leadingDot: false, segments: segments, typeArgs: typeArgs),
 			span,
 		)
 	}
@@ -1256,9 +1252,9 @@ extend Parser {
 					span,
 					"a second list",
 				).withSecondary(earlier.span, "the first list")
-				self.report(move diagnostic)
+				self.report(diagnostic)
 			}
-			.None => typeArgs = .Some(TypeArgs(after: after, args: move args, span: span))
+			.None => typeArgs = .Some(TypeArgs(after: after, args: args, span: span))
 		}
 	}
 
@@ -1299,11 +1295,11 @@ extend Parser {
 					(t) => t == .For || canStartExpr(t),
 					(q) => .Some(q.element()),
 				)
-				return ExprKind::Array(elems: move elems)
+				return ExprKind::Array(elems: elems)
 			},
 		)
 		val span = open.to(self.prevSpan())
-		return self.allocExpr(move kind, span)
+		return self.allocExpr(kind, span)
 	}
 
 	/// An element of a list literal: a value, or `for x in xs { … }`,
@@ -1314,10 +1310,7 @@ extend Parser {
 		val .Some((binding, source)) = self.forHeader() else return self.allocExpr(.Error, start)
 		val body = self.block()
 		val span = start.to(self.prevSpan())
-		return self.allocExpr(
-			.ForElement(binding: move binding, source: move source, body: move body),
-			span,
-		)
+		return self.allocExpr(.ForElement(binding: binding, source: move source, body: body), span)
 	}
 
 	/// `assert(condition)`, or `assert(condition, "note")`.
@@ -1329,7 +1322,7 @@ extend Parser {
 			val diagnostic = self.expected("`(`").withNote(
 				"an assert is written as a call: `assert(condition)`",
 			)
-			self.report(move diagnostic)
+			self.report(diagnostic)
 			return self.errorExpr()
 		}
 		val open = self.bump()
@@ -1348,7 +1341,7 @@ extend Parser {
 				span,
 				"not a condition and a note",
 			).withNote("an assert is written `assert(condition)` or `assert(condition, \"note\")`")
-			self.report(move diagnostic)
+			self.report(diagnostic)
 			return self.errorExpr()
 		}
 		val note: Option<ExprId> = if args.len() == 2 then .Some(args[1]) else .None
@@ -1377,39 +1370,44 @@ extend Parser {
 		var elseBranch: Option<ExprId> = .None
 		if self.at(.Else) {
 			val elseSpan = self.bump()
-			if self.at(.If) {
-				elseBranch = .Some(self.ifInForm(.Some(thenForm)))
-			} else if thenForm && self.at(.LBrace) {
-				val diagnostic = Diagnostic::error(
-					EXPECTED,
-					"a `then` form's `else` is one expression, not a block",
-					self.span(),
-					"a block",
-				).withHelp(
-					"where a branch is more than one expression, write the whole `if` with braces: `if c { … } else { … }`",
-				).withNote("one `if` takes one form: `then` and expressions, or braces and blocks")
-				self.report(move diagnostic)
-				elseBranch = .Some(self.blockExpr(self.block()))
-			} else if thenForm {
-				elseBranch = .Some(self.blockExpr(self.oneExpressionBranch(elseSpan, "`then`")))
-			} else if !self.at(.LBrace) && canStartExpr(self.peek()) {
-				val diagnostic = Diagnostic::error(
-					EXPECTED,
-					"a braced `if`'s `else` is a block",
-					self.span(),
-					"an expression without braces",
-				).withHelp(
-					"put the branch in braces, or write the whole `if` as `if c then a else b`",
-				).withNote("one `if` takes one form: `then` and expressions, or braces and blocks")
-				self.report(move diagnostic)
-				elseBranch = .Some(self.blockExpr(self.oneExpressionBranch(elseSpan, "`then`")))
-			} else {
-				elseBranch = .Some(self.blockExpr(self.block()))
+			when {
+				self.at(.If) => elseBranch = .Some(self.ifInForm(.Some(thenForm)))
+				thenForm && self.at(.LBrace) => {
+					val diagnostic = Diagnostic::error(
+						EXPECTED,
+						"a `then` form's `else` is one expression, not a block",
+						self.span(),
+						"a block",
+					).withHelp(
+						"where a branch is more than one expression, write the whole `if` with braces: `if c { … } else { … }`",
+					).withNote(
+						"one `if` takes one form: `then` and expressions, or braces and blocks",
+					)
+					self.report(diagnostic)
+					elseBranch = .Some(self.blockExpr(self.block()))
+				}
+				thenForm =>
+					elseBranch = .Some(self.blockExpr(self.oneExpressionBranch(elseSpan, "`then`")))
+				!self.at(.LBrace) && canStartExpr(self.peek()) => {
+					val diagnostic = Diagnostic::error(
+						EXPECTED,
+						"a braced `if`'s `else` is a block",
+						self.span(),
+						"an expression without braces",
+					).withHelp(
+						"put the branch in braces, or write the whole `if` as `if c then a else b`",
+					).withNote(
+						"one `if` takes one form: `then` and expressions, or braces and blocks",
+					)
+					self.report(diagnostic)
+					elseBranch = .Some(self.blockExpr(self.oneExpressionBranch(elseSpan, "`then`")))
+				}
+				else => elseBranch = .Some(self.blockExpr(self.block()))
 			}
 		}
 		val span = start.to(self.prevSpan())
 		return self.allocExpr(
-			.If(cond: cond, thenBlock: move thenBlock, elseBranch: elseBranch),
+			.If(cond: cond, thenBlock: thenBlock, elseBranch: elseBranch, form: .Written),
 			span,
 		)
 	}
@@ -1417,7 +1415,7 @@ extend Parser {
 	/// A block as an expression, at the block's own span.
 	var fn blockExpr(block: Block): ExprId = {
 		val span = block.span
-		return self.allocExpr(.Block(block: move block), span)
+		return self.allocExpr(.Block(block: block), span)
 	}
 
 	/// A branch of a `then` form, or a guard's after its `else`: one
@@ -1436,12 +1434,14 @@ extend Parser {
 			).withFix("drop `then`, for the braced form", own [Edit::replace(after, "")]).withNote(
 				"one `if` takes one form: `then` and expressions, or braces and blocks",
 			)
-			self.report(move diagnostic)
+			self.report(diagnostic)
 			return self.block()
 		}
 		var stmts: Vec<StmtId> = Vec()
 		match self.peek() {
-			.Return | .Break | .Continue => { if self.stmt() is .Some(stmt) then stmts.push(stmt) }
+			.Return | .Become | .Break | .Continue => {
+				if self.stmt() is .Some(stmt) then stmts.push(stmt)
+			}
 			kind if canStartExpr(kind) => {
 				val value = self.expr()
 				val span = self.exprSpan(value)
@@ -1449,10 +1449,10 @@ extend Parser {
 			}
 			_ => {
 				val diagnostic = self.expected("an expression after \(word)")
-				self.report(move diagnostic)
+				self.report(diagnostic)
 			}
 		}
-		return Block(stmts: move stmts, span: start.to(self.prevSpan()))
+		return Block(stmts: stmts, span: start.to(self.prevSpan()))
 	}
 
 	/// An `else if` whose form is not the chain's: a chain is one `if`
@@ -1467,12 +1467,18 @@ extend Parser {
 		).withHelp("write every branch of the chain one way").withNote(
 			"an `else if` chain is one `if` with several branches, and takes one form throughout",
 		)
-		self.report(move diagnostic)
+		self.report(diagnostic)
 	}
 
 	var fn matchExpr(): ExprId = {
 		val start = self.bump()
 		val scrutinee = self.cond()
+		return self.matchArms(start, scrutinee)
+	}
+
+	/// A `match`'s arms in braces, after `match` at `start` and the value
+	/// matched.
+	var fn matchArms(start: Span, scrutinee: ExprId): ExprId = {
 		var arms: Vec<Arm> = Vec()
 		if self.at(.LBrace) {
 			val open = self.bump()
@@ -1488,13 +1494,125 @@ extend Parser {
 				(kind) => canStartPattern(kind),
 				(p) => .Some(p.arm()),
 			)
-			arms = move read
+			arms = read
 		} else {
 			val diagnostic = self.expected("`{`")
-			self.report(move diagnostic)
+			self.report(diagnostic)
 		}
 		val span = start.to(self.prevSpan())
-		return self.allocExpr(.Match(scrutinee: scrutinee, arms: move arms), span)
+		return self.allocExpr(.Match(scrutinee: scrutinee, arms: arms), span)
+	}
+
+	/// `when { condition => body … else => body }`: a choice among
+	/// conditions, the first that holds. It is written out as the chain of
+	/// `if`s it means — each arm's body the `then` branch of its condition,
+	/// and `else =>` the last `else` — each marked as a `when`'s, so that the
+	/// formatter writes it back.
+	var fn whenExpr(): ExprId = {
+		val start = self.bump()
+		// `when x { … }`: a choice among one value's values is a `match`,
+		// whose arms these are read as.
+		if !self.at(.LBrace) {
+			val diagnostic = Diagnostic::error(
+				EXPECTED,
+				"`when` chooses among conditions, and takes no value",
+				start,
+				"a value after `when`",
+			).withFix("match on the value", own [Edit::replace(start, "match")]).withNote(
+				"a choice among the values of one thing is a `match` on it; `when { … }` tests a condition in each arm",
+			)
+			self.report(diagnostic)
+			val subject = self.cond()
+			return self.matchArms(start, subject)
+		}
+		val open = self.bump()
+		val list = BraceList(
+			sep: .Comma,
+			what: "a `when` arm",
+			items: "`when` arms",
+			code: MATCH_ARM_SEPARATOR,
+		)
+		val (read, close) = self.braceList(
+			open,
+			list,
+			(kind) => kind == .Else || canStartExpr(kind),
+			(p) => .Some(p.whenArm()),
+		)
+		var arms: Vec<(ExprId, ExprId)> = Vec()
+		var otherwise: Option<ExprId> = .None
+		for arm in read {
+			match arm {
+				.Arm(cond, body) => {
+					if otherwise.isSome() {
+						val diagnostic = Diagnostic::error(
+							EXPECTED,
+							"`else` is a `when`'s last arm",
+							self.exprSpan(cond),
+							"an arm after `else`",
+						).withNote(
+							"`else =>` runs where no condition held, so no arm can follow it",
+						)
+						self.report(diagnostic)
+					}
+					arms.push((cond, body))
+				}
+				.Else(body) => {
+					if otherwise.isSome() {
+						val diagnostic = Diagnostic::error(
+							EXPECTED,
+							"a `when` has one `else`",
+							self.exprSpan(body),
+							"a second `else`",
+						)
+						self.report(diagnostic)
+					}
+					otherwise = .Some(body)
+				}
+			}
+		}
+		val span = start.to(close)
+		if arms.isEmpty() {
+			val diagnostic = Diagnostic::error(
+				EXPECTED,
+				"a `when` has an arm with a condition",
+				span,
+				"none here",
+			)
+			self.report(diagnostic)
+			return self.allocExpr(.Error, span)
+		}
+		var rest: Option<ExprId> = match otherwise {
+			.Some(body) => .Some(self.blockExpr(self.blockOf(body)))
+			.None => .None
+		}
+		var i = arms.len() - 1
+		while i >= 0 {
+			val (cond, body) = arms[i]
+			val form = if i == 0 then IfForm::When else IfForm::WhenArm
+			val at = if i == 0 then span else self.exprSpan(cond).to(close)
+			rest = .Some(
+				self.allocExpr(
+					.If(cond: cond, thenBlock: self.blockOf(body), elseBranch: rest, form: form),
+					at,
+				),
+			)
+			i -= 1
+		}
+		return rest.unwrap()
+	}
+
+	/// One arm of a `when`: `condition => body`, the condition read as a
+	/// guard is, or `else => body`.
+	var fn whenArm(): WhenArm = {
+		if self.eat(.Else) then return .Else(self.arrowBody())
+		val cond = self.guardCond()
+		return .Arm(cond: cond, body: self.arrowBody())
+	}
+
+	/// A block whose one statement is `value`, which is its value.
+	var fn blockOf(value: ExprId): Block = {
+		val span = self.exprSpan(value)
+		return Block(stmts: Vec::of(own [self.allocStmt(.Expr(value: value), span)]), span: span)
 	}
 }
 
@@ -1532,4 +1650,10 @@ fn parseIndex(digits: str): i64 = {
 		at += 1
 	}
 	return value
+}
+
+/// One arm of a `when`, as written.
+enum WhenArm {
+	Arm(cond: ExprId, body: ExprId)
+	Else(body: ExprId)
 }

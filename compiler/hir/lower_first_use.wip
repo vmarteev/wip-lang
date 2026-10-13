@@ -1,0 +1,331 @@
+// A local whose value leaves some of its type arguments undecided, given
+// them by the first place after it that names it: `var shapes = Vec()`, then
+// `shapes.push(move shape)`. The value is checked again then, as if its type
+// had been written.
+
+import std::collections::{Map}
+import std::mem
+import syntax as ast
+import syntax::{CANNOT_INFER, Diagnostic, Span, Symbol}
+
+/// A local waiting for its first use to say its type.
+struct PendingLocal {
+	/// The value, checked again once the type is known.
+	init: ast::ExprId
+	/// The names in scope where it was declared, among which the value is
+	/// checked again.
+	scopes: Vec<Map<Symbol, LocalId>>
+	/// The `val` or `var` that declares it, whose value is replaced then.
+	stmt: Option<StmtId>
+	/// What stands for the value until then.
+	standIn: ExprId
+	name: ast::Name
+	mutable: bool
+}
+
+/// How much checking a value had added, to undo it.
+struct CheckMark {
+	exprs: i64
+	locals: i64
+	stmts: i64
+	fns: i64
+	diagnostics: i64
+	unsettled: i64
+	pending: i64
+	constraints: i64
+	copies: i64
+}
+
+extend Lowerer {
+	fn checkMark(): CheckMark = CheckMark(
+		exprs: self.state.body.exprs.len(),
+		locals: self.state.body.locals.len(),
+		stmts: self.state.body.stmts.len(),
+		fns: self.program.fns.len(),
+		diagnostics: self.diagnostics.len(),
+		unsettled: self.state.unsettledDefaults.len(),
+		pending: self.state.pendingLocals.len(),
+		constraints: self.pendingConstraints.len(),
+		copies: self.pendingCopy.len(),
+	)
+
+	/// Whether a local's value, checked since `mark`, leaves type arguments
+	/// that its first use may decide: its type holds what could not be
+	/// inferred, that is all that went wrong, and checking it added nothing
+	/// but expressions, which can be taken back. A value that is the first
+	/// use of another local waiting for its type is checked once: that use
+	/// decided it, or said why not.
+	fn leavesTypeOpen(mark: &CheckMark, value: ExprId): bool = {
+		if !self.hasError(self.tyOf(value)) then return false
+		if self.state.body.locals.len() != mark.locals ||
+			self.state.body.stmts.len() != mark.stmts ||
+			self.program.fns.len() != mark.fns ||
+			self.state.unsettledDefaults.len() != mark.unsettled ||
+			self.state.pendingLocals.len() != mark.pending {
+			return false
+		}
+		var inferring = false
+		for i in mark.diagnostics..self.diagnostics.len() {
+			if self.diagnostics[i].code == CANNOT_INFER then inferring = true
+			else if self.diagnostics[i].isError() then return false
+		}
+		return inferring
+	}
+
+	/// Takes back what checking `value` added since `mark`, and answers what
+	/// stands for it until its local's first use: an error of what is known
+	/// of its type. The expressions it added are the arena's last.
+	var fn standIn(mark: &CheckMark, value: ExprId): ExprId = {
+		val ty = self.tyOf(value)
+		val span = self.state.body.exprs[value].span
+		self.state.body.exprs.truncate(mark.exprs)
+		self.diagnostics.truncate(mark.diagnostics)
+		self.pendingConstraints.truncate(mark.constraints)
+		self.pendingCopy.truncate(mark.copies)
+		return self.alloc(.Error, ty, span)
+	}
+
+	/// The local `e` names, where it waits for its type.
+	fn waitingLocal(e: ast::ExprId): Option<LocalId> = {
+		if self.state.pendingLocals.isEmpty() then return .None
+		val .Name(sym) = self.ast.exprs[e].kind else return .None
+		val local = self.lookup(sym)?
+		return if self.state.pendingLocals.contains(&local) then .Some(local) else .None
+	}
+
+	/// The first use of a local waiting for its type, where `found` is the
+	/// type the use gives it, `ERROR` where a type argument is not said. The
+	/// value is checked again as one of that type, among the names it was
+	/// declared among; where the use says too little, it is E0315 here.
+	var fn decide(local: LocalId, found: Ty, span: Span) = {
+		val .Some(pending) = self.state.pendingLocals.remove(&local) else return
+		val known = self.state.body.locals[local].ty
+		val ty = match self.filled(known, found) {
+			.Some(filled) => self.defaultsFilled(filled)
+			.None => known
+		}
+		if self.hasError(ty) {
+			self.report(self.notKnownHere(&pending, ty, span))
+			return
+		}
+		self.recheck(local, pending, .Some(ty))
+	}
+
+	/// Checks a waiting local's value again, against `ty` or as it is, and
+	/// puts it in the `val` or `var` in place of what stood for it.
+	var fn recheck(local: LocalId, pending: PendingLocal, ty: Option<Ty>) = {
+		val scopes = mem::replace(&var self.state.scopes, pending.scopes)
+		val value = match ty {
+			.Some(t) => self.check(pending.init, t)
+			.None => self.infer(pending.init, .None)
+		}
+		self.state.scopes = scopes
+		self.state.body.locals[local].ty = self.tyOf(value)
+		if pending.stmt is .Some(stmt) then
+			self.state.body.stmts[stmt].kind = .Let(local: local, init: value)
+		// What stood for it is no longer anyone's, and covers no text.
+		val at = self.state.body.exprs[pending.standIn].span.lo
+		self.state.body.exprs[pending.standIn].span = Span::new(at, at)
+	}
+
+	/// The locals declared in the scope about to end and never used: their
+	/// values are checked as they are, which says what is missing where they
+	/// are declared.
+	var fn settleScope() = {
+		var ending: Vec<LocalId> = Vec()
+		val depth = self.state.scopes.len()
+		for entry in self.state.pendingLocals {
+			if entry.value.scopes.len() == depth then ending.push(entry.key)
+		}
+		for local in ending {
+			val pending = self.state.pendingLocals.remove(&local).unwrap()
+			self.recheck(local, pending, .None)
+		}
+	}
+
+	/// What a use says of a waiting local's type, `found`, laid over what its
+	/// value said, `known`: nothing where the two are different types.
+	var fn filled(known: Ty, found: Ty): Option<Ty> = {
+		if known == ERROR then return .Some(found)
+		if !self.hasError(known) then return .Some(known)
+		return match (self.kind(known), self.kind(found)) {
+			(.Struct(id: a, args: x), .Struct(id: b, args: y)) if a == b => {
+				val args = self.filledArgs(x, y)?
+				.Some(self.intern(.Struct(id: a, args: args)))
+			}
+			(.Enum(id: a, args: x), .Enum(id: b, args: y)) if a == b => {
+				val args = self.filledArgs(x, y)?
+				.Some(self.intern(.Enum(id: a, args: args)))
+			}
+			_ => .None
+		}
+	}
+
+	var fn filledArgs(known: TyList, found: TyList): Option<TyList> = {
+		val knownArgs = self.program.types.list(known).toVec()
+		val foundArgs = self.program.types.list(found).toVec()
+		var args: Vec<Ty> = Vec()
+		for i in 0..knownArgs.len() {
+			args.push(self.filled(knownArgs[i], foundArgs[i])?)
+		}
+		return .Some(self.program.types.internList(&args))
+	}
+
+	/// `ty`, with each of its own type arguments still unknown given its
+	/// default, where it has one and the arguments it names are known:
+	/// `Pool<i64, …>` is a `Pool<i64, i64>`.
+	var fn defaultsFilled(ty: Ty): Ty = {
+		val (def, list) = match self.kind(ty) {
+			.Struct(id, args) => (TypeDef::Struct(id), args)
+			.Enum(id, args) => (TypeDef::Enum(id), args)
+			_ => return ty
+		}
+		val generics = self.typeGenerics(def)
+		var solution: Vec<Option<Ty>> = Vec()
+		for arg in self.program.types.list(list) {
+			solution.push(if arg == ERROR then .None else .Some(arg))
+		}
+		if solution.len() != generics.len() then return ty
+		for i in 0..generics.len() {
+			if solution[i].isSome() then continue
+			if generics[i].default is .Ty(default) && self.resolved(default, &solution) {
+				val args = solved(&solution)
+				solution[i] = .Some(self.program.types.subst(default, &args))
+			}
+		}
+		val tys = solved(&solution)
+		val args = self.program.types.internList(&tys)
+		return match def {
+			.Struct(id) => self.intern(.Struct(id: id, args: args))
+			.Enum(id) => self.intern(.Enum(id: id, args: args))
+			_ => ty
+		}
+	}
+
+	/// E0315 at the first use of a local that says too little of its type.
+	fn notKnownHere(pending: &PendingLocal, known: Ty, span: Span): Diagnostic = {
+		val name = self.text(pending.name.sym)
+		val holes = self.holeNames(known)
+		val keyword = if pending.mutable then "var" else "val"
+		val said = if holes.isEmpty() then String::of("its type") else "`\(holes.join("` or `"))`"
+		return Diagnostic::error(
+			CANNOT_INFER,
+			"the type of `\(name)` is not known here",
+			span,
+			"says nothing of \(said)",
+		).withSecondary(pending.name.span, "declared without its type").
+			withHelp("write it where `\(name)` is declared: `\(keyword) \(name): \(self.holeText(known)) = …`").
+			withNote(
+				"a variable whose value leaves its type open takes it from the first place that names it",
+			)
+	}
+
+	/// The type parameters `ty` leaves unknown, by name.
+	fn holeNames(ty: Ty): Vec<str> = {
+		var names: Vec<str> = Vec()
+		val (def, list) = match self.kind(ty) {
+			.Struct(id, args) => (TypeDef::Struct(id), args)
+			.Enum(id, args) => (TypeDef::Enum(id), args)
+			_ => return names
+		}
+		val generics = self.typeGenerics(def)
+		for (i, arg) in self.program.types.list(list).forwards().enumerate() {
+			if arg == ERROR && i < generics.len() {
+				names.push(self.text(generics[i].name))
+			} else if self.hasError(arg) {
+				val inside = self.holeNames(arg)
+				names.pushAll(&inside)
+			}
+		}
+		return names
+	}
+
+	/// `ty` as it is written, with `…` for what is not known.
+	fn holeText(ty: Ty): String = {
+		if ty == ERROR then return String::of("…")
+		val (def, list) = match self.kind(ty) {
+			.Struct(id, args) if self.hasError(ty) => (TypeDef::Struct(id), args)
+			.Enum(id, args) if self.hasError(ty) => (TypeDef::Enum(id), args)
+			_ => return self.program.tyName(ty, self.interner)
+		}
+		var args: Vec<String> = Vec()
+		for arg in self.program.types.list(list) {
+			args.push(self.holeText(arg))
+		}
+		return "\(self.typeName(def))<\(args.join(", "))>"
+	}
+
+	/// A method called on a local waiting for its type: what the call's
+	/// arguments say of the method's type parameters says the receiver's, as
+	/// a generic function's arguments say its own. They are checked here,
+	/// and kept for where the call checks them.
+	var fn decideByMethod(local: LocalId, base: ast::ExprId, name: ast::Name, item: &ItemUse) = {
+		val known = self.state.body.locals[local].ty
+		var found = ERROR
+		if self.ownerOf(known) is .Some(owner) {
+			var method = self.methodOf(owner, name.sym)
+			if method.isNone() {
+				val (offered, _) = self.offered(owner, known, name.sym)
+				if !offered.isEmpty() then method = .Some(offered[0].method)
+			}
+			if method is .Some(id) &&
+				self.program.fns[id].receiver is .Some(kind) &&
+				kind != .Static {
+				found = self.receiverFromArguments(id, &item)
+			}
+		}
+		self.decide(local, found, self.ast.exprs[base].span)
+	}
+
+	/// The receiver's type a call of `method` says through its arguments.
+	var fn receiverFromArguments(method: FnId, item: &ItemUse): Ty = {
+		val .Some(args) = item.args else return ERROR
+		val params = self.program.fns[method].params.clone()
+		if params.isEmpty() then return ERROR
+		var solution: Vec<Option<Ty>> = Vec()
+		for _ in self.program.fns[method].generics {
+			solution.push(.None)
+		}
+		var checked: Vec<bool> = Vec()
+		for _ in args {
+			checked.push(false)
+		}
+		// A literal waits for what the others say, as in a generic call.
+		for pass in 0..2 {
+			for i in 0..args.len() {
+				if checked[i] then continue
+				val arg = args[i]
+				val at = match (if i < item.names.len() then item.names[i] else .None) {
+					.Some(n) => {
+						var position: Option<i64> = .None
+						for p in 1..params.len() {
+							if params[p].name == n.sym then position = .Some(p)
+						}
+						match position {
+							.Some(p) => p
+							.None => continue
+						}
+					}
+					.None => i + 1
+				}
+				if at >= params.len() then continue
+				var declared = params[at].ty
+				if self.resolved(declared, &solution) then continue
+				if self.isLambda(arg) then continue
+				if pass == 0 && self.takesExpectedType(arg) then continue
+				val inferred = self.inferArgument(arg, .None)
+				self.state.early.put(arg, inferred)
+				checked[i] = true
+				// A value with no place of its own answers a `&T` parameter.
+				if self.kind(declared) is .Ref(inner, kind: .Shared) &&
+					self.kind(self.tyOf(inferred)) !is .Ref(..) {
+					declared = inner
+				}
+				self.unify(declared, self.tyOf(inferred), &var solution)
+			}
+		}
+		val receiver = self.underRefs(params[0].ty)
+		val args = solved(&solution)
+		return self.program.types.subst(receiver, &args)
+	}
+}

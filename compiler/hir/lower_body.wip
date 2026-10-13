@@ -29,6 +29,11 @@ fn lacksElse(file: &ast::Ast, e: ast::ExprId): bool = match file.exprs[e].kind {
 	_ => false
 }
 
+/// What a chain of `if`s was written as, for what is said of it: "a
+/// `when`", or "an `if`".
+fn chainWord(file: &ast::Ast, e: ast::ExprId): str =
+	if file.exprs[e].kind is .If(form: .When | .WhenArm, ..) then "a `when`" else "an `if`"
+
 /// The `-` that an expression statement starts with, if any.
 fn leadingNeg(file: &ast::Ast, stmt: ast::StmtId): Option<Span> = {
 	val .Expr(start) = file.stmts[stmt].kind else return .None
@@ -60,7 +65,7 @@ extend Lowerer {
 	var fn checkFn(body: ast::ExprId, id: FnId) = {
 		val generics = self.program.fns[id].generics.clone()
 		val pins = self.decidedPins(&generics)
-		self.program.types.setPins(move pins)
+		self.program.types.setPins(pins)
 		self.checkBodyOf(body, id)
 		self.program.types.setPins(Vec())
 	}
@@ -91,7 +96,7 @@ extend Lowerer {
 				}
 			}
 		}
-		return move pins
+		return pins
 	}
 
 	var fn checkBodyOf(body: ast::ExprId, id: FnId) = {
@@ -130,6 +135,9 @@ extend Lowerer {
 		self.state.body = Body()
 		self.state.byteLiterals = Set()
 		self.state.scopes = Vec::of(own [Map()])
+		self.state.pendingLocals = Map()
+		self.state.taking = Set()
+		self.state.function = .Some(id)
 		self.state.lends = 0
 		self.state.lentParam = .None
 		self.state.lentTable = false
@@ -144,6 +152,8 @@ extend Lowerer {
 		if self.kind(self.state.ret) is .Ref(..) then self.checkProjection(id, value)
 		// `@tailrec`: its calls to itself must be tail calls.
 		if self.program.fns[id].isTailrec then self.checkTailrec(id, value)
+		if self.program.fns[id].isInline && !self.state.body.becomes.isEmpty() then
+			self.inlineBecomes(id)
 		self.settleBindings()
 		self.program.fns[id].body = .Some(mem::replace(&var self.state.body, Body()))
 	}
@@ -194,7 +204,7 @@ extend Lowerer {
 				)
 				if self.state.retSpan is .Some(retSpan) then
 					diagnostic = diagnostic.withSecondary(retSpan, "declared to return \(self.tyName(ret))")
-				self.report(move diagnostic)
+				self.report(diagnostic)
 			}
 			return value
 		}
@@ -278,6 +288,7 @@ extend Lowerer {
 			stmts.push(id)
 			if d then diverges = true
 		}
+		if !self.state.pendingLocals.isEmpty() then self.settleScope()
 		self.state.scopes.pop()
 		val ty = if diverges {
 			NEVER
@@ -293,7 +304,7 @@ extend Lowerer {
 				.None => UNIT
 			}
 		}
-		return (Block(stmts: move stmts, value: value, span: block.span), ty)
+		return (Block(stmts: stmts, value: value, span: block.span), ty)
 	}
 
 	/// An expression statement, whose value is not used. `if`, `match` and
@@ -321,7 +332,7 @@ extend Lowerer {
 		val span = self.state.body.exprs[id].span
 		val stmt = self.state.body.stmts.add(Stmt(kind: .Expr(id), span: span))
 		val block = Block(stmts: Vec::of(own [stmt]), value: .None, span: span)
-		return self.alloc(.Block(move block), UNIT, span)
+		return self.alloc(.Block(block), UNIT, span)
 	}
 
 	/// A value computed without side effects and never used. Warns about a
@@ -343,7 +354,7 @@ extend Lowerer {
 			diagnostic = diagnostic.withNote(
 				"a line break ends a complete expression, so a line that starts with `-` is a new statement",
 			).withHelp("to continue the previous line, move `-` to its end")
-		self.report(move diagnostic)
+		self.report(diagnostic)
 	}
 
 	/// Whether evaluating `id` does anything besides producing its value: a
@@ -372,10 +383,18 @@ extend Lowerer {
 	var fn stmt(id: ast::StmtId, nextNeg: Option<Span>): (StmtId, bool) = {
 		val file = self.ast
 		val stmt = &file.stmts[id]
+		// The local declared here, where it waits for its type.
+		var waiting: Option<LocalId> = .None
 		val (kind, diverges) = match stmt.kind {
 			.Yield(value) => (self.yieldStmt(value, stmt.span), false)
 			.Let(mutable, isImplicit, name, ty: written, init) => {
-				val (checkedInit, checkedTy) = self.letValue(mutable, written, init)
+				val mark = self.checkMark()
+				val (value, valueTy) = self.letValue(mutable, written, init)
+				// A value that leaves type arguments undecided waits for the
+				// first place that names the local: `var shapes = Vec()`.
+				val waits = written.isNone() && !isImplicit && self.leavesTypeOpen(&mark, value)
+				val (checkedInit, checkedTy) =
+					if waits then (self.standIn(&mark, value), valueTy) else (value, valueTy)
 				// A slice read through a reference is kept as the reference;
 				// any other slice stands for elements that belong to the
 				// caller, with nothing of fixed size to copy.
@@ -399,6 +418,17 @@ extend Lowerer {
 					if mutable then .Var else .Let(Span::new(keyword, keyword + 3))
 				val local = self.declare(name.sym, ty, localKind, name.span)
 				self.state.body.locals[local].implicit = isImplicit
+				if waits {
+					self.state.pendingLocals.put(local, PendingLocal(
+						init: init,
+						scopes: self.state.scopes.clone(),
+						stmt: .None,
+						standIn: checkedInit,
+						name: name,
+						mutable: mutable,
+					))
+					waiting = .Some(local)
+				}
 				(.Let(local: local, init: kept), ty == NEVER)
 			}
 			.Defer(e) => {
@@ -426,6 +456,23 @@ extend Lowerer {
 				self.returnInGenerator(stmt.span)
 				(.Return(self.returnValue(value, stmt.span)), true)
 			}
+			// What the function answers is the call's, which takes its frame.
+			.Become(call) => {
+				if !self.state.defers.isEmpty() {
+					val keyword = self.state.defers[self.state.defers.len() - 1].0
+					self.report(
+						Diagnostic::error(
+							RETURN_IN_DEFER,
+							"cannot `become` from a deferred expression",
+							stmt.span,
+							"would leave the function in the middle of its cleanup",
+						).withSecondary(keyword, "inside this `defer`").withNote(
+							"a `defer` runs while its block exits: it cannot replace the result or skip the cleanup after it",
+						),
+					)
+				}
+				(.Return(.Some(self.becomeCall(call, stmt.span))), true)
+			}
 			.Guard(mutable, pattern, value, elseBlock) => (
 				self.guard(mutable, &pattern, value, elseBlock.asRef()),
 				false,
@@ -439,7 +486,7 @@ extend Lowerer {
 				val (_, breaks) = self.state.loops.pop().unwrap()
 				self.state.scopes.pop()
 				// `while true` with no `break` never finishes normally.
-				(.While(cond: checkedCond, body: move checkedBody), forever && !breaks)
+				(.While(cond: checkedCond, body: checkedBody), forever && !breaks)
 			}
 			.For(label, binding, source, body) => (
 				self.forStmt(label.asRef(), &binding, source, &body),
@@ -452,7 +499,9 @@ extend Lowerer {
 				(.Expr(checked), self.state.body.exprs[checked].ty == NEVER)
 			}
 		}
-		return (self.state.body.stmts.add(Stmt(kind: move kind, span: stmt.span)), diverges)
+		val added = self.state.body.stmts.add(Stmt(kind: kind, span: stmt.span))
+		if waiting is .Some(local) then self.state.pendingLocals.at(&local).stmt = .Some(added)
+		return (added, diverges)
 	}
 
 	/// The value of a `val` or a `var`, and the variable's type.
@@ -491,19 +540,22 @@ extend Lowerer {
 		// which is said here rather than where `r` is first used.
 		if ty == UNIT && file.exprs[init].kind is .If(..) && lacksElse(&file, init) {
 			val inside = file.exprs[init].span
+			val word = chainWord(&file, init)
 			val diagnostic = Diagnostic::error(
 				NO_VALUE,
-				"an `if` without `else` has no value",
+				"\(word) without `else` has no value",
 				inside,
-				"nothing when the condition does not hold",
+				if file.exprs[init].kind is .If(elseBranch: .None, form: .Written, ..) then
+					"nothing when the condition does not hold"
+				else "nothing when no condition holds",
 			).withHelp(
 				"give it an `else`, or say that the value may not be there: `if c { .Some(x) } else { .None }`",
-			).withNote("an `if` without `else` is a statement; what may be missing is an `Option`")
+			).withNote("\(word) without `else` is a statement; what may be missing is an `Option`")
 			// That its branch's value goes unused is this error again.
 			self.diagnostics.retain((d) =>
 				d.code != DISCARDED_VALUE ||
 					!(inside.lo <= d.primary.span.lo && d.primary.span.hi <= inside.hi))
-			self.report(move diagnostic)
+			self.report(diagnostic)
 			ty = ERROR
 		}
 		return (checked, ty)
@@ -522,8 +574,8 @@ extend Lowerer {
 		}
 		val skip = 1 + depth.unwrapOr(0) as i64
 		val target = if self.state.loops.len() > skip then self.state.loops.len() - skip else 0
-		if self.state.loops.isEmpty() {
-			self.report(
+		when {
+			self.state.loops.isEmpty() => self.report(
 				Diagnostic::error(
 					LOOP_JUMP_OUTSIDE,
 					"`\(word)` outside a loop",
@@ -533,21 +585,21 @@ extend Lowerer {
 					"`break` leaves the innermost loop, and `continue` starts its next pass",
 				),
 			)
-		} else if !self.state.defers.isEmpty() &&
-			self.state.defers[self.state.defers.len() - 1].1 > target {
-			val keyword = self.state.defers[self.state.defers.len() - 1].0
-			self.report(
-				Diagnostic::error(
-					JUMP_IN_DEFER,
-					"cannot `\(word)` from a deferred expression",
-					span,
-					"would leave the loop in the middle of a block's cleanup",
-				).withSecondary(keyword, "inside this `defer`").withNote(
-					"a `defer` runs while its block exits, and cannot jump elsewhere; a loop written inside the deferred expression may use `break` and `continue`",
-				),
-			)
-		} else if isBreak {
-			self.state.loops[target].1 = true
+			!self.state.defers.isEmpty() &&
+				self.state.defers[self.state.defers.len() - 1].1 > target => {
+				val keyword = self.state.defers[self.state.defers.len() - 1].0
+				self.report(
+					Diagnostic::error(
+						JUMP_IN_DEFER,
+						"cannot `\(word)` from a deferred expression",
+						span,
+						"would leave the loop in the middle of a block's cleanup",
+					).withSecondary(keyword, "inside this `defer`").withNote(
+						"a `defer` runs while its block exits, and cannot jump elsewhere; a loop written inside the deferred expression may use `break` and `continue`",
+					),
+				)
+			}
+			isBreak => self.state.loops[target].1 = true
 		}
 		val d = depth.unwrapOr(0)
 		return if isBreak then .Break(d) else .Continue(d)
@@ -663,6 +715,7 @@ extend Lowerer {
 		body: &ast::Block,
 	): StmtKind = match source {
 		.Elements(elements) => {
+			self.takenApart(elements)
 			// `for x in move c`: `c` gives up its elements, and each is the
 			// loop's to keep; what a loop that stops early leaves is dropped
 			// with the iterator that holds it.
@@ -706,7 +759,7 @@ extend Lowerer {
 		val pattern = self.elementPattern(&binding, ERROR, .None, .Shared, .None)
 		val checkedBody = self.loopBody(label, &body)
 		self.state.scopes.pop()
-		return .ForElements(binding: move pattern, elements: moved, body: move checkedBody)
+		return .ForElements(binding: pattern, elements: moved, body: checkedBody)
 	}
 
 	/// `for x in c`: each element lent to the loop.
@@ -779,7 +832,7 @@ extend Lowerer {
 		val pattern = self.elementPattern(&binding, elementTy, elem, kind, .Some(e))
 		val checkedBody = self.loopBody(label, &body)
 		self.state.scopes.pop()
-		return .ForElements(binding: move pattern, elements: e, body: move checkedBody)
+		return .ForElements(binding: pattern, elements: e, body: checkedBody)
 	}
 
 	/// `for i in lo..hi`.
@@ -802,16 +855,16 @@ extend Lowerer {
 		}
 		val loTy = self.tyOf(low)
 		val hiTy = self.tyOf(high)
-		val ty = if self.isPoisoned(loTy) || self.isPoisoned(hiTy) {
-			ERROR
-		} else if loTy == hiTy && self.program.types.isInteger(loTy) {
-			loTy
-		} else {
-			val span = self.state.body.exprs[low].span.to(self.state.body.exprs[high].span)
-			self.report(
-				Diagnostic::error(INVALID_OPERANDS, "a range counts with integers of one type", span, "from \(self.tyName(loTy)) to \(self.tyName(hiTy))"),
-			)
-			ERROR
+		val ty = when {
+			self.isPoisoned(loTy) || self.isPoisoned(hiTy) => ERROR
+			loTy == hiTy && self.program.types.isInteger(loTy) => loTy
+			else => {
+				val span = self.state.body.exprs[low].span.to(self.state.body.exprs[high].span)
+				self.report(
+					Diagnostic::error(INVALID_OPERANDS, "a range counts with integers of one type", span, "from \(self.tyName(loTy)) to \(self.tyName(hiTy))"),
+				)
+				ERROR
+			}
 		}
 		self.state.scopes.push(Map())
 		val local: Option<LocalId> = match binding.kind {
@@ -831,19 +884,13 @@ extend Lowerer {
 		}
 		val checkedBody = self.loopBody(label, &body)
 		self.state.scopes.pop()
-		return .ForRange(
-			binding: local,
-			lo: low,
-			hi: high,
-			inclusive: inclusive,
-			body: move checkedBody,
-		)
+		return .ForRange(binding: local, lo: low, hi: high, inclusive: inclusive, body: checkedBody)
 	}
 
 	/// A loop's body, inside the loop for `break` and `continue`.
 	var fn loopBody(label: Option<&ast::Name>, body: &ast::Block): Block = {
 		val (checked, _) = self.typedLoopBody(label, &body)
-		return move checked
+		return checked
 	}
 
 	/// A loop's body and its type: `never` where every path through it
@@ -854,7 +901,7 @@ extend Lowerer {
 		self.pushLoop(label)
 		val checked = self.checkBlock(&body, .Some(UNIT))
 		self.state.loops.pop()
-		return move checked
+		return checked
 	}
 
 	/// Enters a loop, with the name it was given. A name already in use
@@ -910,7 +957,7 @@ extend Lowerer {
 		).withNote("`\(word) name` leaves the loop of that name, which is written `name: while …` or `name: for …`")
 		if !names.isEmpty() then
 			diagnostic = diagnostic.withHelp("the loops here are \(names.join(", "))")
-		self.report(move diagnostic)
+		self.report(diagnostic)
 		return .None
 	}
 
@@ -953,7 +1000,7 @@ extend Lowerer {
 					var diagnostic = Diagnostic::error(MISMATCHED_TYPES, "missing return value", span, "expected a value of type \(self.tyName(ret))")
 					if self.state.retSpan is .Some(retSpan) then
 						diagnostic = diagnostic.withSecondary(retSpan, "return type declared here")
-					self.report(move diagnostic)
+					self.report(diagnostic)
 				}
 				.None
 			}
@@ -984,11 +1031,7 @@ extend Lowerer {
 		val negated = self.alloc(.Unary(op: .Not, operand: condition), BOOL, span)
 		val panicked = self.alloc(.Panic(note: built, message: .Some(text)), NEVER, span)
 		val thenBlock = Block(stmts: Vec(), value: .Some(panicked), span: span)
-		return self.alloc(
-			.If(cond: negated, thenBlock: move thenBlock, elseBlock: .None),
-			UNIT,
-			span,
-		)
+		return self.alloc(.If(cond: negated, thenBlock: thenBlock, elseBlock: .None), UNIT, span)
 	}
 
 	var fn ifExpr(
@@ -1013,7 +1056,25 @@ extend Lowerer {
 			val (checked, _) = self.checkBlock(&thenBlock, wanted)
 			self.state.scopes.pop()
 			return self.alloc(
-				.If(cond: condition, thenBlock: move checked, elseBlock: .None),
+				.If(cond: condition, thenBlock: checked, elseBlock: .None),
+				UNIT,
+				span,
+			)
+		}
+		// A chain whose last `if` has no `else` answers nothing, whatever its
+		// branches do: it is checked as the statement it is, each branch
+		// against what is expected of it, so that the missing `else` is the
+		// one error where a value is asked of it (E0354), as for an `if`.
+		if lacksElse(self.ast, elseAt) {
+			val wanted: Option<Ty> = match hint {
+				.Some(t) if t != UNIT && !self.isPoisoned(t) => .Some(t)
+				_ => .Some(UNIT)
+			}
+			val (checkedThen, _) = self.checkBlock(&thenBlock, wanted)
+			self.state.scopes.pop()
+			val (checkedElse, _) = self.elseBlock(elseAt, wanted)
+			return self.alloc(
+				.If(cond: condition, thenBlock: checkedThen, elseBlock: .Some(checkedElse)),
 				UNIT,
 				span,
 			)
@@ -1024,29 +1085,25 @@ extend Lowerer {
 		if hint.isNone() && self.blockTakesTypeBeside(&thenBlock) && !self.takesTypeBeside(elseAt) {
 			val .Some(bindings) = self.state.scopes.pop() else panic("the condition's scope")
 			val (checkedElse, elseTy) = self.elseBlock(elseAt, .None)
-			self.state.scopes.push(move bindings)
+			self.state.scopes.push(bindings)
 			val expected: Option<Ty> = if elseTy != NEVER then .Some(elseTy) else .None
 			val reported = self.errorsReported()
 			val (checkedThen, thenTy) = self.checkBlock(&thenBlock, expected)
 			self.state.scopes.pop()
 			// A branch that could not take the other's type has been reported,
 			// and the `if` says nothing more of its type.
-			val ty = if self.errorsReported() > reported || self.isPoisoned(thenTy) {
-				ERROR
-			} else if thenTy == NEVER && elseTy == NEVER {
-				NEVER
-			} else {
-				match expected {
-					.Some(t) => t
-					.None => thenTy
+			val ty = when {
+				self.errorsReported() > reported || self.isPoisoned(thenTy) => ERROR
+				thenTy == NEVER && elseTy == NEVER => NEVER
+				else => {
+					match expected {
+						.Some(t) => t
+						.None => thenTy
+					}
 				}
 			}
 			return self.alloc(
-				.If(
-					cond: condition,
-					thenBlock: move checkedThen,
-					elseBlock: .Some(move checkedElse),
-				),
+				.If(cond: condition, thenBlock: checkedThen, elseBlock: .Some(checkedElse)),
 				ty,
 				span,
 			)
@@ -1069,7 +1126,7 @@ extend Lowerer {
 			}
 		}
 		return self.alloc(
-			.If(cond: condition, thenBlock: move checkedThen, elseBlock: .Some(move checkedElse)),
+			.If(cond: condition, thenBlock: checkedThen, elseBlock: .Some(checkedElse)),
 			ty,
 			span,
 		)

@@ -9,7 +9,7 @@
 
 import std::collections::{Map, Set}
 import std::mem
-import hir::{FnId, Program, Ty}
+import hir::{FnId, Program, Ty, isAggregate}
 import syntax::{Interner, Span}
 
 /// Splices every call in `body` to a function that promised to be inlined.
@@ -49,7 +49,7 @@ extend Bodies {
 			self.open.push(id)
 			self.spliceAll(&var body)
 			self.open.pop()
-			self.done.put(id, move body)
+			self.done.put(id, body)
 		}
 		return match self.done.get(&id) {
 			.Some(body) => .Some(body.clone())
@@ -134,10 +134,10 @@ fn splice(
 	for (at, s) in statements.forwards().enumerate() {
 		if at < statement then kept.push(s.clone()) else if at > statement then rest.push(s.clone())
 	}
-	body.blocks[b].statements = move kept
+	body.blocks[b].statements = kept
 	val after = BlockId(body.blocks.len() as u32)
 	val terminator = mem::replace(&var body.blocks[b].terminator, .Goto(after))
-	body.blocks.push(Block(statements: move rest, terminator: move terminator))
+	body.blocks.push(Block(statements: rest, terminator: terminator))
 
 	// A closure argument written at the call is a pair of a code address and
 	// an environment, and the code address is a constant the caller just
@@ -168,31 +168,36 @@ fn splice(
 				break
 			}
 		}
-		val place = if param is .Some(index) {
-			match args[index] {
-				// An aggregate is passed by its address, so the callee reads and
-				// writes the caller's own place, as the call did. A scalar is a
-				// copy, and stays one: a local that is read as an index or a
-				// count must be a local.
-				.Copy(place) if isAggregate(&program, decl.ty) &&
-					!writesBack(&callee, local) => place.clone()
-				operand => {
-					val fresh = freshLocal(&var body, decl.ty, .Temp)
-					prologue.push(.Assign(place: Place::of(fresh), rvalue: .Use(operand.clone())))
-					Place::of(fresh)
+		val place = when {
+			param is .Some(index) => {
+				match args[index] {
+					// An aggregate is passed by its address, so the callee reads and
+					// writes the caller's own place, as the call did. A scalar is a
+					// copy, and stays one: a local that is read as an index or a
+					// count must be a local.
+					.Copy(place) if isAggregate(&program, decl.ty) &&
+						!writesBack(&callee, local) => place.clone()
+					operand => {
+						val fresh = freshLocal(&var body, decl.ty, .Temp)
+						prologue.push(.Assign(
+							place: Place::of(fresh),
+							rvalue: .Use(operand.clone()),
+						))
+						Place::of(fresh)
+					}
 				}
 			}
-		} else if callee.ret == Option::Some(local) {
-			match dest {
-				// The result goes where the call's did, unless the caller is also
-				// reading that place as an argument.
-				.Some(place) if !aliases(&place, &args) => place.clone()
-				_ => Place::of(freshLocal(&var body, decl.ty, .Temp))
+			callee.ret == Option::Some(local) => {
+				match dest {
+					// The result goes where the call's did, unless the caller is also
+					// reading that place as an argument.
+					.Some(place) if !aliases(&place, &args) => place.clone()
+					_ => Place::of(freshLocal(&var body, decl.ty, .Temp))
+				}
 			}
-		} else {
-			Place::of(freshLocal(&var body, decl.ty, decl.kind.clone()))
+			else => Place::of(freshLocal(&var body, decl.ty, decl.kind.clone()))
 		}
-		places.push(move place)
+		places.push(place)
 	}
 
 	// A call through one of those pairs is a call to the lambda itself.
@@ -200,7 +205,7 @@ fn splice(
 	for entry in handed {
 		var code = places[entry.key.index as i64].clone()
 		code.projections.push(.Field(1))
-		direct.push((move code, entry.value))
+		direct.push((code, entry.value))
 	}
 
 	// The callee's blocks, renumbered, with `return` going to what follows the
@@ -219,9 +224,9 @@ fn splice(
 				.None if s is .At(..) => continue
 				_ => s.clone()
 			}
-			val mapped = makeDirect(rewriteStatement(move moved, &var mapping), &direct, &copies)
+			val mapped = makeDirect(rewriteStatement(moved, &var mapping), &direct, &copies)
 			followCopy(&mapped, &var copies)
-			statements.push(move mapped)
+			statements.push(mapped)
 		}
 		val terminator = mapTerminator(original.terminator.clone(), &var mapping, firstBlock, after)
 		if i == 0 {
@@ -230,9 +235,9 @@ fn splice(
 			for s in statements {
 				first.push(s.clone())
 			}
-			statements = move first
+			statements = first
 		}
-		body.blocks.push(Block(statements: move statements, terminator: move terminator))
+		body.blocks.push(Block(statements: statements, terminator: terminator))
 	}
 	body.blocks[b].terminator = .Goto(firstBlock)
 
@@ -246,10 +251,10 @@ fn splice(
 		val value = Operand::Copy(places[ret.index as i64].clone())
 		body.blocks[after.index as i64].statements.insert(0, .Assign(
 			place: written.clone(),
-			rvalue: .Use(move value),
+			rvalue: .Use(value),
 		))
 	}
-	return move lambdas
+	return lambdas
 }
 
 /// The lambda a closure pair holds, when the caller wrote its code address
@@ -277,11 +282,11 @@ fn makeDirect(
 	direct: &[(Place, FnId)],
 	copies: &[(Local, Place)],
 ): Statement = {
-	val .Some(lambda) = directLambda(&statement, &direct, &copies) else return move statement
+	val .Some(lambda) = directLambda(&statement, &direct, &copies) else return statement
 	// The environment stays the first argument: what the lambda captured it
 	// still reads through it.
 	val .Call(args, dest, ..) = move statement else panic("a call through a pair, found above")
-	return .Call(callee: .Fn(lambda), args: move args, dest: move dest)
+	return .Call(callee: .Fn(lambda), args: args, dest: dest)
 }
 
 /// The lambda a call through a closure pair calls, where the pair is one of
@@ -336,7 +341,7 @@ fn followCopy(statement: &Statement, copies: &var Vec<(Local, Place)>) = {
 		for (held, place) in mem::replace(&var copies, Vec()) {
 			if held != local then kept.push((held, place.clone()))
 		}
-		copies = move kept
+		copies = kept
 	}
 }
 
@@ -405,14 +410,14 @@ extend Mapping {
 				other => projections.push(move other)
 			}
 		}
-		return Place(local: mapped.local, projections: move projections)
+		return Place(local: mapped.local, projections: projections)
 	}
 }
 
 extend Mapping: Rewrite {
-	var fn read(place: Place): Place = self.place(move place)
+	var fn read(place: Place): Place = self.place(place)
 
-	var fn written(place: Place): Place = self.place(move place)
+	var fn written(place: Place): Place = self.place(place)
 
 	fn rewritesCallee(): bool = true
 }
@@ -426,10 +431,10 @@ fn mapTerminator(
 	after: BlockId,
 ): Terminator = {
 	val moved = (block: BlockId) => BlockId(block.index + first.index)
-	return match rewriteTerminator(move terminator, &var mapping) {
+	return match rewriteTerminator(terminator, &var mapping) {
 		.Goto(target) => .Goto(moved(target))
 		.Branch(cond, thenBlock, otherwise) => .Branch(
-			cond: move cond,
+			cond: cond,
 			thenBlock: moved(thenBlock),
 			otherwise: moved(otherwise),
 		)
@@ -438,9 +443,9 @@ fn mapTerminator(
 			for (case, target) in cases {
 				targets.push((case, moved(target)))
 			}
-			.Switch(value: move value, cases: move targets, otherwise: moved(otherwise))
+			.Switch(value: value, cases: targets, otherwise: moved(otherwise))
 		}
 		.Return => .Goto(after)
-		other => move other
+		other => other
 	}
 }

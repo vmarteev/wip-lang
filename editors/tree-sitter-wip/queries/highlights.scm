@@ -199,6 +199,7 @@
   "then"
   "else"
   "match"
+  "when"
 ] @keyword.conditional
 
 [
@@ -211,6 +212,7 @@
 
 [
   "return"
+  "become"
   "lend"
   "yield"
 ] @keyword.return

@@ -161,8 +161,8 @@ pub fn lower(modules: &[ModuleAst], interner: &Interner, threads: i64): Lowered 
 	for module in modules {
 		paths.push(module.path.clone())
 	}
-	val program = Program::new(move paths)
-	if files.isEmpty() then return Lowered(program: move program, diagnostics: Vec())
+	val program = Program::new(paths)
+	if files.isEmpty() then return Lowered(program: program, diagnostics: Vec())
 	var scopes: Vec<ModuleScope> = Vec()
 	for module in modules {
 		scopes.push(ModuleScope(
@@ -173,7 +173,7 @@ pub fn lower(modules: &[ModuleAst], interner: &Interner, threads: i64): Lowered 
 			root: module.root.clone(),
 		))
 	}
-	var lowerer = Lowerer::new(files[0].1, &interner, move program, move scopes)
+	var lowerer = Lowerer::new(files[0].1, &interner, program, scopes)
 	// The prelude is declared before anything else, so that a module that
 	// declares one of its names is reported.
 	var prelude: Option<i64> = .None
@@ -226,7 +226,13 @@ pub fn lower(modules: &[ModuleAst], interner: &Interner, threads: i64): Lowered 
 		lowerer.enter(files[i].0, files[i].1, mem::replace(&var imports[i], FileImports()))
 		checkedImports[i] = lowerer.checkImportedItems(&modules)
 	}
-	imports = move checkedImports
+	imports = checkedImports
+	// The constraints of the types' and the interfaces' parameters, which may
+	// name an interface or a type the file imports.
+	for i in declarationOrder {
+		lowerer.enter(files[i].0, files[i].1, imports[i].clone())
+		lowerer.constrainDeclared(&types[i], &interfaces[i])
+	}
 	// A function for every lambda, before the bodies are checked, and before
 	// the constants, whose values may hold one too.
 	var lambdas: Vec<Map<ast::ExprId, FnId>> = Vec()
@@ -241,14 +247,14 @@ pub fn lower(modules: &[ModuleAst], interner: &Interner, threads: i64): Lowered 
 	for i in declarationOrder {
 		lowerer.enter(files[i].0, files[i].1, imports[i].clone())
 		val (fileLambdas, fileEnvs) = lowerer.collectLambdas()
-		lambdas[i] = move fileLambdas
-		envs[i] = move fileEnvs
+		lambdas[i] = fileLambdas
+		envs[i] = fileEnvs
 		generators[i] = lowerer.collectGenerators()
 	}
-	val files = move files
-	val lambdas = move lambdas
-	val envs = move envs
-	val generators = move generators
+	val files = files
+	val lambdas = lambdas
+	val envs = envs
+	val generators = generators
 	// Constants are declared before type bodies, since an array's length may
 	// be one; each is worked out where it is first needed, with its file's
 	// lambdas and generators.
@@ -492,7 +498,7 @@ pub fn lower(modules: &[ModuleAst], interner: &Interner, threads: i64): Lowered 
 					&envs.items(),
 					&generators.items(),
 				)
-				return move worker
+				return worker
 			},
 		)
 		// The types each worker added, numbered in order, as one lowerer would
@@ -502,8 +508,8 @@ pub fn lower(modules: &[ModuleAst], interner: &Interner, threads: i64): Lowered 
 		for worker in move workers {
 			val map = lowerer.program.types.absorb(&worker.program.types, &mark)
 			taken.push(Taken(
-				worker: .Some(move worker),
-				map: move map,
+				worker: .Some(worker),
+				map: map,
 				start: ranges[at].0,
 				end: ranges[at].1,
 				checked: .None,
@@ -514,13 +520,13 @@ pub fn lower(modules: &[ModuleAst], interner: &Interner, threads: i64): Lowered 
 		// declarations, is not: that happens on threads again.
 		future::each(&var taken, (piece) => {
 			var done = match piece.worker.take() {
-				.Some(worker) => move worker
+				.Some(worker) => worker
 				.None => return
 			}
 			piece.checked = .Some(done.intoChecked(&work[piece.start..piece.end], &piece.map))
 		})
 		for piece in move taken {
-			if move piece.checked is .Some(checked) then lowerer.takeChecked(move checked)
+			if move piece.checked is .Some(checked) then lowerer.takeChecked(checked)
 		}
 	}
 	// A projection that forwards to another lends what that one lends, which
@@ -543,7 +549,7 @@ pub fn lower(modules: &[ModuleAst], interner: &Interner, threads: i64): Lowered 
 		if d.isError() then errors = true
 	}
 	if !errors then lowerer.completeTypes(0)
-	return Lowered(program: move lowerer.program, diagnostics: move lowerer.diagnostics)
+	return Lowered(program: lowerer.program, diagnostics: lowerer.diagnostics)
 }
 
 /// What a worker did, taken back in the order of the ranges: the worker,
@@ -742,6 +748,12 @@ struct BodyState {
 	/// The byte literals, `b'x'`: a `u8`, compared with a `u8` alone, which
 	/// a constant of another type is not.
 	byteLiterals: Set<ExprId> = Set()
+	/// Expressions checked ahead of where they are written, for what their
+	/// type says of the parts beside them, with what checking them answered:
+	/// the part of an array's tuples that decides a position's type. Taken
+	/// out where the expression is reached in order, so that nothing is
+	/// checked twice.
+	early: Map<ast::ExprId, ExprId> = Map()
 	/// The names in scope, innermost last.
 	scopes: Vec<Map<Symbol, LocalId>> = Vec()
 	/// The result type, and where it was written.
@@ -808,6 +820,16 @@ struct BodyState {
 	pendingTries: Vec<PendingTry> = Vec()
 	/// Whether the body is a lambda's, which a message names as one.
 	lambda: bool = false
+	/// The locals declared with a value that leaves type arguments
+	/// undecided, waiting for the first place that names them.
+	pendingLocals: Map<LocalId, PendingLocal> = Map()
+	/// What the `move`s are written on where a `match`, an `is`, a `for` or
+	/// a `val` pattern takes the value apart, which the place alone would be
+	/// looked into: no `move` the checker would infer.
+	taking: Set<ast::ExprId> = Set()
+	/// The function whose body is being checked; nothing for a lambda's,
+	/// a default's or a constant's.
+	function: Option<FnId> = .None
 }
 
 extend Lowerer {
@@ -824,9 +846,9 @@ extend Lowerer {
 		return Lowerer(
 			ast: &file,
 			interner: &interner,
-			program: move program,
+			program: program,
 			diagnostics: Vec(),
-			modules: move modules,
+			modules: modules,
 			current: 0,
 			imports: FileImports(),
 			state: BodyState(),
@@ -867,7 +889,7 @@ extend Lowerer {
 	/// The type in backticks, for messages.
 	fn tyName(ty: Ty): String = "`\(self.program.tyName(ty, self.interner))`"
 
-	var fn report(diagnostic: Diagnostic) = self.diagnostics.push(move diagnostic)
+	var fn report(diagnostic: Diagnostic) = self.diagnostics.push(diagnostic)
 
 	/// The names the module being lowered declares.
 	fn types(): &Map<Symbol, (TypeDef, Span)> = lend self.modules[self.current].types
@@ -897,7 +919,7 @@ extend Lowerer {
 	var fn enter(module: i64, file: &ast::Ast, imports: FileImports) keeps file = {
 		self.current = module
 		self.ast = &file
-		self.imports = move imports
+		self.imports = imports
 	}
 
 	/// Moves to the `i`th file, with its imports, lambdas and generators.
@@ -929,7 +951,7 @@ extend Lowerer {
 			var body = self.program.fns[one.id].body.take()
 			if renumber && body is .Some(checked) then
 				checked.mapTypes((ty) => map.get(ty), (list) => map.getList(list))
-			bodies.push((one.id, move body, self.program.fns[one.id].projects.clone()))
+			bodies.push((one.id, body, self.program.fns[one.id].projects.clone()))
 		}
 		// A closure's environment is a struct the worker filled in: what it
 		// captured, or the type parameters of the generic function it was
@@ -944,7 +966,7 @@ extend Lowerer {
 					field.ty = map.get(field.ty)
 				}
 			}
-			envStructs.push((id, move copy))
+			envStructs.push((id, copy))
 		}
 		// A lambda's function was declared before the bodies were checked, and
 		// filled in by the worker that checked the body around it.
@@ -961,7 +983,7 @@ extend Lowerer {
 				if copy.body is .Some(body) then
 					body.mapTypes((ty) => map.get(ty), (list) => map.getList(list))
 			}
-			lambdas.push((id, move copy))
+			lambdas.push((id, copy))
 		}
 		// A generator's `next`, struct and implementation were declared empty,
 		// and filled in by the worker that checked its loop.
@@ -999,10 +1021,10 @@ extend Lowerer {
 			}
 			generators.push(GeneratorChecked(
 				next: next,
-				def: move copy,
+				def: copy,
 				id: id,
-				strukt: move strukt,
-				implementation: move implementation,
+				strukt: strukt,
+				implementation: implementation,
 			))
 		}
 		var names: Vec<(Span, Named)> = Vec()
@@ -1018,11 +1040,11 @@ extend Lowerer {
 			)
 		}
 		return CheckedBodies(
-			bodies: move bodies,
-			lambdas: move lambdas,
-			envStructs: move envStructs,
-			generators: move generators,
-			names: move names,
+			bodies: bodies,
+			lambdas: lambdas,
+			envStructs: envStructs,
+			generators: generators,
+			names: names,
 			implicitFills: mem::replace(&var self.program.implicitFills, Vec()),
 			diagnostics: mem::replace(&var self.diagnostics, Vec()),
 		)
@@ -1031,26 +1053,26 @@ extend Lowerer {
 	/// What a worker checked, put in its place.
 	var fn takeChecked(checked: CheckedBodies) = {
 		for (id, body, projects) in move checked.bodies {
-			self.program.fns[id].body = move body
+			self.program.fns[id].body = body
 			self.program.fns[id].projects = move projects
 		}
 		for (id, def) in move checked.lambdas {
-			self.program.fns[id] = move def
+			self.program.fns[id] = def
 		}
 		for (id, def) in move checked.envStructs {
-			self.program.structs[id] = move def
+			self.program.structs[id] = def
 		}
 		for generator in move checked.generators {
-			self.program.fns[generator.next] = move generator.def
-			self.program.structs[generator.id] = move generator.strukt
+			self.program.fns[generator.next] = generator.def
+			self.program.structs[generator.id] = generator.strukt
 			if generator.implementation is .Some((index, args, conditions)) {
 				self.program.impls[index].args = args
 				self.program.impls[index].conditions = conditions.clone()
 			}
 		}
-		self.program.names.append(move checked.names)
-		self.program.implicitFills.append(move checked.implicitFills)
-		self.diagnostics.append(move checked.diagnostics)
+		self.program.names.append(checked.names)
+		self.program.implicitFills.append(checked.implicitFills)
+		self.diagnostics.append(checked.diagnostics)
 	}
 
 	var fn enterFile(

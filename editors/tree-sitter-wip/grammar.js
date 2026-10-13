@@ -177,9 +177,9 @@ module.exports = grammar({
     // What a result borrows: `from a, self.ast`. A word only here.
     lends_from: $ => prec.right(seq('from', commaSep1($.lend_path))),
 
-    // What a call may keep of its arguments: `keeps value`. A word only
-    // here.
-    keeps: $ => prec.right(seq('keeps', commaSep1($.identifier))),
+    // What a call may keep of its arguments, the receiver as `self`:
+    // `keeps self, value`. A word only here.
+    keeps: $ => prec.right(seq('keeps', commaSep1(choice($.self, $.identifier)))),
 
     lend_path: $ => seq(
       choice($.self, $.identifier),
@@ -407,6 +407,7 @@ module.exports = grammar({
       $.guard_statement,
       $.defer_statement,
       $.return_statement,
+      $.become_statement,
       $.yield_statement,
       $.while_statement,
       $.for_statement,
@@ -439,6 +440,9 @@ module.exports = grammar({
     defer_statement: $ => seq('defer', $._expression),
 
     return_statement: $ => prec.right(seq('return', optional($._expression))),
+
+    // `become f(x)`: a call that takes the function's frame.
+    become_statement: $ => seq('become', $._expression),
 
     // `yield value`: to the list being built, or to
     // whoever asks a generator.
@@ -503,6 +507,7 @@ module.exports = grammar({
       $.lend_expression,
       $.if_expression,
       $.match_expression,
+      $.when_expression,
       $.assert_expression,
       $.block,
       // A loop where a value stands: a generator.
@@ -699,6 +704,7 @@ module.exports = grammar({
     _then_branch: $ => choice(
       $._expression,
       $.return_statement,
+      $.become_statement,
       $.break_statement,
       $.continue_statement,
     ),
@@ -724,6 +730,34 @@ module.exports = grammar({
       field('value', choice(
         $._expression,
         $.return_statement,
+        $.become_statement,
+        $.break_statement,
+        $.continue_statement,
+      )),
+    )),
+
+    // `when { c => a … else => b }`: a choice among conditions, the first
+    // that holds.
+    when_expression: $ => seq(
+      'when',
+      field('body', $.when_block),
+    ),
+
+    when_block: $ => seq(
+      '{',
+      optional($._list_separators),
+      repeat(seq($.when_arm, optional($._list_separators))),
+      '}',
+    ),
+
+    // An arm's condition, or `else` for the last; its value may be a jump.
+    when_arm: $ => prec.right(seq(
+      field('condition', choice($._expression, 'else')),
+      '=>',
+      field('value', choice(
+        $._expression,
+        $.return_statement,
+        $.become_statement,
         $.break_statement,
         $.continue_statement,
       )),

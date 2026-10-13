@@ -196,7 +196,7 @@ extend Holders {
 				}
 			}
 		}
-		return move holders
+		return holders
 	}
 
 	/// Whether a value of `ty` is one, or holds one. What is behind a
@@ -236,6 +236,13 @@ extend Checker {
 		!self.program.holdsView(ty) &&
 		!self.cHolders.holdsString(self.program, ty) &&
 		self.cHolders.holds(self.program, ty)
+
+	/// Whether `callee` is a Wip function whose result type, as it is
+	/// written, holds a C struct's pointer, so that what it answers borrows
+	/// what its signature lends.
+	fn answersCStruct(callee: FnId): bool =
+		!self.program.fns[callee].isExtern &&
+		self.cHolders.holds(self.program, self.program.fns[callee].ret)
 
 	/// Whether a value of `ty` borrows as a view does: a view, or a `&`
 	/// reference kept as one. A lent closure is not one; it borrows what it
@@ -322,9 +329,9 @@ extend Checker {
 			}
 		}
 		for path in move reached {
-			roots.paths.add(move path)
+			roots.paths.add(path)
 		}
-		state.roots.put(local, move roots.paths)
+		state.roots.put(local, roots.paths)
 		state.stale.remove(&local)
 	}
 
@@ -343,7 +350,7 @@ extend Checker {
 			}
 			roots.add(self.lentRoots(arg, self.argLends(callee, i, arg, lends), &state))
 		}
-		return move roots
+		return roots
 	}
 
 	/// What argument `i` of a call of `callee` lends, as its parameter's
@@ -399,11 +406,19 @@ extend Checker {
 			// `&place`: the place, or what the reference it lies behind
 			// borrows.
 			.Ref(..) | .LendClosure(..) => roots = self.lentRoots(id, Lends::all(), &state)
-			// A C struct's pointers point at what its literal was given; one a
-			// call answers points at nothing the program made with `&`.
-			.Call(..) | .DynCall(..) | .CallValue(..) | .CallClosure(..) if self.pointersOnly(
-				body.exprs[id].ty,
-			) => {}
+			// A C struct's pointers point at what its literal was given. One a
+			// Wip function answers, whose result type says it, borrows what
+			// the signature lends to what they point at; one from C, through
+			// a function value, or that came in through a type parameter —
+			// made where the value was, which the signature cannot say —
+			// borrows nothing the program made with `&`.
+			.Call(callee, ..) if self.pointersOnly(body.exprs[id].ty) &&
+				!self.answersCStruct(callee) => {}
+			.DynCall(interfaceId, index, ..) if self.pointersOnly(body.exprs[id].ty) &&
+				!self.answersCStruct(
+					self.program.interfaces[interfaceId].methods[index as i64].id,
+				) => {}
+			.CallValue(..) | .CallClosure(..) if self.pointersOnly(body.exprs[id].ty) => {}
 			.Call(callee, args, ..) => roots = self.callRoots(.Some(callee), &args, &state)
 			.DynCall(interfaceId, index, args, ..) => {
 				val method = self.program.interfaces[interfaceId].methods[index as i64].id
@@ -430,7 +445,7 @@ extend Checker {
 			// call.
 			_ => {}
 		}
-		return move roots
+		return roots
 	}
 
 	fn blockRoots(block: &Block, state: &State): Roots = match block.value {
@@ -475,7 +490,7 @@ extend Checker {
 					match self.keptReferenceBehind(inner) {
 						.Some(reference) => roots.add(self.strRoots(reference, &state))
 						.None => match self.accessPath(inner) {
-							.Some(path) => roots.add(self.placeRoots(move path, &state))
+							.Some(path) => roots.add(self.placeRoots(path, &state))
 							.None => {
 								val temporary =
 									(self.place(inner) is .None | .Some(.Temporary(..)) &&
@@ -495,7 +510,7 @@ extend Checker {
 				if lends.borrows then roots.add(self.strRoots(e, &state))
 				if lends.place {
 					match self.accessPath(e) {
-						.Some(path) => roots.add(self.placeRoots(move path, &state))
+						.Some(path) => roots.add(self.placeRoots(path, &state))
 						.None => {}
 					}
 				}
@@ -504,7 +519,7 @@ extend Checker {
 			// which is where the reference points.
 			_ => roots = self.strRoots(e, &state)
 		}
-		return move roots
+		return roots
 	}
 
 	/// Whether the place `id` lies in a constant table, which the program
@@ -544,10 +559,10 @@ extend Checker {
 					roots.paths.add(p.clone())
 				}
 			}
-			return move roots
+			return roots
 		}
-		roots.paths.add(move path)
-		return move roots
+		roots.paths.add(path)
+		return roots
 	}
 
 	/// What a value is, for messages: "a `str`", or its type.
@@ -689,7 +704,7 @@ extend Checker {
 				"what a `&var` argument reaches is not kept by another argument: its caller writes it again, and would find what kept it stale",
 			).
 			withHelp("keep a copy, an index or a handle into `\(lent)` instead, as an `Arena`'s handle names what it holds")
-		self.report(move diagnostic)
+		self.report(diagnostic)
 	}
 
 	/// Reports that the body keeps what `kept`, a parameter, holds or borrows
@@ -706,20 +721,14 @@ extend Checker {
 		).withSecondary(self.body.locals[kept].span, "`\(keptName)` is not in `keeps`").withNote(
 			"a call keeps nothing of its arguments but what its `keeps` names, so that its callers know what stays borrowed",
 		)
-		if self.body.locals[kept].name == self.interner.selfSymbol() {
-			// `keeps` names the parameters a call is given, and the receiver
-			// is not one of them.
-			diagnostic = diagnostic.withHelp(
-				"`keeps` cannot name `self`: take the value as a parameter of a `static fn`, which `keeps` can name",
-			)
-		} else if self.keepsAt is .Some((at, written)) {
+		if self.keepsAt is .Some((at, written)) {
 			val text = if written then ", \(keptName)" else " keeps \(keptName)"
 			diagnostic = diagnostic.withFix(
 				"say that `\(self.fnName)` keeps `\(keptName)`",
-				own [Edit::insert(at, move text)],
+				own [Edit::insert(at, text)],
 			)
 		}
-		self.report(move diagnostic)
+		self.report(diagnostic)
 	}
 
 	fn isRefParam(local: LocalId): bool =
@@ -752,7 +761,7 @@ extend Checker {
 		val walked = self.body.locals[local].name == Symbol::walked()
 		if roots.temporary is .Some(temporary) && !walked then
 			self.keptTemporary(local, value, temporary)
-		state.roots.put(local, move roots.paths)
+		state.roots.put(local, roots.paths)
 		state.stale.remove(&local)
 	}
 
@@ -802,8 +811,8 @@ extend Checker {
 				"the generator stops here, with `\(name)` borrowed",
 			).withSecondary(b.span, by).
 				withNote(ACROSS_YIELD_NOTE).
-				withHelp(move help)
-			self.report(move diagnostic)
+				withHelp(help)
+			self.report(diagnostic)
 		}
 		var owned: SortedSet<LocalId> = SortedSet()
 		for paths in state.roots.values() {
@@ -848,8 +857,8 @@ extend Checker {
 					"each pass calls `next()` here, after the generator went on",
 				).withSecondary(stale.change, "the generator stops here").
 					withNote(ACROSS_YIELD_NOTE).
-					withHelp(move help)
-				self.report(move diagnostic)
+					withHelp(help)
+				self.report(diagnostic)
 				return
 			}
 			val variable = self.interner.resolve(def.name)
@@ -861,8 +870,8 @@ extend Checker {
 			).withSecondary(stale.change, "the generator stops here").
 				withSecondary(def.span, "`\(variable)` borrows `\(root)`, the generator's own").
 				withNote(ACROSS_YIELD_NOTE).
-				withHelp(move help)
-			self.report(move diagnostic)
+				withHelp(help)
+			self.report(diagnostic)
 			return
 		}
 		// The variable a `for` walks an iterator in has no name a program
@@ -878,7 +887,7 @@ extend Checker {
 					"what the iterator was made from must not change while the loop still walks it",
 				).
 				withHelp("change `\(root)` after the loop, or walk a copy that owns its bytes")
-			self.report(move diagnostic)
+			self.report(diagnostic)
 			return
 		}
 		val variable = self.interner.resolve(def.name)
@@ -896,7 +905,7 @@ extend Checker {
 					"a closure kept in a `val` reads what it captures where it is, so that must not change while the closure is still used",
 				).
 				withHelp("call `\(name)` before `\(root)` changes, or give it `\(root)` as an argument")
-			self.report(move diagnostic)
+			self.report(diagnostic)
 			return
 		}
 		val what = if stale.how == .Dropped then "dropped" else "changed"
@@ -910,53 +919,49 @@ extend Checker {
 			withSecondary(def.span, "`\(variable)` borrows `\(root)`").
 			withNote(borrowing.stale).
 			withHelp("use `\(name)` before `\(root)` changes, or \(borrowing.instead)")
-		self.report(move diagnostic)
+		self.report(diagnostic)
 	}
 
 	/// How a value of `ty` borrows, for messages: a `str` its bytes, a `&`
 	/// reference its place, a view what its parts borrow.
-	fn borrowing(ty: Ty): Borrowing =
-		if ty == CSTRING then
-			Borrowing(
-				stale: "a C string made from a `String` points into its bytes, so those must not change while the C string is still used",
-				leaving: "a C string that leaves a function may only borrow what its reference parameters refer to",
-				instead: "make the C string again after the change",
-				answer: "answer the `String`, and make the C string from it where it is used",
-				bind: "keep the `String` in a variable, and make the C string from it where it is used",
-			)
-		else if !self.program.holdsView(ty) && self.cHolders.holdsString(self.program, ty) then
-			Borrowing(
-				stale: "a C string made from a `String` points into its bytes, so those must not change while what holds the C string is still used",
-				leaving: "a value that holds a C string may leave a function only where the C string borrows what its reference parameters refer to",
-				instead: "make its C string again after the change",
-				answer: "keep the `String` its C string was made from where the value is used, or give it a C string from C or a literal",
-				bind: "keep the `String` in a variable, and make the C string from it",
-			)
-		else if !self.program.holdsView(ty) && self.cHolders.holds(self.program, ty) then
-			Borrowing(
-				stale: "a C struct's pointer made with `&` points at what it was made from, so that must not change while the struct is still used",
-				leaving: "a C struct that leaves a function may only point at what its reference parameters refer to",
-				instead: "build the struct again after the change",
-				answer: "keep what it points at where the struct is used, and build the struct there",
-				bind: "keep what it points at in a variable, and build the struct from it",
-			)
-		else if ty == STR then
-			Borrowing(
-				stale: "a `str` points into the bytes of what it borrows, so those must not change while the `str` is still used",
-				leaving: "a `str` that leaves a function may only borrow what its reference parameters refer to",
-				instead: "keep a copy that owns its bytes with `String::of(…)`",
-			)
-		else if self.isSharedRef(ty) then
-			Borrowing(
-				stale: "a `&` reference points into the place it borrows, so that must not change while the reference is still used",
-				leaving: "a `&` reference that leaves a function may only point into what its reference parameters refer to",
-				instead: "keep a copy of the value it points to",
-			)
-		else Borrowing(
+	fn borrowing(ty: Ty): Borrowing = when {
+		ty == CSTRING => Borrowing(
+			stale: "a C string made from a `String` points into its bytes, so those must not change while the C string is still used",
+			leaving: "a C string that leaves a function may only borrow what its reference parameters refer to",
+			instead: "make the C string again after the change",
+			answer: "answer the `String`, and make the C string from it where it is used",
+			bind: "keep the `String` in a variable, and make the C string from it where it is used",
+		)
+		!self.program.holdsView(ty) && self.cHolders.holdsString(self.program, ty) => Borrowing(
+			stale: "a C string made from a `String` points into its bytes, so those must not change while what holds the C string is still used",
+			leaving: "a value that holds a C string may leave a function only where the C string borrows what its reference parameters refer to",
+			instead: "make its C string again after the change",
+			answer: "keep the `String` its C string was made from where the value is used, or give it a C string from C or a literal",
+			bind: "keep the `String` in a variable, and make the C string from it",
+		)
+		!self.program.holdsView(ty) && self.cHolders.holds(self.program, ty) => Borrowing(
+			stale: "a C struct's pointer made with `&` points at what it was made from, so that must not change while the struct is still used",
+			leaving: "a C struct that leaves a function may only point at what its reference parameters refer to",
+			instead: "build the struct again after the change",
+			answer: "keep what it points at where the struct is used, and build the struct there",
+			bind: "keep what it points at in a variable, and build the struct from it",
+		)
+		ty == STR => Borrowing(
+			stale: "a `str` points into the bytes of what it borrows, so those must not change while the `str` is still used",
+			leaving: "a `str` that leaves a function may only borrow what its reference parameters refer to",
+			instead: "keep a copy that owns its bytes with `String::of(…)`",
+		)
+		self.isSharedRef(ty) => Borrowing(
+			stale: "a `&` reference points into the place it borrows, so that must not change while the reference is still used",
+			leaving: "a `&` reference that leaves a function may only point into what its reference parameters refer to",
+			instead: "keep a copy of the value it points to",
+		)
+		else => Borrowing(
 			stale: "a view points into what it borrows — a `str` into bytes, a `&` into a place — so that must not change while the view is still used",
 			leaving: "a view that leaves a function may only borrow what its reference parameters refer to",
 			instead: "keep a value that owns its data",
 		)
+	}
 
 	/// In one call, a `str` argument must not borrow what a `&var` argument
 	/// lets the call change: `text.push(text.toStr())` reads bytes that the
@@ -967,7 +972,7 @@ extend Checker {
 		for arg in args {
 			if !self.isVarRef(self.ty(arg)) then continue
 			match self.accessPath(arg) {
-				.Some(path) => vars.push((arg, move path))
+				.Some(path) => vars.push((arg, path))
 				.None => {}
 			}
 		}
@@ -994,7 +999,7 @@ extend Checker {
 					"a `&var` argument may change its place while the call still reads the `str`, which points into it",
 				).
 				withHelp("copy the text first: `String::of(…)` owns its bytes")
-			self.report(move diagnostic)
+			self.report(diagnostic)
 		}
 	}
 
@@ -1009,7 +1014,7 @@ extend Checker {
 		).withSecondary(temporary, "a temporary, dropped at the end of the statement").
 			withNote("a view points into what it borrows, which must live as long as it does").
 			withHelp(self.borrowing(self.ty(value)).bind)
-		self.report(move diagnostic)
+		self.report(diagnostic)
 	}
 
 	/// A `str` that leaves the function: every root must be something a
@@ -1033,7 +1038,7 @@ extend Checker {
 			).withSecondary(temporary, "a temporary, dropped at the end of the statement").
 				withNote(self.borrowing(self.ty(value)).leaving).
 				withHelp(self.borrowing(self.ty(value)).answer)
-			self.report(move diagnostic)
+			self.report(diagnostic)
 			return
 		}
 		if leaving == .Result {
@@ -1067,9 +1072,9 @@ extend Checker {
 					span,
 					"points into `\(name)`",
 				).withSecondary(self.body.locals[self.body.params[param]].span, "`\(name)` is `\(self.tyName(self.body.locals[root.local].ty))`").
-					withNote(move note).
+					withNote(note).
 					withHelp("answer what `\(name)` borrows, or a value that owns its data")
-				self.report(move diagnostic)
+				self.report(diagnostic)
 				return
 			}
 			// What a parameter borrows leaves only where `from` names it.
@@ -1093,7 +1098,7 @@ extend Checker {
 				).withSecondary(self.body.locals[self.body.params[param]].span, "`\(name)` is not named after `from`").
 					withNote("`\(self.fnName)` says with `from` what its result borrows, and its callers keep only that").
 					withHelp("name `\(name)` after `from`, or answer from what it names")
-				self.report(move diagnostic)
+				self.report(diagnostic)
 				return
 			}
 		}
@@ -1122,11 +1127,11 @@ extend Checker {
 			STR_OUTLIVES_ITS_ROOT,
 			"cannot \(what) \(self.aView(value)) that borrows `\(name)`",
 			span,
-			move owner,
+			owner,
 		).withSecondary(self.body.locals[root.local].span, "`\(name)` declared here").
 			withNote(note).
 			withHelp(help)
-		self.report(move diagnostic)
+		self.report(diagnostic)
 	}
 
 	/// The value of a block, or of a `match` arm, that borrows one of
@@ -1153,6 +1158,6 @@ extend Checker {
 				"a `str`, a view or a `&` reference points into what it borrows, which must live as long as it does",
 			).
 			withHelp("declare `\(name)` outside the \(what), or answer a value that owns its data")
-		self.report(move diagnostic)
+		self.report(diagnostic)
 	}
 }

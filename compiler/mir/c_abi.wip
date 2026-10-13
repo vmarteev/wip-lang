@@ -13,7 +13,7 @@
 
 import std::collections::{Set}
 import std::io
-import hir::{Access, FnDef, FnId, Program, Ty, UNIT}
+import hir::{Access, FnDef, FnId, Layouts, Program, Ty, UNIT, nextMultiple}
 import syntax::{Diagnostic, Interner, UNSUPPORTED}
 
 /// The processor, which is what decides how C passes a struct. Windows would
@@ -166,7 +166,7 @@ pub fn shimmed(program: &Program, given: Option<Arch>): Set<FnId> = {
 			}
 		}
 	}
-	return move shimmed
+	return shimmed
 }
 
 /// The functions a body calls, or names as a value.
@@ -182,7 +182,7 @@ fn calledOrNamed(program: &Program): Set<FnId> = {
 			}
 		}
 	}
-	return move used
+	return used
 }
 
 /// How `def` travels on `arch`, where there is one.
@@ -208,12 +208,12 @@ fn spilled(arch: Arch, size: u32, parts: Vec<Part>): Vec<Part> = {
 	for part in parts {
 		if part.reg == Reg::I64 then floating = false
 	}
-	if !floating || arch == Arch::AppleArm64 then return move parts
+	if !floating || arch == Arch::AppleArm64 then return parts
 	var pieces: Vec<Part> = Vec()
 	for i in 0..((size + 7) / 8) {
 		pieces.push(Part(offset: i * 8, reg: .F64))
 	}
-	return move pieces
+	return pieces
 }
 
 /// Whether a call that passes more than its declaration names — one of the
@@ -292,7 +292,7 @@ pub fn classify(
 		val leaves = leavesOf(&program, &var layouts, def.ret)?
 		if layout.size == 0 then return .None
 		ret = match pieces(arch, layout.size, &leaves) {
-			.Some(parts) => .Parts(move parts)
+			.Some(parts) => .Parts(parts)
 			.None => {
 				// x86-64's hidden pointer is the first argument; arm64's is x8,
 				// which no argument uses.
@@ -304,65 +304,75 @@ pub fn classify(
 	var params: Vec<Pass> = Vec()
 	for param in def.params {
 		val ty = param.ty
-		val pass: Pass = if crossesAsStruct(&program, ty) {
-			val layout = layouts.of(&program, ty)
-			val leaves = leavesOf(&program, &var layouts, ty)?
-			if layout.size == 0 then return .None
-			match pieces(arch, layout.size, &leaves) {
-				.Some(parts) => {
-					var ints: u32 = 0
-					for p in parts {
-						if p.reg == Reg::I64 then ints += 1
-					}
-					val floats = parts.len() as u32 - ints
-					if regs.ints >= ints && regs.floats >= floats {
-						regs.ints -= ints
-						regs.floats -= floats
-						Pass::Parts(move parts)
-					} else if arch.isArm64() {
-						// C.3 and C.11: the struct goes on the stack whole, and
-						// the registers of its class are spent, so no later
-						// argument of that class is in one either. Filling them
-						// with zeros says so to the code generator, which gives
-						// each argument the next register of its class.
-						val pad = if floats > 0 {
-							val spent = Pad(ints: 0, floats: regs.floats)
-							regs.floats = 0
-							spent
-						} else {
-							val spent = Pad(ints: regs.ints, floats: 0)
-							regs.ints = 0
-							spent
+		val pass: Pass = when {
+			crossesAsStruct(&program, ty) => {
+				val layout = layouts.of(&program, ty)
+				val leaves = leavesOf(&program, &var layouts, ty)?
+				if layout.size == 0 then return .None
+				match pieces(arch, layout.size, &leaves) {
+					.Some(parts) => {
+						var ints: u32 = 0
+						for p in parts {
+							if p.reg == Reg::I64 then ints += 1
 						}
-						Pass::Spilled(pad: move pad, parts: spilled(arch, layout.size, move parts))
-					} else {
-						// "If there are no registers available for any eightbyte
-						// of an argument, the whole argument is passed on the
-						// stack", which is MEMORY, and uses no register.
-						Pass::Stack(nextMultiple(layout.size, 8))
+						val floats = parts.len() as u32 - ints
+						when {
+							regs.ints >= ints && regs.floats >= floats => {
+								regs.ints -= ints
+								regs.floats -= floats
+								Pass::Parts(parts)
+							}
+							arch.isArm64() => {
+								// C.3 and C.11: the struct goes on the stack whole, and
+								// the registers of its class are spent, so no later
+								// argument of that class is in one either. Filling them
+								// with zeros says so to the code generator, which gives
+								// each argument the next register of its class.
+								val pad = if floats > 0 {
+									val spent = Pad(ints: 0, floats: regs.floats)
+									regs.floats = 0
+									spent
+								} else {
+									val spent = Pad(ints: regs.ints, floats: 0)
+									regs.ints = 0
+									spent
+								}
+								Pass::Spilled(
+									pad: move pad,
+									parts: spilled(arch, layout.size, parts),
+								)
+							}
+							// "If there are no registers available for any eightbyte
+							// of an argument, the whole argument is passed on the
+							// stack", which is MEMORY, and uses no register.
+							else => Pass::Stack(nextMultiple(layout.size, 8))
+						}
 					}
+					.None if arch.isArm64() => {
+						regs.takeInt()
+						Pass::Copy
+					}
+					.None => Pass::Stack(nextMultiple(layout.size, 8))
 				}
-				.None if arch.isArm64() => {
-					regs.takeInt()
-					Pass::Copy
-				}
-				.None => Pass::Stack(nextMultiple(layout.size, 8))
 			}
-		} else if program.types.kind(ty) is .Float(..) {
-			regs.takeFloat()
-			Pass::Plain
-		} else if isPair(&program, ty) {
-			// A `str` and a `&[T]` are a pointer and a length.
-			regs.takeInt()
-			regs.takeInt()
-			Pass::Plain
-		} else {
-			regs.takeInt()
-			Pass::Plain
+			program.types.kind(ty) is .Float(..) => {
+				regs.takeFloat()
+				Pass::Plain
+			}
+			isPair(&program, ty) => {
+				// A `str` and a `&[T]` are a pointer and a length.
+				regs.takeInt()
+				regs.takeInt()
+				Pass::Plain
+			}
+			else => {
+				regs.takeInt()
+				Pass::Plain
+			}
 		}
-		params.push(move pass)
+		params.push(pass)
 	}
-	return .Some(CCall(params: move params, ret: move ret))
+	return .Some(CCall(params: params, ret: ret))
 }
 
 /// Whether a type reaches C as a pointer and a length.
@@ -408,7 +418,7 @@ enum Leaf {
 fn leavesOf(program: &Program, layouts: &var Layouts, ty: Ty): Option<Vec<(u32, u32, Leaf)>> = {
 	var out: Vec<(u32, u32, Leaf)> = Vec()
 	if !collect(&program, &var layouts, ty, 0, &var out) then return .None
-	return .Some(move out)
+	return .Some(out)
 }
 
 /// Adds `ty`'s scalars at `base`, each as its offset, its size and its kind;
@@ -479,7 +489,7 @@ fn pieces(arch: Arch, size: u32, leaves: &[(u32, u32, Leaf)]): Option<Vec<Part>>
 			for i in 0..(size / unit) {
 				parts.push(Part(offset: i * unit, reg: reg.clone()))
 			}
-			return .Some(move parts)
+			return .Some(parts)
 		}
 		// Anything else of sixteen bytes or fewer is its bytes, in one or two
 		// general registers (C.10).
@@ -487,7 +497,7 @@ fn pieces(arch: Arch, size: u32, leaves: &[(u32, u32, Leaf)]): Option<Vec<Part>>
 		for i in 0..((size + 7) / 8) {
 			parts.push(Part(offset: i * 8, reg: .I64))
 		}
-		return .Some(move parts)
+		return .Some(parts)
 	}
 	// Over sixteen bytes is MEMORY (System V 3.2.3, rule 1).
 	if size > 16 then return .None
@@ -510,7 +520,7 @@ fn pieces(arch: Arch, size: u32, leaves: &[(u32, u32, Leaf)]): Option<Vec<Part>>
 		val reg: Reg = if integer then .I64 else if used <= 4 then .F32 else .F64
 		parts.push(Part(offset: start, reg: move reg))
 	}
-	return .Some(move parts)
+	return .Some(parts)
 }
 
 /// The `@export("C")` functions this target cannot give C's signature: a
@@ -558,5 +568,5 @@ pub fn refusedExports(
 				).withHelp("wrap it in a function of Wip's own, and take that as the value"),
 			)
 	}
-	return move refused
+	return refused
 }

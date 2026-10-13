@@ -10,8 +10,9 @@
 // next iteration.
 //
 // The rules:
-// - A value whose type contains `own` is never copied implicitly. Using such
-//   a place as a value needs `move` (E0404).
+// - A value whose type contains `own` is never copied. Using such a place as
+//   a value moves it, as `move` does; a later use is E0404, where it was
+//   given.
 // - After `move p`, `p` and everything inside it hold no value until assigned
 //   again (E0401, E0402, E0403). Moving a field leaves the other fields
 //   usable, but not the struct as a whole.
@@ -48,9 +49,17 @@ import hir::{
 }
 import syntax::{Code, Diagnostic, Interner, Span, split}
 
+/// What checking the moves found: what it reports, and in each body, the
+/// places used as values that own memory, which are moved there as `move`
+/// would move them.
+pub struct Analysed {
+	pub diagnostics: Vec<Diagnostic>
+	pub given: Vec<(FnId, Vec<ExprId>)>
+}
+
 /// Checks every function body. Each body is checked on its own, and what
 /// they report is sorted by where it is.
-pub fn check(program: &Program, interner: &Interner, threads: i64): Vec<Diagnostic> = {
+pub fn check(program: &Program, interner: &Interner, threads: i64): Analysed = {
 	val implemented = implementedMethods(&program)
 	// What each function's parameters lend its result, by its signature:
 	// worked out once, for its own body and every call of it.
@@ -76,6 +85,7 @@ pub fn check(program: &Program, interner: &Interner, threads: i64): Vec<Diagnost
 		&ranges.items(),
 		(range) => {
 			var said: Vec<Diagnostic> = Vec()
+			var given: Vec<(FnId, Vec<ExprId>)> = Vec()
 			// What a callee lends, worked out once for the bodies this thread
 			// checks.
 			var lent: Map<(FnId, Ty), Vec<Lends>> = Map()
@@ -86,7 +96,7 @@ pub fn check(program: &Program, interner: &Interner, threads: i64): Vec<Diagnost
 					.Some(declared) => Option::Some(declared.clone())
 					.None => Option::None
 				}
-				for d in checkBody(
+				val (diagnostics, moved) = checkBody(
 					&program,
 					&interner,
 					&signatures,
@@ -95,19 +105,21 @@ pub fn check(program: &Program, interner: &Interner, threads: i64): Vec<Diagnost
 					id,
 					&body,
 					implements,
-				) {
-					said.push(move d)
-				}
+				)
+				said.append(diagnostics)
+				if !moved.isEmpty() then given.push((id, moved))
 			}
-			return move said
+			return (said, given)
 		},
 	)
 	var diagnostics: Vec<Diagnostic> = Vec()
-	for part in move found {
-		diagnostics.append(move part)
+	var given: Vec<(FnId, Vec<ExprId>)> = Vec()
+	for (said, moved) in move found {
+		diagnostics.append(said)
+		given.append(moved)
 	}
 	diagnostics.sortByKey((d) => d.primary.span.lo)
-	return move diagnostics
+	return Analysed(diagnostics: diagnostics, given: given)
 }
 
 /// Each method of an implementation, and the interface's method it
@@ -126,7 +138,7 @@ fn implementedMethods(program: &Program): Map<FnId, FnId> = {
 			}
 		}
 	}
-	return move implemented
+	return implemented
 }
 
 /// Checks one body. `implements` is the interface's method it implements,
@@ -142,7 +154,7 @@ fn checkBody(
 	id: FnId,
 	body: &Body,
 	implements: Option<FnId>,
-): Vec<Diagnostic> = {
+): (Vec<Diagnostic>, Vec<ExprId>) = {
 	val def = &program.fns[id]
 	var lends = signatures[id.index()].clone()
 	if implements is .Some(declared) {
@@ -176,21 +188,23 @@ fn checkBody(
 		exit: .None,
 		seen: Set(),
 		borrows: Vec(),
-		varParams: move varParams,
+		varParams: varParams,
 		fnName: interner.resolve(def.name),
 		generator: def.generator.isSome(),
 		aliases: Map(),
 		scopes: Vec(),
 		loopExits: Vec(),
-		lends: move lends,
+		lends: lends,
 		implements: implements,
 		keptBindings: Set(),
 		saysFrom: def.lendsFrom.isSome(),
-		keeps: move keeps,
+		keeps: keeps,
 		keepsAt: def.keepsAt,
 		keptElements: Set(),
 		copies: Vec(),
 		copiesRead: Set(),
+		given: Set(),
+		givenAt: Map(),
 		lent: mem::replace(&var lent, Map()),
 	)
 	var state = State()
@@ -202,7 +216,7 @@ fn checkBody(
 			if program.holdsView(ty) || cHolders.holds(&program, ty) {
 				var lent: SortedSet<Path> = SortedSet()
 				lent.add(Path(local: param, projs: Vec::of(own [Proj::Lent])))
-				state.roots.put(param, move lent)
+				state.roots.put(param, lent)
 			}
 		}
 	}
@@ -219,7 +233,11 @@ fn checkBody(
 	checker.checkPackedLends()
 	checker.reportCopies()
 	lent = mem::replace(&var checker.lent, Map())
-	return move checker.diagnostics
+	var given: Vec<ExprId> = Vec()
+	for id in checker.given {
+		given.push(id)
+	}
+	return (checker.diagnostics, given)
 }
 
 /// The expression that answers a function's result: the value of its
@@ -239,7 +257,7 @@ fn deeper(base: &Option<Path>, proj: Proj): Option<Path> = match base {
 	.Some(path) => {
 		var further = path.clone()
 		further.projs.push(proj)
-		Option::Some(move further)
+		Option::Some(further)
 	}
 	.None => .None
 }
@@ -248,7 +266,7 @@ fn deeper(base: &Option<Path>, proj: Proj): Option<Path> = match base {
 /// depth: a binder may be a pattern of its own.
 fn bindingsOf(pattern: &Pattern, base: Option<Path>, out: &var Vec<(LocalId, Option<Path>)>) = {
 	match pattern {
-		.Binding(local) => out.push((local, move base))
+		.Binding(local) => out.push((local, base))
 		.Variant(binders, ..) => {
 			for (i, binder) in binders.forwards().enumerate() {
 				binderBindings(&binder, deeper(&base, .Payload(i as u32)), &var out)
@@ -285,15 +303,15 @@ fn bindingsOf(pattern: &Pattern, base: Option<Path>, out: &var Vec<(LocalId, Opt
 					for i in 0..merged.len() {
 						if merged[i].0 == local {
 							val shared = merged[i].1.clone()
-							merged[i].1 = commonPath(move shared, path.clone())
+							merged[i].1 = commonPath(shared, path.clone())
 							seen = true
 							break
 						}
 					}
-					if !seen then merged.push((local, move path))
+					if !seen then merged.push((local, path))
 				}
 			}
-			out.append(move merged)
+			out.append(merged)
 		}
 		// What lies behind a reference is not part of the place: its
 		// bindings are kept references, which borrow what the reference
@@ -307,7 +325,7 @@ fn bindingsOf(pattern: &Pattern, base: Option<Path>, out: &var Vec<(LocalId, Opt
 fn commonPath(a: Option<Path>, b: Option<Path>): Option<Path> = {
 	val .Some(second) = b else return .None
 	var path = match move a {
-		.Some(first) => move first
+		.Some(first) => first
 		.None => return .None
 	}
 	if path.local != second.local then return .None
@@ -318,7 +336,7 @@ fn commonPath(a: Option<Path>, b: Option<Path>): Option<Path> = {
 		shared += 1
 	}
 	path.projs.truncate(shared)
-	return .Some(move path)
+	return .Some(path)
 }
 
 /// The names a pattern binds behind a reference it tests through, at any
@@ -350,8 +368,8 @@ fn binderBindings(
 	out: &var Vec<(LocalId, Option<Path>)>,
 ) = match binder {
 	.Ignored => {}
-	.Bind(local) => out.push((local, move base))
-	.Nested(pattern) => bindingsOf(&pattern, move base, &var out)
+	.Bind(local) => out.push((local, base))
+	.Nested(pattern) => bindingsOf(&pattern, base, &var out)
 }
 
 @derive(Eq, Ord, Hash, Clone)
@@ -502,6 +520,10 @@ view struct Checker {
 	copies: Vec<(Span, LocalId)>
 	/// The copies after which the variable was read again.
 	copiesRead: Set<Span>
+	/// The places used as values that own memory, which are moved where
+	/// they are used; and where each is, which a later use names.
+	given: Set<ExprId>
+	givenAt: Map<Span, Ty>
 	/// What a callee's parameters lend to the value a `&var` argument
 	/// refers to, by the callee and that value's type: a signature lends the
 	/// same at every call.
@@ -565,7 +587,7 @@ struct LoopExits {
 extend Checker {
 	var fn report(diagnostic: Diagnostic) = {
 		if self.quiet == 0 && self.seen.add((diagnostic.code.clone(), diagnostic.primary.span)) then
-			self.diagnostics.push(move diagnostic)
+			self.diagnostics.push(diagnostic)
 	}
 
 	fn ty(id: ExprId): Ty = self.body.exprs[id].ty
@@ -609,11 +631,11 @@ extend Checker {
 		.Field(base, index) => .Some(
 			match self.place(base) {
 				.Some(.Path(path)) => {
-					var further = move path
+					var further = path
 					further.projs.push(.Field(index))
-					Place::Path(move further)
+					Place::Path(further)
 				}
-				.Some(other) => move other
+				.Some(other) => other
 				.None => Place::Temporary(base)
 			},
 		)
@@ -633,11 +655,11 @@ extend Checker {
 				) => Place::ThroughRef(inner)
 				_ => match self.place(inner) {
 					.Some(.Path(path)) => {
-						var further = move path
+						var further = path
 						further.projs.push(.Deref)
-						Place::Path(move further)
+						Place::Path(further)
 					}
-					.Some(other) => move other
+					.Some(other) => other
 					.None => Place::Temporary(inner)
 				}
 			},

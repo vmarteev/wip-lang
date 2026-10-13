@@ -67,7 +67,7 @@ clones of a value:
 
 ```wip,run
 fn main() = {
-    var numbers: Vec<i64> = Vec()
+    var numbers = Vec()
     numbers.push(1)
     numbers.push(2)
     assert(numbers.len() == 2 && numbers[0] == 1)
@@ -127,7 +127,7 @@ fn main() = {
     var rest = words.splitOff(1)
     assert(words.len() == 1 && rest[0] == "b")
     rest.append(Vec::of(own [String::of("d")]))
-    words.append(move rest)
+    words.append(rest)
     assert(words.len() == 4 && words[3] == "d")
 }
 ```
@@ -144,7 +144,7 @@ fn main() = {
     val block: [u8; 3] = [7, 8, 9]
     window[2..5].copyFrom(&block)
     assert(window[1] == 0 && window[2] == 7 && window[4] == 9)
-    var list: Vec<u8> = Vec()
+    var list = Vec()
     list.pushAll(&block)
     list.pushAll(&window[2..4])
     assert(list.len() == 5 && list[4] == 8)
@@ -495,9 +495,7 @@ fn main() = {
     "1 2 3".split(" ").forEach((w) => { total += w.toInt().unwrap() })
     assert(total == 6)
     val years = [30, 40]
-    val ages: Map<str, i64> = Map::fromPairs(
-        "ann bo".split(" ").zip(years.walk()),
-    )
+    val ages = Map::fromPairs("ann bo".split(" ").zip(years.walk()))
     assert(ages.at("bo") == 40)
 }
 ```
@@ -801,7 +799,7 @@ fn options(args: &[cstring]): Result<Options, ArgumentError> = {
             _ => return .Err(argument.unexpected())
         }
     }
-    return .Ok(move options)
+    return .Ok(options)
 }
 
 fn main() = {
@@ -1134,7 +1132,7 @@ fn main() = {
 
     val link: Weak<Vec<i64>> = first.downgrade()
     assert(link.upgrade().isSome())
-    destroy(move first)
+    destroy(first)
     assert(link.upgrade().isNone())
 }
 ```

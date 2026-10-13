@@ -5,7 +5,6 @@ import std::mem
 import syntax as ast
 import syntax::{
 	BINDING_SHADOWS_VARIANT,
-	CANNOT_COPY_OWN,
 	Diagnostic,
 	Edit,
 	GUARD_ELSE_FALLS_THROUGH,
@@ -143,6 +142,7 @@ extend Lowerer {
 		span: Span,
 	): ExprId = {
 		val file = self.ast
+		self.takenApart(scrutinee)
 		// A tuple written here is matched where its elements are; anything
 		// else is one value.
 		val (scrut, places) = match tupleWritten(file, scrutinee) {
@@ -199,7 +199,7 @@ extend Lowerer {
 			}
 			if result.isNone() && self.takesTypeBeside(arm.body) {
 				val .Some(bindings) = self.state.scopes.pop() else panic("the arm's scope")
-				waiting.push((slots.len(), move bindings, move pattern, guard))
+				waiting.push((slots.len(), bindings, pattern, guard))
 				slots.push(.None)
 				continue
 			}
@@ -211,11 +211,11 @@ extend Lowerer {
 			val ty = self.tyOf(body)
 			if result.isNone() && ty != NEVER then result = .Some(ty)
 			self.state.scopes.pop()
-			slots.push(.Some(Arm(pattern: move pattern, guard: guard, body: body, span: arm.span)))
+			slots.push(.Some(Arm(pattern: pattern, guard: guard, body: body, span: arm.span)))
 		}
 		for (at, bindings, pattern, guard) in move waiting {
 			val arm = &arms[at]
-			self.state.scopes.push(move bindings)
+			self.state.scopes.push(bindings)
 			val body = match result {
 				.Some(t) => self.check(arm.body, t)
 				.None => self.infer(arm.body, .None)
@@ -223,16 +223,16 @@ extend Lowerer {
 			val ty = self.tyOf(body)
 			if result.isNone() && ty != NEVER then result = .Some(ty)
 			self.state.scopes.pop()
-			slots[at] = .Some(Arm(pattern: move pattern, guard: guard, body: body, span: arm.span))
+			slots[at] = .Some(Arm(pattern: pattern, guard: guard, body: body, span: arm.span))
 		}
 		var hirArms: Vec<Arm> = Vec()
 		for slot in move slots {
 			val .Some(arm) = move slot else panic("every arm is checked")
-			hirArms.push(move arm)
+			hirArms.push(arm)
 		}
 		self.exhaustiveness(scrutTy, file.exprs[scrutinee].span, &arms, &hirArms)
 		val ty = result.unwrapOr(NEVER)
-		return self.alloc(.Match(scrutinee: scrut, arms: move hirArms), ty, span)
+		return self.alloc(.Match(scrutinee: scrut, arms: hirArms), ty, span)
 	}
 
 	/// A tuple matched where its elements are: each element checked as a
@@ -256,22 +256,8 @@ extend Lowerer {
 		for id in lowered {
 			tys.push(self.tyOf(id))
 		}
-		// The prelude's tuple, found as a tuple pattern finds it: in the module
-		// being lowered first, which is where it is while the prelude itself
-		// is.
-		val name = Symbol::tuple(tys.len())
-		val declared: Option<TypeDef> = match self.types().get(&name) {
-			.Some((def, _)) => .Some(def)
-			.None => self.preludeType(name)
-		}
-		val ty = match declared {
-			.Some(.Struct(id)) => {
-				val list = self.program.types.internList(&tys)
-				self.intern(.Struct(id: id, args: list))
-			}
-			_ => ERROR
-		}
-		return (self.alloc(.Places(move lowered), ty, span), .Some(move binds))
+		val ty = self.tupleType(&tys)
+		return (self.alloc(.Places(lowered), ty, span), .Some(binds))
 	}
 
 	/// An arm's pattern on a tuple matched in place: a tuple pattern, whose
@@ -298,17 +284,17 @@ extend Lowerer {
 			Pattern::Error
 		}
 		.Parens(..) => {
-			self.state.placeBinds = .Some(move elementBinds)
+			self.state.placeBinds = .Some(elementBinds)
 			val lowered = self.pattern(&pattern, scrutTy, binds)
 			self.state.placeBinds = .None
-			move lowered
+			lowered
 		}
 		// Tuples of which any one may match: each is matched where the
 		// elements are, as one alone would be.
 		.Any(alternatives) => {
 			val how = Alternative::Places(
 				scrutTy: scrutTy,
-				elementBinds: move elementBinds,
+				elementBinds: elementBinds,
 				binds: binds,
 			)
 			self.anyPattern(&alternatives, &how)
@@ -335,13 +321,13 @@ extend Lowerer {
 			val top = self.state.alternatives.len() - 1
 			val bound = mem::replace(&var self.state.alternatives[top].bound, Map())
 			match self.state.alternatives[top].first.clone() {
-				.None => self.state.alternatives[top].first = .Some(move bound)
+				.None => self.state.alternatives[top].first = .Some(bound)
 				.Some(earlier) => {
 					if !patternHasError(&pattern) then
 						self.alternativeDiffers(&earlier, &bound, alternative.span)
 				}
 			}
-			lowered.push(move pattern)
+			lowered.push(pattern)
 		}
 		val done = self.state.alternatives.pop().unwrap()
 		val bindsNames = match done.first {
@@ -353,7 +339,7 @@ extend Lowerer {
 			binding = .Some(self.state.bindingAlternatives)
 			self.state.bindingAlternatives += 1
 		}
-		return .Any(alternatives: move lowered, binding: binding)
+		return .Any(alternatives: lowered, binding: binding)
 	}
 
 	/// The kind of reference the bindings of a pattern on `scrut` are:
@@ -373,6 +359,7 @@ extend Lowerer {
 		inCondition: bool,
 		span: Span,
 	): ExprId = {
+		self.takenApart(scrutinee)
 		val scrut = self.operand(scrutinee, .None)
 		val scrutTy = self.tyOf(scrut)
 		val alias = self.aliasKind(scrut)
@@ -406,11 +393,11 @@ extend Lowerer {
 			if outside && !patternHasError(&lowered) {
 				val (sym, at) = names[0]
 				val diagnostic = self.unseenBinding(sym, at)
-				self.report(move diagnostic)
+				self.report(diagnostic)
 			}
-			move lowered
+			lowered
 		}
-		return self.alloc(.Is(scrutinee: scrut, pattern: move tested), BOOL, span)
+		return self.alloc(.Is(scrutinee: scrut, pattern: tested), BOOL, span)
 	}
 
 	/// Reports an `is` test whose pattern matches every value, with what to
@@ -444,6 +431,7 @@ extend Lowerer {
 		value: ast::ExprId,
 		elseBlock: Option<&ast::Block>,
 	): StmtKind = {
+		self.takenApart(value)
 		val scrut = self.operand(value, .None)
 		val scrutTy = self.tyOf(scrut)
 		// A variable aliases nothing: it holds its part, as `var x = …` holds
@@ -466,7 +454,7 @@ extend Lowerer {
 					),
 				)
 			}
-			elseHir = .Some(move checked)
+			elseHir = .Some(checked)
 		}
 		// A binding of plain data takes a copy, so the place it came from stays
 		// free for the rest of the block.
@@ -478,7 +466,7 @@ extend Lowerer {
 			variables: mutable,
 		)
 		val lowered = self.pattern(&pattern, scrutTy, binds)
-		if mutable then self.variablesTake(&lowered, scrut)
+		if mutable then self.variablesTake(&lowered, scrut, value)
 		// A pattern that leaves nothing out always matches, so an `else` beside
 		// it never runs, and one that can fail has no path to take without it.
 		val irrefutable = self.alwaysMatches(&lowered, scrutTy)
@@ -504,7 +492,7 @@ extend Lowerer {
 				),
 			)
 		}
-		return .Guard(scrutinee: scrut, pattern: move lowered, elseBlock: move elseHir)
+		return .Guard(scrutinee: scrut, pattern: lowered, elseBlock: elseHir)
 	}
 
 	/// The condition of an `if` or a `while`. An `is` test in it, alone or
@@ -538,7 +526,7 @@ extend Lowerer {
 			self.namesOf(&pattern, &var names)
 			if !names.isEmpty() {
 				val diagnostic = self.unseenBinding(names[0].0, names[0].1)
-				self.report(move diagnostic)
+				self.report(diagnostic)
 			}
 		}
 		self.state.scopes.push(Map())
@@ -549,7 +537,7 @@ extend Lowerer {
 		val no = self.alloc(.Bool(false), BOOL, span)
 		val elseBlock = Block(stmts: Vec(), value: .Some(no), span: span)
 		return self.alloc(
-			.If(cond: cond, thenBlock: move thenBlock, elseBlock: .Some(move elseBlock)),
+			.If(cond: cond, thenBlock: thenBlock, elseBlock: .Some(elseBlock)),
 			BOOL,
 			span,
 		)
@@ -672,7 +660,7 @@ extend Lowerer {
 				)
 				return .Error
 			}
-			move lowered
+			lowered
 		}
 	}
 
@@ -697,7 +685,7 @@ extend Lowerer {
 	/// would: `.Yellow`, `.Round(_)`.
 	fn missingVariants(scrutTy: Ty, matrix: &[Vec<Shape>]): Vec<String> = {
 		var missing: Vec<String> = Vec()
-		val .Enum(id, ..) = self.kind(scrutTy) else return move missing
+		val .Enum(id, ..) = self.kind(scrutTy) else return missing
 		val variants = self.program.enums[id].variants.len()
 		for variant in 0..variants {
 			val fields = self.program.enums[id].variants[variant].fields.len()
@@ -705,11 +693,11 @@ extend Lowerer {
 			for _ in 0..fields {
 				wilds.push(.Wild)
 			}
-			val row = Vec::of(own [Shape::Ctor(ctor: .Variant(variant as u32), fields: move wilds)])
+			val row = Vec::of(own [Shape::Ctor(ctor: .Variant(variant as u32), fields: wilds)])
 			if useful(&self.program, &matrix, &row, [scrutTy]) is .Some(witness) then
 				missing.push(witness.text(&self.program, scrutTy, self.interner))
 		}
-		return move missing
+		return missing
 	}
 
 	/// Whether a pattern matches every value of its type: nothing is left for
@@ -717,7 +705,7 @@ extend Lowerer {
 	fn alwaysMatches(pattern: &Pattern, ty: Ty): bool = {
 		if self.isPoisoned(ty) || pattern is .Error then return true
 		val row = Vec::of(own [Shape::of(&self.program, &pattern, ty)])
-		return useful(&self.program, [move row], [Shape::Wild], [ty]).isNone()
+		return useful(&self.program, [row], [Shape::Wild], [ty]).isNone()
 	}
 
 	/// A pattern where a field name could stand, in a pattern whose type has
@@ -1086,37 +1074,22 @@ extend Lowerer {
 		return binds.copy && !self.isPoisoned(ty) && !self.owns(ty) && !self.program.holdsView(ty)
 	}
 
-	/// A `var` pattern on a place copies its parts out, so a part that owns
-	/// memory, which is never copied, needs the place to give the value up
-	/// with `move`, as `var x = place` does.
-	var fn variablesTake(pattern: &Pattern, scrut: ExprId) = {
-		if !self.rootsInLocal(scrut) then return
+	/// A `var` pattern on a place copies its parts out, and a part that owns
+	/// memory, which is never copied, is given up by the place: it is moved,
+	/// as `var x = place` moves it. A `move` written there is that move, and
+	/// E0451; where nothing it binds owns memory, it is the only move.
+	var fn variablesTake(pattern: &Pattern, scrut: ExprId, value: ast::ExprId) = {
 		var locals: Vec<LocalId> = Vec()
 		pattern.locals(&var locals)
-		var owning: Option<LocalId> = .None
+		var owning = false
 		for local in locals {
 			val ty = self.state.body.locals[local].ty
-			if owning.isNone() && !self.isPoisoned(ty) && self.owns(ty) then owning = .Some(local)
+			if !self.isPoisoned(ty) && self.owns(ty) then owning = true
 		}
-		val .Some(local) = owning else return
-		val name = String::of(self.text(self.state.body.locals[local].name))
-		val span = self.state.body.locals[local].span
-		val ty = self.state.body.locals[local].ty
-		val scrutSpan = self.state.body.exprs[scrut].span
-		self.report(
-			Diagnostic::error(
-				CANNOT_COPY_OWN,
-				"`\(name)` would hold a copy of a \(self.tyName(ty))",
-				span,
-				"owns memory, so it is never copied",
-			).withSecondary(scrutSpan, "a place, which keeps its value").
-				withNote(
-					"the names of a `var` pattern are variables of their own, which hold their parts; a place gives its value up to them with `move`",
-				).
-				withFix("to take the value apart, move it", own [
-					Edit::insert(scrutSpan.lo, "move "),
-				]),
-		)
+		if !owning then return
+		if self.rootsInLocal(scrut) then self.state.body.moveAt(scrut)
+		if self.ast.exprs[value].kind is .Unary(op: .Move, operand, ..) then
+			self.reportInferredMove(self.ast.exprs[value].span, self.ast.exprs[operand].span)
 	}
 
 	/// Declares a binding of a value of type `ty`: an alias for it, a
@@ -1169,7 +1142,7 @@ extend Lowerer {
 			through.alias = .Some(alias)
 			val tested = self.pattern(&pattern, referent, through)
 			if tested is .Error then return .Error
-			return .Deref(own move tested)
+			return .Deref(own tested)
 		}
 		return match pattern.kind {
 			.Wildcard => .Wildcard
@@ -1293,7 +1266,7 @@ extend Lowerer {
 		if move wrong is .Some((at, message, label)) {
 			if !self.isPoisoned(scrutTy) then
 				self.report(
-					Diagnostic::error(INVALID_PATTERN, move message, at, label).withNote(
+					Diagnostic::error(INVALID_PATTERN, message, at, label).withNote(
 						"a tuple is taken apart by position, `(first, second)`; a struct by its fields' names, `(x: across, ..)`",
 					),
 				)
@@ -1398,12 +1371,7 @@ extend Lowerer {
 				if isVariant then String::of("variant pattern is missing its enum")
 				else "cannot find a struct named `\(text)`"
 			self.report(
-				Diagnostic::error(
-					INVALID_PATTERN,
-					move message,
-					span,
-					"write `.\(text)(…)` to match a variant",
-				).withFix(
+				Diagnostic::error(INVALID_PATTERN, message, span, "write `.\(text)(…)` to match a variant").withFix(
 					"match the variant `.\(text)`",
 					own [Edit::insert(name.span.lo, ".")],
 				).withNote(
@@ -1504,7 +1472,7 @@ extend Lowerer {
 			)
 			if rename is .Some((field, wanted)) then
 				diagnostic = diagnostic.withHelp("to bind one name from each, rename: `\(self.text(field)): \(self.text(wanted))`")
-			self.report(move diagnostic)
+			self.report(diagnostic)
 		}
 		var missing: Vec<(Symbol, Span)> = Vec()
 		for i in 0..first.len() {
@@ -1605,7 +1573,7 @@ extend Lowerer {
 				.Pattern(p) => match self.pattern(&p, elem, binds) {
 					.Wildcard => .Ignored
 					.Binding(local) => .Bind(local)
-					other => .Nested(move other)
+					other => .Nested(other)
 				}
 				// A constant's name after `..`: the elements below it.
 				.Rest(name, span: at) => {
@@ -1617,10 +1585,10 @@ extend Lowerer {
 						val bound = ast::RangeBound(kind: .Const(Vec::of(own [n])), span: n.span)
 						self.rangePattern(.None, .Some(&bound), false, elem, at)
 					}
-					.Nested(move range)
+					.Nested(range)
 				}
 			}
-			if rest.isSome() then after.push(move binder) else before.push(move binder)
+			if rest.isSome() then after.push(binder) else before.push(binder)
 		}
 		val named = before.len() + after.len()
 		if len is .Some(count) {
@@ -1635,11 +1603,11 @@ extend Lowerer {
 				).withNote("the value being matched has type \(self.tyName(scrutTy))")
 				if rest.isNone() && (named as u64) < count then
 					diagnostic = diagnostic.withHelp("to match the first \(named) and pass over the rest, end it with `..`")
-				self.report(move diagnostic)
+				self.report(diagnostic)
 				return .Error
 			}
 		}
-		return .Slice(prefix: move before, rest: move rest, suffix: move after)
+		return .Slice(prefix: before, rest: move rest, suffix: after)
 	}
 
 	/// Declares a slice pattern's names as errors, so that what follows
@@ -1689,7 +1657,7 @@ extend Lowerer {
 			diagnostic = diagnostic.withHelp(
 				"match the elements it lends: `match value.items() { … }`",
 			)
-		self.report(move diagnostic)
+		self.report(diagnostic)
 	}
 
 	/// `..rest` in a slice pattern: the elements between, as a slice of where
@@ -1770,7 +1738,7 @@ extend Lowerer {
 			}
 			diagnostic = diagnostic.withNote("the fields are \(names.join(", "))")
 		}
-		self.report(move diagnostic)
+		self.report(diagnostic)
 	}
 
 	/// The fields a pattern without `..` leaves unnamed, reported.
@@ -1870,7 +1838,7 @@ extend Lowerer {
 		if !fields.rest && !failed && self.reportUnnamedFields(&path, &defs, &bound, span) then
 			failed = true
 		if failed then return .Error
-		return .Fields(move locals)
+		return .Fields(locals)
 	}
 
 	var fn variantPattern(
@@ -1919,7 +1887,7 @@ extend Lowerer {
 				diagnostic = diagnostic.withFix("remove the parentheses", own [
 					Edit::replace(parens, String()),
 				])
-			self.report(move diagnostic)
+			self.report(diagnostic)
 			return self.bindersFailed(fields.binders)
 		}
 		// Binders name their fields, in any order.
@@ -1965,7 +1933,7 @@ extend Lowerer {
 		if !fields.rest && !failed && self.reportUnnamedFields(&path, &defs, &bound, span) then
 			failed = true
 		if failed then return .Error
-		return .Variant(variant: index, binders: move locals)
+		return .Variant(variant: index, binders: locals)
 	}
 
 	/// Whether the arms cover every value, and whether each can be reached:
@@ -1996,7 +1964,7 @@ extend Lowerer {
 				)
 			// An arm with a guard may not match, whatever its pattern, so it
 			// covers nothing.
-			if arm.guard.isNone() then matrix.push(move row)
+			if arm.guard.isNone() then matrix.push(row)
 		}
 		if hasError then return
 		val .Some(witness) = useful(&self.program, &matrix, [Shape::Wild], [scrutTy]) else return
@@ -2120,7 +2088,7 @@ extend Lowerer {
 		for id in reads {
 			val .Deref(inner) = self.state.body.exprs[id].kind else continue
 			val local = self.state.body.exprs[inner].kind.clone()
-			self.state.body.exprs[id].kind = move local
+			self.state.body.exprs[id].kind = local
 		}
 		for local in copies {
 			if self.kind(self.state.body.locals[local].ty) is .Ref(inner: value, ..) then

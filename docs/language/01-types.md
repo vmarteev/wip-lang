@@ -650,7 +650,7 @@ struct Pool<T, K = T> {
 
 extend Pool<T, K> {
     var fn add(value: T): Tag<K> keeps value = {
-        self.items.push(move value)
+        self.items.push(value)
         return Tag(self.items.len())
     }
 }
@@ -670,6 +670,51 @@ fn main() = {
 
 A function has no defaults: its type arguments are inferred where it is
 called. An `extend` block names every parameter, defaults too.
+
+An empty container, or a `.None`, says nothing of what it will hold. A
+`val` or a `var` whose value leaves type arguments open takes them from
+the first place after it that names it: a method called on it, whose
+arguments say them as a generic function's arguments say its own; the type
+expected there, of an argument, a field or a `return`; or a value assigned
+to it. A parameter that place leaves open takes its default. The type is
+then what it would be had it been written, and the language server shows
+it:
+
+```wip,run
+import std::collections::{Map}
+
+struct Hit {
+    at: f64
+}
+
+fn main() = {
+    var small = Vec()
+    var large = Vec()
+    for n in 0..5 {
+        if n < 2 then small.push(n) else large.push(n * 10) // Vec<i64>
+    }
+    var counts = Map()
+    counts.put("one", 1) // Map<str, i64>
+    var nearest = .None
+    nearest = .Some(Hit(at: 2.5)) // Option<Hit>
+    assert(small.len() == 2 && large.len() == 3 && counts.len() == 1)
+    assert(nearest.isSome())
+}
+```
+
+The first place must say them. A test, a walk, or a method whose arguments
+say nothing of them — `len()`, `isEmpty()` — is an error there, and the type
+is written where the variable is declared, which is also where a reader
+looks for it when the next line does not say it:
+
+```wip,error=E0315
+fn main() = {
+    var sizes = Vec()
+    if sizes.isEmpty() { // nothing says what it holds
+        sizes.push(1)
+    }
+}
+```
 
 ## `own<T>` and views
 

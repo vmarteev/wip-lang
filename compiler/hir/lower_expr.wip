@@ -12,6 +12,7 @@ import syntax::{
 	INTEGER_OUT_OF_RANGE,
 	INVALID_CAST,
 	INVALID_OPERANDS,
+	MOVE_INFERRED,
 	MOVE_NOT_A_PLACE,
 	NOT_A_VALUE,
 	NULL_WITHOUT_TYPE,
@@ -40,7 +41,19 @@ fn onlyOne(tys: &[Ty]): Option<Ty> = if tys.len() == 1 then .Some(tys[0]) else .
 fn comparison(op: BinaryOp): bool = op is .Eq | .Ne | .Lt | .Le | .Gt | .Ge
 
 extend Lowerer {
+	/// An expression checked already, ahead of where it is written: for the
+	/// type it says of the parts beside it, or of the variable a method is
+	/// called on.
+	var fn checkedEarly(id: ast::ExprId): Option<ExprId> = {
+		if self.state.early.isEmpty() then return .None
+		val checked = self.state.early.get(&id)?
+		val done = checked
+		self.state.early.remove(&id)
+		return .Some(done)
+	}
+
 	var fn infer(id: ast::ExprId, hint: Option<Ty>): ExprId = {
+		if self.checkedEarly(id) is .Some(checked) then return checked
 		val file = self.ast
 		val expr = &file.exprs[id]
 		val span = expr.span
@@ -52,9 +65,9 @@ extend Lowerer {
 			}
 			.Block(block) => {
 				val (checked, ty) = self.checkBlock(&block, hint)
-				self.alloc(.Block(move checked), ty, span)
+				self.alloc(.Block(checked), ty, span)
 			}
-			.If(cond, thenBlock, elseBranch) => self.ifExpr(
+			.If(cond, thenBlock, elseBranch, ..) => self.ifExpr(
 				cond,
 				&thenBlock,
 				elseBranch,
@@ -241,7 +254,7 @@ extend Lowerer {
 			if negative && !t.signed() then "`\(name)` is unsigned, so it has no negative values"
 			else if t.signed() then "`\(name)` holds -\(t.minMagnitude()) to \(t.max())"
 			else "`\(name)` holds 0 to \(t.max())"
-		self.report(diagnostic.withNote(move note))
+		self.report(diagnostic.withNote(note))
 		return 0
 	}
 
@@ -364,6 +377,15 @@ extend Lowerer {
 
 	var fn name(sym: Symbol, hint: Option<Ty>, span: Span): ExprId = {
 		if self.lookup(sym) is .Some(local) {
+			// The first use of a local waiting for its type: what is expected
+			// here says it.
+			if !self.state.pendingLocals.isEmpty() && self.state.pendingLocals.contains(&local) {
+				val found = match hint {
+					.Some(h) => self.underRefs(h)
+					.None => ERROR
+				}
+				self.decide(local, found, span)
+			}
 			val ty = self.state.body.locals[local].ty
 			val e = self.alloc(.Local(local), ty, span)
 			return self.referent(e, hint, span)
@@ -425,14 +447,14 @@ extend Lowerer {
 					"type used as a value",
 				)
 				match def {
-					.Builtin(_) => move d
+					.Builtin(_) => d
 					.Enum(_) => d.withHelp("enum variants are written `\(text)::Variant`")
-					.Struct(_) => d.withHelp("to construct one, write `\(text) { … }`")
+					.Struct(_) => d.withHelp("to construct one, write `\(text)(…)`")
 				}
 			}
 			.None => self.unknownName(sym, span)
 		}
-		self.report(move diagnostic)
+		self.report(diagnostic)
 		return self.errorExpr(span)
 	}
 
@@ -454,13 +476,13 @@ extend Lowerer {
 			span,
 			"not found",
 		)
-		if leftThePrelude(text) is .Some(help) then return diagnostic.withHelp(move help)
+		if leftThePrelude(text) is .Some(help) then return diagnostic.withHelp(help)
 		return match suggest(text, &candidates) {
 			.Some(similar) => diagnostic.withFix(
 				"a name with a similar spelling exists: `\(similar)`",
 				own [Edit::replace(span, similar)],
 			)
-			.None => move diagnostic
+			.None => diagnostic
 		}
 	}
 
@@ -475,14 +497,15 @@ extend Lowerer {
 		// `[a, if c { b }]`: an element that is no value.
 		for e in elems {
 			if file.exprs[e].kind is .If(..) && lacksElse(&file, e) {
-				self.addsNothing(file.exprs[e].span)
+				self.addsNothing(file.exprs[e].span, chainWord(&file, e))
 				return self.errorExpr(span)
 			}
 		}
 		// An array is expected, or a slice it becomes: kept, as `own<[View]>`
 		// takes `own [.Text(…), .Space()]`, or lent, as `&[str]` takes `["q",
-		// "Q"]`.
-		val elemHint = self.elementHint(hint)
+		// "Q"]`. Where nothing is, tuples say their type a position at a time.
+		var elemHint = self.elementHint(hint)
+		if elemHint.isNone() && elems.len() > 1 then elemHint = self.tuplesBeside(elems)
 		if elems.isEmpty() {
 			val .Some(elem) = elemHint else {
 				self.report(
@@ -523,12 +546,72 @@ extend Lowerer {
 			checked.push(if i == deciding then first else self.arrayElement(elems[i], elem))
 		}
 		val ty = self.intern(.Array(elem: elem, len: elems.len() as u64))
-		return self.alloc(.Array(move checked), ty, span)
+		return self.alloc(.Array(checked), ty, span)
 	}
 
 	/// An element of an array that holds `elem`: where that is a reference,
 	/// a slice read through one is that reference, as it is where nothing is
 	/// expected.
+	/// The type of `parts`, where each is a tuple literal of one length: a
+	/// position at a time, the type of the first part there that says its
+	/// own, so that a literal before it takes it — `[(0.0, x), (y, 1.0)]` —
+	/// and a position of tuples worked out the same way. The part that
+	/// decides is checked here, and kept for where its tuple is checked.
+	/// Nothing where the parts are not such tuples.
+	var fn tuplesBeside(parts: &[ast::ExprId]): Option<Ty> = {
+		val file = self.ast
+		val .Some(first) = tupleWritten(&file, parts[0]) else return .None
+		val length = first.len()
+		for part in parts {
+			val .Some(inside) = tupleWritten(&file, part) else return .None
+			if inside.len() != length then return .None
+		}
+		var tys: Vec<Ty> = Vec()
+		for position in 0..length {
+			var column: Vec<ast::ExprId> = Vec()
+			for part in parts {
+				column.push(tupleWritten(&file, part).unwrap()[position])
+			}
+			tys.push(self.columnType(&column))
+		}
+		return .Some(self.tupleType(&tys))
+	}
+
+	/// The type the parts in one position of an array's tuples have: their
+	/// tuples' where they are tuples, or that of the first that says its own,
+	/// or of the first alone where none does, checked here and kept.
+	var fn columnType(parts: &[ast::ExprId]): Ty = {
+		if self.tuplesBeside(parts) is .Some(ty) then return ty
+		var deciding = parts[0]
+		for part in parts {
+			if tupleWritten(self.ast, part).isNone() && !self.takesTypeBeside(part) {
+				deciding = part
+				break
+			}
+		}
+		val checked = self.infer(deciding, .None)
+		self.state.early.put(deciding, checked)
+		return self.tyOf(checked)
+	}
+
+	/// The prelude's tuple of `tys`, found as a tuple pattern finds it: in
+	/// the module being lowered first, which is where it is while the
+	/// prelude itself is.
+	var fn tupleType(tys: &[Ty]): Ty = {
+		val name = Symbol::tuple(tys.len())
+		val declared: Option<TypeDef> = match self.types().get(&name) {
+			.Some((def, _)) => .Some(def)
+			.None => self.preludeType(name)
+		}
+		return match declared {
+			.Some(.Struct(id)) => {
+				val list = self.program.types.internList(&tys)
+				self.intern(.Struct(id: id, args: list))
+			}
+			_ => ERROR
+		}
+	}
+
 	var fn arrayElement(e: ast::ExprId, elem: Ty): ExprId = {
 		val inferred = self.infer(e, .Some(elem))
 		val kept =
@@ -609,8 +692,8 @@ extend Lowerer {
 						span,
 						"`-` needs a number",
 					)
-					diagnostic = self.operatorHint(move diagnostic, ty, "Negate", "negates")
-					self.report(move diagnostic)
+					diagnostic = self.operatorHint(diagnostic, ty, "Negate", "negates")
+					self.report(diagnostic)
 				}
 				self.errorExpr(span)
 			}
@@ -630,8 +713,8 @@ extend Lowerer {
 						span,
 						"`!` needs a `bool` or an integer",
 					)
-					diagnostic = self.operatorHint(move diagnostic, ty, "Not", "answers `!`")
-					self.report(move diagnostic)
+					diagnostic = self.operatorHint(diagnostic, ty, "Not", "answers `!`")
+					self.report(diagnostic)
 				}
 				self.errorExpr(span)
 			}
@@ -648,10 +731,56 @@ extend Lowerer {
 							"a temporary value",
 						).withHelp("a temporary is already moved where it is used; remove `move`"),
 					)
-				self.noMoveOutOfDrop(e, span)
+				if !self.noMoveOutOfDrop(e, span) then self.inferredMove(operand, e, span)
 				self.alloc(.Move(e), ty, span)
 			}
 			.Own => self.ownExpr(operand, hint, span)
+		}
+	}
+
+	/// Warns of a `move` written on a place that owns memory, used as a
+	/// value, where it is moved anyway (E0451). Where a `match`, an `is`, a
+	/// `for` or a `val` pattern takes the value, `move` says to take it
+	/// apart, and is no such thing.
+	var fn inferredMove(operand: ast::ExprId, place: ExprId, span: Span) = {
+		if self.state.taking.remove(&operand) then return
+		val ty = self.tyOf(place)
+		if self.isPoisoned(ty) || !self.owns(ty) || !self.state.body.isPlace(place) then return
+		self.reportInferredMove(span, self.state.body.exprs[place].span)
+	}
+
+	/// E0451 for the `move` at `span`, before the place at `inner`.
+	var fn reportInferredMove(span: Span, inner: Span) = {
+		// One the parser wrote for what a line says, as for an interpolated
+		// string, has no word of its own.
+		if inner.lo < span.lo + 4 then return
+		self.report(
+			Diagnostic::warning(
+				MOVE_INFERRED,
+				"`move` is not needed here",
+				Span::new(span.lo, span.lo + 4),
+				"moved where it is used, written or not",
+			).withFix("remove `move`", own [
+				Edit::replace(Span::new(span.lo, inner.lo), ""),
+			]).withNote(
+				"a place that owns memory, used as a value, is given away there; `move` is written where a `match`, an `is`, a `for` or a `val` pattern would look into the place, to take it apart",
+			),
+		)
+	}
+
+	/// Marks the value a `match`, an `is`, a `for` or a `val` pattern takes:
+	/// a `move` written there takes it apart, where the place alone would be
+	/// looked into. Each element of a tuple written there is such a value.
+	var fn takenApart(value: ast::ExprId) = {
+		match self.ast.exprs[value].kind {
+			.Unary(op: .Move, operand, ..) => self.state.taking.add(operand)
+			.Paren(inner) => self.takenApart(inner)
+			_ => {}
+		}
+		if tupleWritten(self.ast, value) is .Some(elements) {
+			for element in elements {
+				self.takenApart(element)
+			}
 		}
 	}
 
@@ -989,7 +1118,7 @@ extend Lowerer {
 	/// The help for an operator a type of a program's own does not answer:
 	/// the block that would make it.
 	fn operatorHint(diagnostic: Diagnostic, ty: Ty, interfaceName: str, what: str): Diagnostic = {
-		if self.kind(ty) !is .Struct(..) | .Enum(..) then return move diagnostic
+		if self.kind(ty) !is .Struct(..) | .Enum(..) then return diagnostic
 		val name = self.tyName(ty)
 		return diagnostic.withHelp("a type \(what) by `extend \(name.toStr().trimMatches("`")): \(interfaceName)`")
 	}
@@ -1072,16 +1201,16 @@ extend Lowerer {
 	/// which say what a number written there is.
 	var fn operatorRhsTys(which: KnownInterface, lt: Ty): Vec<Ty> = {
 		var found: Vec<Ty> = Vec()
-		val .Some(interfaceId) = self.program.preludeItems.interfaceOf(which) else return move found
+		val .Some(interfaceId) = self.program.preludeItems.interfaceOf(which) else return found
 		if self.kind(lt) is .Param(param) {
-			if param.index as i64 >= self.typeParams.len() then return move found
+			if param.index as i64 >= self.typeParams.len() then return found
 			for c in self.typeParams[param.index as i64].interfaces {
 				val list = self.program.types.list(c.args)
 				if c.interfaceId == interfaceId && !list.isEmpty() then found.push(list[0])
 			}
-			return move found
+			return found
 		}
-		val .Some(owner) = self.ownerOf(lt) else return move found
+		val .Some(owner) = self.ownerOf(lt) else return found
 		val ownerArgs = self.ownerArgs(lt)
 		for at in 0..self.program.impls.len() {
 			if self.program.impls[at].interfaceId != interfaceId ||
@@ -1091,7 +1220,7 @@ extend Lowerer {
 			val list = self.program.types.list(self.program.impls[at].args).toVec()
 			if !list.isEmpty() then found.push(self.program.types.subst(list[0], &ownerArgs))
 		}
-		return move found
+		return found
 	}
 
 	/// The left sides whose implementations of an operator take `rt` on the
@@ -1099,7 +1228,7 @@ extend Lowerer {
 	/// type of a program's own is, `2.0 * v`.
 	var fn operatorLhsBuiltins(which: KnownInterface, rt: Ty): Vec<Ty> = {
 		var tys: Vec<Ty> = Vec()
-		val .Some(interfaceId) = self.program.preludeItems.interfaceOf(which) else return move tys
+		val .Some(interfaceId) = self.program.preludeItems.interfaceOf(which) else return tys
 		var owners: Vec<TypeDef> = Vec()
 		for i in self.program.impls {
 			val list = self.program.types.list(i.args)
@@ -1113,7 +1242,7 @@ extend Lowerer {
 		for owner in owners {
 			tys.push(self.ownSelfTy(owner))
 		}
-		return move tys
+		return tys
 	}
 
 	/// `a op b` as the call of the implementation `operatorImpl` found, with
@@ -1229,43 +1358,48 @@ extend Lowerer {
 		val allowed = self.operatorApplies(op, lt)
 		val lspan = self.state.body.exprs[l].span
 		val rspan = self.state.body.exprs[r].span
-		var diagnostic = if lt != rt && (self.declaredType(lt) || self.declaredType(rt)) {
+		var diagnostic = when {
 			// A type of a program's own on either side: no implementation takes
 			// the two.
-			Diagnostic::error(
+			lt != rt && (self.declaredType(lt) || self.declaredType(rt)) => Diagnostic::error(
 				INVALID_OPERANDS,
 				"cannot apply `\(text)` to \(self.tyName(lt)) and \(self.tyName(rt))",
 				opSpan,
 				"no implementation takes these two",
 			)
-		} else if lt != rt && allowed {
-			val d = Diagnostic::error(
-				INVALID_OPERANDS,
-				"cannot apply `\(text)` to \(self.tyName(lt)) and \(self.tyName(rt))",
-				opSpan,
-				"operands of different types",
-			).withNote("Wip has no implicit numeric conversions")
-			// An integer literal next to a float was almost certainly meant as a
-			// float literal.
-			if self.program.types.isFloat(lt) && self.state.body.exprs[r].kind is .Int(..) then
-				d.withFix("use a float literal", own [Edit::insert(rspan.hi, ".0")])
-			else if self.program.types.isFloat(rt) && self.state.body.exprs[l].kind is .Int(..) then
-				d.withFix("use a float literal", own [Edit::insert(lspan.hi, ".0")])
-			else move d
-		} else {
-			val what = match op {
-				.Rem => "`%` needs integer operands"
-				.BitAnd | .BitOr | .BitXor | .Shl | .Shr =>
-					"bitwise operators need integer operands"
-				.Eq | .Ne => "`==` and `!=` compare numbers or `bool`"
-				_ => "arithmetic and ordering need numbers"
+			lt != rt && allowed => {
+				val d = Diagnostic::error(
+					INVALID_OPERANDS,
+					"cannot apply `\(text)` to \(self.tyName(lt)) and \(self.tyName(rt))",
+					opSpan,
+					"operands of different types",
+				).withNote("Wip has no implicit numeric conversions")
+				// An integer literal next to a float was almost certainly meant as a
+				// float literal.
+				if self.program.types.isFloat(lt) && self.state.body.exprs[r].kind is .Int(..) {
+					d.withFix("use a float literal", own [Edit::insert(rspan.hi, ".0")])
+				} else if self.program.types.isFloat(rt) &&
+					self.state.body.exprs[l].kind is .Int(..) {
+					d.withFix("use a float literal", own [Edit::insert(lspan.hi, ".0")])
+				} else {
+					d
+				}
 			}
-			Diagnostic::error(
-				INVALID_OPERANDS,
-				"cannot apply `\(text)` to \(self.tyName(lt))",
-				opSpan,
-				what,
-			)
+			else => {
+				val what = match op {
+					.Rem => "`%` needs integer operands"
+					.BitAnd | .BitOr | .BitXor | .Shl | .Shr =>
+						"bitwise operators need integer operands"
+					.Eq | .Ne => "`==` and `!=` compare numbers or `bool`"
+					_ => "arithmetic and ordering need numbers"
+				}
+				Diagnostic::error(
+					INVALID_OPERANDS,
+					"cannot apply `\(text)` to \(self.tyName(lt))",
+					opSpan,
+					what,
+				)
+			}
 		}
 		diagnostic = diagnostic.withSecondary(lspan, self.tyName(lt)).withSecondary(
 			rspan,
@@ -1282,18 +1416,20 @@ extend Lowerer {
 				.Div => "divides"
 				_ => "answers `%`"
 			}
-			if lt == rt {
-				diagnostic = self.operatorHint(move diagnostic, lt, known.name(), verb)
-			} else if self.declaredType(lt) {
-				val other = self.tyName(rt)
-				val writtenName = "\(known.name())<\(other.toStr().trimMatches("`"))>"
-				diagnostic = self.operatorHint(move diagnostic, lt, &writtenName, verb)
-			} else if self.declaredType(rt) {
-				val numberName = self.tyName(lt)
-				val otherName = self.tyName(rt)
-				val number = numberName.toStr().trimMatches("`")
-				val other = otherName.toStr().trimMatches("`")
-				diagnostic = diagnostic.withHelp("a number \(verb) a `\(other)` by `extend \(number): \(known.name())<\(other), …>`, written in the module of `\(other)`")
+			when {
+				lt == rt => diagnostic = self.operatorHint(diagnostic, lt, known.name(), verb)
+				self.declaredType(lt) => {
+					val other = self.tyName(rt)
+					val writtenName = "\(known.name())<\(other.toStr().trimMatches("`"))>"
+					diagnostic = self.operatorHint(diagnostic, lt, &writtenName, verb)
+				}
+				self.declaredType(rt) => {
+					val numberName = self.tyName(lt)
+					val otherName = self.tyName(rt)
+					val number = numberName.toStr().trimMatches("`")
+					val other = otherName.toStr().trimMatches("`")
+					diagnostic = diagnostic.withHelp("a number \(verb) a `\(other)` by `extend \(number): \(known.name())<\(other), …>`, written in the module of `\(other)`")
+				}
 			}
 		}
 		// On `bool`, `&` and `|` were almost certainly meant as `&&` and `||`.
@@ -1306,7 +1442,7 @@ extend Lowerer {
 					Edit::replace(opSpan, "||"),
 				])
 				.BitXor => diagnostic.withHelp("for `bool`, `!=` is exclusive or")
-				_ => move diagnostic
+				_ => diagnostic
 			}
 		// A type that does implement the interface, but only for type
 		// arguments that do themselves, is told which argument does not:
@@ -1320,44 +1456,49 @@ extend Lowerer {
 		if lt == rt && wanted is .Some(interfaceId) {
 			val constraint = Constraint(interfaceId: interfaceId, args: TyList::empty())
 			val chain = self.unmetChain(lt, constraint)
-			if !chain.isEmpty() then unmet = .Some((constraint, move chain))
+			if !chain.isEmpty() then unmet = .Some((constraint, chain))
 		}
 		// A type says it compares with `@derive(Eq)` and that it is ordered
 		// with `@derive(Ord)`, and the compiler writes both.
 		val declared = self.declaredType(lt)
-		if unmet is .Some((constraint, chain)) {
-			diagnostic = diagnostic.withHelp(self.unmetHelp(lt, constraint, &chain))
-			// The type that lacks it is the innermost, which is where it is
-			// written, if the program may write it.
-			val (arg, condition) = chain[chain.len() - 1]
-			val name = self.constraintName(condition, arg)
-			val insideName = self.tyName(arg)
-			val inside = insideName.toStr().trimMatches("`")
-			if self.stdModuleOf(arg) is .Some(module) {
-				val where = if module == PRELUDE then String::of("the prelude") else "`\(module)`"
-				diagnostic = diagnostic.withHelp("`\(inside)` is declared in \(where), which does not implement `\(name)` for it")
-			} else if self.declaredType(arg) {
-				diagnostic = diagnostic.withHelp("write `@derive(\(name))` on `\(inside)`, and the compiler writes it field by field")
+		when {
+			unmet is .Some((constraint, chain)) => {
+				diagnostic = diagnostic.withHelp(self.unmetHelp(lt, constraint, &chain))
+				// The type that lacks it is the innermost, which is where it is
+				// written, if the program may write it.
+				val (arg, condition) = chain[chain.len() - 1]
+				val name = self.constraintName(condition, arg)
+				val insideName = self.tyName(arg)
+				val inside = insideName.toStr().trimMatches("`")
+				if self.stdModuleOf(arg) is .Some(module) {
+					val where =
+						if module == PRELUDE then String::of("the prelude") else "`\(module)`"
+					diagnostic = diagnostic.withHelp("`\(inside)` is declared in \(where), which does not implement `\(name)` for it")
+				} else if self.declaredType(arg) {
+					diagnostic = diagnostic.withHelp("write `@derive(\(name))` on `\(inside)`, and the compiler writes it field by field")
+				}
+				diagnostic = diagnostic.withNote(
+					"an implementation may hold only for some type arguments: `extend Option<T: Eq>: Eq`",
+				)
 			}
-			diagnostic = diagnostic.withNote(
-				"an implementation may hold only for some type arguments: `extend Option<T: Eq>: Eq`",
-			)
-		} else if op is .Eq | .Ne && declared {
-			val typeName = self.tyName(lt)
-			val name = typeName.toStr().trimMatches("`")
-			diagnostic = diagnostic.withHelp("write `@derive(Eq)` on `\(name)`, and the compiler writes the comparison field by field").withNote(
-				"a type whose equality is not its fields writes `extend …: Eq` itself instead",
-			)
-		} else if op is .Lt | .Le | .Gt | .Ge && declared && lt == rt {
-			val typeName = self.tyName(lt)
-			val name = typeName.toStr().trimMatches("`")
-			diagnostic = diagnostic.withHelp("write `@derive(Eq, Ord)` on `\(name)`, and the compiler writes the order field by field").withNote(
-				"a type whose order is not its fields writes `extend …: Ord` itself instead",
-			)
-		} else if op is .Eq | .Ne && self.kind(lt) is .Array(..) {
-			diagnostic = diagnostic.withHelp("compare the elements one by one")
+			op is .Eq | .Ne && declared => {
+				val typeName = self.tyName(lt)
+				val name = typeName.toStr().trimMatches("`")
+				diagnostic = diagnostic.withHelp("write `@derive(Eq)` on `\(name)`, and the compiler writes the comparison field by field").withNote(
+					"a type whose equality is not its fields writes `extend …: Eq` itself instead",
+				)
+			}
+			op is .Lt | .Le | .Gt | .Ge && declared && lt == rt => {
+				val typeName = self.tyName(lt)
+				val name = typeName.toStr().trimMatches("`")
+				diagnostic = diagnostic.withHelp("write `@derive(Eq, Ord)` on `\(name)`, and the compiler writes the order field by field").withNote(
+					"a type whose order is not its fields writes `extend …: Ord` itself instead",
+				)
+			}
+			op is .Eq | .Ne && self.kind(lt) is .Array(..) =>
+				diagnostic = diagnostic.withHelp("compare the elements one by one")
 		}
-		self.report(move diagnostic)
+		self.report(diagnostic)
 	}
 
 	/// Whether `op` applies to operands of type `ty`.
@@ -1376,14 +1517,14 @@ extend Lowerer {
 	}
 
 	/// A field of a type that cleans up after itself may not be moved out:
-	/// its drop is about to run over the hole.
-	var fn noMoveOutOfDrop(place: ExprId, span: Span) = {
+	/// its drop is about to run over the hole. Whether it was refused.
+	var fn noMoveOutOfDrop(place: ExprId, span: Span): bool = {
 		var at = place
 		while true {
 			val base = match self.state.body.exprs[at].kind {
 				.Field(base, ..) | .Index(base, ..) => base
 				.Deref(inner) => inner
-				_ => return
+				_ => return false
 			}
 			val ty = self.underRefs(self.tyOf(base))
 			if self.program.hasDrop(ty) {
@@ -1400,10 +1541,11 @@ extend Lowerer {
 						"move the whole value, or give the type a method that hands out what it holds",
 					),
 				)
-				return
+				return true
 			}
 			at = base
 		}
+		return false
 	}
 
 	/// `expr as T`: a conversion between numbers, between a character and a
@@ -1485,7 +1627,7 @@ extend Lowerer {
 			val name = self.typeName(.Enum(id))
 			diagnostic = diagnostic.withHelp("`\(name)::fromIndex(n)` answers the variant with that number, or nothing where `\(name)` has no such variant")
 		}
-		self.report(move diagnostic)
+		self.report(diagnostic)
 		return self.errorExpr(span)
 	}
 

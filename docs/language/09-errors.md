@@ -36,6 +36,26 @@ Both carry the methods a program reaches for — `isSome`, `isNone`, `isOk`,
 `isErr`, `unwrap`, `map`, `mapErr`, `unwrapOr`, `getOrInsert` — which are on
 [page 10](10-library.md).
 
+What `?` is for one result, `Result::collect` is for an iterator of them:
+every value, in order, in a `Vec`, or the first error, after which nothing
+more is asked of the iterator. `Option::collect` answers every value, or
+nothing at the first that has none:
+
+```wip,run
+import std::text::{ParseError}
+
+fn numbers(texts: &[str]): Result<Vec<i64>, ParseError> = Result::collect(
+    texts.walk().map(own (text) => text.toInt()),
+)
+
+fn main() = {
+    assert(numbers(["1", "2"]) == .Ok([1, 2].toVec()))
+    assert(numbers(["1", "x"]).isErr())
+    val gaps: [Option<i64>; 2] = [.Some(1), .None]
+    assert(Option::collect(gaps.walk()).isNone())
+}
+```
+
 Where nothing says what is expected, `.Some` and `.None` are `Option`'s,
 and `.Some(x)` says the rest; `.Ok` and `.Err`, which each
 say only half of a `Result`, still need its type:

@@ -1,7 +1,9 @@
 // Diagnostics for using a moved value, and assignment that refills one.
 
+import hir::{Ty}
 import syntax::{
 	ASSIGN_TO_PART_OF_MOVED,
+	USED_AFTER_GIVEN,
 	Diagnostic,
 	MOVED_IN_PREVIOUS_ITERATION,
 	Span,
@@ -34,49 +36,63 @@ extend Checker {
 				}
 			}
 		}
-		var diagnostic = match previousIteration {
-			// The use is the move itself: `run(move job)` in a loop.
-			.Some(moveSpan) if moveSpan.lo <= span.lo &&
-				span.hi <= moveSpan.hi => Diagnostic::error(
-				MOVED_IN_PREVIOUS_ITERATION,
-				"`\(m.name)` is moved in every iteration of the loop",
-				moveSpan,
-				"moved here, but only the first iteration has a value to move",
-			).withHelp("assign `\(root)` a new value before the next iteration, or declare it inside the loop")
-			.Some(moveSpan) => Diagnostic::error(
-				MOVED_IN_PREVIOUS_ITERATION,
-				"`\(m.name)` is used after it was moved in the previous iteration of the loop",
+		var diagnostic = if self.givenAt.get(&first) is .Some(ty) {
+			self.givenAgain(
+				m.name.toStr(),
+				name,
+				ty,
+				root,
+				partial,
+				m.definite,
+				first,
 				span,
-				"used here in the next iteration",
-			).withSecondary(
-				moveSpan,
-				"moved here in the previous iteration",
-			).withHelp("assign `\(root)` a new value before the next iteration, or declare it inside the loop")
-			.None if partial => Diagnostic::error(
-				if m.definite then USE_OF_MOVED_VALUE else USE_OF_POSSIBLY_MOVED_VALUE,
-				"use of partially moved value `\(name)`",
-				span,
-				"`\(name)` used as a whole here",
-			).withSecondary(first, "`\(m.name)` moved here").withNote("the other fields of `\(name)` can still be used, but not `\(name)` as a whole")
-			.None if m.definite => Diagnostic::error(
-				USE_OF_MOVED_VALUE,
-				"use of moved value `\(m.name)`",
-				span,
-				"used here after the move",
-			).withSecondary(first, "`\(m.name)` moved here").withNote("after `move`, `\(m.name)` holds no value until it is assigned again")
-			.None => {
-				var possibly = Diagnostic::error(
-					USE_OF_POSSIBLY_MOVED_VALUE,
-					"use of possibly moved value `\(m.name)`",
+				previousIteration,
+			)
+		} else {
+			match previousIteration {
+				// The use is the move itself: `run(move job)` in a loop.
+				.Some(moveSpan) if moveSpan.lo <= span.lo &&
+					span.hi <= moveSpan.hi => Diagnostic::error(
+					MOVED_IN_PREVIOUS_ITERATION,
+					"`\(m.name)` is moved in every iteration of the loop",
+					moveSpan,
+					"moved here, but only the first iteration has a value to move",
+				).withHelp("assign `\(root)` a new value before the next iteration, or declare it inside the loop")
+				.Some(moveSpan) => Diagnostic::error(
+					MOVED_IN_PREVIOUS_ITERATION,
+					"`\(m.name)` is used after it was moved in the previous iteration of the loop",
 					span,
-					"used here",
-				)
-				for s in m.spans.items().take(3) {
-					possibly = possibly.withSecondary(s, "`\(m.name)` moved here")
+					"used here in the next iteration",
+				).withSecondary(
+					moveSpan,
+					"moved here in the previous iteration",
+				).withHelp("assign `\(root)` a new value before the next iteration, or declare it inside the loop")
+				.None if partial => Diagnostic::error(
+					if m.definite then USE_OF_MOVED_VALUE else USE_OF_POSSIBLY_MOVED_VALUE,
+					"use of partially moved value `\(name)`",
+					span,
+					"`\(name)` used as a whole here",
+				).withSecondary(first, "`\(m.name)` moved here").withNote("the other fields of `\(name)` can still be used, but not `\(name)` as a whole")
+				.None if m.definite => Diagnostic::error(
+					USE_OF_MOVED_VALUE,
+					"use of moved value `\(m.name)`",
+					span,
+					"used here after the move",
+				).withSecondary(first, "`\(m.name)` moved here").withNote("after `move`, `\(m.name)` holds no value until it is assigned again")
+				.None => {
+					var possibly = Diagnostic::error(
+						USE_OF_POSSIBLY_MOVED_VALUE,
+						"use of possibly moved value `\(m.name)`",
+						span,
+						"used here",
+					)
+					for s in m.spans.items().take(3) {
+						possibly = possibly.withSecondary(s, "`\(m.name)` moved here")
+					}
+					possibly.withNote("`\(m.name)` is moved on some paths to this point, so it may hold no value").withHelp(
+						"move it on every path, or assign it a new value after the move",
+					)
 				}
-				possibly.withNote("`\(m.name)` is moved on some paths to this point, so it may hold no value").withHelp(
-					"move it on every path, or assign it a new value after the move",
-				)
 			}
 		}
 		if self.exit is .Some((exit, label)) then
@@ -87,7 +103,7 @@ extend Checker {
 			diagnostic = diagnostic.withNote(
 				"a `defer` makes its moves when it runs, where its block exits",
 			)
-		self.report(move diagnostic)
+		self.report(diagnostic)
 		return false
 	}
 
@@ -105,10 +121,61 @@ extend Checker {
 					span,
 					"assigned here",
 				).withSecondary(first, "`\(movedName)` moved here").withHelp("assign all of `\(movedName)` instead: `\(movedName) = …`")
-				self.report(move diagnostic)
+				self.report(diagnostic)
 				return
 			}
 		}
 		state.reinit(&path)
+	}
+
+	/// A later use of a place given away where it was used as a value:
+	/// E0404, where it was given, with the use beside it.
+	fn givenAgain(
+		given: str,
+		used: str,
+		ty: Ty,
+		root: str,
+		partial: bool,
+		definite: bool,
+		at: Span,
+		span: Span,
+		previousIteration: Option<Span>,
+	): Diagnostic = {
+		val clones = match self.program.preludeItems.interfaceOf(.Clone) {
+			.Some(clone) => self.program.implementsWhere(ty, clone)
+			.None => false
+		}
+		// The use is the move itself: `run(job)` in a loop.
+		if previousIteration is .Some(moveSpan) &&
+			moveSpan.lo <= span.lo &&
+			span.hi <= moveSpan.hi {
+			val again = "assign `\(root)` a new value before the next iteration"
+			return Diagnostic::error(
+				USED_AFTER_GIVEN,
+				"`\(given)` is given in every iteration of the loop",
+				moveSpan,
+				"given here, but only the first iteration has it to give",
+			).withHelp(if clones then "give a copy, `\(given).clone()`, or \(again)" else again)
+		}
+		val label = when {
+			previousIteration.isSome() => String::of("used again in the next iteration")
+			partial => "`\(used)` used as a whole here"
+			definite => String::of("used again here")
+			else => String::of("used again, on the path where it was given")
+		}
+		var diagnostic = Diagnostic::error(
+			USED_AFTER_GIVEN,
+			"`\(given)` is given here, and used again",
+			match previousIteration {
+				.Some(moveSpan) => moveSpan
+				.None => at
+			},
+			"given here: `\(self.tyName(ty))` is never copied",
+		).withSecondary(span, label)
+		if partial then
+			diagnostic = diagnostic.withNote("the other fields of `\(used)` can still be used, but not `\(used)` as a whole")
+		if clones then
+			diagnostic = diagnostic.withHelp("to keep `\(given)`, give a copy: `\(given).clone()`")
+		return diagnostic
 	}
 }

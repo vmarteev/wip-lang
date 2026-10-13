@@ -2,6 +2,72 @@
 
 Each version published, newest first.
 
+## 0.5.0 — 2026-10-13
+
+Programs written for 0.4 compile as they did; where they write `move`
+that is now inferred, a warning says so, with the fix that removes it.
+
+**The language**
+
+- **A value that owns memory moves where it is used as a value:** an
+  argument, a field, `return`, an arm's value. `move` is no longer
+  written there, and a use after the move is refused at the place it was
+  given, "`report` is given here, and used again". `move` stays where a
+  place is only lent or aliased, in `match move`, `for … in move` and a
+  pattern's value; where it is written and inferred, it is a warning
+  (E0451) whose fix removes it.
+- **`when`, the first condition that holds:** `when { c.isDigit() =>
+  number() … else => unexpected() }`, a choice among conditions, each
+  arm a line, an `is` binding for its own arm. A choice among the values
+  of one thing stays a `match`.
+- **A local's type arguments from its first use:** `var shapes = Vec()`
+  and then `shapes.push(circle)` is a `Vec<Shape>`, decided by the next
+  place that names it — a method's arguments, an expected type, an
+  assignment.
+- **`become f(x)`** leaves the function and calls `f` in its place, a
+  tail call that is guaranteed, so functions that call each other run in
+  one frame: an interpreter's dispatch, a state machine. The callee has
+  the caller's signature, and nothing owned or deferred is left to end.
+- **A method may say `keeps self`:** a call may keep, in its `&var`
+  arguments, what the receiver holds or borrows, as a render queue keeps
+  views of a scene: `scene.drawn(camera, &var draws)`.
+- **A literal in a tuple takes the type of the tuples beside it** in an
+  array, as a literal element does: `[(0.0, -reach), (-reach, 0.0)]`.
+- **A module named by a full path needs no import:**
+  `std::math::PI_F32` is found whether or not another file imports
+  `std::math`.
+- **A struct's, an enum's and an interface's constraints** may name an
+  interface imported by name, `struct Held<S: Shelf>`, as a function's
+  could.
+- **Type arguments are inferred through what an iterator hands out:**
+  `Map::fromPairs(…)` needs no type written.
+
+**C**
+
+- **A plain value's bytes:** `c::bytesOf(&value)`, borrowing it, for a
+  type with no padding and no address in it — a GPU's constants, a hash,
+  a file.
+- **A C struct a Wip function answers borrows what its signature lends,**
+  so a function may return C structs that point into its arguments, as a
+  list of draws or descriptor writes built for a call does.
+- **Assembly in a file:** `@source` takes `.s` files, and `.S` files
+  given the module's `@define`s.
+- **`wip bindgen`** types an enum's enumerators alike whichever clang it
+  asks, and asks the compiler `$CC` or `$WIP_CLANG` names, as `wip`
+  builds with.
+
+**The library**
+
+- **Results collected:** `Result::collect(results)` and
+  `Option::collect(options)`, every value or the first failure.
+
+**Tools**
+
+- **Hover** on a place given away says so: it owns memory, so it is
+  moved, never copied.
+- **The compiler and the library are written with `when`** and without
+  the `move`s now inferred.
+
 ## 0.4.0 — 2026-10-12
 
 Programs written for 0.3 may need changes where marked **breaking**.

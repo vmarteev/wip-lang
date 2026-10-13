@@ -427,7 +427,7 @@ fn named(node: &Json, wanted: str): Vec<&Json> = {
             if kind(child) == .Some(wanted) then found.push(child)
         }
     }
-    return move found
+    return found
 }
 
 fn main() = {
@@ -629,11 +629,9 @@ name in a `&var` parameter's place, by assignment or by a call that keeps
 it, is refused, with a fix that names it (E0449). So is one that stores a
 reference made from what a parameter refers to — `&thing.name` of a
 `thing: &Thing`, a view a method of `thing` answers, an element a `for`
-over it binds — since that borrows what the parameter borrows. `keeps`
-names parameters, and a method's receiver is not one: a function that
-keeps what it is given takes it as a parameter. A value of a type
-parameter counts, since an instance may make it a `str`, which is why
-`Vec`'s `push` says `keeps value`:
+over it binds — since that borrows what the parameter borrows. A value of
+a type parameter counts, since an instance may make it a `str`, which is
+why `Vec`'s `push` says `keeps value`:
 
 ```wip,error=E0449
 struct Bag<T> {
@@ -641,7 +639,7 @@ struct Bag<T> {
 }
 
 extend Bag<T> {
-    var fn put(item: T) = self.items.push(move item)
+    var fn put(item: T) = self.items.push(item)
 }
 
 fn main() = {}
@@ -650,9 +648,41 @@ fn main() = {}
 `keeps` names parameters that are not `&var`, in a function that has a
 `&var` parameter to keep them in, and follows the result type and `from`:
 `fn longer(a: str, b: str, into: &var Vec<str>): str from a, b keeps a, b`.
-An interface's method says what it keeps, and an implementation keeps no
-more; a call through a function value says nothing, and is taken to keep
-every argument. As `from` is, `keeps` is a word only there.
+A method's receiver is named `self`, where it is `&` or a value — a `fn`
+or a `move fn`, not a `var fn`, whose receiver is lent for writing: a
+method that fills a list with views of what it holds keeps `self`, and
+the list then borrows the receiver. An interface's method says what it
+keeps, and an implementation keeps no more; a call through a function
+value says nothing, and is taken to keep every argument. As `from` is,
+`keeps` is a word only there:
+
+```wip,run
+struct Shelf {
+    names: Vec<String>
+}
+
+view struct Label {
+    text: str
+}
+
+extend Shelf {
+    fn labelled(labels: &var Vec<Label>) keeps self = {
+        labels.clear()
+        for name in self.names {
+            labels.push(Label(text: name.toStr()))
+        }
+    }
+}
+
+fn main() = {
+    val shelf = Shelf(
+        names: Vec::of(own [String::of("apple"), String::of("pear")]),
+    )
+    var labels: Vec<Label> = Vec()
+    shelf.labelled(&var labels)
+    assert(labels.len() == 2 && labels[1].text == "pear")
+}
+```
 
 ## What a thread may borrow
 

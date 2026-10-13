@@ -21,21 +21,32 @@
 import std::collections::{Deque, Map, Set}
 import std::future
 import std::io
-import hir::{ConstId, FnDef, FnId, GlobalId, I64, InterfaceId, NEVER, Program, Ty, TyKind}
+import hir::{
+	ConstId,
+	FnDef,
+	FnId,
+	GlobalId,
+	I64,
+	InterfaceId,
+	Layout,
+	Layouts,
+	NEVER,
+	Program,
+	Ty,
+	TyKind,
+	isAggregate,
+	isSlicePointer,
+	isDynPointer,
+	isClosurePointer
+}
 import mir::{
 	Arch,
 	Body,
 	CCall,
-	Layout,
-	Layouts,
 	Part,
 	Reg,
 	TableBytes,
 	functionBody,
-	isAggregate,
-	isClosurePointer,
-	isDynPointer,
-	isSlicePointer,
 	lowerDropFn,
 	lowerDropInPlaceFn,
 	readsBeforeWrites,
@@ -103,17 +114,19 @@ pub fn compile(
 	// any number of threads; what each is defined from is made ahead of it,
 	// on threads.
 	while true {
-		if llvm.queue.first() is .Some(id) {
-			if !llvm.madeFns.contains(&id) then llvm.makeAhead(threads)
-			llvm.queue.popFront()
-			llvm.defineFunction(id)
-		} else if !llvm.pendingDrops.isEmpty() {
-			val drop = llvm.pendingDrops[llvm.pendingDrops.len() - 1]
-			if !llvm.madeDrops.contains(&drop) then llvm.makeAhead(threads)
-			llvm.pendingDrops.pop()
-			llvm.defineDrop(drop.0, drop.1)
-		} else {
-			break
+		when {
+			llvm.queue.first() is .Some(id) => {
+				if !llvm.madeFns.contains(&id) then llvm.makeAhead(threads)
+				llvm.queue.popFront()
+				llvm.defineFunction(id)
+			}
+			!llvm.pendingDrops.isEmpty() => {
+				val drop = llvm.pendingDrops[llvm.pendingDrops.len() - 1]
+				if !llvm.madeDrops.contains(&drop) then llvm.makeAhead(threads)
+				llvm.pendingDrops.pop()
+				llvm.defineDrop(drop.0, drop.1)
+			}
+			else => break
 		}
 	}
 	return llvm.finish()
@@ -139,11 +152,11 @@ fn bodyOf(
 ): Option<Body> = match waiting {
 	.Fn(id) => {
 		val .Some(lowered) = functionBody(program, interner, id) else return .None
-		var body = move lowered
+		var body = lowered
 		// A release build's MIR splits its scalars out; a debug build's
 		// keeps each variable whole, for the debugger.
 		if optimize then scalars(program, &var body)
-		.Some(move body)
+		.Some(body)
 	}
 	.Drop(ty, inPlace) => .Some(
 		if inPlace then lowerDropInPlaceFn(program, interner, ty)
@@ -165,7 +178,7 @@ struct Slot {
 }
 
 extend Slot {
-	static fn of(t: Type): Slot = Slot(t: move t, attrs: Vec())
+	static fn of(t: Type): Slot = Slot(t: t, attrs: Vec())
 
 	fn text(): String = slotText(&self.t, &self.attrs)
 }
@@ -220,7 +233,7 @@ fn partsType(parts: &[Part]): Type = {
 	for part in parts {
 		fields.push(regType(part.reg.clone()))
 	}
-	return structOf(move fields, false)
+	return structOf(fields, false)
 }
 
 view struct Llvm {
@@ -327,12 +340,12 @@ extend Llvm {
 			pendingDrops: Vec(),
 			madeFns: Map(),
 			madeDrops: Map(),
-			runtimeFns: move runtime,
+			runtimeFns: runtime,
 		)
 		llvm.global("@wip_runtime_words")
 		llvm.global("@\"wip.frame_tables\"")
 		llvm.global("@wip_thread_words")
-		return move llvm
+		return llvm
 	}
 
 	/// The declarations, in the order of their text.
@@ -344,9 +357,9 @@ extend Llvm {
 		all.sortBy((a, b) => a.0 < b.0)
 		var declared: Vec<Declared> = Vec()
 		for (_, item) in move all {
-			declared.push(move item)
+			declared.push(item)
 		}
-		return move declared
+		return declared
 	}
 
 	move fn finish(): Ir = {
@@ -384,29 +397,28 @@ extend Llvm {
 			threadWords(THREAD_WORDS),
 		])
 		val optimize = self.optimize
-		var functions = move self.functions
+		var functions = self.functions
 		if optimize then markCycles(&var functions)
 		val module = Module(
 			heading: "; Written by wip's LLVM backend.",
-			names: move self.names,
-			data: move self.data,
-			globals: move globals,
-			declared: move declared,
-			functions: move functions,
-			groups: Vec::of(own [move returns, move panics, move inCycles]),
+			names: self.names,
+			data: self.data,
+			globals: globals,
+			declared: declared,
+			functions: functions,
+			groups: Vec::of(own [returns, panics, inCycles]),
 			unit: self.debug.unit,
 			flags: self.debug.flags,
-			nodes: move self.debug.nodes,
+			nodes: self.debug.nodes,
 		)
-		val modules =
-			if self.optimize then Vec::of(own [move module]) else split(move module, &self.files)
-		return Ir(modules: move modules, files: move self.debug.paths)
+		val modules = if self.optimize then Vec::of(own [module]) else split(module, &self.files)
+		return Ir(modules: modules, files: self.debug.paths)
 	}
 
 	/// A function defined, written in `file`.
 	var fn define(file: String, function: Function) = {
-		self.files.push(move file)
-		self.functions.push(move function)
+		self.files.push(file)
+		self.functions.push(function)
 	}
 
 	/// The number of the global or function named `name`, as written.
@@ -415,13 +427,13 @@ extend Llvm {
 		if self.numbers.get(&key) is .Some(number) then return number
 		val number = self.names.len() as u32
 		self.names.push(key.clone())
-		self.numbers.put(move key, number)
+		self.numbers.put(key, number)
 		return number
 	}
 
 	/// What the module declares as `symbol`, once.
 	var fn declare(symbol: u32, declared: Declared) = {
-		if !self.declarations.contains(&symbol) then self.declarations.put(symbol, move declared)
+		if !self.declarations.contains(&symbol) then self.declarations.put(symbol, declared)
 	}
 
 	/// An intrinsic of LLVM's, declared once: what it answers, and what it
@@ -431,9 +443,9 @@ extend Llvm {
 		if self.declarations.contains(&symbol) then return symbol
 		var slots: Vec<Param> = Vec()
 		for t in move params {
-			slots.push(Param(t: move t, attrs: Vec(), name: .None))
+			slots.push(Param(t: t, attrs: Vec(), name: .None))
 		}
-		self.declare(symbol, .Function(Declaration::of(symbol, move ret, move slots)))
+		self.declare(symbol, .Function(Declaration::of(symbol, ret, slots)))
 		return symbol
 	}
 
@@ -446,8 +458,8 @@ extend Llvm {
 			linkage: .Private,
 			unnamedAddr: true,
 			constant: true,
-			t: move t,
-			init: .Some(move init),
+			t: t,
+			init: .Some(init),
 			align: .Some(align),
 		))
 		return name
@@ -456,7 +468,7 @@ extend Llvm {
 	/// The file `span` was written in, as a panic names it.
 	fn fileOf(span: Span): String = {
 		val (file, _, _) = (self.locations)(span)
-		return move file
+		return file
 	}
 
 	/// The linkage of a function the program keeps to itself: kept to the
@@ -505,7 +517,7 @@ extend Llvm {
 		}
 		var attrs: Vec<Attr> = Vec()
 		if attr is .Some(a) then attrs.push(a)
-		return .Some(Slot(t: move lt, attrs: move attrs))
+		return .Some(Slot(t: lt, attrs: attrs))
 	}
 
 	/// A scalar result, as a parameter is but for `noalias`: on a result, LLVM
@@ -513,10 +525,10 @@ extend Llvm {
 	/// projection's `&var` into its argument is not.
 	fn result(ty: Ty): Option<Slot> = {
 		val .Some(found) = self.slot(ty) else return .None
-		var slot = move found
+		var slot = found
 		val noalias = Attr::NoAlias
 		if slot.attrs.contains(&noalias) then slot.attrs = Vec()
-		return .Some(move slot)
+		return .Some(slot)
 	}
 
 	/// Whether a `&` parameter of this type reaches a place that nothing
@@ -577,7 +589,7 @@ extend Llvm {
 				continue
 			}
 			var slot = match self.slot(param) {
-				.Some(s) => move s
+				.Some(s) => s
 				.None => Slot::of(.Ptr)
 			}
 			if !cAbi && self.noalias && self.onlyRead(param) then
@@ -607,16 +619,16 @@ extend Llvm {
 				}
 			}
 			addAttr(&var slot, self.referentAttrs(param))
-			slots.push(move slot)
+			slots.push(slot)
 		}
 		var retSlot = self.result(ret)
 		if retSlot is .Some(..) {
 			val more = self.referentAttrs(ret)
 			var given = retSlot.unwrap()
-			addAttr(&var given, move more)
-			retSlot = .Some(move given)
+			addAttr(&var given, more)
+			retSlot = .Some(given)
 		}
-		return Sig(params: move slots, ret: move retSlot, sret: sret, parts: .None)
+		return Sig(params: slots, ret: retSlot, sret: sret, parts: .None)
 	}
 
 	/// The whole value a reference of type `ty` reaches, where it is one
@@ -662,7 +674,7 @@ extend Llvm {
 		}
 		val sig = self.signatureWith(&params, def.ret, usesCAbi(&def), !def.isTailrec)
 		self.noalias = keep
-		return move sig
+		return sig
 	}
 
 	/// The signature of a call through a value, with `noalias` only where no
@@ -672,7 +684,7 @@ extend Llvm {
 		if io::env("WIP_LLVM_NOALIAS_ONLY").isSome() then self.noalias = false
 		val sig = self.signatureWith(&params, ret, cAbi, false)
 		self.noalias = keep
-		return move sig
+		return sig
 	}
 
 	/// How C passes `id`'s structs, where it passes one by value and the call
@@ -689,12 +701,12 @@ extend Llvm {
 					.Some(call) => call.isPlain()
 					.None => true
 				}
-				if plain then .None else move classified
+				if plain then .None else classified
 			}
 			_ => .None
 		}
 		self.cCalls.put(id, found.clone())
-		return move found
+		return found
 	}
 
 	/// The signature C gives a function whose structs travel as `cCall` says:
@@ -725,7 +737,7 @@ extend Llvm {
 					} else {
 						params.push(
 							match self.slot(ty) {
-								.Some(s) => move s
+								.Some(s) => s
 								.None => Slot::of(.Ptr)
 							},
 						)
@@ -761,7 +773,7 @@ extend Llvm {
 			.Parts(given) => parts = .Some(given.clone())
 			.Hidden => {}
 		}
-		return Sig(params: move params, ret: move ret, sret: sret, parts: move parts)
+		return Sig(params: params, ret: ret, sret: sret, parts: parts)
 	}
 
 	/// A variable C owns, as the symbol the linker resolves.
@@ -800,35 +812,43 @@ extend Llvm {
 				return name
 			}
 		}
-		val name = if def.isExtern {
-			val cName =
-				if self.shimmed.contains(&id) then shimName(id)
-				else self.interner.resolve(def.symbol.unwrapOr(def.name))
-			val symbol = self.global(globalName(cName))
-			// One C function may be declared under two names, each with a
-			// signature of its own; a call says its own, and the first is the
-			// declaration's.
-			if self.cDeclared.add(move cName) {
-				val sig = self.signature(id)
-				var params: Vec<Param> = Vec()
-				for slot in sig.params {
-					params.push(Param(t: slot.t.clone(), attrs: slot.attrs.clone(), name: .None))
+		val name = when {
+			def.isExtern => {
+				val cName =
+					if self.shimmed.contains(&id) then shimName(id)
+					else self.interner.resolve(def.symbol.unwrapOr(def.name))
+				val symbol = self.global(globalName(cName))
+				// One C function may be declared under two names, each with a
+				// signature of its own; a call says its own, and the first is the
+				// declaration's.
+				if self.cDeclared.add(cName) {
+					val sig = self.signature(id)
+					var params: Vec<Param> = Vec()
+					for slot in sig.params {
+						params.push(Param(
+							t: slot.t.clone(),
+							attrs: slot.attrs.clone(),
+							name: .None,
+						))
+					}
+					var declaration = Declaration::of(symbol, sig.retType(), params)
+					declaration.retAttrs = sig.retAttrs()
+					// A function C declares with `...`, called with more.
+					declaration.variadic = def.isVariadic && !self.shimmed.contains(&id)
+					self.declare(symbol, .Function(declaration))
 				}
-				var declaration = Declaration::of(symbol, sig.retType(), move params)
-				declaration.retAttrs = sig.retAttrs()
-				// A function C declares with `...`, called with more.
-				declaration.variadic = def.isVariadic && !self.shimmed.contains(&id)
-				self.declare(symbol, .Function(move declaration))
+				symbol
 			}
-			symbol
-		} else if def.exportsC {
-			self.queue.pushBack(id)
-			self.global(globalName(self.interner.resolve(def.symbol.unwrapOr(def.name))))
-		} else {
-			self.queue.pushBack(id)
-			val written = self.program.fnName(id, self.interner)
-			val symbol = "wip.\(written).\(id.index())"
-			self.global(globalName(symbol))
+			def.exportsC => {
+				self.queue.pushBack(id)
+				self.global(globalName(self.interner.resolve(def.symbol.unwrapOr(def.name))))
+			}
+			else => {
+				self.queue.pushBack(id)
+				val written = self.program.fnName(id, self.interner)
+				val symbol = "wip.\(written).\(id.index())"
+				self.global(globalName(symbol))
+			}
 		}
 		self.symbols.put(id, name)
 		return name
@@ -863,12 +883,7 @@ extend Llvm {
 		val text = self.interner.resolve(symbol)
 		var withNul = text.items().toVec()
 		withNul.push(0)
-		val name = self.constant(
-			written,
-			byteArray((text.len() + 1) as u32),
-			.Bytes(move withNul),
-			1,
-		)
+		val name = self.constant(written, byteArray((text.len() + 1) as u32), .Bytes(withNul), 1)
 		self.strings.put(symbol, name)
 		return name
 	}
@@ -885,7 +900,7 @@ extend Llvm {
 			byteConstant(&text.items()),
 			1,
 		)
-		self.texts.put(move key, name)
+		self.texts.put(key, name)
 		return name
 	}
 
@@ -951,7 +966,7 @@ extend Llvm {
 			types.push(byteArray((bytes.len() - at).max(1) as u32))
 			values.push(byteConstant(&bytes[at..bytes.len()]))
 		}
-		return self.constant(written, structOf(move types, true), .Packed(move values), align)
+		return self.constant(written, structOf(types, true), .Packed(values), align)
 	}
 
 	/// A type's table of methods for an interface.
@@ -982,8 +997,8 @@ extend Llvm {
 			linkage: .Private,
 			unnamedAddr: true,
 			constant: true,
-			t: move t,
-			init: .Some(.Array(move entries)),
+			t: t,
+			init: .Some(.Array(entries)),
 			align: .Some(8),
 		))
 		return name
@@ -996,7 +1011,7 @@ extend Llvm {
 		if self.cDeclared.add("abort") {
 			var declaration = Declaration::of(symbol, .Void, Vec())
 			declaration.attrs = Vec::of(own [FnAttr::NoReturn, FnAttr::NoUnwind])
-			self.declare(symbol, .Function(move declaration))
+			self.declare(symbol, .Function(declaration))
 		}
 		return symbol
 	}
@@ -1041,13 +1056,13 @@ extend Llvm {
 			for k in range.0..range.1 {
 				bodies.push(bodyOf(&program, &interner, &waiting[k], optimize))
 			}
-			return move bodies
+			return bodies
 		})
 		var k = 0
 		for part in move made {
 			for body in move part {
 				match waiting[k] {
-					.Fn(id) => self.madeFns.put(id, move body)
+					.Fn(id) => self.madeFns.put(id, body)
 					.Drop(ty, inPlace) => self.madeDrops.put((ty, inPlace), body.unwrap())
 				}
 				k += 1
@@ -1059,7 +1074,7 @@ extend Llvm {
 		val program = self.program
 		val def = &program.fns[id]
 		val .Some(.Some(lowered)) = self.madeFns.remove(&id) else return
-		var body = move lowered
+		var body = lowered
 		// For finding what MIR reads before it writes.
 		if io::env("WIP_MIR_UNWRITTEN").isSome() {
 			for (local, block) in readsBeforeWrites(&body) {
@@ -1082,7 +1097,7 @@ extend Llvm {
 			val inner = "wip.\(name).\(id.index())"
 			val bodySymbol = self.global(globalName(inner))
 			val export = self.defineExport(id, symbol, bodySymbol, &cCall)
-			self.define(self.fileOf(def.span), move export)
+			self.define(self.fileOf(def.span), export)
 			var params: Vec<Ty> = Vec()
 			for p in def.params {
 				params.push(p.ty)
@@ -1104,7 +1119,7 @@ extend Llvm {
 			subprogram,
 			.Some(at),
 		)
-		self.define(self.fileOf(at), move function)
+		self.define(self.fileOf(at), function)
 	}
 
 	var fn defineDrop(ty: Ty, inPlace: bool) = {
@@ -1128,7 +1143,7 @@ extend Llvm {
 			subprogram,
 			.None,
 		)
-		self.define(String(), move function)
+		self.define(String(), function)
 	}
 
 	/// `int main(int argc, char **argv)`: calls Wip's `main`, with the
@@ -1181,47 +1196,48 @@ extend Llvm {
 			)
 			code.push((.None, .Ret(.Some(Val::of(Value::Main(.Code), .I(32))))))
 		}
-		if self.program.entryReport is .Some(report) {
-			val layout = self.layout(def.ret)
-			val reporter = Value::Global(self.symbol(report))
-			code.push(
-				(
-					.Some(Value::Main(.Result)),
-					.Alloca(t: byteArray(layout.size.max(1)), align: layout.align.max(1)),
-				),
-			)
-			var withResult = Vec::of(own [Val::of(Value::Main(.Result), .Ptr)])
-			for a in args {
-				withResult.push(a.clone())
+		when {
+			self.program.entryReport is .Some(report) => {
+				val layout = self.layout(def.ret)
+				val reporter = Value::Global(self.symbol(report))
+				code.push(
+					(
+						.Some(Value::Main(.Result)),
+						.Alloca(t: byteArray(layout.size.max(1)), align: layout.align.max(1)),
+					),
+				)
+				var withResult = Vec::of(own [Val::of(Value::Main(.Result), .Ptr)])
+				for a in args {
+					withResult.push(a.clone())
+				}
+				code.push((.None, .Call(own Call::plain(callee, .Void, withResult))))
+				code.push(
+					(
+						.Some(Value::Main(.Code64)),
+						.Call(own Call::plain(
+							reporter,
+							.I(64),
+							Vec::of(own [Val::of(Value::Main(.Result), .Ptr)]),
+						)),
+					),
+				)
+				exit(&var code)
 			}
-			code.push((.None, .Call(own Call::plain(move callee, .Void, move withResult))))
-			code.push(
-				(
-					.Some(Value::Main(.Code64)),
-					.Call(own Call::plain(
-						move reporter,
-						.I(64),
-						Vec::of(own [Val::of(Value::Main(.Result), .Ptr)]),
-					)),
-				),
-			)
-			exit(&var code)
-		} else if def.ret == I64 {
-			code.push(
-				(
-					.Some(Value::Main(.Code64)),
-					.Call(own Call::plain(move callee, .I(64), move args)),
-				),
-			)
-			exit(&var code)
-		} else {
-			val sig = self.signature(main)
-			var call = Call::plain(move callee, sig.retType(), move args)
-			call.retAttrs = sig.retAttrs()
-			code.push((.None, .Call(own move call)))
-			code.push((.None, .Ret(.Some(Val::of(.Int(0), .I(32))))))
+			def.ret == I64 => {
+				code.push(
+					(.Some(Value::Main(.Code64)), .Call(own Call::plain(callee, .I(64), args))),
+				)
+				exit(&var code)
+			}
+			else => {
+				val sig = self.signature(main)
+				var call = Call::plain(callee, sig.retType(), args)
+				call.retAttrs = sig.retAttrs()
+				code.push((.None, .Call(own call)))
+				code.push((.None, .Ret(.Some(Val::of(.Int(0), .I(32))))))
+			}
 		}
-		self.defineCMain(move code)
+		self.defineCMain(code)
 	}
 
 	/// C's `main`, whose instructions are `code`: code the compiler writes on
@@ -1232,7 +1248,7 @@ extend Llvm {
 		val place = self.debug.noLine(subprogram.clone())
 		var instructions: Vec<Instruction> = Vec()
 		for (result, op) in move code {
-			instructions.push(Instruction(result: move result, op: move op, at: .Some(place)))
+			instructions.push(Instruction(result: result, op: op, at: .Some(place)))
 		}
 		val function = Function(
 			symbol: self.global("@main"),
@@ -1245,9 +1261,9 @@ extend Llvm {
 			]),
 			returns: true,
 			subprogram: subprogram.node,
-			blocks: Vec::of(own [Block(label: .Start, instructions: move instructions)]),
+			blocks: Vec::of(own [Block(label: .Start, instructions: instructions)]),
 		)
-		self.define(String(), move function)
+		self.define(String(), function)
 	}
 
 	/// The runner `wip test` asks for: the library's, given each test in
@@ -1265,7 +1281,7 @@ extend Llvm {
 				Val::of(.Global(self.symbol(id)), .Ptr),
 			])
 			val .Some(.Panics(holding)) = self.program.fns[id].test else {
-				self.callRuntime(&var code, "wip_test", move args)
+				self.callRuntime(&var code, "wip_test", args)
 				continue
 			}
 			val text = match holding {
@@ -1279,18 +1295,18 @@ extend Llvm {
 			args.push(Val::of(.Int(file.len() as i64), .I(64)))
 			args.push(Val::of(.Int(line as i64), .I(64)))
 			args.push(Val::of(.Int(column as i64), .I(64)))
-			self.callRuntime(&var code, "wip_test_panics", move args)
+			self.callRuntime(&var code, "wip_test_panics", args)
 		}
-		self.callRuntime(&var code, "wip_tests_end", Vec::of(own [move count]))
+		self.callRuntime(&var code, "wip_tests_end", Vec::of(own [count]))
 		code.push((.None, .Ret(.Some(Val::of(.Int(0), .I(32))))))
-		self.defineCMain(move code)
+		self.defineCMain(code)
 	}
 
 	/// A call to the runtime's function `name`, which answers nothing, with
 	/// `args`, at the end of `code`.
 	var fn callRuntime(code: &var Vec<(Option<Value>, Op)>, name: str, args: Vec<Val>) = {
 		val callee = self.symbol(self.runtime(name))
-		code.push((.None, .Call(own Call::plain(.Global(callee), .Void, move args))))
+		code.push((.None, .Call(own Call::plain(.Global(callee), .Void, args))))
 	}
 }
 
@@ -1340,7 +1356,7 @@ fn byteArray(size: u32): Type = arrayOf(size as u64, .I(8))
 
 /// `slot`'s attributes, and `more` after them.
 fn addAttr(slot: &var Slot, more: Vec<Attr>) = {
-	slot.attrs.append(move more)
+	slot.attrs.append(more)
 }
 
 /// Whether C is on the other side of a function's calls.
@@ -1364,7 +1380,7 @@ fn escape(text: str): String = {
 			out.pushByte(digits[(byte & 15) as i64])
 		}
 	}
-	return move out
+	return out
 }
 
 /// Marks the functions that are in a cycle of their direct calls: each
@@ -1389,7 +1405,7 @@ fn markCycles(functions: &var Vec<Function>) = {
 				}
 			}
 		}
-		callees.push(move called)
+		callees.push(called)
 	}
 	val count = functions.len()
 	var index = Vec::filled(count, -1)

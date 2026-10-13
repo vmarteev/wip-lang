@@ -2,10 +2,9 @@
 // a few instructions, every block a label.
 
 import std::mem
-import hir::{Access, BOOL, FnId, I64, IntTy, STR, Ty, TyKind}
+import hir::{Access, BOOL, FnId, I64, IntTy, Layout, STR, Tag, Ty, TyKind}
 import mir::{
 	Answer,
-	Layout,
 	Part,
 	AtomicOp,
 	AtomicOrder,
@@ -25,7 +24,6 @@ import mir::{
 	Rvalue,
 	Source,
 	Statement,
-	Tag,
 	Terminator,
 	Turn,
 	elementTy,
@@ -109,7 +107,7 @@ fn defineFn(
 		entry: Vec(),
 		next: 0,
 		storage: Vec(),
-		addressSlots: move addressSlots,
+		addressSlots: addressSlots,
 		subprogram: subprogram.clone(),
 		place: .Some(first),
 		blocks: Vec(),
@@ -138,16 +136,16 @@ fn defineFn(
 	val into: Option<i64> = if m.optimize then .None else g.firstPlace()
 	var start = mem::replace(&var g.entry, Vec())
 	for instruction in mem::replace(&var g.code[0].instructions, Vec()) {
-		start.push(move instruction)
+		start.push(instruction)
 	}
 	start.push(Instruction(result: .None, op: .Br(.Block(0)), at: into))
-	g.code[0].instructions = move start
+	g.code[0].instructions = start
 	return Function(
 		symbol: symbol,
 		linkage: linkage,
 		ret: sig.retType(),
 		retAttrs: sig.retAttrs(),
-		params: move params,
+		params: params,
 		returns: !never,
 		subprogram: subprogram.node,
 		blocks: mem::replace(&var g.code, Vec()),
@@ -245,7 +243,7 @@ extend FnGen {
 			)
 			self.entry.push(Instruction(
 				result: .None,
-				op: .Declare(address: move storage, variable: variable, expression: expression),
+				op: .Declare(address: storage, variable: variable, expression: expression),
 				at: .Some(place),
 			))
 		}
@@ -286,16 +284,16 @@ extend FnGen {
 	var fn instruction(result: Option<Value>, op: Op) = {
 		val at = self.place
 		val last = self.code.len() - 1
-		self.code[last].instructions.push(Instruction(result: move result, op: move op, at: at))
+		self.code[last].instructions.push(Instruction(result: result, op: op, at: at))
 	}
 
-	var fn emit(op: Op) = self.instruction(.None, move op)
+	var fn emit(op: Op) = self.instruction(.None, op)
 
 	/// An instruction whose answer is a new temporary.
 	var fn value(op: Op, t: Type): Val = {
 		val name = self.temp()
-		self.instruction(.Some(name.clone()), move op)
-		return Val(v: move name, t: move t)
+		self.instruction(.Some(name.clone()), op)
+		return Val(v: name, t: t)
 	}
 
 	/// Starts a block.
@@ -303,8 +301,8 @@ extend FnGen {
 
 	/// A stack slot `name` in the entry block, of type `t` at `align`.
 	var fn slot(name: Value, t: Type, align: u32) = self.entry.push(Instruction(
-		result: .Some(move name),
-		op: .Alloca(t: move t, align: align),
+		result: .Some(name),
+		op: .Alloca(t: t, align: align),
 		at: .None,
 	))
 
@@ -312,7 +310,7 @@ extend FnGen {
 	var fn alloca(size: u32, align: u32): Value = {
 		val name = self.temp()
 		self.slot(name.clone(), byteArray(size.max(1)), align.max(1))
-		return move name
+		return name
 	}
 
 	fn placeTy(m: &Llvm, place: &Place): Ty = placeTy(m.program, self.body, &place)
@@ -362,52 +360,56 @@ extend FnGen {
 				values.push(.Param(i))
 			}
 			incoming += count
-			paramValues.push((param, move values))
+			paramValues.push((param, values))
 		}
 		for (i, decl) in body.locals.forwards().enumerate() {
 			val local = Local::of(i as u32)
 			val aggregate = m.isAggregate(decl.ty)
-			val storage: Value = if decl.kind == .Return && aggregate {
-				match sret {
-					.Some(s) => s.clone()
-					.None => panic("an aggregate result's address")
-				}
-			} else if decl.kind == .Param && aggregate {
-				var values: Vec<Value> = Vec()
-				for (p, given) in paramValues {
-					if p == local then values = given.clone()
-				}
-				if values.len() == 2 {
-					// A pointer and a length from C, put back together.
-					val slot = Value::Slot(i as u32)
-					self.slot(slot.clone(), byteArray(16), 8)
-					val pointer = Val::of(values[0].clone(), .Ptr)
-					self.store(&pointer, slot.clone(), 8)
-					val length = self.temp()
-					self.instruction(
-						.Some(length.clone()),
-						.Offset(base: slot.clone(), offset: .Int(8)),
-					)
-					val count = Val::of(values[1].clone(), .I(64))
-					self.store(&count, move length, 8)
-					move slot
-				} else {
-					if debug {
-						val slot = Value::AddressSlot(i as u32)
-						self.slot(slot.clone(), .Ptr, 8)
-						val address = Val::of(values[0].clone(), .Ptr)
-						self.store(&address, slot.clone(), 8)
-						self.addressSlots[i] = .Some(move slot)
+			val storage: Value = when {
+				decl.kind == .Return && aggregate => {
+					match sret {
+						.Some(s) => s.clone()
+						.None => panic("an aggregate result's address")
 					}
-					values[0].clone()
 				}
-			} else {
-				val layout = m.layout(decl.ty)
-				val slot = Value::Slot(i as u32)
-				self.slot(slot.clone(), byteArray(layout.size.max(1)), layout.align.max(1))
-				move slot
+				decl.kind == .Param && aggregate => {
+					var values: Vec<Value> = Vec()
+					for (p, given) in paramValues {
+						if p == local then values = given.clone()
+					}
+					if values.len() == 2 {
+						// A pointer and a length from C, put back together.
+						val slot = Value::Slot(i as u32)
+						self.slot(slot.clone(), byteArray(16), 8)
+						val pointer = Val::of(values[0].clone(), .Ptr)
+						self.store(&pointer, slot.clone(), 8)
+						val length = self.temp()
+						self.instruction(
+							.Some(length.clone()),
+							.Offset(base: slot.clone(), offset: .Int(8)),
+						)
+						val count = Val::of(values[1].clone(), .I(64))
+						self.store(&count, length, 8)
+						slot
+					} else {
+						if debug {
+							val slot = Value::AddressSlot(i as u32)
+							self.slot(slot.clone(), .Ptr, 8)
+							val address = Val::of(values[0].clone(), .Ptr)
+							self.store(&address, slot.clone(), 8)
+							self.addressSlots[i] = .Some(slot)
+						}
+						values[0].clone()
+					}
+				}
+				else => {
+					val layout = m.layout(decl.ty)
+					val slot = Value::Slot(i as u32)
+					self.slot(slot.clone(), byteArray(layout.size.max(1)), layout.align.max(1))
+					slot
+				}
 			}
-			self.storage.push(move storage)
+			self.storage.push(storage)
 		}
 		for (local, values) in paramValues {
 			val ty = body.local(local).ty
@@ -417,7 +419,7 @@ extend FnGen {
 				val .Param(index) = values[0] else panic("a parameter")
 				val given = Val(v: values[0].clone(), t: sig.params[index as i64].t.clone())
 				val slot = self.storage[local.index as i64].clone()
-				self.writeAt(&var m, &given, ty, move slot)
+				self.writeAt(&var m, &given, ty, slot)
 			}
 		}
 		self.place = place
@@ -426,12 +428,12 @@ extend FnGen {
 	// Places and values.
 
 	var fn gep(base: Value, offset: i64): Value =
-		if offset == 0 then move base
-		else self.value(.Offset(base: move base, offset: .Int(offset as i64)), .Ptr).take()
+		if offset == 0 then base
+		else self.value(.Offset(base: base, offset: .Int(offset as i64)), .Ptr).take()
 
 	var fn load(addr: Value, t: Type, align: u32): Val = self.value(
-		.Load(t: t.clone(), address: move addr, align: align, assumes: .Nothing),
-		move t,
+		.Load(t: t.clone(), address: addr, align: align, assumes: .Nothing),
+		t,
 	)
 
 	/// A reference read from memory, with what LLVM may assume of it: that it
@@ -446,19 +448,17 @@ extend FnGen {
 			.Tuple(Vec::of(own [MetaItem::Int(bits: 64, value: layout.align.max(1) as i64)])),
 		)
 		return self.value(
-			.Load(
-				t: .Ptr,
-				address: move addr,
-				align: 8,
-				assumes: .Reference(nonnull: nonnull, align: align),
-			),
+			.Load(t: .Ptr, address: addr, align: 8, assumes: .Reference(
+				nonnull: nonnull,
+				align: align,
+			)),
 			.Ptr,
 		)
 	}
 
 	var fn store(value: &Val, addr: Value, align: u32) = self.emit(.Store(
 		value: value.clone(),
-		address: move addr,
+		address: addr,
 		align: align,
 	))
 
@@ -467,10 +467,10 @@ extend FnGen {
 		var addr = self.storage[place.local.index as i64].clone()
 		var ty = self.body.local(place.local).ty
 		for projection in place.projections {
-			addr = self.project(&var m, move addr, ty, &projection)
+			addr = self.project(&var m, addr, ty, &projection)
 			ty = projectTy(m.program, ty, projection.clone())
 		}
-		return move addr
+		return addr
 	}
 
 	var fn project(
@@ -480,23 +480,22 @@ extend FnGen {
 		projection: &Projection,
 	): Value = match projection {
 		.Deref => match m.referent(ty) {
-			.Some(layout) => self.loadReference(&var m, move addr, layout).take()
-			.None => self.load(move addr, .Ptr, 8).take()
+			.Some(layout) => self.loadReference(&var m, addr, layout).take()
+			.None => self.load(addr, .Ptr, 8).take()
 		}
 		.Field(index) => {
 			val offset =
 				if m.kind(ty) is .Struct(..) then m.layouts.fieldOffset(m.program, ty, index)
 				else index * 8
-			self.gep(move addr, offset as i64)
+			self.gep(addr, offset as i64)
 		}
 		.VariantField(variant, field) => {
 			val offset = m.layouts.variantOffset(m.program, ty, variant, field)
-			self.gep(move addr, offset as i64)
+			self.gep(addr, offset as i64)
 		}
 		.Index(..) | .ConstIndex(..) => {
 			val .Some(elem) = elementTy(m.program, ty) else panic("elements")
-			val first =
-				if m.kind(ty) is .Array(..) then move addr else self.load(move addr, .Ptr, 8).take()
+			val first = if m.kind(ty) is .Array(..) then addr else self.load(addr, .Ptr, 8).take()
 			val stride = m.layout(elem).stride() as i64
 			match projection {
 				.Index(local) => {
@@ -507,14 +506,14 @@ extend FnGen {
 						.Arithmetic(
 							op: .Mul,
 							wrap: .None,
-							left: Val::of(move wide, .I(64)),
+							left: Val::of(wide, .I(64)),
 							right: .Int(stride as i64),
 						),
 						.I(64),
 					)
-					self.value(.Offset(base: move first, offset: move offset.v), .Ptr).take()
+					self.value(.Offset(base: first, offset: offset.v), .Ptr).take()
 				}
-				.ConstIndex(index) => self.gep(move first, stride *% index as i64)
+				.ConstIndex(index) => self.gep(first, stride *% index as i64)
 				_ => panic("an element")
 			}
 		}
@@ -527,16 +526,16 @@ extend FnGen {
 	/// A float's or a pointer's bits as the integer `bits` is, for an
 	/// instruction that takes integers; an integer as it is.
 	var fn asBits(value: Val, bits: &Type): Val = {
-		if value.t == bits then return move value
+		if value.t == bits then return value
 		val cast: Cast = if value.t is .Ptr then .PtrToInt else .Bitcast
-		return self.value(.Cast(cast: cast, value: move value, to: bits.clone()), bits.clone())
+		return self.value(.Cast(cast: cast, value: value, to: bits.clone()), bits.clone())
 	}
 
 	/// What `asBits` made, as the type `to` again.
 	var fn fromBits(value: Val, to: &Type): Val = {
-		if value.t == to then return move value
+		if value.t == to then return value
 		val cast: Cast = if to is .Ptr then .IntToPtr else .Bitcast
-		return self.value(.Cast(cast: cast, value: move value, to: to.clone()), to.clone())
+		return self.value(.Cast(cast: cast, value: value, to: to.clone()), to.clone())
 	}
 
 	var fn coerce(value: &Val, to: Type): Value = {
@@ -549,7 +548,7 @@ extend FnGen {
 	var fn convert(value: &Val, to: Type): Value = match (value.t.clone(), to.clone()) {
 		(.Ptr, .I(64)) => self.value(
 			.Cast(cast: .PtrToInt, value: value.clone(), to: to.clone()),
-			move to,
+			to,
 		).take()
 		(.Ptr, .I(bits)) => {
 			val word = self.value(.Cast(cast: .PtrToInt, value: value.clone(), to: .I(64)), .I(64))
@@ -557,16 +556,13 @@ extend FnGen {
 		}
 		(.I(64), .Ptr) => self.value(
 			.Cast(cast: .IntToPtr, value: value.clone(), to: .Ptr),
-			move to,
+			to,
 		).take()
 		(.I(..), .Ptr) => {
 			val word = self.intResize(&value, 64)
-			self.value(
-				.Cast(cast: .IntToPtr, value: Val::of(move word, .I(64)), to: .Ptr),
-				move to,
-			).take()
+			self.value(.Cast(cast: .IntToPtr, value: Val::of(word, .I(64)), to: .Ptr), to).take()
 		}
-		_ => self.coerce(&value, move to)
+		_ => self.coerce(&value, to)
 	}
 
 	/// An integer to another width: its low bits, or extended with zeros.
@@ -586,8 +582,8 @@ extend FnGen {
 			val align = self.placeAlign(&var m, &place, ty)
 			val addr = self.placeAddr(&var m, &place)
 			match m.referent(ty) {
-				.Some(layout) => self.loadReference(&var m, move addr, layout)
-				.None => self.load(move addr, move lt, align)
+				.Some(layout) => self.loadReference(&var m, addr, layout)
+				.None => self.load(addr, lt, align)
 			}
 		}
 	}
@@ -632,8 +628,8 @@ extend FnGen {
 		val .Some(lt) = m.lt(ty) else return
 		val v = self.coerce(&value, lt.clone())
 		val align = self.align(&var m, ty)
-		val stored = Val(v: move v, t: move lt)
-		self.store(&stored, move slot, align)
+		val stored = Val(v: v, t: lt)
+		self.store(&stored, slot, align)
 	}
 
 	/// Stores a scalar in a place, as the place's type.
@@ -643,20 +639,20 @@ extend FnGen {
 		val v = self.coerce(&value, lt.clone())
 		val align = self.placeAlign(&var m, &place, ty)
 		val addr = self.placeAddr(&var m, &place)
-		val stored = Val(v: move v, t: move lt)
-		self.store(&stored, move addr, align)
+		val stored = Val(v: v, t: lt)
+		self.store(&stored, addr, align)
 	}
 
 	/// A call of a function that answers nothing, already declared.
 	var fn callVoid(callee: u32, values: Vec<Val>) = self.emit(
-		.Call(own Call::plain(.Global(callee), .Void, move values)),
+		.Call(own Call::plain(.Global(callee), .Void, values)),
 	)
 
 	/// A call of LLVM's intrinsic `name`, declared as taking what `values`
 	/// are, that answers nothing.
 	var fn intrinsicVoid(m: &var Llvm, name: str, values: Vec<Val>) = {
 		val callee = m.intrinsic(name, .Void, typesOf(&values))
-		self.callVoid(callee, move values)
+		self.callVoid(callee, values)
 	}
 
 	var fn memset(m: &var Llvm, addr: Value, byte: u8, size: u32) = {
@@ -665,7 +661,7 @@ extend FnGen {
 			&var m,
 			"@llvm.memset.p0.i64",
 			Vec::of(own [
-				Val::of(move addr, .Ptr),
+				Val::of(addr, .Ptr),
 				Val::of(.Int((byte as i8) as i64), .I(8)),
 				Val::of(.Int(size as i64), .I(64)),
 				Val::of(.Int(0), .I(1)),
@@ -679,8 +675,8 @@ extend FnGen {
 			&var m,
 			"@llvm.memmove.p0.p0.i64",
 			Vec::of(own [
-				Val::of(move dest, .Ptr),
-				Val::of(move src, .Ptr),
+				Val::of(dest, .Ptr),
+				Val::of(src, .Ptr),
 				Val::of(.Int(size as i64), .I(64)),
 				Val::of(.Int(0), .I(1)),
 			]),
@@ -704,13 +700,13 @@ extend FnGen {
 			val ty = self.placeTy(&m, &place)
 			val size = m.layout(ty).size
 			val addr = self.placeAddr(&var m, &place)
-			self.memset(&var m, move addr, 0, size)
+			self.memset(&var m, addr, 0, size)
 		}
 		.Poison(place) => {
 			val ty = self.placeTy(&m, &place)
 			val size = m.layout(ty).size
 			val addr = self.placeAddr(&var m, &place)
-			self.memset(&var m, move addr, POISON as u8, size)
+			self.memset(&var m, addr, POISON as u8, size)
 		}
 		.CheckMoved(place, at) => self.checkMoved(&var m, &place, at)
 		.Call(callee, args, dest) => self.call(&var m, &callee, &args, &dest)
@@ -726,7 +722,7 @@ extend FnGen {
 			} else {
 				m.runtime("wip_alloc")
 			}
-			val .Some(ptr) = self.callValues(&var m, alloc, move values) else {
+			val .Some(ptr) = self.callValues(&var m, alloc, values) else {
 				panic("an allocation's address")
 			}
 			self.write(&var m, &dest, &ptr)
@@ -743,39 +739,39 @@ extend FnGen {
 				Vec::of(own [counted.clone(), Val::of(.Int(stride as i64), .I(64))]),
 			)
 			val size = self.value(.ExtractValue(aggregate: both.clone(), index: 0), .I(64))
-			val over = self.value(.ExtractValue(aggregate: move both, index: 1), .I(1))
-			self.trapIf(&var m, move over.v)
+			val over = self.value(.ExtractValue(aggregate: both, index: 1), .I(1))
+			self.trapIf(&var m, over.v)
 			val elemAlign = m.layout(elem).align
-			var values = Vec::of(own [move size])
+			var values = Vec::of(own [size])
 			val alloc = if elemAlign > 16 {
 				values.push(Val::of(.Int(elemAlign as i64), .I(64)))
 				m.runtime("wip_alloc_aligned")
 			} else {
 				m.runtime("wip_alloc")
 			}
-			val .Some(ptr) = self.callValues(&var m, alloc, move values) else {
+			val .Some(ptr) = self.callValues(&var m, alloc, values) else {
 				panic("an allocation's address")
 			}
 			val addr = self.placeAddr(&var m, &dest)
 			self.store(&ptr, addr.clone(), 8)
-			val length = self.gep(move addr, 8)
-			self.store(&counted, move length, 8)
+			val length = self.gep(addr, 8)
+			self.store(&counted, length, 8)
 		}
 		.Free(operand) => {
 			val ptr = self.operand(&var m, &operand)
 			val free = m.runtime("wip_free")
-			self.callValues(&var m, free, Vec::of(own [move ptr]))
+			self.callValues(&var m, free, Vec::of(own [ptr]))
 		}
 		.DropFn(ty, ptr) => {
 			val given = self.operand(&var m, &ptr)
 			val pointer = self.coerce(&given, .Ptr)
 			val drop = m.dropFn(ty, false)
-			self.callVoid(drop, Vec::of(own [Val::of(move pointer, .Ptr)]))
+			self.callVoid(drop, Vec::of(own [Val::of(pointer, .Ptr)]))
 		}
 		.DropInPlace(ty, place) => {
 			val pointer = self.placeAddr(&var m, &place)
 			val drop = m.dropFn(ty, true)
-			self.callVoid(drop, Vec::of(own [Val::of(move pointer, .Ptr)]))
+			self.callVoid(drop, Vec::of(own [Val::of(pointer, .Ptr)]))
 		}
 		.Arith(dest, op, lhs, rhs, at) => {
 			val ty = self.placeTy(&m, &dest)
@@ -785,7 +781,7 @@ extend FnGen {
 			val lt = left.t.clone()
 			val right = Val(v: self.coerce(&given, lt.clone()), t: lt.clone())
 			val over = self.overflows(&var m, op, signed, &left, &right)
-			self.checkI1(&var m, move over.v, .Overflow(which: overflowCode(op), at: at))
+			self.checkI1(&var m, over.v, .Overflow(which: overflowCode(op), at: at))
 			// Past the check the answer fits, which LLVM's flags say of the
 			// operation computed again here, where it is used: a loop's counter
 			// that cannot wrap is one LLVM can reason about. LLVM finds the two
@@ -797,13 +793,8 @@ extend FnGen {
 			}
 			val wrap: Wrap = if signed then .NoSigned else .NoUnsigned
 			val answer = self.value(
-				.Arithmetic(
-					op: arithmetic,
-					wrap: .Some(wrap),
-					left: move left,
-					right: move right.v,
-				),
-				move lt,
+				.Arithmetic(op: arithmetic, wrap: .Some(wrap), left: left, right: right.v),
+				lt,
 			)
 			self.write(&var m, &dest, &answer)
 		}
@@ -837,8 +828,8 @@ extend FnGen {
 						self.value(
 							.AtomicRmw(
 								op: rmw,
-								address: move at,
-								value: Val::of(move amount, lt.clone()),
+								address: at,
+								value: Val::of(amount, lt.clone()),
 								align: align,
 								order: ordering,
 							),
@@ -853,14 +844,14 @@ extend FnGen {
 					val swapped = self.value(
 						.AtomicRmw(
 							op: .Xchg,
-							address: move at,
-							value: self.asBits(Val::of(move stored, lt.clone()), &bits),
+							address: at,
+							value: self.asBits(Val::of(stored, lt.clone()), &bits),
 							align: align,
 							order: ordering,
 						),
 						bits.clone(),
 					)
-					.Some(self.fromBits(move swapped, &lt))
+					.Some(self.fromBits(swapped, &lt))
 				}
 				// It answers whether it swapped, the flag LLVM gives: the bits
 				// held were the bits expected, which for a float is not `==`.
@@ -873,19 +864,19 @@ extend FnGen {
 					val stored = self.coerce(&given, lt.clone())
 					val both = self.value(
 						.CmpXchg(own CmpXchg(
-							address: move at,
-							expected: self.asBits(Val::of(move wanted, lt.clone()), &bits),
-							replacement: self.asBits(Val::of(move stored, lt.clone()), &bits),
+							address: at,
+							expected: self.asBits(Val::of(wanted, lt.clone()), &bits),
+							replacement: self.asBits(Val::of(stored, lt.clone()), &bits),
 							align: align,
 							order: ordering,
 						)),
 						withFlag(bits.clone()),
 					)
-					.Some(self.value(.ExtractValue(aggregate: move both, index: 1), .I(1)))
+					.Some(self.value(.ExtractValue(aggregate: both, index: 1), .I(1)))
 				}
 				.Load => .Some(
 					self.value(
-						.LoadAtomic(t: lt.clone(), address: move at, align: align, order: ordering),
+						.LoadAtomic(t: lt.clone(), address: at, align: align, order: ordering),
 						lt.clone(),
 					),
 				)
@@ -894,8 +885,8 @@ extend FnGen {
 					val given = self.operand(&var m, &operand)
 					val stored = self.coerce(&given, lt.clone())
 					self.emit(.StoreAtomic(
-						value: Val::of(move stored, lt.clone()),
-						address: move at,
+						value: Val::of(stored, lt.clone()),
+						address: at,
 						align: align,
 						order: ordering,
 					))
@@ -923,14 +914,14 @@ extend FnGen {
 			withFlag(left.t.clone()),
 			Vec::of(own [left.clone(), right.clone()]),
 		)
-		return self.value(.ExtractValue(aggregate: move both, index: 1), .I(1))
+		return self.value(.ExtractValue(aggregate: both, index: 1), .I(1))
 	}
 
 	/// Branches to what `panics` says when the `bool` `fails` holds is true,
 	/// and carries on otherwise.
 	var fn check(m: &var Llvm, fails: &Val, panics: Panics) = {
 		val flag = self.value(.IntCompare(cond: .Ne, left: fails.clone(), right: .Int(0)), .I(1))
-		self.checkI1(&var m, move flag.v, move panics)
+		self.checkI1(&var m, flag.v, panics)
 	}
 
 	var fn checkI1(m: &var Llvm, flag: Value, panics: Panics) = {
@@ -938,13 +929,13 @@ extend FnGen {
 		val fine = Label::Fine(self.number())
 		val unlikely = m.debug.unlikely()
 		self.emit(.CondBr(
-			condition: move flag,
+			condition: flag,
 			ifTrue: failed.clone(),
 			ifFalse: fine.clone(),
 			weights: .Some(unlikely),
 		))
 		self.startBlock(failed)
-		self.panics(&var m, move panics)
+		self.panics(&var m, panics)
 		self.emit(.Unreachable)
 		self.startBlock(fine)
 	}
@@ -957,11 +948,11 @@ extend FnGen {
 				.Bounds(index, length) => {
 					val i = self.operand(&var m, &index)
 					val n = self.operand(&var m, &length)
-					("wip_panic_index", Vec::of(own [move i, move n]))
+					("wip_panic_index", Vec::of(own [i, n]))
 				}
 				.Length(length) => {
 					val n = self.operand(&var m, &length)
-					("wip_panic_length", Vec::of(own [move n]))
+					("wip_panic_length", Vec::of(own [n]))
 				}
 				.Division => ("wip_panic_division", Vec())
 				.NullText => ("wip_panic_null_text", Vec())
@@ -970,7 +961,7 @@ extend FnGen {
 					Vec::of(own [Val::of(.Int(overflowCode(op) as i64), .I(64))]),
 				)
 			}
-			self.panicCall(&var m, name, move numbers, at)
+			self.panicCall(&var m, name, numbers, at)
 		}
 		.Overflow(which, at) => self.panicCall(
 			&var m,
@@ -988,20 +979,20 @@ extend FnGen {
 		}
 	}
 
-	var fn trapIf(m: &var Llvm, flag: Value) = self.checkI1(&var m, move flag, .Trap)
+	var fn trapIf(m: &var Llvm, flag: Value) = self.checkI1(&var m, flag, .Trap)
 
 	/// A call of a runtime panic: its own numbers, then the file, the line and
 	/// the column.
 	var fn panicCall(m: &var Llvm, name: str, numbers: Vec<Val>, at: Span) = {
 		val (file, line, column) = (m.locations)(at)
 		val fileData = m.text(file)
-		var args = move numbers
+		var args = numbers
 		args.push(Val::of(.Global(move fileData), .Ptr))
 		args.push(Val::of(.Int(file.len() as i64), .I(64)))
 		args.push(Val::of(.Int(line as i64), .I(64)))
 		args.push(Val::of(.Int(column as i64), .I(64)))
 		val id = m.runtime(name)
-		self.callValues(&var m, id, move args)
+		self.callValues(&var m, id, args)
 	}
 
 	/// A panic where the value at `place` begins with what a move leaves in a
@@ -1017,14 +1008,13 @@ extend FnGen {
 		val bits: u32 =
 			if size >= 8 then 64 else if size >= 4 then 32 else if size >= 2 then 16 else 8
 		val addr = self.placeAddr(&var m, &place)
-		var first = self.load(move addr, .I(bits), 1)
-		if bits < 64 then
-			first = self.value(.Cast(cast: .ZExt, value: move first, to: .I(64)), .I(64))
+		var first = self.load(addr, .I(bits), 1)
+		if bits < 64 then first = self.value(.Cast(cast: .ZExt, value: first, to: .I(64)), .I(64))
 		val poison = POISON as u128 & (((1 as u128) << bits) - 1)
 		val (file, line, column) = (m.locations)(at)
 		val fileData = m.text(file)
 		val args = Vec::of(own [
-			move first,
+			first,
 			Val::of(Value::int(signed(poison, 64)), .I(64)),
 			Val::of(.Global(move fileData), .Ptr),
 			Val::of(.Int(file.len() as i64), .I(64)),
@@ -1032,7 +1022,7 @@ extend FnGen {
 			Val::of(.Int(column as i64), .I(64)),
 		])
 		val id = m.runtime("wip_check_moved")
-		self.callValues(&var m, id, move args)
+		self.callValues(&var m, id, args)
 	}
 
 	var fn setVariant(m: &var Llvm, place: &Place, variant: u32) = {
@@ -1041,14 +1031,14 @@ extend FnGen {
 			.Byte(size) => {
 				val lt: Type = if size == 1 then .I(8) else .I(32)
 				val addr = self.placeAddr(&var m, &place)
-				val stored = Val::of(.Int(variant as i64), move lt)
-				self.store(&stored, move addr, size.min(4))
+				val stored = Val::of(.Int(variant as i64), lt)
+				self.store(&stored, addr, size.min(4))
 			}
 			.Niche(empty, offset, ..) if variant == empty => {
 				val addr = self.placeAddr(&var m, &place)
-				val at = self.gep(move addr, offset as i64)
+				val at = self.gep(addr, offset as i64)
 				val stored = Val::of(.Zero, .Ptr)
-				self.store(&stored, move at, 8)
+				self.store(&stored, at, 8)
 			}
 			.Niche(..) => {}
 		}
@@ -1059,17 +1049,17 @@ extend FnGen {
 		ty,
 	) {
 		.Byte(size: 1) => {
-			val tag = self.load(move addr, .I(8), 1)
-			self.value(.Cast(cast: .ZExt, value: move tag, to: .I(32)), .I(32))
+			val tag = self.load(addr, .I(8), 1)
+			self.value(.Cast(cast: .ZExt, value: tag, to: .I(32)), .I(32))
 		}
-		.Byte(..) => self.load(move addr, .I(32), 4)
+		.Byte(..) => self.load(addr, .I(32), 4)
 		.Niche(payload, empty, offset) => {
-			val at = self.gep(move addr, offset as i64)
-			val ptr = self.load(move at, .Ptr, 8)
-			val isNull = self.value(.IntCompare(cond: .Eq, left: move ptr, right: .Zero), .I(1))
+			val at = self.gep(addr, offset as i64)
+			val ptr = self.load(at, .Ptr, 8)
+			val isNull = self.value(.IntCompare(cond: .Eq, left: ptr, right: .Zero), .I(1))
 			self.value(
 				.Select(own Select(
-					condition: move isNull.v,
+					condition: isNull.v,
 					ifTrue: Val::of(.Int(empty as i64), .I(32)),
 					ifFalse: Val::of(.Int(payload as i64), .I(32)),
 				)),
@@ -1085,7 +1075,7 @@ extend FnGen {
 			val size = m.layout(ty).size
 			val dest = self.placeAddr(&var m, &place)
 			val from = self.placeAddr(&var m, &src)
-			self.memmove(&var m, move dest, move from, size)
+			self.memmove(&var m, dest, from, size)
 			return
 		}
 		if m.lt(ty).isNone() then return
@@ -1097,7 +1087,7 @@ extend FnGen {
 	/// are, that answers a value of type `t`.
 	var fn intrinsicValue(m: &var Llvm, name: str, t: Type, values: Vec<Val>): Val = {
 		val callee = m.intrinsic(name, t.clone(), typesOf(&values))
-		return self.value(.Call(own Call::plain(.Global(callee), t.clone(), move values)), move t)
+		return self.value(.Call(own Call::plain(.Global(callee), t.clone(), values)), t)
 	}
 
 	var fn rvalue(m: &var Llvm, rvalue: &Rvalue, ty: Ty): Val = match rvalue {
@@ -1111,29 +1101,29 @@ extend FnGen {
 			val lt = left.t.clone()
 			val right = Val(v: self.coerce(&given, lt.clone()), t: lt.clone())
 			val over = self.overflows(&var m, op, signed, &left, &right)
-			self.value(.Cast(cast: .ZExt, value: move over, to: .I(8)), .I(8))
+			self.value(.Cast(cast: .ZExt, value: over, to: .I(8)), .I(8))
 		}
 		.Unary(op, operand) => {
 			val value = self.operand(&var m, &operand)
 			val t = value.t.clone()
 			match op {
 				.Neg => {
-					if m.kind(ty) is .Float(..) then self.value(.FNeg(move value), move t)
+					if m.kind(ty) is .Float(..) then self.value(.FNeg(value), t)
 					else self.value(
 						.Arithmetic(
 							op: .Sub,
 							wrap: .None,
 							left: Val::of(.Int(0), t.clone()),
-							right: move value.v,
+							right: value.v,
 						),
-						move t,
+						t,
 					)
 				}
 				.Not => {
 					val mask: i64 = if m.kind(ty) is .Bool then 1 else -1
 					self.value(
-						.Arithmetic(op: .Xor, wrap: .None, left: move value, right: .Int(mask)),
-						move t,
+						.Arithmetic(op: .Xor, wrap: .None, left: value, right: .Int(mask)),
+						t,
 					)
 				}
 			}
@@ -1144,18 +1134,18 @@ extend FnGen {
 		.VTableFn(table, index, methods) => {
 			val given = self.operand(&var m, &table)
 			val at = self.coerce(&given, .Ptr)
-			val entry = self.gep(move at, index as i64 * 8)
+			val entry = self.gep(at, index as i64 * 8)
 			if methods {
 				// A table of methods is a constant, never freed: what is read
 				// from it is the same wherever it is read, which lets LLVM read
 				// it once where a loop calls through one `&dyn`.
 				val invariant = m.debug.constant(.Tuple(Vec()))
 				self.value(
-					.Load(t: .Ptr, address: move entry, align: 8, assumes: .Invariant(invariant)),
+					.Load(t: .Ptr, address: entry, align: 8, assumes: .Invariant(invariant)),
 					.Ptr,
 				)
 			} else {
-				self.load(move entry, .Ptr, 8)
+				self.load(entry, .Ptr, 8)
 			}
 		}
 		.Float(op, operand) => {
@@ -1168,12 +1158,7 @@ extend FnGen {
 			}
 			val (t, suffix) = floatNames(value.t.clone())
 			val answer = value.t.clone()
-			self.intrinsicValue(
-				&var m,
-				"@llvm.\(name).\(suffix)",
-				move answer,
-				Vec::of(own [move value]),
-			)
+			self.intrinsicValue(&var m, "@llvm.\(name).\(suffix)", answer, Vec::of(own [value]))
 		}
 		.MulAdd(first, second, third) => {
 			val a = self.operand(&var m, &first)
@@ -1181,17 +1166,12 @@ extend FnGen {
 			val c = self.operand(&var m, &third)
 			val (t, suffix) = floatNames(a.t.clone())
 			val answer = a.t.clone()
-			self.intrinsicValue(
-				&var m,
-				"@llvm.fma.\(suffix)",
-				move answer,
-				Vec::of(own [move a, move b, move c]),
-			)
+			self.intrinsicValue(&var m, "@llvm.fma.\(suffix)", answer, Vec::of(own [a, b, c]))
 		}
 		.Integer(op, operand) => {
 			val value = self.operand(&var m, &operand)
 			val t = value.t.text()
-			if op == IntegerOp::SwapBytes && value.t == Type::I(8) then return move value
+			if op == IntegerOp::SwapBytes && value.t == Type::I(8) then return value
 			val answer = value.t.clone()
 			match op {
 				.CountOnes | .SwapBytes | .ReverseBits => {
@@ -1200,12 +1180,7 @@ extend FnGen {
 						.SwapBytes => "bswap"
 						_ => "bitreverse"
 					}
-					self.intrinsicValue(
-						&var m,
-						"@llvm.\(name).\(t)",
-						move answer,
-						Vec::of(own [move value]),
-					)
+					self.intrinsicValue(&var m, "@llvm.\(name).\(t)", answer, Vec::of(own [value]))
 				}
 				.LeadingZeros | .TrailingZeros => {
 					val name = if op == IntegerOp::LeadingZeros then "ctlz" else "cttz"
@@ -1213,8 +1188,8 @@ extend FnGen {
 					self.intrinsicValue(
 						&var m,
 						"@llvm.\(name).\(t)",
-						move answer,
-						Vec::of(own [move value, Val::of(.Int(0), .I(1))]),
+						answer,
+						Vec::of(own [value, Val::of(.Int(0), .I(1))]),
 					)
 				}
 			}
@@ -1226,31 +1201,31 @@ extend FnGen {
 			val t = value.t.text()
 			val name = if turn == Turn::Left then "fshl" else "fshr"
 			val answer = value.t.clone()
-			val shifted = Val::of(move by, value.t.clone())
+			val shifted = Val::of(by, value.t.clone())
 			self.intrinsicValue(
 				&var m,
 				"@llvm.\(name).\(t)",
-				move answer,
-				Vec::of(own [value.clone(), move value, move shifted]),
+				answer,
+				Vec::of(own [value.clone(), value, shifted]),
 			)
 		}
 		.Bits(operand) => {
 			val value = self.operand(&var m, &operand)
 			val .Some(target) = m.lt(ty) else panic("bits are a scalar's")
-			self.value(.Cast(cast: .Bitcast, value: move value, to: target.clone()), move target)
+			self.value(.Cast(cast: .Bitcast, value: value, to: target.clone()), target)
 		}
 		.CstrLen(operand) => {
 			val pointer = self.operand(&var m, &operand)
 			val id = m.runtime("wip_cstr_len")
-			match self.callValues(&var m, id, Vec::of(own [move pointer])) {
-				.Some(length) => move length
+			match self.callValues(&var m, id, Vec::of(own [pointer])) {
+				.Some(length) => length
 				.None => panic("a length")
 			}
 		}
 		.Variant(place) => {
 			val placed = self.placeTy(&m, &place)
 			val addr = self.placeAddr(&var m, &place)
-			self.variantIndex(&var m, move addr, placed)
+			self.variantIndex(&var m, addr, placed)
 		}
 	}
 
@@ -1271,11 +1246,8 @@ extend FnGen {
 				_ => .None
 			}
 			if compare is .Some(cond) {
-				val answer = self.value(
-					.FloatCompare(cond: cond, left: move l, right: move r.v),
-					.I(1),
-				)
-				return self.value(.Cast(cast: .ZExt, value: move answer, to: .I(8)), .I(8))
+				val answer = self.value(.FloatCompare(cond: cond, left: l, right: r.v), .I(1))
+				return self.value(.Cast(cast: .ZExt, value: answer, to: .I(8)), .I(8))
 			}
 			val arithmetic: Arithmetic = match op {
 				.Add => .FAdd
@@ -1285,10 +1257,7 @@ extend FnGen {
 				.Rem => .FRem
 				_ => panic("the type checker rejects this operator on floats")
 			}
-			return self.value(
-				.Arithmetic(op: arithmetic, wrap: .None, left: move l, right: move r.v),
-				move t,
-			)
+			return self.value(.Arithmetic(op: arithmetic, wrap: .None, left: l, right: r.v), t)
 		}
 		val unsigned = !(kind is .Int(int) && int.signed())
 		val right = Val(v: self.coerce(&r, t.clone()), t: t.clone())
@@ -1302,11 +1271,8 @@ extend FnGen {
 			_ => .None
 		}
 		if comparison is .Some(cond) {
-			val answer = self.value(
-				.IntCompare(cond: cond, left: move l, right: move right.v),
-				.I(1),
-			)
-			return self.value(.Cast(cast: .ZExt, value: move answer, to: .I(8)), .I(8))
+			val answer = self.value(.IntCompare(cond: cond, left: l, right: right.v), .I(1))
+			return self.value(.Cast(cast: .ZExt, value: answer, to: .I(8)), .I(8))
 		}
 		val .I(bits) = t else panic("arithmetic on \(t.text())")
 		// MIR checks the most negative number divided by -1 only to 64 bits;
@@ -1320,10 +1286,10 @@ extend FnGen {
 			)
 			val by = self.value(.IntCompare(cond: .Eq, left: right.clone(), right: .Int(-1)), .I(1))
 			val both = self.value(
-				.Arithmetic(op: .And, wrap: .None, left: move edge, right: move by.v),
+				.Arithmetic(op: .And, wrap: .None, left: edge, right: by.v),
 				.I(1),
 			)
-			self.checkI1(&var m, move both.v, .Abort)
+			self.checkI1(&var m, both.v, .Abort)
 		}
 		val arithmetic: Arithmetic = match op {
 			.Add => .Add
@@ -1340,28 +1306,17 @@ extend FnGen {
 				// The amount is taken modulo the width, which LLVM leaves
 				// undefined past it.
 				val masked = self.value(
-					.Arithmetic(
-						op: .And,
-						wrap: .None,
-						left: move right,
-						right: .Int((bits - 1) as i64),
-					),
+					.Arithmetic(op: .And, wrap: .None, left: right, right: .Int((bits - 1) as i64)),
 					t.clone(),
 				)
 				val shift: Arithmetic =
 					if op == BinaryOp::Shl then .Shl else if unsigned then .LShr else .AShr
-				return self.value(
-					.Arithmetic(op: shift, wrap: .None, left: move l, right: move masked.v),
-					move t,
-				)
+				return self.value(.Arithmetic(op: shift, wrap: .None, left: l, right: masked.v), t)
 			}
 			.And | .Or => panic("`&&` and `||` are branches in MIR")
 			_ => panic("compared above")
 		}
-		return self.value(
-			.Arithmetic(op: arithmetic, wrap: .None, left: move l, right: move right.v),
-			move t,
-		)
+		return self.value(.Arithmetic(op: arithmetic, wrap: .None, left: l, right: right.v), t)
 	}
 
 	/// `operand as to`.
@@ -1373,24 +1328,15 @@ extend FnGen {
 		if from is .Int(int: a) && toKind is .Int(int: b) {
 			if a.bits() < b.bits() {
 				val extend: Cast = if a.signed() then .SExt else .ZExt
-				return self.value(
-					.Cast(cast: extend, value: move value, to: target.clone()),
-					move target,
-				)
+				return self.value(.Cast(cast: extend, value: value, to: target.clone()), target)
 			}
 			if a.bits() > b.bits() then
-				return self.value(
-					.Cast(cast: .Trunc, value: move value, to: target.clone()),
-					move target,
-				)
-			return move value
+				return self.value(.Cast(cast: .Trunc, value: value, to: target.clone()), target)
+			return value
 		}
 		if from is .Int(int: a) && toKind is .Float(..) {
 			val conversion: Cast = if a.signed() then .SiToFp else .UiToFp
-			return self.value(
-				.Cast(cast: conversion, value: move value, to: target.clone()),
-				move target,
-			)
+			return self.value(.Cast(cast: conversion, value: value, to: target.clone()), target)
 		}
 		// Toward zero, saturating at the ends of the range, NaN to 0: what
 		// LLVM's saturating conversion does.
@@ -1401,23 +1347,17 @@ extend FnGen {
 			return self.intrinsicValue(
 				&var m,
 				"@llvm.\(name).sat.\(t).\(suffix)",
-				move target,
-				Vec::of(own [move value]),
+				target,
+				Vec::of(own [value]),
 			)
 		}
 		if from is .Float(float: .F32) && toKind is .Float(float: .F64) then
-			return self.value(
-				.Cast(cast: .FpExt, value: move value, to: target.clone()),
-				move target,
-			)
+			return self.value(.Cast(cast: .FpExt, value: value, to: target.clone()), target)
 		if from is .Float(float: .F64) && toKind is .Float(float: .F32) then
-			return self.value(
-				.Cast(cast: .FpTrunc, value: move value, to: target.clone()),
-				move target,
-			)
+			return self.value(.Cast(cast: .FpTrunc, value: value, to: target.clone()), target)
 		// A pointer and the number it is, an `own` as a pointer: the same word.
 		val v = self.convert(&value, target.clone())
-		return Val(v: move v, t: move target)
+		return Val(v: v, t: target)
 	}
 
 	// Calls.
@@ -1437,10 +1377,10 @@ extend FnGen {
 				if args.len() == 1 {
 					val given = self.operand(&var m, &args[0])
 					val v = self.coerce(&given, lt.clone())
-					val stored = Val(v: move v, t: move lt)
-					self.store(&stored, move symbol, align)
+					val stored = Val(v: v, t: lt)
+					self.store(&stored, symbol, align)
 				} else {
-					val value = self.load(move symbol, move lt, align)
+					val value = self.load(symbol, lt, align)
 					val .Some(d) = dest else panic("a read has a destination")
 					self.write(&var m, &d, &value)
 				}
@@ -1498,24 +1438,25 @@ extend FnGen {
 		}
 		for arg in args {
 			val ty = self.operandTy(&m, &arg)
-			if cAbi && m.isCPair(ty) {
-				val .Copy(place) = arg else panic("a pointer-and-length operand is a place")
-				val addr = self.placeAddr(&var m, &place)
-				val pointer = self.load(addr.clone(), .Ptr, 8)
-				val at = self.gep(move addr, 8)
-				val length = self.load(move at, .I(64), 8)
-				values.push(move pointer)
-				values.push(move length)
-			} else if m.isAggregate(ty) {
-				val .Copy(place) = arg else panic("an aggregate operand is a place")
-				values.push(Val(v: self.placeAddr(&var m, &place), t: .Ptr))
-			} else if m.lt(ty) == .None {
+			when {
+				cAbi && m.isCPair(ty) => {
+					val .Copy(place) = arg else panic("a pointer-and-length operand is a place")
+					val addr = self.placeAddr(&var m, &place)
+					val pointer = self.load(addr.clone(), .Ptr, 8)
+					val at = self.gep(addr, 8)
+					val length = self.load(at, .I(64), 8)
+					values.push(pointer)
+					values.push(length)
+				}
+				m.isAggregate(ty) => {
+					val .Copy(place) = arg else panic("an aggregate operand is a place")
+					values.push(Val(v: self.placeAddr(&var m, &place), t: .Ptr))
+				}
 				// A value with no size, `void`, which a generic function takes
 				// as it takes any `T`: the signature gives it a pointer, which
 				// the callee never reads.
-				values.push(Val::of(.Zero, .Ptr))
-			} else {
-				values.push(self.operand(&var m, &arg))
+				m.lt(ty) == .None => values.push(Val::of(.Zero, .Ptr))
+				else => values.push(self.operand(&var m, &arg))
 			}
 		}
 		val target: Value = match callee {
@@ -1533,7 +1474,7 @@ extend FnGen {
 				self.coerce(&given, .Ptr)
 			}
 		}
-		val answer = self.emitCall(move target, &sig, move values)
+		val answer = self.emitCall(target, &sig, values)
 		if !sig.sret && answer is .Some(a) && dest is .Some(d) then self.write(&var m, &d, &a)
 	}
 
@@ -1567,10 +1508,10 @@ extend FnGen {
 					val src = self.placeAddr(&var m, &argPlace)
 					val scratch = self.scratch(&var m, ty, &parts)
 					val size = m.layout(ty).size
-					self.memmove(&var m, scratch.clone(), move src, size)
+					self.memmove(&var m, scratch.clone(), src, size)
 					for part in parts {
 						val at = self.gep(scratch.clone(), part.offset as i64)
-						values.push(self.load(move at, regType(part.reg.clone()), 1))
+						values.push(self.load(at, regType(part.reg.clone()), 1))
 					}
 				}
 				.Copy => {
@@ -1578,8 +1519,8 @@ extend FnGen {
 					val src = self.placeAddr(&var m, &argPlace)
 					val layout = m.layout(ty)
 					val copy = self.alloca(layout.size, layout.align)
-					self.memmove(&var m, copy.clone(), move src, layout.size)
-					values.push(Val(v: move copy, t: .Ptr))
+					self.memmove(&var m, copy.clone(), src, layout.size)
+					values.push(Val(v: copy, t: .Ptr))
 				}
 				.Stack(..) => {
 					val argPlace = placeOf(&arg)
@@ -1590,10 +1531,10 @@ extend FnGen {
 						val argPlace = placeOf(&arg)
 						val addr = self.placeAddr(&var m, &argPlace)
 						val pointer = self.load(addr.clone(), .Ptr, 8)
-						val at = self.gep(move addr, 8)
-						val length = self.load(move at, .I(64), 8)
-						values.push(move pointer)
-						values.push(move length)
+						val at = self.gep(addr, 8)
+						val length = self.load(at, .I(64), 8)
+						values.push(pointer)
+						values.push(length)
 					} else {
 						values.push(self.operand(&var m, &arg))
 					}
@@ -1606,43 +1547,44 @@ extend FnGen {
 			if i >= sig.params.len() then break
 			val slot = &sig.params[i]
 			val v = self.coerce(&value, slot.t.clone())
-			typed.push(Arg(value: Val::of(move v, slot.t.clone()), attrs: slot.attrs.clone()))
+			typed.push(Arg(value: Val::of(v, slot.t.clone()), attrs: slot.attrs.clone()))
 		}
 		val call = Call(
 			ret: sig.retType(),
 			retAttrs: sig.retAttrs(),
 			variadic: .None,
 			callee: .Global(move target),
-			args: move typed,
+			args: typed,
+			tail: false,
 		)
 		match cCall.ret {
 			// The pieces, stored where they belong through a slot as large as
 			// all of them.
 			.Parts(parts) => {
 				val ty = partsType(&parts)
-				val both = self.value(.Call(own move call), move ty)
+				val both = self.value(.Call(own call), ty)
 				val scratch = self.scratch(&var m, defRet, &parts)
 				for (i, part) in parts.forwards().enumerate() {
 					val t = regType(part.reg.clone())
 					val piece = self.value(
 						.ExtractValue(aggregate: both.clone(), index: i as u32),
-						move t,
+						t,
 					)
 					val at = self.gep(scratch.clone(), part.offset as i64)
-					self.store(&piece, move at, 1)
+					self.store(&piece, at, 1)
 				}
 				val .Some(d) = dest else panic("an aggregate result has a destination")
 				val to = self.placeAddr(&var m, &d)
 				val size = m.layout(defRet).size
-				self.memmove(&var m, move to, move scratch, size)
+				self.memmove(&var m, to, scratch, size)
 			}
-			.Hidden => self.emit(.Call(own move call))
+			.Hidden => self.emit(.Call(own call))
 			.Plain => match sig.ret {
 				.Some(slot) => {
-					val answer = self.value(.Call(own move call), slot.t.clone())
+					val answer = self.value(.Call(own call), slot.t.clone())
 					if dest is .Some(d) then self.write(&var m, &d, &answer)
 				}
-				.None => self.emit(.Call(own move call))
+				.None => self.emit(.Call(own call))
 			}
 		}
 	}
@@ -1682,17 +1624,17 @@ extend FnGen {
 				val .Copy(place) = arg else panic("a pointer-and-length operand is a place")
 				val addr = self.placeAddr(&var m, &place)
 				val pointer = self.load(addr.clone(), .Ptr, 8)
-				val at = self.gep(move addr, 8)
-				val length = self.load(move at, .I(64), 8)
-				typed.push(Arg::of(move pointer))
-				typed.push(Arg::of(move length))
+				val at = self.gep(addr, 8)
+				val length = self.load(at, .I(64), 8)
+				typed.push(Arg::of(pointer))
+				typed.push(Arg::of(length))
 				slot += 2
 				continue
 			}
 			val value = self.operand(&var m, &arg)
 			val param = &sig.params[slot]
 			val v = self.coerce(&value, param.t.clone())
-			typed.push(Arg(value: Val::of(move v, param.t.clone()), attrs: param.attrs.clone()))
+			typed.push(Arg(value: Val::of(v, param.t.clone()), attrs: param.attrs.clone()))
 			slot += 1
 		}
 		for i in named..args.len() {
@@ -1708,7 +1650,7 @@ extend FnGen {
 								.F64,
 							).take()
 						else value.v.clone()
-					typed.push(Arg::of(Val::of(move v, .F64)))
+					typed.push(Arg::of(Val::of(v, .F64)))
 				}
 				.Some(.Int(bits, signed)) => {
 					val v = if value.t is .I(from) && from < bits {
@@ -1721,7 +1663,7 @@ extend FnGen {
 						value.v.clone()
 					}
 					val t: Type = if value.t == Type::Ptr then .Ptr else .I(bits)
-					typed.push(Arg::of(Val::of(move v, move t)))
+					typed.push(Arg::of(Val::of(v, t)))
 				}
 				.None => panic("a scalar extra argument")
 			}
@@ -1735,16 +1677,17 @@ extend FnGen {
 		val call = Call(
 			ret: sig.retType(),
 			retAttrs: sig.retAttrs(),
-			variadic: .Some(move namedTypes),
+			variadic: .Some(namedTypes),
 			callee: .Global(move target),
-			args: move typed,
+			args: typed,
+			tail: false,
 		)
 		match sig.ret {
 			.Some(s) => {
-				val answer = self.value(.Call(own move call), s.t.clone())
+				val answer = self.value(.Call(own call), s.t.clone())
 				if dest is .Some(d) then self.write(&var m, &d, &answer)
 			}
-			.None => self.emit(.Call(own move call))
+			.None => self.emit(.Call(own call))
 		}
 	}
 
@@ -1753,7 +1696,7 @@ extend FnGen {
 	var fn callValues(m: &var Llvm, id: FnId, values: Vec<Val>): Option<Val> = {
 		val sig = m.signature(id)
 		val target = m.symbol(id)
-		return self.emitCall(.Global(move target), &sig, move values)
+		return self.emitCall(.Global(move target), &sig, values)
 	}
 
 	var fn emitCall(target: Value, sig: &Sig, values: Vec<Val>): Option<Val> = {
@@ -1762,19 +1705,20 @@ extend FnGen {
 		for (i, value) in values.forwards().enumerate() {
 			val slot = &sig.params[i]
 			val v = self.coerce(&value, slot.t.clone())
-			args.push(Arg(value: Val::of(move v, slot.t.clone()), attrs: slot.attrs.clone()))
+			args.push(Arg(value: Val::of(v, slot.t.clone()), attrs: slot.attrs.clone()))
 		}
 		val call = Call(
 			ret: sig.retType(),
 			retAttrs: sig.retAttrs(),
 			variadic: .None,
-			callee: move target,
-			args: move args,
+			callee: target,
+			args: args,
+			tail: false,
 		)
 		return match sig.ret {
-			.Some(slot) => .Some(self.value(.Call(own move call), slot.t.clone()))
+			.Some(slot) => .Some(self.value(.Call(own call), slot.t.clone()))
 			.None => {
-				self.emit(.Call(own move call))
+				self.emit(.Call(own call))
 				Option::None
 			}
 		}
@@ -1786,9 +1730,9 @@ extend FnGen {
 		.Goto(target) => self.emit(.Br(.Block(target.index)))
 		.Branch(cond, thenBlock, otherwise) => {
 			val value = self.operand(&var m, &cond)
-			val flag = self.value(.IntCompare(cond: .Ne, left: move value, right: .Int(0)), .I(1))
+			val flag = self.value(.IntCompare(cond: .Ne, left: value, right: .Int(0)), .I(1))
 			self.emit(.CondBr(
-				condition: move flag.v,
+				condition: flag.v,
 				ifTrue: .Block(thenBlock.index),
 				ifFalse: .Block(otherwise.index),
 				weights: .None,
@@ -1802,9 +1746,9 @@ extend FnGen {
 				written.push(((case as i32) as i64, .Block(target.index)))
 			}
 			self.emit(.Switch(
-				value: Val::of(move word, .I(32)),
+				value: Val::of(word, .I(32)),
 				otherwise: .Block(otherwise.index),
-				cases: move written,
+				cases: written,
 			))
 		}
 		.Return => {
@@ -1817,7 +1761,7 @@ extend FnGen {
 				val value = self.operand(&var m, &read)
 				val .Some(slot) = m.slot(ty) else panic("a scalar result")
 				val v = self.coerce(&value, slot.t.clone())
-				self.emit(.Ret(.Some(Val::of(move v, slot.t.clone()))))
+				self.emit(.Ret(.Some(Val::of(v, slot.t.clone()))))
 			} else {
 				self.emit(.Ret(.None))
 			}
@@ -1833,19 +1777,66 @@ extend FnGen {
 				Val::of(.Int(text.len() as i64), .I(64)),
 			])
 			match note {
-				.None => self.panicCall(&var m, "wip_panic", move said, at)
+				.None => self.panicCall(&var m, "wip_panic", said, at)
 				.Some(.Copy(place)) => {
 					val addr = self.placeAddr(&var m, &place)
 					val pointer = self.load(addr.clone(), .Ptr, 8)
-					val atLength = self.gep(move addr, 8)
-					val length = self.load(move atLength, .I(64), 8)
-					var numbers = Vec::of(own [move pointer, move length])
-					numbers.append(move said)
-					self.panicCall(&var m, "wip_panic_noted", move numbers, at)
+					val atLength = self.gep(addr, 8)
+					val length = self.load(atLength, .I(64), 8)
+					var numbers = Vec::of(own [pointer, length])
+					numbers.append(said)
+					self.panicCall(&var m, "wip_panic_noted", numbers, at)
 				}
 				.Some(.Const(..)) => panic("a note is a place")
 			}
 			self.emit(.Unreachable)
+		}
+		// `become`: a call that takes this frame, and the `ret` LLVM wants
+		// right after it. An aggregate answer goes where this function's
+		// caller asked for its own.
+		.TailCall(callee, args) => {
+			val sig = m.signature(callee)
+			var values: Vec<Val> = Vec()
+			if sig.sret {
+				val .Some(ret) = self.body.ret else panic("an aggregate result has a place")
+				val result = Place::of(ret)
+				values.push(Val(v: self.placeAddr(&var m, &result), t: .Ptr))
+			}
+			for arg in args {
+				val ty = self.operandTy(&m, &arg)
+				when {
+					m.isAggregate(ty) => {
+						val given = placeOf(&arg)
+						values.push(Val(v: self.placeAddr(&var m, &given), t: .Ptr))
+					}
+					m.lt(ty) == .None => values.push(Val::of(.Zero, .Ptr))
+					else => values.push(self.operand(&var m, &arg))
+				}
+			}
+			var typed: Vec<Arg> = Vec()
+			for (i, value) in values.forwards().enumerate() {
+				val slot = &sig.params[i]
+				val v = self.coerce(&value, slot.t.clone())
+				typed.push(Arg(value: Val::of(v, slot.t.clone()), attrs: slot.attrs.clone()))
+			}
+			val call = Call(
+				ret: sig.retType(),
+				retAttrs: sig.retAttrs(),
+				variadic: .None,
+				callee: .Global(m.symbol(callee)),
+				args: typed,
+				tail: true,
+			)
+			match sig.ret {
+				.Some(slot) => {
+					val answer = self.value(.Call(own call), slot.t.clone())
+					self.emit(.Ret(.Some(answer)))
+				}
+				.None => {
+					self.emit(.Call(own call))
+					self.emit(.Ret(.None))
+				}
+			}
 		}
 		.Unreachable => self.emit(.Unreachable)
 	}
@@ -1883,7 +1874,7 @@ fn signed(bits: u128, width: u32): i128 = {
 
 /// The struct an intrinsic answers a value of type `t` in, with a flag: an
 /// overflow's, or a compare-and-swap's.
-fn withFlag(t: Type): Type = structOf(Vec::of(own [move t, Type::I(1)]), false)
+fn withFlag(t: Type): Type = structOf(Vec::of(own [t, Type::I(1)]), false)
 
 /// An order of the MIR's as LLVM names it.
 fn orderingOf(order: &AtomicOrder): AtomicOrdering = match order {
@@ -1911,5 +1902,5 @@ fn typesOf(values: &[Val]): Vec<Type> = {
 	for value in values {
 		types.push(value.t.clone())
 	}
-	return move types
+	return types
 }

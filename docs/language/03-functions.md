@@ -440,9 +440,14 @@ fn main() = {
 }
 ```
 
-Type arguments are inferred from the arguments, and from what the
-arguments hold — a `T` from a `ptr<T>` or a `&[T]`; where they cannot be,
-they are written at the call: `firstEqual<i64>(…)`. A generic type's static
+Type arguments are inferred from the arguments, from what the
+arguments hold — a `T` from a `ptr<T>` or a `&[T]` — and from what an
+argument's type implements: with `I: Iterator<(K, V)>`, an iterator that
+hands out `(str, i64)` says `K` and `V`, as `Map::fromPairs` is called with
+no type written. A variable's are also inferred from the first place that
+names it ([page 1](01-types.md#generic-types)): `var counts = Map()`, then
+`counts.put(word, 1)`. Where they cannot be, they are written at the call:
+`firstEqual<i64>(…)`. A generic type's static
 function is called through the type, and the type's arguments are written
 after its name, `Pair<i64>::zero()`; the function's own are still inferred.
 
@@ -454,7 +459,7 @@ struct Pair<T> {
 
 extend Pair<T> {
     static fn of<U: copy>(a: T, b: T, tag: U): (Pair<T>, U) = (
-        Pair(first: move a, second: move b),
+        Pair(first: a, second: b),
         tag,
     )
 }
@@ -486,5 +491,59 @@ fn twice(n: i64): i64 = n * 2
 fn main() = {
     assert(sum(100000) == 5000050000)
     assert(twice(21) == 42)
+}
+```
+
+## `become`
+
+`become f(args)` leaves the function and calls `f` in its place: the
+function's frame is gone before `f` runs, and what `f` answers is answered
+to the function's own caller. It stands where `return` may, followed by a
+call, so two functions that call each other at the end use one frame
+however deep they go:
+
+```wip,run
+fn isEven(n: u64): bool = {
+    if n == 0 then return true
+    become isOdd(n - 1)
+}
+
+fn isOdd(n: u64): bool = {
+    if n == 0 then return false
+    become isEven(n - 1)
+}
+
+fn main() = {
+    assert(isEven(1_000_000) && !isOdd(1_000_000))
+}
+```
+
+The call takes the frame, so it must fit in it:
+
+- **The callee is a function called by its name** — a function, a method or
+  a static function, not a closure, a function value, a `dyn` method, a C
+  function or an `@inline` one — and `become` is not written in a lambda, a
+  projection or a generator.
+- **It takes what the function was given and answers what it answers:** its
+  parameters, a method's receiver first, have the function's parameter
+  types in their order, and its result is the function's.
+- **Nothing of the frame is left:** no local still owns memory (E0422), no
+  `defer` is waiting (E0422), and no argument refers into the frame — `&` of
+  a local, or a closure lent for the call (E0421).
+- **A struct, an enum, an array, a `str` or a slice is a parameter passed
+  on.** Such a value is passed by the address of its place, and a place of
+  the frame is gone before the call reads it (E0461); a parameter the
+  function was given is in its caller's frame. An aggregate result is
+  fine: it is written where the function's caller asked for its own.
+
+A panic's calls, and a debugger's, show `isOdd` called from where `isEven`
+was. `@tailrec` stays for a function's calls to itself, which it makes a
+jump to its own top, with no rule on its signature.
+
+```wip,error=E0460
+fn add(n: i64, m: i64): i64 = n + m
+
+fn one(n: i64): i64 = {
+    become add(n, 1) // takes two, where `one` was given one
 }
 ```

@@ -109,9 +109,9 @@ Rules the EBNF does not express:
 ### Keywords
 
 ```
-as  assert  break  continue  defer  dyn  else  enum  extern  false  fn  for
-if  import  in  interface  is  lend  match  move  null  own  pub  return
-self  static  struct  then  true  type  val  var  while  yield
+as  assert  become  break  continue  defer  dyn  else  enum  extern  false  fn
+for  if  import  in  interface  is  lend  match  move  null  own  pub  return
+self  static  struct  then  true  type  val  var  when  while  yield
 ```
 
 `let` and `impl` are **reserved**: neither is part of the language, and
@@ -313,11 +313,12 @@ lendsFrom   = "from" lendPath ( "," lendPath )* ;
                                             nothing else; `from` is a word
                                             here alone *)
 lendPath    = ( IDENT | "self" ) ( "." IDENT )* ;
-keeps       = "keeps" IDENT ( "," IDENT )* ;
+keeps       = "keeps" keepName ( "," keepName )* ;
+keepName    = IDENT | "self" ;
                                          (* the parameters a call may keep in
                                             its `&var` arguments, and no
-                                            others; `keeps` is a word here
-                                            alone *)
+                                            others, the receiver as `self`;
+                                            `keeps` is a word here alone *)
 generics    = "<" typeParam ( "," typeParam )* ","? ">" ;
 typeParam   = "type"? IDENT ( ":" constraint ( "+" constraint )* )?
               ( "=" type )? ;
@@ -391,7 +392,7 @@ typeArgs    = "<" type ( "," type )* ","? ">" ;
 (* ---- blocks and statements ---- *)
 
 block       = "{" sep? ( stmt ( sep stmt )* sep? )? "}" ;
-stmt        = bindStmt | patternStmt | deferStmt | returnStmt
+stmt        = bindStmt | patternStmt | deferStmt | returnStmt | becomeStmt
             | yieldStmt | whileStmt | forStmt | breakStmt | continueStmt | expr ;
 bindStmt    = "implicit"? ( "val" | "var" ) IDENT ( ":" type )? "=" expr ;
 patternStmt = ( "val" | "var" ) pattern "=" expr ( "else" ( block | branch ) )? ;
@@ -401,6 +402,7 @@ patternStmt = ( "val" | "var" ) pattern "=" expr ( "else" ( block | branch ) )? 
                                             of its own *)
 deferStmt   = "defer" expr ;             (* runs when the block exits *)
 returnStmt  = "return" expr? ;           (* a line break after `return` means no value *)
+becomeStmt  = "become" expr ;            (* a call, which takes the function's frame *)
 yieldStmt   = "yield" expr ;             (* to the list being built,
                                             or to whoever asks the generator it is
                                             in *)
@@ -459,6 +461,7 @@ primary     = lambda
             | block
             | ifExpr
             | matchExpr
+            | whenExpr
             | assertExpr
             | forElement                 (* a loop where a value stands: a
                                             generator *)
@@ -486,7 +489,14 @@ matchExpr   = "match" cond "{" ( arm ( lsep arm )* lsep? )? "}" ;
 arm         = pattern ( "if" cond )? "=>" ( expr | jump ) ;
                                          (* a guard: the arm matches only where
                                             it is true; its `=>`, see R8 *)
-jump        = "return" expr? | "break" IDENT? | "continue" IDENT? ;
+whenExpr    = "when" "{" whenArm ( lsep whenArm )* lsep? "}" ;
+whenArm     = ( cond | "else" ) "=>" ( expr | jump ) ;
+                                         (* the first arm whose condition is
+                                            true runs; `else` is the last arm,
+                                            and is needed where the `when` is a
+                                            value; a condition is read as a
+                                            guard is, see R8 *)
+jump        = "return" expr? | "become" expr | "break" IDENT? | "continue" IDENT? ;
                                          (* the arm ends the function or the
                                             loop *)
 
@@ -661,9 +671,9 @@ bool>`. In an expression, `<` after a name starts type arguments when:
 
 A `(` whose matching `)` is followed by `=>`, or by `:` and then `=>`
 after a type, begins a lambda; any other `(` begins parentheses or a
-tuple. In a match arm's guard, the `=>` after a `)` at the guard's top
-level is the arm's, so the guard's `( … )` is parentheses there, even
-around one name: `n if (n < 5) => …`. A lambda inside the guard's
+tuple. In a match arm's guard, and in a `when` arm's condition, the `=>`
+after a `)` at its top level is the arm's, so its `( … )` is parentheses
+there, even around one name: `n if (n < 5) => …`, `(ready) => go()`. A lambda inside the guard's
 parentheses, brackets or arguments is still one: `_ if
 values.any((v) => v > 0) => …`.
 

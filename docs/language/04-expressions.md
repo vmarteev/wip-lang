@@ -119,6 +119,24 @@ fn main() = {
 }
 ```
 
+An array's tuples are taken a position at a time: each position is the
+type of the first part there that says one, so a table of tuples types
+its literals by the parts beside them, whatever its rows' order. An `if`'s
+and a `match`'s tuples are not, since a branch's parts are checked in the
+branch's own scope; there, the type is written:
+
+```wip,run
+fn main() = {
+    val reach: f32 = 12.0
+    var count = 0
+    for (x, z) in [(0.0, -reach), (-reach, 0.0)] {
+        val across: f32 = x + z
+        if across == -reach then count += 1
+    }
+    assert(count == 2)
+}
+```
+
 `if c then { … }` is refused, with the fix that drops `then`; so is a
 `then` form whose `else` is a block, a braced `if` whose `else` is an
 expression without braces, and a chain that changes form (E0101). A
@@ -129,6 +147,44 @@ to stay on one line with its `then`.
 
 An `if` without `else` answers nothing, so it stands where a statement
 stands: `if done then return`, whose branch's value is discarded.
+
+A choice among several conditions is a `when`: each arm is a condition, a
+`bool`, and `=>` its body, and the first arm whose condition holds runs —
+those after it are not tested. `else =>` is the last arm, where none
+held; a `when` that answers a value needs one, as an `if` does. An `is`
+in a condition binds for its arm alone. Arms of one expression and of a
+block mix, as a `match`'s do, and an arm may be `return`, `break` or
+`continue`:
+
+```wip,run
+fn kind(c: char): str = when {
+    c.isAsciiLetter() || c == '_' => "a name"
+    c.isDigit() => "a number"
+    c == '"' => {
+        val opened = "text"
+        opened
+    }
+    else => "a sign"
+}
+
+fn main() = {
+    assert(
+        kind('x') == "a name" && kind('7') == "a number" && kind('"') == "text",
+    )
+    val maybe: Option<i64> = .Some(12)
+    val size = when {
+        maybe is .Some(n) && n > 10 => n
+        maybe is .Some(n) => n * 10
+        else => 0
+    }
+    assert(size == 12)
+}
+```
+
+Two branches are an `if`. A choice among several conditions is a `when`.
+A choice among the values of one thing is a `match` on it, and `when x {
+… }` is refused with the fix that writes `match x { … }` (E0101): a `when`
+takes no value.
 
 An arm's value may also be `return`, `break` or `continue`: that case ends
 the function or the loop, and the arm's type is `never`, which any other
@@ -193,7 +249,7 @@ struct Node {
 }
 
 fn main() = {
-    var nodes: Vec<Node> = Vec()
+    var nodes = Vec()
     nodes.push(Node(value: 1))
     nodes[0].next = {
         nodes.push(Node(value: 2))
@@ -529,7 +585,7 @@ words.push("one")
 words.push("two")
 var kept: Vec<String> = Vec()
 for word in move words {
-    kept.push(move word)
+    kept.push(word)
 }
 assert(kept.len() == 2 && kept[0] == "one")
 ```

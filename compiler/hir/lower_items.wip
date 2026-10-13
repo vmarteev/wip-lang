@@ -117,13 +117,16 @@ extend Lowerer {
 							isPub: declared.isPub,
 							span: name.span,
 						))
-						if self.opaques().get(&name.sym) is .Some(first) {
-							val previous = self.program.opaques[first].span
-							self.duplicate(name, previous)
-						} else if self.types().get(&name.sym) is .Some((_, previous)) {
-							self.duplicate(name, previous)
-						} else {
-							self.modules[self.current].opaques.put(name.sym, id)
+						when {
+							self.opaques().get(&name.sym) is .Some(first) => {
+								val previous = self.program.opaques[first].span
+								self.duplicate(name, previous)
+							}
+							self.types().get(&name.sym) is .Some((_, previous)) => self.duplicate(
+								name,
+								previous,
+							)
+							else => self.modules[self.current].opaques.put(name.sym, id)
 						}
 					}
 					continue
@@ -137,7 +140,7 @@ extend Lowerer {
 					val generics = self.typeGenericParams(&e.generics)
 					val id = self.program.enums.add(EnumDef(
 						name: e.name.sym,
-						generics: move generics,
+						generics: generics,
 						variants: Vec(),
 						methods: Vec(),
 						module: self.current as u32,
@@ -159,7 +162,7 @@ extend Lowerer {
 			self.nameType(name, def)
 			types.push((.Item(&item), def))
 		}
-		return move types
+		return types
 	}
 
 	/// The paths an annotation names, each of which must be inside the
@@ -189,9 +192,9 @@ extend Lowerer {
 				)
 				continue
 			}
-			paths.push((move path, span))
+			paths.push((path, span))
 		}
-		return move paths
+		return paths
 	}
 
 	/// The settings `@define` names, each `NAME` or `NAME=value`, where
@@ -228,9 +231,9 @@ extend Lowerer {
 				)
 				continue
 			}
-			defines.push(move define)
+			defines.push(define)
 		}
-		return move defines
+		return defines
 	}
 
 	/// The header an `extern "C"` block names, read without checking the
@@ -248,10 +251,10 @@ extend Lowerer {
 	/// prelude's names are reserved, a built-in's cannot be taken, and a name
 	/// declared twice is reported.
 	var fn nameType(name: ast::Name, def: TypeDef) = {
-		if self.preludeName(name, "a type named") {
+		when {
 			// Reported; it keeps its own place in this module's scope.
-		} else if self.builtin(name.sym).isSome() {
-			self.report(
+			self.preludeName(name, "a type named") => {}
+			self.builtin(name.sym).isSome() => self.report(
 				Diagnostic::error(
 					BUILTIN_REDEFINED,
 					"`\(self.text(name.sym))` is a built-in type and cannot be redefined",
@@ -259,10 +262,8 @@ extend Lowerer {
 					"built-in type name",
 				),
 			)
-		} else if self.types().get(&name.sym) is .Some((_, first)) {
-			self.duplicate(name, first)
-		} else {
-			self.modules[self.current].types.put(name.sym, (def, name.span))
+			self.types().get(&name.sym) is .Some((_, first)) => self.duplicate(name, first)
+			else => self.modules[self.current].types.put(name.sym, (def, name.span))
 		}
 	}
 
@@ -373,7 +374,7 @@ extend Lowerer {
 				.None => .None
 			},
 			accessors: Vec(),
-			generics: move generics,
+			generics: generics,
 			fields: Vec(),
 			methods: Vec(),
 			isEnv: false,
@@ -441,7 +442,7 @@ extend Lowerer {
 			}
 			self.modules[self.current].aliases.put(name.sym, AliasDef(
 				ty: .None,
-				generics: move generics,
+				generics: generics,
 				isPub: alias.isPub,
 				span: name.span,
 			))
@@ -501,9 +502,9 @@ extend Lowerer {
 		self.aliasStack.push((module, sym))
 		self.enter(module, source.ast, source.imports.clone())
 		val ty = self.resolveTy(source.decl.ty)
-		self.enter(hereModule, hereAst, move hereImports)
+		self.enter(hereModule, hereAst, hereImports)
 		self.aliasStack.pop()
-		self.typeParams = move typeParams
+		self.typeParams = typeParams
 		self.selfTy = selfTy
 		// An alias a default type argument names, which leaves out another
 		// type's argument whose default is not read yet, is read again with
@@ -516,7 +517,7 @@ extend Lowerer {
 		// A cycle through it has said so, and it stands for nothing.
 		if updated.ty is .Some(said) then return .Some(said)
 		updated.ty = .Some(ty)
-		self.modules[module].aliases.put(sym, move updated)
+		self.modules[module].aliases.put(sym, updated)
 		return .Some(ty)
 	}
 
@@ -538,7 +539,7 @@ extend Lowerer {
 			),
 		)
 		updated.ty = .Some(ERROR)
-		self.modules[module].aliases.put(name, move updated)
+		self.modules[module].aliases.put(name, updated)
 	}
 
 	/// A use of a type alias: the type it names, with the arguments it was
@@ -570,6 +571,33 @@ extend Lowerer {
 			tys.push(self.typeArg(arg))
 		}
 		return .Some(self.program.types.subst(body, &tys))
+	}
+
+	/// Reads the constraints of this file's structs', enums' and
+	/// interfaces' type parameters, which may name what the file imports.
+	var fn constrainDeclared(
+		types: &[(Declared, TypeDef)],
+		interfaces: &[(&ast::InterfaceDecl, InterfaceId)],
+	) = {
+		for (item, def) in types {
+			val params: Vec<ast::GenericParam> = match (item.structDecl(), item.enumDecl()) {
+				(.Some(s), _) => s.generics.clone()
+				(_, .Some(e)) => e.generics.clone()
+				_ => continue
+			}
+			var defs = self.typeGenerics(def)
+			self.constrain(&params, &var defs)
+			match def {
+				.Struct(id) => self.program.structs[id].generics = defs
+				.Enum(id) => self.program.enums[id].generics = defs
+				.Builtin(..) => {}
+			}
+		}
+		for (decl, id) in interfaces {
+			var defs = self.program.interfaces[id].generics.clone()
+			self.constrain(&decl.generics, &var defs)
+			self.program.interfaces[id].generics = defs
+		}
 	}
 
 	/// Reads the defaults of this file's structs' and enums' type parameters
@@ -691,7 +719,7 @@ extend Lowerer {
 							i += 1
 						}
 					}
-					self.program.structs[id].fields = move fields
+					self.program.structs[id].fields = fields
 					// `@opaque`: C knows where the fields are, so each one is
 					// read and written through C.
 					if self.program.structs[id].isOpaque then self.declareFieldAccessors(id)
@@ -709,11 +737,11 @@ extend Lowerer {
 						val fields = self.fields(&v.fields, true, e.isView)
 						variants.push(VariantDef(
 							name: v.name.sym,
-							fields: move fields,
+							fields: fields,
 							span: v.name.span,
 						))
 					}
-					self.program.enums[id].variants = move variants
+					self.program.enums[id].variants = variants
 				}
 				_ => panic("collectTypes pairs items with their kind")
 			}
@@ -735,18 +763,17 @@ extend Lowerer {
 			}
 			var ty = self.resolveTy(f.ty)
 			val lent = view && self.kind(ty) is .Ref(kind: .Shared, ..)
-			val refused = if lent {
+			val refused = when {
 				// What the reference refers to is checked as a parameter's
 				// would be.
-				self.noNever(ty, f.ty, "a field")
-			} else if view && self.kind(ty) is .Ref(kind: .Var, ..) {
-				self.varInView(f.ty)
-			} else {
-				self.noVarRef(ty, f.ty, "a field") ||
-					self.noNever(ty, f.ty, "a field") ||
-					self.bareDyn(ty, f.ty) ||
-					self.bareSlice(ty, f.ty, false) ||
-					(!view && self.storedField(ty, f.ty, exported))
+				lent => self.noNever(ty, f.ty, "a field")
+				view && self.kind(ty) is .Ref(kind: .Var, ..) => self.varInView(f.ty)
+				else =>
+					self.noVarRef(ty, f.ty, "a field") ||
+						self.noNever(ty, f.ty, "a field") ||
+						self.bareDyn(ty, f.ty) ||
+						self.bareSlice(ty, f.ty, false) ||
+						(!view && self.storedField(ty, f.ty, exported))
 			}
 			if refused then ty = ERROR
 			val fieldAnnotations = self.annotations(&f.annotations, .Field)
@@ -770,7 +797,7 @@ extend Lowerer {
 				),
 			)
 		}
-		return move defs
+		return defs
 	}
 
 	/// The packed structs of a file, once every type's fields are known:
@@ -822,7 +849,7 @@ extend Lowerer {
 			if self.hasError(ty) then continue
 			self.typeParams = self.program.fns[id].generics.clone()
 			val default = self.defaultOf(value, ty)
-			self.program.fns[id].params[index].default = move default
+			self.program.fns[id].params[index].default = default
 		}
 		self.typeParams.clear()
 	}
@@ -843,11 +870,11 @@ extend Lowerer {
 		val selfTy = mem::replace(&var self.selfTy, .None)
 		self.enter(source.module, source.ast, source.imports.clone())
 		self.checkFieldDefaults([(source.item, def)])
-		self.enter(hereModule, hereAst, move hereImports)
-		self.lambdas = move lambdas
-		self.lambdaEnvs = move lambdaEnvs
-		self.generators = move generators
-		self.typeParams = move typeParams
+		self.enter(hereModule, hereAst, hereImports)
+		self.lambdas = lambdas
+		self.lambdaEnvs = lambdaEnvs
+		self.generators = generators
+		self.typeParams = typeParams
 		self.selfTy = selfTy
 	}
 
@@ -888,7 +915,7 @@ extend Lowerer {
 				}
 				if self.hasError(ty) then continue
 				val default = self.defaultOf(value, ty)
-				self.program.structs[id].fields[index].default = move default
+				self.program.structs[id].fields[index].default = default
 			}
 			self.typeParams.clear()
 		}
@@ -912,7 +939,7 @@ extend Lowerer {
 				val ty = self.program.enums[id].variants[v].fields[index].ty
 				if self.hasError(ty) then continue
 				val default = self.defaultOf(value, ty)
-				self.program.enums[id].variants[v].fields[index].default = move default
+				self.program.enums[id].variants[v].fields[index].default = default
 			}
 		}
 		self.typeParams.clear()
@@ -1048,7 +1075,7 @@ extend Lowerer {
 				"did you mean `\(similar)`?",
 				own [Edit::replace(name.span, similar)],
 			)
-		self.report(move diagnostic)
+		self.report(diagnostic)
 		return ERROR
 	}
 }
@@ -1086,14 +1113,14 @@ extend Lowerer {
 								),
 							)
 						else if !self.program.libraries.contains(&name) then
-							self.program.libraries.push(move name)
+							self.program.libraries.push(name)
 					}
 					// How the module's C is built: where its headers are, and
 					// what an Apple target links.
 					for (framework, _) in annotations.framework {
 						val name = String::of(self.text(framework))
 						if !self.program.frameworks.contains(&name) then
-							self.program.frameworks.push(move name)
+							self.program.frameworks.push(name)
 					}
 					for (dir, span) in annotations.include {
 						val path = String::of(self.text(dir))
@@ -1113,9 +1140,9 @@ extend Lowerer {
 								),
 							)
 						} else {
-							val entry = (self.current, move path)
+							val entry = (self.current, path)
 							if !self.program.cIncludes.contains(&entry) then
-								self.program.cIncludes.push(move entry)
+								self.program.cIncludes.push(entry)
 						}
 					}
 					// `@source("src/rcore.c")`: a C file of the module, below
@@ -1125,26 +1152,26 @@ extend Lowerer {
 					for (path, _) in self.modulePaths(&annotations.source, "@source") {
 						val entry = (
 							self.current,
-							move path,
+							path,
 							annotations.sourceLanguage.clone(),
 							annotations.sourceStandard.clone(),
 						)
 						if !self.program.cSources.contains(&entry) then
-							self.program.cSources.push(move entry)
+							self.program.cSources.push(entry)
 					}
 					var prefixes: Vec<(Symbol, Span)> = Vec()
 					if annotations.prefix is .Some(prefix) then prefixes.push(prefix)
 					for (path, _) in self.modulePaths(&prefixes, "@prefix") {
-						val entry = (self.current, move path)
+						val entry = (self.current, path)
 						if !self.program.cPrefix.contains(&entry) then
-							self.program.cPrefix.push(move entry)
+							self.program.cPrefix.push(entry)
 					}
 					// `@define("PLATFORM_DESKTOP")`: what the module's C is
 					// compiled with defined.
 					for define in self.cDefines(&annotations.define) {
-						val entry = (self.current, move define)
+						val entry = (self.current, define)
 						if !self.program.cDefines.contains(&entry) then
-							self.program.cDefines.push(move entry)
+							self.program.cDefines.push(entry)
 					}
 					for declared in e.globals {
 						self.declareGlobal(&declared)
@@ -1206,7 +1233,7 @@ extend Lowerer {
 				_ => {}
 			}
 		}
-		return move bodies
+		return bodies
 	}
 
 	/// The methods of a type, declared with the type's parameters under the
@@ -1256,7 +1283,7 @@ extend Lowerer {
 					&method.annotations,
 					false,
 					visible.unwrapOr(method.isPub),
-					.Some(move member),
+					.Some(member),
 				)
 				val both = receiver != .Lend || self.lentBothWays(id, half, &method)
 				if receiver == .Lend && half == .Var then self.program.lentHalves.add(id)
@@ -1293,7 +1320,7 @@ extend Lowerer {
 			diagnostic = diagnostic.withHelp(
 				"write `&`: the writing half lends it as `&var` by itself",
 			)
-		self.report(move diagnostic)
+		self.report(diagnostic)
 		// Reported once: a result written `&var` is read as the `&` it should
 		// be, so the body is checked as the reading half it is.
 		if kind is .Ref(inner, kind: .Var) then
@@ -1327,9 +1354,9 @@ extend Lowerer {
 						span: elem.span,
 					)
 				else block.generics[0].clone()
-			val generics = self.genericParams([move param])
+			val generics = self.genericParams([param])
 			return match self.builtinOwner(&block, .Slice, generics.clone(), elem.span) {
-				.Some(owner) => .Some((owner, move generics))
+				.Some(owner) => .Some((owner, generics))
 				.None => .None
 			}
 		}
@@ -1337,7 +1364,7 @@ extend Lowerer {
 		if block.boxed is .Some(word) {
 			val generics = self.genericParams(&block.generics)
 			return match self.builtinOwner(&block, .Own, generics.clone(), word) {
-				.Some(owner) => .Some((owner, move generics))
+				.Some(owner) => .Some((owner, generics))
 				.None => .None
 			}
 		}
@@ -1347,7 +1374,7 @@ extend Lowerer {
 			val builtin: BuiltinOwner = if self.text(name.sym) == "ptr" then .Ptr else .Slots
 			val generics = self.genericParams(&block.generics)
 			return match self.builtinOwner(&block, builtin, generics.clone(), name.span) {
-				.Some(owner) => .Some((owner, move generics))
+				.Some(owner) => .Some((owner, generics))
 				.None => .None
 			}
 		}
@@ -1394,7 +1421,7 @@ extend Lowerer {
 			val diagnostic =
 				if self.imported(name).isSome() then self.elsewhere(text, name.span)
 				else self.unknownName(name.sym, name.span)
-			self.report(move diagnostic)
+			self.report(diagnostic)
 			return .None
 		}
 		self.program.names.push((name.span, .Owner(owner)))
@@ -1435,7 +1462,7 @@ extend Lowerer {
 				IMPL_TARGET,
 				"`extend` of `\(text)` must name its type parameters",
 				writtenSpan,
-				move expected,
+				expected,
 			).withNote(
 				"an `extend` block binds the type's parameters under the names it writes, one for each",
 			)
@@ -1448,7 +1475,7 @@ extend Lowerer {
 				diagnostic = diagnostic.withNote(
 					"a default type argument is for a use of the type; the block names the parameter it stands for too",
 				)
-			self.report(move diagnostic)
+			self.report(diagnostic)
 			return .None
 		}
 		// The names are binders for the type's own parameters, and a
@@ -1494,7 +1521,7 @@ extend Lowerer {
 					// The type's parameter, under the name the block writes.
 					name: declared[i].name,
 					written: written[i].name.sym,
-					interfaces: move condition.interfaces,
+					interfaces: condition.interfaces,
 					copy: condition.copy || declared[i].copy,
 					// The type's default, which `Pool<i64>::of()` leaves out as
 					// `Pool<i64>` does; the block itself names every one.
@@ -1503,7 +1530,7 @@ extend Lowerer {
 				),
 			)
 		}
-		return .Some((owner, move params))
+		return .Some((owner, params))
 	}
 
 	/// A function the compiler declares and writes the body of in C: an
@@ -1527,7 +1554,7 @@ extend Lowerer {
 		interfaceId: .None,
 		generics: Vec(),
 		instanceOf: .None,
-		params: move params,
+		params: params,
 		ret: ret,
 		retSpan: .None,
 		isExtern: true,
@@ -1593,7 +1620,7 @@ extend Lowerer {
 					field.name,
 					field.span,
 					.None,
-					Vec::of(own [move owner, move value]),
+					Vec::of(own [owner, value]),
 					UNIT,
 					header,
 					move access,
@@ -1603,7 +1630,7 @@ extend Lowerer {
 			)
 			accessors.push((get, set))
 		}
-		self.program.structs[id].accessors = move accessors
+		self.program.structs[id].accessors = accessors
 	}
 
 	/// `val optind: c_int` or `var errno: c_int` in an extern block: a
@@ -1668,7 +1695,7 @@ extend Lowerer {
 						name.sym,
 						name.span,
 						symbol,
-						Vec::of(own [move param]),
+						Vec::of(own [param]),
 						UNIT,
 						header,
 						.None,
@@ -1693,14 +1720,18 @@ extend Lowerer {
 		self.program.fns[getter].accesses = .Some(.Global(id))
 		if setter is .Some(setter) then self.program.fns[setter].accesses = .Some(.Global(id))
 		// It takes a name in the module, as a constant does.
-		if self.preludeName(name, "a variable named") {
+		when {
 			// Reported; it keeps its own place in this module's scope.
-		} else if self.globals().get(&name.sym) is .Some(first) {
-			self.duplicate(name, self.program.globals[first].span)
-		} else if self.consts().get(&name.sym) is .Some(first) {
-			self.duplicate(name, self.program.consts[first].span)
-		} else {
-			self.modules[self.current].globals.put(name.sym, id)
+			self.preludeName(name, "a variable named") => {}
+			self.globals().get(&name.sym) is .Some(first) => self.duplicate(
+				name,
+				self.program.globals[first].span,
+			)
+			self.consts().get(&name.sym) is .Some(first) => self.duplicate(
+				name,
+				self.program.consts[first].span,
+			)
+			else => self.modules[self.current].globals.put(name.sym, id)
 		}
 	}
 
@@ -1757,7 +1788,7 @@ extend Lowerer {
 			.None => .None
 		}
 		val pins = self.decidedPins(&generics)
-		self.program.types.setPins(move pins)
+		self.program.types.setPins(pins)
 		val (params, deferred) = self.fnParams(&sig, &member, isExtern)
 		val (ret, yields, generatorArgs) = self.fnResult(&sig, &member, isExtern)
 		self.program.types.setPins(Vec())
@@ -1791,9 +1822,9 @@ extend Lowerer {
 				}
 				.None => .None
 			},
-			generics: move generics,
+			generics: generics,
 			instanceOf: .None,
-			params: move params,
+			params: params,
 			ret: ret,
 			retSpan: match sig.ret {
 				.Some(t) => .Some(file.types[t].span)
@@ -1817,8 +1848,8 @@ extend Lowerer {
 			accesses: .None,
 			isVariadic: sig.variadic.isSome(),
 			variadicOf: .None,
-			lendsFrom: move lendsFrom,
-			keeps: move keeps,
+			lendsFrom: lendsFrom,
+			keeps: keeps,
 			keepsAt: .Some((sig.span.hi, !sig.keeps.isEmpty())),
 			isLambda: false,
 			generator: .None,
@@ -1837,7 +1868,7 @@ extend Lowerer {
 			isPub: isPub,
 			span: sig.span,
 		)
-		val id = self.program.fns.add(move def)
+		val id = self.program.fns.add(def)
 		self.checkTestShape(id, if annotations.test is .Some((_, at)) then .Some(at) else .None)
 		for (index, value) in deferred {
 			self.paramDefaults.push((id, index, value))
@@ -1887,9 +1918,9 @@ extend Lowerer {
 							),
 						)
 					}
-					all.push(move param)
+					all.push(param)
 				}
-				move all
+				all
 			}
 		}
 		if isExtern && !generics.isEmpty() then
@@ -1901,7 +1932,7 @@ extend Lowerer {
 					"a type parameter",
 				).withNote("C has no generics; declare the function once for each type it takes"),
 			)
-		return move generics
+		return generics
 	}
 
 	/// `Self` in a method: the type it belongs to.
@@ -1974,7 +2005,7 @@ extend Lowerer {
 			val kept = index as u32
 			if !keeps.contains(&kept) then keeps.push(kept)
 		}
-		return move keeps
+		return keeps
 	}
 
 	/// What `from` names the result as borrowing: a parameter named alone,
@@ -1988,7 +2019,7 @@ extend Lowerer {
 		for path in sig.lendsFrom {
 			val name = match path.root {
 				.Some(root) => root.sym
-				.None => self.interner.selfSymbol()
+				.None => Symbol::receiver()
 			}
 			val written = String::of(self.text(name))
 			var index: Option<i64> = .None
@@ -2074,7 +2105,7 @@ extend Lowerer {
 			}
 			if lent then lends.push(.Borrowed(index as u32))
 		}
-		return .Some(move lends)
+		return .Some(lends)
 	}
 
 	/// A function's parameters, a method's receiver first, and the defaults
@@ -2096,7 +2127,7 @@ extend Lowerer {
 				_ => selfTy
 			}
 			params.push(ParamDef(
-				name: self.interner.selfSymbol(),
+				name: Symbol::receiver(),
 				nameSpan: m.keyword,
 				ty: ty,
 				span: m.keyword,
@@ -2143,51 +2174,42 @@ extend Lowerer {
 				implicit: p.isImplicit,
 			))
 		}
-		return (move params, move deferred)
+		return (params, deferred)
 	}
 
 	/// An implicit parameter is lent or copied, of one type a call can find
 	/// by its name, and has no default: what fills it is the caller's.
 	var fn checkImplicitParam(p: &ast::Param, ty: Ty, isExtern: bool) = {
 		val name = String::of(self.text(p.name.sym))
-		val why: Option<(String, str)> =
-			if isExtern then
-				.Some(
-					(
-						"a C function takes no implicit parameter",
-						"C passes every argument it is given",
-					),
-				)
-			else if p.default.isSome() then
-				.Some(
-					(
-						"`\(name)` is implicit and has a default",
-						"a call that passes nothing fills an implicit from its caller; a default would give a value nothing shows",
-					),
-				)
-			else if self.program.types.isGeneric(ty) then
-				.Some(
-					(
-						"`\(name)` is implicit and its type names a type parameter",
-						"a call fills it from the implicit of its name, which has one type; a type parameter would be decided by what is found",
-					),
-				)
-			else if self.kind(ty) !is .Ref(..) && self.owns(ty) then
-				.Some(
-					(
-						"`\(name)` is implicit and owns what it holds",
-						"an implicit is lent, `&` or `&var`, or copied; a value that owns memory would be moved out of the caller at every call",
-					),
-				)
-			else .None
+		val why: Option<(String, str)> = when {
+			isExtern => .Some(
+				("a C function takes no implicit parameter", "C passes every argument it is given"),
+			)
+			p.default.isSome() => .Some(
+				(
+					"`\(name)` is implicit and has a default",
+					"a call that passes nothing fills an implicit from its caller; a default would give a value nothing shows",
+				),
+			)
+			self.program.types.isGeneric(ty) => .Some(
+				(
+					"`\(name)` is implicit and its type names a type parameter",
+					"a call fills it from the implicit of its name, which has one type; a type parameter would be decided by what is found",
+				),
+			)
+			self.kind(ty) !is .Ref(..) && self.owns(ty) => .Some(
+				(
+					"`\(name)` is implicit and owns what it holds",
+					"an implicit is lent, `&` or `&var`, or copied; a value that owns memory would be moved out of the caller at every call",
+				),
+			)
+			else => .None
+		}
 		val .Some((message, note)) = move why else return
 		self.report(
-			Diagnostic::error(
-				IMPLICIT_NOT_ONE_NAME,
-				move message,
-				p.span,
-				"implicit here",
-			).withNote(note),
+			Diagnostic::error(IMPLICIT_NOT_ONE_NAME, message, p.span, "implicit here").withNote(
+				note,
+			),
 		)
 	}
 
@@ -2313,6 +2335,8 @@ extend Lowerer {
 				"sizeOf" => .Some(.SizeOf)
 				// A slice's address, for C to read.
 				"pointerTo" if path == "std::c" || path == "std::prelude" => .Some(.SlicePointer)
+				// A plain value's bytes, for C and a GPU to read.
+				"bytesOf" if path == "std::c" => .Some(.ValueBytes)
 				"alignOf" => .Some(.AlignOf)
 				"offsetOf" => .Some(.OffsetOf)
 				// What the runtime written in Wip needs of memory C gave it.
@@ -2458,7 +2482,7 @@ extend Lowerer {
 									.None => BuiltinImpl()
 								}
 								built.methods.push(id)
-								self.program.builtins.put(builtin, move built)
+								self.program.builtins.put(builtin, built)
 							}
 						}
 					}
@@ -2467,33 +2491,37 @@ extend Lowerer {
 			}
 			.None if !isExtern && self.preludeName(sig.name, "a function named") => {}
 			.None => {
-				if self.fns().get(&sig.name.sym) is .Some(first) {
-					val firstSpan = self.program.fns[first].nameSpan
-					self.duplicate(sig.name, firstSpan)
-				} else if self.structNamed(sig.name.sym) is .Some(first) {
-					// `Row(…)` builds a struct, or what an alias names, so a
-					// function may not take its name.
-					val text = String::of(self.text(sig.name.sym))
-					self.report(
-						Diagnostic::error(
-							DUPLICATE_DEFINITION,
-							"`\(text)` is a type of this module and a function",
-							sig.name.span,
-							"a function of that name",
-						).withSecondary(first, "the type").
-							withNote("`\(text)(…)` builds the struct, as a variant is built, so it cannot also call a function").
-							withHelp(
-								"give the function a name of its own, or make it a `static fn` of the type",
-							),
-					)
-				} else {
-					// The free functions of the prelude's that the compiler
-					// calls, each for what `KnownFn` says.
-					if self.prelude == .Some(self.current) &&
-						KnownFn::named(.None, self.text(sig.name.sym)) is .Some(known) {
-						self.program.preludeItems.setFunction(known, id)
+				when {
+					self.fns().get(&sig.name.sym) is .Some(first) => {
+						val firstSpan = self.program.fns[first].nameSpan
+						self.duplicate(sig.name, firstSpan)
 					}
-					self.modules[self.current].fns.put(sig.name.sym, id)
+					self.structNamed(sig.name.sym) is .Some(first) => {
+						// `Row(…)` builds a struct, or what an alias names, so a
+						// function may not take its name.
+						val text = String::of(self.text(sig.name.sym))
+						self.report(
+							Diagnostic::error(
+								DUPLICATE_DEFINITION,
+								"`\(text)` is a type of this module and a function",
+								sig.name.span,
+								"a function of that name",
+							).withSecondary(first, "the type").
+								withNote("`\(text)(…)` builds the struct, as a variant is built, so it cannot also call a function").
+								withHelp(
+									"give the function a name of its own, or make it a `static fn` of the type",
+								),
+						)
+					}
+					else => {
+						// The free functions of the prelude's that the compiler
+						// calls, each for what `KnownFn` says.
+						if self.prelude == .Some(self.current) &&
+							KnownFn::named(.None, self.text(sig.name.sym)) is .Some(known) {
+							self.program.preludeItems.setFunction(known, id)
+						}
+						self.modules[self.current].fns.put(sig.name.sym, id)
+					}
 				}
 			}
 		}
@@ -2564,12 +2592,13 @@ extend Lowerer {
 	var fn checkTestShape(id: FnId, test: Option<Span>) = {
 		val .Some(at) = test else return
 		val def = &self.program.fns[id]
-		val wrong: Option<str> =
-			if def.receiver.isSome() then .Some("a method")
-			else if !def.params.isEmpty() then .Some("parameters")
-			else if !def.generics.isEmpty() then .Some("type parameters")
-			else if def.ret != UNIT then .Some("a result")
-			else .None
+		val wrong: Option<str> = when {
+			def.receiver.isSome() => .Some("a method")
+			!def.params.isEmpty() => .Some("parameters")
+			!def.generics.isEmpty() => .Some("type parameters")
+			def.ret != UNIT => .Some("a result")
+			else => .None
+		}
 		if wrong is .Some(wrong) {
 			val span = def.span
 			self.report(
@@ -2686,8 +2715,8 @@ extend Lowerer {
 			.Some(found) => found.clone()
 			.None => BuiltinImpl()
 		}
-		if entry.generics.isEmpty() then entry.generics = move generics
-		self.program.builtins.put(builtin, move entry)
+		if entry.generics.isEmpty() then entry.generics = generics
+		self.program.builtins.put(builtin, entry)
 		return .Some(.Builtin(builtin))
 	}
 
@@ -2869,6 +2898,6 @@ extend Lowerer {
 			diagnostic = diagnostic.withHelp(
 				"`usize` and `isize` are Wip's own; C's are built in as `size_t`, `ssize_t`, `uintptr_t` and `intptr_t`",
 			)
-		self.report(move diagnostic)
+		self.report(diagnostic)
 	}
 }

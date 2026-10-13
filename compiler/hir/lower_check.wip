@@ -106,7 +106,7 @@ extend Lowerer {
 					"this constant is \(text), which is out of range for `\(name)`",
 					span,
 					"does not fit in `\(name)`",
-				).withNote(move note),
+				).withNote(note),
 			)
 			return .Some(self.errorExpr(span))
 		}
@@ -165,13 +165,14 @@ extend Lowerer {
 	/// A call's argument, where what it is taken as is not known yet: an
 	/// `&place` is the argument's own.
 	var fn inferArgument(e: ast::ExprId, hint: Option<Ty>): ExprId = {
+		if self.checkedEarly(e) is .Some(checked) then return checked
 		val file = self.ast
 		val expr = &file.exprs[e]
 		if expr.kind is .Unary(op, operand, ..) && op is .Ref | .RefVar then
 			return self.reference(op, operand, hint, expr.span, true)
 		if expr.kind is .Block(block) {
 			val (checked, ty) = self.argumentBlock(&block, hint)
-			return self.alloc(.Block(move checked), ty, expr.span)
+			return self.alloc(.Block(checked), ty, expr.span)
 		}
 		return self.infer(e, hint)
 	}
@@ -356,18 +357,20 @@ extend Lowerer {
 		var container = self.tyOf(id)
 		var given: RefKind = .Shared
 		val actual = self.kind(self.tyOf(id))
-		if actual is .Ref(inner: c, kind: g) {
-			container = c
-			given = g
-		} else if self.state.body.exprs[id].kind is .Deref(r) {
-			val .Ref(inner: c, kind: g) = self.kind(self.tyOf(r)) else return .None
-			reference = r
-			container = c
-			given = g
-		} else if self.placeRoot(id) is .NotAPlace && actual !is .Ref(..) | .Fn(..) {
-			container = self.tyOf(id)
-		} else {
-			return .None
+		when {
+			actual is .Ref(inner: c, kind: g) => {
+				container = c
+				given = g
+			}
+			self.state.body.exprs[id].kind is .Deref(r) => {
+				val .Ref(inner: c, kind: g) = self.kind(self.tyOf(r)) else return .None
+				reference = r
+				container = c
+				given = g
+			}
+			self.placeRoot(id) is .NotAPlace && actual !is .Ref(..) | .Fn(..) =>
+				container = self.tyOf(id)
+			else => return .None
 		}
 		// A reference to read with is not lent as one to write with, and an
 		// array or a slice has its own coercions.
@@ -483,126 +486,138 @@ extend Lowerer {
 		if context is .Some((contextSpan, label)) then
 			diagnostic = diagnostic.withSecondary(contextSpan, label)
 		val stringOwner = self.stringOwner()
-		if self.program.types.isFloat(expected) && kind is .Int(..) {
-			diagnostic = diagnostic.withFix("use a float literal", own [
-				Edit::insert(span.hi, ".0"),
-			])
-		} else if self.kind(expected) is .Ref(inner: want, ..) &&
-			want == actual &&
-			self.kind(actual) is .Fn(..) {
+		when {
+			self.program.types.isFloat(expected) && kind is .Int(..) =>
+				diagnostic = diagnostic.withFix("use a float literal", own [
+					Edit::insert(span.hi, ".0"),
+				])
 			// A function value where a closure is expected. There is no way to
 			// write `&` on it: a closure is a pair, and a lambda makes one.
-			diagnostic = diagnostic.withNote(
-				"a closure is an environment and its code; a function value is code alone",
-			).withHelp("wrap it in a lambda that calls it, as in `(x) => f(x)`")
-		} else if expected == CSTRING && self.lendsText(actual) {
+			self.kind(expected) is .Ref(inner: want, ..) &&
+				want == actual &&
+				self.kind(actual) is .Fn(..) =>
+				diagnostic = diagnostic.withNote(
+					"a closure is an environment and its code; a function value is code alone",
+				).withHelp("wrap it in a lambda that calls it, as in `(x) => f(x)`")
 			// A `String` holds its bytes, and can write the NUL C wants after
 			// them.
-			diagnostic = diagnostic.withNote(
-				"a `cstring` is a pointer to bytes that end with a NUL, and a `String` holds bytes with nothing after them",
-			).withFix("write the NUL with `toCstring()`", own [
-				Edit::insert(span.hi, ".toCstring()"),
-			])
-		} else if expected == CSTRING && actual == STR {
+			expected == CSTRING && self.lendsText(actual) =>
+				diagnostic = diagnostic.withNote(
+					"a `cstring` is a pointer to bytes that end with a NUL, and a `String` holds bytes with nothing after them",
+				).withFix("write the NUL with `toCstring()`", own [
+					Edit::insert(span.hi, ".toCstring()"),
+				])
 			// Text that C can take must end with a NUL, and a `str` is a pointer
 			// and a length with nothing after it. Nothing converts one silently:
 			// it would have to allocate, and C may keep the pointer.
-			diagnostic = diagnostic.withNote(
-				"a `cstring` is a pointer to bytes that end with a NUL; a `str` is a pointer and a length, and has none",
-			).withHelp(
-				"a literal is either, if its type is said: `val sql: cstring = \"select …\"`; text built at run time goes through `String::toCstring()`, which writes the NUL",
-			)
-		} else if (expected == STR || self.kind(expected) == .Ref(inner: STR, kind: .Shared)) &&
-			stringOwner.isSome() &&
-			self.ownerOf(actual) == stringOwner {
+			expected == CSTRING && actual == STR =>
+				diagnostic = diagnostic.withNote(
+					"a `cstring` is a pointer to bytes that end with a NUL; a `str` is a pointer and a length, and has none",
+				).withHelp(
+					"a literal is either, if its type is said: `val sql: cstring = \"select …\"`; text built at run time goes through `String::toCstring()`, which writes the NUL",
+				)
 			// A `String` where a `str` is expected, somewhere a call is not: the
 			// bytes would outlive what holds them.
-			diagnostic = diagnostic.withNote(
-				"a `String` owns its bytes and a `str` borrows them, so it is lent as a `str` for a call and no longer",
-			).withHelp(
-				"call `toStr()` to say where the bytes are looked at, and keep the `String` alive for as long",
-			)
-		} else if self.kind(expected) == .Ref(inner: STR, kind: .Var) && self.lendsText(actual) {
+			(expected == STR || self.kind(expected) == .Ref(inner: STR, kind: .Shared)) &&
+				stringOwner.isSome() &&
+				self.ownerOf(actual) == stringOwner =>
+				diagnostic = diagnostic.withNote(
+					"a `String` owns its bytes and a `str` borrows them, so it is lent as a `str` for a call and no longer",
+				).withHelp(
+					"call `toStr()` to say where the bytes are looked at, and keep the `String` alive for as long",
+				)
 			// A `String` is lent as a `str` to read, never to write: the `str`
 			// written would not be the `String`.
-			diagnostic = diagnostic.withNote(
-				"a `String` is lent as a `str` where its text is read; writing a `str` would not write the `String`",
-			)
-		} else if self.kind(expected) is .Ref(inner: string, kind: .Var) &&
-			self.program.isString(string) &&
-			self.kind(actual) is .Ref(inner: text, ..) &&
-			text == STR {
+			self.kind(expected) == .Ref(inner: STR, kind: .Var) && self.lendsText(actual) =>
+				diagnostic = diagnostic.withNote(
+					"a `String` is lent as a `str` where its text is read; writing a `str` would not write the `String`",
+				)
 			// Text is copied where a `String` is kept and lent where one is read;
 			// one that is written would be a copy the caller never sees.
-			diagnostic = diagnostic.withNote(
-				"text is copied into a `String` where one is kept, and lent as one where it is read; a `&var String` is written, and a copy would lose what is written",
-			).withHelp("keep the text in a `String` to be written: `var text: String = …`")
-		} else if self.kind(expected) is .Own(target) &&
-			self.kind(target) is .Slice(elem) &&
-			self.kind(actual) is .Array(elem: e, ..) &&
-			e == elem &&
-			kind is .Array(..) {
+			self.kind(expected) is .Ref(inner: string, kind: .Var) &&
+				self.program.isString(string) &&
+				self.kind(actual) is .Ref(inner: text, ..) &&
+				text == STR =>
+				diagnostic = diagnostic.withNote(
+					"text is copied into a `String` where one is kept, and lent as one where it is read; a `&var String` is written, and a copy would lose what is written",
+				).withHelp("keep the text in a `String` to be written: `var text: String = …`")
 			// An array written where a list on the heap is expected, as `Vec::of`
 			// takes one.
-			diagnostic = diagnostic.withFix("build it on the heap, with `own`", own [
-				Edit::insert(span.lo, "own "),
-			]).withNote(
-				"an array is kept where it is written; `own [ … ]` builds the list on the heap, for what takes it to keep",
-			)
-		} else if self.kind(expected) == .Ref(inner: actual, kind: .Shared) {
-			diagnostic = diagnostic.withFix("borrow it with `&`", own [Edit::insert(span.lo, "&")])
-		} else if self.kind(expected) == .Ref(inner: actual, kind: .Var) {
-			diagnostic = diagnostic.withFix("pass a `&var` reference", own [
-				Edit::insert(span.lo, "&var "),
-			])
-		} else if self.kind(expected) is .Ref(inner: target, kind: refKind) &&
-			self.kind(target) is .Slice(elem) &&
-			self.kind(actual) is .Array(elem: e, ..) &&
-			e == elem {
-			// An array where a slice of it is expected.
-			val text = if refKind == .Var then "&var " else "&"
-			diagnostic = diagnostic.withFix("pass it as a slice", own [Edit::insert(span.lo, text)])
-		} else if self.kind(expected) is .Ref(inner: target, kind: refKind) &&
-			self.kind(target) is .Slice(elem) &&
-			self.kind(actual) !is .Ref(..) &&
-			self.itemsElement(actual) == .Some(elem) {
-			// A container where a slice of its elements is expected: a call lends
-			// them, once it is borrowed.
-			val text = if refKind == .Var then "&var " else "&"
-			diagnostic = diagnostic.withFix("borrow it, and its elements are lent", own [
-				Edit::insert(span.lo, text),
-			])
-		} else if self.kind(expected) is .Ref(inner: target, kind: .Var) &&
-			self.kind(target) is .Slice(elem) &&
-			self.kind(actual) is .Ref(inner: have, kind: .Shared) &&
-			self.itemsElement(have) == .Some(elem) &&
-			kind is .Ref(inner) {
-			// `&c` where its elements are lent to be written.
-			val between = Span::new(span.lo + 1, self.state.body.exprs[inner].span.lo)
-			diagnostic = diagnostic.withFix("pass a `&var` reference", own [
-				Edit::replace(between, "var "),
-			])
-		} else if self.kind(expected) is .Ref(inner: want, kind: wantKind) &&
-			self.kind(actual) is .Ref(inner: have, ..) &&
-			want == have &&
-			kind is .Ref(inner) {
-			// `&x` where `&var` is expected, or the other way round.
-			val between = Span::new(span.lo + 1, self.state.body.exprs[inner].span.lo)
-			diagnostic = if wantKind == .Var then
-				diagnostic.withFix("pass a `&var` reference", own [Edit::replace(between, "var ")])
-			else diagnostic.withFix("pass a `&` reference", own [Edit::replace(between, String())])
-		} else if kind is .If(elseBlock: .None, ..) {
-			diagnostic = diagnostic.withNote(
-				"an `if` without `else` produces no value",
-			).withHelp("add an `else` branch that produces \(self.tyName(expected))")
-		} else if actual == UNIT {
-			diagnostic = diagnostic.withNote("this expression produces no value")
+			self.kind(expected) is .Own(target) &&
+				self.kind(target) is .Slice(elem) &&
+				self.kind(actual) is .Array(elem: e, ..) &&
+				e == elem &&
+				kind is .Array(..) =>
+				diagnostic = diagnostic.withFix("build it on the heap, with `own`", own [
+					Edit::insert(span.lo, "own "),
+				]).withNote(
+					"an array is kept where it is written; `own [ … ]` builds the list on the heap, for what takes it to keep",
+				)
+			self.kind(expected) == .Ref(inner: actual, kind: .Shared) =>
+				diagnostic = diagnostic.withFix("borrow it with `&`", own [
+					Edit::insert(span.lo, "&"),
+				])
+			self.kind(expected) == .Ref(inner: actual, kind: .Var) =>
+				diagnostic = diagnostic.withFix("pass a `&var` reference", own [
+					Edit::insert(span.lo, "&var "),
+				])
+			self.kind(expected) is .Ref(inner: target, kind: refKind) &&
+				self.kind(target) is .Slice(elem) &&
+				self.kind(actual) is .Array(elem: e, ..) &&
+				e == elem => {
+				// An array where a slice of it is expected.
+				val text = if refKind == .Var then "&var " else "&"
+				diagnostic = diagnostic.withFix("pass it as a slice", own [
+					Edit::insert(span.lo, text),
+				])
+			}
+			self.kind(expected) is .Ref(inner: target, kind: refKind) &&
+				self.kind(target) is .Slice(elem) &&
+				self.kind(actual) !is .Ref(..) &&
+				self.itemsElement(actual) == .Some(elem) => {
+				// A container where a slice of its elements is expected: a call lends
+				// them, once it is borrowed.
+				val text = if refKind == .Var then "&var " else "&"
+				diagnostic = diagnostic.withFix("borrow it, and its elements are lent", own [
+					Edit::insert(span.lo, text),
+				])
+			}
+			self.kind(expected) is .Ref(inner: target, kind: .Var) &&
+				self.kind(target) is .Slice(elem) &&
+				self.kind(actual) is .Ref(inner: have, kind: .Shared) &&
+				self.itemsElement(have) == .Some(elem) &&
+				kind is .Ref(inner) => {
+				// `&c` where its elements are lent to be written.
+				val between = Span::new(span.lo + 1, self.state.body.exprs[inner].span.lo)
+				diagnostic = diagnostic.withFix("pass a `&var` reference", own [
+					Edit::replace(between, "var "),
+				])
+			}
+			self.kind(expected) is .Ref(inner: want, kind: wantKind) &&
+				self.kind(actual) is .Ref(inner: have, ..) &&
+				want == have &&
+				kind is .Ref(inner) => {
+				// `&x` where `&var` is expected, or the other way round.
+				val between = Span::new(span.lo + 1, self.state.body.exprs[inner].span.lo)
+				diagnostic = if wantKind == .Var then
+					diagnostic.withFix("pass a `&var` reference", own [
+						Edit::replace(between, "var "),
+					])
+				else diagnostic.withFix("pass a `&` reference", own [
+					Edit::replace(between, String()),
+				])
+			}
+			kind is .If(elseBlock: .None, ..) =>
+				diagnostic = diagnostic.withNote(
+					"an `if` or a `when` without `else` produces no value",
+				).withHelp("add an `else` branch that produces \(self.tyName(expected))")
+			actual == UNIT => diagnostic = diagnostic.withNote("this expression produces no value")
 		}
-		self.report(move diagnostic)
+		self.report(diagnostic)
 	}
 
 	var fn alloc(kind: ExprKind, ty: Ty, span: Span): ExprId = self.state.body.exprs.add(Expr(
-		kind: move kind,
+		kind: kind,
 		ty: ty,
 		span: span,
 	))

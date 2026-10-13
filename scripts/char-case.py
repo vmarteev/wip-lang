@@ -131,13 +131,13 @@ fn {name}(c: char): char = {{
 	while lo <= hi {{
 		val middle = (lo + hi) / 2
 		val (first, last, delta, step) = {table}[middle]
-		if code < first {{
-			hi = middle - 1
-		}} else if code > last {{
-			lo = middle + 1
-		}} else {{
-			if ((code - first) as i64) % step != 0 then return c
-			return char::fromScalar(((code as i64) + delta) as u32)
+		when {{
+			code < first => hi = middle - 1
+			code > last => lo = middle + 1
+			else => {{
+				if ((code - first) as i64) % step != 0 then return c
+				return char::fromScalar(((code as i64) + delta) as u32)
+			}}
 		}}
 	}}
 	return c
@@ -203,7 +203,7 @@ extend str {{
 		for c in self.chars() {{
 			out.pushChar(c.toLowercase())
 		}}
-		return move out
+		return out
 	}}
 
 	/// Each of its characters in upper case.
@@ -212,7 +212,7 @@ extend str {{
 		for c in self.chars() {{
 			out.pushChar(c.toUppercase())
 		}}
-		return move out
+		return out
 	}}
 
 	/// Whether the two are the same text in any case: what
@@ -246,7 +246,7 @@ extend str {{
 		for c in self.chars() {{
 			out.pushChar(c.folded())
 		}}
-		return move out
+		return out
 	}}
 }}
 

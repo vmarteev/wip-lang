@@ -1,7 +1,7 @@
 // Blocks, statements, `if`, `match`, `&&` and `||`.
 
 import hir as hir
-import hir::{BOOL, ERROR, ExprId, I32, I64, LocalId, PTR_U8, STR, StmtId, Ty}
+import hir::{BOOL, ERROR, ExprId, I32, I64, LocalId, PTR_U8, STR, StmtId, Ty, isSlicePointer}
 import syntax::{BinaryOp, Span, Symbol}
 
 /// Where a `for` over numbers stops: before its end, or after it.
@@ -49,7 +49,7 @@ extend Builder {
 			.Some(value) if !self.dead => match move dest {
 				.Some(place) => {
 					self.storeExpr(value, place.clone())
-					Value::Place(move place)
+					Value::Place(place)
 				}
 				.None => self.expr(value)
 			}
@@ -57,7 +57,7 @@ extend Builder {
 		}
 		if self.dead then self.scopes.pop() else self.dropScope()
 		self.seenUntil.pop()
-		return move value
+		return value
 	}
 
 	var fn stmt(id: StmtId) = {
@@ -132,21 +132,21 @@ extend Builder {
 					// `continue` and `break` go through too.
 					val next = self.newBlock()
 					val leave = self.newBlock()
-					self.terminate(.Branch(cond: move test, thenBlock: bodyBlock, otherwise: leave))
+					self.terminate(.Branch(cond: test, thenBlock: bodyBlock, otherwise: leave))
 					val breaks = self.loopBody(bodyBlock, &body, next, leave, .Nothing)
 					val scope = match self.scopes.pop() {
-						.Some(s) => move s
+						.Some(s) => s
 						.None => panic("pushed for the bindings")
 					}
 					self.switchTo(next)
 					self.unwind(scope.clone())
 					self.terminate(.Goto(header))
 					self.switchTo(leave)
-					self.unwind(move scope)
+					self.unwind(scope)
 					self.terminate(.Goto(exit))
 					breaks
 				} else {
-					self.terminate(.Branch(cond: move test, thenBlock: bodyBlock, otherwise: exit))
+					self.terminate(.Branch(cond: test, thenBlock: bodyBlock, otherwise: exit))
 					self.loopBody(bodyBlock, &body, header, exit, .Nothing)
 				}
 				self.switchTo(exit)
@@ -167,11 +167,11 @@ extend Builder {
 				self.seenUntil.push(hir.stmts[id].span.hi)
 				val bind = LoopBind::Element(
 					binding: binding.clone(),
-					elements: move place,
+					elements: place,
 					counter: i,
 					elemTy: elemTy,
 				)
-				self.countedLoop(i, .Before(move len), I64, &body, mark, move bind)
+				self.countedLoop(i, .Before(len), I64, &body, mark, bind)
 				self.seenUntil.pop()
 			}
 			.ForRange(binding, lo, hi, inclusive, body) => {
@@ -179,10 +179,10 @@ extend Builder {
 				val low = self.scalar(lo)
 				val high = self.scalar(hi)
 				val i = self.temp(ty)
-				self.assign(Place::of(i), .Use(move low))
-				val end = if inclusive then End::Through(move high) else End::Before(move high)
+				self.assign(Place::of(i), .Use(low))
+				val end = if inclusive then End::Through(high) else End::Before(high)
 				self.seenUntil.push(hir.stmts[id].span.hi)
-				self.countedLoop(i, move end, ty, &body, mark, .Range(binding: binding, counter: i))
+				self.countedLoop(i, end, ty, &body, mark, .Range(binding: binding, counter: i))
 				self.seenUntil.pop()
 			}
 			// A jump unwinds what the loop's body opened: the temporaries of the
@@ -305,23 +305,19 @@ extend Builder {
 		self.terminate(.Goto(header))
 		self.switchTo(header)
 		val (past, last) = match move end {
-			.Before(e) => (BinaryOp::Ge, move e)
-			.Through(e) => (.Gt, move e)
+			.Before(e) => (BinaryOp::Ge, e)
+			.Through(e) => (.Gt, e)
 		}
 		val done = self.value(BOOL, .Binary(op: past, lhs: .Copy(Place::of(i)), rhs: last.clone()))
-		self.terminate(.Branch(cond: move done, thenBlock: exit, otherwise: bodyBlock))
-		self.loopBody(bodyBlock, &body, step, exit, move bind)
+		self.terminate(.Branch(cond: done, thenBlock: exit, otherwise: bodyBlock))
+		self.loopBody(bodyBlock, &body, step, exit, bind)
 		self.switchTo(step)
 		// Through the end, the loop stops at it rather than step past it, which
 		// the type may not hold: `0..=255` of a `u8`.
 		if past == .Gt {
-			val atLast = self.value(BOOL, .Binary(
-				op: .Eq,
-				lhs: .Copy(Place::of(i)),
-				rhs: move last,
-			))
+			val atLast = self.value(BOOL, .Binary(op: .Eq, lhs: .Copy(Place::of(i)), rhs: last))
 			val increment = self.newBlock()
-			self.terminate(.Branch(cond: move atLast, thenBlock: exit, otherwise: increment))
+			self.terminate(.Branch(cond: atLast, thenBlock: exit, otherwise: increment))
 			self.switchTo(increment)
 		}
 		val next = self.value(ty, .Binary(
@@ -329,7 +325,7 @@ extend Builder {
 			lhs: .Copy(Place::of(i)),
 			rhs: Builder::int(1, ty),
 		))
-		self.assign(Place::of(i), .Use(move next))
+		self.assign(Place::of(i), .Use(next))
 		self.terminate(.Goto(header))
 		self.switchTo(exit)
 		self.dropTemps(mark)
@@ -340,7 +336,7 @@ extend Builder {
 	var fn branchDest(ty: Ty, dest: Option<Place>): Option<Place> = {
 		if !self.isAggregate(ty) then return .None
 		return match move dest {
-			.Some(place) => Option::Some(move place)
+			.Some(place) => Option::Some(place)
 			.None => Option::Some(Place::of(self.temp(ty)))
 		}
 	}
@@ -356,13 +352,13 @@ extend Builder {
 	): Value = {
 		val bindings = self.conditionBindings(cond)
 		val test = self.scalar(cond)
-		val target = self.branchDest(ty, move dest)
+		val target = self.branchDest(ty, dest)
 		val result: Option<Local> =
 			if target.isNone() && self.isScalar(ty) then .Some(self.temp(ty)) else .None
 		val thenStart = self.newBlock()
 		val elseStart = self.newBlock()
 		val join = self.newBlock()
-		self.terminate(.Branch(cond: move test, thenBlock: thenStart, otherwise: elseStart))
+		self.terminate(.Branch(cond: test, thenBlock: thenStart, otherwise: elseStart))
 		var joined = false
 		for which in 0..2 {
 			self.switchTo(if which == 0 then thenStart else elseStart)
@@ -385,7 +381,7 @@ extend Builder {
 			self.dropTemps(mark)
 			if result is .Some(r) {
 				match move value {
-					.Scalar(operand) => self.assign(Place::of(r), .Use(move operand))
+					.Scalar(operand) => self.assign(Place::of(r), .Use(operand))
 					_ => panic("a branch of a scalar `if` produced no scalar")
 				}
 			}
@@ -403,7 +399,7 @@ extend Builder {
 		if bindings then self.dropScope()
 		return match (result, move target) {
 			(.Some(r), _) => Value::Scalar(.Copy(Place::of(r)))
-			(.None, .Some(place)) => Value::Place(move place)
+			(.None, .Some(place)) => Value::Place(place)
 			(.None, .None) => Value::Unit
 		}
 	}
@@ -421,11 +417,11 @@ extend Builder {
 				for e in elements {
 					places.push(self.testedPlace(e))
 				}
-				Tested::Many(move places)
+				Tested::Many(places)
 			}
 			_ => {
 				val (place, placeTy) = self.testedPlace(scrutinee)
-				Tested::One(place: move place, ty: placeTy)
+				Tested::One(place: place, ty: placeTy)
 			}
 		}
 		// What one place the switches below read; a tuple matched in place is
@@ -438,7 +434,7 @@ extend Builder {
 			if self.kind(scrutineeTy) is .Enum(..) then
 				.Some(self.value(I32, .Variant(place.clone())))
 			else .None
-		val target = self.branchDest(ty, move dest)
+		val target = self.branchDest(ty, dest)
 		val result: Option<Local> =
 			if target.isNone() && self.isScalar(ty) then .Some(self.temp(ty)) else .None
 		val join = self.newBlock()
@@ -468,49 +464,54 @@ extend Builder {
 		val numbers = self.numbersSwitch(scrutineeTy, &arms, &armBlocks, unmatched)
 		var tests: Vec<BlockId> = Vec()
 		val hasVariant = variant.isSome()
-		if !hasVariant && numbers.isSome() {
-			val .Some((cases, otherwise)) = numbers else panic("just asked")
-			self.terminate(.Switch(
-				value: .Copy(place.clone()),
-				cases: cases.clone(),
-				otherwise: otherwise,
-			))
-		} else if hasVariant && switchable {
-			val .Some(which) = move variant else panic("just asked")
-			var cases: Vec<(u32, BlockId)> = Vec()
-			var otherwise = unmatched
-			for (i, arm) in arms.forwards().enumerate() {
-				val block = armBlocks[i]
-				match arm.pattern {
-					.Variant(variant, ..) => {
-						var seen = false
-						for (case, _) in cases {
-							if case == variant then seen = true
+		when {
+			!hasVariant && numbers.isSome() => {
+				val .Some((cases, otherwise)) = numbers else panic("just asked")
+				self.terminate(.Switch(
+					value: .Copy(place.clone()),
+					cases: cases.clone(),
+					otherwise: otherwise,
+				))
+			}
+			hasVariant && switchable => {
+				val .Some(which) = move variant else panic("just asked")
+				var cases: Vec<(u32, BlockId)> = Vec()
+				var otherwise = unmatched
+				for (i, arm) in arms.forwards().enumerate() {
+					val block = armBlocks[i]
+					match arm.pattern {
+						.Variant(variant, ..) => {
+							var seen = false
+							for (case, _) in cases {
+								if case == variant then seen = true
+							}
+							if !seen then cases.push((variant, block))
 						}
-						if !seen then cases.push((variant, block))
-					}
-					_ => {
-						otherwise = block
-						break
+						_ => {
+							otherwise = block
+							break
+						}
 					}
 				}
+				self.terminate(.Switch(value: which, cases: cases, otherwise: otherwise))
 			}
-			self.terminate(.Switch(value: move which, cases: move cases, otherwise: otherwise))
-		} else if !switchable || !hasVariant {
-			// One block per arm's test, each falling to the next.
-			for _ in arms {
-				tests.push(self.newBlock())
+			!switchable || !hasVariant => {
+				// One block per arm's test, each falling to the next.
+				for _ in arms {
+					tests.push(self.newBlock())
+				}
+				val first = if tests.isEmpty() then unmatched else tests[0]
+				self.terminate(.Goto(first))
+				for (i, arm) in arms.forwards().enumerate() {
+					val next = if i + 1 < tests.len() then tests[i + 1] else unmatched
+					self.switchTo(tests[i])
+					self.testTested(&arm.pattern, &tested, armBlocks[i], next)
+				}
 			}
-			val first = if tests.isEmpty() then unmatched else tests[0]
-			self.terminate(.Goto(first))
-			for (i, arm) in arms.forwards().enumerate() {
-				val next = if i + 1 < tests.len() then tests[i + 1] else unmatched
-				self.switchTo(tests[i])
-				self.testTested(&arm.pattern, &tested, armBlocks[i], next)
+			else => {
+				val first = if armBlocks.isEmpty() then unmatched else armBlocks[0]
+				self.terminate(.Goto(first))
 			}
-		} else {
-			val first = if armBlocks.isEmpty() then unmatched else armBlocks[0]
-			self.terminate(.Goto(first))
 		}
 		var joined = false
 		for (i, arm) in arms.forwards().enumerate() {
@@ -531,11 +532,11 @@ extend Builder {
 				// answer is read out of it first.
 				val mark = self.temps.len()
 				val answer = self.scalar(guard)
-				val test = self.value(BOOL, .Use(move answer))
+				val test = self.value(BOOL, .Use(answer))
 				self.dropTemps(mark)
 				val body = self.newBlock()
 				val next = if i + 1 < tests.len() then tests[i + 1] else unmatched
-				self.terminate(.Branch(cond: move test, thenBlock: body, otherwise: next))
+				self.terminate(.Branch(cond: test, thenBlock: body, otherwise: next))
 				self.switchTo(body)
 			}
 			self.dropUntakenTested(&arm.pattern, &tested)
@@ -562,7 +563,7 @@ extend Builder {
 			self.dropScope()
 			if result is .Some(r) {
 				match move value {
-					.Scalar(operand) => self.assign(Place::of(r), .Use(move operand))
+					.Scalar(operand) => self.assign(Place::of(r), .Use(operand))
 					_ => panic("an arm of a scalar `match` produced no scalar")
 				}
 			}
@@ -579,7 +580,7 @@ extend Builder {
 		self.switchTo(join)
 		return match (result, move target) {
 			(.Some(r), _) => Value::Scalar(.Copy(Place::of(r)))
-			(.None, .Some(place)) => Value::Place(move place)
+			(.None, .Some(place)) => Value::Place(place)
 			(.None, .None) => Value::Unit
 		}
 	}
@@ -600,7 +601,7 @@ extend Builder {
 			self.vars.put(local, variable)
 			scope.push(.Drop(local))
 		}
-		self.scopes.push(move scope)
+		self.scopes.push(scope)
 		return true
 	}
 
@@ -717,9 +718,9 @@ extend Builder {
 			val temp = Place::of(self.temp(scrutineeTy))
 			self.storeExpr(scrutinee, temp.clone())
 			self.ownTemp(temp.clone(), scrutineeTy)
-			move temp
+			temp
 		}
-		return (move place, scrutineeTy)
+		return (place, scrutineeTy)
 	}
 
 	/// The cases of a switch on a number, and where the rest go, where every
@@ -750,11 +751,11 @@ extend Builder {
 						if !addCase(value, block, limit, &var cases) then return .None
 					}
 				}
-				.Wildcard | .Binding(..) => return .Some((move cases, block))
+				.Wildcard | .Binding(..) => return .Some((cases, block))
 				_ => return .None
 			}
 		}
-		return .Some((move cases, unmatched))
+		return .Some((cases, unmatched))
 	}
 }
 
@@ -823,7 +824,7 @@ extend Builder {
 			if binder is .Nested(pattern) && tests(&pattern) then
 				fields.push((i as u32, pattern.clone()))
 		}
-		return move fields
+		return fields
 	}
 
 	/// Emits the test a pattern makes, going to `matched` where the value
@@ -849,7 +850,7 @@ extend Builder {
 				// is known, each failure going on to the next arm.
 				val nested = self.newBlock()
 				self.terminate(.Switch(
-					value: move tag,
+					value: tag,
 					cases: Vec::of(own [(variant, nested)]),
 					otherwise: next,
 				))
@@ -862,9 +863,9 @@ extend Builder {
 				val same = self.value(BOOL, .Binary(
 					op: .Eq,
 					lhs: .Copy(place.clone()),
-					rhs: move constant,
+					rhs: constant,
 				))
-				self.terminate(.Branch(cond: move same, thenBlock: matched, otherwise: next))
+				self.terminate(.Branch(cond: same, thenBlock: matched, otherwise: next))
 			}
 			// `lo..=hi`: at least `lo`, then at most `hi`, an end left off not
 			// tested.
@@ -877,11 +878,11 @@ extend Builder {
 					val within = self.value(BOOL, .Binary(
 						op: op,
 						lhs: .Copy(place.clone()),
-						rhs: move end,
+						rhs: end,
 					))
 					val last = i + 1 == tested.len()
 					val pass = if last then matched else self.newBlock()
-					self.terminate(.Branch(cond: move within, thenBlock: pass, otherwise: next))
+					self.terminate(.Branch(cond: within, thenBlock: pass, otherwise: next))
 					if !last then self.switchTo(pass)
 				}
 				if tested.isEmpty() then self.terminate(.Goto(matched))
@@ -892,7 +893,7 @@ extend Builder {
 					lhs: .Copy(place.clone()),
 					rhs: .Const(.Bool(wanted)),
 				))
-				self.terminate(.Branch(cond: move same, thenBlock: matched, otherwise: next))
+				self.terminate(.Branch(cond: same, thenBlock: matched, otherwise: next))
 			}
 			// Text is compared by its bytes, wherever they are: a `String` by
 			// the text it lends, `toStr()`.
@@ -906,10 +907,10 @@ extend Builder {
 					val lent = Place::of(self.temp(STR))
 					self.push(.Call(
 						callee: .Fn(toStr),
-						args: Vec::of(own [move receiver]),
+						args: Vec::of(own [receiver]),
 						dest: .Some(lent.clone()),
 					))
-					move lent
+					lent
 				} else {
 					place.clone()
 				}
@@ -928,7 +929,7 @@ extend Builder {
 					]),
 					dest: .Some(same.clone()),
 				))
-				self.terminate(.Branch(cond: .Copy(move same), thenBlock: matched, otherwise: next))
+				self.terminate(.Branch(cond: .Copy(same), thenBlock: matched, otherwise: next))
 			}
 			// Any one of several: each is tried, and the last one that fails
 			// goes on to the next arm. Where they bind, which one matched is
@@ -964,7 +965,7 @@ extend Builder {
 						rhs: Builder::int(named, I64),
 					))
 					val pass = self.newBlock()
-					self.terminate(.Branch(cond: move fits, thenBlock: pass, otherwise: next))
+					self.terminate(.Branch(cond: fits, thenBlock: pass, otherwise: next))
 					self.switchTo(pass)
 				}
 				val elem = self.program.elementTy(scrutineeTy)
@@ -1010,7 +1011,7 @@ extend Builder {
 		.Array(len, ..) => (place.clone(), Builder::int(len as u128, I64))
 		_ => {
 			val len = self.value(I64, .Use(.Copy(place.project(.Field(1)))))
-			(place.clone(), move len)
+			(place.clone(), len)
 		}
 	}
 
@@ -1032,7 +1033,7 @@ extend Builder {
 			val back = (suffix.len() - j) as u64
 			parts.push(self.sliceElement(&elements, ty, &len, back, true))
 		}
-		return move parts
+		return parts
 	}
 
 	/// The element `index` from the start, or `index` back from the end, of an
@@ -1056,7 +1057,7 @@ extend Builder {
 					rhs: Builder::int(index as u128, I64),
 				))
 			else Builder::int(index as u128, I64)
-		val local = self.localOf(move at, I64)
+		val local = self.localOf(at, I64)
 		return elements.project(.Index(local))
 	}
 
@@ -1069,12 +1070,12 @@ extend Builder {
 		val start = self.value(PTR_U8, .AddressOf(elements.project(.Index(first))))
 		val count = self.value(I64, .Binary(
 			op: .Sub,
-			lhs: move len,
+			lhs: len,
 			rhs: Builder::int((prefix + suffix) as u128, I64),
 		))
 		val slice = Place::of(variable)
-		self.assign(slice.project(.Field(0)), .Use(move start))
-		self.assign(slice.project(.Field(1)), .Use(move count))
+		self.assign(slice.project(.Field(0)), .Use(start))
+		self.assign(slice.project(.Field(1)), .Use(count))
 		if made then return
 		self.vars.put(local, variable)
 		if !self.scopes.isEmpty() {
@@ -1119,7 +1120,7 @@ extend Builder {
 				if binder is .Ignored then continue
 				val field = place.project(.VariantField(variant: variant, field: i as u32))
 				val fieldTy = self.program.variantFieldTy(scrutineeTy, variant, i as u32)
-				self.binder(&binder, move field, fieldTy)
+				self.binder(&binder, field, fieldTy)
 			}
 		}
 		// A struct's fields, bound where they lie.
@@ -1128,7 +1129,7 @@ extend Builder {
 				if binder is .Ignored then continue
 				val field = place.project(.Field(i as u32))
 				val fieldTy = self.program.fieldTy(scrutineeTy, i as u32)
-				self.binder(&binder, move field, fieldTy)
+				self.binder(&binder, field, fieldTy)
 			}
 		}
 		// The elements it names, and the slice of those between.
@@ -1141,7 +1142,7 @@ extend Builder {
 				self.binder(&binder, part.clone(), elem)
 			}
 			if rest is .Some(.Bind(local)) then
-				self.bindRest(local, &elements, move len, prefix.len() as u64, suffix.len() as u64)
+				self.bindRest(local, &elements, len, prefix.len() as u64, suffix.len() as u64)
 		}
 		// A value the scrutinee must equal binds nothing; the test is made
 		// where the arm is chosen.
@@ -1189,7 +1190,7 @@ extend Builder {
 		for i in 0..(blocks.len() - 1) {
 			cases.push((i as u32, blocks[i]))
 		}
-		self.terminate(.Switch(value: .Copy(Place::of(which)), cases: move cases, otherwise: last))
+		self.terminate(.Switch(value: .Copy(Place::of(which)), cases: cases, otherwise: last))
 		for (i, alternative) in alternatives.forwards().enumerate() {
 			self.switchTo(blocks[i])
 			match each {
@@ -1207,7 +1208,7 @@ extend Builder {
 	/// turn.
 	var fn binder(binder: &hir::Binder, field: Place, fieldTy: Ty) = match binder {
 		.Ignored => {}
-		.Bind(local) => self.bindLocal(local, move field, fieldTy)
+		.Bind(local) => self.bindLocal(local, field, fieldTy)
 		.Nested(pattern) => self.bind(&pattern, &field, fieldTy)
 	}
 
@@ -1238,11 +1239,7 @@ extend Builder {
 				for (i, binder) in binders.forwards().enumerate() {
 					val field = place.project(.VariantField(variant: variant, field: i as u32))
 					parts.push(
-						(
-							move field,
-							self.program.variantFieldTy(ty, variant, i as u32),
-							binder.clone(),
-						),
+						(field, self.program.variantFieldTy(ty, variant, i as u32), binder.clone()),
 					)
 				}
 			}
@@ -1337,7 +1334,7 @@ extend Builder {
 		val made = self.vars.contains(&local)
 		val variable = if made then self.varOf(local) else self.sourceLocal(local, .Var)
 		if self.hir.aliasBindings.contains(&local) {
-			self.assign(Place::of(variable), .AddressOf(move field))
+			self.assign(Place::of(variable), .AddressOf(field))
 		} else {
 			self.assign(Place::of(variable), .Use(.Copy(field.clone())))
 			if self.needsDrop(ty) {
@@ -1345,7 +1342,7 @@ extend Builder {
 				// say so for an `own`; a type that cleans up after itself needs
 				// the temporary's flag.
 				self.takenFromTemp(&field)
-				self.vacate(move field, ty)
+				self.vacate(field, ty)
 			}
 			// It holds a value now: a binding moved away on one path only is
 			// dropped on the others, which its flag says. Without this the flag
@@ -1368,14 +1365,14 @@ extend Builder {
 		val rhsBlock = self.newBlock()
 		val merge = self.newBlock()
 		val (whenTrue, whenFalse) = if op == .And then (rhsBlock, merge) else (merge, rhsBlock)
-		self.terminate(.Branch(cond: move left, thenBlock: whenTrue, otherwise: whenFalse))
+		self.terminate(.Branch(cond: left, thenBlock: whenTrue, otherwise: whenFalse))
 		self.switchTo(rhsBlock)
 		// Temporaries made on the right only exist on this path, so they are
 		// dropped before the paths join.
 		val mark = self.temps.len()
 		val right = self.scalar(rhs)
 		self.dropTemps(mark)
-		self.assign(Place::of(result), .Use(move right))
+		self.assign(Place::of(result), .Use(right))
 		self.terminate(.Goto(merge))
 		self.switchTo(merge)
 		return .Copy(Place::of(result))

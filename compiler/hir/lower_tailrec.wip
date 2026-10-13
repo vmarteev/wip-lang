@@ -1,4 +1,5 @@
-// `@tailrec`: a function whose calls to itself are jumps.
+// Tail calls: `@tailrec`, a function whose calls to itself are jumps, and
+// `become f(x)`, a call that takes the function's frame.
 //
 // Tail position is decided here, where the spans are: the value of the body,
 // the value of a block in tail position, every arm of an `if` or a `match` in
@@ -9,7 +10,8 @@
 // move checker asks it.
 
 import std::collections::{Set}
-import syntax::{Diagnostic, NOT_A_TAIL_CALL, Span}
+import syntax as ast
+import syntax::{BECOME_AGGREGATE, BECOME_SIGNATURE, Diagnostic, NOT_A_TAIL_CALL, Span}
 
 extend Lowerer {
 	/// Checks a `@tailrec` function once its body is checked, and records the
@@ -75,10 +77,16 @@ extend Lowerer {
 				)
 				continue
 			}
-			if self.borrowsFrame(call) then continue
+			if self.borrowsFrame(
+				call,
+				"reuses",
+				"a `@tailrec` function's call to itself is a jump, so this frame is the one the next round uses",
+			) {
+				continue
+			}
 			tailCalls.push(call)
 		}
-		self.state.body.tailCalls = move tailCalls
+		self.state.body.tailCalls = tailCalls
 	}
 
 	/// The expressions in tail position, starting from the body's value.
@@ -167,9 +175,10 @@ extend Lowerer {
 		if block.value is .Some(value) then self.selfCalls(value, function, &var calls)
 	}
 
-	/// Whether an argument of the call refers into this frame, which the jump
-	/// is about to reuse. Reports it, and returns whether it did.
-	var fn borrowsFrame(call: ExprId): bool = {
+	/// Whether an argument of the call refers into this frame, which the call
+	/// is about to take: it `does` so, and `note` says why. Reports it, and
+	/// returns whether it did.
+	var fn borrowsFrame(call: ExprId, does: str, note: str): bool = {
 		val .Call(args, ..) = self.state.body.exprs[call].kind.clone() else {
 			panic("a self-call is a call")
 		}
@@ -181,12 +190,12 @@ extend Lowerer {
 		self.report(
 			Diagnostic::error(
 				NOT_A_TAIL_CALL,
-				"this argument refers into the frame the call reuses, so it cannot be a \(what)",
+				"this argument refers into the frame the call \(does), so it cannot be a \(what)",
 				span,
 				"points into this call's frame",
-			).withNote(
-				"a `@tailrec` function's call to itself is a jump, so this frame is the one the next round uses",
-			).withHelp("pass the value itself, or a reference the function was given"),
+			).withNote(note).withHelp(
+				"pass the value itself, or a reference the function was given",
+			),
 		)
 		return true
 	}
@@ -220,5 +229,166 @@ extend Lowerer {
 		.Deref(_) => false
 		// A temporary of this call: it lives in this frame.
 		_ => true
+	}
+
+	/// `become f(args)`: the call, checked as the function's value, and
+	/// recorded as one that takes the function's frame. What may not be is
+	/// said here; what the frame still holds, the move checker says.
+	var fn becomeCall(call: ast::ExprId, span: Span): ExprId = {
+		val keyword = Span::new(span.lo, span.lo + 6)
+		// Where there is no function's frame of the signature to give.
+		val around: Option<str> = when {
+			self.state.lambda => .Some("a lambda")
+			self.state.generator.isSome() => .Some("a generator")
+			self.kind(self.state.ret) is .Ref(..) => .Some("a projection")
+			else => .None
+		}
+		if around is .Some(what) {
+			self.report(
+				Diagnostic::error(
+					NOT_A_TAIL_CALL,
+					"`become` cannot be written in \(what)",
+					keyword,
+					"in \(what)",
+				).withNote("`become` gives a function's frame to the call, and \(what) has none of its own to give").withHelp(
+					"write `return`",
+				),
+			)
+			// Checked as `return` would check it, which says a lambda's result.
+			return match self.returnValue(.Some(call), span) {
+				.Some(returned) => returned
+				.None => self.errorExpr(span)
+			}
+		}
+		val value = self.check(call, self.state.ret)
+		if self.isPoisoned(self.tyOf(value)) then return value
+		val .Call(callee, args, typeArgs, ..) = self.state.body.exprs[value].kind.clone() else {
+			self.report(
+				Diagnostic::error(
+					NOT_A_TAIL_CALL,
+					"`become` needs a function called by its name",
+					self.state.body.exprs[value].span,
+					"not a call of a function by its name",
+				).withNote(
+					"a closure, a function value and a `dyn` method are called through an address, and only a call of a function by its name can take the frame",
+				).withHelp("write `return`"),
+			)
+			return value
+		}
+		val def = &self.program.fns[callee]
+		val name = String::of(self.text(def.name))
+		val exportsC = match self.state.function {
+			.Some(id) => self.program.fns[id].exportsC
+			.None => false
+		}
+		val refused: Option<str> = when {
+			def.isExtern || def.isVariadic => .Some("a C function, which takes C's frame")
+			def.exportsC != exportsC => .Some(
+				"a function called as C calls it, or not, where this one is the other",
+			)
+			def.isInline => .Some("an `@inline` function, which has no call to become")
+			def.intrinsic.isSome() => .Some("a function the compiler writes in place")
+			else => .None
+		}
+		if refused is .Some(what) {
+			self.report(
+				Diagnostic::error(
+					NOT_A_TAIL_CALL,
+					"`become` cannot call `\(name)`",
+					self.state.body.exprs[value].span,
+					"\(what)",
+				).withHelp("write `return`"),
+			)
+			return value
+		}
+		// The call takes the frame, so it takes what the function was given.
+		val typeArgsList = self.program.types.list(typeArgs).toVec()
+		var theirs: Vec<Ty> = Vec()
+		for param in def.params {
+			theirs.push(self.program.types.subst(param.ty, &typeArgsList))
+		}
+		val answers = self.program.types.subst(def.ret, &typeArgsList)
+		var mine: Vec<Ty> = Vec()
+		for param in self.state.body.params {
+			mine.push(self.state.body.locals[param].ty)
+		}
+		if theirs != mine || answers != self.state.ret {
+			val declared = def.nameSpan
+			self.report(
+				Diagnostic::error(
+					BECOME_SIGNATURE,
+					"`\(name)` \(self.signatureText(&theirs, answers)), and this function \(self.signatureText(&mine, self.state.ret))",
+					self.state.body.exprs[value].span,
+					"would take this function's frame",
+				).withSecondary(declared, "`\(name)` declared here").
+					withNote(
+						"the call takes the caller's frame, so it takes what the caller was given, in its order, and answers what the caller answers",
+					).
+					withHelp("write `return`, which makes a call of its own"),
+			)
+			return value
+		}
+		// A value passed by the address of its place must be in a frame that
+		// outlives this one.
+		for (i, arg) in args.forwards().enumerate() {
+			if i >= theirs.len() then break
+			if !isAggregate(&self.program, theirs[i]) || self.passedOn(arg) then continue
+			val ty = self.tyName(theirs[i])
+			self.report(
+				Diagnostic::error(
+					BECOME_AGGREGATE,
+					"this \(ty) is made in this frame, which is gone before `\(name)` reads it",
+					self.state.body.exprs[arg].span,
+					"passed by the address of its place",
+				).withNote(
+					"a struct, an enum, an array, a `str` and a slice are passed by the address of their place; a parameter passed on is in the frame of the caller's caller",
+				).withHelp(
+					"keep the value where the caller's caller can lend it, and pass `&` or `&var` of it",
+				),
+			)
+			return value
+		}
+		if self.borrowsFrame(
+			value,
+			"takes",
+			"`become` gives this frame to the call, so nothing in it is there when the call runs",
+		) {
+			return value
+		}
+		self.state.body.becomes.push(value)
+		return value
+	}
+
+	/// Whether an argument is a parameter of the function passed on as it
+	/// is, in the frame of the caller's caller.
+	fn passedOn(arg: ExprId): bool = match self.state.body.exprs[arg].kind {
+		.Local(local) => self.state.body.params.contains(&local)
+		_ => false
+	}
+
+	/// `(u64, i64)` and what it answers, for a message.
+	fn signatureText(params: &[Ty], ret: Ty): String = {
+		var names: Vec<String> = Vec()
+		for param in params {
+			names.push(self.program.tyName(param, self.interner))
+		}
+		val answered = if ret == UNIT then String::of("nothing") else self.tyName(ret)
+		return "takes `(\(names.join(", ")))` and answers \(answered)"
+	}
+
+	/// An `@inline` function's `become`s: each would leave the function it is
+	/// spliced into.
+	var fn inlineBecomes(id: FnId) = {
+		val span = self.state.body.exprs[self.state.body.becomes[0]].span
+		self.report(
+			Diagnostic::error(
+				NOT_A_TAIL_CALL,
+				"an `@inline` function cannot `become`",
+				span,
+				"would leave the function it is spliced into",
+			).withSecondary(self.program.fns[id].nameSpan, "`@inline` here").withHelp(
+				"write `return`, or leave out `@inline`",
+			),
+		)
 	}
 }

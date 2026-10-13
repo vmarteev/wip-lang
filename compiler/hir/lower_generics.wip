@@ -16,7 +16,8 @@ import syntax::{
 	Symbol,
 	TYPE_ARGUMENT_COUNT,
 	TYPE_PARAMETER_DEFAULT,
-	UNKNOWN_CONSTRAINT
+	UNKNOWN_CONSTRAINT,
+	UNSATISFIED_CONSTRAINT
 }
 
 /// An operand of a generic call or literal: the expression, the declared type
@@ -48,7 +49,7 @@ extend Inference {
 		for t in tys {
 			given.push(t.isSome())
 		}
-		return Inference(tys: move tys, given: move given)
+		return Inference(tys: tys, given: given)
 	}
 }
 
@@ -58,7 +59,7 @@ fn solved(solution: &[Option<Ty>]): Vec<Ty> = {
 	for t in solution {
 		args.push(t.unwrapOr(ERROR))
 	}
-	return move args
+	return args
 }
 
 extend Lowerer {
@@ -161,9 +162,13 @@ extend Lowerer {
 		return self.paramsOf(&params, true, isInterface)
 	}
 
+	/// The type parameters `params` declare. A type's and an interface's,
+	/// `declared` before the imports are checked, have their defaults and
+	/// their constraints read later, once every name a file imports is
+	/// known (`constrain`); a function's are read here.
 	var fn paramsOf(
 		params: &[ast::GenericParam],
-		defaults: bool,
+		declared: bool,
 		isInterface: bool,
 	): Vec<GenericParamDef> = {
 		var seen: Map<Symbol, Span> = Map()
@@ -206,11 +211,17 @@ extend Lowerer {
 				written: param.name.sym,
 				interfaces: Vec(),
 				copy: copy,
-				default: if param.default.isSome() && defaults then ParamDefault::Pending
+				default: if param.default.isSome() && declared then ParamDefault::Pending
 				else ParamDefault::None,
 				span: param.name.span,
 			))
 		}
+		if !declared then self.constrain(&params, &var defs)
+		return defs
+	}
+
+	/// Reads the constraints of `params` into `defs`, their parameters.
+	var fn constrain(params: &[ast::GenericParam], defs: &var Vec<GenericParamDef>) = {
 		// With the names in scope, `C: Items<T>` can be read.
 		val outer = self.typeParams.len()
 		for def in defs {
@@ -261,10 +272,9 @@ extend Lowerer {
 			}
 			// Seen by the parameters after it: `J: Iterator<I::Item>`.
 			self.typeParams[outer + i].interfaces = interfaces.clone()
-			defs[i].interfaces = move interfaces
+			defs[i].interfaces = interfaces
 		}
 		self.typeParams.truncate(outer)
-		return move defs
 	}
 
 	/// The types a constraint's interface takes, checked against what it
@@ -290,7 +300,7 @@ extend Lowerer {
 			self.checkConstraints(ty, &generics[i], self.ast.types[arg].span)
 			args.push(ty)
 		}
-		val all = self.interfaceDefaults(id, move args, constrained)
+		val all = self.interfaceDefaults(id, args, constrained)
 		return self.program.types.internList(&all)
 	}
 
@@ -300,7 +310,7 @@ extend Lowerer {
 	/// first, then the interface's own parameters.
 	var fn interfaceDefaults(id: InterfaceId, written: Vec<Ty>, implementing: Ty): Vec<Ty> = {
 		val generics = self.program.interfaces[id].generics.clone()
-		var args = move written
+		var args = written
 		while args.len() < generics.len() {
 			val index = args.len()
 			val ty = match generics[index].default {
@@ -322,7 +332,7 @@ extend Lowerer {
 			}
 			args.push(ty)
 		}
-		return move args
+		return args
 	}
 
 	/// The type parameters of an item, as types.
@@ -335,7 +345,7 @@ extend Lowerer {
 				),
 			)
 		}
-		return move tys
+		return tys
 	}
 
 	/// The type parameter in scope under `sym`, if there is one.
@@ -407,7 +417,7 @@ extend Lowerer {
 			self.checkCopy(ty, &generics[i], self.ast.types[args[i]].span)
 			written.push(ty)
 		}
-		val tys = self.withDefaults(&generics, move written, span)
+		val tys = self.withDefaults(&generics, written, span)
 		// Each written argument's constraints, read with every argument known:
 		// `J: Iterator<I::Item>` is about the `I` given beside it.
 		for i in 0..args.len() {
@@ -458,7 +468,7 @@ extend Lowerer {
 			val was = if given == 1 then String::of("1 was") else "\(given) were"
 			"`\(text)` takes \(count) (`\(names.join("`, `"))`), but \(was) given"
 		}
-		self.report(Diagnostic::error(TYPE_ARGUMENT_COUNT, move message, span, "expected \(count)"))
+		self.report(Diagnostic::error(TYPE_ARGUMENT_COUNT, message, span, "expected \(count)"))
 	}
 
 	/// Reports a type argument that owns memory where `param` requires
@@ -541,7 +551,7 @@ extend Lowerer {
 			unknown.push(.None)
 			broken.push(.Some(ERROR))
 		}
-		val .Some(typeArgs) = typeArgs else return move unknown
+		val .Some(typeArgs) = typeArgs else return unknown
 		if typeArgs.after != expectedAfter {
 			for arg in typeArgs.args {
 				self.resolveTy(arg)
@@ -554,7 +564,7 @@ extend Lowerer {
 					"not after the generic item",
 				),
 			)
-			return move broken
+			return broken
 		}
 		val given = typeArgs.args.len()
 		if given < requiredTypeArgs(&generics) || given > generics.len() {
@@ -562,7 +572,7 @@ extend Lowerer {
 				self.resolveTy(arg)
 			}
 			self.typeArgCount(name, &generics, given, typeArgs.span)
-			return move broken
+			return broken
 		}
 		var written: Vec<Ty> = Vec()
 		for i in 0..given {
@@ -573,10 +583,10 @@ extend Lowerer {
 			written.push(ty)
 		}
 		var all: Vec<Option<Ty>> = Vec()
-		for t in self.withDefaults(&generics, move written, typeArgs.span) {
+		for t in self.withDefaults(&generics, written, typeArgs.span) {
 			all.push(.Some(t))
 		}
-		return move all
+		return all
 	}
 
 	/// The type arguments a use writes, followed by the defaults of the ones
@@ -584,7 +594,7 @@ extend Lowerer {
 	/// written one is. A default not read yet, while the defaults are read,
 	/// is waited for.
 	var fn withDefaults(generics: &[GenericParamDef], written: Vec<Ty>, span: Span): Vec<Ty> = {
-		var tys = move written
+		var tys = written
 		val count = if tys.len() < generics.len() then tys.len() else generics.len()
 		for i in count..generics.len() {
 			val ty = match generics[i].default {
@@ -603,7 +613,7 @@ extend Lowerer {
 			self.checkCopy(tys[i], &generics[i], span)
 			self.checkConstraintsIn(tys[i], &generics[i], span, &tys)
 		}
-		return move tys
+		return tys
 	}
 
 	/// Learns type arguments by matching a declared type, which mentions the
@@ -849,13 +859,12 @@ extend Lowerer {
 				val id = if known {
 					val args = solved(&solution)
 					val declared = self.program.types.subst(operand.declared, &args)
-					if operand.toC &&
-						self.lentToC(operand.expr, declared, operand.context) is .Some(lent) {
-						lent
-					} else if operand.isArg {
-						self.checkArgument(operand.expr, declared, operand.context)
-					} else {
-						self.checkIn(operand.expr, declared, operand.context)
+					when {
+						operand.toC &&
+							self.lentToC(operand.expr, declared, operand.context) is .Some(lent) =>
+							lent
+						operand.isArg => self.checkArgument(operand.expr, declared, operand.context)
+						else => self.checkIn(operand.expr, declared, operand.context)
 					}
 				} else {
 					// A lambda takes its parameters' types from what is expected,
@@ -911,7 +920,7 @@ extend Lowerer {
 				.None => panic("every operand was checked")
 			}
 		}
-		return move all
+		return all
 	}
 
 	/// An array inferred for a parameter whose interfaces its slice implements
@@ -971,8 +980,8 @@ extend Lowerer {
 		inference: Inference,
 		span: Span,
 	): Vec<Ty> = {
-		var solution = move inference.tys
-		val given = move inference.given
+		var solution = inference.tys
+		val given = inference.given
 		// A constraint's argument may be a parameter of its own, and the
 		// implementation the type has says what it is: `C = Vec<i64>` with
 		// `C: Items<T>` makes `T` an `i64`.
@@ -1030,12 +1039,14 @@ extend Lowerer {
 				self.checkConstraintsIn(ty, &generics[i], span, &tys)
 			}
 		}
-		return move tys
+		return tys
 	}
 
 	/// What a constraint's arguments say about the parameters they name.
 	/// `C: Items<T>` with `C` known looks for the implementation `C` has,
-	/// reads its arguments in `C`'s own, and that is `T`.
+	/// reads its arguments in `C`'s own, and that is `T`. A parameter inside
+	/// an argument is found the same way: `I: Iterator<(K, V)>`, with `I` an
+	/// iterator of `(String, i64)`, says `K` and `V`.
 	var fn solveThroughConstraints(
 		generics: &[GenericParamDef],
 		solution: &var Vec<Option<Ty>>,
@@ -1047,11 +1058,14 @@ extend Lowerer {
 			for constraint in generics[i].interfaces.clone() {
 				val declared = self.program.types.list(constraint.args).toVec()
 				// Only where something is still unknown.
+				var unknown: Vec<u32> = Vec()
+				for at in 0..solution.len() {
+					if solution[at].isNone() then unknown.push(at as u32)
+				}
 				var wanted = false
 				for arg in declared {
-					if self.kind(arg) is .Param(param: p) &&
-						(p.index as i64) < solution.len() &&
-						solution[p.index as i64].isNone() {
+					if self.program.types.any(arg, (kind) =>
+						kind is .Param(param: p) && unknown.contains(&p.index)) {
 						wanted = true
 					}
 				}
@@ -1061,10 +1075,38 @@ extend Lowerer {
 				}
 				var j = 0
 				while j < declared.len() && j < args.len() {
-					if self.kind(declared[j]) is .Param(param: p) &&
-						(p.index as i64) < solution.len() &&
-						solution[p.index as i64].isNone() {
-						solution[p.index as i64] = .Some(args[j])
+					self.unify(declared[j], args[j], &var solution)
+					// What the type hands out is no such thing: said here, once,
+					// and the parameters inside are the error type, so that
+					// neither their inference nor the constraint says it again.
+					val missed = self.program.types.any(
+						declared[j],
+						(kind) =>
+							kind is .Param(param: p) &&
+								(p.index as i64) < solution.len() &&
+								solution[p.index as i64].isNone(),
+					)
+					if missed {
+						val interfaceName = String::of(
+							self.text(self.program.interfaces[constraint.interfaceId].name),
+						)
+						self.report(
+							Diagnostic::error(
+								UNSATISFIED_CONSTRAINT,
+								"\(self.tyName(ty)) is `\(interfaceName)<\(self.program.tyName(args[j], self.interner))>`, not `\(interfaceName)<\(self.program.tyName(declared[j], self.interner))>`",
+								span,
+								"hands out \(self.tyName(args[j]))",
+							).withNote("the constraint asks for `\(self.program.tyName(declared[j], self.interner))`, and its parameters are read from what the argument hands out"),
+						)
+						for at in 0..solution.len() {
+							if solution[at].isNone() &&
+								self.program.types.any(
+									declared[j],
+									(kind) => kind is .Param(param: p) && p.index as i64 == at,
+								) {
+								solution[at] = .Some(ERROR)
+							}
+						}
 					}
 					j += 1
 				}
@@ -1113,7 +1155,7 @@ extend Lowerer {
 		for arg in args {
 			substituted.push(self.program.types.subst(arg, &ownArgs))
 		}
-		return .Some(move substituted)
+		return .Some(substituted)
 	}
 
 	/// The type arguments a generic struct or enum takes from the type
@@ -1124,17 +1166,17 @@ extend Lowerer {
 		for _ in 0..count {
 			unknown.push(.None)
 		}
-		val .Some(expected) = expected else return move unknown
+		val .Some(expected) = expected else return unknown
 		val list: TyList = match (def, self.kind(expected)) {
 			(.Struct(a), .Struct(id: b, args)) if a == b => args
 			(.Enum(a), .Enum(id: b, args)) if a == b => args
-			_ => return move unknown
+			_ => return unknown
 		}
 		var args: Vec<Option<Ty>> = Vec()
 		for t in self.program.types.list(list) {
 			args.push(.Some(t))
 		}
-		return move args
+		return args
 	}
 
 	/// Interns the field types of every instance interned since `from`, so
@@ -1142,7 +1184,7 @@ extend Lowerer {
 	var fn completeTypes(from: i64) = {
 		var diagnostics: Vec<Diagnostic> = Vec()
 		completeTypes(&var self.program, from, self.interner, &var diagnostics)
-		self.diagnostics.append(move diagnostics)
+		self.diagnostics.append(diagnostics)
 	}
 }
 

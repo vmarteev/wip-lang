@@ -16,7 +16,7 @@ fn recordingCompiler(root: str): String = {
 	val script = path::join(root, "cc.sh")
 	fs::writeFile(script, "#!/bin/sh\necho \"$*\" >> '\(log)'\nexec \(real) \"$@\"\n")
 	run(Command::of("chmod").args(["755", script.toStr()]))
-	return move script
+	return script
 }
 
 /// A program of Wip alone compiles no C: the runtime is Wip, and `cc` is
@@ -178,7 +178,7 @@ fn libraryForC(gate: &Gate, root: str): Option<String> = {
 	val cc = io::env("CC").unwrapOr("cc")
 	var link = Command::of(cc).args(["c/main.c", "libboard.a", "-o", "c/program"]).directory(root)
 	if needsLibm then link = link.arg("-lm")
-	val linked = run(move link)
+	val linked = run(link)
 	if !linked.exit.success() then return wrong("the C program does not link", &linked)
 	val ran = run(Command::of(path::join(root, "c/program")))
 	if ran.stdout != "42 9 5\n" then return wrong("the C program", &ran)
@@ -312,6 +312,59 @@ fn objectiveC(gate: &Gate, root: str): Option<String> = {
 	val cache = path::join(root, "cache")
 	val ran = run(gate.command(root, ["run", "main.wip"]).env("WIP_CACHE_DIR", cache))
 	if ran.stdout != "true\n" then return wrong("`wip run main.wip`", &ran)
+	return .None
+}
+
+/// A module's assembly is built as its C is: a `.S` file `@source` names for
+/// the processor, through the C preprocessor with the module's `@define`s
+/// and without its `@prefix`, and a `.s` file assembled as it is; each
+/// called through `extern "C"`.
+fn assembly(gate: &Gate, root: str): Option<String> = {
+	write(
+		root,
+		"main.wip",
+		"import std::io\nimport adds\n\nfn main() = io::println(\"\\(adds::adds_add(40, 2)) \\(adds::adds_one(41))\")\n",
+	)
+	write(
+		root,
+		"adds/adds.wip",
+		"@target(arch = \"arm64\")\n@source(\"add_arm64.S\", \"one_arm64.s\")\nextern \"C\" {}\n\n@target(arch = \"x86_64\")\n@source(\"add_x86_64.S\", \"one_x86_64.s\")\nextern \"C\" {}\n\n@define(\"EXTRA=0\")\n@prefix(\"prefix.h\")\nextern \"C\" {\n    pub fn adds_add(a: i64, b: i64): i64\n    pub fn adds_one(a: i64): i64\n}\n",
+	)
+	// A header the module's C is compiled with, which assembly is not.
+	write(root, "adds/prefix.h", "#error \"assembly is not compiled with the prefix\"\n")
+	val name = (symbol: str) =>
+		if TARGET_VENDOR == "apple" then "_\(symbol)" else String::of(symbol)
+	write(
+		root,
+		"adds/add_arm64.S",
+		"#if defined(__APPLE__)\n#define NAME(n) _##n\n#else\n#define NAME(n) n\n#endif\n    .text\n    .globl NAME(adds_add)\n    .p2align 2\nNAME(adds_add):\n    add x0, x0, x1\n    add x0, x0, #EXTRA\n    ret\n",
+	)
+	write(
+		root,
+		"adds/add_x86_64.S",
+		"#if defined(__APPLE__)\n#define NAME(n) _##n\n#else\n#define NAME(n) n\n#endif\n    .text\n    .globl NAME(adds_add)\nNAME(adds_add):\n    leaq EXTRA(%rdi,%rsi), %rax\n    ret\n",
+	)
+	write(root, "adds/one_arm64.s", "    .text\n    .globl \(name("adds_one"))\n    .p2align 2\n\(name("adds_one")):\n    add x0, x0, #1\n    ret\n")
+	write(root, "adds/one_x86_64.s", "    .text\n    .globl \(name("adds_one"))\n\(name("adds_one")):\n    leaq 1(%rdi), %rax\n    ret\n")
+	val cc = recordingCompiler(root)
+	val cache = path::join(root, "cache")
+	val ran = run(gate.command(root, ["run", "main.wip"]).env("CC", cc).env("WIP_CACHE_DIR", cache))
+	if !ran.exit.success() || ran.stdout != "42 42\n" then
+		return wrong("`wip run main.wip`, with assembly", &ran)
+	var preprocessed = false
+	var plain = false
+	for call in linesOf(read(root, "calls.txt")) {
+		if call.contains(".S") &&
+			call.contains("-x assembler-with-cpp") &&
+			call.contains("-DEXTRA=0") &&
+			!call.contains("-include") {
+			preprocessed = true
+		}
+		if call.contains(".s ") && call.contains("-x assembler ") && !call.contains("-D") then
+			plain = true
+	}
+	if !preprocessed || !plain then
+		return .Some("the assembly was not assembled as said: \(read(root, "calls.txt"))")
 	return .None
 }
 

@@ -307,7 +307,7 @@ struct Row {
 fn main() = {
     var tags: Vec<String> = Vec()
     tags.push("new")
-    val row = Row(name: "a", tags: move tags)
+    val row = Row(name: "a", tags: tags)
     var copy = row.clone()
     copy.tags.push("changed")
     assert(row.tags.len() == 1 && copy.tags.len() == 2)
@@ -355,7 +355,7 @@ struct Settings {
 fn main() = {
     var bindings: Map<String, Key> = Map()
     bindings.put("jump", .Letter(char: 'w'))
-    val settings = Settings(bindings: move bindings, player: .None)
+    val settings = Settings(bindings: bindings, player: .None)
     val text = json::encode(&settings)
     assert(text.startsWith("{\"volume\":0.8,\"bindings\":{\"jump\":"))
     assert(text.endsWith("{\"Letter\":{\"char\":\"w\"}}}}"), "no player")
@@ -414,7 +414,7 @@ extend Source<T: Add + Zero> {
         while self.take() is .Some(x) {
             sum = sum + x
         }
-        return move sum
+        return sum
     }
 }
 
