@@ -34,6 +34,7 @@ import hir::{
 }
 import syntax::{
 	BORROWED_ACROSS_YIELD,
+	CHANGED_WHILE_BORROWED,
 	Diagnostic,
 	Edit,
 	KEEPS,
@@ -97,6 +98,8 @@ enum Change {
 	/// A generator's local, at a `yield`: it may be moved with the generator
 	/// before the generator goes on.
 	AcrossYield
+	/// Read, while a closure kept in a `val` writes it.
+	Read
 }
 
 extend Change {
@@ -107,6 +110,7 @@ extend Change {
 		.PassedAsVar => "passed as `&var`"
 		.Dropped => "dropped"
 		.AcrossYield => "is held across a `yield`"
+		.Read => "read"
 	}
 }
 
@@ -296,8 +300,8 @@ extend Checker {
 				// `names[0]` in `names`; and `&place` is the place.
 				.Call(callee, args, ..) => {
 					val .Some(.Param(base)) = self.program.fns[callee].projects else return .None
-					if (base as i64) >= args.len() then return .None
-					e = args[base as i64]
+					if base >= args.len() then return .None
+					e = args[base]
 				}
 				.Ref(inner) => e = inner
 				_ => return .None
@@ -306,12 +310,56 @@ extend Checker {
 		return .None
 	}
 
-	/// Whether a value of `ty` is a closure that reads what it captured,
-	/// `&(…) => R`, which a `val` may keep: it borrows what it captured as a
-	/// view borrows.
+	/// Whether a value of `ty` is a closure lent for a call, `&(…) => R` or
+	/// `&var (…) => R`, which a `val` may keep: it borrows what it captured as
+	/// a view borrows.
 	fn isKeptClosure(ty: Ty): bool = match self.program.types.kind(ty) {
-		.Ref(inner, kind: .Shared) => self.program.types.kind(inner) is .Fn(..)
+		.Ref(inner, ..) => self.program.types.kind(inner) is .Fn(..)
 		_ => false
+	}
+
+	/// Whether a value of `ty` is a closure that writes, `&var (…) => R`.
+	fn isWritingClosure(ty: Ty): bool = match self.program.types.kind(ty) {
+		.Ref(inner, kind: .Var) => self.program.types.kind(inner) is .Fn(..)
+		_ => false
+	}
+
+	/// The places a closure's value writes: each it captured by `&var`, or
+	/// what a `&var` it captured refers to.
+	fn writtenBy(value: ExprId): SortedSet<Path> = {
+		var paths: SortedSet<Path> = SortedSet()
+		val body = self.body
+		val .Closure(env, ..) = body.exprs[value].kind else return paths
+		val .Struct(fields, ..) = body.exprs[env].kind else return paths
+		for field in fields {
+			if !self.isVarRef(body.exprs[field].ty) then continue
+			match body.exprs[field].kind {
+				.Ref(place) => if self.accessPath(place) is .Some(path) then paths.add(path)
+				.Local(local) => paths.add(Path(local: local, projs: [Proj::Deref]))
+				_ => {}
+			}
+		}
+		return paths
+	}
+
+	/// `path` is read: a closure kept in a `val` that writes it, other than
+	/// `reader`, is stale from here on, and must not be used again.
+	fn readWhileWritten(path: &Path, reader: LocalId, span: Span, state: &var State) = {
+		var stale: Vec<LocalId> = Vec()
+		for (i, local) in state.writes.keys().forwards().enumerate() {
+			if local != reader && state.writes.values()[i].items().any((p) => p.overlaps(&path)) {
+				stale.push(local)
+			}
+		}
+		for local in stale {
+			if state.stale.contains(&local) then continue
+			state.stale.put(local, Stale(
+				definite: true,
+				change: span,
+				how: .Read,
+				root: self.rootName(&path),
+			))
+		}
 	}
 
 	/// `local`, a closure kept in a `val`, borrows what its value captured.
@@ -333,6 +381,8 @@ extend Checker {
 		}
 		state.roots.put(local, roots.paths)
 		state.stale.remove(&local)
+		if self.isWritingClosure(self.body.locals[local].ty) then
+			state.writes.put(local, self.writtenBy(value))
 	}
 
 	/// What the arguments of a call of `callee` lend its result, each as its
@@ -415,13 +465,11 @@ extend Checker {
 			.Call(callee, ..) if self.pointersOnly(body.exprs[id].ty) &&
 				!self.answersCStruct(callee) => {}
 			.DynCall(interfaceId, index, ..) if self.pointersOnly(body.exprs[id].ty) &&
-				!self.answersCStruct(
-					self.program.interfaces[interfaceId].methods[index as i64].id,
-				) => {}
+				!self.answersCStruct(self.program.interfaces[interfaceId].methods[index].id) => {}
 			.CallValue(..) | .CallClosure(..) if self.pointersOnly(body.exprs[id].ty) => {}
 			.Call(callee, args, ..) => roots = self.callRoots(.Some(callee), &args, &state)
 			.DynCall(interfaceId, index, args, ..) => {
-				val method = self.program.interfaces[interfaceId].methods[index as i64].id
+				val method = self.program.interfaces[interfaceId].methods[index].id
 				roots = self.callRoots(.Some(method), &args, &state)
 			}
 			// A function value or closure may answer what it captured, so the
@@ -540,8 +588,8 @@ extend Checker {
 		.Deref(inner) => {
 			val .Call(callee, args, ..) = self.body.exprs[inner].kind else return false
 			val .Some(.Param(at)) = self.program.fns[callee].projects else return false
-			if (at as i64) >= args.len() then return false
-			val .Ref(from) = self.body.exprs[args[at as i64]].kind else return false
+			if at >= args.len() then return false
+			val .Ref(from) = self.body.exprs[args[at]].kind else return false
 			return (self.place(from) is .None | .Some(.Temporary(..)) && !self.inTable(from)) ||
 				self.lentFromTemporary(from)
 		}
@@ -625,9 +673,7 @@ extend Checker {
 							.Ref(inner: p, ..) => p
 							_ => inner
 						}
-					} else {
-						inner
-					}
+					} else inner
 					val key = (c, pointee)
 					if !self.lent.contains(&key) then
 						self.lent.put(key, lendsTo(self.program, &def.generics, &params, pointee))
@@ -699,11 +745,11 @@ extend Checker {
 			"`\(kept)` would keep what `\(lent)` reaches, which is lent for this call alone",
 			span,
 			label.replace("{lent}", by: lent),
-		).withSecondary(self.body.locals[lentLocal].span, "`\(lent)` is lent for writing").
-			withNote(
+		).withSecondary(self.body.locals[lentLocal].span, "`\(lent)` is lent for writing")
+			.withNote(
 				"what a `&var` argument reaches is not kept by another argument: its caller writes it again, and would find what kept it stale",
-			).
-			withHelp("keep a copy, an index or a handle into `\(lent)` instead, as an `Arena`'s handle names what it holds")
+			)
+			.withHelp("keep a copy, an index or a handle into `\(lent)` instead, as an `Arena`'s handle names what it holds")
 		self.report(diagnostic)
 	}
 
@@ -725,7 +771,7 @@ extend Checker {
 			val text = if written then ", \(keptName)" else " keeps \(keptName)"
 			diagnostic = diagnostic.withFix(
 				"say that `\(self.fnName)` keeps `\(keptName)`",
-				own [Edit::insert(at, text)],
+				[Edit::insert(at, text)],
 			)
 		}
 		self.report(diagnostic)
@@ -809,9 +855,9 @@ extend Checker {
 				"`\(name)` is borrowed across a `yield`",
 				span,
 				"the generator stops here, with `\(name)` borrowed",
-			).withSecondary(b.span, by).
-				withNote(ACROSS_YIELD_NOTE).
-				withHelp(help)
+			).withSecondary(b.span, by)
+				.withNote(ACROSS_YIELD_NOTE)
+				.withHelp(help)
 			self.report(diagnostic)
 		}
 		var owned: SortedSet<LocalId> = SortedSet()
@@ -855,9 +901,9 @@ extend Checker {
 					"this loop's iterator borrows `\(root)` across a `yield`",
 					span,
 					"each pass calls `next()` here, after the generator went on",
-				).withSecondary(stale.change, "the generator stops here").
-					withNote(ACROSS_YIELD_NOTE).
-					withHelp(help)
+				).withSecondary(stale.change, "the generator stops here")
+					.withNote(ACROSS_YIELD_NOTE)
+					.withHelp(help)
 				self.report(diagnostic)
 				return
 			}
@@ -867,10 +913,10 @@ extend Checker {
 				"`\(name)` borrows `\(root)` across a `yield`",
 				span,
 				"used here, after the generator went on",
-			).withSecondary(stale.change, "the generator stops here").
-				withSecondary(def.span, "`\(variable)` borrows `\(root)`, the generator's own").
-				withNote(ACROSS_YIELD_NOTE).
-				withHelp(help)
+			).withSecondary(stale.change, "the generator stops here")
+				.withSecondary(def.span, "`\(variable)` borrows `\(root)`, the generator's own")
+				.withNote(ACROSS_YIELD_NOTE)
+				.withHelp(help)
 			self.report(diagnostic)
 			return
 		}
@@ -882,16 +928,34 @@ extend Checker {
 				"this loop's iterator borrows `\(root)`, which changes inside it",
 				span,
 				"each pass calls `next()` here",
-			).withSecondary(stale.change, "`\(root)` \(stale.how.text()) here").
-				withNote(
+			).withSecondary(stale.change, "`\(root)` \(stale.how.text()) here")
+				.withNote(
 					"what the iterator was made from must not change while the loop still walks it",
-				).
-				withHelp("change `\(root)` after the loop, or walk a copy that owns its bytes")
+				)
+				.withHelp("change `\(root)` after the loop, or walk a copy that owns its bytes")
 			self.report(diagnostic)
 			return
 		}
 		val variable = self.interner.resolve(def.name)
 		val verb = if stale.definite then "was" else "may have been"
+		// A closure kept in a `val` that writes holds what it writes as a
+		// `&var` is held, to its last use: nothing else reads or changes it
+		// before then.
+		if self.isWritingClosure(def.ty) {
+			val diagnostic = Diagnostic::error(
+				CHANGED_WHILE_BORROWED,
+				"`\(root)` \(verb) \(stale.how.text()) while `\(variable)`, which writes it, is still used",
+				stale.change,
+				"`\(root)` \(stale.how.text()) here",
+			).withSecondary(span, "`\(name)` used here, after")
+				.withSecondary(def.span, "`\(variable)` writes `\(root)`")
+				.withNote(
+					"a closure kept in a `val` that writes what it captures holds it as a `&var` is held, until the closure's last use: nothing else reads or changes it before then",
+				)
+				.withHelp("use `\(root)` after the last use of `\(variable)`, or give it to `\(variable)` as an argument")
+			self.report(diagnostic)
+			return
+		}
 		// A closure kept in a `val` reads what it captured where it is.
 		if self.isKeptClosure(def.ty) {
 			val diagnostic = Diagnostic::error(
@@ -899,12 +963,12 @@ extend Checker {
 				"`\(name)` is used after `\(root)`, which it captures, \(verb) \(stale.how.text())",
 				span,
 				"used here",
-			).withSecondary(stale.change, "`\(root)` \(stale.how.text()) here").
-				withSecondary(def.span, "`\(variable)` captures `\(root)`").
-				withNote(
+			).withSecondary(stale.change, "`\(root)` \(stale.how.text()) here")
+				.withSecondary(def.span, "`\(variable)` captures `\(root)`")
+				.withNote(
 					"a closure kept in a `val` reads what it captures where it is, so that must not change while the closure is still used",
-				).
-				withHelp("call `\(name)` before `\(root)` changes, or give it `\(root)` as an argument")
+				)
+				.withHelp("call `\(name)` before `\(root)` changes, or give it `\(root)` as an argument")
 			self.report(diagnostic)
 			return
 		}
@@ -915,10 +979,10 @@ extend Checker {
 			"`\(name)` is used after `\(root)`, which it borrows, \(verb) \(what)",
 			span,
 			"used here",
-		).withSecondary(stale.change, "`\(root)` \(stale.how.text()) here").
-			withSecondary(def.span, "`\(variable)` borrows `\(root)`").
-			withNote(borrowing.stale).
-			withHelp("use `\(name)` before `\(root)` changes, or \(borrowing.instead)")
+		).withSecondary(stale.change, "`\(root)` \(stale.how.text()) here")
+			.withSecondary(def.span, "`\(variable)` borrows `\(root)`")
+			.withNote(borrowing.stale)
+			.withHelp("use `\(name)` before `\(root)` changes, or \(borrowing.instead)")
 		self.report(diagnostic)
 	}
 
@@ -994,11 +1058,11 @@ extend Checker {
 				"this argument borrows `\(root)`, which the same call may change",
 				body.exprs[arg].span,
 				"borrows `\(root)`",
-			).withSecondary(body.exprs[vars[k].0].span, "passed as `&var` here").
-				withNote(
+			).withSecondary(body.exprs[vars[k].0].span, "passed as `&var` here")
+				.withNote(
 					"a `&var` argument may change its place while the call still reads the `str`, which points into it",
-				).
-				withHelp("copy the text first: `String::of(…)` owns its bytes")
+				)
+				.withHelp("copy the text first: `String::of(…)` owns its bytes")
 			self.report(diagnostic)
 		}
 	}
@@ -1011,9 +1075,9 @@ extend Checker {
 			"`\(name)` would borrow a temporary",
 			self.body.exprs[value].span,
 			"\(self.aView(value)) is kept here",
-		).withSecondary(temporary, "a temporary, dropped at the end of the statement").
-			withNote("a view points into what it borrows, which must live as long as it does").
-			withHelp(self.borrowing(self.ty(value)).bind)
+		).withSecondary(temporary, "a temporary, dropped at the end of the statement")
+			.withNote("a view points into what it borrows, which must live as long as it does")
+			.withHelp(self.borrowing(self.ty(value)).bind)
 		self.report(diagnostic)
 	}
 
@@ -1035,9 +1099,9 @@ extend Checker {
 				"cannot \(what) \(self.aView(value)) that borrows a temporary",
 				span,
 				"leaves the function here",
-			).withSecondary(temporary, "a temporary, dropped at the end of the statement").
-				withNote(self.borrowing(self.ty(value)).leaving).
-				withHelp(self.borrowing(self.ty(value)).answer)
+			).withSecondary(temporary, "a temporary, dropped at the end of the statement")
+				.withNote(self.borrowing(self.ty(value)).leaving)
+				.withHelp(self.borrowing(self.ty(value)).answer)
 			self.report(diagnostic)
 			return
 		}
@@ -1071,9 +1135,9 @@ extend Checker {
 					"cannot \(what) \(self.aView(value)) that points into `\(name)`",
 					span,
 					"points into `\(name)`",
-				).withSecondary(self.body.locals[self.body.params[param]].span, "`\(name)` is `\(self.tyName(self.body.locals[root.local].ty))`").
-					withNote(note).
-					withHelp("answer what `\(name)` borrows, or a value that owns its data")
+				).withSecondary(self.body.locals[self.body.params[param]].span, "`\(name)` is `\(self.tyName(self.body.locals[root.local].ty))`")
+					.withNote(note)
+					.withHelp("answer what `\(name)` borrows, or a value that owns its data")
 				self.report(diagnostic)
 				return
 			}
@@ -1095,9 +1159,9 @@ extend Checker {
 					"cannot \(what) \(self.aView(value)) that borrows what `\(name)` borrows",
 					span,
 					"borrows what `\(name)` borrows",
-				).withSecondary(self.body.locals[self.body.params[param]].span, "`\(name)` is not named after `from`").
-					withNote("`\(self.fnName)` says with `from` what its result borrows, and its callers keep only that").
-					withHelp("name `\(name)` after `from`, or answer from what it names")
+				).withSecondary(self.body.locals[self.body.params[param]].span, "`\(name)` is not named after `from`")
+					.withNote("`\(self.fnName)` says with `from` what its result borrows, and its callers keep only that")
+					.withHelp("name `\(name)` after `from`, or answer from what it names")
 				self.report(diagnostic)
 				return
 			}
@@ -1128,9 +1192,9 @@ extend Checker {
 			"cannot \(what) \(self.aView(value)) that borrows `\(name)`",
 			span,
 			owner,
-		).withSecondary(self.body.locals[root.local].span, "`\(name)` declared here").
-			withNote(note).
-			withHelp(help)
+		).withSecondary(self.body.locals[root.local].span, "`\(name)` declared here")
+			.withNote(note)
+			.withHelp(help)
 		self.report(diagnostic)
 	}
 
@@ -1153,11 +1217,11 @@ extend Checker {
 			"the value of this \(what) borrows `\(name)`, which is dropped where it ends",
 			self.body.exprs[value].span,
 			"borrows `\(name)`",
-		).withSecondary(self.body.locals[root.local].span, "`\(name)` declared here").
-			withNote(
+		).withSecondary(self.body.locals[root.local].span, "`\(name)` declared here")
+			.withNote(
 				"a `str`, a view or a `&` reference points into what it borrows, which must live as long as it does",
-			).
-			withHelp("declare `\(name)` outside the \(what), or answer a value that owns its data")
+			)
+			.withHelp("declare `\(name)` outside the \(what), or answer a value that owns its data")
 		self.report(diagnostic)
 	}
 }

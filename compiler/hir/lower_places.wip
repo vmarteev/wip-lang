@@ -85,9 +85,8 @@ extend Lowerer {
 	): Option<(StructId, i64, Span)> = match self.state.body.exprs[id].kind {
 		.Field(base, index) => {
 			val ty = self.underRefs(self.tyOf(base))
-			if self.kind(ty) is .Struct(id: owner, ..) && !self.fieldSettable(owner, index as i64) {
-				return .Some((owner, index as i64, self.state.body.exprs[id].span))
-			}
+			if self.kind(ty) is .Struct(id: owner, ..) && !self.fieldSettable(owner, index) then
+				return .Some((owner, index, self.state.body.exprs[id].span))
 			self.readonlyStep(base)
 		}
 		.Index(base, ..) | .SubSlice(base, ..) | .Deref(base) => self.readonlyStep(base)
@@ -180,7 +179,7 @@ extend Lowerer {
 		// another module's is read-only because that module says so, as a
 		// set's keys are.
 		val helped =
-			if def.module as i64 == self.current then
+			if def.module == self.current then
 				diagnostic.withHelp("declare `var fn \(name)(\(params.join(", "))): &var \(lends)` beside it")
 			else diagnostic.withHelp("`\(owner)` lends what `\(name)` finds for reading only; its own methods are how it is changed")
 		return .Some(
@@ -246,15 +245,15 @@ extend Lowerer {
 					.Assign => "cannot assign to `\(name)`, a constant"
 					.Borrow => "cannot borrow `\(name)`, a constant, as `&var`"
 				}
-				.Some(
+				Option::Some(
 					Diagnostic::error(
 						code,
 						message,
 						span,
 						"a constant cannot change",
-					).withSecondary(self.program.consts[id].span, "declared here").
-						withNote("a top-level `val` is kept once, in memory nothing writes").
-						withHelp("to change a copy of it, copy it first: `var copy = \(name)`"),
+					).withSecondary(self.program.consts[id].span, "declared here")
+						.withNote("a top-level `val` is kept once, in memory nothing writes")
+						.withHelp("to change a copy of it, copy it first: `var copy = \(name)`"),
 				)
 			}
 			.Local(id) => .Some(self.unwritableLocal(id, how, span))
@@ -277,7 +276,7 @@ extend Lowerer {
 			.Let(keyword) => diagnostic.withSecondary(
 				local.span,
 				"declared with `val`, so it cannot change",
-			).withFix("declare it with `var`", own [Edit::replace(keyword, "var")])
+			).withFix("declare it with `var`", [Edit::replace(keyword, "var")])
 			.Param => diagnostic.withSecondary(
 				local.span,
 				"a parameter",
@@ -319,8 +318,7 @@ extend Lowerer {
 				"an owned closure holds what it captured and reads it; whether it may change it is left for later",
 			).withHelp("take what changes as a parameter of the closure")
 		}
-		// What a closure that reads captured: one lent as `&(…) => R`, or kept
-		// in a `val`.
+		// What a closure that reads captured: one lent as `&(…) => R`.
 		if self.state.body.exprs[place].kind is .Deref(field) &&
 			self.state.body.exprs[field].kind is .Field(base, index) &&
 			self.kind(self.tyOf(base)) is .Struct(id, ..) &&
@@ -336,7 +334,7 @@ extend Lowerer {
 				.Borrow => "cannot borrow \(name), which this closure only reads, as `&var`"
 			}
 			return Diagnostic::error(code, message, span, "captured to read").withNote(
-				"a closure lent as `&(…) => R`, or kept in a `val`, reads what it captures; one that changes it is a `&var (…) => R`, lent for the call it is written in",
+				"a closure lent as `&(…) => R` reads what it captures; one that changes it is a `&var (…) => R`, lent for the call it is written in, or kept in a `val` it is the whole value of",
 			).withHelp(
 				"write the lambda where a `&var (…) => R` is taken, or take what changes as a `&var` parameter of it",
 			)
@@ -370,14 +368,12 @@ extend Lowerer {
 	/// What is not a place at all.
 	fn unwritableValue(place: ExprId, how: Writing, span: Span): Diagnostic = {
 		val kind = &self.state.body.exprs[place].kind
-		val message = if kind is .Len(..) {
-			"the length of an array or string cannot be changed"
-		} else {
-			match how {
+		val message =
+			if kind is .Len(..) then "the length of an array or string cannot be changed"
+			else match how {
 				.Assign => "cannot assign to this expression"
 				.Borrow => "`&var` needs a variable, field or element"
 			}
-		}
 		// A variable C owns is read as a copy, so there is nothing here to
 		// point at.
 		val global: Option<Access> = match kind {
@@ -400,7 +396,7 @@ extend Lowerer {
 			}
 			// A field of a struct C lays out, read the same way.
 			.Some(.Field(id, index)) => {
-				val field = &self.program.structs[id].fields[index as i64]
+				val field = &self.program.structs[id].fields[index]
 				val name = String::of(self.text(field.name))
 				diagnostic.withSecondary(
 					field.span,
@@ -450,9 +446,7 @@ extend Lowerer {
 		// The first use of a local waiting for its type: a value that says its
 		// own says it, `nearest = .Some(hit)`.
 		if op.isNone() && self.waitingLocal(target) is .Some(local) {
-			val found = if self.takesTypeBeside(value) {
-				ERROR
-			} else {
+			val found = if self.takesTypeBeside(value) then ERROR else {
 				val checked = self.infer(value, .None)
 				self.state.early.put(value, checked)
 				self.tyOf(checked)
@@ -498,15 +492,21 @@ extend Lowerer {
 		}
 		val given = self.operand(value, .Some(hint))
 		// A constant of another integer type is as the literal it stands for,
-		// as it is beside the place in `a + b`.
-		val operand = if binary !is .Shl | .Shr &&
-			self.tyOf(given) != placeTy &&
-			self.constantShaped(given) &&
-			self.constantFits(given, placeTy) {
-			self.constantAs(given, placeTy).unwrap()
-		} else {
-			given
+		// as it is beside the place in `a + b`, and a narrower integer widens,
+		// as it does there: `total += b`.
+		val shift = binary is .Shl | .Shr
+		val operand = when {
+			!shift &&
+				self.tyOf(given) != placeTy &&
+				self.constantShaped(given) &&
+				self.constantFits(given, placeTy) => self.constantAs(given, placeTy).unwrap()
+			!shift && self.program.types.widens(self.tyOf(given), placeTy) => self.widen(
+				given,
+				placeTy,
+			)
+			else => given
 		}
+		if self.shiftByWidth(binary, place, operand, opSpan, true) then return self.errorExpr(span)
 		// `<<=` and `>>=` take an amount of any integer type, as `<<` does.
 		val amount = self.shiftAmount(binary, place, operand)
 		val valueTy = self.tyOf(amount)
@@ -582,12 +582,7 @@ extend Lowerer {
 			// since C's field is not a place Wip holds.
 			.Some((binary, opSpan)) => {
 				val lhs = self.alloc(
-					.Call(
-						callee: get,
-						args: Vec::of(own [pointer]),
-						typeArgs: TyList::empty(),
-						order: Vec(),
-					),
+					.Call(callee: get, args: [pointer], typeArgs: TyList::empty(), order: Vec()),
 					ty,
 					self.ast.exprs[base].span,
 				)
@@ -609,7 +604,7 @@ extend Lowerer {
 			self.alloc(
 				.Call(
 					callee: set,
-					args: Vec::of(own [pointer, written]),
+					args: [pointer, written],
 					typeArgs: TyList::empty(),
 					order: Vec(),
 				),
@@ -656,9 +651,9 @@ extend Lowerer {
 					"cannot assign to `\(text)`, which C owns and Wip only reads",
 					self.ast.exprs[target].span,
 					"declared `val`",
-				).withSecondary(declared, "declared here").
-					withHelp("a variable Wip writes is declared `var`").
-					withNote(
+				).withSecondary(declared, "declared here")
+					.withHelp("a variable Wip writes is declared `var`")
+					.withNote(
 						"`val` in an extern block reads what C holds; `var` writes it as well",
 					),
 			)
@@ -695,12 +690,7 @@ extend Lowerer {
 			}
 		}
 		return self.alloc(
-			.Call(
-				callee: setter,
-				args: Vec::of(own [written]),
-				typeArgs: TyList::empty(),
-				order: Vec(),
-			),
+			.Call(callee: setter, args: [written], typeArgs: TyList::empty(), order: Vec()),
 			UNIT,
 			span,
 		)
@@ -744,12 +734,7 @@ extend Lowerer {
 						val (get, _) = self.program.structs[id].accessors[index]
 						val fieldTy = self.program.structs[id].fields[index].ty
 						return self.alloc(
-							.Call(
-								callee: get,
-								args: Vec::of(own [b]),
-								typeArgs: TyList::empty(),
-								order: Vec(),
-							),
+							.Call(callee: get, args: [b], typeArgs: TyList::empty(), order: Vec()),
 							fieldTy,
 							span,
 						)
@@ -800,7 +785,7 @@ extend Lowerer {
 			"a method, not a field",
 		).withNote("`x.name` is not a value, since it would hold `x`")
 		diagnostic = if takesNothing then
-			diagnostic.withFix("call it: `\(text)()`", own [Edit::insert(name.span.hi, "()")])
+			diagnostic.withFix("call it: `\(text)()`", [Edit::insert(name.span.hi, "()")])
 		else diagnostic.withHelp("to call it, write `\(call)`")
 		// Where a function is wanted, the type's is one, where it can be a
 		// value and its type has a name to write it with.
@@ -847,7 +832,7 @@ extend Lowerer {
 				if suggest(fieldText, &texts) is .Some(similar) then
 					diagnostic = diagnostic.withFix(
 						"did you mean `\(similar)`?",
-						own [Edit::replace(name.span, similar)],
+						[Edit::replace(name.span, similar)],
 					)
 				else if !names.isEmpty() then
 					diagnostic = diagnostic.withNote("the fields are \(names.join(", "))")
@@ -867,11 +852,11 @@ extend Lowerer {
 					"a `cstring` is a pointer to bytes that end with a NUL, so its length is not known until it is walked",
 				)
 				if fieldText == "toStr" then
-					diagnostic = diagnostic.withFix("`toStr` is a method: call it", own [
+					diagnostic = diagnostic.withFix("`toStr` is a method: call it", [
 						Edit::insert(name.span.hi, "()"),
 					])
 				else if fieldText == "len" then
-					diagnostic = diagnostic.withFix("walk it first, with `toStr()`, and ask it: `toStr().len()`", own [
+					diagnostic = diagnostic.withFix("walk it first, with `toStr()`, and ask it: `toStr().len()`", [
 						Edit::replace(name.span, "toStr().len()"),
 					])
 				self.report(diagnostic)
@@ -1024,12 +1009,7 @@ extend Lowerer {
 		val .Some(function) = callee else return self.coerce(id, I64, .None)
 		val widened = if ty == wide then id else self.alloc(.Cast(id), wide, span)
 		return self.alloc(
-			.Call(
-				callee: function,
-				args: Vec::of(own [widened]),
-				typeArgs: TyList::empty(),
-				order: Vec::of(own [0]),
-			),
+			.Call(callee: function, args: [widened], typeArgs: TyList::empty(), order: [0]),
 			I64,
 			span,
 		)
@@ -1098,14 +1078,8 @@ extend Lowerer {
 		val operand = self.operand(base, .None)
 		// A `String` is read as the text it holds.
 		var b = self.lendString(operand).unwrapOr(operand)
-		val low: Option<ExprId> = match lo {
-			.Some(e) => .Some(self.indexValue(e))
-			.None => .None
-		}
-		var high: Option<ExprId> = match hi {
-			.Some(e) => .Some(self.indexValue(e))
-			.None => .None
-		}
+		val low: Option<ExprId> = lo.map((e) => self.indexValue(e))
+		var high: Option<ExprId> = hi.map((e) => self.indexValue(e))
 		// `lo..=hi` is `lo..hi + 1`, which only a range as long as there are
 		// positions could make overflow.
 		if inclusive && high is .Some(end) {
@@ -1176,7 +1150,7 @@ extend Lowerer {
 					"a range of elements",
 				).withNote(
 					"a slice is a view of elements that belong to someone else, so it exists only as a `&` or `&var` argument, or as what a `for` loop walks",
-				).withFix("borrow it", own [Edit::insert(span.lo, "&")]),
+				).withFix("borrow it", [Edit::insert(span.lo, "&")]),
 			)
 			return self.errorExpr(span)
 		}

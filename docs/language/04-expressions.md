@@ -5,19 +5,33 @@
 A line break ends a statement, so semicolons are not written. A statement is
 a binding, an assignment, or an expression evaluated for what it does.
 
-A line that starts with `.` begins a variant, so a long
-chain of calls goes on with the `.` at the end of the line, or inside
-parentheses, where a line break ends nothing. A chain
-written with the `.` starting each line is warned about, with the fix
-that moves it:
+A line that starts with `.` continues the expression above it, as it
+would on one line, so a long chain of calls goes on with a `.` at the
+start of each line, or inside parentheses, where a line break ends
+nothing. A line that ends with `.` is refused (E0113), with the fix that
+moves the `.` to the start of the next: one way to wrap a chain, the one
+the eye finds. Where nothing is finished above — first in a
+block, after `=>` or `=`, or after a loop — a `.` begins a variant, and
+among a `match`'s arms a line that reads as a pattern before `=>` is the
+next arm. A variant meant under an expression, as a block's value under a
+statement, is written with its type, `Option::None`: written `.None`
+there, it is a member of what the line above answers, and refused with
+the fix that writes the type (E0126). The formatter writes a chain that
+does not fit one call a line, each line starting with its `.`:
 
 ```wip,run
 val words = ["wip", "is", "short", "and", "plain"]
-val lengths = words.walk().
-    filter(own (word) => word.len() > 2).
-    map(own (word) => word.len()).
-    toVec()
-assert(lengths == Vec::of(own [3, 5, 3, 5]))
+val lengths = words.copies()
+    .filter((word) => word.len() > 2)
+    .map((word) => word.len())
+    .toVec()
+assert(lengths == [3, 5, 3, 5])
+```
+
+```wip,error=E0113
+val words = ["wip", "is"]
+val count = words.copies().
+    count()
 ```
 
 `val` binds a name to a value; `var` binds one that may be assigned again:
@@ -60,15 +74,18 @@ val computed = {
 assert(computed == 15)
 ```
 
-An `if` is written one of two ways. **`if condition then
-a else b`**, where each branch is one expression — a value, a call, an
-assignment, or `return`, `break` or `continue`; and **`if condition { … }
-else { … }`**, where a branch is a block of statements. `then` marks where
-the condition ends, which is all the braces would; `else` takes the rest of
-the expression, as a lambda's body does, so `if c then a else b + 1` is
-`else (b + 1)`. A chain of `else if` is one `if` with several branches, and
-is written one way throughout. A long one breaks before each `else`, a
-line that ends in `then` going on to the next:
+Each branch of an `if` is written one of two ways. **`if condition then
+a else b`**, where a branch is one expression — a value, a call, an
+assignment, a `match`, or `return`, `break` or `continue`; and **`if
+condition { … } else { … }`**, where a branch is a block of statements.
+The branches of one `if` may differ, as a `when`'s arms may: `if
+xs.isEmpty() then return .None else { … }` answers early beside a body,
+and `if cached { … } else 0` puts a short value beside a block. `then`
+marks where the condition ends, which is all the braces would, and a block
+takes no `then`; `else` takes the rest of the expression, as a lambda's
+body does, so `if c then a else b + 1` is `else (b + 1)`. A chain of
+`else if` is one `if` with several branches. A long one breaks before each
+`else`, a line that ends in `then` going on to the next:
 
 ```wip,run
 fn sign(x: i64): i64 = if x < 0 then -1 else if x == 0 then 0 else 1
@@ -83,18 +100,23 @@ fn firstOf(xs: &[i64]): Option<i64> = {
     return .Some(xs[0])
 }
 
+fn doubledFirst(xs: &[i64]): Option<i64> = {
+    if xs.isEmpty() then return .None else {
+        val n = xs[0]
+        return .Some(n * 2)
+    }
+}
+
 fn main() = {
     assert(sign(-3) == -1 && sign(0) == 0)
     assert(describe(2) == "2 items")
-    assert(firstOf([4, 5]) == .Some(4))
+    assert(firstOf([4, 5]) == .Some(4) && doubledFirst([4, 5]) == .Some(8))
 
     val n = 7
     val total = if n > 3 {
         val half = n / 2
         half * 3
-    } else {
-        0
-    }
+    } else 0
     assert(total == 9)
 }
 ```
@@ -218,17 +240,32 @@ fn main() = {
 | `as` | between number types, and between `char` and a number |
 
 Arithmetic panics where the answer will not fit; `/` and `%` by zero panic.
-Between numbers, both sides must be the same type: Wip
-converts nothing on its own.
+Between numbers, both sides are of one type, or one is an integer whose
+type the other's holds, which widens to it: `byte + total` of a `u8` and
+an `i64` adds `i64`s ([page 1](01-types.md)). Two integer types neither
+of which holds the other — `i64` and `u64` — and an integer beside a
+float are refused, and `as` converts one.
+
+```wip,run
+val byte: u8 = 200
+val total: i64 = 1000
+assert(byte + total == 1200 && byte < total)
+```
+
+```wip,error=E0303
+val signed: i64 = -1
+val unsigned: u64 = 1
+val mixed = signed + unsigned
+```
 
 `a op= b` works out the place `a` once and is checked as `op` is, so
 `+=` past what the type holds panics too; `+%=`, `-%=` and `*%=` wrap, as
-`+%` does:
+`+%` does. A narrower integer `b` widens to `a`'s type:
 
 ```wip,run
 var hash: u32 = 2166136261
 for byte in "wip".items() {
-    hash ^= byte as u32
+    hash ^= byte
     hash *%= 16777619
 }
 assert(hash == 0x25F7F447)
@@ -286,18 +323,25 @@ n += {
 
 A shift's amount may be an integer of any type, and the answer is of the
 type shifted. It takes the amount modulo the width of what
-it shifts, so `x >> 8` of a `u8` is `x` itself, and
-`x << 64` of a `u64` is `x`. C makes a `u8` an `int` before it shifts it,
+it shifts, so a shift of a `u8` by 8 leaves it as it was, and one of a
+`u64` by 64 too. C makes a `u8` an `int` before it shifts it,
 where the same `x >> 8` is `0`: a port of C shifts in a type wide enough
-for the amount.
+for the amount. A constant amount at least the width is refused (E0367),
+as it is never what was meant, with the fix that widens the value first.
 
 ```wip,run
 val byte: u8 = 0xF0
-assert(byte >> 8 == 0xF0 && byte >> 4 == 0x0F)
+val eight = 8
+assert(byte >> eight == 0xF0 && byte >> 4 == 0x0F)
 assert(((byte as u32) >> 8) as u8 == 0)
 val buffer: u64 = 1
 val count: u32 = 12
 assert(buffer << count == 4096)
+```
+
+```wip,error=E0367
+val byte: u8 = 0xF0
+val gone = byte >> 8
 ```
 
 ```wip,error=E0303
@@ -546,11 +590,11 @@ A `for` binding is the element itself, so writing through it writes into
 what is being walked:
 
 ```wip,run
-var numbers = Vec::of(own [1, 2, 3])
+var numbers = Vec::of([1, 2, 3])
 for n in numbers {
     n *= 10
 }
-assert(numbers == Vec::of(own [10, 20, 30]))
+assert(numbers == [10, 20, 30])
 ```
 
 Part of an array or a slice is walked as the whole is: a range of its
@@ -598,7 +642,7 @@ for, and borrowing a temporary there is refused (E0437):
 ```wip,run
 val PRIMES: [i64; 4] = [2, 3, 5, 7]
 
-fn names(): Vec<String> = Vec::of(own [String::of("ada"), String::of("bob")])
+fn names(): Vec<String> = ["ada", "bob"]
 
 fn main() = {
     var sum = 0
@@ -639,10 +683,10 @@ fn main() = {
     val xs = [1, 2, 3, 4, 5, 6]
     var squares = for x in xs { yield x * x }
     assert(squares.next() == .Some(1))
-    assert(squares.take(2).toVec() == Vec::of(own [4, 9]))
+    assert(squares.take(2).toVec() == [4, 9])
 
     assert(evens(&xs).count() == 3)
-    assert(words("a bb ccc").toVec() == Vec::of(own ["a", "bb", "ccc"]))
+    assert(words("a bb ccc").toVec() == ["a", "bb", "ccc"])
 }
 ```
 
@@ -682,11 +726,11 @@ fn leaves(tree: &Tree): Iterator<i64> = {
 }
 
 fn main() = {
-    val tree = Tree::Node(children: own [
+    val tree = Tree::Node(children: [
         .Leaf(1),
-        .Node(children: own [.Leaf(2), .Leaf(3)]),
+        .Node(children: [.Leaf(2), .Leaf(3)]),
     ])
-    assert(leaves(&tree).toVec() == Vec::of(own [1, 2, 3]))
+    assert(leaves(&tree).toVec() == [1, 2, 3])
 }
 ```
 
@@ -706,7 +750,7 @@ fn total(values: &[i64]): i64 = {
 }
 
 fn main() = {
-    var numbers = Vec::of(own [1, 2, 3])
+    var numbers = Vec::of([1, 2, 3])
     assert(numbers[0] == 1)
     numbers[0] = 10
     assert(numbers[0] == 10)

@@ -112,10 +112,7 @@ extend Lowerer {
 		self.state.bindingAlternatives = 0
 		// A function that yields answers a generator.
 		if self.generatorOfFn(id) is .Some(genId) {
-			self.selfTy = match owner {
-				.Some(owner) => .Some(self.ownSelfTy(owner))
-				.None => .None
-			}
+			self.selfTy = owner.map((owner) => self.ownSelfTy(owner))
 			self.state.lentHalf = false
 			self.state.lends = 0
 			self.state.lentParam = .None
@@ -128,13 +125,10 @@ extend Lowerer {
 		self.state.lentHalf = self.program.lentHalves.contains(&id)
 		val params = self.program.fns[id].params.clone()
 		// `Self` in the body is the type the method belongs to.
-		self.selfTy = match owner {
-			.Some(owner) => .Some(self.ownSelfTy(owner))
-			.None => .None
-		}
+		self.selfTy = owner.map((owner) => self.ownSelfTy(owner))
 		self.state.body = Body()
 		self.state.byteLiterals = Set()
-		self.state.scopes = Vec::of(own [Map()])
+		self.state.scopes = [Map()]
 		self.state.pendingLocals = Map()
 		self.state.taking = Set()
 		self.state.function = .Some(id)
@@ -177,7 +171,7 @@ extend Lowerer {
 					"a value of type `\(name)` that is never used",
 				).withNote("a function without `: T` returns nothing").withFix(
 					"to return it, declare the return type: `: \(name)`",
-					own [Edit::insert(sigSpan.hi, ": \(name)")],
+					[Edit::insert(sigSpan.hi, ": \(name)")],
 				),
 			)
 		}
@@ -259,10 +253,17 @@ extend Lowerer {
 		var value: Option<ExprId> = .None
 		var diverges = false
 		val count = block.stmts.len()
+		// A last statement that ends in a variant under it, which its `.`
+		// continued: the block's value, meant and not written.
+		val variantTail = match expected {
+			.Some(t) => self.variantTail(&block, t)
+			.None => false
+		}
 		for (i, stmt) in block.stmts.forwards().enumerate() {
 			// An `if` without `else` has no value: where one is expected, it is
 			// a statement and the block falls off its end.
 			if i + 1 == count &&
+				!variantTail &&
 				expected != .Some(UNIT) &&
 				file.stmts[stmt].kind is .Expr(e) &&
 				!(expected.isSome() && lacksElse(&file, e)) {
@@ -290,9 +291,7 @@ extend Lowerer {
 		}
 		if !self.state.pendingLocals.isEmpty() then self.settleScope()
 		self.state.scopes.pop()
-		val ty = if diverges {
-			NEVER
-		} else {
+		val ty = if diverges then NEVER else {
 			match value {
 				// The value was checked against `expected`, and any mismatch
 				// reported there; an argument's is checked by the call.
@@ -304,7 +303,59 @@ extend Lowerer {
 				.None => UNIT
 			}
 		}
-		return (Block(stmts: stmts, value: value, span: block.span), ty)
+		// Reported: what the block was meant to answer is not known.
+		val answered = if variantTail then ERROR else ty
+		return (Block(stmts: stmts, value: value, span: block.span), answered)
+	}
+
+	/// Whether the block's last statement ends in a variant of the enum
+	/// `expected` written at the start of a line: the `.` there continued
+	/// the statement's last line — a `val`'s value, an assignment's, the last
+	/// branch of an `if` — where the variant was meant as the block's value.
+	/// Reported once (E0126), with the fix that writes its type.
+	var fn variantTail(block: &ast::Block, expected: Ty): bool = {
+		val .Some(field) = self.trailingDot(block) else return false
+		val .Field(base, name) = self.ast.exprs[field].kind else return false
+		val .Enum(id: enumId, ..) = self.kind(expected) else return false
+		var named = false
+		for variant in self.program.enums[enumId].variants {
+			if variant.name == name.sym then named = true
+		}
+		if !named then return false
+		self.state.variantTails.add(field)
+		self.reportVariantUnder(enumId, base, name)
+		return true
+	}
+
+	/// The field whose `.` began the last line of a block that answers
+	/// nothing, where that line is under its last statement.
+	fn trailingDot(block: &ast::Block): Option<ast::ExprId> = {
+		if block.stmts.isEmpty() then return .None
+		return match self.ast.stmts[block.stmts[block.stmts.len() - 1]].kind {
+			.Let(init, ..) => self.lastDot(init)
+			.Expr(value) | .Defer(value) | .Return(value: .Some(value)) => self.lastDot(value)
+			_ => .None
+		}
+	}
+
+	/// The field whose `.` began the line that ends `e`: `e`, or the last
+	/// part of it — an assignment's value, an operator's right side or its
+	/// operand, the last branch of an `if`, a block's last line.
+	fn lastDot(e: ast::ExprId): Option<ast::ExprId> = {
+		val file = self.ast
+		return match file.exprs[e].kind {
+			.Field(..) if file.lineDots.contains(&e) => .Some(e)
+			.Call(callee, ..) if file.lineDots.contains(&callee) => .Some(callee)
+			.Assign(value, ..) => self.lastDot(value)
+			.Binary(rhs, ..) => self.lastDot(rhs)
+			.Unary(operand, ..) => self.lastDot(operand)
+			.If(thenBlock, elseBranch, ..) => match elseBranch {
+				.Some(other) => self.lastDot(other)
+				.None => self.trailingDot(&thenBlock)
+			}
+			.Block(inner) => self.trailingDot(&inner)
+			_ => .None
+		}
 	}
 
 	/// An expression statement, whose value is not used. `if`, `match` and
@@ -331,7 +382,7 @@ extend Lowerer {
 	var fn wrapDiscarded(id: ExprId): ExprId = {
 		val span = self.state.body.exprs[id].span
 		val stmt = self.state.body.stmts.add(Stmt(kind: .Expr(id), span: span))
-		val block = Block(stmts: Vec::of(own [stmt]), value: .None, span: span)
+		val block = Block(stmts: [stmt], value: .None, span: span)
 		return self.alloc(.Block(block), UNIT, span)
 	}
 
@@ -345,11 +396,11 @@ extend Lowerer {
 		val negated = self.state.body.exprs[id].kind is .Unary(op: .Neg, ..)
 		var diagnostic = Diagnostic::warning(DISCARDED_VALUE, "this value is computed and never used", span, "a value of type \(self.tyName(ty))")
 		if nextNeg is .Some(neg) then
-			diagnostic = diagnostic.withSecondary(neg, "this `-` starts a new statement").
-				withNote(
+			diagnostic = diagnostic.withSecondary(neg, "this `-` starts a new statement")
+				.withNote(
 					"a line break ends a complete expression, so a line that starts with `-` is a new statement",
-				).
-				withHelp("to subtract, move `-` to the end of the previous line")
+				)
+				.withHelp("to subtract, move `-` to the end of the previous line")
 		else if negated then
 			diagnostic = diagnostic.withNote(
 				"a line break ends a complete expression, so a line that starts with `-` is a new statement",
@@ -409,9 +460,7 @@ extend Lowerer {
 						).withHelp("use it directly, or pass it on with `&`"),
 					)
 					ERROR
-				} else {
-					keptTy
-				}
+				} else keptTy
 				// The keyword, after `implicit` where that is written.
 				val keyword = stmt.span.lo + (if isImplicit then 9 else 0)
 				val localKind: LocalKind =
@@ -513,14 +562,16 @@ extend Lowerer {
 		val file = self.ast
 		if written is .Some(t) {
 			var ty = self.resolveTy(t)
-			// A `val` may keep a closure that reads what it captures: `&(…) =>
-			// R`, which a `var` may not. A `&` reference is a view, kept as
-			// one, and a `&var` is a parameter's.
+			// A `val` may keep a closure: `&(…) => R`, or `&var (…) => R` where
+			// its whole value is a lambda that writes what it captures, which a
+			// `var` may not. A `&` reference is a view, kept as one, and a
+			// `&var` is otherwise a parameter's.
 			val lentClosure = self.kind(ty) is .Ref(inner, ..) && self.kind(inner) is .Fn(..)
+			val keptWriter = lentClosure && !mutable && file.exprs[init].kind is .Lambda(..)
 			if (mutable &&
 				lentClosure &&
 				self.noRef(ty, t, "a `var` cannot hold a lent closure", .None)) ||
-				self.noVarRef(ty, t, "a variable") ||
+				(!keptWriter && self.noVarRef(ty, t, "a variable")) ||
 				self.noNever(ty, t, "a variable") ||
 				self.bareSlice(ty, t, false) {
 				ty = ERROR
@@ -612,8 +663,8 @@ extend Lowerer {
 	fn itemsElement(ty: Ty): Option<Ty> = {
 		val interfaceId = self.program.preludeItems.interfaceOf(.Items)?
 		if self.kind(ty) is .Param(param) {
-			if param.index as i64 >= self.typeParams.len() then return .None
-			for c in self.typeParams[param.index as i64].interfaces {
+			if param.index >= self.typeParams.len() then return .None
+			for c in self.typeParams[param.index].interfaces {
 				if c.interfaceId == interfaceId {
 					val args = self.program.types.list(c.args)
 					return if args.isEmpty() then .None else .Some(args[0])
@@ -655,8 +706,8 @@ extend Lowerer {
 		var args: Vec<Ty> = Vec()
 		if self.kind(ty) is .Param(param) {
 			var found: Option<Ty> = .None
-			if (param.index as i64) < self.typeParams.len() {
-				for c in self.typeParams[param.index as i64].interfaces {
+			if param.index < self.typeParams.len() {
+				for c in self.typeParams[param.index].interfaces {
 					if found.isNone() && c.interfaceId == interfaceId {
 						val list = self.program.types.list(c.args)
 						if list.isEmpty() then break
@@ -665,7 +716,7 @@ extend Lowerer {
 				}
 			}
 			val .Some(elem) = found else return .No
-			args = Vec::of(own [ty, elem])
+			args = [ty, elem]
 		} else {
 			val .Some(owner) = self.ownerOf(ty) else return .No
 			// Its element is what its implementation decides, and it has one.
@@ -694,12 +745,7 @@ extend Lowerer {
 		val borrowed = self.intern(.Ref(inner: ty, kind: .Shared))
 		val lent = self.alloc(.Ref(receiver), borrowed, span)
 		val call = self.alloc(
-			.Call(
-				callee: items,
-				args: Vec::of(own [lent]),
-				typeArgs: typeArgs,
-				order: Vec::of(own [0]),
-			),
+			.Call(callee: items, args: [lent], typeArgs: typeArgs, order: [0]),
 			ret,
 			span,
 		)
@@ -986,14 +1032,14 @@ extend Lowerer {
 					self.report(
 						Diagnostic::error(MISMATCHED_TYPES, "this function returns nothing, but a value is returned", self.state.body.exprs[e].span, "a value of type \(self.tyName(ty))").withHelp("to return it, declare the return type: `: \(self.program.tyName(ty, self.interner))`"),
 					)
-				.Some(e)
+				Option::Some(e)
 			}
 			.Some(v) => {
 				val context: Option<(Span, str)> = match self.state.retSpan {
 					.Some(s) => .Some((s, "return type declared here"))
 					.None => .None
 				}
-				.Some(self.checkIn(v, ret, context))
+				Option::Some(self.checkIn(v, ret, context))
 			}
 			.None => {
 				if ret != UNIT && !self.hasError(ret) {
@@ -1002,7 +1048,7 @@ extend Lowerer {
 						diagnostic = diagnostic.withSecondary(retSpan, "return type declared here")
 					self.report(diagnostic)
 				}
-				.None
+				Option::None
 			}
 		}
 	}
@@ -1110,6 +1156,8 @@ extend Lowerer {
 		}
 		val (checkedThen, thenTy) = self.checkBlock(&thenBlock, hint)
 		self.state.scopes.pop()
+		if hint.isNone() && self.program.types.isInteger(thenTy) then
+			return self.ifOfIntegers(condition, checkedThen, thenTy, elseAt, span)
 		// Without an expected type, the `then` branch sets the type of the
 		// `else` branch.
 		val expected: Option<Ty> = match hint {
@@ -1117,19 +1165,57 @@ extend Lowerer {
 			.None => if thenTy != NEVER then .Some(thenTy) else .None
 		}
 		val (checkedElse, elseTy) = self.elseBlock(elseAt, expected)
-		val ty = if thenTy == NEVER && elseTy == NEVER {
-			NEVER
-		} else {
-			match expected {
+		val ty =
+			if thenTy == NEVER && elseTy == NEVER then NEVER
+			else match expected {
 				.Some(t) => t
 				.None => elseTy
 			}
-		}
 		return self.alloc(
 			.If(cond: condition, thenBlock: checkedThen, elseBlock: .Some(checkedElse)),
 			ty,
 			span,
 		)
+	}
+
+	/// An `if` whose `then` branch answers an integer, where nothing is
+	/// expected of it: the `else` branch takes that type where it says none
+	/// of its own, and where one branch's type holds the other's, the `if`
+	/// is of the wider, and the other branch widens to it.
+	var fn ifOfIntegers(
+		condition: ExprId,
+		thenBlock: Block,
+		thenTy: Ty,
+		elseAt: ast::ExprId,
+		span: Span,
+	): ExprId = {
+		val file = self.ast
+		val expr = &file.exprs[elseAt]
+		val (
+			elseBlock,
+			elseTy,
+		) = if expr.kind is .Block(block) then self.blockOf(&block, .Some(thenTy), true) else {
+			val value = self.infer(elseAt, .Some(thenTy))
+			(Block(stmts: Vec(), value: .Some(value), span: expr.span), self.tyOf(value))
+		}
+		val ty = if elseTy == NEVER then thenTy else self.partsType(thenTy, elseTy).unwrapOr(thenTy)
+		val checkedThen = self.blockAs(thenBlock, thenTy, ty)
+		val checkedElse = self.blockAs(elseBlock, elseTy, ty)
+		return self.alloc(
+			.If(cond: condition, thenBlock: checkedThen, elseBlock: .Some(checkedElse)),
+			ty,
+			span,
+		)
+	}
+
+	/// A branch whose value is of type `answered`, made to answer `ty`: as it
+	/// is where it does, its value widened where it is a narrower integer,
+	/// and a mismatch reported where it is neither.
+	var fn blockAs(block: Block, answered: Ty, ty: Ty): Block = {
+		if answered == ty || answered == NEVER then return block
+		var changed = block
+		if changed.value is .Some(value) then changed.value = .Some(self.coerce(value, ty, .None))
+		return changed
 	}
 
 	/// How many errors have been reported so far.

@@ -5,8 +5,11 @@
 A reference is written at a call, and is a parameter's type. A `&var`
 reference exists only while the call it was passed to is running: it is
 never a variable's type, a field's, or what a function answers, except for a
-projection, below. A `&` reference may also be kept where a view is kept,
-which the section on views says.
+projection, below, and for a closure kept in a `val` that writes what it
+captures, which holds its `&var`s in its own block, to its last use, and is
+never copied ([page 3](03-functions.md#functions-as-values)). A `&`
+reference may also be kept where a view is kept, which the section on
+views says.
 
 ```wip,run
 fn total(values: &[i64]): i64 = {
@@ -165,7 +168,7 @@ extend Board {
 }
 
 fn main() = {
-    var board = Board(Vec::of(own [1, 2, 3]))
+    var board = Board([1, 2, 3])
     assert(board.at(0) == 1)
     board.at(0) = 10
     board.at(0) += 5
@@ -225,7 +228,7 @@ extend Board {
 }
 
 fn main() = {
-    var board = Board(Vec::of(own [1, 2, 3]))
+    var board = Board([1, 2, 3])
     assert(board.at(2) == 3)
     board.at(2) = 30
     assert(board.at(2) == 30)
@@ -301,7 +304,7 @@ extend Tree {
 }
 
 fn main() = {
-    val tree = Tree(Vec::of(own [Node(size: 3)]))
+    val tree = Tree([Node(size: 3)])
     var name = String::of("a")
     val found = tree.first(name.toStr())
     name.clear()
@@ -378,7 +381,7 @@ extend Tree {
 }
 
 fn main() = {
-    val tree = Tree(Vec::of(own [Node(size: 1), Node(size: 2)]))
+    val tree = Tree([Node(size: 1), Node(size: 2)])
     val found = tree.find(2)
     assert(found.isSome())
     var at = &tree.nodes[0]
@@ -397,7 +400,7 @@ struct Node {
 }
 
 fn main() = {
-    var nodes = Vec::of(own [Node(size: 1)])
+    var nodes = Vec::of([Node(size: 1)])
     val first = &nodes[0]
     nodes.clear()
     assert(first.size == 1)
@@ -473,7 +476,7 @@ extend Lowerer {
 }
 
 fn main() = {
-    val ast = Ast(names: Vec::of(own ["a", ""]))
+    val ast = Ast(names: ["a", ""])
     var lowerer = Lowerer(ast: &ast, errors: Vec())
     lowerer.check()
 }
@@ -506,7 +509,7 @@ fn label(name: str, fallback: str): str from name =
     if name.isEmpty() then "?" else name
 
 fn main() = {
-    val ast = Ast(names: Vec::of(own ["ab"]))
+    val ast = Ast(names: ["ab"])
     var lowerer = Lowerer(ast: &ast, errors: Vec())
     val text = lowerer.text(0)
     lowerer.errors.push("the view changes; the text is the tree's")
@@ -675,9 +678,7 @@ extend Shelf {
 }
 
 fn main() = {
-    val shelf = Shelf(
-        names: Vec::of(own [String::of("apple"), String::of("pear")]),
-    )
+    val shelf = Shelf(names: ["apple", "pear"])
     var labels: Vec<Label> = Vec()
     shelf.labelled(&var labels)
     assert(labels.len() == 2 && labels[1].text == "pear")

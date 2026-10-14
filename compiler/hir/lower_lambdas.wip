@@ -62,7 +62,8 @@ enum Captured {
 	/// One of its own variables.
 	Local(local: LocalId)
 	/// One it captured itself, from the body around it: the field of its
-	/// environment that holds the reference, which is copied.
+	/// environment that holds it — a reference, which is copied, or an owned
+	/// closure's value, which is lent.
 	Field(index: u32)
 }
 
@@ -93,8 +94,15 @@ extend Lowerer {
 			}
 			val envRef = self.alloc(.Local(envLocal), envRefTy, capture.span)
 			val env = self.alloc(.Deref(envRef), envTy, capture.span)
-			val field = self.alloc(.Field(base: env, index: index), capture.ty, capture.span)
-			(field, capture.ty)
+			// What this body's own field holds, by what it captured: a
+			// reference, or an owned closure's value.
+			val first = match self.state.captureKind {
+				.Some(kind) => kind.firstField()
+				.None => 0
+			}
+			val held = self.state.captures[(index - first) as i64].ty
+			val field = self.alloc(.Field(base: env, index: index), held, capture.span)
+			(field, held)
 		}
 	}
 
@@ -195,12 +203,16 @@ extend Lowerer {
 				self.report(
 					Diagnostic::error(
 						MISMATCHED_TYPES,
-						"an owned closure is written here, and \(self.tyName(hint.unwrap())) is expected",
+						if self.hasError(hint.unwrap()) then
+							"an owned closure is written here, and a lent one is expected"
+						else "an owned closure is written here, and \(self.tyName(hint.unwrap())) is expected",
 						span,
 						"an owned closure",
 					).withNote(
 						"`own (x) => …` allocates an environment that holds what it captured",
-					).withHelp("leave out `own`, so the lambda is lent for the call"),
+					).withFix("leave out `own`, so the lambda is lent", [
+						Edit::replace(Span::new(span.lo, file.exprs[exprId].span.lo), ""),
+					]),
 				)
 				return self.errorExpr(span)
 			}
@@ -213,27 +225,26 @@ extend Lowerer {
 					"a lambda that is not owned",
 				).withNote(
 					"an owned closure holds what it captured on the heap, so it is written with `own`, as every other allocation is",
-				).withFix("write `own` before it", own [Edit::insert(span.lo, "own ")]),
+				).withFix("write `own` before it", [Edit::insert(span.lo, "own ")]),
 			)
 			return self.errorExpr(span)
 		}
 		// With `own` written, it is an owned closure whether or not a type is
 		// expected: its parameters' types are then written, as any lambda's
 		// are where nothing expects them. A lambda that is a `val`'s whole
-		// value may keep what it captures by `&`, as a view keeps what it
-		// borrows; one that captures nothing is a plain function value after
-		// all.
+		// value may keep what it captures, as a view keeps what it borrows: by
+		// `&` what it reads, and by `&var` what it writes, which makes it a
+		// closure that writes; one that captures nothing is a plain function
+		// value after all.
 		val keeping = self.state.keepingClosure
 		self.state.keepingClosure = false
 		val kept = keeping && !owned && expectedFn.isNone()
-		val closure: Option<CaptureKind> = if owned {
-			.Some(.Owned)
-		} else {
-			match expectedFn {
+		val closure: Option<CaptureKind> =
+			if owned then .Some(.Owned)
+			else match expectedFn {
 				.Some((_, kind)) => kind
-				.None => if kept then .Some(.Lent(.Shared)) else .None
+				.None => if kept then .Some(.Lent(.Var)) else .None
 			}
-		}
 		// The types the expected function type gives, where it is one.
 		var expected: Option<(Vec<Ty>, Ty)> = .None
 		if expectedFn is .Some((inner, _)) && self.kind(inner) is .Fn(params: list, ret: r) then
@@ -366,11 +377,22 @@ extend Lowerer {
 			}
 			made = .None
 		}
+		// A kept closure that writes nothing it captured is one that reads.
+		if kept && made is .Some(.Lent(.Var)) {
+			var writes = false
+			for c in captures {
+				if c.written then writes = true
+			}
+			if !writes then made = .Some(.Lent(.Shared))
+		}
 		// A closure is a pair: what it captured, and its code. A lambda that
 		// captures nothing is a plain function value.
 		return match made {
 			.Some(kind) => {
-				val env = self.buildEnv(id, captures, kind, span)
+				// A kept closure was checked as one that may write: what it only
+				// reads, it holds by `&`.
+				val envKind = if kept then CaptureKind::Lent(.Var) else kind
+				val env = self.buildEnv(id, captures, envKind, span)
 				val ty = match kind {
 					.Lent(k) => self.intern(.Ref(inner: valueTy, kind: k))
 					.Owned => self.intern(.Own(valueTy))
@@ -397,7 +419,7 @@ extend Lowerer {
 		// The enclosing body waits, whole, while this one is checked: a name
 		// this one does not declare is looked for in it, and is a capture.
 		self.outer.push(mem::replace(&var self.state, BodyState()))
-		self.state.scopes = Vec::of(own [Map()])
+		self.state.scopes = [Map()]
 		self.state.ret = expectedRet.unwrapOr(UNIT)
 		self.state.captureKind = capturesAllowed
 		self.state.lambda = true
@@ -521,9 +543,7 @@ extend Lowerer {
 						}
 						val target = self.alloc(.Deref(place), inner, capture.span)
 						self.alloc(.Ref(target), capture.ty, capture.span)
-					} else {
-						place
-					}
+					} else place
 				}
 				.Lent(k) => {
 					if k == .Var && !read {
@@ -572,7 +592,7 @@ extend Lowerer {
 				if body.exprs[inner].kind is .Local(local) &&
 					local == env &&
 					reads.contains(&index) {
-					body.exprs[expr].ty = captures[index as i64].ty
+					body.exprs[expr].ty = captures[index].ty
 				}
 			}
 		}
@@ -611,7 +631,7 @@ extend Lowerer {
 					if self.state.body.exprs[base].kind is .Deref(inner) &&
 						self.state.body.exprs[inner].kind is .Local(local) &&
 						local == env {
-						return .Some(index as i64)
+						return .Some(index)
 					}
 					at = base
 				}
@@ -653,11 +673,7 @@ extend Lowerer {
 			val envTy = self.intern(.Struct(id: envId, args: empty))
 			val dropTy = self.program.structs[envId].fields[0].ty
 			val drop = self.alloc(.DropRef(envTy), dropTy, span)
-			val fields = self.alloc(
-				.Struct(id: envId, fields: Vec::of(own [drop]), order: Vec::of(own [0])),
-				envTy,
-				span,
-			)
+			val fields = self.alloc(.Struct(id: envId, fields: [drop], order: [0]), envTy, span)
 			val ownedTy = self.intern(.Own(envTy))
 			self.alloc(.Own(fields), ownedTy, span)
 		} else {
@@ -709,7 +725,7 @@ extend Lowerer {
 			val paramTys = self.program.types.list(params).toVec()
 			val targetParams = self.program.fns[target].params.clone()
 			var body = Body()
-			var defs = Vec::of(own [
+			var defs = Vec::of([
 				ParamDef(
 					name: self.interner.lambdaSymbol(),
 					nameSpan: span,
@@ -815,13 +831,13 @@ extend Lowerer {
 	}
 
 	/// A name the body around the one being checked does not declare, but
-	/// captures itself from the body around it, through a reference: the
-	/// field that holds that reference, and the reference's type. A closure
-	/// that holds values holds no reference to pass on.
+	/// captures itself from the body around it: the field that holds it, and
+	/// the field's type. A lent closure's field is a reference, which is
+	/// copied; an owned closure's is the value, which is lent from where it
+	/// lies, for as long as the owned closure's call.
 	var fn capturedAround(sym: Symbol, span: Span): Option<(Captured, Ty, bool)> = {
 		if self.outer.len() < 2 then return .None
 		val around = self.outer[self.outer.len() - 1].captureKind.clone()?
-		if around == .Owned then return .None
 		// Resolved in the body around, which captures it in turn.
 		val inner = mem::replace(&var self.state, BodyState())
 		self.state = self.outer.pop().unwrap()
@@ -895,10 +911,27 @@ extend Lowerer {
 					span,
 					"captured here",
 				).withNote(
-					"a plain function value captures nothing; a closure is `&(…) => R` or `&var (…) => R`, lent for one call, or kept in a `val` it is the whole value of, reading what it captures",
+					"a plain function value captures nothing; a closure is `&(…) => R` or `&var (…) => R`, lent for one call, or kept in a `val` it is the whole value of",
 				).withHelp(
 					"take it as a parameter of the lambda, declare the parameter a closure, or keep the lambda in a `val`",
 				),
+			)
+			return .Some(self.errorExpr(span))
+		}
+		// A closure that writes is called only where what it writes may be:
+		// one that reads cannot hold it, and one that writes holds it as
+		// written.
+		val holdsWriter =
+			self.kind(fromTy) is .Ref(inner: code, kind: .Var) && self.kind(code) is .Fn(..)
+		if holdsWriter && kind !is .Lent(.Var) {
+			val name = String::of(self.text(sym))
+			self.report(
+				Diagnostic::error(
+					LAMBDA_CAPTURE,
+					"a closure that reads cannot use `\(name)`, a closure that writes",
+					span,
+					"captured here",
+				).withNote("calling `\(name)` writes what it captured, and a closure that reads writes nothing; one that reads may be shared, as among threads"),
 			)
 			return .Some(self.errorExpr(span))
 		}
@@ -931,8 +964,12 @@ extend Lowerer {
 					}
 					fromTy
 				}
-				// A reference is copied; anything else is captured by one.
-				.Lent(_) | .Generator if self.kind(fromTy) is .Ref(..) => fromTy
+				// A reference is copied; anything else is captured by one. A
+				// closure that only reads holds a `&var` as a `&`: what it was
+				// lent may be shared — every thread of `future::map` calls one
+				// closure — so nothing it holds may write.
+				.Lent(.Var) if self.kind(fromTy) is .Ref(..) => fromTy
+				.Lent(_) | .Generator if self.kind(fromTy) is .Ref(..) => self.readOnly(fromTy)
 				// A function value is held as an array of one, so that the
 				// reference to it is an address and not a closure.
 				.Lent(_) | .Generator if self.kind(fromTy) is .Fn(..) => {
@@ -959,6 +996,7 @@ extend Lowerer {
 			index = .Some(self.state.captures.len() - 1)
 		}
 		val at = index.unwrap()
+		if holdsWriter then self.state.captures[at].written = true
 		val fieldTy = self.state.captures[at].ty
 		val heldAsOne = self.state.captures[at].heldAsOne
 		val envLocal = self.state.body.params[0]
@@ -991,8 +1029,17 @@ extend Lowerer {
 					val zero = self.alloc(.Int(0), I64, span)
 					return .Some(self.alloc(.Index(base: held, index: zero), value, span))
 				}
-				.Some(held)
+				Option::Some(held)
 			}
 		}
+	}
+}
+
+extend Lowerer {
+	/// A reference as a closure that only reads holds it: `&` where it was
+	/// `&var`.
+	var fn readOnly(ty: Ty): Ty = match self.kind(ty) {
+		.Ref(inner, ..) => self.intern(.Ref(inner: inner, kind: .Shared))
+		_ => ty
 	}
 }

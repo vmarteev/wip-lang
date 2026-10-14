@@ -68,11 +68,15 @@ blockChar   = (* any character except "\" and newline, and '"""' *) ;
 
 Rules the EBNF does not express:
 
-- **A `.` that starts a line begins a variant**, since a line break has
-  already ended the expression above it. Where the line above could have
-  gone on, the parser warns (E0126): a variant gets a fix that writes
-  `return` before it, and a name in lower case — a method or a field — one
-  that moves the `.` to the end of the line above, where it continues it.
+- **A `.` that starts a line continues the expression above it**, as it
+  would on one line: a method, a field, a `?` after one. Where nothing is
+  finished above — first in a block, after `=>`, `=`, `return`, `then`,
+  `else`, an operator, an open bracket, or a statement that is no
+  expression, such as a loop — it begins a variant. Directly among a
+  `match`'s or a `when`'s arms, a line that reads as a pattern before `=>`,
+  or one that goes on in `|`, is the next arm. A variant meant under an
+  expression is a member of what it answers, refused (E0126) with the fix
+  that writes the variant's type where it is expected.
 
 - **Longest match**, with one exception: there is no `>>` or `<<` token.
   `>>` always lexes as two `>`, so `own<own<i64>>` needs no special case. In
@@ -175,19 +179,21 @@ Where line breaks are significant:
 2. **They end a complete expression.** An expression does not continue
    across a line break once it is complete. A binary operator, `(` or `[` at
    the start of a line begins something new; it does not continue the line
-   above. An incomplete expression — a line ending in an operator, `.`, `=`,
-   `=>`, `then`, `,` or an open bracket — continues onto the next line.
-3. **Two tokens continue the line above:** `else`, and the `|` before a
-   pattern's next alternative, neither of which can begin a statement. A
-   `.` does not: at the start of a line it begins a variant.
+   above. An incomplete expression — a line ending in an operator, `=`,
+   `=>`, `then`, `,` or an open bracket — continues onto the next line. A
+   line that ends in `.` is an error (E0113), with a fix that moves the `.`
+   to the start of the next line.
+3. **Three tokens continue the line above:** `else`, the `|` before a
+   pattern's next alternative, and `.`, as above.
 
-**A long expression wraps after an operator or a `.`** that ends its line,
-or inside parentheses, where line breaks are whitespace:
+**A long expression wraps after an operator that ends its line, at a `.`
+that starts the next, or inside parentheses**, where line breaks are
+whitespace:
 
 ```wip
-val best = some.
-    map((v: i64) => v * 2).
-    unwrapOr(0)
+val best = some
+    .map((v: i64) => v * 2)
+    .unwrapOr(0)
 
 val total = price +
     tax -
@@ -198,11 +204,13 @@ val also = (price
     - discount)
 ```
 
-Outside brackets, the operator or the `.` goes at the end of the line it
-continues from, never at the start of the next one.
+Outside brackets, an operator goes at the end of the line it continues
+from, and a `.` at the start of the next one, never the other way round.
 
 A line that starts with a binary operator other than `-` and `&`, and
-other than a `|` between alternatives, is an error (E0113), with a fix that joins it to the line above. A line starting
+other than a `|` between alternatives, is an error (E0113), with a fix
+that joins it to the line above; so is a line that ends in `.`, with a fix
+that moves the `.` to the start of the next. A line starting
 with `-` is a new expression, so `total = price` followed by `- discount` on
 the next line is two statements; the type checker warns that the second one
 has no effect (E0320).
@@ -481,10 +489,11 @@ assertExpr  = "assert" "(" expr ( "," STRING )? ")" ;
                                             prints it and ends; the note stands
                                             before it *)
 
-ifExpr      = "if" cond block ( "else" ( block | ifExpr ) )?
-            | "if" cond "then" branch ( "else" branch )? ;
-branch      = expr | jump ;          (* one expression, no braces; an `else
-                                        if` chain takes one form throughout *)
+ifExpr      = "if" cond ( block | "then" branch )
+              ( "else" ( block | ifExpr | branch ) )? ;
+branch      = expr | jump ;          (* one expression, no braces; each
+                                        branch of an `if` takes its own form,
+                                        and a block after `then` is refused *)
 matchExpr   = "match" cond "{" ( arm ( lsep arm )* lsep? )? "}" ;
 arm         = pattern ( "if" cond )? "=>" ( expr | jump ) ;
                                          (* a guard: the arm matches only where
@@ -576,7 +585,8 @@ token: `::` → `pathExpr`, anything else → `IDENT`. `IDENT {` is not a
 struct: it is refused as the way one used to be written (E0133), with a fix
 that writes the call. A `{` where an expression is expected begins a block.
 A `.` where an expression or a pattern is expected begins a variant of the
-expected enum; it is never field access, which only follows a primary.
+expected enum; it is never field access, which only follows a primary —
+on its line, or on the line above where the `.` starts a line (§1.1).
 Apart from R7 and R8, no production needs more than one token of
 lookahead; §1.1 needs one token of line information.
 

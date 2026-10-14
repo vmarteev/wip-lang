@@ -82,7 +82,8 @@ extend Lowerer {
 	/// literal it stands for: its value, worked out as a constant's is, of
 	/// the type expected where it fits, and E0310 where it does not, as a
 	/// literal's is. Nothing for anything that is not one: what a program
-	/// computes is converted by `as`, where a value could change.
+	/// computes is widened where nothing is lost, and converted by `as`
+	/// elsewhere.
 	var fn constantAs(id: ExprId, expected: Ty): Option<ExprId> = {
 		val .Some(to) = self.program.types.intTy(expected) else return .None
 		val .Some(from) = self.program.types.intTy(self.tyOf(id)) else return .None
@@ -190,10 +191,13 @@ extend Lowerer {
 		// Where nothing is expected, a value is discarded.
 		if expected == UNIT then return self.discard(id)
 		if self.constantAs(id, expected) is .Some(converted) then return converted
+		if self.widened(id, expected) is .Some(widened) then return widened
 		if self.derefCoercion(id, expected) is .Some(coerced) then return coerced
 		if self.stringArgument(id, expected, argument) is .Some(coerced) then return coerced
 		if self.textCopied(id, expected) is .Some(copied) then return copied
 		if self.containerArgument(id, expected, argument) is .Some(coerced) then return coerced
+		if self.listLiteralAs(id, expected) is .Some(made) then return made
+		if self.readerAsWriter(id, expected) is .Some(seen) then return seen
 		// A named function is lent as a closure.
 		if self.fnAsClosure(id, expected) is .Some(closure) then return closure
 		// A value with no place of its own is lent where it is used, so a call
@@ -243,6 +247,25 @@ extend Lowerer {
 		}
 		self.mismatch(id, expected, context)
 		return id
+	}
+
+	/// Why a number is not taken where a number of type `expected` is.
+	fn notWidened(actual: Ty, expected: Ty): String = {
+		val types = &self.program.types
+		if !types.isInteger(actual) || !types.isInteger(expected) then
+			return String::of(self.unconverted(actual, expected))
+		return "\(self.tyName(expected)) does not hold every value of \(self.tyName(actual)), so it is not widened to it; `as` converts it, keeping the low bits of a value that does not fit"
+	}
+
+	/// A closure that reads, where one that writes is expected: it writes
+	/// nothing, so it is the writing closure that does not write, the same
+	/// pair seen as one. Not the other way round.
+	var fn readerAsWriter(id: ExprId, expected: Ty): Option<ExprId> = {
+		val .Ref(inner: code, kind: .Var) = self.kind(expected) else return .None
+		if self.kind(code) !is .Fn(..) then return .None
+		if self.kind(self.tyOf(id)) != .Ref(inner: code, kind: .Shared) then return .None
+		val span = self.state.body.exprs[id].span
+		return .Some(self.alloc(.LendClosure(id), expected, span))
 	}
 
 	/// Whether `id` is an array written in a constant's value, outside any
@@ -305,12 +328,7 @@ extend Lowerer {
 		val span = self.state.body.exprs[id].span
 		return .Some(
 			self.alloc(
-				.Call(
-					callee: of,
-					args: Vec::of(own [id]),
-					typeArgs: TyList::empty(),
-					order: Vec::of(own [0]),
-				),
+				.Call(callee: of, args: [id], typeArgs: TyList::empty(), order: [0]),
 				expected,
 				span,
 			),
@@ -328,12 +346,7 @@ extend Lowerer {
 		val over = self.program.preludeItems.function(.StringOver)?
 		val span = self.state.body.exprs[id].span
 		val made = self.alloc(
-			.Call(
-				callee: over,
-				args: Vec::of(own [id]),
-				typeArgs: TyList::empty(),
-				order: Vec::of(own [0]),
-			),
+			.Call(callee: over, args: [id], typeArgs: TyList::empty(), order: [0]),
 			string,
 			span,
 		)
@@ -424,12 +437,7 @@ extend Lowerer {
 		val receiver = self.alloc(.Ref(text), refTy, span)
 		return .Some(
 			self.alloc(
-				.Call(
-					callee: toStr,
-					args: Vec::of(own [receiver]),
-					typeArgs: TyList::empty(),
-					order: Vec::of(own [0]),
-				),
+				.Call(callee: toStr, args: [receiver], typeArgs: TyList::empty(), order: [0]),
 				STR,
 				span,
 			),
@@ -488,9 +496,20 @@ extend Lowerer {
 		val stringOwner = self.stringOwner()
 		when {
 			self.program.types.isFloat(expected) && kind is .Int(..) =>
-				diagnostic = diagnostic.withFix("use a float literal", own [
+				diagnostic = diagnostic.withFix("use a float literal", [
 					Edit::insert(span.hi, ".0"),
 				])
+			// A number where another kind of number is expected: why it is not
+			// taken as one.
+			self.program.types.isNumeric(expected) && self.program.types.isNumeric(actual) =>
+				diagnostic = diagnostic.withNote(self.notWidened(actual, expected))
+			// A closure that writes where one that reads is expected.
+			self.kind(expected) is .Ref(inner: code, kind: .Shared) &&
+				self.kind(code) is .Fn(..) &&
+				self.kind(actual) == .Ref(inner: code, kind: .Var) =>
+				diagnostic = diagnostic.withNote(
+					"a closure that writes what it captures is taken where `&var (…) => R` is; one taken as `&(…) => R` writes nothing, and may be shared, as among threads",
+				)
 			// A function value where a closure is expected. There is no way to
 			// write `&` on it: a closure is a pair, and a lambda makes one.
 			self.kind(expected) is .Ref(inner: want, ..) &&
@@ -504,7 +523,7 @@ extend Lowerer {
 			expected == CSTRING && self.lendsText(actual) =>
 				diagnostic = diagnostic.withNote(
 					"a `cstring` is a pointer to bytes that end with a NUL, and a `String` holds bytes with nothing after them",
-				).withFix("write the NUL with `toCstring()`", own [
+				).withFix("write the NUL with `toCstring()`", [
 					Edit::insert(span.hi, ".toCstring()"),
 				])
 			// Text that C can take must end with a NUL, and a `str` is a pointer
@@ -541,24 +560,16 @@ extend Lowerer {
 				diagnostic = diagnostic.withNote(
 					"text is copied into a `String` where one is kept, and lent as one where it is read; a `&var String` is written, and a copy would lose what is written",
 				).withHelp("keep the text in a `String` to be written: `var text: String = …`")
-			// An array written where a list on the heap is expected, as `Vec::of`
-			// takes one.
-			self.kind(expected) is .Own(target) &&
-				self.kind(target) is .Slice(elem) &&
-				self.kind(actual) is .Array(elem: e, ..) &&
-				e == elem &&
-				kind is .Array(..) =>
-				diagnostic = diagnostic.withFix("build it on the heap, with `own`", own [
-					Edit::insert(span.lo, "own "),
-				]).withNote(
-					"an array is kept where it is written; `own [ … ]` builds the list on the heap, for what takes it to keep",
+			// A list where a collection is expected that is not the prelude's
+			// `Vec`, which is the one a list becomes.
+			kind is .Array(..) | .ArrayRepeat(..) && self.kind(expected) is .Struct(..) =>
+				diagnostic = diagnostic.withNote(
+					"a list is a `Vec` where one is expected, and an array elsewhere; any other collection is made by a call",
 				)
 			self.kind(expected) == .Ref(inner: actual, kind: .Shared) =>
-				diagnostic = diagnostic.withFix("borrow it with `&`", own [
-					Edit::insert(span.lo, "&"),
-				])
+				diagnostic = diagnostic.withFix("borrow it with `&`", [Edit::insert(span.lo, "&")])
 			self.kind(expected) == .Ref(inner: actual, kind: .Var) =>
-				diagnostic = diagnostic.withFix("pass a `&var` reference", own [
+				diagnostic = diagnostic.withFix("pass a `&var` reference", [
 					Edit::insert(span.lo, "&var "),
 				])
 			self.kind(expected) is .Ref(inner: target, kind: refKind) &&
@@ -567,9 +578,7 @@ extend Lowerer {
 				e == elem => {
 				// An array where a slice of it is expected.
 				val text = if refKind == .Var then "&var " else "&"
-				diagnostic = diagnostic.withFix("pass it as a slice", own [
-					Edit::insert(span.lo, text),
-				])
+				diagnostic = diagnostic.withFix("pass it as a slice", [Edit::insert(span.lo, text)])
 			}
 			self.kind(expected) is .Ref(inner: target, kind: refKind) &&
 				self.kind(target) is .Slice(elem) &&
@@ -578,7 +587,7 @@ extend Lowerer {
 				// A container where a slice of its elements is expected: a call lends
 				// them, once it is borrowed.
 				val text = if refKind == .Var then "&var " else "&"
-				diagnostic = diagnostic.withFix("borrow it, and its elements are lent", own [
+				diagnostic = diagnostic.withFix("borrow it, and its elements are lent", [
 					Edit::insert(span.lo, text),
 				])
 			}
@@ -589,7 +598,7 @@ extend Lowerer {
 				kind is .Ref(inner) => {
 				// `&c` where its elements are lent to be written.
 				val between = Span::new(span.lo + 1, self.state.body.exprs[inner].span.lo)
-				diagnostic = diagnostic.withFix("pass a `&var` reference", own [
+				diagnostic = diagnostic.withFix("pass a `&var` reference", [
 					Edit::replace(between, "var "),
 				])
 			}
@@ -600,12 +609,8 @@ extend Lowerer {
 				// `&x` where `&var` is expected, or the other way round.
 				val between = Span::new(span.lo + 1, self.state.body.exprs[inner].span.lo)
 				diagnostic = if wantKind == .Var then
-					diagnostic.withFix("pass a `&var` reference", own [
-						Edit::replace(between, "var "),
-					])
-				else diagnostic.withFix("pass a `&` reference", own [
-					Edit::replace(between, String()),
-				])
+					diagnostic.withFix("pass a `&var` reference", [Edit::replace(between, "var ")])
+				else diagnostic.withFix("pass a `&` reference", [Edit::replace(between, String())])
 			}
 			kind is .If(elseBlock: .None, ..) =>
 				diagnostic = diagnostic.withNote(

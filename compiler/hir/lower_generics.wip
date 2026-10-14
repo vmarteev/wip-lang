@@ -315,7 +315,7 @@ extend Lowerer {
 			val index = args.len()
 			val ty = match generics[index].default {
 				.Ty(default) => {
-					var known = Vec::of(own [implementing])
+					var known = Vec::of([implementing])
 					for a in args {
 						known.push(a)
 					}
@@ -388,11 +388,11 @@ extend Lowerer {
 					"`\(text)` is laid out by C, so a value cannot have its type",
 					span,
 					"not a type a value can have",
-				).withSecondary(declared, "declared `@opaque` here").
-					withNote(
+				).withSecondary(declared, "declared `@opaque` here")
+					.withNote(
 						"`@opaque` says where the fields are is C's business, so how large one is, is too",
-					).
-					withHelp("a pointer to one is written `ptr<\(text)>`, and its fields are read through it"),
+					)
+					.withHelp("a pointer to one is written `ptr<\(text)>`, and its fields are read through it"),
 			)
 			return ERROR
 		}
@@ -458,16 +458,12 @@ extend Lowerer {
 			1 => "\(required) or \(generics.len()) type arguments"
 			_ => "\(required) to \(generics.len()) type arguments"
 		}
-		val message = if generics.isEmpty() {
-			"`\(text)` is not generic, and takes no type arguments"
-		} else {
-			var names: Vec<str> = Vec()
-			for p in generics {
-				names.push(self.text(p.name))
+		val message =
+			if generics.isEmpty() then "`\(text)` is not generic, and takes no type arguments" else {
+				val names: Vec<str> = generics.map((p) => self.text(p.name))
+				val was = if given == 1 then String::of("1 was") else "\(given) were"
+				"`\(text)` takes \(count) (`\(names.join("`, `"))`), but \(was) given"
 			}
-			val was = if given == 1 then String::of("1 was") else "\(given) were"
-			"`\(text)` takes \(count) (`\(names.join("`, `"))`), but \(was) given"
-		}
 		self.report(Diagnostic::error(TYPE_ARGUMENT_COUNT, message, span, "expected \(count)"))
 	}
 
@@ -480,17 +476,22 @@ extend Lowerer {
 			self.pendingCopy.push((ty, param.name, span))
 			return
 		}
-		if self.owns(ty) then
-			self.report(
-				Diagnostic::error(
-					NOT_COPY,
-					"\(self.tyName(ty)) owns memory, but `\(self.text(param.name))` must be `copy`",
-					span,
-					"owns memory",
-				).withNote(
-					"a `copy` type is plain data, read without `move`: it holds no `own`, directly or in its fields",
-				),
-			)
+		if !self.owns(ty) then return
+		val diagnostic = Diagnostic::error(
+			NOT_COPY,
+			"\(self.tyName(ty)) owns memory, but `\(self.text(param.name))` must be `copy`",
+			span,
+			"owns memory",
+		).withNote(
+			"a `copy` type is plain data, read without `move`: it holds no `own`, directly or in its fields",
+		)
+		self.report(
+			if self.state.copiesCalled then
+				diagnostic.withHelp(
+					"`copies()` copies each element out; `forwards()` lends each where it lies, for any element",
+				)
+			else diagnostic,
+		)
 	}
 
 	/// Runs the `copy` checks that waited for every type body.
@@ -624,8 +625,7 @@ extend Lowerer {
 		val types = &self.program.types
 		match (types.kind(declared), types.kind(found)) {
 			(.Param(param), _) => {
-				if solution[param.index as i64].isNone() then
-					solution[param.index as i64] = .Some(found)
+				if solution[param.index].isNone() then solution[param.index] = .Some(found)
 			}
 			// A slice is matched by the elements of an array or buffer, as the
 			// coercions allow.
@@ -737,7 +737,7 @@ extend Lowerer {
 	/// Whether every type parameter `ty` mentions has a type argument.
 	fn resolved(ty: Ty, solution: &[Option<Ty>]): bool =
 		!self.program.types.any(ty, (kind) =>
-			kind is .Param(param) && solution[param.index as i64].isNone())
+			kind is .Param(param) && solution[param.index].isNone())
 
 	/// A lambda, lent or owned.
 	fn isLambda(e: ast::ExprId): bool = match self.ast.exprs[e].kind {
@@ -872,10 +872,8 @@ extend Lowerer {
 					// not known is inferred from its body.
 					val hint: Option<Ty> = if self.isLambda(operand.expr) {
 						val args = solved(&solution)
-						.Some(self.program.types.subst(operand.declared, &args))
-					} else {
-						.None
-					}
+						Option::Some(self.program.types.subst(operand.declared, &args))
+					} else .None
 					val inferred =
 						if operand.isArg then self.inferArgument(operand.expr, hint)
 						else self.infer(operand.expr, hint)
@@ -891,7 +889,12 @@ extend Lowerer {
 							self.heldReference(inferred).isSome()) {
 						declared = inner
 					}
-					self.unify(declared, self.tyOf(inferred), &var solution)
+					// A list given where a `Vec<T>` is taken says `T` by its
+					// elements, and is made the vector once it is known.
+					match self.listLiteralElement(inferred, declared) {
+						.Some((wanted, elem)) => self.unify(wanted, elem, &var solution)
+						.None => self.unify(declared, self.tyOf(inferred), &var solution)
+					}
 					unconverted.push(i)
 					inferred
 				}
@@ -1083,8 +1086,8 @@ extend Lowerer {
 						declared[j],
 						(kind) =>
 							kind is .Param(param: p) &&
-								(p.index as i64) < solution.len() &&
-								solution[p.index as i64].isNone(),
+								p.index < solution.len() &&
+								solution[p.index].isNone(),
 					)
 					if missed {
 						val interfaceName = String::of(
@@ -1102,7 +1105,7 @@ extend Lowerer {
 							if solution[at].isNone() &&
 								self.program.types.any(
 									declared[j],
-									(kind) => kind is .Param(param: p) && p.index as i64 == at,
+									(kind) => kind is .Param(param: p) && p.index == at,
 								) {
 								solution[at] = .Some(ERROR)
 							}
@@ -1121,7 +1124,7 @@ extend Lowerer {
 		val owner = self.ownerOf(ty)?
 		val ownArgs: Vec<Ty> = match self.kind(ty) {
 			.Struct(args, ..) | .Enum(args, ..) => self.program.types.list(args).toVec()
-			.Slice(elem) => Vec::of(own [elem])
+			.Slice(elem) => [elem]
 			_ => Vec()
 		}
 		var found: Vec<TyList> = Vec()

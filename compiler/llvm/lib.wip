@@ -66,6 +66,12 @@ val FRAME_TABLES: u32 = 1
 /// The name of the block of words each thread has.
 val THREAD_WORDS: u32 = 2
 
+/// How many words each thread has: its allocator's, and the trace of its
+/// last error after them in a build that traces errors, as
+/// `std/prelude/trace.wip` lays them out.
+val THREAD_WORD_COUNT: u64 = 4
+val TRACED_THREAD_WORD_COUNT: u64 = 164
+
 /// What the program starts at: its `main`, or the tests `wip test` runs.
 pub enum Entry {
 	Main(main: FnId)
@@ -115,7 +121,8 @@ pub fn compile(
 	// on threads.
 	while true {
 		when {
-			llvm.queue.first() is .Some(id) => {
+			llvm.queue.first() is .Some(next) => {
+				val id = next.clone()
 				if !llvm.madeFns.contains(&id) then llvm.makeAhead(threads)
 				llvm.queue.popFront()
 				llvm.defineFunction(id)
@@ -156,7 +163,7 @@ fn bodyOf(
 		// A release build's MIR splits its scalars out; a debug build's
 		// keeps each variable whole, for the debugger.
 		if optimize then scalars(program, &var body)
-		.Some(body)
+		Option::Some(body)
 	}
 	.Drop(ty, inPlace) => .Some(
 		if inPlace then lowerDropInPlaceFn(program, interner, ty)
@@ -369,7 +376,7 @@ extend Llvm {
 		// a jump, and the function would be missing from them. A function that
 		// does not return — a panic — is never called from two places by one
 		// call, which would have one line for both.
-		val returns = Vec::of(own [
+		val returns = Vec::of([
 			FnAttr::NoUnwind,
 			FnAttr::UwTable,
 			FnAttr::FramePointer,
@@ -391,10 +398,13 @@ extend Llvm {
 		// The runtime's words, and the list of the tables a panic reads its
 		// calls from, which is written once LLVM has compiled the program and
 		// its DWARF says what is where (`frames.wip`).
-		val globals = Vec::of(own [
+		val globals = Vec::of([
 			runtimeWords(RUNTIME_WORDS),
 			frameTables(FRAME_TABLES),
-			threadWords(THREAD_WORDS),
+			threadWords(
+				THREAD_WORDS,
+				if self.program.tracesErrors then TRACED_THREAD_WORD_COUNT else THREAD_WORD_COUNT,
+			),
 		])
 		val optimize = self.optimize
 		var functions = self.functions
@@ -406,12 +416,12 @@ extend Llvm {
 			globals: globals,
 			declared: declared,
 			functions: functions,
-			groups: Vec::of(own [returns, panics, inCycles]),
+			groups: [returns, panics, inCycles],
 			unit: self.debug.unit,
 			flags: self.debug.flags,
 			nodes: self.debug.nodes,
 		)
-		val modules = if self.optimize then Vec::of(own [module]) else split(module, &self.files)
+		val modules = if self.optimize then Vec::of([module]) else split(module, &self.files)
 		return Ir(modules: modules, files: self.debug.paths)
 	}
 
@@ -593,7 +603,7 @@ extend Llvm {
 				.None => Slot::of(.Ptr)
 			}
 			if !cAbi && self.noalias && self.onlyRead(param) then
-				slot.attrs = Vec::of(own [Attr::NoAlias, Attr::ReadOnly])
+				slot.attrs = [Attr::NoAlias, Attr::ReadOnly]
 			// An aggregate taken by value is passed by the address of a place
 			// nothing else reaches while the call runs: a copy the caller made
 			// of a place it keeps, or what it moved or built, which it no
@@ -604,7 +614,7 @@ extend Llvm {
 			// caller's own place, where it does not change while the call
 			// runs, rather than a copy of it.
 			if !cAbi && self.noalias && self.isAggregate(param) {
-				slot.attrs = Vec::of(own [Attr::NoAlias])
+				slot.attrs = [Attr::NoAlias]
 				if readsItsValues && !self.program.ownsMemory(param) {
 					slot.attrs.push(.ReadOnly)
 					slot.attrs.push(.NoCapture)
@@ -646,11 +656,11 @@ extend Llvm {
 
 	/// What a parameter or result of type `ty` says of what it reaches.
 	var fn referentAttrs(ty: Ty): Vec<Attr> = match self.referent(ty) {
-		.Some(layout) => Vec::of(own [
+		.Some(layout) => [
 			Attr::NonNull,
 			Attr::Dereferenceable(layout.size),
 			Attr::Align(layout.align.max(1)),
-		])
+		]
 		.None => Vec()
 	}
 
@@ -718,13 +728,10 @@ extend Llvm {
 		val sret = cCall.ret == mir::Answer::Hidden
 		if sret {
 			val layout = self.layout(def.ret)
-			params.push(Slot(
-				t: .Ptr,
-				attrs: Vec::of(own [
-					Attr::Sret(layout.size.max(1)),
-					Attr::Align(layout.align.max(1)),
-				]),
-			))
+			params.push(Slot(t: .Ptr, attrs: [
+				Attr::Sret(layout.size.max(1)),
+				Attr::Align(layout.align.max(1)),
+			]))
 		}
 		for (i, pass) in cCall.params.forwards().enumerate() {
 			if i >= def.params.len() then break
@@ -734,14 +741,12 @@ extend Llvm {
 					if self.isCPair(ty) {
 						params.push(Slot::of(.Ptr))
 						params.push(Slot::of(.I(64)))
-					} else {
-						params.push(
-							match self.slot(ty) {
-								.Some(s) => s
-								.None => Slot::of(.Ptr)
-							},
-						)
-					}
+					} else params.push(
+						match self.slot(ty) {
+							.Some(s) => s
+							.None => Slot::of(.Ptr)
+						},
+					)
 				}
 				.Parts(parts) => {
 					for part in parts {
@@ -760,10 +765,10 @@ extend Llvm {
 					}
 				}
 				.Copy => params.push(Slot::of(.Ptr))
-				.Stack(size) => params.push(Slot(
-					t: .Ptr,
-					attrs: Vec::of(own [Attr::ByVal(size), Attr::Align(8)]),
-				))
+				.Stack(size) => params.push(Slot(t: .Ptr, attrs: [
+					Attr::ByVal(size),
+					Attr::Align(8),
+				]))
 			}
 		}
 		var ret: Option<Slot> = .None
@@ -987,10 +992,7 @@ extend Llvm {
 		// Numbered before its methods, which a method's own table may name.
 		val name = self.global(globalName(written))
 		self.vtables.put(key, name)
-		var entries: Vec<Constant> = Vec()
-		for method in methods {
-			entries.push(.Address(self.symbol(method)))
-		}
+		val entries: Vec<Constant> = methods.map((method) => .Address(self.symbol(method)))
 		val t = arrayOf(entries.len() as u64, .Ptr)
 		self.data.push(Global(
 			name: name,
@@ -1010,7 +1012,7 @@ extend Llvm {
 		val symbol = self.global(globalName("abort"))
 		if self.cDeclared.add("abort") {
 			var declaration = Declaration::of(symbol, .Void, Vec())
-			declaration.attrs = Vec::of(own [FnAttr::NoReturn, FnAttr::NoUnwind])
+			declaration.attrs = [FnAttr::NoReturn, FnAttr::NoUnwind]
 			self.declare(symbol, .Function(declaration))
 		}
 		return symbol
@@ -1128,7 +1130,7 @@ extend Llvm {
 			panic("a drop is defined from what was made ahead of it")
 		}
 		val symbol = self.dropFn(ty, inPlace)
-		val sig = Sig(params: Vec::of(own [Slot::of(.Ptr)]), ret: .None, sret: false, parts: .None)
+		val sig = Sig(params: [Slot::of(.Ptr)], ret: .None, sret: false, parts: .None)
 		val name = "drop<\(self.program.tyName(ty, self.interner))>"
 		val subprogram = self.debug.subprogram(name, .None)
 		val linkage = self.ownLinkage()
@@ -1206,7 +1208,7 @@ extend Llvm {
 						.Alloca(t: byteArray(layout.size.max(1)), align: layout.align.max(1)),
 					),
 				)
-				var withResult = Vec::of(own [Val::of(Value::Main(.Result), .Ptr)])
+				var withResult = Vec::of([Val::of(Value::Main(.Result), .Ptr)])
 				for a in args {
 					withResult.push(a.clone())
 				}
@@ -1217,7 +1219,7 @@ extend Llvm {
 						.Call(own Call::plain(
 							reporter,
 							.I(64),
-							Vec::of(own [Val::of(Value::Main(.Result), .Ptr)]),
+							[Val::of(Value::Main(.Result), .Ptr)],
 						)),
 					),
 				)
@@ -1255,13 +1257,13 @@ extend Llvm {
 			linkage: .External,
 			ret: .I(32),
 			retAttrs: Vec(),
-			params: Vec::of(own [
+			params: [
 				Param(t: .I(32), attrs: Vec(), name: .Some(.Main(.Argc))),
 				Param(t: .Ptr, attrs: Vec(), name: .Some(.Main(.Argv))),
-			]),
+			],
 			returns: true,
 			subprogram: subprogram.node,
-			blocks: Vec::of(own [Block(label: .Start, instructions: instructions)]),
+			blocks: [Block(label: .Start, instructions: instructions)],
 		)
 		self.define(String(), function)
 	}
@@ -1272,10 +1274,10 @@ extend Llvm {
 	var fn defineTestEntry(tests: &[FnId]) = {
 		var code: Vec<(Option<Value>, Op)> = Vec()
 		val count = Val::of(.Int(tests.len() as i64), .I(64))
-		self.callRuntime(&var code, "wip_tests_begin", Vec::of(own [count.clone()]))
+		self.callRuntime(&var code, "wip_tests_begin", [count.clone()])
 		for id in tests {
 			val name = self.program.testName(id, self.interner)
-			var args = Vec::of(own [
+			var args = Vec::of([
 				Val::of(.Global(self.text(name)), .Ptr),
 				Val::of(.Int(name.len() as i64), .I(64)),
 				Val::of(.Global(self.symbol(id)), .Ptr),
@@ -1293,11 +1295,11 @@ extend Llvm {
 			val (file, line, column) = (self.locations)(self.program.fns[id].span)
 			args.push(Val::of(.Global(self.text(file)), .Ptr))
 			args.push(Val::of(.Int(file.len() as i64), .I(64)))
-			args.push(Val::of(.Int(line as i64), .I(64)))
-			args.push(Val::of(.Int(column as i64), .I(64)))
+			args.push(Val::of(.Int(line), .I(64)))
+			args.push(Val::of(.Int(column), .I(64)))
 			self.callRuntime(&var code, "wip_test_panics", args)
 		}
-		self.callRuntime(&var code, "wip_tests_end", Vec::of(own [count]))
+		self.callRuntime(&var code, "wip_tests_end", [count])
 		code.push((.None, .Ret(.Some(Val::of(.Int(0), .I(32))))))
 		self.defineCMain(code)
 	}
@@ -1321,14 +1323,15 @@ fn runtimeWords(name: u32): Global = Global(
 	align: .Some(8),
 )
 
-/// The block of words each thread has of its own, named `name`, zeroed in
-/// a new thread: where the runtime keeps the thread's allocator.
-fn threadWords(name: u32): Global = Global(
+/// The block of `count` words each thread has of its own, named `name`,
+/// zeroed in a new thread: where the runtime keeps the thread's allocator,
+/// and the trace of its last error.
+fn threadWords(name: u32, count: u64): Global = Global(
 	name: name,
 	linkage: .External,
 	unnamedAddr: false,
 	constant: false,
-	t: arrayOf(4, .I(64)),
+	t: arrayOf(count, .I(64)),
 	init: .Some(.Zero),
 	align: .Some(8),
 	threadLocal: true,
@@ -1349,7 +1352,7 @@ fn frameTables(name: u32): Global = Global(
 /// Bytes as a constant: an empty one a NUL, since an object holds a byte at
 /// least.
 fn byteConstant(bytes: &[u8]): Constant =
-	if bytes.isEmpty() then .Bytes(Vec::of(own [0 as u8])) else .Bytes(bytes.toVec())
+	if bytes.isEmpty() then .Bytes([0 as u8]) else .Bytes(bytes.toVec())
 
 /// `[size x i8]`: a stack slot's bytes.
 fn byteArray(size: u32): Type = arrayOf(size as u64, .I(8))
@@ -1372,12 +1375,10 @@ fn escape(text: str): String = {
 	var out = String()
 	for i in 0..text.len() {
 		val byte = text[i]
-		if byte >= 0x20 && byte <= 0x7e && byte != b'"' && byte != b'\\' {
-			out.pushByte(byte)
-		} else {
+		if byte >= 0x20 && byte <= 0x7e && byte != b'"' && byte != b'\\' then out.pushByte(byte) else {
 			out.pushByte(b'\\')
 			out.pushByte(digits[(byte >> 4) as i64])
-			out.pushByte(digits[(byte & 15) as i64])
+			out.pushByte(digits[(byte & 15)])
 		}
 	}
 	return out
@@ -1416,7 +1417,7 @@ fn markCycles(functions: &var Vec<Function>) = {
 	for root in 0..count {
 		if index[root] >= 0 then continue
 		// The walk: each function entered, and how far through its callees.
-		var walk: Vec<(i64, i64)> = Vec::of(own [(root, 0)])
+		var walk: Vec<(i64, i64)> = [(root, 0)]
 		index[root] = next
 		low[root] = next
 		next += 1
@@ -1434,9 +1435,7 @@ fn markCycles(functions: &var Vec<Function>) = {
 					stack.push(w)
 					onStack[w] = true
 					walk.push((w, 0))
-				} else if onStack[w] && index[w] < low[v] {
-					low[v] = index[w]
-				}
+				} else if onStack[w] && index[w] < low[v] then low[v] = index[w]
 				continue
 			}
 			walk.pop()

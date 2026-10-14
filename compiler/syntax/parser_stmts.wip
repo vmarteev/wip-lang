@@ -33,93 +33,9 @@ extend Parser {
 				self.bump()
 				continue
 			}
-			if stmts.len() >= 2 then
-				self.variantUnderExpression(stmts[stmts.len() - 2], stmts[stmts.len() - 1])
 			self.stmtSeparator()
 		}
 		return Block(stmts: stmts, span: open.to(self.prevSpan()))
-	}
-
-	/// A variant at the start of a line, directly under a statement that a `.`
-	/// could have continued: `io::println(…)` and then `.Ok(value)` reads as a
-	/// method call on the line above, though a line break ends the expression
-	/// there. It means what it says, so this is a warning and not an error
-	/// (E0126).
-	var fn variantUnderExpression(previous: StmtId, last: StmtId) = {
-		val .Expr(value) = self.ast.stmts[last].kind else return
-		val .Some(name) = self.dotName(value) else return
-		// A name in lower case is a method's or a field's:
-		// a chain meant to go on, which a `val`'s value can be too.
-		val text = self.text(name.span)
-		val first = if text.isEmpty() then 'A' else text.charAt(0).0
-		if first.isLowercase() {
-			val above = match self.ast.stmts[previous].kind {
-				.Expr(value: above) | .Let(init: above, ..) => above
-				_ => return
-			}
-			self.chainUnderExpression(above, last, name)
-			return
-		}
-		// Only what a `.` could have carried on: a binding, a loop, an
-		// assignment and an `if` without `else` have no value to take one,
-		// so nothing there can be misread.
-		val .Expr(value: above) = self.ast.stmts[previous].kind else return
-		if self.ast.exprs[above].kind is .Assign(..) | .If(elseBranch: .None, ..) then return
-		val (aboveSpan, below) = (self.ast.stmts[previous].span, self.ast.stmts[last].span)
-		if !self.src[self.local(aboveSpan.hi)..self.local(below.lo)].contains("\n") then return
-		val diagnostic = Diagnostic::warning(
-			VARIANT_UNDER_EXPRESSION,
-			"this reads as a method call on the line above",
-			below,
-			"a variant, on a line of its own",
-		).withSecondary(aboveSpan, "the expression this seems to continue").
-			withNote(
-				"a line break ends an expression, and a `.` that starts a line begins a variant of the expected type, so these are two statements",
-			).
-			withFix("say so with `return`", own [Edit::insert(below.lo, "return ")])
-		self.report(diagnostic)
-	}
-
-	/// A chain continued with a `.` at the start of a line: `xs` and then
-	/// `.walk()` under it, which a line break ended, so
-	/// that `.walk` names a variant. A line that starts with `.` begins a
-	/// variant; a chain goes on with the `.` at the end of the line above,
-	/// or inside parentheses.
-	var fn chainUnderExpression(above: ExprId, last: StmtId, name: Name) = {
-		val aboveSpan = self.exprSpan(above)
-		val below = self.ast.stmts[last].span
-		if !self.src[self.local(aboveSpan.hi)..self.local(below.lo)].contains("\n") then return
-		val method = self.text(name.span)
-		val dot = Span::new(name.span.lo - 1, name.span.lo)
-		val diagnostic = Diagnostic::warning(
-			VARIANT_UNDER_EXPRESSION,
-			"`.\(method)` starts a line, so it does not continue the line above",
-			below,
-			"a variant of its own, not a call on the line above",
-		).withSecondary(aboveSpan, "the expression it seems to continue").
-			withNote(
-				"a line break ends an expression, and a `.` that starts a line begins a variant; a chain goes on with the `.` at the end of the line above, or inside parentheses",
-			).
-			withFix("end the line above with the `.`", own [
-				Edit::replace(dot, ""),
-				Edit::insert(aboveSpan.hi, "."),
-			])
-		self.report(diagnostic)
-	}
-
-	/// The name after the `.` an expression begins with, through the
-	/// postfix forms that keep their value on the left; nothing where it
-	/// does not begin with one.
-	fn dotName(id: ExprId): Option<Name> = match self.ast.exprs[id].kind {
-		.Path(leadingDot: true, segments, ..) =>
-			if segments.isEmpty() then .None else .Some(segments[0])
-		.Call(callee, ..) => self.dotName(callee)
-		.Field(base, ..) => self.dotName(base)
-		.Index(base, ..) | .SubSlice(base, ..) => self.dotName(base)
-		.Try(inner) => self.dotName(inner)
-		.Binary(lhs, ..) => self.dotName(lhs)
-		.Cast(expr, ..) => self.dotName(expr)
-		_ => .None
 	}
 
 	/// After a statement: `;`, a line break or `}` must follow (E0112).
@@ -131,7 +47,7 @@ extend Parser {
 			"missing `;` between statements on one line",
 			self.span(),
 			"starts another statement on the same line",
-		).withNote("statements on one line are separated by `;`").withFix("add `;`", own [
+		).withNote("statements on one line are separated by `;`").withFix("add `;`", [
 			Edit::insert(self.prevSpan().hi, ";"),
 		])
 		self.report(diagnostic)
@@ -198,7 +114,7 @@ extend Parser {
 						"immutable variables are declared with `val`",
 						span,
 						"`let` is not used in Wip",
-					).withFix("write `val`", own [Edit::replace(span, "val")])
+					).withFix("write `val`", [Edit::replace(span, "val")])
 					self.report(diagnostic)
 				}
 				val mutable = self.at(.Var)
@@ -234,7 +150,13 @@ extend Parser {
 				}
 				val ty: Option<TypeId> = if self.eat(.Colon) then .Some(self.ty()) else .None
 				val init = if self.expect(.Eq) then self.expr() else self.errorExpr()
-				.Let(mutable: mutable, isImplicit: isImplicit, name: name, ty: ty, init: init)
+				StmtKind::Let(
+					mutable: mutable,
+					isImplicit: isImplicit,
+					name: name,
+					ty: ty,
+					init: init,
+				)
 			}
 			.Defer => {
 				self.bump()
@@ -246,7 +168,7 @@ extend Parser {
 				val value: Option<ExprId> =
 					if canStartExpr(self.peek()) && !self.lineBreak() then .Some(self.expr())
 					else .None
-				.Return(value: value)
+				StmtKind::Return(value: value)
 			}
 			.Become => {
 				self.bump()
@@ -261,7 +183,7 @@ extend Parser {
 				self.bump()
 				val cond = self.cond()
 				val body = self.block()
-				.While(label: .None, cond: cond, body: body)
+				StmtKind::While(label: .None, cond: cond, body: body)
 			}
 			// `outer: while …`, `outer: for …`: a loop with a name, which
 			// `break outer` leaves.
@@ -294,7 +216,7 @@ extend Parser {
 					return .None
 				}
 				val body = self.block()
-				.For(label: .None, binding: binding, source: move source, body: body)
+				StmtKind::For(label: .None, binding: binding, source: move source, body: body)
 			}
 			// `break`, or `break outer`: the loop of that name.
 			.Break => {

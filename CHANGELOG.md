@@ -2,6 +2,79 @@
 
 Each version published, newest first.
 
+## 0.6.0 — 2026-10-13
+
+Programs written for 0.5 may need changes where marked **breaking**; the
+compiler's errors carry the fixes, and the `wip fmt` of this version
+writes the new forms.
+
+**The language**
+
+- **A chain goes on with a `.` at the start of a line,** as in Swift and
+  Kotlin: `query()` and then `.every()` on the next line is one chain. A
+  `match` arm, read as a pattern before `=>`, is never a chain.
+  **Breaking:** a line that ends with `.` is refused (E0113), with the
+  fix that moves it; and a variant meant as a block's value under a
+  statement is written with its type, `Option::None`, since a `.None`
+  there continues the line above (E0126, with the fix that writes the
+  type).
+- **Each branch of an `if` in its own form:** one expression after `then`
+  or `else`, statements in braces, mixed in one `if` as a `when`'s arms
+  are — `if xs.isEmpty() then return .None else { … }`, `} else 0`, and a
+  `match` after `else` without braces round it.
+- **A list literal takes the type expected of it:** `args: [id]` where a
+  `Vec` is expected is one, `[]` an empty one, and a list where an
+  `own<[T]>` is expected is built on the heap; text in a `Vec<String>`
+  becomes `String`s. A `Vec` compared with a list, an array or a slice
+  compares their elements and builds nothing: `order == [3, 2, 1]`.
+- **Integers widen where nothing is lost:** a `u8` where an `i64` is
+  expected, or beside one in an operator, is taken as one, as are the
+  branches of an `if` and the elements of an array of the type that holds
+  them all. `as` is left to what may lose something. What an operator
+  works out in a narrow type and is then widened is warned of (E0366),
+  with the fix that widens an operand. **Breaking:** a shift by a constant
+  at least as wide as the value is refused (E0367), since the amount is
+  taken modulo the width and it leaves the value as it was.
+- **Closures that write:** what calls a closure one call at a time — a
+  slice's `map`, `fold`, `filter`, `find`, `any`, an `Option`'s and a
+  `Result`'s, an iterator's consumers — takes one that may change what it
+  captures, `self` among them: `names.map((n) => self.intern(n))`. A
+  closure that reads goes where one that writes is taken. A lambda kept
+  in a `val` may write what it captures, which it holds until its last
+  use; reading it before then is refused (E0414).
+- **An iterator's adapters borrow:** `map`, `filter`, `filterMap`,
+  `flatMap` and `takeWhile` take a closure lent to read, and the chain is
+  a view of what it captured, so it may read a `str`, a reference or
+  `self`: `text.split(" ").filter((w) => w.startsWith(prefix))`.
+  **Breaking:** `own` at an adapter is refused, with the fix that leaves
+  it out.
+- **Where an error was made, and the way it came:** in a debug build, an
+  error that ends the program, or is `unwrap`ped, is followed by where it
+  was made and each `?` that passed it on, as a panic's calls are.
+- **Breaking:** a closure that reads, `&(…) => R`, no longer writes
+  through a `&var` it captured, which let `future::map` race on `self`.
+
+**The library**
+
+- **Breaking — walks and lookups named for what they do:** the copying
+  walk is `copies()`, and its iterator `std::iter::Copies` (was `walk()`
+  and `Walk`); a position is `indexOf` and `lastIndexOf` on every type,
+  text's and a `Map`'s and a `Set`'s among them (was `find` and
+  `findLast`); a `Deque`'s `first()` and `last()` lend, as a slice's do.
+  `find` answers what it finds.
+- The functions that take a closure that writes are `@inline`, so it
+  costs what the loop it replaces costs; an `@inline` function is not a
+  value, so `Option::map` is passed as a lambda.
+
+**Tools**
+
+- **`wip fmt`** writes each branch of an `if` in its form and a long chain
+  with a `.` at the start of each line.
+- **The reference** has a glossary and a one-page cheat sheet.
+- **The compiler and the library** are written with all of the above:
+  lists for vectors, closures for loops, without the casts and the
+  `own`s no longer needed.
+
 ## 0.5.0 — 2026-10-13
 
 Programs written for 0.4 compile as they did; where they write `move`

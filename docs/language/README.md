@@ -11,7 +11,10 @@ questions:
 | [the README](../../README.md#where-it-stands) | what it cannot do yet |
 
 Each page states the rule and shows it in an example. Only the rule that
-holds today is written down, not how it came to be.
+holds today is written down, not how it came to be. The
+[cheat sheet](cheat-sheet.md) is the language on one page, an example for
+each part, and the [glossary](glossary.md) says what the pages' own
+words mean: a value *answers*, a place is *lent*, a call *keeps*.
 
 ## The pages
 
@@ -29,6 +32,8 @@ holds today is written down, not how it came to be.
 | [10. The standard library](10-library.md) | the prelude, `Vec`, `String`, collections, iterators, `std::io` |
 | [11. C](11-c.md) | `extern` blocks, `@link` and `@header`, C files in a module and their settings, `cstring` |
 | [12. The tools](12-tools.md) | `wip build`, `run`, `test`, `check`, `mir`, and what they read from disk |
+| [Cheat sheet](cheat-sheet.md) | the language on one page, an example for each part |
+| [Glossary](glossary.md) | the words these pages use in a sense of their own |
 
 ## The examples are compiled
 
@@ -47,8 +52,11 @@ true. The fence says what is expected:
 - **`wip,ignore`** — a fragment that stands for something rather than a
   program.
 
-Each example is also laid out as `wip fmt` lays it out, four spaces to an
-indent and in 80 columns, since what a page shows is what a reader copies.
+Each example is also laid out as `wip fmt --spaces 4 --width 80` lays it
+out, so that it fits a page. `wip fmt` with its defaults indents with a
+tab and breaks lines at 100 columns
+([page 12](12-tools.md#formatting)), so an example copied and formatted
+changes only its indentation and where a long line breaks.
 
 ## Keeping it true
 

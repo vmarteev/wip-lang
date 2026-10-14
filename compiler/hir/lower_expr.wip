@@ -21,7 +21,8 @@ import syntax::{
 	RUNTIME_LENGTH,
 	Span,
 	Symbol,
-	UNKNOWN_NAME
+	UNKNOWN_NAME,
+	VARIANT_UNDER_EXPRESSION
 }
 
 /// The implementation an arithmetic operator calls on a type of a program's
@@ -54,6 +55,7 @@ extend Lowerer {
 
 	var fn infer(id: ast::ExprId, hint: Option<Ty>): ExprId = {
 		if self.checkedEarly(id) is .Some(checked) then return checked
+		if self.variantUnderExpression(id, hint) is .Some(refused) then return refused
 		val file = self.ast
 		val expr = &file.exprs[id]
 		val span = expr.span
@@ -86,7 +88,7 @@ extend Lowerer {
 			.Char(c) => self.alloc(.Int(c as u128), CHAR, span)
 			// A byte is the number it is, a `u8`.
 			.Byte(b) => {
-				val byte = self.alloc(.Int(b as u128), U8, span)
+				val byte = self.alloc(.Int(b), U8, span)
 				self.state.byteLiterals.add(byte)
 				byte
 			}
@@ -119,6 +121,12 @@ extend Lowerer {
 				item.typeArgs = typeArgs.asRef()
 				self.pathExpr(leadingDot, &segments, item)
 			}
+			// A list where a `Vec` or a buffer is expected is one.
+			.Array(..) | .ArrayRepeat(..) if self.listExpected(id, hint) => self.listAs(
+				id,
+				hint.unwrap(),
+				span,
+			)
 			.Array(elems) => self.arrayLit(&elems, hint, span)
 			.ArrayRepeat(elem, count: .Literal(count)) => self.arrayRepeat(elem, count, hint, span)
 			// `[0; SIZE]`: a count that names a constant is known where it is
@@ -134,10 +142,18 @@ extend Lowerer {
 				}
 			}
 			// `own [x; n]` handles its own count; anywhere else a count must be
-			// a literal.
+			// a literal. Where a `Vec` is expected, the buffer is made one.
 			.ArrayRepeat(elem, count: .Expr(count)) => {
 				self.infer(elem, .None)
 				self.checkOperand(count, I64)
+				val vector = hint is .Some(h) && self.program.vecElement(h).isSome()
+				val words =
+					if vector then "allocate it on the heap, as a vector"
+					else "allocate it on the heap"
+				val edits: own<[Edit]> =
+					if vector then
+						[Edit::insert(span.lo, "Vec::of(own "), Edit::insert(span.hi, ")")]
+					else [Edit::insert(span.lo, "own ")]
 				self.report(
 					Diagnostic::error(
 						RUNTIME_LENGTH,
@@ -146,7 +162,7 @@ extend Lowerer {
 						"the length is not a literal",
 					).withNote(
 						"an array's length is part of its type; only a buffer on the heap keeps its length with it",
-					).withFix("allocate it on the heap", own [Edit::insert(span.lo, "own ")]),
+					).withFix(words, edits),
 				)
 				self.errorExpr(span)
 			}
@@ -300,22 +316,54 @@ extend Lowerer {
 	/// written: `window[0..4] == magic`.
 	var fn comparedOperand(op: BinaryOp, e: ast::ExprId, hint: Option<Ty>): ExprId = {
 		if comparison(op) {
-			val id = self.inferBorrowed(e, hint)
+			val id = self.inferBorrowed(e, self.comparedList(e, hint))
 			return self.autoderef(id)
 		}
 		return self.operand(e, hint)
 	}
 
-	/// What a comparison reads of an array, a slice, a buffer or a reference
-	/// to a slice: its elements as a slice place, and their type. Nothing for
-	/// anything else.
+	/// What a list literal compared with a `Vec` or a buffer is expected to
+	/// be: an array of its elements, which the other side's are compared
+	/// with, and not a vector built to compare. A list written as text,
+	/// beside `String`s, stays text, compared with each `String` where it
+	/// lies.
+	var fn comparedList(e: ast::ExprId, hint: Option<Ty>): Option<Ty> = {
+		val .Some(other) = hint else return hint
+		if self.ast.exprs[e].kind !is .Array(..) | .ArrayRepeat(..) then return hint
+		val elem = match self.program.vecElement(other) {
+			.Some(t) => t
+			.None => self.bufferElement(other).unwrapOr(ERROR)
+		}
+		if elem == ERROR then return hint
+		val text = self.program.isString(elem) && self.writtenAsText(e)
+		return .Some(self.intern(.Slice(if text then STR else elem)))
+	}
+
+	/// Whether every element of a list is text written out, `["a", "b"]`.
+	fn writtenAsText(list: ast::ExprId): bool = {
+		val .Array(elems) = self.ast.exprs[list].kind else return false
+		for e in elems {
+			if self.ast.exprs[e].kind !is .Str(..) then return false
+		}
+		return true
+	}
+
+	/// What a comparison reads of an array, a slice, a buffer, a reference to
+	/// a slice or a `Vec`: its elements as a slice place, and their type.
+	/// Nothing for anything else.
 	var fn asElements(e: ExprId): Option<(ExprId, Ty)> = {
 		val ty = self.tyOf(e)
 		val span = self.state.body.exprs[e].span
+		if self.program.vecElement(ty).isSome() {
+			val .Items(items, elem) = self.itemsOf(e, ty) else return .None
+			return .Some((items, elem))
+		}
 		return match self.kind(ty) {
 			.Array(elem, ..) => {
 				val slice = self.intern(.Slice(elem))
-				.Some((self.alloc(.SubSlice(base: e, lo: .None, hi: .None), slice, span), elem))
+				Option::Some(
+					(self.alloc(.SubSlice(base: e, lo: .None, hi: .None), slice, span), elem),
+				)
 			}
 			.Slice(elem) => .Some((e, elem))
 			.Own(inner) | .Ref(inner, ..) => match self.kind(inner) {
@@ -480,7 +528,7 @@ extend Lowerer {
 		return match suggest(text, &candidates) {
 			.Some(similar) => diagnostic.withFix(
 				"a name with a similar spelling exists: `\(similar)`",
-				own [Edit::replace(span, similar)],
+				[Edit::replace(span, similar)],
 			)
 			.None => diagnostic
 		}
@@ -514,7 +562,11 @@ extend Lowerer {
 						"cannot infer the element type of an empty array",
 						span,
 						"type unknown",
-					).withHelp("annotate the variable, for example `val xs: [i64; 0] = []`"),
+					).withHelp(
+						"annotate the variable, for example `val xs: [i64; 0] = []`",
+					).withFix("make it an empty vector, whose type its first use says", [
+						Edit::replace(span, "Vec()"),
+					]),
 				)
 				return self.errorExpr(span)
 			}
@@ -542,9 +594,29 @@ extend Lowerer {
 			.None => self.tyOf(first)
 		}
 		var checked: Vec<ExprId> = Vec()
+		if elemHint.isNone() && self.program.types.isInteger(elem) then
+			return self.integerArray(elems, deciding, first, span)
 		for i in 0..elems.len() {
 			checked.push(if i == deciding then first else self.arrayElement(elems[i], elem))
 		}
+		val ty = self.intern(.Array(elem: elem, len: elems.len() as u64))
+		return self.alloc(.Array(checked), ty, span)
+	}
+
+	/// An array of integers where nothing says its element type: each
+	/// element takes the type of the one that decided it where it says none
+	/// of its own, and the array holds the integer type that holds them all,
+	/// where one does, the others widened to it.
+	var fn integerArray(elems: &[ast::ExprId], deciding: i64, first: ExprId, span: Span): ExprId = {
+		val decided = self.tyOf(first)
+		var elem = decided
+		var inferred: Vec<ExprId> = Vec()
+		for i in 0..elems.len() {
+			val e = if i == deciding then first else self.infer(elems[i], .Some(decided))
+			if self.partsType(elem, self.tyOf(e)) is .Some(wide) then elem = wide
+			inferred.push(e)
+		}
+		val checked: Vec<ExprId> = inferred.map((e) => self.coerce(e, elem, .None))
 		val ty = self.intern(.Array(elem: elem, len: elems.len() as u64))
 		return self.alloc(.Array(checked), ty, span)
 	}
@@ -760,9 +832,7 @@ extend Lowerer {
 				"`move` is not needed here",
 				Span::new(span.lo, span.lo + 4),
 				"moved where it is used, written or not",
-			).withFix("remove `move`", own [
-				Edit::replace(Span::new(span.lo, inner.lo), ""),
-			]).withNote(
+			).withFix("remove `move`", [Edit::replace(Span::new(span.lo, inner.lo), "")]).withNote(
 				"a place that owns memory, used as a value, is given away there; `move` is written where a `match`, an `is`, a `for` or a `val` pattern would look into the place, to take it apart",
 			),
 		)
@@ -792,11 +862,11 @@ extend Lowerer {
 		// `yield`s decide how long it is.
 		if file.exprs[operand].kind is .Array(elems) {
 			for e in elems {
-				if yields(&file, e) then return self.builtList(&elems, hint, span)
+				if yields(&file, e) then return self.builtList(&elems, hint, false, span)
 			}
 		}
 		if file.exprs[operand].kind is .ForElement(..) then
-			return self.builtList([operand], hint, span)
+			return self.builtList([operand], hint, false, span)
 		// `own [x; n]` with a length known only at run time.
 		if file.exprs[operand].kind is .ArrayRepeat(elem, count: .Expr(count)) then
 			return self.ownRepeat(elem, count, hint, span)
@@ -889,7 +959,12 @@ extend Lowerer {
 		// A constant beside an integer of another type is as the literal it
 		// stands for: `flags & VK_QUEUE_GRAPHICS_BIT`. Not a shift's amount,
 		// which may be of any type already.
-		val (l0, r0) = if shift then (left, right) else self.constantBeside(left, right)
+		// And an integer beside a wider one widens: `b == n` of a `u8` and an
+		// `i64` compares `i64`s.
+		val (l0, r0) = if shift then (left, right) else {
+			val (l, r) = self.constantBeside(left, right)
+			self.widenedBeside(l, r)
+		}
 		val lt0 = self.tyOf(l0)
 		val rt0 = self.tyOf(r0)
 		// `name == null` asks whether a C string is null: `null` has no text
@@ -920,6 +995,7 @@ extend Lowerer {
 		// A shift's amount may be of any integer type: it is taken modulo the
 		// width of what is shifted, which it keeps when it is made that type
 		// first, since every width is a power of two.
+		if self.shiftByWidth(op, l, r, opSpan, false) then return self.errorExpr(span)
 		r = self.shiftAmount(op, l, r)
 		var lt = self.tyOf(l)
 		var rt = self.tyOf(r)
@@ -952,6 +1028,15 @@ extend Lowerer {
 				r = re
 				lt = slice
 				rt = slice
+			}
+			// `String`s compared with text, either way round: each with the text
+			// beside it, as one `String` is compared with text.
+			if op is .Eq | .Ne &&
+				left is .Some((le, lElem)) &&
+				right is .Some((re, rElem)) &&
+				self.sameTexts(le, lElem, re, rElem, span) is .Some(same) {
+				return if op == .Eq then same
+				else self.alloc(.Unary(op: .Not, operand: same), BOOL, span)
 			}
 		}
 		// `a < b` on a type that implements `Ord` asks it.
@@ -996,6 +1081,39 @@ extend Lowerer {
 			}
 		}
 		return self.alloc(.Binary(op: op, lhs: l, rhs: r, wrapping: wrapping), result, span)
+	}
+
+	/// `sameTexts(&strings, &texts)`, where one side's elements are `String`s
+	/// and the other's text.
+	var fn sameTexts(l: ExprId, lElem: Ty, r: ExprId, rElem: Ty, span: Span): Option<ExprId> = {
+		val (strings, texts) = when {
+			self.program.isString(lElem) && rElem == STR => (l, r)
+			lElem == STR && self.program.isString(rElem) => (r, l)
+			else => return .None
+		}
+		val compare = self.program.preludeItems.function(.SameTexts)?
+		val lentStrings = self.alloc(
+			.Ref(strings),
+			self.intern(.Ref(inner: self.tyOf(strings), kind: .Shared)),
+			span,
+		)
+		val lentTexts = self.alloc(
+			.Ref(texts),
+			self.intern(.Ref(inner: self.tyOf(texts), kind: .Shared)),
+			span,
+		)
+		return .Some(
+			self.alloc(
+				.Call(
+					callee: compare,
+					args: [lentStrings, lentTexts],
+					typeArgs: TyList::empty(),
+					order: [0, 1],
+				),
+				BOOL,
+				span,
+			),
+		)
 	}
 
 	/// `&place` or `&var place`. A call's argument may be either, which
@@ -1077,7 +1195,7 @@ extend Lowerer {
 					"`&` needs a variable, field or element",
 					self.state.body.exprs[e].span,
 					"a temporary value",
-				).withFix("remove the `&`", own [Edit::replace(amp, String())]).withNote(
+				).withFix("remove the `&`", [Edit::replace(amp, String())]).withNote(
 					"a temporary is already lent where it is used, as it is already moved",
 				),
 			)
@@ -1104,12 +1222,7 @@ extend Lowerer {
 			}
 		}
 		return self.alloc(
-			.Call(
-				callee: method,
-				args: Vec::of(own [receiver]),
-				typeArgs: typeArgs,
-				order: Vec::of(own [0]),
-			),
+			.Call(callee: method, args: [receiver], typeArgs: typeArgs, order: [0]),
 			ty,
 			span,
 		)
@@ -1131,7 +1244,7 @@ extend Lowerer {
 	fn interfaceMethod(which: KnownInterface, ty: Ty): Option<FnId> = {
 		val interfaceId = self.program.preludeItems.interfaceOf(which)?
 		if self.kind(ty) is .Param(param) {
-			if param.index as i64 >= self.typeParams.len() then return .None
+			if param.index >= self.typeParams.len() then return .None
 			for c in self.typeParams[param.index as i64].interfaces {
 				if c.interfaceId == interfaceId then
 					return .Some(self.program.interfaces[interfaceId].methods[0].id)
@@ -1149,9 +1262,9 @@ extend Lowerer {
 	var fn operatorImpl(which: KnownInterface, lt: Ty, rt: Ty): Option<OperatorImpl> = {
 		val interfaceId = self.program.preludeItems.interfaceOf(which)?
 		if self.kind(lt) is .Param(param) {
-			if param.index as i64 >= self.typeParams.len() then return .None
+			if param.index >= self.typeParams.len() then return .None
 			var found: Option<Constraint> = .None
-			for c in self.typeParams[param.index as i64].interfaces {
+			for c in self.typeParams[param.index].interfaces {
 				val list = self.program.types.list(c.args)
 				if found.isNone() &&
 					c.interfaceId == interfaceId &&
@@ -1162,7 +1275,7 @@ extend Lowerer {
 			}
 			val constraint = found?
 			val args = self.program.types.list(constraint.args).toVec()
-			var typeArgs = Vec::of(own [lt])
+			var typeArgs = Vec::of([lt])
 			for a in args {
 				typeArgs.push(a)
 			}
@@ -1203,7 +1316,7 @@ extend Lowerer {
 		var found: Vec<Ty> = Vec()
 		val .Some(interfaceId) = self.program.preludeItems.interfaceOf(which) else return found
 		if self.kind(lt) is .Param(param) {
-			if param.index as i64 >= self.typeParams.len() then return found
+			if param.index >= self.typeParams.len() then return found
 			for c in self.typeParams[param.index as i64].interfaces {
 				val list = self.program.types.list(c.args)
 				if c.interfaceId == interfaceId && !list.isEmpty() then found.push(list[0])
@@ -1256,9 +1369,9 @@ extend Lowerer {
 		return self.alloc(
 			.Call(
 				callee: found.method,
-				args: Vec::of(own [receiver, other]),
+				args: [receiver, other],
 				typeArgs: found.typeArgs,
-				order: Vec::of(own [0, 1]),
+				order: [0, 1],
 			),
 			found.out,
 			span,
@@ -1301,12 +1414,7 @@ extend Lowerer {
 		val borrowed = self.alloc(.Ref(r), other, span)
 		val typeArgs = self.methodTypeArgs(compare, ty)
 		return self.alloc(
-			.Call(
-				callee: compare,
-				args: Vec::of(own [receiver, borrowed]),
-				typeArgs: typeArgs,
-				order: Vec::of(own [0, 1]),
-			),
+			.Call(callee: compare, args: [receiver, borrowed], typeArgs: typeArgs, order: [0, 1]),
 			answer,
 			span,
 		)
@@ -1335,12 +1443,7 @@ extend Lowerer {
 		val borrowed = self.alloc(.Ref(r), other, span)
 		val typeArgs = self.methodTypeArgs(equals, ty)
 		val call = self.alloc(
-			.Call(
-				callee: equals,
-				args: Vec::of(own [receiver, borrowed]),
-				typeArgs: typeArgs,
-				order: Vec::of(own [0, 1]),
-			),
+			.Call(callee: equals, args: [receiver, borrowed], typeArgs: typeArgs, order: [0, 1]),
 			BOOL,
 			span,
 		)
@@ -1352,6 +1455,18 @@ extend Lowerer {
 
 	/// Reports operands of `op`, written `text`, that it does not apply to:
 	/// of different types, or of a type it does not take.
+	/// Why two numbers of different types are not taken together.
+	fn unconverted(lt: Ty, rt: Ty): str = {
+		val types = &self.program.types
+		return when {
+			types.isInteger(lt) && types.isInteger(rt) =>
+				"an integer is taken as a wider type that holds every value of it, and neither of these holds the other; `as` converts one, keeping the low bits of a value that does not fit"
+			types.isFloat(lt) && types.isFloat(rt) =>
+				"a float is made another by `as`, which may round"
+			else => "an integer is made a float, and a float an integer, by `as`, which may round"
+		}
+	}
+
 	var fn reportOperands(op: BinaryOp, opSpan: Span, text: str, l: ExprId, r: ExprId) = {
 		val lt = self.tyOf(l)
 		val rt = self.tyOf(r)
@@ -1373,14 +1488,14 @@ extend Lowerer {
 					"cannot apply `\(text)` to \(self.tyName(lt)) and \(self.tyName(rt))",
 					opSpan,
 					"operands of different types",
-				).withNote("Wip has no implicit numeric conversions")
+				).withNote(self.unconverted(lt, rt))
 				// An integer literal next to a float was almost certainly meant as a
 				// float literal.
 				if self.program.types.isFloat(lt) && self.state.body.exprs[r].kind is .Int(..) {
-					d.withFix("use a float literal", own [Edit::insert(rspan.hi, ".0")])
+					d.withFix("use a float literal", [Edit::insert(rspan.hi, ".0")])
 				} else if self.program.types.isFloat(rt) &&
 					self.state.body.exprs[l].kind is .Int(..) {
-					d.withFix("use a float literal", own [Edit::insert(lspan.hi, ".0")])
+					d.withFix("use a float literal", [Edit::insert(lspan.hi, ".0")])
 				} else {
 					d
 				}
@@ -1435,10 +1550,10 @@ extend Lowerer {
 		// On `bool`, `&` and `|` were almost certainly meant as `&&` and `||`.
 		if lt == BOOL && rt == BOOL && text == op.text() then
 			diagnostic = match op {
-				.BitAnd => diagnostic.withFix("for logical and, write `&&`", own [
+				.BitAnd => diagnostic.withFix("for logical and, write `&&`", [
 					Edit::replace(opSpan, "&&"),
 				])
-				.BitOr => diagnostic.withFix("for logical or, write `||`", own [
+				.BitOr => diagnostic.withFix("for logical or, write `||`", [
 					Edit::replace(opSpan, "||"),
 				])
 				.BitXor => diagnostic.withHelp("for `bool`, `!=` is exclusive or")
@@ -1474,9 +1589,8 @@ extend Lowerer {
 					val where =
 						if module == PRELUDE then String::of("the prelude") else "`\(module)`"
 					diagnostic = diagnostic.withHelp("`\(inside)` is declared in \(where), which does not implement `\(name)` for it")
-				} else if self.declaredType(arg) {
+				} else if self.declaredType(arg) then
 					diagnostic = diagnostic.withHelp("write `@derive(\(name))` on `\(inside)`, and the compiler writes it field by field")
-				}
 				diagnostic = diagnostic.withNote(
 					"an implementation may hold only for some type arguments: `extend Option<T: Eq>: Eq`",
 				)
@@ -1563,8 +1677,8 @@ extend Lowerer {
 		val types = &self.program.types
 		if types.isNumeric(from) && types.isNumeric(target) then
 			return self.alloc(.Cast(e), target, span)
-		// A character is its number, which fits any integer type that holds
-		// it; of the numbers, only a byte is always a character.
+		// A character is its number, cut to the integer type's width as any
+		// number is; of the numbers, only a byte is always a character.
 		if from == CHAR && types.isInteger(target) then return self.alloc(.Cast(e), target, span)
 		if target == CHAR && from == U8 then return self.alloc(.Cast(e), target, span)
 		if target == CHAR && types.isInteger(from) {
@@ -1637,5 +1751,54 @@ extend Lowerer {
 			if !v.fields.isEmpty() then return false
 		}
 		return true
+	}
+}
+
+extend Lowerer {
+	/// A variant written at the start of a line, under an expression, where
+	/// its type is expected — a block's value under a statement: the `.`
+	/// continued the line above, and names a member of what it answers
+	/// (E0126). The fix writes the variant with its type; the line above is
+	/// checked as what it was. One a block found under its last statement
+	/// (`variantTail`) is that statement's, checked without it.
+	var fn variantUnderExpression(id: ast::ExprId, hint: Option<Ty>): Option<ExprId> = {
+		val field = match self.ast.exprs[id].kind {
+			.Field(..) => id
+			.Call(callee, ..) => callee
+			_ => return .None
+		}
+		if !self.ast.lineDots.contains(&field) then return .None
+		val .Field(base, name) = self.ast.exprs[field].kind else return .None
+		if self.state.variantTails.contains(&field) then return .Some(self.infer(base, hint))
+		val .Some(expected) = hint else return .None
+		val .Enum(id: enumId, ..) = self.kind(expected) else return .None
+		var named = false
+		for variant in self.program.enums[enumId].variants {
+			if variant.name == name.sym then named = true
+		}
+		if !named then return .None
+		self.reportVariantUnder(enumId, base, name)
+		self.infer(base, .None)
+		return .Some(self.errorExpr(self.ast.exprs[id].span))
+	}
+
+	/// E0126: `.name`, a variant of the enum `enumId`, at the start of a
+	/// line under `base`, with the fix that writes the enum's name before it.
+	var fn reportVariantUnder(enumId: EnumId, base: ast::ExprId, name: ast::Name) = {
+		val enumName = String::of(self.text(self.program.enums[enumId].name))
+		val variant = String::of(self.text(name.sym))
+		val dot = Span::new(name.span.lo - 1, name.span.lo)
+		self.report(
+			Diagnostic::error(
+				VARIANT_UNDER_EXPRESSION,
+				"`.\(variant)` starts a line, so it is a member of the line above",
+				dot.to(name.span),
+				"a variant of `\(enumName)`, read as a member",
+			).withSecondary(self.ast.exprs[base].span, "the expression it continues")
+				.withNote(
+					"a `.` at the start of a line continues the expression above it, as it would on one line",
+				)
+				.withFix("write the variant with its type", [Edit::replace(dot, "\(enumName)::")]),
+		)
 	}
 }

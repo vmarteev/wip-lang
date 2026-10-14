@@ -3,8 +3,16 @@
 // the program says so on standard error and ends with 1 —
 // a program working as written, where a panic's 101 means a program that is
 // wrong.
+//
+// In a debug build it says, after the error, where it was made and the way
+// it came. The code generator calls `wip_error_made` where an `.Err` makes
+// an error, and `wip_error_passed_on` where one is handed on — by `?`, or by
+// an `.Err` built from what an `.Err` held — each with the function's name,
+// the file and the line; a release build calls neither. The trace is kept in the words each thread has, after its
+// allocator's, so nothing is allocated, and a thread begins with none.
+// `unwrap` of an error prints it too, after its panic's calls.
 
-import std::libc::{fflush, fwrite, stdout, stderr}
+import std::libc::{fflush, fprintf, fwrite, stdout, stderr}
 
 // The exit code of a `main` that returns `Result<i64, E>`: the value it
 // gives, or 1 once the error is reported. The code generator calls one of
@@ -32,5 +40,121 @@ fn report<E: Text>(error: E): i64 = {
 	// before the output it is about.
 	fflush(stdout)
 	fwrite(text, 1, stderr)
+	// Where it was made, and the way it came, in a debug build.
+	printTrace()
 	return 1
+}
+
+/// The thread's word that says how many places were recorded since its last
+/// error was made: 0 where there is no trace.
+val TRACE_STEPS: i64 = 1
+
+/// Whether the first place is where the error was made, 1, or only where it
+/// was first passed on, 0: an error a constant made, at compile time.
+val TRACE_MADE: i64 = 2
+
+/// Set where `unwrap` panics on an error, so that the panic prints the
+/// trace after its calls.
+val TRACE_SHOWN: i64 = 3
+
+/// Where the places begin, each five words: the function's name and its
+/// length, the file's and its length, and the line.
+val TRACE_FIRST: i64 = 4
+val PLACE_WORDS: i64 = 5
+
+/// How many places are kept: the first, and the latest after it.
+val TRACE_PLACES: i64 = 32
+
+@export("C")
+fn wip_error_made(name: ptr<u8>, nameLength: i64, file: ptr<u8>, fileLength: i64, line: i64) = {
+	val words = threadWords()
+	words[TRACE_STEPS] = 0
+	words[TRACE_MADE] = 1
+	record(words, name, nameLength, file, fileLength, line)
+}
+
+@export("C")
+fn wip_error_passed_on(
+	name: ptr<u8>,
+	nameLength: i64,
+	file: ptr<u8>,
+	fileLength: i64,
+	line: i64,
+) = {
+	val words = threadWords()
+	// An error made where nothing recorded it begins its trace here.
+	if words[TRACE_STEPS] == 0 then words[TRACE_MADE] = 0
+	record(words, name, nameLength, file, fileLength, line)
+}
+
+/// Keeps a place as the next step: in a slot of its own while there is
+/// room, and once there is not, over the oldest after the first.
+fn record(
+	words: ptr<i64>,
+	name: ptr<u8>,
+	nameLength: i64,
+	file: ptr<u8>,
+	fileLength: i64,
+	line: i64,
+) = {
+	val step = words[TRACE_STEPS]
+	val at = TRACE_FIRST +% slot(step) *% PLACE_WORDS
+	words[at] = name as i64
+	words[at +% 1] = nameLength
+	words[at +% 2] = file as i64
+	words[at +% 3] = fileLength
+	words[at +% 4] = line
+	words[TRACE_STEPS] = step +% 1
+}
+
+/// The slot step `step` is kept in: the first in the first, and the rest in
+/// turn in the others.
+fn slot(step: i64): i64 = if step == 0 then 0 else 1 +% (step -% 1) % (TRACE_PLACES -% 1)
+
+/// Says that the panic about to happen is `unwrap`'s, on an error: it
+/// prints the trace after its calls.
+fn showsTrace() = {
+	threadWords()[TRACE_SHOWN] = 1
+}
+
+/// After a panic's calls, the trace of the error `unwrap` found, where it
+/// was `unwrap`'s.
+fn printUnwrapped() = {
+	val words = threadWords()
+	if words[TRACE_SHOWN] == 0 || words[TRACE_STEPS] == 0 then return
+	fwrite("where the error came from:\n", 1, stderr)
+	printTrace()
+}
+
+/// The trace, a place a line, as a panic's calls are: where the error was
+/// made, then each place that passed it on; where some were left out, the
+/// first and the latest, and how many between.
+fn printTrace() = {
+	val words = threadWords()
+	val steps = words[TRACE_STEPS]
+	if steps == 0 then return
+	printPlace(words, 0, if words[TRACE_MADE] == 1 then "made in" else "passed on in")
+	val next = if steps <= TRACE_PLACES then 1 else steps -% (TRACE_PLACES -% 1)
+	if next > 1 then fprintf(stderr, "  … %lld more passed it on\n", next -% 1)
+	var step = next
+	while step < steps {
+		printPlace(words, step, "passed on in")
+		step = step +% 1
+	}
+}
+
+/// `made in name (file:line)`, or `passed on in` it.
+fn printPlace(words: ptr<i64>, step: i64, what: str) = {
+	val at = TRACE_FIRST +% slot(step) *% PLACE_WORDS
+	fwrite("  ", 1, stderr)
+	fwrite(what, 1, stderr)
+	fprintf(
+		stderr,
+		" %.*s (%.*s:%lld)\n",
+		words[at +% 1] as c_int,
+		words[at] as ptr<u8>,
+		words[at +% 3] as c_int,
+		words[at +% 2] as ptr<u8>,
+		words[at +% 4],
+	)
 }

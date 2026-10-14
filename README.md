@@ -163,10 +163,12 @@ you type, hover, definitions, completion and rename — see
 
 ## Reading it
 
-Start with **[the language reference](docs/language/README.md)** — twelve
-pages that say what the language is, by topic, each rule with an example
-that runs. Then **[the grammar](docs/grammar.md)** for exactly what the
-parser accepts.
+Start with **[the cheat sheet](docs/language/cheat-sheet.md)**, the
+language on one page, then **[the language reference](docs/language/README.md)** —
+twelve pages that say what the language is, by topic, each rule with an
+example that runs, and a [glossary](docs/language/glossary.md) of the
+words they use in a sense of their own. Then
+**[the grammar](docs/grammar.md)** for exactly what the parser accepts.
 
 **[The examples](examples/README.md)** are whole programs, each showing a
 part of the language at work: options, files, JSON, threads, a web server,

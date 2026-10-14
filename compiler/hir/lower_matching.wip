@@ -193,18 +193,25 @@ extend Lowerer {
 			// decides whether the arm matches.
 			if arm.guard is .Some(written) then
 				self.guardTakesNothing(&pattern, alias, arm.pattern.span, written)
-			val guard: Option<ExprId> = match arm.guard {
-				.Some(g) => .Some(self.check(g, BOOL))
-				.None => .None
-			}
+			val guard: Option<ExprId> = arm.guard.map((g) => self.check(g, BOOL))
 			if result.isNone() && self.takesTypeBeside(arm.body) {
 				val .Some(bindings) = self.state.scopes.pop() else panic("the arm's scope")
 				waiting.push((slots.len(), bindings, pattern, guard))
 				slots.push(.None)
 				continue
 			}
-			// The first arm that produces a value sets the type of the others.
+			// The first arm that produces a value sets the type of the others;
+			// where it is an integer and nothing is expected, an arm of a type
+			// that holds it widens the `match` to that type.
 			val body = match result {
+				.Some(t) if hint.isNone() && self.program.types.isInteger(t) => {
+					val inferred = self.infer(arm.body, .Some(t))
+					if self.partsType(t, self.tyOf(inferred)) is .Some(wide) {
+						result = .Some(wide)
+						inferred
+					} else if self.tyOf(inferred) == NEVER then inferred
+					else self.coerce(inferred, t, .None)
+				}
 				.Some(t) => self.check(arm.body, t)
 				.None => self.infer(arm.body, .None)
 			}
@@ -229,6 +236,14 @@ extend Lowerer {
 		for slot in move slots {
 			val .Some(arm) = move slot else panic("every arm is checked")
 			hirArms.push(arm)
+		}
+		// The arms of a narrower integer than the one that holds them all,
+		// widened to it.
+		if hint.isNone() && result is .Some(t) && self.program.types.isInteger(t) {
+			for i in 0..hirArms.len() {
+				if self.program.types.widens(self.tyOf(hirArms[i].body), t) then
+					hirArms[i].body = self.widen(hirArms[i].body, t)
+			}
 		}
 		self.exhaustiveness(scrutTy, file.exprs[scrutinee].span, &arms, &hirArms)
 		val ty = result.unwrapOr(NEVER)
@@ -480,7 +495,7 @@ extend Lowerer {
 					"never reached",
 				).withNote("a struct has one shape, so taking it apart cannot fail"),
 			)
-		} else if elseHir.isNone() && !irrefutable && lowered !is .Error {
+		} else if elseHir.isNone() && !irrefutable && lowered !is .Error then
 			self.report(
 				Diagnostic::error(
 					GUARD_REFUTABILITY,
@@ -491,7 +506,6 @@ extend Lowerer {
 					"`val pattern = value else { … }` runs the `else` block when the value does not match; the block must leave",
 				),
 			)
-		}
 		return .Guard(scrutinee: scrut, pattern: lowered, elseBlock: elseHir)
 	}
 
@@ -631,7 +645,7 @@ extend Lowerer {
 		.Binding(sym) => {
 			val local = self.declare(sym, elementTy, .Binding, pattern.span)
 			if self.kind(elementTy) is .Ref(..) then self.state.body.aliasBindings.add(local)
-			.Binding(local)
+			Pattern::Binding(local)
 		}
 		.Error => .Error
 		// A struct taken apart: its binders refer into the element.
@@ -693,7 +707,7 @@ extend Lowerer {
 			for _ in 0..fields {
 				wilds.push(.Wild)
 			}
-			val row = Vec::of(own [Shape::Ctor(ctor: .Variant(variant as u32), fields: wilds)])
+			val row = Vec::of([Shape::Ctor(ctor: .Variant(variant as u32), fields: wilds)])
 			if useful(&self.program, &matrix, &row, [scrutTy]) is .Some(witness) then
 				missing.push(witness.text(&self.program, scrutTy, self.interner))
 		}
@@ -704,7 +718,7 @@ extend Lowerer {
 	/// an `else` or a next arm.
 	fn alwaysMatches(pattern: &Pattern, ty: Ty): bool = {
 		if self.isPoisoned(ty) || pattern is .Error then return true
-		val row = Vec::of(own [Shape::of(&self.program, &pattern, ty)])
+		val row = Vec::of([Shape::of(&self.program, &pattern, ty)])
 		return useful(&self.program, [row], [Shape::Wild], [ty]).isNone()
 	}
 
@@ -727,10 +741,7 @@ extend Lowerer {
 			)
 			return
 		}
-		var names: Vec<String> = Vec()
-		for f in fields {
-			names.push("`\(self.text(f.name))`")
-		}
+		val names: Vec<String> = fields.map((f) => "`\(self.text(f.name))`")
 		self.report(
 			Diagnostic::error(
 				NO_SUCH_FIELD,
@@ -827,9 +838,9 @@ extend Lowerer {
 				"an arm that takes `\(name)` cannot have a guard",
 				self.ast.exprs[guard].span,
 				"a guard",
-			).withSecondary(span, "`\(name)` is \(typeName), which owns memory").
-				withHelp("match without `move`, and take what the arm needs in its body").
-				withNote(
+			).withSecondary(span, "`\(name)` is \(typeName), which owns memory")
+				.withHelp("match without `move`, and take what the arm needs in its body")
+				.withNote(
 					"a guard runs once the pattern has taken the value apart, so a guard that fails would leave it half taken",
 				),
 		)
@@ -921,14 +932,13 @@ extend Lowerer {
 					self.literalPattern(scrutTy, I64, "a number", span)
 					return .None
 				}
-				.Some(self.intLiteral(negative, magnitude, scrutTy, span))
+				Option::Some(self.intLiteral(negative, magnitude, scrutTy, span))
 			}
 			.Char(c) =>
-				if self.literalPattern(scrutTy, CHAR, "a character", span).isNone() then
-					.Some(c as u128)
+				if self.literalPattern(scrutTy, CHAR, "a character", span).isNone() then .Some(c)
 				else .None
 			.Byte(b) =>
-				if self.literalPattern(scrutTy, U8, "a byte", span).isNone() then .Some(b as u128)
+				if self.literalPattern(scrutTy, U8, "a byte", span).isNone() then .Some(b)
 				else .None
 			.Const(path) => self.constEnd(&path, scrutTy, span)
 		}
@@ -936,21 +946,16 @@ extend Lowerer {
 
 	/// A range's end that names a constant.
 	var fn constEnd(path: &[ast::Name], scrutTy: Ty, span: Span): Option<u128> = {
-		val found: Option<ConstId> = if path.len() == 1 {
-			self.constNamed(path[0])
-		} else {
-			match self.resolvePath(&path, false, MODULE_NOTE) {
+		val found: Option<ConstId> =
+			if path.len() == 1 then self.constNamed(path[0])
+			else match self.resolvePath(&path, false, MODULE_NOTE) {
 				.Item(module, name) => match self.modules[module].consts.get(&name.sym) {
 					.Some(id) => .Some(id)
 					.None => .None
 				}
 				_ => return .None
 			}
-		}
-		var parts: Vec<str> = Vec()
-		for n in path {
-			parts.push(self.text(n.sym))
-		}
+		val parts: Vec<str> = path.map((n) => self.text(n.sym))
 		val written = parts.join("::")
 		val .Some(id) = found else {
 			self.report(
@@ -1158,12 +1163,10 @@ extend Lowerer {
 			}
 			// A character is matched as the number it is.
 			.Char(c) => self.literalPattern(scrutTy, CHAR, "a character", pattern.span).unwrapOr(
-				.Int(c as u128),
+				.Int(c),
 			)
 			// And a byte as the `u8` it is.
-			.Byte(b) => self.literalPattern(scrutTy, U8, "a byte", pattern.span).unwrapOr(
-				.Int(b as u128),
-			)
+			.Byte(b) => self.literalPattern(scrutTy, U8, "a byte", pattern.span).unwrapOr(.Int(b))
 			// `'a'..='z'`, `0..10`, `..0`, `10..`.
 			.Range(lo, hi, inclusive) => self.rangePattern(
 				lo.asRef(),
@@ -1313,7 +1316,7 @@ extend Lowerer {
 						"matches every value",
 					).withFix(
 						"to match the variant, write `.\(text)`",
-						own [Edit::replace(span, ".\(text)")],
+						[Edit::replace(span, ".\(text)")],
 					),
 				)
 			}
@@ -1352,7 +1355,7 @@ extend Lowerer {
 						"a struct is taken apart without its name",
 						name.span,
 						"the struct's name",
-					).withFix("drop the name", own [Edit::replace(name.span, "")]).withNote(
+					).withFix("drop the name", [Edit::replace(name.span, "")]).withNote(
 						"a struct has one shape, so its name tests nothing: `(x, y)` takes it apart by its fields' names",
 					),
 				)
@@ -1373,7 +1376,7 @@ extend Lowerer {
 			self.report(
 				Diagnostic::error(INVALID_PATTERN, message, span, "write `.\(text)(…)` to match a variant").withFix(
 					"match the variant `.\(text)`",
-					own [Edit::insert(name.span.lo, ".")],
+					[Edit::insert(name.span.lo, ".")],
 				).withNote(
 					"a name with fields after it is a struct taken apart; a variant is `.Variant(…)` or `Enum::Variant(…)`",
 				),
@@ -1386,15 +1389,13 @@ extend Lowerer {
 				self.unknownModule(segments[0], note)
 				return .Error
 			}
-		} else {
-			match self.resolvePath(&segments, true, note) {
-				.Variant(module, enumName: named, ..) => enumName = .Some((module, named))
-				.Item(name: item, ..) => {
-					self.unknownModule(item, note)
-					return .Error
-				}
-				.Broken => return .Error
+		} else match self.resolvePath(&segments, true, note) {
+			.Variant(module, enumName: named, ..) => enumName = .Some((module, named))
+			.Item(name: item, ..) => {
+				self.unknownModule(item, note)
+				return .Error
 			}
+			.Broken => return .Error
 		}
 		val variant = segments[segments.len() - 1]
 		return self.variantPattern(enumName, variant, fields, scrutTy, span, binds)
@@ -1582,10 +1583,10 @@ extend Lowerer {
 						self.hiddenConstant(n)
 						Pattern::Error
 					} else {
-						val bound = ast::RangeBound(kind: .Const(Vec::of(own [n])), span: n.span)
+						val bound = ast::RangeBound(kind: .Const([n]), span: n.span)
 						self.rangePattern(.None, .Some(&bound), false, elem, at)
 					}
-					.Nested(range)
+					Binder::Nested(range)
 				}
 			}
 			if rest.isSome() then after.push(binder) else before.push(binder)
@@ -1716,10 +1717,7 @@ extend Lowerer {
 	/// A binder that names no field there is.
 	var fn unknownBinderField(path: str, fields: &[FieldDef], b: &ast::Binder, listFields: bool) = {
 		val field = self.text(b.field.sym)
-		var texts: Vec<str> = Vec()
-		for f in fields {
-			texts.push(self.text(f.name))
-		}
+		val texts: Vec<str> = fields.map((f) => self.text(f.name))
 		var diagnostic = Diagnostic::error(
 			NO_SUCH_FIELD,
 			"`\(path)` has no field `\(field)`",
@@ -1729,13 +1727,10 @@ extend Lowerer {
 		if suggest(field, &texts) is .Some(similar) {
 			diagnostic = diagnostic.withFix(
 				"did you mean `\(similar)`?",
-				own [Edit::replace(b.field.span, similar)],
+				[Edit::replace(b.field.span, similar)],
 			)
 		} else if listFields {
-			var names: Vec<String> = Vec()
-			for f in fields {
-				names.push("`\(self.text(f.name))`")
-			}
+			val names: Vec<String> = fields.map((f) => "`\(self.text(f.name))`")
 			diagnostic = diagnostic.withNote("the fields are \(names.join(", "))")
 		}
 		self.report(diagnostic)
@@ -1861,7 +1856,7 @@ extend Lowerer {
 				)
 			return self.bindersFailed(fields.binders)
 		}
-		val defs = self.program.enums[id].variants[index as i64].fields.clone()
+		val defs = self.program.enums[id].variants[index].fields.clone()
 		val path = "\(self.text(self.program.enums[id].name))::\(self.text(variant.sym))"
 		val .Some(binders) = fields.binders else {
 			if defs.isEmpty() then return .Variant(variant: index, binders: Vec())
@@ -1871,7 +1866,7 @@ extend Lowerer {
 					"`\(path)` has \(plural(defs.len(), "field", "fields")); the pattern must name them or end with `..`",
 					span,
 					"fields not mentioned",
-				).withFix("ignore them", own [Edit::insert(span.hi, "(..)")]),
+				).withFix("ignore them", [Edit::insert(span.hi, "(..)")]),
 			)
 			return .Error
 		}
@@ -1884,7 +1879,7 @@ extend Lowerer {
 				"unexpected parentheses",
 			)
 			if binders.isEmpty() then
-				diagnostic = diagnostic.withFix("remove the parentheses", own [
+				diagnostic = diagnostic.withFix("remove the parentheses", [
 					Edit::replace(parens, String()),
 				])
 			self.report(diagnostic)
@@ -1925,7 +1920,7 @@ extend Lowerer {
 				continue
 			}
 			bound[i] = .Some(b.field.span)
-			val fieldTy = self.variantFieldTy(scrutTy, index as i64, i)
+			val fieldTy = self.variantFieldTy(scrutTy, index, i)
 			locals[i] = self.binder(&b, fieldTy, binds)
 		}
 		// Only when every binder landed: after an unknown or repeated field,
@@ -1933,6 +1928,17 @@ extend Lowerer {
 		if !fields.rest && !failed && self.reportUnnamedFields(&path, &defs, &bound, span) then
 			failed = true
 		if failed then return .Error
+		// What an `.Err` holds is an error: an `.Err` built from it hands
+		// that error on.
+		if index == 1 && self.program.preludeItems.enumeration(.Result) == .Some(id) {
+			var bound: Vec<LocalId> = Vec()
+			for b in locals {
+				b.locals(&var bound)
+			}
+			for local in bound {
+				self.state.body.errorBindings.add(local)
+			}
+		}
 		return .Variant(variant: index, binders: locals)
 	}
 
@@ -1952,7 +1958,7 @@ extend Lowerer {
 				hasError = true
 				continue
 			}
-			val row = Vec::of(own [Shape::of(&self.program, &arm.pattern, scrutTy)])
+			val row = Vec::of([Shape::of(&self.program, &arm.pattern, scrutTy)])
 			if useful(&self.program, &matrix, &row, [scrutTy]).isNone() then
 				self.report(
 					Diagnostic::warning(
@@ -1975,9 +1981,7 @@ extend Lowerer {
 		var names = self.missingVariants(scrutTy, &matrix)
 		if names.isEmpty() then names = missingRanges(&self.program, &matrix, scrutTy)
 		if names.isEmpty() then names.push(witness.text(&self.program, scrutTy, self.interner))
-		val listed = if names.len() <= 3 {
-			"`\(names.join("`, `"))`"
-		} else {
+		val listed = if names.len() <= 3 then "`\(names.join("`, `"))`" else {
 			var first: Vec<String> = Vec()
 			for k in 0..3 {
 				first.push(names[k].clone())

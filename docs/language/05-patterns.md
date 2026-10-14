@@ -204,7 +204,7 @@ fn main() = {
     assert(a + b == 7)
 
     // A `Vec` is matched through the slice it lends.
-    val words = Vec::of(own ["a", "b", "c"])
+    val words = Vec::of(["a", "b", "c"])
     val [.., last] = words.items() else return
     assert(last == "c")
 }
@@ -374,7 +374,7 @@ where there is more than one statement:
 
 ```wip,run
 fn firstWord(text: str): str = {
-    val .Some(end) = text.find(" ") else return text
+    val .Some(end) = text.indexOf(" ") else return text
     return text[0..end]
 }
 
@@ -596,10 +596,7 @@ fn width(token: Option<&Token>): i64 = match token {
 }
 
 fn main() = {
-    val tokens: Vec<Token> = Vec::of(own [
-        Token::Word(text: "hello"),
-        Token::Space,
-    ])
+    val tokens: Vec<Token> = [Token::Word(text: "hello"), Token::Space]
     assert(width(tokens.first()) == 5 && width(tokens.last()) == 1)
     assert("x7".chars().peekable().peek() is .Some('a'..='z'))
 }

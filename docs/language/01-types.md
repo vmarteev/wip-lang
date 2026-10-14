@@ -1,8 +1,9 @@
 # 1. Values and types
 
 Every value has a type, and every type is known where the value is written.
-Nothing is converted on its own: a number the program computes becomes
-another kind of number only where the program says `as`.
+Nothing that may change a value is converted on its own: an integer is
+taken as a wider integer type that holds every value of it, and any other
+conversion of a number is written `as`.
 
 ## Numbers
 
@@ -46,6 +47,51 @@ fn main() = {
 }
 ```
 
+An integer the program computes is taken as a wider integer type where
+that type holds every value of it, with no `as`: an unsigned type as a
+wider unsigned or signed one, a signed type as a wider signed one. Where
+a type is expected — an argument, a field, an element, an assignment, a
+`return` — it widens to it; beside a wider operand of an operator it
+widens, and the operation is the wider type's; and the branches of an
+`if`, the arms of a `match` and the elements of an array are of the type
+that holds them all. Nothing widens from a signed type to an unsigned
+one, between two types of one width (`i64` and `u64`), from an integer to
+a float, or to a `usize` or an `isize` from more than 32 bits, the width
+an address may have; each of these is `as`, which marks a conversion that
+may lose something.
+
+```wip,run
+fn area(width: i64, height: i64): i64 = width * height
+
+fn main() = {
+    val side: u8 = 200
+    val count: u32 = 70000
+    assert(area(side, 3) == 600)
+    val total: i64 = count
+    assert(total + side == 70200 && side < total)
+    val sizes = [side, 1000 as u16] // a [u16; 2]
+    assert(sizes[0] == 200)
+}
+```
+
+An operation is done in its operands' type, and what is expected of its
+answer does not reach into it: `val total: i64 = count * 2` of a `u8`
+multiplies as `u8`s, and widens the product. Where an operator's answer is
+widened so, it is a warning (E0366), whose fix widens an operand, so the
+work is done in the wider type; a cast of the answer says the narrow work
+is meant.
+
+```wip,run
+val count: u8 = 200
+val total: i64 = (count as i64) * 2
+assert(total == 400)
+```
+
+```wip,error=E0301
+val n: i64 = -1
+val size: u64 = n
+```
+
 Arithmetic that cannot hold its answer panics. Where wrapping
 is what a program wants — a hash, a random number — it says so with `+%`,
 `-%` and `*%`:
@@ -70,13 +116,17 @@ assert(count.saturatingAdd(100) == 255 && (3 as u8).saturatingSub(5) == 0)
 assert((7 as i64).checkedDiv(0) == .None)
 ```
 
-`as` converts between number types, and truncates or rounds as that
-conversion does in C:
+`as` converts between number types. An integer keeps its low bits where
+the type is narrower and its bits where only the sign differs, a float
+rounds to the nearest the type holds, and a float made an integer drops
+its fraction and stops at the type's least or greatest value, `NaN` at 0:
 
 ```wip,run
 val n = 300
 assert(n as u8 == 44)
+assert(-1 as u64 == 18446744073709551615)
 assert(3.7 as i64 == 3)
+assert(1e20 as i64 == 9223372036854775807)
 assert(65 as u8 as char == 'A')
 ```
 
@@ -286,7 +336,7 @@ fn total(values: &[i64]): i64 = {
 fn count<T>(values: &[T]): i64 = values.len()
 
 fn main() = {
-    val numbers = Vec::of(own [3, 1, 4])
+    val numbers: Vec<i64> = [3, 1, 4]
     assert(total(&numbers) == 8)
     assert(count(String::of("abc")) == 3)
 }
@@ -294,20 +344,24 @@ fn main() = {
 
 Arrays and slices compare where their elements do: equal where they are
 as long and hold equal elements, and ordered as a dictionary orders words.
-An array, a slice and a buffer of one element type
-compare with each other, either way round, and a range of elements is an
-operand as it stands. They hash where their elements do
+An array, a slice, a buffer and a `Vec` of one element type
+compare with each other, either way round, as their elements, and a range
+of elements is an operand as it stands; nothing is built to compare with.
+A `Vec<String>` compares with a list of text, each `String` with the text
+beside it. They hash where their elements do
 too, so a `Vec` of arrays sorts and a `Set` of them can be kept.
 
 ```wip,run
 val a = [1, 2, 3]
 val b = [1, 2, 4]
 assert(a != b && a < b)
-var pairs = Vec::of(own [[2, 1], [1, 5]])
+var pairs: Vec<[i64; 2]> = [[2, 1], [1, 5]]
 pairs.sort()
 assert(pairs[0] == [1, 5])
-val list = Vec::of(own [1, 2, 3, 4])
-assert(list.items() == [1, 2, 3, 4] && list.items()[1..3] == [2, 3])
+val list: Vec<i64> = [1, 2, 3, 4]
+assert(list == [1, 2, 3, 4] && list.items()[1..3] == [2, 3])
+val names: Vec<String> = ["ann", "bob"]
+assert(names == ["ann", "bob"])
 ```
 
 A block of values whose size is known only when the program runs is written
@@ -343,13 +397,50 @@ fn main() = {
 }
 ```
 
-The elements are moved in. Without `own` such a list is refused: an
-array's length is part of its type, known where it is written.
+The elements are moved in. Where nothing expects a `Vec` or an
+`own<[T]>`, such a list without `own` is refused: an array's length is
+part of its type, known where it is written.
 
 `Vec<T>` is the growing one, and is the usual answer; it is on
-[page 10](10-library.md). `Vec::of(own [1, 2, 3])` makes a list a vector,
-and `v.intoBuffer()` hands a vector's values back as an `own<[T]>`,
-neither moving a value.
+[page 10](10-library.md). A list literal takes the type expected of it,
+as text does: where a `Vec<T>` is expected — a field, an argument, what a
+function answers, a variable declared as one, the branches of an `if` —
+it is a vector, its values moved in, and where an `own<[T]>` is expected
+it is built on the heap. Each element is checked against the element
+type, so text in a `Vec<String>` is a `String`; `[]` is an empty vector,
+and a repeat and a list that yields are vectors too. Only the prelude's
+`Vec` is made so; any other collection is made by a call. Where nothing
+expects one, a list is an array, on the stack, and `Vec::of([1, 2, 3])`
+makes it a vector, since `of` expects a buffer. `v.intoBuffer()` hands a
+vector's values back as an `own<[T]>`, neither moving a value.
+
+```wip,run
+struct Call {
+    args: Vec<i64>
+    names: Vec<String>
+}
+
+fn sum(values: Vec<i64>): i64 = {
+    var total = 0
+    for value in values {
+        total += value
+    }
+    return total
+}
+
+fn main() = {
+    val call = Call(args: [1, 2], names: ["a", "b"])
+    assert(call.args == [1, 2] && call.names[1] == "b")
+    assert(sum([1, 2, 3]) == 6)
+    var grown: Vec<i64> = []
+    grown.append([4, 5])
+    val rows = [10, 20]
+    val built: Vec<i64> = [1, for row in rows { yield row }]
+    assert(grown == [4, 5] && built == [1, 10, 20])
+    val counted = Vec::of([1, 2, 3])
+    assert(counted.len() == 3)
+}
+```
 
 ## Tuples
 
@@ -399,8 +490,12 @@ fn main() = {
 }
 ```
 
-A field written `var` may be changed through a `var` binding, as `age` is
-above; a field without it is set when the value is made and not after.
+A field is changed through a `var` binding or a `&var`, as `age` is
+above, and by the module that declares the type: there, every field is
+read and written. `var` on a field says who else may write it. `pub var`
+lets any module write it, where `pub` alone lets them only read it
+([page 2](02-modules.md#what-pub-means)); `var` on a private field is
+refused (E0124), since nothing outside the module reaches it.
 
 A default runs where the literal is, each time it leaves the field out,
 so it may be code — an empty list, a text — as well as a constant:

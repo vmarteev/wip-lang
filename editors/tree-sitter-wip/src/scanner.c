@@ -5,7 +5,8 @@
 // inside `( )` or `[ ]`, nor after an operator, a comma or an open bracket,
 // so a line break there stays space — and never before `else`, nor before
 // the `|` of a pattern's next alternative, each of which continues the line
-// above. And a text block's text: all of
+// above, nor before a `.` and a name, which continues it as on one line,
+// unless that line is a `match` arm. And a text block's text: all of
 // it up to a `\\` or the closing `"""`, line breaks and quotes included.
 
 #include "tree_sitter/parser.h"
@@ -71,6 +72,73 @@ static bool text_block_content(TSLexer *lexer) {
     return any;
 }
 
+// Whether the line from here reads as a `match` arm's pattern: a `=>`
+// outside brackets before it ends. The pattern goes on past the line's end
+// inside brackets, after a `|` or a `&&` that ends it, and where the next
+// line starts with `|`, more alternatives. Text and characters are looked
+// through for their quotes.
+static bool line_is_arm(TSLexer *lexer) {
+    int depth = 0;
+    int32_t last = 0;
+    while (!lexer->eof(lexer)) {
+        int32_t c = lexer->lookahead;
+        if (c == '\n') {
+            skip(lexer);
+            if (depth > 0 || last == '|' || last == '&') {
+                continue;
+            }
+            while (lexer->lookahead == ' ' || lexer->lookahead == '\t' || lexer->lookahead == '\r') {
+                skip(lexer);
+            }
+            if (lexer->lookahead == '|') {
+                continue;
+            }
+            return false;
+        }
+        if (c == '"' || c == '\'') {
+            int32_t quote = c;
+            skip(lexer);
+            while (!lexer->eof(lexer) && lexer->lookahead != quote && lexer->lookahead != '\n') {
+                if (lexer->lookahead == '\\') {
+                    skip(lexer);
+                }
+                skip(lexer);
+            }
+            skip(lexer);
+            last = quote;
+            continue;
+        }
+        if (c == '/') {
+            skip(lexer);
+            if (lexer->lookahead == '/') {
+                while (!lexer->eof(lexer) && lexer->lookahead != '\n') {
+                    skip(lexer);
+                }
+                continue;
+            }
+            last = '/';
+            continue;
+        }
+        if (c == '(' || c == '[' || c == '{') {
+            depth++;
+        } else if (c == ')' || c == ']' || c == '}') {
+            depth--;
+        } else if (c == '=' && depth == 0) {
+            skip(lexer);
+            if (lexer->lookahead == '>') {
+                return true;
+            }
+            last = '=';
+            continue;
+        }
+        if (c != ' ' && c != '\t' && c != '\r') {
+            last = c;
+        }
+        skip(lexer);
+    }
+    return false;
+}
+
 bool tree_sitter_wip_external_scanner_scan(void *payload, TSLexer *lexer, const bool *valid_symbols) {
     Scanner *scanner = payload;
     if (valid_symbols[TEXT_BLOCK_CONTENT] && !valid_symbols[ERROR_SENTINEL]) {
@@ -122,6 +190,16 @@ bool tree_sitter_wip_external_scanner_scan(void *payload, TSLexer *lexer, const 
         while (lexer->lookahead != '\n' && !lexer->eof(lexer)) {
             skip(lexer);
         }
+    }
+    // `.` and a name continues the expression above, as on one line, but
+    // where the line reads as a `match` arm: a `=>` outside brackets, or a
+    // line that ends in `|`.
+    if (lexer->lookahead == '.') {
+        skip(lexer);
+        if (lexer->lookahead == '.' || !is_word(lexer->lookahead)) {
+            return true;
+        }
+        return line_is_arm(lexer);
     }
     // `|` alone continues a pattern's alternatives; `||` and `|=` begin no
     // line, which the parser reports.

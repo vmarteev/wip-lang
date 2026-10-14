@@ -202,7 +202,7 @@ fn main() = {
     val text = "first\nsecond"
     // An iterator made to be asked for one value needs no name.
     assert(text.lines().next() == .Some("first"))
-    assert(Vec::of(own [1, 2, 3]).pop() == .Some(3))
+    assert(Vec::of([1, 2, 3]).pop() == .Some(3))
 }
 ```
 
@@ -215,14 +215,15 @@ has how it works.
 
 ## Functions as values
 
-There are three ways to hand code to a function, and they differ in what the
+There are four ways to hand code to a function, and they differ in what the
 code may carry with it:
 
 | Written | Is | May capture |
 |---|---|---|
 | `(x: i64) => i64` | a function value: code alone | nothing |
-| `&(x: i64) => i64` | a closure, lent for the call | what is around it |
-| `own<(x: i64) => i64>` | a closure that owns what it captured | and outlives the call |
+| `&(x: i64) => i64` | a closure, lent for the call | what is around it, to read |
+| `&var (x: i64) => i64` | a closure, lent for the call | what is around it, to read and change |
+| `own<(x: i64) => i64>` | a closure that owns what it captured | its own copies, and outlives the call |
 
 A lambda is written `(x) => body`, and its parameter types come from what is
 expected of it:
@@ -259,7 +260,7 @@ struct Shape {
 
 fn main() = {
     val shapes = [Shape(side: 2), Shape(side: 3)]
-    assert(shapes.map(Shape::area) == Vec::of(own [4, 9]))
+    assert(shapes.map(Shape::area) == [4, 9])
     val area: (shape: &Shape) => i64 = Shape::area
     assert(area(&shapes[1]) == 9)
     val build: (text: str) => String = String::of
@@ -348,26 +349,85 @@ fn main() = {
 }
 ```
 
-A lambda that is a `val`'s whole value is kept there, and may be called
-and passed on for as long as the block goes on. It reads
-what it captures where it is, as a view reads what it borrows, so what it
-captured must not change while it is still used, and it does not write it:
+What calls a closure one call at a time, in order — a slice's `map`,
+`filter`, `fold`, `find` and `any`, an `Option`'s `map`, an iterator's
+`fold` and `find` — takes `&var (…) => R`, so the closure may change what it
+captures, `self` in a `var fn` among them. What shares one closure among
+threads, `future::map`, takes `&(…) => R`, and a closure that writes is
+refused there. A closure that reads goes where one that writes is taken,
+since it writes nothing; not the other way round:
 
 ```wip,run
+struct Interner {
+    names: Vec<String>
+
+    var fn intern(name: str): i64 = {
+        self.names.push(name)
+        return self.names.len() - 1
+    }
+
+    var fn ids(names: &[str]): Vec<i64> = names.map((name) => self.intern(name))
+}
+
 fn main() = {
-    val names = Vec::of(own ["ann", "bartholomew", "cy"])
+    var interner = Interner(names: [])
+    assert(interner.ids(["a", "b"]) == [0, 1])
+    val first: Option<str> = .Some("c")
+    assert(first.map((name) => interner.intern(name)) == .Some(2))
+}
+```
+
+A lambda that is a `val`'s whole value is kept there, and may be called
+and passed on for as long as the block goes on. What it only reads, it
+reads where it is, as a view reads what it borrows, so that must not
+change while the closure is still used. What it writes, it holds as a
+`&var` is held, from the `val` to the closure's last use: nothing else
+reads or changes it until then (E0414), and the closure is `&var (…) =>
+R`, written so where its type is said:
+
+```wip,run
+fn twice(f: &var (x: i64) => void) = {
+    f(1)
+    f(2)
+}
+
+fn main() = {
+    val names = Vec::of(["ann", "bartholomew", "cy"])
     val limit = 3
     val short = (name: &str) => name.len() <= limit
     assert(short(&names[0]) && !short(&names[1]))
     assert(names.items().countWhere(short) == 2)
+
+    var seen = 0
+    val note: &var (x: i64) => void = (x) => seen += x
+    note(1)
+    twice(note)
+    assert(seen == 4)
 }
 ```
 
+```wip,error=E0414
+fn main() = {
+    var seen = 0
+    val note = (x: i64) => seen += x
+    note(1)
+    val early = seen
+    note(2)
+}
+```
+
+It is the one `&var` a variable holds: a `var` holds no closure, since it
+could be pointed at another while the first still held what it
+captured.
+
 A lambda that captures where a plain function value is expected is refused,
-and says which name it captured. A closure that must outlive the call it is
-given to — one an iterator adapter keeps, or a struct holds — is written
-`own` at the call: `values.map(own (x) => x + step)`
-([page 10](10-library.md)). A named function goes where either kind of
+and says which name it captured. An iterator's adapter keeps the closure
+it is lent, and is a view of what the closure captured: `words.filter((w)
+=> w.startsWith(prefix))` borrows `prefix`, and is used while that stays
+as it was, in its statement, its `val`'s block or its loop
+([page 10](10-library.md)). A closure that must outlive the block it is
+written in — one a struct owns, or another thread runs — is written `own`:
+`Future::run(own () => …)`. A named function goes where either kind of
 closure is expected, a module's or a type's, since it captures nothing: it
 is lent for a call, or owned with nothing to own:
 
@@ -376,9 +436,9 @@ fn double(x: i64): i64 = x * 2
 
 fn main() = {
     val words = "a bc".split(" ").map(String::of).toVec()
-    assert(words == Vec::of(own [String::of("a"), String::of("bc")]))
-    val doubled = Vec::of(own [1, 2]).intoIterator().map(double).toVec()
-    assert(doubled == Vec::of(own [2, 4]))
+    assert(words == ["a", "bc"])
+    val doubled = Vec::of([1, 2]).intoIterator().map(double).toVec()
+    assert(doubled == [2, 4])
     val kept: own<(x: i64) => i64> = double
     assert(kept(21) == 42)
 }

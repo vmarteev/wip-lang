@@ -166,7 +166,7 @@ fn main() = {
         defer order.push(2)
         order.push(3)
     }
-    assert(order == Vec::of(own [3, 2, 1]))
+    assert(order == [3, 2, 1])
 }
 ```
 

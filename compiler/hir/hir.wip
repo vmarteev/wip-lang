@@ -52,6 +52,10 @@ pub struct Program {
 	/// does, a release build does not. The build says so before the program
 	/// is compiled.
 	pub var checkMoves: bool
+	/// Whether each `.Err` built records, in the thread's trace, where an
+	/// error was made or passed on: a debug build does, a release build does
+	/// not. The build says so before the program is compiled.
+	pub var tracesErrors: bool
 	/// Whether a struct, an enum or an array is dropped by calling the
 	/// function that drops its type, written once, as a debug build is, or
 	/// field by field where it is dropped, which a release build's optimiser
@@ -154,6 +158,7 @@ extend Program {
 		fns: Arena(),
 		fnValues: Set(),
 		checkMoves: false,
+		tracesErrors: false,
 		dropsByCall: false,
 		libraries: Vec(),
 		frameworks: Vec(),
@@ -182,6 +187,15 @@ extend Program {
 	/// treat as the text it holds.
 	pub fn isString(ty: Ty): bool =
 		self.types.kind(ty) is .Struct(id, ..) && self.preludeItems.structure(.String) == .Some(id)
+
+	/// What `ty` holds, when it is the prelude's `Vec`, which a list literal
+	/// becomes where one is expected.
+	pub fn vecElement(ty: Ty): Option<Ty> = {
+		val .Struct(id, args) = self.types.kind(ty) else return .None
+		if self.preludeItems.structure(.Vec) != .Some(id) then return .None
+		val list = self.types.list(args)
+		return if list.len() == 1 then .Some(list[0]) else .None
+	}
 
 	/// The type as it is written in source, for diagnostics.
 	pub fn tyName(ty: Ty, interner: &Interner): String = self.nameOf(ty, &interner, false)
@@ -253,9 +267,7 @@ extend Program {
 		.Assoc(base, interfaceId: id, index) => {
 			val generics = &self.interfaces[id].generics
 			val param =
-				if (index as i64) < generics.len() then
-					interner.resolve(generics[index as i64].name)
-				else "?"
+				if index < generics.len() then interner.resolve(generics[index].name) else "?"
 			"\(self.nameOf(base, &interner, symbol))::\(param)"
 		}
 		.Struct(id, args) => {
@@ -306,7 +318,7 @@ extend Program {
 	/// bare, as the program writes it.
 	pub fn declaredName(name: Symbol, module: u32, interner: &Interner): String = {
 		val bare = interner.resolve(name)
-		val path = &self.modules[module as i64]
+		val path = &self.modules[module]
 		if path.isEmpty() then return bare
 		var shared = false
 		for s in self.structs {
@@ -350,8 +362,8 @@ extend Program {
 		}
 		val fields = &self.structs[id].fields
 		// A generator's frame follows its declared fields.
-		if index as i64 >= fields.len() then return self.frames.at(&ty)[index as i64 - fields.len()]
-		val field = fields[index as i64].ty
+		if index >= fields.len() then return self.frames.at(&ty)[index - fields.len()]
+		val field = fields[index].ty
 		return self.types.substFind(field, &self.types.list(args))
 	}
 
@@ -378,7 +390,7 @@ extend Program {
 		val .Enum(id, args) = self.types.kind(ty) else {
 			panic("variants of a type that is not an enum")
 		}
-		val declared = self.enums[id].variants[variant as i64].fields[field as i64].ty
+		val declared = self.enums[id].variants[variant].fields[field].ty
 		return self.types.substFind(declared, &self.types.list(args))
 	}
 
@@ -444,7 +456,7 @@ extend Program {
 				self.implementsWhere(inner, interfaceId)
 		val args: Vec<Ty> = match self.types.kind(ty) {
 			.Struct(args, ..) | .Enum(args, ..) => self.types.list(args).toVec()
-			.Own(inner) | .Slice(elem: inner) | .Slots(inner) => Vec::of(own [inner])
+			.Own(inner) | .Slice(elem: inner) | .Slots(inner) => [inner]
 			_ => Vec()
 		}
 		val owner: TypeDef = match self.typeDef(ty) {
@@ -1432,6 +1444,10 @@ pub struct Body {
 	/// a write through one says where it would go, and a `match`'s or an
 	/// `is`'s that nothing writes through.
 	pub var copiedBindings: Set<LocalId> = Set()
+	/// The bindings of what a `Result`'s `.Err` holds, at any depth: an
+	/// `.Err` built from one passes that error on, where any other makes
+	/// one, for the trace a debug build keeps of where an error came from.
+	pub var errorBindings: Set<LocalId> = Set()
 	/// One local per parameter, in order.
 	pub var params: Vec<LocalId> = Vec()
 	pub var exprs: Arena<Expr> = Arena()
@@ -1586,10 +1602,10 @@ extend StmtKind {
 	/// for an expression.
 	pub fn children(): Vec<ExprId> = match self {
 		.Let(init: e, ..) | .Guard(scrutinee: e, ..) | .Defer(e) | .While(cond: e, ..)
-		| .ForElements(elements: e, ..) | .Expr(e) | .Yield(e) => Vec::of(own [e])
-		.ForRange(lo, hi, ..) => Vec::of(own [lo, hi])
+		| .ForElements(elements: e, ..) | .Expr(e) | .Yield(e) => [e]
+		.ForRange(lo, hi, ..) => [lo, hi]
 		.Return(value) => match value {
-			.Some(e) => Vec::of(own [e])
+			.Some(e) => [e]
 			.None => Vec()
 		}
 		.Break(..) | .Continue(..) => Vec()
@@ -1598,15 +1614,15 @@ extend StmtKind {
 	/// The blocks this statement holds: a loop's body, a guard's `else`.
 	pub fn blocks(): Vec<&Block> from self = match self {
 		.Guard(elseBlock: .Some(b), ..) | .While(body: b, ..) | .ForElements(body: b, ..)
-		| .ForRange(body: b, ..) => Vec::of(own [&b])
+		| .ForRange(body: b, ..) => [&b]
 		_ => Vec()
 	}
 
 	/// The locals this statement declares, if it declares any.
 	pub fn declares(): Vec<LocalId> = match self {
-		.Let(local, ..) => Vec::of(own [local])
+		.Let(local, ..) => [local]
 		.ForRange(binding, ..) => match binding {
-			.Some(local) => Vec::of(own [local])
+			.Some(local) => [local]
 			.None => Vec()
 		}
 		// A `for` binds a name, or a struct's fields.
@@ -1729,8 +1745,9 @@ pub enum ExprKind {
 	/// closure's environment carries so that a closure value can be dropped
 	/// without knowing which lambda made it.
 	DropRef(ty: Ty)
-	/// An owned closure lent for one call: the same pair, seen as
-	/// `&(…) => R`.
+	/// An owned closure lent for one call, or a closure that reads given
+	/// where one that writes is taken: the same pair, seen as `&(…) => R` or
+	/// `&var (…) => R`.
 	LendClosure(inner: ExprId)
 	/// A call through a closure: the code takes what was captured first.
 	/// `codeTy` is the function type as it is called, with the captures'
@@ -1765,7 +1782,7 @@ pub enum ExprKind {
 pub fn evaluationOrder(order: &[u32], len: i64): Vec<i64> = {
 	var indices: Vec<i64> = Vec::withCapacity(len)
 	for i in 0..len {
-		indices.push(if i < order.len() then order[i] as i64 else i)
+		indices.push(if i < order.len() then order[i] else i)
 	}
 	return indices
 }
@@ -1797,32 +1814,32 @@ extend ExprKind {
 		.Int(..) | .Float(..) | .Bool(..) | .Str(..) | .Table(..) | .Null | .Zeroed | .Local(..)
 		| .FnRef(..) | .DropRef(..) | .Error => Vec()
 		.Panic(note, ..) => match note {
-			.Some(e) => Vec::of(own [e])
+			.Some(e) => [e]
 			.None => Vec()
 		}
 		.Lend(e) | .Unary(operand: e, ..) | .Cast(e) | .VariantIndex(e) | .Len(e)
 		| .Field(base: e, ..) | .Deref(e) | .Ref(e) | .Undropped(e) | .Move(e) | .Own(e)
 		| .ArrayRepeat(elem: e, ..) | .Unsize(e) | .IsNull(e) | .CstrToStr(e)
 		| .DynRef(value: e, ..) | .Closure(env: e, ..) | .LendClosure(e) | .Is(scrutinee: e, ..)
-		| .Match(scrutinee: e, ..) | .If(cond: e, ..) => Vec::of(own [e])
-		.Binary(lhs, rhs, ..) | .StrCmp(lhs, rhs) | .StrEq(lhs, rhs) => Vec::of(own [lhs, rhs])
-		.Assign(place, value, ..) => Vec::of(own [place, value])
-		.Index(base, index) => Vec::of(own [base, index])
-		.OwnRepeat(elem, count) => Vec::of(own [elem, count])
+		| .Match(scrutinee: e, ..) | .If(cond: e, ..) => [e]
+		.Binary(lhs, rhs, ..) | .StrCmp(lhs, rhs) | .StrEq(lhs, rhs) => [lhs, rhs]
+		.Assign(place, value, ..) => [place, value]
+		.Index(base, index) => [base, index]
+		.OwnRepeat(elem, count) => [elem, count]
 		.SubSlice(base, lo, hi) => {
-			var parts = Vec::of(own [base])
+			var parts = Vec::of([base])
 			if lo is .Some(lo) then parts.push(lo)
 			if hi is .Some(hi) then parts.push(hi)
 			parts
 		}
 		.Union(field, ..) => match field {
-			.Some((_, e)) => Vec::of(own [e])
+			.Some((_, e)) => [e]
 			.None => Vec()
 		}
 		.Struct(fields: parts, ..) | .Variant(args: parts, ..) | .Array(parts)
 		| .Call(args: parts, ..) | .Places(parts) | .DynCall(args: parts, ..) => parts.clone()
 		.CallValue(callee, args) | .CallClosure(callee, args, ..) => {
-			var parts = Vec::of(own [callee])
+			var parts = Vec::of([callee])
 			for a in args {
 				parts.push(a)
 			}
@@ -1835,10 +1852,10 @@ extend ExprKind {
 	/// `if`. A block holds statements, so what is inside one runs whether or
 	/// not the block produces a value.
 	pub fn blocks(): Vec<&Block> from self = match self {
-		.Block(block) => Vec::of(own [&block])
+		.Block(block) => [&block]
 		.If(thenBlock, elseBlock, ..) => match elseBlock {
-			.Some(b) => Vec::of(own [&thenBlock, &b])
-			.None => Vec::of(own [&thenBlock])
+			.Some(b) => [&thenBlock, &b]
+			.None => [&thenBlock]
 		}
 		_ => Vec()
 	}

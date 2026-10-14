@@ -1,0 +1,148 @@
+// An integer taken as a wider integer type that holds every value of it,
+// with no `as`: where a type is expected, beside one in an operator, and
+// among the branches of an `if`, the arms of a `match` and the elements of
+// an array. Nothing is lost, so nothing is written; `as` is left to what
+// may lose something. An operation is done in its operands' type, widened
+// to each other's only, so what one works out in a narrow type and is
+// then widened is said, with the casts that choose.
+
+import syntax::{BinaryOp, Diagnostic, Edit, NARROW_RESULT_WIDENED, SHIFT_BY_WIDTH, Span}
+
+extend Lowerer {
+	/// An integer where a wider integer type is expected, widened: `f(b)`
+	/// of a `u8` where an `i64` is taken.
+	var fn widened(id: ExprId, expected: Ty): Option<ExprId> = {
+		if !self.program.types.widens(self.tyOf(id), expected) then return .None
+		return .Some(self.widen(id, expected))
+	}
+
+	/// `id` as the wider integer type `wide`, said where an operator worked
+	/// it out in its own.
+	var fn widen(id: ExprId, wide: Ty): ExprId = {
+		self.narrowWork(id, wide)
+		val span = self.state.body.exprs[id].span
+		return self.alloc(.Cast(id), wide, span)
+	}
+
+	/// The operands of an arithmetic, bitwise or comparison operator, where
+	/// both are integers and one type holds the other: the narrower widened,
+	/// so the operation is the wider type's. Anything else as it is.
+	var fn widenedBeside(lhs: ExprId, rhs: ExprId): (ExprId, ExprId) = {
+		val lt = self.tyOf(lhs)
+		val rt = self.tyOf(rhs)
+		if lt == rt then return (lhs, rhs)
+		if self.program.types.widens(lt, rt) then return (self.widen(lhs, rt), rhs)
+		if self.program.types.widens(rt, lt) then return (lhs, self.widen(rhs, lt))
+		return (lhs, rhs)
+	}
+
+	/// The type of the parts of an `if`, a `match` or an array, given the
+	/// type of the parts so far and of the next: the integer type that holds
+	/// both, where one does. Nothing where they are not such integers.
+	fn partsType(sofar: Ty, next: Ty): Option<Ty> = {
+		if sofar == next || !self.program.types.isInteger(sofar) then return .None
+		val wide = self.program.types.wider(sofar, next)?
+		return if wide == sofar then .None else .Some(wide)
+	}
+
+	/// Warns where what is widened was worked out by an operator in its
+	/// narrower type, which may have overflowed or lost bits there: `count *
+	/// 2` of a `u8` where an `i64` is expected multiplies as `u8`s. A cast
+	/// says which is meant: the fix casts an operand, to work in the wider
+	/// type, and the help a cast of the result, to say the narrow work is.
+	var fn narrowWork(id: ExprId, wide: Ty) = {
+		val .Some(work) = self.lossyWork(id) else return
+		val span = self.state.body.exprs[id].span
+		val narrow = self.program.tyName(self.tyOf(id), self.interner)
+		val wideName = self.program.tyName(wide, self.interner)
+		val operand = self.leftmostOperand(work)
+		val at = self.state.body.exprs[operand].span
+		val shifts = self.state.body.exprs[work].kind is .Binary(op: .Shl, ..)
+		val done = if shifts then "shifted" else "worked out"
+		self.report(
+			Diagnostic::warning(
+				NARROW_RESULT_WIDENED,
+				"this is \(done) as \(integerArticle(&narrow)) `\(narrow)`, then widened to `\(wideName)`",
+				span,
+				"\(integerArticle(&narrow)) `\(narrow)`, where `\(wideName)` is expected",
+			).withFix(
+				"work in `\(wideName)`",
+				[Edit::insert(at.lo, "("), Edit::insert(at.hi, " as \(wideName))")],
+			)
+				.withHelp("or, where the `\(narrow)` is meant, say so with a cast of the result: `(…) as \(wideName)`")
+				.withNote("an operation is done in its operands' type, and what is expected of its result does not reach into it; \(integerArticle(&narrow)) `\(narrow)` may overflow, or lose bits shifted out, where `\(wideName)` would not"),
+		)
+	}
+
+	/// The operation in `id` that may lose something in its own type: an
+	/// addition, a subtraction, a multiplication or a left shift, the value
+	/// itself or under a bitwise operator. Nothing for a value that was not
+	/// worked out so, which is widened as it is.
+	fn lossyWork(id: ExprId): Option<ExprId> = match self.state.body.exprs[id].kind {
+		.Binary(op: .Add | .Sub | .Mul | .Shl, ..) => .Some(id)
+		.Binary(op: .BitAnd | .BitOr | .BitXor, lhs, rhs, ..) => match self.lossyWork(lhs) {
+			.Some(found) => .Some(found)
+			.None => self.lossyWork(rhs)
+		}
+		_ => .None
+	}
+
+	/// The first operand of an operation, through the operations on its left:
+	/// what a cast widens so that the whole is worked out in the wider type.
+	fn leftmostOperand(id: ExprId): ExprId = match self.state.body.exprs[id].kind {
+		.Binary(lhs, ..) => self.leftmostOperand(lhs)
+		_ => id
+	}
+
+	/// Refuses a shift by a constant amount at least as wide as the value
+	/// shifted: the amount is taken modulo the width, so `b << 8` of a `u8`
+	/// is `b`, which is never what was meant. The fix widens the value first,
+	/// where it is a value and not the place `<<=` writes.
+	var fn shiftByWidth(
+		op: BinaryOp,
+		shifted: ExprId,
+		amount: ExprId,
+		opSpan: Span,
+		place: bool,
+	): bool = {
+		if op !is .Shl | .Shr then return false
+		val .Some(int) = self.program.types.intTy(self.tyOf(shifted)) else return false
+		if self.program.types.intTy(self.tyOf(amount)).isNone() || !self.constantShaped(amount) then
+			return false
+		val .Ok(.Int(bits)) = self.fold(amount) else return false
+		val width = int.bits() as u128
+		if bits < width then return false
+		val span = self.state.body.exprs[shifted].span
+		val name = int.name()
+		var diagnostic = Diagnostic::error(
+			SHIFT_BY_WIDTH,
+			"a shift by \(bits) of \(integerArticle(name)) `\(name)`, which is \(width) bits wide",
+			opSpan,
+			"the amount is taken modulo \(width)",
+		).withNote(
+			"a shift's amount is taken modulo the width of what is shifted, so a shift by the whole width leaves the value as it was",
+		)
+		val wider = widerOfSign(int.signed(), bits)
+		if !place && wider is .Some(wide) then
+			diagnostic = diagnostic.withFix("widen the value first", [
+				Edit::insert(span.lo, "("),
+				Edit::insert(span.hi, " as \(wide))"),
+			])
+		self.report(diagnostic)
+		return true
+	}
+}
+
+/// The narrowest integer type of a signedness wider than `bits`, by name,
+/// where one is.
+fn widerOfSign(signed: bool, bits: u128): Option<str> = when {
+	bits < 16 => .Some(if signed then "i16" else "u16")
+	bits < 32 => .Some(if signed then "i32" else "u32")
+	bits < 64 => .Some(if signed then "i64" else "u64")
+	bits < 128 => .Some(if signed then "i128" else "u128")
+	else => .None
+}
+
+/// "a" or "an" before an integer type's name, as it is said: an `i64`, a
+/// `u8`.
+fn integerArticle(name: str): str = if name.startsWith("i") then "an" else "a"

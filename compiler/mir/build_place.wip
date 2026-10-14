@@ -169,11 +169,13 @@ extend Builder {
 			// `&make()`: the value lives in a temporary until the statement
 			// ends.
 			_ => {
-				val place = if self.isAggregate(expr.ty) {
-					self.aggregate(id)
-				} else {
+				val place = if self.isAggregate(expr.ty) then self.aggregate(id) else {
 					val temp = Place::of(self.temp(expr.ty))
-					self.storeExpr(id, temp.clone())
+					// Worked out already, where its place was written: the
+					// pointer a call answered, `words()[i] = x`.
+					if self.early.contains(&id) then
+						self.assign(temp.clone(), .Use(self.scalar(id)))
+					else self.storeExpr(id, temp.clone())
 					temp
 				}
 				self.ownTemp(place.clone(), expr.ty)
@@ -220,8 +222,9 @@ extend Builder {
 			if self.program.fns[callee].projects is .Some(.Param(from)) {
 				for i in evaluationOrder(&order, args.len()) {
 					match hir.exprs[args[i]].kind {
-						.Ref(place) if i == from as i64 &&
-							self.isPlaceKind(place) => self.placeOperands(place)
+						.Ref(place) if i == from && self.isPlaceKind(place) => self.placeOperands(
+							place,
+						)
 						_ => self.keepEarly(args[i])
 					}
 				}
@@ -240,9 +243,7 @@ extend Builder {
 			val temp = Place::of(self.temp(self.ty(id)))
 			self.assign(temp.clone(), .Use(.Copy(place.clone())))
 			Value::Place(temp)
-		} else {
-			lowered
-		}
+		} else lowered
 		self.early.put(id, value)
 	}
 
@@ -257,7 +258,7 @@ extend Builder {
 
 	/// The place of an array's or slice's elements, and how many there are.
 	var fn elements(base: ExprId): (Place, Operand) = match self.kind(self.ty(base)) {
-		.Array(len, ..) => (self.projectionBase(base), Builder::int(len as u128, I64))
+		.Array(len, ..) => (self.projectionBase(base), Builder::int(len, I64))
 		// A slice is a pointer and a length, and a block of slots is a pointer
 		// and how many it has.
 		.Slice(..) | .Slots(..) | .Str => {
@@ -278,6 +279,18 @@ extend Builder {
 		val right = self.value(U64, .Cast(operand: rhs, ty: U64))
 		val fails = self.value(BOOL, .Binary(op: op, lhs: left, rhs: right))
 		self.push(.Check(fails: fails, kind: .Bounds(index: index, length: length), at: at))
+	}
+
+	/// Whether an `.Err`'s values name what an `.Err` pattern bound: the
+	/// error taken out of a `Result`, handed on as it is or wrapped.
+	fn namesAnError(args: &[ExprId]): bool = {
+		var open = args.toVec()
+		while open.pop() is .Some(at) {
+			val kind = &self.hir.exprs[at].kind
+			if kind is .Local(local) && self.hir.errorBindings.contains(&local) then return true
+			open.pushAll(kind.children())
+		}
+		return false
 	}
 
 	/// Evaluates `id` into `dest`. Literals, calls, blocks, `if` and `match`
@@ -306,9 +319,7 @@ extend Builder {
 					if self.lentSliceToC(structId, i, fields[i]) {
 						val slice = self.aggregate(fields[i])
 						self.assign(part.clone(), .Use(.Copy(slice.project(.Field(0)))))
-					} else {
-						self.storeExpr(fields[i], part.clone())
-					}
+					} else self.storeExpr(fields[i], part.clone())
 					if n + 1 < fields.len() then
 						self.pendingPart(part, self.ty(fields[i]), &var pending)
 				}
@@ -331,9 +342,7 @@ extend Builder {
 				// An owned closure's environment is on the heap already, and the
 				// expression that builds it is its address; a lent one is built
 				// in this frame.
-				val captures = if self.kind(envTy) is .Own(..) {
-					self.scalar(env)
-				} else {
+				val captures = if self.kind(envTy) is .Own(..) then self.scalar(env) else {
 					val place = Place::of(self.temp(envTy))
 					self.storeExpr(env, place.clone())
 					self.value(PTR_U8, .AddressOf(place))
@@ -363,10 +372,10 @@ extend Builder {
 				}
 				val ptr = self.scalar(inner)
 				self.assign(dest.project(.Field(0)), .Use(ptr))
-				self.assign(dest.project(.Field(1)), .Use(Builder::int(len as u128, I64)))
+				self.assign(dest.project(.Field(1)), .Use(Builder::int(len, I64)))
 			}
 			// The tag, then the fields.
-			.Variant(variant, args, order, ..) => {
+			.Variant(id: enumId, variant, args, order) => {
 				self.push(.SetVariant(place: dest.clone(), variant: variant))
 				var pending: Vec<i64> = Vec()
 				val ordered = evaluationOrder(&order, args.len())
@@ -377,6 +386,14 @@ extend Builder {
 						self.pendingPart(part, self.ty(args[i]), &var pending)
 				}
 				self.forgetParts(pending)
+				// A `Result`'s `.Err`: an error made here, or one passed on.
+				if self.program.tracesErrors &&
+					variant == 1 &&
+					self.program.preludeItems.enumeration(.Result) == .Some(enumId) &&
+					self.fnId is .Some(function) {
+					val made = !self.namesAnError(&args)
+					self.push(.ErrorStep(made: made, function: function, at: expr.span))
+				}
 			}
 			.Match(scrutinee, arms) if aggregate => {
 				self.matchExpr(scrutinee, &arms, expr.ty, .Some(dest))
@@ -542,7 +559,7 @@ extend Builder {
 		val done = self.value(BOOL, .Binary(
 			op: .Ge,
 			lhs: .Copy(Place::of(i)),
-			rhs: Builder::int(count as u128, U64),
+			rhs: Builder::int(count, U64),
 		))
 		self.terminate(.Branch(cond: done, thenBlock: exit, otherwise: body))
 		self.switchTo(body)

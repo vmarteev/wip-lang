@@ -68,7 +68,7 @@ says which others it uses.
 | `wip check file.wip` | reports everything wrong, and writes nothing; given a package, every module of it, imported or not; `--target` checks as another target compiles the program; `--dump-diagnostics` writes them plainly, [for a tool](#diagnostics); `--dump-hir` writes what the checker made of the program, [for a tool](#the-checked-program), and with `--library` the standard library's items too |
 | `wip fmt [paths]` | lays `.wip` files out in one way; `--check` writes nothing and fails if any would change; `-` formats standard input |
 | `wip doc [program]` | writes the program's documentation as pages, into `doc` unless `-o` says otherwise, with its packages' and the standard library's; `--std` the standard library's alone |
-| `wip doc path::to::item` | prints one item's documentation: `std::collections::Map`, `str::findLast` |
+| `wip doc path::to::item` | prints one item's documentation: `std::collections::Map`, `str::lastIndexOf` |
 | `wip debug program [args]` | starts lldb on a Mac, gdb elsewhere, or the one `--debugger` names, on a program `wip build` wrote, with the scripts that show Wip's values; `--scripts` prints where the scripts are |
 | `wip lsp` | serves an editor: the Language Server Protocol on standard input and output |
 | `wip cache clean` | removes everything `wip` keeps in its cache, and nothing else there ([below](#the-cache)) |
@@ -306,7 +306,7 @@ extend Point {
 ```
 
 Given a path of names instead of a program, `wip doc` prints that item —
-`wip doc std::collections::Map`, `wip doc str::findLast` — looking in the
+`wip doc std::collections::Map`, `wip doc str::lastIndexOf` — looking in the
 program in the current directory, and in the standard library where there
 is none. Nothing is type-checked, so a program with errors still has its
 documentation.
@@ -383,7 +383,7 @@ fn main() = {}
 
 @test(panics = "out of bounds")
 fn aVectorIsNotReadPastItsEnd() = {
-    val numbers = Vec::of(own [1, 2, 3])
+    val numbers = Vec::of([1, 2, 3])
     numbers[3]
 }
 

@@ -683,22 +683,17 @@ module.exports = grammar({
 
     lend_expression: $ => prec.right(PREC.lend, seq('lend', $._expression)),
 
-    // `if c { … } else { … }`, or `if c then a else b`, whose branches
-    // are one expression or a jump each.
-    if_expression: $ => prec.right(choice(
-      seq(
-        'if',
-        field('condition', $._expression),
+    // `if c { … } else { … }`, `if c then a else b`, or each branch in its
+    // own form: one expression or a jump after `then` or `else`, a block in
+    // braces. A block is an expression, so an `else` takes either.
+    if_expression: $ => prec.right(seq(
+      'if',
+      field('condition', $._expression),
+      choice(
         field('consequence', $.block),
-        optional(seq('else', field('alternative', choice($.block, $.if_expression)))),
+        seq('then', field('consequence', $._then_branch)),
       ),
-      seq(
-        'if',
-        field('condition', $._expression),
-        'then',
-        field('consequence', $._then_branch),
-        optional(seq('else', field('alternative', $._then_branch))),
-      ),
+      optional(seq('else', field('alternative', $._then_branch))),
     )),
 
     _then_branch: $ => choice(

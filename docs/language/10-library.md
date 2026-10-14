@@ -40,8 +40,9 @@ function that makes it, called only where it is needed — on a `Result`,
 with the error. Both also carry `flatMap`, `fold`, `filter`
 (on `Option`), `any`, `all` and `forEach`. `fold` takes a function for each
 case, and calls only the one that applies: `found.fold(() => 0, (n) => n *
-2)`. `unwrap` panics where there is nothing to answer, so it is for what
-cannot happen.
+2)`. Each is given its function for the call, which may change what it
+captures. `unwrap` panics where there is nothing to answer, so it is for
+what cannot happen.
 
 `asRef()` lends an option's value where it lies, as an `Option<&T>`, which
 `map` makes into what it looks at: an `Option<String>` read as an
@@ -61,9 +62,10 @@ fn main() = {
 ## `Vec<T>`
 
 A growing buffer, written in Wip over one primitive the compiler knows.
-`Vec()` is an empty one, `Vec::of(own [ … ])` takes the
-values a list was built with, and `Vec::filled(count, value)` holds
-clones of a value:
+`Vec()` is an empty one; a list where a `Vec` is expected is one, its
+values moved in, and `Vec::of([ … ])` makes one where nothing is expected,
+taking the values a list was built with; `Vec::filled(count, value)`
+holds clones of a value. A `Vec` compares with a list as its elements:
 
 ```wip,run
 fn main() = {
@@ -73,15 +75,18 @@ fn main() = {
     assert(numbers.len() == 2 && numbers[0] == 1)
     assert(numbers.pop() == .Some(2))
 
-    var made = Vec::of(own [3, 1, 2])
+    var made = Vec::of([3, 1, 2])
     made.sort()
-    assert(made == Vec::of(own [1, 2, 3]))
+    assert(made == [1, 2, 3])
     assert(made[1..] == [2, 3])
     made.insert(0, 0)
     assert(made.remove(0) == 0)
     assert(made.swapRemove(0) == 1)
     made.retain((n) => n > 2)
-    assert(made == Vec::of(own [3]))
+    assert(made == [3])
+    var listed: Vec<i64> = [4, 5]
+    listed = []
+    assert(listed.isEmpty())
 
     val filled: Vec<i64> = Vec::filled(3, 7)
     assert(filled.len() == 3 && filled[2] == 7)
@@ -107,7 +112,7 @@ a `Deque` take theirs the same way:
 
 ```wip,run
 fn main() = {
-    var frames = Vec::of(own [(1, 10), (2, 20)])
+    var frames = Vec::of([(1, 10), (2, 20)])
     frames.atLast().1 += 5
     assert(frames[1] == (2, 25) && frames.atLast().0 == 2)
     val all = frames.takeAll()
@@ -123,10 +128,10 @@ order, leaving nothing behind it. Nothing is copied or cloned, and a
 
 ```wip,run
 fn main() = {
-    var words = Vec::of(own [String::of("a"), String::of("b"), String::of("c")])
+    var words: Vec<String> = ["a", "b", "c"]
     var rest = words.splitOff(1)
     assert(words.len() == 1 && rest[0] == "b")
-    rest.append(Vec::of(own [String::of("d")]))
+    rest.append(["d"])
     words.append(rest)
     assert(words.len() == 4 && words[3] == "d")
 }
@@ -166,13 +171,15 @@ fn main() = {
 
 A slice and a `Vec` make new values from their elements, as Scala's
 collections do, and at once, where an iterator's adapters wait to be
-walked. The function each is given is lent for the call:
+walked. The function each is given is lent for the call, one call at a
+time, so it may change what it captures, `&var (…) => R`; a closure that
+reads goes there too:
 
 ```wip,run
 fn main() = {
     val numbers = [3, 1, 4, 1, 5, 9]
-    assert(numbers.map((n) => n * 2) == Vec::of(own [6, 2, 8, 2, 10, 18]))
-    assert(numbers.filter((n) => n > 3) == Vec::of(own [4, 5, 9]))
+    assert(numbers.map((n) => n * 2) == [6, 2, 8, 2, 10, 18])
+    assert(numbers.filter((n) => n > 3) == [4, 5, 9])
     assert(numbers.fold(0, (sum, n) => sum + n) == 23 && numbers.sum() == 23)
     assert(numbers.find((n) => n > 3) == .Some(&4))
     assert(numbers.first() == .Some(&3) && numbers.max() == .Some(9))
@@ -184,10 +191,13 @@ fn main() = {
 ```
 
 `map`, `flatMap`, `fold`, `indexWhere` and `lastIndexWhere`, `take` and
-`skip` work on any elements, and `take` and `skip` lend a part of the slice
-rather than copy it. `find`, `first` and `last` answer the element by
-reference, for any elements, and so do `minBy` and `maxBy`, the element
-whose key is least or greatest, the first of equals. `sum` and `product`
+`skip` work on any elements. A slice's methods answer by what they do:
+what picks an element where it lies lends it — `first`, `last`, `find`,
+`minBy` and `maxBy`, the element whose key is least or greatest, the first
+of equals, and `take` and `skip`, a part of the slice — for any elements;
+what works out a value answers it, of plain data — `min`, `max`, `sum`,
+`product`, `count`, `countWhere`. `find` answers what it finds, and a
+position is `indexOf`, on a slice, text, a `Map` and a `Set` alike. `sum` and `product`
 add up and multiply elements that implement `Add` and `Zero`, or
 `Multiply` and `One`, as every number does: nothing sums to zero and
 multiplies to one. `filter`, `partition`, `min` and `max` copy the
@@ -227,7 +237,7 @@ fn main() = {
     assert(text.trim() == "one,two")
     assert(text.trim().split(",").count() == 2)
     assert(text.contains("two"))
-    assert(text.find("two") == .Some(6))
+    assert(text.indexOf("two") == .Some(6))
     assert("42".toInt() == .Ok(42))
     assert("4.5".toFloat() == .Ok(4.5))
     assert("\(0.1 + 0.2)" == "0.30000000000000004")
@@ -236,7 +246,8 @@ fn main() = {
 }
 ```
 
-Text is searched from either end — `find` and `findLast` — and compared in
+Text is searched from either end — `indexOf` and `lastIndexOf`, the
+position, as a slice's and a map's are — and compared in
 any case without making anything, `equalsAnyCase` and `startsWithAnyCase`;
 `toAsciiUpper()` and `toAsciiLower()` change the case of its ASCII letters
 alone, as a protocol or a format that is ASCII asks; a `String` takes its
@@ -245,7 +256,7 @@ last character back with `popChar`, as a backspace does:
 ```wip,run
 fn main() = {
     val path = "a/b/c.tar.gz"
-    assert(path.find(".") == .Some(5) && path.findLast(".") == .Some(9))
+    assert(path.indexOf(".") == .Some(5) && path.lastIndexOf(".") == .Some(9))
     assert("Content-Length".equalsAnyCase("content-length"))
     assert("Content-Type: text/plain".startsWithAnyCase("content-type"))
     assert("Grüße".toAsciiUpper() == "GRüßE")
@@ -319,7 +330,7 @@ fn main() = {
     val .Some((name, value)) = "WIDTH 32".splitOnce(" ") else return
     assert(name == "WIDTH" && value == "32")
     assert("==title==".trimMatches("=") == "title")
-    assert("k=v=w".splitn(2, "=").toVec() == Vec::of(own ["k", "v=w"]))
+    assert("k=v=w".splitn(2, "=").toVec() == ["k", "v=w"])
     assert(" a  b ".splitWhitespace().count() == 2)
     assert("18446744073709551615".toU64().isOk())
 }
@@ -426,9 +437,10 @@ the prelude:
 fn main() = {
     val text = "the quick brown fox"
 
-    // Adapters answer another iterator, and keep an `own` closure.
-    val long = text.split(" ").filter(own (w) => w.len() > 3).toVec()
-    assert(long == Vec::of(own ["quick", "brown"]))
+    // Adapters answer another iterator, and keep the closure they are lent:
+    // a view of what it captured.
+    val long = text.split(" ").filter((w) => w.len() > 3).toVec()
+    assert(long == ["quick", "brown"])
 
     var pairs = 0
     for (i, word) in text.split(" ").enumerate() {
@@ -436,7 +448,7 @@ fn main() = {
     }
     assert(pairs == 22)
 
-    // Consumers walk it to the end, and are lent a plain closure.
+    // Consumers walk it to the end, and are lent a closure that may write.
     assert(text.split(" ").count() == 4)
     assert(text.split(" ").any((w) => w == "fox"))
     assert(text.split(" ").all((w) => w.len() >= 3))
@@ -446,12 +458,12 @@ fn main() = {
     var letters = "ab".chars().peekable()
     assert(letters.peek() == .Some(&'a') && letters.next() == .Some('a'))
 
-    // A slice walks through `walk()`, and through `forwards()` and
-    // `backwards()`, which lend each element where it lies.
+    // A slice walks through `copies()`, which copies each element out, and
+    // through `forwards()` and `backwards()`, which lend each where it lies.
     val numbers = [1, 2, 3, 4]
-    assert(numbers.walk().skip(1).take(2).toVec() == Vec::of(own [2, 3]))
+    assert(numbers.copies().skip(1).take(2).toVec() == [2, 3])
     assert(numbers.countWhere((n) => n > 2) == 2)
-    val names: Vec<String> = Vec::of(own ["a", "b"])
+    val names: Vec<String> = ["a", "b"]
     var seen = String()
     for (index, name) in names.forwards().enumerate() {
         seen.push("\(index)\(name)")
@@ -463,9 +475,12 @@ fn main() = {
 }
 ```
 
-`walk()` hands out copies, so its elements are plain data, which is what
+`copies()` hands out copies, so its elements are plain data, which is what
 `sum` and arithmetic on them want; `forwards()` and `backwards()` lend
 them, `&T`, so they walk any list, from the first element or from the last.
+Over values that own memory, `copies()` is refused, and names `forwards()`.
+Three walks, then, by what they do: they lend, they copy, or — `for x in
+move c` and `intoIterator()` — they take.
 
 The adapters are `map`, `filter`, `filterMap` — what a closure makes of
 an element, where it makes something — `flatMap`, `flatten` where the
@@ -474,28 +489,68 @@ elements are iterators, `enumerate`, `take`,
 `count`, `toVec`, `toSet` where the elements hash, `find`, `findMap`,
 `position`, `nth`, `last`, `any`, `all`, `fold`, `forEach`, `minBy` and
 `maxBy`. `nth` passes over the elements before the one it answers, and the
-iterator goes on after it. A map is made of pairs by `Map::fromPairs`:
+iterator goes on after it.
+
+An adapter's closure is lent, and reads: the adapter is a view of what it
+captured, as of what it walks, so a chain may read a `str`, a reference or
+`self` around it, and is used while those stay as they were — used up in
+its statement, kept in a `val` for its block, or walked by a `for` for the
+loop — and does not leave the function that holds them. A closure that
+names nothing around it borrows nothing, so its chain leaves as far as
+what it walks may. A lazy walk that leaves its function reading what is
+around it is a generator, which borrows only what it is given
+([page 4](04-expressions.md)):
+
+```wip,run
+import std::iter::{Forwards, Mapped}
+
+fn double(x: &i64): i64 = x * 2
+
+fn doubled(values: &[i64]): Mapped<Forwards<i64>, i64> from values = {
+    return values.forwards().map(double)
+}
+
+fn main() = {
+    val prefix = "b"
+    val words = "alpha beta bold".split(" ")
+    var picked = words.filter((w) => w.startsWith(prefix))
+    assert(picked.next() == .Some("beta") && picked.count() == 1)
+    assert(doubled([1, 2]).sum() == 6)
+}
+```
+
+```wip,error=E0436
+fn main() = {
+    var step = 1
+    val values = [1, 2]
+    var shifted = values.forwards().map((x) => x + step)
+    step = 2
+    val first = shifted.next()
+}
+```
+
+A map is made of pairs by `Map::fromPairs`:
 
 ```wip,run
 import std::collections::{Map}
 
 fn main() = {
-    val numbers = "1 x 22 y".split(" ").
-        filterMap(own (w) => w.toInt().toOption()).
-        toVec()
-    assert(numbers == Vec::of(own [1, 22]))
-    val letters = "ab cd".split(" ").flatMap(own (w) => w.chars()).toVec()
+    val numbers = "1 x 22 y".split(" ")
+        .filterMap((w) => w.toInt().toOption())
+        .toVec()
+    assert(numbers == [1, 22])
+    val letters = "ab cd".split(" ").flatMap((w) => w.chars()).toVec()
     assert(letters.len() == 4 && letters[2] == 'c')
-    val words = "ab cd".split(" ").map(own (w) => w.chars()).flatten()
+    val words = "ab cd".split(" ").map((w) => w.chars()).flatten()
     assert(words.count() == 4)
-    assert("12a3".chars().takeWhile(own (c) => c.isDigit()).count() == 2)
+    assert("12a3".chars().takeWhile((c) => c.isDigit()).count() == 2)
     assert("a b".split(" ").chain("c".split(" ")).last() == .Some("c"))
     assert("a b c".split(" ").position((w) => w == "c") == .Some(2))
     var total = 0
     "1 2 3".split(" ").forEach((w) => { total += w.toInt().unwrap() })
     assert(total == 6)
     val years = [30, 40]
-    val ages = Map::fromPairs("ann bo".split(" ").zip(years.walk()))
+    val ages = Map::fromPairs("ann bo".split(" ").zip(years.copies()))
     assert(ages.at("bo") == 40)
 }
 ```
@@ -517,17 +572,17 @@ struct Person {
 }
 
 fn main() = {
-    var people: Vec<Person> = Vec::of(own [
+    var people: Vec<Person> = [
         Person(name: "cy", age: 30),
         Person(name: "ann", age: 40),
         Person(name: "bo", age: 30),
-    ])
+    ]
     people.sortByKey((p) => p.name.toString())
     people.sortByKey((p) => p.age)
     assert(people[0].name == "bo" && people[1].name == "cy")
-    var ages = people.forwards().map(own (p) => p.age).toVec()
+    var ages = people.forwards().map((p) => p.age).toVec()
     ages.dedup()
-    assert(ages == Vec::of(own [30, 40]))
+    assert(ages == [30, 40])
 }
 ```
 
@@ -554,11 +609,11 @@ of equals, as a slice does ([page 8](08-interfaces.md)):
 ```wip,run
 fn main() = {
     val text = "wide 字\nab"
-    assert(text.chars().map(own (c) => c.width()).sum() == 9)
-    assert(text.lines().map(own (line) => line.len()).max() == .Some(8))
+    assert(text.chars().map((c) => c.width()).sum() == 9)
+    assert(text.lines().map((line) => line.len()).max() == .Some(8))
     assert("pear fig plum".split(" ").min() == .Some("fig"))
     val values = [3, 9, 4]
-    assert(values.walk().product() == 108)
+    assert(values.copies().product() == 108)
     assert(values.backwards().max() == .Some(&9))
 }
 ```
@@ -579,7 +634,7 @@ is an `Iterator`, which a loop reads until every sender is gone:
 import std::future::{Future, channel}
 
 fn main() = {
-    val data = Vec::of(own [1, 2, 3, 4])
+    val data = Vec::of([1, 2, 3, 4])
     val sum = Future::run(own () => {
         var total = 0
         for x in data {
@@ -617,7 +672,9 @@ once both are done; `future::each(items, work)` and `future::map(items,
 work)` split a slice among the processors, as many as `future::cores()`
 says are working. The closures are lent for the
 call, so what they capture is checked as the call's arguments are: what
-one writes, no other touches, and several may read one place.
+one writes, no other touches, and several may read one place. `each` and
+`map` call one closure from every thread at once, so it reads,
+`&(…) => R`, and one that writes is refused there.
 
 Two types change through a `&`, safely from any number of threads:
 `std::sync::Atomic<T>` — `load`, `store`, `swap`, `add`, `subtract` and
@@ -1004,12 +1061,12 @@ fn main() = {
     assert(counts.len() == 2)
     assert(counts.at("a") == 1)
     assert(counts.contains("b"))
-    assert(counts.find("a") == .Some(0))
+    assert(counts.indexOf("a") == .Some(0))
     assert(counts.get("a") == .Some(&1) && counts.get("z").isNone())
     assert(counts.keyAt(1) == "b")
     counts.at("a") += 10
     assert(counts.remove("a") == .Some(11))
-    assert(counts == Map::fromPairs([("b", 2)].walk()))
+    assert(counts == Map::fromPairs([("b", 2)].copies()))
 
     var seen = Set<i64>()
     assert(seen.add(1))
@@ -1031,8 +1088,8 @@ keys, whatever order they went in.
 
 `Deque<T>` is pushed and taken at either end at the same small cost, where
 a `Vec` is quick at its back alone: a queue, a stack, or a list pushed at
-its front. It is read and written by position, and walked
-from front to back:
+its front. It is read and written by position, walked from front to back,
+and lends its ends, `first()` and `last()`, as a slice does:
 
 ```wip,run
 import std::collections::{Deque}
@@ -1045,7 +1102,7 @@ fn main() = {
     assert(waiting.len() == 3 && waiting[0] == 1)
     assert(waiting.popFront() == .Some(1))
     assert(waiting.popBack() == .Some(3))
-    assert(waiting == Deque::of([2]))
+    assert(waiting == Deque::of([2]) && waiting.first() == .Some(&2))
 }
 ```
 
@@ -1124,7 +1181,7 @@ atomic, so owners may be on different threads.
 import std::shared::{Shared, Weak}
 
 fn main() = {
-    val first = Shared::of(Vec::of(own [1, 2, 3]))
+    val first = Shared::of(Vec::of([1, 2, 3]))
     var second = first.share()
     assert(first.owners() == 2 && second.value().len() == 3)
     second.edit().push(4) // a copy: `first` is shared

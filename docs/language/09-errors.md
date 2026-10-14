@@ -45,14 +45,14 @@ nothing at the first that has none:
 import std::text::{ParseError}
 
 fn numbers(texts: &[str]): Result<Vec<i64>, ParseError> = Result::collect(
-    texts.walk().map(own (text) => text.toInt()),
+    texts.copies().map((text) => text.toInt()),
 )
 
 fn main() = {
     assert(numbers(["1", "2"]) == .Ok([1, 2].toVec()))
     assert(numbers(["1", "x"]).isErr())
     val gaps: [Option<i64>; 2] = [.Some(1), .None]
-    assert(Option::collect(gaps.walk()).isNone())
+    assert(Option::collect(gaps.copies()).isNone())
 }
 ```
 
@@ -177,6 +177,38 @@ fn main(): Result<void, io::IoError> = {
     return .Ok()
 }
 ```
+
+## Where an error came from
+
+In a debug build, an error that ends the program is followed by where it
+was made and each place that passed it on, innermost first, as a panic's
+calls are:
+
+```
+error: no such name
+  made in found (main.wip:1)
+  passed on in total (main.wip:4)
+  passed on in main (main.wip:9)
+```
+
+An error is made where an `.Err(…)` is built, and passed on by each `?`
+that returns it, a `?` that converts it through `From` among them. An
+`.Err` built from what an `.Err` held — `mapErr`, or a `match` that hands
+the error back, `.Err(e) => .Err(e)`, wrapped or not — passes it on too, so
+the first line still says where the error was made. A `?` on an `Option`
+records nothing: there is no error to report.
+
+What is kept is the last error made on the thread, in a buffer of the
+runtime: where it was made and the 31 places nearest the end, with how
+many were left out between. An error kept in a variable while another is
+made and handled, and passed on after, shows the other's beginning. A
+thread starts with none.
+
+`unwrap` of an error prints the same, after its panic's calls, under
+`where the error came from:` — which is how a test, which answers
+nothing, ends on an error.
+
+A release build records nothing, and prints the error alone.
 
 ## `panic`
 

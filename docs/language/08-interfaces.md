@@ -118,7 +118,7 @@ fn counted<C: Items<i64>>(container: &C): i64 = {
 fn main() = {
     val numbers = [3, 9, 4]
     assert(largest(&numbers) == 9)
-    assert(counted(Vec::of(own [1, 2, 3])) == 6)
+    assert(counted(Vec::of([1, 2, 3])) == 6)
 }
 ```
 
