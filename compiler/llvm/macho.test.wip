@@ -1,0 +1,144 @@
+// A table written into a Mach-O object `clang` wrote: every section,
+// symbol and relocation of the object is as it was, moved and renumbered;
+// the table's entries name the functions, the one the object keeps to
+// itself among them; and, on a Mac, the object links into a program that
+// runs.
+
+import std::collections::{Map}
+import std::fs
+import std::io
+import std::path
+import std::process
+import std::process::{Command}
+
+/// C whose `twice` the object keeps to itself, as LLVM keeps a part's.
+val SOURCE: str =
+	"static int twice(int x) { return x * 2; }\nint shown(int x) { return twice(x) + 1; }\nint main(void) { return shown(1) - 3; }\n"
+
+@test
+fn aTableIsWrittenIntoAMachoObjectClangWrote() = {
+	val root = match io::env("TMPDIR") {
+		.Some(dir) => if dir.isEmpty() then String::of("/tmp") else dir
+		.None => String::of("/tmp")
+	}
+	val dir = path::join(root, "wip-macho-\(process::id())")
+	assert(fs::makeDirs(dir).isOk())
+	val source = path::join(dir, "table.c")
+	val first = path::join(dir, "first.o")
+	assert(fs::writeFile(source, SOURCE).isOk())
+	val clang = match io::env("WIP_CLANG") {
+		.Some(clang) => clang
+		.None => String::of("clang")
+	}
+	val compiled = Command::of(clang).args([
+		"-c",
+		"-g",
+		"-O0",
+		"-target",
+		"arm64-apple-macos11",
+		source.toStr(),
+		"-o",
+		first.toStr(),
+	]).output()
+	assert(compiled is .Ok(result) && result.exit.success(), "clang writes a Mach-O object")
+	val object = bytesOf(first)
+	val files: Map<String, String> = Map()
+	val .Ok(written) = withFrameTables([object.clone()], &files, "wip.frames.test", 7, true) else {
+		panic("the table is written into the object")
+	}
+	val .Ok(before) = readObject(&object) else panic("the object is read")
+	val .Ok(after) = readObject(&written) else panic("the object written is read")
+
+	// Every section as it was, at its number, with its relocations naming
+	// what they named.
+	for section in before.sections {
+		val .Some(again) = after.sectionAt(section.index) else {
+			panic("section \(section.index) is there")
+		}
+		assert(again.name == section.name && again.size == section.size)
+		assert(again.relocations.len() == section.relocations.len())
+		for (i, r) in section.relocations.forwards().enumerate() {
+			val moved = &again.relocations[i]
+			assert(moved.offset == r.offset && moved.addend == r.addend)
+			assert(
+				named(&before, &r.target) == named(&after, &moved.target),
+				"a relocation names what it named",
+			)
+		}
+		if section.size > 0 then
+			assert(
+				object[section.offset..(section.offset + section.size)] ==
+					written[again.offset..(again.offset + again.size)],
+			)
+	}
+	// Every symbol as it was, at its address.
+	for symbol in before.symbols {
+		val .Some(s) = symbol else continue
+		var found = false
+		for other in after.symbols {
+			if other is .Some(o) &&
+				o.name == s.name &&
+				o.address == s.address &&
+				o.section == s.section {
+				found = true
+			}
+		}
+		assert(found, "\(s.name) is there")
+	}
+	// The table: its shared piece named, and an entry for each function.
+	var functions: Vec<String> = Vec()
+	for section in after.sections {
+		if section.name != "__wip_frames" then continue
+		for r in section.relocations {
+			functions.push(named(&after, &r.target))
+		}
+	}
+	assert(
+		functions.contains("_twice") && functions.contains("_shown") && functions.contains("_main"),
+	)
+	var shared = false
+	for symbol in after.symbols {
+		if symbol is .Some(s) && s.name == "_wip.frames.test" && !s.undefined then shared = true
+	}
+	assert(shared, "the shared piece is named")
+
+	// On a Mac, it links, dropping what nothing reaches, and runs.
+	if TARGET_VENDOR == "apple" {
+		val table = path::join(dir, "table.o")
+		val program = path::join(dir, "table")
+		var file = match fs::File::create(table) {
+			.Ok(file) => file
+			.Err(..) => panic("the object is written")
+		}
+		assert(file.writeBytes(&written).isOk())
+		val linked = Command::of(clang).args([
+			table.toStr(),
+			"-Wl,-dead_strip",
+			"-o",
+			program.toStr(),
+		]).output()
+		assert(linked is .Ok(result) && result.exit.success(), "the object links")
+		val ran = Command::of(program).output()
+		assert(ran is .Ok(result) && result.exit.success(), "the program runs")
+	}
+	fs::removeAll(dir)
+}
+
+/// What a relocation names: a symbol by its name, or a section by its
+/// number.
+fn named(object: &Object, target: &RelocationTarget): String = match target {
+	.Symbol(index) => match object.symbols[index] {
+		.Some(symbol) => symbol.name.clone()
+		.None => "a debugging symbol"
+	}
+	.Section(index) => "section \(index)"
+	.Nothing => "nothing"
+}
+
+/// The bytes of a file.
+fn bytesOf(file: str): Vec<u8> = {
+	val .Ok(text) = fs::readFile(file) else panic("\(file) is read")
+	var bytes: Vec<u8> = Vec()
+	bytes.pushAll(text.toStr())
+	return bytes
+}

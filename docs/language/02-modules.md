@@ -13,7 +13,9 @@ which is [page 12](12-tools.md).
 ## A module is a directory
 
 Every `.wip` file in a directory is one module, and the files of a module
-share everything: a name declared in one is a name in all of them. The
+share everything: a name declared in one is a name in all of them. A test
+file, `name.test.wip`, is the one exception: it sees all its module
+declares, and what it declares is its own (see "Tests", page 12). The
 program's own module is the directory the entry file is in; every other
 module is a directory below it.
 
@@ -39,17 +41,65 @@ circle is.
 
 ## A file may be for one target
 
-A file whose name ends `.macos.wip`, `.linux.wip`, `.windows.wip` — or with
-an architecture, `.arm64.wip`, `.x86_64.wip` — is compiled only for that
-target, as a `.test.wip` file is compiled only by `wip test`. The two
-compose: `board.linux.test.wip` is a test for Linux. A name whose last piece
-is not a target the compiler knows says nothing, so `v1.2.wip` is an
-ordinary file.
+A file whose name ends `.macos.wip`, `.linux.wip`, `.windows.wip`,
+`.ios.wip` — or with an architecture, `.arm64.wip`, `.x86_64.wip`, or with
+`.apple.wip`, which is a Mac's and iOS's together — is compiled only for
+that target, as a `.test.wip` file is compiled only by `wip test`. The two
+compose: `board.linux.test.wip` is a test for Linux. `.macos.wip` is a
+Mac's alone, so what a Mac and an iPad share, as Metal, is `.apple.wip`. A
+name whose last piece is not a target the compiler knows says nothing, so
+`v1.2.wip` is an ordinary file.
 
 An item may say the same thing with `@target(os = "linux")`, which [page
 11](11-c.md) shows; a file is for the places where most of it differs. What
 another target takes is checked by asking for that target: `wip check
 --target linux` on a Mac ([page 12](12-tools.md)).
+
+## Constants a build defines
+
+A build is given settings with `--define NAME=VALUE`: a release without
+its editor, a renderer built with its validation, a demo with half its
+world. What a build may set is a constant that says `@define`, of a
+`bool`, an integer, a float or a `str`, with the value it has where no
+build sets it written where it is; a program reads it as any constant.
+Where a condition is a constant — a define, `TARGET_OS`, `!`, `&&`, `||`,
+`==` and `!=` of those, and a constant written as one of them — the branch
+it never takes is checked, as all code is, and not compiled: what only it
+calls is not in the program, in a debug build as in a release.
+
+```wip,run
+import std::io
+
+@define
+val EDITOR: bool = true
+
+@define
+val ZONE_SIZE: i64 = 32
+
+// Built of a define and a target: a constant, which decides as they do.
+val EDITING: bool = EDITOR && TARGET_OS != "ios"
+
+fn openEditor(): str = "the editor"
+
+fn main() = {
+    if EDITING then io::println(openEditor())
+    assert(ZONE_SIZE == 32)
+}
+```
+
+```sh
+wip build --release --define EDITOR=false main.wip
+```
+
+A define names a constant by its name, or by its module's path where two
+declare one, `--define world::DEBUG=true`; a library's are set the same
+way. A name no constant declares, a value not of its type — `true` or
+`false`, an integer in its range, a float, any text for a `str` — and a
+name given twice are refused (E0368), so a misspelt define is never
+quietly the default. A define decides branches, not which items there are:
+both sides are always checked, which is what keeps the one a build leaves
+out from rotting, where `@target` drops what another machine would not
+compile.
 
 ## Imports
 
@@ -218,6 +268,33 @@ pub fn size(): i64 = 10
   package may.
 - **`package::NAME` and `package::VERSION`** are constants of the package
   the code is written in, known when it is compiled.
+- **`@files("levels", "help.txt")`** names the files and directories,
+  from the package's root, that the package's code reads while the
+  program runs, a library's as a program's: each build puts them beside
+  the program, and `package::besideProgram("levels")` is where the
+  package's code finds them ([page 12](12-tools.md)). A program's own are
+  at the same paths beside it as in its root, and a dependency's under a
+  directory of its name, `engine/shaders/…`, which `package::besideProgram`
+  knows: the engine's code asks for `"shaders"`, whether the engine is the
+  program, as its tests are, or what a game depends on. Each must be the
+  package's own — no whole path, nothing outside its root — and hold no
+  `.wip` file, since what a package reads is not its code; a program's
+  own may not begin with a dependency's name, the directory beside it
+  that is the dependency's. A path written out to
+  `package::besideProgram` must be one `@files` names, or below one. A
+  file read when the program is compiled is embedded instead ([page
+  10](10-library.md)): what is part of the code, as a table it is written
+  against; a file, for what is changed apart from the code, as a game's
+  pictures and shaders.
+- **`@app(id = "com.example.game", name = "The Game")`** says the package
+  is an app, which a build for iOS makes a bundle of
+  ([page 12](12-tools.md#ios)): `id`, which it must say, is its
+  identifier, reverse-DNS; `name` is what the home screen shows, the
+  package's name if not said; `devices` is `ipad`, `iphone` or `both`;
+  `orientation` is `landscape`, `portrait` or `any`; `icon` is a square
+  PNG of the package, which the build makes each size of; `minimum` is the
+  least iOS version it runs on, `"17.0"` if not said. Its version is the
+  package's `@version`. A build for a Mac or Linux does not read it.
 - **`wip build game`** builds the package whose root is `game/`, with what
   it depends on, from source, into one program; `wip test game` runs
   `game`'s own tests. A package with a `main` is a program, and one
@@ -228,12 +305,14 @@ pub fn size(): i64 = 10
 ## The prelude
 
 Some names are in scope in every file without an import: the types
-`Option`, `Result`, `Ordering`, `Vec`, `String`, `Slots`, `Hasher`,
-`Align` and the tuple structs; the interfaces `Eq`, `Ord`, `Hash`, `Text`,
-`Clone`, `Items`, `Iterator`, `IntoIterator`, `Sequence`, `Index`,
-`Destroy` and `From`, and the operators' `Add`, `Subtract`, `Multiply`,
-`Divide`, `Remainder`, `Negate` and `Not`; and `assert` and `panic` as
-forms of the language. That list is closed and the compiler knows it: a
+`Option`, `Result`, `Ordering`, `Vec`, `String`, `Hasher`, `Align`,
+`InRadix`, `WithPrecision` and the tuple structs; the interfaces
+`Eq`, `Ord`, `Hash`, `Text`, `Clone`, `Items`, `Iterator`,
+`IntoIterator`, `Sequence`, `Index`, `Destroy` and `From`, the operators'
+`Add`, `Subtract`, `Multiply`, `Divide`, `Remainder`, `Negate` and `Not`,
+the numbers' `Zero` and `One`, and `Encode`, `Decode`, `Encoder` and
+`Decoder`; the functions `destroy` and `cloneOf`; and `assert` and
+`panic` as forms of the language. That list is closed and the compiler knows it: a
 module may not declare or import a name the prelude has.
 
 ```wip,error=E0345

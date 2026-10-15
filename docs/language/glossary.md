@@ -50,6 +50,10 @@ compiler writes those interfaces for a type, field by field. [Page 8](08-interfa
 **`dyn`** — `&dyn Shape`, a reference to a value of some type that
 implements `Shape`, called through a table of that type's methods. [Page 8](08-interfaces.md#dyn)
 
+**`empties`** — `var fn clear() empties`: the call leaves the receiver
+holding no view, so it borrows nothing until something is put in it again;
+a list of views is cleared and filled while what it borrowed changes. [Page 7](07-references.md#empties-what-a-call-leaves)
+
 **end** — a value ends where its owner does, in the reverse of the order
 values were declared; what it owns is freed then, and a type that must do
 something more implements `Destroy`. [Page 6](06-ownership.md#ending-destroy)
@@ -75,12 +79,12 @@ allocates nothing. [Page 4](04-expressions.md#generators)
 `return`ed, assigned. A place given away holds nothing after, and using it
 again is refused at the place it was given. [Page 6](06-ownership.md#copies-and-moves)
 
-**held to** — a body is held to what its signature says, `from` and
-`keeps`: one that does more is refused, so that a caller may rely on the
-signature alone. [Page 7](07-references.md#what-a-call-keeps)
+**held to** — a body is held to what its signature says, `from`, `keeps`
+and `empties`: one that does otherwise is refused, so that a caller may
+rely on the signature alone. [Page 7](07-references.md#what-a-signature-says-about-borrows)
 
 **`from`** — `fn text(i: i64): str from self.ast`, after a result type:
-what the result borrows, where the signature alone would say more. [Page 7](07-references.md#a-reference-kept-as-a-view)
+what the result borrows, where the signature alone would say more. [Page 7](07-references.md#from-what-a-call-answers)
 
 **implicit parameter** — `implicit dice: &var Dice`: filled, where a call
 leaves it out, from the caller's implicit of the same name. [Page 3](03-functions.md#implicit-parameters)
@@ -90,7 +94,7 @@ asks for, and what `&dyn` calls through. Rust's trait, Swift's protocol. [Page 8
 
 **`keeps`** — `var fn add(word: str) keeps word`: the call may store that
 parameter's value in one of its `&var` arguments, which then borrows it. A
-call keeps nothing it does not say. [Page 7](07-references.md#what-a-call-keeps)
+call keeps nothing it does not say. [Page 7](07-references.md#keeps-what-a-call-stores)
 
 **lend** — to let a call use a place for as long as it runs: `&place` for
 reading, `&var place` for reading and writing. While a place is lent for

@@ -5,11 +5,8 @@
 A reference is written at a call, and is a parameter's type. A `&var`
 reference exists only while the call it was passed to is running: it is
 never a variable's type, a field's, or what a function answers, except for a
-projection, below, and for a closure kept in a `val` that writes what it
-captures, which holds its `&var`s in its own block, to its last use, and is
-never copied ([page 3](03-functions.md#functions-as-values)). A `&`
-reference may also be kept where a view is kept, which the section on
-views says.
+projection, below. A `&` reference may also be kept where a view is kept,
+which the section on views says.
 
 ```wip,run
 fn total(values: &[i64]): i64 = {
@@ -79,6 +76,12 @@ fn main() = {
 This is what makes ownership cheap to check: since no `&var` outlives the
 call it was made for, two writers of one place are only ever two arguments
 of one call, and there is no lifetime to write down.
+
+One thing besides a projection holds a `&var` past a call's start: a
+closure kept in a `val` that writes what it captures. It holds its `&var`s
+in its own block, to its last use, and is never copied ([page
+3](03-functions.md#functions-as-values)), so it is the one writer of what
+it captures while it lives.
 
 ## What may happen while a place is lent
 
@@ -239,6 +242,10 @@ Its result is written `&T`: a result that is not a reference lends nothing,
 and one written `&var T` is told that the writing half makes it `&var` by
 itself.
 
+Generic code writes through `&var [T]` rather than through `c[i]`, because
+the interfaces that answer `at` ask for the reading half alone; an
+interface that asks for both halves of a lending pair is still to come.
+
 ## Views
 
 A `str` is a view of bytes that belong to something else, and so is a
@@ -277,6 +284,36 @@ fn main() = {
     val words = Words::of(whole)
     assert(words.rest() == "one two")
 }
+```
+
+Whether a type borrows is read from its fields. A struct that is not a
+view cannot hold a `str`, a reference or a view, nor a generic type given
+one for a parameter its fields hold — an `Option<str>`, a `Vec<str>` — and
+is refused with the fix that makes it one (E0427). A generic type that
+names its parameter without holding a value of it is plain data whatever
+it is given: a `Handle<str>` is a slot and a generation, which name text
+in an `Arena` and hold none of it, and is kept anywhere:
+
+```wip,run
+import std::collections::{Arena, Handle}
+
+struct Named {
+    at: Handle<str>
+}
+
+fn main() = {
+    var names: Arena<str> = Arena()
+    val named = Named(at: names.add("pear"))
+    assert(names[named.at] == "pear")
+}
+```
+
+```wip,error=E0427
+struct Named {
+    label: Option<str>
+}
+
+fn main() = {}
 ```
 
 What a call answers borrows an argument only where the argument's type
@@ -482,14 +519,110 @@ fn main() = {
 }
 ```
 
+A `&var` is kept nowhere: a view may be copied, and two copies of a
+`&var` would each write one place. A struct or an enum that holds a `&`
+is declared `view`, as one that holds a `str` is.
+
+Nor is what a `&var` reaches kept by another argument: a
+call that writes a context — a parser stepped with the machine it fills —
+leaves a view argument borrowing what it borrowed, and the caller goes on
+writing the context. A body that would keep a view of it is refused
+(E0447); a value argument, and what a `&` reaches, may be kept where the
+signature says so, as the next section shows:
+
+```wip,run
+struct Vm {
+    names: Vec<String>
+}
+
+view struct Parser {
+    source: str
+    at: i64
+}
+
+extend Parser {
+    var fn step(vm: &var Vm) = {
+        vm.names.push(self.source[self.at..self.at + 1])
+        self.at += 1
+    }
+}
+
+fn main() = {
+    var vm = Vm(names: Vec())
+    val text = String::of("ab")
+    var parser = Parser(source: text.toStr(), at: 0)
+    parser.step(&var vm)
+    parser.step(&var vm)
+    assert(vm.names.len() == 2)
+}
+```
+
+## What a signature says about borrows
+
+What a call does with what borrows is read from the callee's signature
+alone, so a caller never looks into a body. Unless it says otherwise, a
+call's result borrows every argument whose type can hold what it refers
+to, a call keeps nothing of its arguments, and a method leaves its
+receiver borrowing what it borrowed. Three clauses after the signature
+say otherwise, and the body is held to each, so a caller relies on the
+signature, and changing a body never breaks one:
+
+| Clause | What it overrides | The body is held to |
+|---|---|---|
+| `: T from a, self.field` | the result borrows every argument whose type can hold what it refers to | answering nothing else (E0437) |
+| `keeps a, self` | a call keeps nothing in its `&var` arguments | storing nothing else (E0449) |
+| `empties` | the receiver goes on borrowing what it borrowed | every field that can hold a view emptied, on every path (E0463) |
+
+They are written in that order, after the result type, and combine: a
+method that empties a list of views and fills it from what it is given
+says both, and a call leaves the list borrowing that alone:
+
+```wip,run
+view struct Words {
+    words: Vec<str> = Vec()
+}
+
+extend Words {
+    var fn refill(line: str) keeps line empties = {
+        self.words = Vec()
+        for word in line.split(" ") {
+            self.words.push(word)
+        }
+    }
+}
+
+fn main() = {
+    var line = String()
+    var words = Words()
+    var count = 0
+    for text in ["a b", "c d e"] {
+        line.clear()
+        line.push(text)
+        words.refill(line.toStr())
+        count += words.words.len()
+    }
+    assert(count == 5)
+}
+```
+
+Each is a word only there, so a method may still be named `from`, `keeps`
+or `empties`. A body that stores what its `keeps` does not name is refused
+with the fix that names it (E0449). A view refused because what it borrows
+changed (E0436), where it borrows through a function of the program that
+could have said less — a result with no `from`, a method that empties with
+no `empties` — is offered the word, with its fix, where saying it would
+have kept the view good.
+
+### `from`: what a call answers
+
 What a call answers borrows what its arguments' types can hold, which is
 read from the signature alone; a helper of a view that owns as well as
 borrows answers what borrows the whole view, and a function of two texts
 answers what borrows both. `from` after the result type says what it
 borrows instead, and nothing else: a parameter, whose place and what it
 borrows, or `self.ast`, a `&`, `str` or view field of one, what the
-parameter borrows and not its place. The body is held to it (E0437), so changing the
-body never breaks a caller, and the caller keeps only what it names:
+parameter borrows and not its place. The body is held to it (E0437), and
+the caller keeps only what it names:
 
 ```wip,run
 struct Ast {
@@ -544,48 +677,7 @@ fn main() = {
 }
 ```
 
-`from` is a word only after a result type, so a method may still be named
-`from`.
-
-A `&var` is kept nowhere: a view may be copied, and two copies of a
-`&var` would each write one place. A struct or an enum that holds a `&`
-is declared `view`, as one that holds a `str` is.
-
-Nor is what a `&var` reaches kept by another argument: a
-call that writes a context — a parser stepped with the machine it fills —
-leaves a view argument borrowing what it borrowed, and the caller goes on
-writing the context. A body that would keep a view of it is refused
-(E0447); a value argument, and what a `&` reaches, may be kept where the
-signature says so, as the next section shows:
-
-```wip,run
-struct Vm {
-    names: Vec<String>
-}
-
-view struct Parser {
-    source: str
-    at: i64
-}
-
-extend Parser {
-    var fn step(vm: &var Vm) = {
-        vm.names.push(self.source[self.at..self.at + 1])
-        self.at += 1
-    }
-}
-
-fn main() = {
-    var vm = Vm(names: Vec())
-    val text = String::of("ab")
-    var parser = Parser(source: text.toStr(), at: 0)
-    parser.step(&var vm)
-    parser.step(&var vm)
-    assert(vm.names.len() == 2)
-}
-```
-
-## What a call keeps
+### `keeps`: what a call stores
 
 A call keeps nothing of its arguments unless its signature says `keeps`
 and the parameters whose values it may keep in its `&var` arguments, the
@@ -634,7 +726,36 @@ reference made from what a parameter refers to — `&thing.name` of a
 `thing: &Thing`, a view a method of `thing` answers, an element a `for`
 over it binds — since that borrows what the parameter borrows. A value of
 a type parameter counts, since an instance may make it a `str`, which is
-why `Vec`'s `push` says `keeps value`:
+why `Vec`'s `push` says `keeps value`; so does a value of a type that
+holds one, and a call's result, of the arguments its signature says it
+borrows. A `Handle<T>` holds no `T`, so a method that takes a value out by
+its handle and keeps the value keeps nothing of the handle:
+
+```wip,run
+import std::collections::{Arena, Handle}
+
+struct Shelf<T> {
+    items: Arena<T> = Arena()
+    taken: Vec<T> = Vec()
+}
+
+extend Shelf<T> {
+    var fn put(item: T): Handle<T> keeps item = self.items.add(item)
+
+    var fn take(handle: Handle<T>) = {
+        if self.items.remove(handle) is .Some(item) then self.taken.push(item)
+    }
+}
+
+fn main() = {
+    var shelf: Shelf<str> = Shelf()
+    val pear = shelf.put("pear")
+    shelf.take(pear)
+    assert(shelf.taken == ["pear"] && shelf.items.isEmpty())
+}
+```
+
+A generic body that keeps a `T` and does not say so is refused:
 
 ```wip,error=E0449
 struct Bag<T> {
@@ -649,15 +770,12 @@ fn main() = {}
 ```
 
 `keeps` names parameters that are not `&var`, in a function that has a
-`&var` parameter to keep them in, and follows the result type and `from`:
-`fn longer(a: str, b: str, into: &var Vec<str>): str from a, b keeps a, b`.
-A method's receiver is named `self`, where it is `&` or a value — a `fn`
+`&var` parameter to keep them in. A method's receiver is named `self`, where it is `&` or a value — a `fn`
 or a `move fn`, not a `var fn`, whose receiver is lent for writing: a
 method that fills a list with views of what it holds keeps `self`, and
 the list then borrows the receiver. An interface's method says what it
 keeps, and an implementation keeps no more; a call through a function
-value says nothing, and is taken to keep every argument. As `from` is,
-`keeps` is a word only there:
+value says nothing, and is taken to keep every argument:
 
 ```wip,run
 struct Shelf {
@@ -685,6 +803,77 @@ fn main() = {
 }
 ```
 
+### `empties`: what a call leaves
+
+A list of views borrows what its views borrow, until it is given a new
+value, which borrows what that value does. A method may say after its
+signature that it does the same, `empties`: a call leaves the receiver
+holding no view, so it borrows nothing from then on, until something is
+put in it again. The library's containers say it of `clear`
+and `takeAll`, so a list kept from one line to the next, for its room, is
+cleared and filled while the line it borrowed changes:
+
+```wip,run
+fn main() = {
+    var line = String()
+    var words: Vec<str> = Vec()
+    var count = 0
+    for text in ["a b", "c d e"] {
+        words.clear()
+        line.clear()
+        line.push(text)
+        for word in line.toStr().split(" ") {
+            words.push(word)
+        }
+        count += words.len()
+    }
+    assert(count == 5)
+}
+```
+
+A program's own container says it in one word:
+
+```wip
+view struct Words {
+    words: Vec<str> = Vec()
+    count: i64 = 0
+}
+
+extend Words {
+    var fn clear() empties = {
+        self.words.clear()
+        self.count = 0
+    }
+}
+```
+
+Only a `var fn` says it, since only it changes its receiver (E0462), and
+the body is held to it: each field of `self` that can hold a view is, at
+every way out, assigned a value that borrows nothing of `self`, or emptied
+by a call that empties, after the last thing of `self` put in it (E0463).
+An interface's method may say it, and then each implementation does:
+
+```wip,error=E0463
+view struct Words {
+    words: Vec<str> = Vec()
+    count: i64 = 0
+}
+
+extend Words {
+    var fn reset() empties = {
+        self.count = 0
+    }
+}
+
+fn main() = {
+    var words = Words()
+    words.reset()
+}
+```
+
+A view taken from the receiver before the call is the receiver's no
+longer, and still borrows what it did.
+
 ## What a thread may borrow
 
 A reference lives for the call it is lent to, so a thread may borrow
@@ -694,9 +883,3 @@ run are checked as a call's arguments are, which is what keeps threads
 from racing: a place one writes, no other reaches, and a place several
 reach, all only read. The one way to change a place through a `&` is
 `std::sync`'s `Atomic` and `Mutex`, each safe from any number of threads.
-
-## What is still to come
-
-Generic code writes through `&var [T]` rather than through `c[i]`, because
-the interfaces that answer `at` ask for the reading half alone. An interface
-that asks for both halves of a lending pair is the next step.

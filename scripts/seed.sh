@@ -11,10 +11,11 @@
 # `compiler/` by the `wip` there — `--with` here, where it is given one,
 # and otherwise, and in the guests, the one that system's seed builds — and
 # that compiler writes its own bitcode, a release build without debug
-# information, which a seed has no use for. The three are then optimised
-# for size by `clang-15`, the oldest `clang` Wip builds with, in the arm64
-# guest: LLVM reads bitcode older versions wrote, so every `clang` it
-# supports reads a seed, on every system.
+# information, which a seed has no use for: in parts, as a release build
+# is. The three are then joined each into one module by `llvm-link-15` and
+# optimised for size by `clang-15`, the oldest `clang` Wip builds with, in
+# the arm64 guest: LLVM reads bitcode older versions wrote, so every `clang`
+# it supports reads a seed, on every system.
 #
 # A seed is made again only when the compiler's source uses what the seed's
 # compiler cannot compile; the commit that changes it says which commit's
@@ -59,10 +60,11 @@ system() {
 raw=target/seed
 
 # This system's compiler as bitcode, unoptimised, and the libraries it
-# links: `raw/<system>.bc` and `raw/<system>.link`. The compiler is built
-# from the source by `$with`, or the seed's compiler, through a C compiler
-# that writes down how it is called, so that what the link names past its
-# objects is known: the last call is the compiler's own link.
+# links: its parts in `raw/<system>/`, `wip.bc` and `wip.1.bc` on, and
+# `raw/<system>.link`. The compiler is built from the source by `$with`, or
+# the seed's compiler, through a C compiler that writes down how it is
+# called, so that what the link names past its objects is known: the last
+# call is the compiler's own link.
 make_raw() {
     local name out log
     name=$(system)
@@ -71,34 +73,45 @@ make_raw() {
     printf '#!/bin/sh\necho "$*" >> "%s"\nexec %s "$@"\n' "$log" "${CC:-cc}" >"$out/cc.sh"
     chmod +x "$out/cc.sh"
     CC="$out/cc.sh" WIP_CACHE_DIR="$out/cache" scripts/build.sh --release ${with:+--with "$with"} --out "$out/stage"
-    mkdir -p "$raw"
+    mkdir -p "$raw/$name"
     WIP_HOME="$PWD" "$out/stage/bin/wip" build --release --no-debug-info --emit llvm-bc \
-        compiler/main.wip -o "$raw/$name.bc"
+        compiler/main.wip -o "$raw/$name/wip.bc"
     # The link is the last call: past `-o <program>` and the objects, the
-    # libraries and frameworks, one a line.
+    # libraries and frameworks, one a line; not what the linker is told to do
+    # with them, `-Wl,…`, such as a release build's stripping, which linking
+    # a seed has no need of.
     tail -1 "$log" | tr ' ' '\n' | awk '
         skip { skip = 0; next }
         $0 == "-o" { skip = 1; next }
-        /\.o$/ || $0 == "" { next }
+        /\.o$/ || /^-Wl,/ || $0 == "" { next }
         $0 == "-framework" { framework = 1; next }
         framework { print "-framework " $0; framework = 0; next }
         { print }' >"$raw/$name.link"
     rm -rf "$out"
-    echo "$name: $(du -h "$raw/$name.bc" | cut -f1) of bitcode"
+    echo "$name: $(du -ch "$raw/$name"/*.bc | tail -1 | cut -f1) of bitcode, $(ls "$raw/$name" | wc -l | tr -d ' ') parts"
 }
 
-# Every raw seed, optimised for size by clang-15 and compressed, into
+# Every raw seed's parts joined into one module by llvm-link-15, in their
+# order — a copy a part holds of another's function gives way to the
+# definition — optimised for size by clang-15 and compressed, into
 # `bootstrap/<system>/`.
 optimise() {
-    if ! command -v clang-15 >/dev/null; then
+    if ! command -v clang-15 >/dev/null || ! command -v llvm-link-15 >/dev/null; then
         mkdir -p /work/apt/partial
-        { apt-get update -qq && apt-get install -y -qq -o Dir::Cache::Archives=/work/apt clang-15; } >/dev/null
+        { apt-get update -qq && apt-get install -y -qq -o Dir::Cache::Archives=/work/apt clang-15 llvm-15; } >/dev/null
     fi
-    local bc name
-    for bc in "$raw"/*.bc; do
-        name=$(basename "$bc" .bc)
+    local dir name parts i
+    for dir in "$raw"/*/; do
+        name=$(basename "$dir")
+        parts=("$dir/wip.bc")
+        i=1
+        while [ -f "$dir/wip.$i.bc" ]; do
+            parts+=("$dir/wip.$i.bc")
+            i=$((i + 1))
+        done
+        llvm-link-15 "${parts[@]}" -o "$raw/$name.bc"
         mkdir -p "bootstrap/$name"
-        clang-15 -Oz -c -emit-llvm -Wno-override-module "$bc" -o "$raw/$name.oz.bc"
+        clang-15 -Oz -c -emit-llvm -Wno-override-module "$raw/$name.bc" -o "$raw/$name.oz.bc"
         gzip -9 -n -c "$raw/$name.oz.bc" >"bootstrap/$name/wip.bc.gz"
         cp "$raw/$name.link" "bootstrap/$name/link.txt"
         echo "$name: $(du -h "bootstrap/$name/wip.bc.gz" | cut -f1) gzipped"

@@ -106,7 +106,11 @@ extend Sources {
 		var file = self.files.len()
 		while file > 0 {
 			file -= 1
-			if self.files[file].2 <= span.lo then return .Some(file)
+			val (_, text, base) = self.files[file]
+			// Past the last file's end is in no file: what the build was
+			// given, which no line of the program says.
+			if base <= span.lo then
+				return if span.lo as i64 > base as i64 + text.len() then .None else .Some(file)
 		}
 		return .None
 	}
@@ -121,6 +125,10 @@ pub struct LoadedModule {
 	/// What `@derive` writes for its types: syntax the checker reads as one
 	/// more of its files, placed in the files above.
 	pub derived: Ast
+	/// Its test files, whose names are each their own, and what `@derive`
+	/// writes for each one's types, which is that file's too.
+	pub tests: Vec<Parsed> = Vec()
+	pub testDerived: Vec<Ast> = Vec()
 	/// Where its files are. Empty for the standard library, which is in
 	/// the compiler.
 	pub dir: String
@@ -131,6 +139,9 @@ pub struct LoadedModule {
 	/// Its package's root, which a file it embeds may not leave. Nothing
 	/// for the standard library.
 	pub root: Option<String>
+	/// What its package's `@files` names, which `package::besideProgram` is
+	/// asked for.
+	pub packageFiles: Vec<String> = Vec()
 }
 
 /// A program: every module it reaches, and every file's text.
@@ -154,6 +165,19 @@ pub struct Loaded {
 	/// How many threads the phases that read the program split their work
 	/// across: given to the loader, and kept with what it loaded.
 	pub threads: i64
+	/// The constants the build defines, `--define NAME=VALUE`.
+	pub var defines: Vec<hir::Define> = Vec()
+}
+
+extend Loaded {
+	/// The constants the build defines, from `--define NAME=VALUE`, each
+	/// value's text kept for a `str` constant to hold.
+	pub var fn define(given: &[(String, String)]) = {
+		for (name, value) in given {
+			val text = self.interner.intern(value)
+			self.defines.push(hir::Define(name: name.clone(), value: value.clone(), text: text))
+		}
+	}
 }
 
 /// What is compiled: a program; a program and every module of its
@@ -363,17 +387,27 @@ fn loadWith(
 	val started = Instant::now()
 	loaded.packages = packages(root, &var loaded, &overlay)
 	timings.record("read", started)
-	// `package::NAME` and `package::VERSION`: a module of two constants for
-	// each package that has a name, written here, as the prelude's
-	// `target.wip` is.
+	// `package::NAME`, `package::VERSION` and `package::besideProgram`: a
+	// module for each package that has a name, written here, as the
+	// prelude's `target.wip` is. Where a package's files are beside the
+	// program is the build's to say: at their own paths for the program's
+	// own package, and under a directory of its name for a dependency.
 	var generated: Vec<Generated> = Vec()
 	for package in loaded.packages {
 		val .Some(name) = package.name else continue
 		val modulePath =
 			if package.prefix.isEmpty() then String::of("package") else "\(package.prefix)::package"
-		var text = "pub val NAME: str = \"\(name)\"\n"
+		var text = String::of("import std::process\n\n")
+		text.push("pub val NAME: str = \"\(name)\"\n")
 		if package.version is .Some(version) then
 			text.push("pub val VERSION: str = \"\(version)\"\n")
+		val beside =
+			if package.prefix.isEmpty() then String::of("path")
+			else "\"\(package.prefix)/\\(path)\""
+		text.push(
+			"\n/// Where the file `path` this package names with `@files` is, as the program runs.\n",
+		)
+		text.push("pub fn besideProgram(path: str): String = process::besideProgram(\(beside))\n")
 		generated.push(Generated(path: modulePath, name: "<package \(name)>", text: text))
 	}
 	// The root module, the prelude, which every program has without an
@@ -510,8 +544,11 @@ fn loadWith(
 		timings.record("parse", started)
 		// In file order: diagnostics, imports, and the next wave.
 		var files: Vec<Vec<Parsed>> = Vec()
+		// Which of each module's files are tests, as `files` holds them.
+		var testing: Vec<Vec<bool>> = Vec()
 		for _ in wave {
 			files.push(Vec())
+			testing.push(Vec())
 		}
 		var next: Vec<String> = Vec()
 		var i = -1
@@ -582,23 +619,38 @@ fn loadWith(
 					seen.push(named.clone())
 					next.push(named)
 				}
+				testing[module].push(entries[first + i].0.endsWith(".test.wip"))
 				files[module].push(parsed)
 			}
 		}
 		for (module, modulePath) in wave.forwards().enumerate() {
-			val moduleFiles = mem::replace(&var files[module], Vec())
+			val allFiles = mem::replace(&var files[module], Vec())
 			// A directory with no files is no module: the import that named
 			// it reports it, with the span of the path it wrote.
-			if moduleFiles.isEmpty() && !modulePath.isEmpty() then continue
+			if allFiles.isEmpty() && !modulePath.isEmpty() then continue
+			// Its own files, and its tests', which come after them.
+			var moduleFiles: Vec<Parsed> = Vec()
+			var testFiles: Vec<Parsed> = Vec()
+			var k = 0
+			for parsed in move allFiles {
+				if testing[module][k] then testFiles.push(parsed) else moduleFiles.push(parsed)
+				k += 1
+			}
 			// What `@derive` writes, as syntax of the module's own, placed in
-			// its files.
+			// its files; and for each test file's types, of that file's own.
 			val derived = expand(&moduleFiles, &var loaded.interner)
+			var testDerived: Vec<Ast> = Vec()
+			for k in 0..testFiles.len() {
+				testDerived.push(expand(&testFiles[k..k + 1], &var loaded.interner))
+			}
 			val (dir, package) = places[module].clone()
 			var prefix = String()
 			var depends: Vec<String> = Vec()
 			var packageRoot: Option<String> = .None
+			var packageFiles: Vec<String> = Vec()
 			if package is .Some(p) {
 				prefix = loaded.packages[p].prefix.clone()
+				packageFiles = loaded.packages[p].files.clone()
 				for (name, _, _) in loaded.packages[p].depends {
 					depends.push(name.clone())
 				}
@@ -608,10 +660,13 @@ fn loadWith(
 				path: modulePath.clone(),
 				files: moduleFiles,
 				derived: derived,
+				tests: testFiles,
+				testDerived: testDerived,
 				dir: dir,
 				prefix: prefix,
 				depends: depends,
 				root: packageRoot,
+				packageFiles: packageFiles,
 			))
 		}
 		wave = next
@@ -624,7 +679,9 @@ fn loadWith(
 }
 
 /// The `.wip` files of one module of a package whose root is `root`, in
-/// name order. `package.wip` is the package's, not a module's.
+/// name order, its own before its tests', so that what the module declares
+/// is the first of a name and what a test declares again is the one said
+/// to be declared twice. `package.wip` is the package's, not a module's.
 fn moduleFiles(
 	root: str,
 	module: str,
@@ -663,7 +720,11 @@ fn moduleFiles(
 		if text.len() > 0xFFFF_FFFF then return .Err("`\(file)` is larger than 4 GiB")
 		files.push((file, text))
 	}
-	files.sortBy((a, b) => a.0 < b.0)
+	files.sortBy((a, b) => {
+		val aTest = a.0.toStr().endsWith(".test.wip")
+		val bTest = b.0.toStr().endsWith(".test.wip")
+		if aTest != bTest then !aTest else a.0 < b.0
+	})
 	return .Ok(files)
 }
 
@@ -776,14 +837,40 @@ pub fn moduleDir(root: str, module: str): String = {
 }
 
 extend LoadedModule {
-	/// The module as the checker reads it: its files, and then what `@derive`
-	/// wrote for them.
-	pub fn syntax(): ModuleAst from self = {
+	/// Its files as they are written, its own and then its tests', and not
+	/// what `@derive` writes for them.
+	pub fn written(): Vec<&Ast> from self = {
 		var files: Vec<&Ast> = Vec()
 		for f in self.files {
 			files.push(&f.ast)
 		}
-		if !self.derived.items.isEmpty() then files.push(&self.derived)
+		for f in self.tests {
+			files.push(&f.ast)
+		}
+		return files
+	}
+
+	/// The module as the checker reads it: its files, and then what `@derive`
+	/// wrote for them.
+	pub fn syntax(): ModuleAst from self = {
+		var files: Vec<&Ast> = Vec()
+		var tests: Vec<Option<i64>> = Vec()
+		for f in self.files {
+			files.push(&f.ast)
+			tests.push(.None)
+		}
+		if !self.derived.items.isEmpty() {
+			files.push(&self.derived)
+			tests.push(.None)
+		}
+		for k in 0..self.tests.len() {
+			files.push(&self.tests[k].ast)
+			tests.push(.Some(k))
+			if !self.testDerived[k].items.isEmpty() {
+				files.push(&self.testDerived[k])
+				tests.push(.Some(k))
+			}
+		}
 		// A module of the program has a package; the standard library's have
 		// none, and no directory. An empty directory is the current one, as a
 		// bare file name's parent is.
@@ -799,6 +886,8 @@ extend LoadedModule {
 				.Some(root) => .Some(if root.isEmpty() then "." else root.clone())
 				.None => .None
 			},
+			packageFiles: self.packageFiles.clone(),
+			tests: tests,
 		)
 	}
 }

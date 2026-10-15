@@ -190,6 +190,7 @@
 
 "from" @keyword
 "keeps" @keyword
+"empties" @keyword
 ((modifier) @keyword (#eq? @keyword "implicit"))
 
 [

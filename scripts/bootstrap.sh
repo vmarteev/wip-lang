@@ -66,9 +66,10 @@ mkdir -p "$work"
 started=$SECONDS
 say() { printf '%-34s %ss\n' "$1" $((SECONDS - started)); }
 
-# Stage A. The table of calls is a list of none: one word, its count.
+# Stage A. The table of calls is a list of none: no entries, where they
+# begin and end, and no parts.
 gunzip -c "$seed/wip.bc.gz" >"$work/seed.bc"
-printf '@"wip.frame_tables" = hidden global [1 x i64] zeroinitializer, align 8\n' >"$work/tables.ll"
+printf '@"wip.frame_tables" = hidden global [3 x i64] zeroinitializer, align 8\n' >"$work/tables.ll"
 "$clang" -O2 -Wno-override-module -c "$work/seed.bc" -o "$work/seed.o"
 "$clang" -Wno-override-module -c "$work/tables.ll" -o "$work/tables.o"
 link=()

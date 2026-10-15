@@ -973,6 +973,11 @@ fn main() = {
 }
 ```
 
+An app on iOS may not start another program: there, `Command` answers the
+error the system gives, as it answers any refusal; and iOS has none of the
+programs a shell has, `printf` and `false` among them, even in the
+simulator, which allows a start.
+
 A program that ends with a code other than 0 has answered, not failed:
 `exit.success()` asks. Failing to start is an `IoError`.
 
@@ -1404,6 +1409,7 @@ or one of the special files — a `Pipe`, a `Socket`, a `CharDevice`, a
 `BlockDevice` — or `Other`; `kind.isSpecial()` says whether it is none of
 the first three. `meta` follows a symbolic link and `linkMeta` looks at
 the link itself; `exists` asks whether there is anything there;
+`readBytes` reads a whole file that need not be text, as a `Vec<u8>`;
 `removeFile` removes a file and refuses a directory; `makeDir` makes a
 directory and fails where one already is, and `File::createNew` makes a
 file the same way, where `File::create` would empty one that is there. An
@@ -1422,9 +1428,15 @@ way.
 none an error where it is there already; `removeDir` removes an empty
 directory, and `removeAll` a directory and everything in it, or a file;
 `rename` moves a path within its filesystem; `copy` writes a file's bytes
-and its permission bits to another, and answers how many bytes.
+and its permission bits to another, and answers how many bytes;
+`makeLink(target, at)` makes a symbolic link, which `removeAll` removes
+without what it names.
 `std::process` answers the program's own `currentDir()`, `executable()` —
-the absolute path of the file it was started from — and `id()`, and
+the absolute path of the file it was started from — `besideProgram(path)`,
+where `path` is beside that file, which is where the files a package names
+with `@files` are, each package's code finding its own with
+`package::besideProgram` ([page 12](12-tools.md)); this one is for what
+is beside the program that no package names — and `id()`, and
 `std::io` whether a stream is a terminal, `io::isTerminal(.Output)`, which
 is what decides whether to colour what is written:
 
@@ -1439,8 +1451,11 @@ fn main() = {
     assert(fs::writeFile("\(root)/a/b/note", "hi").isOk())
     assert(fs::copy("\(root)/a/b/note", "\(root)/copy") == .Ok(2))
     assert(fs::rename("\(root)/copy", "\(root)/moved").isOk())
+    assert(fs::makeLink("a", "\(root)/link").isOk())
+    assert(fs::readFile("\(root)/link/b/note") == .Ok(String::of("hi")))
     assert(fs::removeAll(root).isOk() && !fs::exists(root))
     assert(process::executable().isOk())
+    assert(process::besideProgram("levels").endsWith("/levels"))
     val colour = io::isTerminal(.Output)
     assert(colour || !colour)
 }
@@ -1506,9 +1521,10 @@ val BUILT: str = embed::textOr("built.txt", "")
 ## What the target is
 
 Three constants the compiler writes say what machine the program is being
-compiled for: `TARGET_OS` is `macos`, `linux` or
-`windows`; `TARGET_ARCH` is `arm64` or `x86_64`; `TARGET_VENDOR` is `apple`
-on a Mac and empty elsewhere.
+compiled for: `TARGET_OS` is `macos`, `linux`,
+`windows` or `ios`, which the simulator is too; `TARGET_ARCH` is `arm64` or
+`x86_64`; `TARGET_VENDOR` is `apple` on a Mac and on iOS, and empty
+elsewhere.
 
 ```wip,run
 fn main() = {

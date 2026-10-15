@@ -171,6 +171,8 @@ module.exports = grammar({
         optional(field('lends_from', $.lends_from)),
       )),
       optional(field('keeps', $.keeps)),
+      // A call leaves the receiver holding no view. A word only here.
+      optional('empties'),
       optional(seq('=', field('body', $._expression))),
     ),
 
@@ -778,11 +780,15 @@ module.exports = grammar({
       $.slice_pattern,
       $.variant_pattern,
       $.or_pattern,
+      $.var_pattern,
     ),
 
     wildcard_pattern: _ => '_',
 
     identifier_pattern: $ => $.identifier,
+
+    // `var name`: a name bound to a variable of its own.
+    var_pattern: $ => seq('var', field('name', $.identifier)),
 
     literal_pattern: $ => choice(
       seq(optional('-'), $.integer),

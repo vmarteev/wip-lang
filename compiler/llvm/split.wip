@@ -1,9 +1,16 @@
-// A debug build's program as parts, each an LLVM module of its own that
-// `clang` compiles at once with the others, and that the cache keeps on its
-// own.
+// A program as parts, each an LLVM module of its own that `clang` compiles
+// at once with the others, and that the cache keeps on its own.
 //
 // At `-O0` nothing is inlined, so where a function goes changes nothing it
-// does. The functions are taken file by file, in the order each file's were
+// does. At `-O2` a part inlines only what it has the body of, and Wip's code
+// is made of small functions, which a call into another part would leave
+// calls; so in a release build a part also has a copy of each small
+// function of another part that it names, and of each that those name, as
+// LLVM's `available_externally`: a body to inline, never emitted, the
+// definition being the other part's. A function in a cycle of calls is
+// inlined nowhere, and is not copied. A function no other part names is kept
+// to its part, as one module keeps its functions, so that LLVM may drop it
+// once every call is inlined, or change how it is called. The functions are taken file by file, in the order each file's were
 // defined, and cut into parts of about a megabyte of text: each part is a
 // `clang` started, which costs as much as compiling a part a third that size,
 // and a smaller part is compiled again sooner after an edit, which changes
@@ -23,7 +30,7 @@
 // into its part, which a program's millions of instructions make worth more
 // than a copy.
 
-import std::collections::{Map}
+import std::collections::{Map, Set}
 import std::future
 import std::mem
 
@@ -39,9 +46,16 @@ val MOST: i64 = 1 << 20
 /// One function in this many, by its symbol's hash, may end a part.
 val ENDS: u64 = 16
 
+/// How many instructions a function of another part is at most, for a part
+/// of a release build to copy it: fewer, and too little is inlined for the
+/// program to run as fast as one module; more, and the parts grow, and the
+/// build slows, with the program no faster.
+val COPIED: i64 = 250
+
 /// The program's parts, each a module of its own: the function `i` of
-/// `whole` was written in `files[i]`.
-fn split(whole: Module, files: &[String]): Vec<Module> = {
+/// `whole` was written in `files[i]`. Where `copies` says, as for a release
+/// build, each part has a copy of the small functions of others it names.
+fn split(whole: Module, files: &[String], copies: bool): Vec<Module> = {
 	var module = whole
 	var byFile: Map<String, Vec<i64>> = Map()
 	for (index, file) in files.forwards().enumerate() {
@@ -82,6 +96,14 @@ fn split(whole: Module, files: &[String]): Vec<Module> = {
 	for (index, global) in module.data.forwards().enumerate() {
 		data.put(global.name, index)
 	}
+	// The functions a part may copy, by their symbols.
+	var copyable: Map<u32, Function> = Map()
+	if copies {
+		for function in module.functions {
+			if !function.inCycle && function.instructions() <= COPIED then
+				copyable.put(function.symbol, function.clone())
+		}
+	}
 	// Each function to its part, in the part's order.
 	var taken: Vec<Option<Function>> = Vec()
 	for function in mem::replace(&var module.functions, Vec()) {
@@ -96,26 +118,55 @@ fn split(whole: Module, files: &[String]): Vec<Module> = {
 			}
 			functions.push(function)
 		}
-		works.push(PartWork(at: at, functions: functions, made: .None))
+		var symbols: Vec<u32> = Vec()
+		for function in functions {
+			symbols.push(function.symbol)
+		}
+		works.push(PartWork(
+			at: at,
+			functions: functions,
+			symbols: symbols,
+			named: Vec(),
+			made: .None,
+		))
 	}
 	// Each part made on a thread: they share only what they read.
 	future::each(&var works, (work) => {
-		var writing = PartWriter::new(&module, &data, &defined, work.at)
+		var writing = PartWriter::new(&module, &data, &defined, &copyable, work.at)
 		work.made = .Some(writing.part(mem::replace(&var work.functions, Vec())))
+		work.named = mem::replace(&var writing.others, Vec())
 	})
+	// What another part names, it declares or copies; the rest of a release
+	// build's functions are their own part's.
+	var namedElsewhere: Set<u32> = Set()
+	for work in works {
+		for symbol in work.named {
+			namedElsewhere.add(symbol)
+		}
+	}
 	var made: Vec<Module> = Vec()
 	for work in move works {
-		val .Some(part) = move work.made else panic("every part is made")
-		made.push(part)
+		var .Some(written) = work.made else panic("every part is made")
+		if copies {
+			for (i, symbol) in work.symbols.forwards().enumerate() {
+				if written.functions[i].linkage == Linkage::Hidden &&
+					!namedElsewhere.contains(&symbol) {
+					written.functions[i].linkage = .Internal
+				}
+			}
+		}
+		made.push(written)
 	}
 	return made
 }
 
-/// A part to be made: its number, its functions, and the module made of
-/// them.
+/// A part to be made: its number, its functions and their symbols, the
+/// functions of other parts it names, and the module made of them.
 struct PartWork {
 	at: i64
 	functions: Vec<Function>
+	symbols: Vec<u32>
+	named: Vec<u32>
 	made: Option<Module>
 }
 
@@ -136,6 +187,8 @@ view struct PartWriter {
 	/// Each constant of the program's, by its name's number.
 	wholeData: &Map<u32, i64>
 	defined: &Map<u32, (i64, Declaration)>
+	/// The functions a part may copy, by the program's numbers.
+	copyable: &Map<u32, Function>
 	at: i64
 	/// The part's names, by its own numbers.
 	names: Vec<String>
@@ -148,6 +201,12 @@ view struct PartWriter {
 	nodeOrder: Vec<i64>
 	/// The functions of other parts it calls or names, by its own numbers.
 	declared: Map<u32, Declaration>
+	/// The functions of other parts it copies, by the program's numbers, in
+	/// the order its text names them.
+	copied: Vec<u32>
+	/// The functions of other parts it names, copied or declared, by the
+	/// program's numbers.
+	others: Vec<u32>
 }
 
 extend PartWriter {
@@ -155,11 +214,13 @@ extend PartWriter {
 		whole: &Module,
 		wholeData: &Map<u32, i64>,
 		defined: &Map<u32, (i64, Declaration)>,
+		copyable: &Map<u32, Function>,
 		at: i64,
 	): PartWriter = PartWriter(
 		whole: &whole,
 		wholeData: &wholeData,
 		defined: &defined,
+		copyable: &copyable,
 		at: at,
 		names: Vec(),
 		numbers: Map(),
@@ -167,19 +228,32 @@ extend PartWriter {
 		nodes: Map(),
 		nodeOrder: Vec(),
 		declared: Map(),
+		copied: Vec(),
+		others: Vec(),
 	)
 
-	/// The part of `functions`: the functions, then the constants they name,
-	/// the compile unit and the flags, and the nodes, each numbered as it is
-	/// first named.
+	/// The part of `functions`: the functions, then the copies of others',
+	/// then the constants they name, the compile unit and the flags, and the
+	/// nodes, each numbered as it is first named.
 	var fn part(functions: Vec<Function>): Module = {
 		val whole = self.whole
 		var defined: Vec<Function> = Vec()
 		for function in move functions {
 			defined.push(self.function(function))
 		}
-		var data: Vec<Global> = Vec()
+		// A copy may name more to copy, after it.
 		var next = 0
+		while next < self.copied.len() {
+			val .Some(original) = self.copyable.get(&self.copied[next]) else {
+				panic("what is copied is copyable")
+			}
+			next += 1
+			var copy = self.function(original.clone())
+			copy.linkage = .AvailableExternally
+			defined.push(copy)
+		}
+		var data: Vec<Global> = Vec()
+		next = 0
 		while next < self.dataOrder.len() {
 			val global = whole.data[self.dataOrder[next]].clone()
 			next += 1
@@ -256,9 +330,12 @@ extend PartWriter {
 		if constant.isNone() &&
 			self.defined.get(&global) is .Some((part, declaration)) &&
 			part != self.at {
-			var declared = declaration.clone()
-			declared.symbol = mine
-			self.declared.put(mine, declared)
+			self.others.push(global)
+			if self.copyable.contains(&global) then self.copied.push(global) else {
+				var declared = declaration.clone()
+				declared.symbol = mine
+				self.declared.put(mine, declared)
+			}
 		}
 		return mine
 	}

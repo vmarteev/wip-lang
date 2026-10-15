@@ -14,7 +14,21 @@
 import std::collections::{Map}
 import std::mem
 import syntax as ast
-import syntax::{BinaryOp, COMPTIME_MARK, Diagnostic, Edit, NOT_A_CONSTANT, Span}
+import syntax::{BinaryOp, COMPTIME_MARK, DEFINE, Diagnostic, Edit, NOT_A_CONSTANT, Span, Symbol}
+
+/// Where a diagnostic of what a build was given is: in no file, so it is
+/// shown without an excerpt.
+val NOWHERE: u32 = 0xffffffff
+
+/// A constant a build sets, as `--define NAME=VALUE` gives it: the name,
+/// alone or with its module's path, `engine::VALIDATION`; the value as it
+/// was written; and that text, interned, for a `str`.
+@derive(Clone)
+pub struct Define {
+	pub var name: String
+	pub var value: String
+	pub var text: Symbol
+}
 
 /// Where a constant was written, so that a use of it can work it out even
 /// where the pass over its own file has not reached it yet.
@@ -23,6 +37,8 @@ view struct ConstSource {
 	decl: &ast::ValDecl
 	/// Where `@comptime` was written on it, if it was.
 	comptime: Option<Span>
+	/// Where `@define` was written on it, if it was: a build may set it.
+	defined: Option<Span>
 	ast: &ast::Ast
 	module: i64
 	imports: FileImports
@@ -52,18 +68,19 @@ extend Lowerer {
 			))
 			// Reported where it is; it keeps its place in this module's scope.
 			self.preludeName(decl.name, "a constant named")
-			match self.consts().get(&decl.name.sym) {
+			match self.constHere(decl.name.sym) {
 				.Some(first) => {
 					val previous = self.program.consts[first].span
 					self.duplicate(decl.name, previous)
 				}
-				.None => self.modules[self.current].consts.put(decl.name.sym, id)
+				.None => self.modules[self.declaring(decl.isPub)].consts.put(decl.name.sym, id)
 			}
 			// Where it was written, so that a use can work it out before the
 			// pass over its own file reaches it.
 			val source = ConstSource(
 				decl: &decl,
 				comptime: annotations.comptime,
+				defined: annotations.defined,
 				ast: &file,
 				module: self.current,
 				imports: self.imports.clone(),
@@ -72,7 +89,108 @@ extend Lowerer {
 				generators: self.generators.clone(),
 			)
 			self.constSources.put(id, source)
+			if annotations.defined.isSome() then self.definable.push(id)
 		}
+	}
+
+	/// Which constant each of the build's defines sets, by its name alone or
+	/// by its module's path and its name; reported where none does, or more
+	/// than one, with the names a build may set.
+	var fn matchDefines(defines: &[Define]) = {
+		for (i, define) in defines.forwards().enumerate() {
+			var matched: Vec<ConstId> = Vec()
+			for id in self.definable {
+				val def = &self.program.consts[id]
+				val name = self.text(def.name)
+				val path = &self.modules[def.module as i64].path
+				val qualified = if path.isEmpty() then String::of(name) else "\(path)::\(name)"
+				if define.name == name || define.name == qualified then matched.push(id)
+			}
+			if matched.len() == 1 {
+				if self.defines.contains(&matched[0]) then
+					self.report(
+						Diagnostic::error(
+							DEFINE,
+							"`\(self.definedName(matched[0]))` is defined twice",
+							Span::at(NOWHERE),
+							"given to the build",
+						).withNote("a build gives a constant one value"),
+					)
+				else self.defines.put(matched[0], i)
+				continue
+			}
+			var names: Vec<String> = Vec()
+			for id in if matched.isEmpty() then self.definable.items() else matched.items() {
+				names.push("`\(self.definedName(id))`")
+			}
+			val listed =
+				if names.isEmpty() then String::of("no constant of the program says `@define`")
+				else "the constants a build may set are \(names.join(", "))"
+			self.report(
+				Diagnostic::error(
+					DEFINE,
+					if matched.isEmpty() then
+						"`--define \(define.name)` names no constant that says `@define`"
+					else "`--define \(define.name)` names \(matched.len()) constants",
+					Span::at(NOWHERE),
+					"given to the build",
+				).withNote(listed),
+			)
+		}
+	}
+
+	/// A `@define` constant's name as a build names it: with its module's
+	/// path, where it has one.
+	fn definedName(id: ConstId): String = {
+		val def = &self.program.consts[id]
+		val path = &self.modules[def.module as i64].path
+		return if path.isEmpty() then String::of(self.text(def.name))
+		else "\(path)::\(self.text(def.name))"
+	}
+
+	/// What a build's define gives constant `id`, of type `ty`, where it
+	/// gives one: the value of its text, read as the type reads one; reported
+	/// at the constant where the text is not one.
+	var fn definedValue(id: ConstId, ty: Ty, span: Span): Option<Result<ConstValue, Unfolded>> = {
+		val .Some(index) = self.defines.get(&id) else return .None
+		val define = &self.defineList[index]
+		val text = define.value.toStr()
+		val name = self.definedName(id)
+		val value: Option<ConstValue> = match self.kind(ty) {
+			.Bool =>
+				if text == "true" then .Some(.Bool(true))
+				else if text == "false" then .Some(.Bool(false))
+				else .None
+			.Int(int: t) => {
+				val negative = text.startsWith("-")
+				val digits = if negative then text[1..] else text
+				match digits.toU128() {
+					.Ok(magnitude) if (if negative then magnitude <= t.minMagnitude()
+					else magnitude <= t.max()) => .Some(
+						.Int((if negative then 0 -% magnitude else magnitude) & t.mask()),
+					)
+					_ => .None
+				}
+			}
+			.Float(..) => match text.toFloat() {
+				.Ok(f) => .Some(.Float(f))
+				.Err(..) => .None
+			}
+			.Str => .Some(.Str(define.text))
+			_ => .None
+		}
+		if value is .Some(v) then return .Some(.Ok(v.clone()))
+		self.report(
+			Diagnostic::error(
+				DEFINE,
+				"`--define \(define.name)=\(text)` is not \(self.tyName(ty))",
+				span,
+				"`\(name)` is \(self.tyName(ty))",
+			).withNote(
+				"the build's value is read as the constant's type reads one: `true` or `false`, an integer in its range, a float, or any text for a `str`",
+			),
+		)
+		return .Some(.Err(.Failed))
 	}
 
 	/// Works out the values of the file's constants, once every type is
@@ -82,9 +200,11 @@ extend Lowerer {
 		// two constants defined in terms of each other are reported from the
 		// first of them, whatever else a program happens to name.
 		var ids: Vec<ConstId> = Vec()
-		val scope = &self.consts()
-		for i in 0..scope.len() {
-			ids.push(scope.valueAt(i).clone())
+		for scope in self.here() {
+			val consts = &self.modules[scope].consts
+			for i in 0..consts.len() {
+				ids.push(consts.valueAt(i).clone())
+			}
 		}
 		ids.sortBy((a, b) => a.index() < b.index())
 		for id in ids {
@@ -170,6 +290,38 @@ extend Lowerer {
 		// a function of its own, which the compiler runs once the program is
 		// checked, where the constant says so with `@comptime`.
 		folded = self.comptimeMark(&decl, source.comptime, folded, value)
+		// A constant a build may set: a `bool`, an integer, a float or a
+		// `str`, its value written where it is; and what a build gave it in
+		// place of that.
+		if source.defined is .Some(at) && !self.hasError(ty) {
+			val settable = self.kind(ty) is .Bool | .Int(..) | .Float(..) | .Str
+			if !settable {
+				self.report(
+					Diagnostic::error(
+						DEFINE,
+						"a build cannot set \(self.tyName(ty))",
+						at,
+						"`@define` here",
+					).withNote(
+						"a build gives a `@define` constant a `bool`, an integer, a float or a `str`",
+					),
+				)
+			} else if folded is .Err(.Runs) {
+				val span = self.state.body.exprs[value].span
+				self.report(
+					Diagnostic::error(
+						DEFINE,
+						"a `@define` constant's value is written where it is",
+						span,
+						"worked out",
+					).withNote(
+						"what the build does not set is the value written, a literal, as `--define` gives one",
+					),
+				)
+			} else if self.definedValue(id, ty, decl.name.span) is .Some(given) {
+				folded = given
+			}
+		}
 		var code: Option<FnId> = .None
 		if folded is .Err(.Runs) {
 			var body = mem::replace(&var self.state.body, Body())
@@ -246,6 +398,13 @@ extend Lowerer {
 				val left = self.fold(lhs)?
 				val right = self.fold(rhs)?
 				self.foldBinary(op, left, right, lhsTy, span)
+			}
+			// Text compared, as `TARGET_OS == "linux"` is: by its bytes, so
+			// that a constant built of a target and a define is one, and
+			// decides a branch as they do.
+			.StrEq(lhs, rhs) => match (self.fold(lhs)?, self.fold(rhs)?) {
+				(.Str(a), .Str(b)) => .Ok(.Bool(self.text(a) == self.text(b)))
+				_ => .Err(.Runs)
 			}
 			// `as` between numbers: the checker has already agreed to it.
 			.Cast(inner) => {

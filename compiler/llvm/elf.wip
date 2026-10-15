@@ -1,8 +1,9 @@
-// An ELF object, read as far as adding to it needs, and added to: a section
-// of data, the relocations of the addresses in it, and the symbols they name.
+// An ELF object, read as far as adding to it needs, and added to: sections
+// of data, the relocations of the addresses in them, and the symbols they
+// name.
 //
 // The object is kept as `clang` wrote it, and what is added comes after it:
-// the section's bytes and its relocations, the symbol table again with the
+// each section's bytes and its relocations, the symbol table again with the
 // new symbols at its end, the strings again with their names, and a header
 // for each section, which names them all. A new symbol is global, and global
 // symbols come last, so none `clang` wrote moves and none of its relocations
@@ -23,6 +24,7 @@ val SHT_RELA: u32 = 4
 val SHF_WRITE: u64 = 1
 val SHF_ALLOC: u64 = 2
 val SHF_INFO_LINK: u64 = 0x40
+val SHF_LINK_ORDER: u64 = 0x80
 val STB_GLOBAL: u8 = 1
 val STT_NOTYPE: u8 = 0
 val STT_OBJECT: u8 = 1
@@ -33,12 +35,15 @@ val R_X86_64_64: u32 = 1
 val R_AARCH64_ABS64: u32 = 257
 
 /// A section of data to add: its name, its bytes, the hidden symbol at its
-/// start, and where in it an address goes, and of what.
+/// start where it has one, where in it an address goes, and of what, and
+/// the section of the object it is tied to where it has one: kept by a
+/// linker that drops what nothing reaches only while that section is.
 struct Data {
 	name: String
 	bytes: Vec<u8>
-	symbol: String
+	symbol: Option<String>
 	addresses: Vec<(u64, Address)>
+	tiedTo: Option<u32>
 }
 
 /// What an address in the data is of.
@@ -116,8 +121,8 @@ extend Elf {
 	}
 }
 
-/// `object`, an ELF object, with `data` added as a section of its own.
-fn withData(object: &[u8], data: &Data): Result<Vec<u8>, String> = {
+/// `object`, an ELF object, with each of `added` as a section of its own.
+fn withData(object: &[u8], added: &[Data]): Result<Vec<u8>, String> = {
 	val elf = Elf::read(&object)?
 	val absolute =
 		if elf.machine == EM_AARCH64 then R_AARCH64_ABS64
@@ -133,15 +138,14 @@ fn withData(object: &[u8], data: &Data): Result<Vec<u8>, String> = {
 	val .Some(table) = symtab else return .Err("an object with no symbol table")
 	val strtab = elf.sections[table].link as i64
 	if strtab >= elf.sections.len() then return .Err("the symbol table's strings are no section")
+	val count = elf.sections.len() + 2 * added.len()
+	if count >= 0xff00 then return .Err("\(count) sections, more than an object's header can count")
 	// LLVM keeps the sections' names with the symbols' strings, and where they
-	// are one table, it is written once.
+	// are one table, it is written once; a name many sections share, once.
 	val shared = elf.names == strtab
 	var strings = elf.data(&object, strtab)?
 	var names: Vec<u8> = if shared then Vec() else elf.data(&object, elf.names)?
-	val dataName =
-		if shared then addName(&var strings, data.name) else addName(&var names, data.name)
-	val rela = ".rela\(data.name)"
-	val relaName = if shared then addName(&var strings, rela) else addName(&var names, rela)
+	var sectionNames: Map<String, u32> = Map()
 
 	// The symbols by name, the last of a name standing for it; and those
 	// added at the end.
@@ -152,86 +156,108 @@ fn withData(object: &[u8], data: &Data): Result<Vec<u8>, String> = {
 		byName.put(nameAt(&strings, name)?, index as u32)
 	}
 	// A symbol another object holds, named for the linker to find.
-	for (_, address) in data.addresses {
-		if address is .Symbol(name) && !byName.contains(&name) {
-			val index = addSymbol(
-				&var symbols,
-				&var strings,
-				name,
-				(STB_GLOBAL << 4) | STT_NOTYPE,
-				0,
-				0,
-				0,
-			)
-			byName.put(name.clone(), index)
-		}
-	}
-	val dataIndex = elf.sections.len()
-	val start = addSymbol(
-		&var symbols,
-		&var strings,
-		data.symbol,
-		(STB_GLOBAL << 4) | STT_OBJECT,
-		STV_HIDDEN,
-		dataIndex as u16,
-		data.bytes.len() as u64,
-	)
-	var relocations: Vec<u8> = Vec()
-	for (offset, address) in data.addresses {
-		val (symbol, addend) = match address {
-			.Symbol(name) => match byName.get(&name) {
-				.Some(index) => (index, 0 as i64)
-				.None => return .Err("no symbol `\(name)` in the object")
+	for data in added {
+		for (_, address) in data.addresses {
+			if address is .Symbol(name) && !byName.contains(&name) {
+				val index = addSymbol(
+					&var symbols,
+					&var strings,
+					name,
+					(STB_GLOBAL << 4) | STT_NOTYPE,
+					0,
+					0,
+					0,
+				)
+				byName.put(name.clone(), index)
 			}
-			.Here(at) => (start, at as i64)
 		}
-		pushWord(&var relocations, offset)
-		pushWord(&var relocations, (symbol as u64) << 32 | absolute)
-		pushWord(&var relocations, addend as u64)
 	}
 
-	// The object, then what is added, each where its alignment says.
+	// Each section's bytes and relocations, after the object, each where its
+	// alignment says.
 	var out = object.toVec()
-	val dataAt = place(&var out, &data.bytes, 8)
-	val relaAt = place(&var out, &relocations, 8)
+	var headers = elf.headers.clone()
+	for (i, data) in added.forwards().enumerate() {
+		val dataIndex = elf.sections.len() + 2 * i
+		val start: Option<u32> = match data.symbol {
+			.Some(symbol) => Option::Some(
+				addSymbol(
+					&var symbols,
+					&var strings,
+					symbol,
+					(STB_GLOBAL << 4) | STT_OBJECT,
+					STV_HIDDEN,
+					dataIndex as u16,
+					data.bytes.len() as u64,
+				),
+			)
+			.None => .None
+		}
+		var relocations: Vec<u8> = Vec()
+		for (offset, address) in data.addresses {
+			val (symbol, addend) = match address {
+				.Symbol(name) => match byName.get(&name) {
+					.Some(index) => (index, 0 as i64)
+					.None => return .Err("no symbol `\(name)` in the object")
+				}
+				.Here(at) => match start {
+					.Some(index) => (index, at as i64)
+					.None => return .Err("a place in `\(data.name)`, which has no symbol")
+				}
+			}
+			pushWord(&var relocations, offset)
+			pushWord(&var relocations, (symbol as u64) << 32 | absolute)
+			pushWord(&var relocations, addend as u64)
+		}
+		val dataAt = place(&var out, &data.bytes, 8)
+		val relaAt = place(&var out, &relocations, 8)
+		val rela = ".rela\(data.name)"
+		val dataName =
+			if shared then sectionName(data.name, &var strings, &var sectionNames)
+			else sectionName(data.name, &var names, &var sectionNames)
+		val relaName =
+			if shared then sectionName(rela, &var strings, &var sectionNames)
+			else sectionName(rela, &var names, &var sectionNames)
+		val (flags, link) = match data.tiedTo {
+			.Some(section) => (SHF_ALLOC | SHF_WRITE | SHF_LINK_ORDER, section)
+			.None => (SHF_ALLOC | SHF_WRITE, 0 as u32)
+		}
+		header(&var headers, dataName, SHT_PROGBITS, flags, dataAt, data.bytes.len(), link, 0, 0)
+		header(
+			&var headers,
+			relaName,
+			SHT_RELA,
+			SHF_INFO_LINK,
+			relaAt,
+			relocations.len(),
+			table as u32,
+			dataIndex as u32,
+			RELA as u64,
+		)
+	}
 	val stringsAt = place(&var out, &strings, 1)
 	val namesAt = if shared then stringsAt else place(&var out, &names, 1)
 	val symbolsAt = place(&var out, &symbols, 8)
-
-	var headers = elf.headers.clone()
 	moved(&var headers, table, symbolsAt, symbols.len())
 	moved(&var headers, strtab, stringsAt, strings.len())
 	if !shared then moved(&var headers, elf.names, namesAt, names.len())
-	header(
-		&var headers,
-		dataName,
-		SHT_PROGBITS,
-		SHF_ALLOC | SHF_WRITE,
-		dataAt,
-		data.bytes.len(),
-		0,
-		0,
-		0,
-	)
-	header(
-		&var headers,
-		relaName,
-		SHT_RELA,
-		SHF_INFO_LINK,
-		relaAt,
-		relocations.len(),
-		table as u32,
-		dataIndex as u32,
-		RELA as u64,
-	)
 	val headersAt = place(&var out, &headers, 8)
 	for i in 0..8 {
 		out[0x28 + i] = (headersAt >> (8 * i as u64)) as u8
 	}
-	val count = (dataIndex + 2) as u16
 	out[0x3c] = count as u8
 	out[0x3d] = (count >> 8) as u8
 	return .Ok(out)
+}
+
+/// Where the section name `name` is in `table`: where it was put before, or
+/// at its end.
+fn sectionName(name: str, table: &var Vec<u8>, known: &var Map<String, u32>): u32 = {
+	val key = String::of(name)
+	if known.get(&key) is .Some(at) then return at
+	val at = addName(&var table, name)
+	known.put(key, at)
+	return at
 }
 
 /// `name` at the end of a table of names, and where it is.

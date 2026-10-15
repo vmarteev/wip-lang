@@ -17,7 +17,9 @@ import lang::{
 	Debugger,
 	Emit,
 	Loaded,
+	Os,
 	Profile,
+	Shipping,
 	buildLoaded,
 	Search,
 	SourceFile,
@@ -42,7 +44,14 @@ import lang::{
 	isDirectory,
 	loadFor,
 	loadMode,
+	madeApp,
+	minimumOf,
 	parseFile,
+	placeFiles,
+	runOnDevice,
+	runOnSimulator,
+	simulator,
+	spawnOnSimulator,
 	renderAll,
 	renderProgram,
 	scripts as debuggerScripts,
@@ -66,6 +75,9 @@ fn main(args: &[cstring]): i64 = {
 	var libraryOption = false
 	var dumpDiagnosticsOption = false
 	var targets: Vec<str> = Vec()
+	// The constants the build defines, `--define NAME=VALUE`, as many as are
+	// given.
+	var defines: Vec<(String, String)> = Vec()
 	// `mir`'s, `build`'s, `run`'s and `test`'s option: a release build's
 	// form.
 	var releaseOption = false
@@ -79,6 +91,12 @@ fn main(args: &[cstring]): i64 = {
 	// An option only `build`, `run` and `test` take, given to another
 	// command.
 	var runOption: Option<str> = .None
+	// How an app for iOS is signed, and where it runs.
+	var shipping = Shipping()
+	// An option only `build` and `run` take, given to another command; and
+	// one only `run` takes.
+	var appOption: Option<str> = .None
+	var deviceOption: Option<str> = .None
 	// `build`'s options: where the build is written, what it writes, where
 	// the declarations of what a library exports go, and whether to say how
 	// long each phase took.
@@ -250,8 +268,47 @@ fn main(args: &[cstring]): i64 = {
 				checkOption = .Some("--dump-diagnostics")
 				dumpDiagnosticsOption = true
 			}
+			.Long("define") => {
+				val given = match arguments.value() {
+					.Ok(value) => value
+					.Err(error) => {
+						io::eprintln("error: \(error)")
+						return 2
+					}
+				}
+				val .Some(at) = given.indexOf("=") else {
+					io::eprintln("error: `--define` is `NAME=VALUE`, not `\(given)`")
+					return 2
+				}
+				if at == 0 {
+					io::eprintln("error: `--define \(given)` names no constant")
+					return 2
+				}
+				defines.push((String::of(given[0..at]), String::of(given[(at + 1)..])))
+			}
+			.Long("sign") | .Long("profile") => {
+				val signs = argument == .Long("sign")
+				appOption = .Some(if signs then "--sign" else "--profile")
+				match arguments.value() {
+					.Ok(value) if signs => shipping.identity = .Some(String::of(value))
+					.Ok(value) => shipping.profile = .Some(String::of(value))
+					.Err(error) => {
+						io::eprintln("error: \(error)")
+						return 2
+					}
+				}
+			}
+			.Long("device") => {
+				deviceOption = .Some("--device")
+				match arguments.value() {
+					.Ok(value) => shipping.device = .Some(String::of(value))
+					.Err(error) => {
+						io::eprintln("error: \(error)")
+						return 2
+					}
+				}
+			}
 			.Long("target") => {
-				checkOption = .Some("--target")
 				match arguments.value() {
 					.Ok(value) => targets.push(value)
 					.Err(error) => {
@@ -335,6 +392,16 @@ fn main(args: &[cstring]): i64 = {
 			}
 		}
 	}
+	if command !is .Some("check") | .Some("mir") | .Some("build") | .Some("run") | .Some("test") &&
+		!defines.isEmpty() {
+		io::eprintln("error: `--define` is an option of `check`, `mir`, `build`, `run` and `test`")
+		return 2
+	}
+	if command !is .Some("check") | .Some("build") | .Some("run") | .Some("test") &&
+		!targets.isEmpty() {
+		io::eprintln("error: `--target` is an option of `check`, `build`, `run` and `test`")
+		return 2
+	}
 	if command == .Some("fmt") then return fmtCommand(&paths, stdinPath, check, &layout, color)
 	if fmtOption is .Some(option) {
 		io::eprintln("error: `\(option)` is an option of `fmt`")
@@ -347,6 +414,14 @@ fn main(args: &[cstring]): i64 = {
 	if command !is .Some("mir") | .Some("build") | .Some("run") | .Some("test") &&
 		mirOption is .Some(option) {
 		io::eprintln("error: `\(option)` is an option of `mir`, `build`, `run` and `test`")
+		return 2
+	}
+	if command !is .Some("build") | .Some("run") && appOption is .Some(option) {
+		io::eprintln("error: `\(option)` is an option of `build` and `run`")
+		return 2
+	}
+	if command !is .Some("run") | .Some("test") && deviceOption.isSome() {
+		io::eprintln("error: `--device` is an option of `run` and `test`")
 		return 2
 	}
 	if command !is .Some("build") | .Some("run") | .Some("test") && runOption is .Some(option) {
@@ -419,12 +494,48 @@ fn main(args: &[cstring]): i64 = {
 	return match command {
 		.Some("lex") => lexFile(path, color)
 		.Some("parse") => parseFileCommand(path, color)
-		.Some("check") if dumpHirOption => checkDumped(path, libraryOption, color, threads)
-		.Some("check") if !targets.isEmpty() => checkForTargets(path, &targets, color, threads)
-		.Some("check") => checkCommand(path, dumpDiagnosticsOption, color, threads)
-		.Some("mir") => mirCommand(path, releaseOption, libraryOption, color, threads)
+		.Some("check") if dumpHirOption => checkDumped(
+			path,
+			libraryOption,
+			&defines,
+			color,
+			threads,
+		)
+		.Some("check") if !targets.isEmpty() => checkForTargets(
+			path,
+			&targets,
+			&defines,
+			color,
+			threads,
+		)
+		.Some("check") => checkCommand(path, dumpDiagnosticsOption, &defines, color, threads)
+		.Some("mir") => mirCommand(path, releaseOption, libraryOption, &defines, color, threads)
 		.Some("build") | .Some("run") | .Some("test") => {
-			val cpu = match Cpu::parse(cpuOption) {
+			// One target, this machine where none is named.
+			if targets.len() > 1 {
+				io::eprintln("error: a build is for one target")
+				return 2
+			}
+			val named: Result<Vec<Target>, String> =
+				if targets.isEmpty() then .Ok([Target::host()]) else Target::parse(targets[0])
+			val target = match named {
+				.Ok(parsed) => {
+					if parsed.len() != 1 {
+						io::eprintln("error: a build is for one target, and `all` is every one")
+						return 2
+					}
+					parsed[0].clone()
+				}
+				.Err(message) => {
+					io::eprintln("error: \(message)")
+					return 2
+				}
+			}
+			if target.buildable() is .Err(message) {
+				io::eprintln("error: \(message)")
+				return 2
+			}
+			val cpu = match Cpu::parse(cpuOption, &target) {
 				.Ok(cpu) => move cpu
 				.Err(message) => {
 					io::eprintln("error: invalid value '\(cpuOption)' for '--cpu <CPU>': \(message)")
@@ -445,11 +556,21 @@ fn main(args: &[cstring]): i64 = {
 				profile: if releaseOption then Profile::Release else Profile::Debug,
 				cpu: move cpu,
 				debugInfo: !noDebugInfoOption,
+				defines: defines.clone(),
+				target: target,
 			)
 			match command {
-				.Some("run") => runCommand(path, &options, &programArgs, color, threads)
-				.Some("test") => testCommand(path, &options, filter, color, threads)
-				_ => buildCommand(path, outputOption, &options, timeOption, color, threads)
+				.Some("run") => runCommand(path, &options, &shipping, &programArgs, color, threads)
+				.Some("test") => testCommand(path, &options, &shipping, filter, color, threads)
+				_ => buildCommand(
+					path,
+					outputOption,
+					&options,
+					&shipping,
+					timeOption,
+					color,
+					threads,
+				)
 			}
 		}
 		_ => {
@@ -497,15 +618,22 @@ fn parseFileCommand(path: str, color: bool): i64 = {
 /// `check --dump-hir`: the checked program, one fact a line, and what is
 /// wrong in it. A package is checked whole, every module of it, imported or
 /// not.
-fn checkDumped(path: str, library: bool, color: bool, threads: i64): i64 = {
+fn checkDumped(
+	path: str,
+	library: bool,
+	defines: &[(String, String)],
+	color: bool,
+	threads: i64,
+): i64 = {
 	var timings = Timings()
-	val loaded = match loadMode(path, .Package, &var timings, threads) {
+	var loaded = match loadMode(path, .Package, &var timings, threads) {
 		.Ok(loaded) => loaded
 		.Err(message) => {
 			io::eprintln("error: \(message)")
 			return 2
 		}
 	}
+	loaded.define(&defines)
 	val checked = checkTypes(&loaded, &var timings)
 	val sources = &loaded.sources
 	io::print(
@@ -518,7 +646,13 @@ fn checkDumped(path: str, library: bool, color: bool, threads: i64): i64 = {
 /// `check`: what is wrong in a program, drawn, or written one fact a line
 /// for tools. A package is checked whole, every module of it, imported or
 /// not.
-fn checkCommand(path: str, dumpDiagnostics: bool, color: bool, threads: i64): i64 = {
+fn checkCommand(
+	path: str,
+	dumpDiagnostics: bool,
+	defines: &[(String, String)],
+	color: bool,
+	threads: i64,
+): i64 = {
 	var timings = Timings()
 	var loaded = match loadMode(path, .Package, &var timings, threads) {
 		.Ok(loaded) => loaded
@@ -527,6 +661,7 @@ fn checkCommand(path: str, dumpDiagnostics: bool, color: bool, threads: i64): i6
 			return 2
 		}
 	}
+	loaded.define(&defines)
 	val checked = checkLoaded(&var loaded, &var timings)
 	if dumpDiagnostics then io::print(dumpDiagnosticsOf(&checked.diagnostics, &loaded.sources))
 	else io::eprint(renderProgram(&checked.diagnostics, &loaded.sources, color))
@@ -536,7 +671,14 @@ fn checkCommand(path: str, dumpDiagnostics: bool, color: bool, threads: i64): i6
 /// `mir`: the program as a build compiles it, and what is wrong in it. A
 /// debug build drops a struct by a call, and a release build in place, as a
 /// build says before the program is compiled.
-fn mirCommand(path: str, release: bool, library: bool, color: bool, threads: i64): i64 = {
+fn mirCommand(
+	path: str,
+	release: bool,
+	library: bool,
+	defines: &[(String, String)],
+	color: bool,
+	threads: i64,
+): i64 = {
 	var timings = Timings()
 	var loaded = match loadMode(path, .Program, &var timings, threads) {
 		.Ok(loaded) => loaded
@@ -545,6 +687,7 @@ fn mirCommand(path: str, release: bool, library: bool, color: bool, threads: i64
 			return 2
 		}
 	}
+	loaded.define(&defines)
 	val checked = checkLoaded(&var loaded, &var timings)
 	for diagnostic in checked.diagnostics {
 		if diagnostic.isError() {
@@ -568,54 +711,99 @@ fn mirCommand(path: str, release: bool, library: bool, color: bool, threads: i64
 	return errors(&checked.diagnostics)
 }
 
-/// `build`: the program, compiled and linked, or its LLVM IR.
+/// `build`: the program, compiled and linked, or its LLVM IR; for iOS, of a
+/// package that says it is an app, the app's bundle, signed.
 fn buildCommand(
 	path: str,
 	output: Option<str>,
-	options: &BuildOptions,
+	given: &BuildOptions,
+	shipping: &Shipping,
 	time: bool,
 	color: bool,
 	threads: i64,
 ): i64 = {
 	// The IR is written before `clang` would be run.
 	val unique = Unique::new()
-	if options.emit != Emit::LlvmIr && !clangFound(&unique) then return 1
+	if given.emit != Emit::LlvmIr && !clangFound(&unique) then return 1
 	var timings = Timings()
-	var loaded = match loadMode(path, .Program, &var timings, threads) {
+	var loaded = match loadFor(path, .Program, given.target.clone(), &var timings, threads) {
 		.Ok(loaded) => loaded
 		.Err(message) => {
 			io::eprintln("error: \(message)")
 			return 2
 		}
 	}
+	loaded.define(&given.defines)
+	val .Some(options) = forTarget(&given, &loaded) else return 1
+	// An iOS program a device runs is an app, which the package says it is.
+	val app = appOf(&loaded, &options)
+	if options.target.os == Os::Ios &&
+		!options.target.simulator &&
+		options.emit == Emit::Program &&
+		app.isNone() {
+		io::eprintln(
+			"error: a device runs an app, and the program is not one: its `package.wip` says `@app(id = \"com.example.game\")`",
+		)
+		return 2
+	}
 	// A package is built as what it calls itself, into its own root; a
-	// program of files, as its entry file, where the command is typed.
+	// program of files, as its entry file, where the command is typed; an
+	// app, as the package, a bundle of that name.
+	val named = isDirectory(path) || path::name(path) == "package.wip"
+	val stem: String = match loaded.packages[0].name {
+		.Some(name) if named => name.clone()
+		_ => String::of(path::stem(path))
+	}
 	val written: String = match output {
 		.Some(given) => given
 		.None => {
-			val named = isDirectory(path) || path::name(path) == "package.wip"
-			match loaded.packages[0].name {
-				.Some(name) if named => path::join(
-					loaded.packages[0].dir,
-					defaultOutput(name, options.emit.clone()),
-				)
-				_ => defaultOutput(path::stem(path), options.emit.clone())
-			}
+			val file =
+				if app.isSome() then "\(stem).app" else defaultOutput(stem, options.emit.clone())
+			if named && loaded.packages[0].name.isSome() then
+				path::join(loaded.packages[0].dir, file)
+			else file
 		}
 	}
 	// Written where it is asked to be, into a directory made for it where
 	// there is none: `-o target/game` in a checkout with no `target` yet.
-	val dir = path::parent(written)
+	val dir = if app.isSome() then String::of(written) else String::of(path::parent(written))
 	if !dir.isEmpty() && fs::makeDirs(dir) is .Err(error) {
 		io::eprintln("error: cannot make `\(dir)`, where `\(written)` is written: \(error)")
 		return 1
 	}
-	val result = buildLoaded(&var loaded, written, &options, &unique, &var timings)
-	if time then io::eprint(timings.toString())
+	val program = if app.isSome() then path::join(written, stem) else written.clone()
+	val result = buildLoaded(&var loaded, program, &options, &unique, &var timings)
+	if time {
+		// What the build was given, which a build's time depends on too.
+		for (name, value) in options.defines {
+			io::eprintln("define         \(name)=\(value)")
+		}
+		io::eprint(timings.toString())
+	}
 	return match result {
 		.Ok(warnings) => {
 			io::eprint(renderProgram(&warnings, &loaded.sources, color))
-			errors(&warnings)
+			val failed = errors(&warnings)
+			if failed != 0 || options.emit != Emit::Program then return failed
+			// The files the package reads while it runs, beside the program;
+			// in an app, in its bundle, which is then finished and signed.
+			val placed = match app {
+				.Some(made) => madeApp(
+					&loaded.packages.items(),
+					&made,
+					written,
+					stem,
+					&options.target,
+					&shipping,
+					&unique,
+				)
+				.None => placeFiles(&loaded.packages.items(), dir, false)
+			}
+			if placed is .Err(message) {
+				io::eprintln("error: \(message)")
+				return 1
+			}
+			0
 		}
 		.Err(.Diagnostics(diagnostics)) => {
 			io::eprint(renderProgram(&diagnostics, &loaded.sources, color))
@@ -628,18 +816,57 @@ fn buildCommand(
 	}
 }
 
+/// `options`, with what `clang` is told of their target, which for iOS
+/// depends on the least version the loaded program's app says; nothing,
+/// where that cannot be found, which is said.
+fn forTarget(options: &BuildOptions, loaded: &Loaded): Option<BuildOptions> = {
+	var made = options.clone()
+	match options.target.clangFlags(minimumOf(&loaded)) {
+		.Ok(flags) => made.targetFlags = flags
+		.Err(message) => {
+			io::eprintln("error: \(message)")
+			return .None
+		}
+	}
+	return .Some(made)
+}
+
+/// The app the program's package says it is, where it is built for iOS: an
+/// app means nothing to a Mac's or Linux's build yet.
+fn appOf(loaded: &Loaded, options: &BuildOptions): Option<lang::App> =
+	if options.target.os == Os::Ios then loaded.packages[0].app.clone() else .None
+
 /// `run`: the program, built in a directory of its own and run with what
-/// followed its file, its exit code this command's.
-fn runCommand(path: str, options: &BuildOptions, args: &[str], color: bool, threads: i64): i64 = {
+/// followed its file, its exit code this command's. For iOS, on the
+/// simulator or the device: an app installed and launched, a program that
+/// is not one run in the simulator as a command.
+fn runCommand(
+	path: str,
+	given: &BuildOptions,
+	shipping: &Shipping,
+	args: &[str],
+	color: bool,
+	threads: i64,
+): i64 = {
 	val unique = Unique::new()
 	if !clangFound(&unique) then return 1
 	var timings = Timings()
-	var loaded = match loadMode(path, .Program, &var timings, threads) {
+	var loaded = match loadFor(path, .Program, given.target.clone(), &var timings, threads) {
 		.Ok(loaded) => loaded
 		.Err(message) => {
 			io::eprintln("error: \(message)")
 			return 2
 		}
+	}
+	loaded.define(&given.defines)
+	val .Some(options) = forTarget(&given, &loaded) else return 1
+	val app = appOf(&loaded, &options)
+	val ios = options.target.os == Os::Ios
+	if ios && !options.target.simulator && app.isNone() {
+		io::eprintln(
+			"error: a device runs an app, and the program is not one: its `package.wip` says `@app(id = \"com.example.game\")`",
+		)
+		return 2
 	}
 	val dir = match TempDir::new(&unique) {
 		.Ok(dir) => dir
@@ -648,7 +875,16 @@ fn runCommand(path: str, options: &BuildOptions, args: &[str], color: bool, thre
 			return 1
 		}
 	}
-	val exe = dir.join("program")
+	val stem = match loaded.packages[0].name {
+		.Some(name) => name.clone()
+		.None => String::of("program")
+	}
+	val bundle = dir.join("\(stem).app")
+	val exe = if app.isSome() then path::join(bundle, stem) else dir.join("program")
+	if app.isSome() && fs::makeDirs(bundle) is .Err(error) {
+		io::eprintln("error: cannot make `\(bundle)`: \(error)")
+		return 1
+	}
 	match buildLoaded(&var loaded, exe, &options, &unique, &var timings) {
 		.Ok(warnings) => {
 			io::eprint(renderProgram(&warnings, &loaded.sources, color))
@@ -663,40 +899,87 @@ fn runCommand(path: str, options: &BuildOptions, args: &[str], color: bool, thre
 			return 1
 		}
 	}
-	return match Command::of(exe).args(&args).run() {
+	val placed = match app {
+		.Some(made) => madeApp(
+			&loaded.packages.items(),
+			&made,
+			bundle,
+			stem,
+			&options.target,
+			&shipping,
+			&unique,
+		)
+		.None => placeFiles(&loaded.packages.items(), dir.path, true)
+	}
+	if placed is .Err(message) {
+		io::eprintln("error: \(message)")
+		return 1
+	}
+	val ran = if !ios {
+		Command::of(exe).args(&args).run().mapErr((error) => "cannot run the program: \(error)")
+	} else if !options.target.simulator {
+		match app {
+			.Some(made) => runOnDevice(bundle, &made, &shipping.device, &args)
+			.None => .Err(String::of("a device runs an app"))
+		}
+	} else {
+		match simulator(&shipping.device, &app) {
+			.Ok(id) => match app {
+				.Some(made) => runOnSimulator(id, bundle, &made, &args)
+				// Run where the command is typed, as on a Mac.
+				.None => spawnOnSimulator(id, exe, here(), &args)
+			}
+			.Err(message) => .Err(message)
+		}
+	}
+	return match ran {
 		.Ok(.Code(code)) => code
 		.Ok(exit) => {
 			io::eprintln("error: the program was terminated: \(exit)")
 			1
 		}
-		.Err(error) => {
-			io::eprintln("error: cannot run the program: \(error)")
+		.Err(message) => {
+			io::eprintln("error: \(message)")
 			1
 		}
 	}
 }
 
+/// The directory the command is typed in, whole: what a program the
+/// simulator runs is run in, as `wip run` runs one in it on a Mac.
+fn here(): String = match fs::realPath(".") {
+	.Ok(dir) => dir
+	.Err(..) => String::of(".")
+}
+
 /// `test`: the program's tests, built in a directory of their own and run,
 /// in the package's root where the program is a package, so that the paths
 /// they name are its own wherever the command is typed; the runner's exit
-/// code is this command's.
+/// code is this command's. For iOS, in the simulator.
 fn testCommand(
 	path: str,
-	options: &BuildOptions,
+	given: &BuildOptions,
+	shipping: &Shipping,
 	filter: Option<str>,
 	color: bool,
 	threads: i64,
 ): i64 = {
+	if given.target.os == Os::Ios && !given.target.simulator {
+		io::eprintln("error: tests are run on iOS in the simulator: `--target ios-arm64-simulator`")
+		return 2
+	}
 	val unique = Unique::new()
 	if !clangFound(&unique) then return 1
 	var timings = Timings()
-	var loaded = match loadMode(path, .Tests, &var timings, threads) {
+	var loaded = match loadFor(path, .Tests, given.target.clone(), &var timings, threads) {
 		.Ok(loaded) => loaded
 		.Err(message) => {
 			io::eprintln("error: \(message)")
 			return 2
 		}
 	}
+	loaded.define(&given.defines)
+	val .Some(options) = forTarget(&given, &loaded) else return 1
 	val dir = match TempDir::new(&unique) {
 		.Ok(dir) => dir
 		.Err(message) => {
@@ -726,16 +1009,30 @@ fn testCommand(
 		}
 	}
 	val root = &loaded.packages[0]
-	var tests = Command::of(exe)
-	if root.name.isSome() && !root.dir.isEmpty() then tests = tests.directory(root.dir)
-	return match tests.run() {
+	if placeFiles(&loaded.packages.items(), dir.path, true) is .Err(message) {
+		io::eprintln("error: \(message)")
+		return 1
+	}
+	val inRoot = root.name.isSome() && !root.dir.isEmpty()
+	val ran = if options.target.simulator {
+		val runIn = if inRoot then fs::realPath(root.dir).unwrapOr(String::of(root.dir)) else here()
+		match simulator(&shipping.device, &root.app) {
+			.Ok(id) => spawnOnSimulator(id, exe, runIn, [])
+			.Err(message) => .Err(message)
+		}
+	} else {
+		var tests = Command::of(exe)
+		if inRoot then tests = tests.directory(root.dir)
+		tests.run().mapErr((error) => "cannot run the tests: \(error)")
+	}
+	return match ran {
 		.Ok(.Code(code)) => code
 		.Ok(exit) => {
 			io::eprintln("error: the tests were terminated: \(exit)")
 			1
 		}
-		.Err(error) => {
-			io::eprintln("error: cannot run the tests: \(error)")
+		.Err(message) => {
+			io::eprintln("error: \(message)")
 			1
 		}
 	}
@@ -915,7 +1212,7 @@ fn defaultOutput(stem: str, emit: Emit): String = match emit {
 	.LlvmIr => "\(stem).ll"
 	.LlvmBc => "\(stem).bc"
 	.Static => "lib\(stem).a"
-	.Dynamic => if TARGET_OS == "macos" then "lib\(stem).dylib" else "lib\(stem).so"
+	.Dynamic => if TARGET_VENDOR == "apple" then "lib\(stem).dylib" else "lib\(stem).so"
 }
 
 /// One diagnostic, said once, as `check --target` found it: with the first
@@ -931,7 +1228,13 @@ struct Found {
 /// `check --target`: the program checked as each target compiles it, each
 /// diagnostic said once, with the targets that found it where not every
 /// one did.
-fn checkForTargets(path: str, names: &[str], color: bool, threads: i64): i64 = {
+fn checkForTargets(
+	path: str,
+	names: &[str],
+	defines: &[(String, String)],
+	color: bool,
+	threads: i64,
+): i64 = {
 	var targets: Vec<Target> = Vec()
 	for name in names {
 		match Target::parse(name) {
@@ -957,6 +1260,7 @@ fn checkForTargets(path: str, names: &[str], color: bool, threads: i64): i64 = {
 				return 2
 			}
 		}
+		loaded.define(&defines)
 		val checked = checkLoaded(&var loaded, &var timings)
 		for diagnostic in checked.diagnostics {
 			val one = Vec::of([diagnostic.clone()])

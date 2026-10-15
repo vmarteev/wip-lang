@@ -4,26 +4,34 @@
 // What the table holds — each function's code, and where each run of it was
 // written — is known only once LLVM has compiled the program, and LLVM has
 // inlined much of it. The table names each function by its symbol, which
-// only the program's own object may do of a function it keeps to itself, so
-// the table goes into that object:
+// only the object that defines it may do of a function LLVM made of the
+// program's, as a release build's optimising makes them, kept to the object:
+// so a release build's part has a table of its own, in its own object.
 //
-// - **ELF:** the object `clang` wrote is read, and the table, its relocations
-//   and its symbol are added after it (`withFrameTables`, through
-//   `elf.wip`).
-// - **Mach-O:** the program is compiled to assembly, assembled once to read
-//   its DWARF, and assembled again with the table after it
-//   (`frameTableAssembly`); the code is the same both times, since the table
-//   adds only data. Every symbol there begins with `_`, so none reads as a
-//   register, which on Linux's arm64 `v0` or `x1` would.
-// - **A debug build** hides its functions rather than keeping them to its
-//   objects, and is compiled in parts: the table is read from every part's
-//   DWARF, and is, on a Mac, the same assembly, an object of its own, and on
-//   ELF added to the first part's object, which names the others' functions
-//   for the linker to find.
+// The object `clang` wrote is read, and the table, its relocations and its
+// symbols are added to it (`withFrameTables`): after it on ELF
+// (`elf.wip`), and laid out again around it in Mach-O (`macho.wip`), whose
+// sections and symbols are listed where adding one moves the rest. A debug
+// build changes nothing LLVM is given, and makes no functions of its own:
+// one table is read from every part's DWARF, and added to the first part's
+// object, which names the others' functions for the linker to find.
 //
-// The table has the form the runtime reads (`std/prelude/runtime.wip`), with
-// what LLVM's inlining adds: a row may say that its code is a call inlined,
-// and the list of those says what was called, and from which line of what.
+// A table is pieces the linker may keep or drop one by one. Each function
+// has an entry of its own — its address, its code's length, its rows — in
+// the section `wip_frames`, which references nothing but the function, so
+// that a linker dropping what nothing reaches keeps the entry while it keeps
+// the function: on a Mac, an entry is a piece of its own in a section marked
+// `live_support`; on ELF, a release build's part ties each entry's section
+// to its function's (`SHF_LINK_ORDER`). What the entries share — the files,
+// the calls inlined, the names — is one piece, which an entry finds by its
+// part's key, through the list.
+//
+// The runtime reads the list, `wip.frame_tables`, an object of its own
+// (`frameListAssembly`): where the entries begin and end, and each part's
+// key and shared piece. The pieces have the form the runtime reads
+// (`std/prelude/runtime.wip`), with what LLVM's inlining adds: a row may say
+// that its code is a call inlined, and the shared piece's list of those says
+// what was called, and from which line of what.
 
 import std::collections::{Map}
 
@@ -126,32 +134,20 @@ struct Row {
 	inlined: u32
 }
 
-/// The program's table and the list of tables, as assembly to follow the
-/// program's, or, in a debug build, to be an object of its own: read from
-/// their DWARF, which names files as `files` says a panic names them. For
-/// Mach-O.
-pub fn frameTableAssembly(
-	objects: &[Vec<u8>],
-	files: &Map<String, String>,
-): Result<String, String> = {
-	var table = Table::new()
-	var macho = false
-	for object in objects {
-		val file = readObject(&object)?
-		macho = file.format == Format::Macho
-		read(&file, &files, &var table)?
-	}
-	val items = table.layout()
-	return .Ok(assembly(&items, macho))
-}
-
-/// The first of `objects`, the program as `clang` compiled it, with the table
-/// of them all and the list of tables added: read from their DWARF, which
-/// names files as `files` says a panic names them. A function of another of
-/// them is named by a symbol the linker finds. For ELF.
+/// The first of `objects`, as `clang` compiled it, with the table of them
+/// all added, its shared piece named `symbol` and its entries saying `key`:
+/// read from their DWARF, which names files as `files` says a panic names
+/// them. A function of another of them is named by a symbol the linker
+/// finds. On ELF, where `tied` says, as for a release build's part, whose
+/// functions are all its own, each entry is a section tied to its
+/// function's; in Mach-O each entry is a piece of its own, after a symbol of
+/// its own, in a section the linker keeps only what is live of.
 pub fn withFrameTables(
 	objects: &[Vec<u8>],
 	files: &Map<String, String>,
+	symbol: str,
+	key: u64,
+	tied: bool,
 ): Result<Vec<u8>, String> = {
 	var table = Table::new()
 	for object in objects {
@@ -159,8 +155,55 @@ pub fn withFrameTables(
 		read(&file, &files, &var table)?
 	}
 	if objects.isEmpty() then return .Err("no object to add the table to")
-	val items = table.layout()
-	return elfWith(&objects[0], &items)
+	val (shared, entries) = table.layout(key)
+	if readObject(&objects[0])?.format == Format::Macho then
+		return withMachoData(&objects[0], machoTable(&shared, &entries, symbol))
+	var added = Vec::of([
+		elfData(".data.rel.ro.wip.frames", &shared, .Some(String::of(symbol)), .None),
+	])
+	if tied {
+		for entry in entries {
+			added.push(elfData(ENTRIES, &entry.items, .None, .Some(entry.section)))
+		}
+	} else {
+		var all: Vec<Item> = Vec()
+		for entry in move entries {
+			for item in move entry.items {
+				all.push(item)
+			}
+		}
+		added.push(elfData(ENTRIES, &all, .None, .None))
+	}
+	return withData(&objects[0], &added)
+}
+
+/// The list the runtime reads, `wip.frame_tables`: where the functions'
+/// entries begin and end, how many parts there are, and each one's key and
+/// shared piece, by its symbol; as assembly to be an object of its own. A
+/// program with no entries — built without debug information — must still
+/// have where they begin and end: a Mac's linker gives them for the empty
+/// section the list carries, and ELF's for none, so ELF's are named weakly,
+/// and are 0 where there is no section.
+pub fn frameListAssembly(tables: &[(u64, String)], macho: bool): String = {
+	val (start, end) =
+		if macho then
+			("section$start$__DATA_CONST$__wip_frames", "section$end$__DATA_CONST$__wip_frames")
+		else ("__start_wip_frames", "__stop_wip_frames")
+	var items: Vec<Item> = [
+		Item::Address(.Symbol(String::of(start))),
+		Item::Address(.Symbol(String::of(end))),
+		Item::Word(tables.len() as u64),
+	]
+	for (key, table) in tables {
+		items.push(.Word(key))
+		items.push(.Address(.Symbol(if macho then "_\(table)" else table.clone())))
+	}
+	var out = String()
+	if !macho then out.push("\t.weak\t\"\(start)\"\n\t.weak\t\"\(end)\"\n")
+	out.push(assembly(&items, TABLES, macho))
+	if macho then
+		out.push("\t.section\t__DATA_CONST,__wip_frames,regular,live_support\n\t.p2align\t3\n")
+	return out
 }
 
 /// What an object's DWARF and symbols describe, added to `table`.
@@ -350,8 +393,7 @@ fn readUnit(
 				parent: parent,
 			))
 			open.push((depth, record))
-			if function.take() is .Some((at, f, calls)) {
-				var more = calls
+			if function.take() is .Some((at, f, var more)) {
 				more.push(InlinedCall(record: record, ranges: ranges))
 				function = .Some((at, f, more))
 			}
@@ -509,8 +551,19 @@ fn finish(
 /// The name of the list of the tables, which the runtime reads.
 val TABLES: str = "wip.frame_tables"
 
-/// What the list of tables and this table are, in order: words, addresses,
-/// rows' `u32`s and names' bytes.
+/// The section of the functions' entries, which ELF's linker gives a start
+/// and an end where its name is a C name.
+val ENTRIES: str = "wip_frames"
+
+/// A function's entry: what it holds, and in an ELF object the section of
+/// its function's code, which a release build's entry is tied to.
+struct FrameEntry {
+	section: u32
+	items: Vec<Item>
+}
+
+/// What the list, a table's shared piece and an entry are, in order: words,
+/// addresses, rows' `u32`s and names' bytes.
 enum Item {
 	Word(word: u64)
 	Address(target: Target)
@@ -521,9 +574,10 @@ enum Item {
 /// What an address is of.
 @derive(Clone)
 enum Target {
-	/// A function, by its symbol.
-	Function(name: String)
-	/// A place in the list and the table, by its distance from their start.
+	/// A function, a table or a section's bound, by its symbol as the object
+	/// names it.
+	Symbol(name: String)
+	/// A place in the piece, by its distance from its start.
 	Here(at: u64)
 }
 
@@ -535,122 +589,187 @@ struct TableNames {
 }
 
 extend TableNames {
-	var fn name(text: str): Item = {
+	/// Where `text` is in the piece, written there where it is not yet.
+	var fn place(text: str): u64 = {
 		val key = String::of(text)
-		val at = match self.named.get(&key) {
-			.Some(found) => found
-			.None => {
-				val found = self.at + self.bytes.len() as u64
-				for i in 0..text.len() {
-					self.bytes.push(text[i])
-				}
-				self.named.put(key, found)
-				found
-			}
+		if self.named.get(&key) is .Some(found) then return found
+		val found = self.at + self.bytes.len() as u64
+		for i in 0..text.len() {
+			self.bytes.push(text[i])
 		}
-		return .Address(.Here(at))
+		self.named.put(key, found)
+		return found
 	}
+
+	/// `text`'s address, in the piece.
+	var fn name(text: str): Item = .Address(.Here(self.place(text)))
+
+	/// `text`'s distance from where the names begin: what an entry, which
+	/// references nothing but its function, holds of its name.
+	var fn offset(text: str): u64 = self.place(text) - self.at
 }
 
 extend Table {
-	/// The list of tables, `wip.frame_tables`, which holds this one, then this
-	/// one: its functions, files, calls inlined, rows and names.
-	fn layout(): Vec<Item> = {
-		// Where each part begins: the list, two words; the table, three words
-		// and seven for each function; two words for each file, six for each
-		// call inlined, sixteen bytes for each row, and the names.
-		val table: u64 = 16
-		val files = table + 24 + 56 * self.functions.len() as u64
+	/// The table as its pieces: what the entries share — three words, two for
+	/// each file, six for each call inlined, and the names — and each
+	/// function's entry, saying the key of its part, `key`: seven words, and
+	/// sixteen bytes for each row.
+	fn layout(key: u64): (Vec<Item>, Vec<FrameEntry>) = {
+		val files: u64 = 24
 		val inlined = files + 16 * self.files.len() as u64
-		val rows = inlined + 48 * self.inlined.len() as u64
-		var rowCount = 0
-		for (_, functionRows) in self.functions {
-			rowCount += functionRows.len()
-		}
-		var names = TableNames(at: rows + 16 * rowCount as u64, bytes: Vec(), named: Map())
-		var items: Vec<Item> = [
-			Item::Word(1),
-			Item::Address(.Here(table)),
-			Item::Word(self.functions.len() as u64),
+		val namesAt = inlined + 48 * self.inlined.len() as u64
+		var names = TableNames(at: namesAt, bytes: Vec(), named: Map())
+		var shared: Vec<Item> = [
 			Item::Address(.Here(files)),
 			Item::Address(.Here(inlined)),
+			Item::Address(.Here(namesAt)),
 		]
-		var rowAt: u64 = 0
-		for (function, functionRows) in self.functions {
-			items.push(.Address(.Function(function.symbol.clone())))
-			items.push(.Word(function.high - function.low))
-			items.push(names.name(function.name))
-			items.push(.Word(function.name.len() as u64))
-			items.push(.Address(.Here(rows + rowAt * 16)))
-			items.push(.Word(functionRows.len() as u64))
-			items.push(.Word(if function.passOver then 1 else 0))
-			rowAt += functionRows.len() as u64
-		}
 		for file in self.files {
-			items.push(names.name(file))
-			items.push(.Word(file.len() as u64))
+			shared.push(names.name(file))
+			shared.push(.Word(file.len() as u64))
 		}
 		// A call inlined: what was called, its name's length, the file and
 		// line of the call, the call it is in, and whether it is passed over.
 		for call in self.inlined {
-			items.push(names.name(call.name))
-			items.push(.Word(call.name.len() as u64))
-			items.push(.Word(call.file))
-			items.push(.Word(call.line))
-			items.push(.Word(call.parent))
-			items.push(.Word(if call.passOver then 1 else 0))
+			shared.push(names.name(call.name))
+			shared.push(.Word(call.name.len() as u64))
+			shared.push(.Word(call.file))
+			shared.push(.Word(call.line))
+			shared.push(.Word(call.parent))
+			shared.push(.Word(if call.passOver then 1 else 0))
 		}
-		for (_, functionRows) in self.functions {
-			for row in functionRows {
+		// A function: its code and its length, its part, its name and the
+		// name's length, whether it is passed over, and its rows.
+		var entries: Vec<FrameEntry> = Vec()
+		for (function, rows) in self.functions {
+			var items: Vec<Item> = [
+				Item::Address(.Symbol(function.symbol.clone())),
+				Item::Word(function.high - function.low),
+				Item::Word(key),
+				Item::Word(names.offset(function.name)),
+				Item::Word(function.name.len() as u64),
+				Item::Word(if function.passOver then 1 else 0),
+				Item::Word(rows.len() as u64),
+			]
+			for row in rows {
 				items.push(.U32(row.offset))
 				items.push(.U32(row.file))
 				items.push(.U32(row.line))
 				items.push(.U32(row.inlined))
 			}
+			// An ELF object's code is placed by its section, above the
+			// distance into it.
+			entries.push(FrameEntry(section: (function.low >> 32) as u32, items: items))
 		}
-		items.push(.Text(names.bytes))
-		return items
+		shared.push(.Text(names.bytes))
+		return (shared, entries)
 	}
 }
 
-/// The table as assembly, in the program's data.
-fn assembly(items: &[Item], macho: bool): String = {
-	val tables = if macho then "\"_\(TABLES)\"" else "\"\(TABLES)\""
+/// A table's shared piece or the list as assembly, in the program's data,
+/// named `symbol`.
+fn assembly(items: &[Item], symbol: str, macho: bool): String = {
+	val named = if macho then "\"_\(symbol)\"" else "\"\(symbol)\""
 	var out = String::of("\n")
 	if macho {
 		out.push("\t.section\t__DATA,__const\n")
-		out.push("\t.private_extern\t\(tables)\n")
+		out.push("\t.private_extern\t\(named)\n")
 	} else {
 		out.push("\t.section\t.data.rel.ro,\"aw\",@progbits\n")
-		out.push("\t.hidden\t\(tables)\n")
+		out.push("\t.hidden\t\(named)\n")
 	}
-	out.push("\t.globl\t\(tables)\n\t.p2align\t3\n\(tables):\n")
+	out.push("\t.globl\t\(named)\n\t.p2align\t3\n\(named):\n")
+	itemsAssembly(&var out, &items, named)
+	return out
+}
+
+/// `items` as assembly, at the end of `out`: a place in the piece is a
+/// distance from `named`, its symbol as the assembly writes it.
+fn itemsAssembly(out: &var String, items: &[Item], named: str) = {
 	for item in items {
 		match item {
 			.Word(word) => out.push("\t.quad\t\(word)\n")
-			// A function's symbol is as the object names it, `_` and all.
-			.Address(.Function(name)) => out.push("\t.quad\t\"\(name)\"\n")
-			.Address(.Here(at)) => out.push("\t.quad\t\(tables)+\(at)\n")
+			// A symbol is as the object names it, `_` and all.
+			.Address(.Symbol(name)) => out.push("\t.quad\t\"\(name)\"\n")
+			.Address(.Here(at)) => out.push("\t.quad\t\(named)+\(at)\n")
 			.U32(word) => out.push("\t.long\t\(word)\n")
 			.Text(bytes) => out.push("\t.ascii\t\"\(ascii(&bytes))\"\n")
 		}
 	}
-	return out
 }
 
-/// The list and the table, added to an ELF object in a section of their own:
-/// their bytes, and an address of each function they name and of each place
-/// in them they point to.
-fn elfWith(object: &[u8], items: &[Item]): Result<Vec<u8>, String> = {
+/// `items` as a section of an ELF object named `name`: its bytes, and an
+/// address of each function it names and of each place in it it points to,
+/// with the hidden `symbol` at its start where it has one, tied to the
+/// section `tiedTo` where it is.
+fn elfData(name: str, items: &[Item], symbol: Option<String>, tiedTo: Option<u32>): Data = {
 	var bytes: Vec<u8> = Vec()
 	var addresses: Vec<(u64, Address)> = Vec()
+	itemBytes(&items, &var bytes, &var addresses)
+	return Data(
+		name: String::of(name),
+		bytes: bytes,
+		symbol: symbol,
+		addresses: addresses,
+		tiedTo: tiedTo,
+	)
+}
+
+/// A table as the two sections of a Mach-O object that hold it: the shared
+/// piece, named `symbol`, in `__DATA,__const`; and the entries, each after
+/// a linker-private symbol of its own, `lwip.frame_entry.N`, that makes it a
+/// piece of its own, in `__DATA_CONST,__wip_frames`, which the linker keeps
+/// only the pieces of that keep something live (`live_support`).
+fn machoTable(shared: &[Item], entries: &[FrameEntry], symbol: str): Vec<MachoData> = {
+	var sharedBytes: Vec<u8> = Vec()
+	var sharedAddresses: Vec<(u64, Address)> = Vec()
+	itemBytes(&shared, &var sharedBytes, &var sharedAddresses)
+	var bytes: Vec<u8> = Vec()
+	var addresses: Vec<(u64, Address)> = Vec()
+	var labels: Vec<(u64, String)> = Vec()
+	for (n, entry) in entries.forwards().enumerate() {
+		while bytes.len() % 8 != 0 {
+			bytes.push(0)
+		}
+		labels.push((bytes.len() as u64, "lwip.frame_entry.\(n)"))
+		itemBytes(&entry.items, &var bytes, &var addresses)
+	}
+	return [
+		MachoData(
+			segment: "__DATA",
+			section: "__const",
+			flags: 0,
+			align: 3,
+			bytes: sharedBytes,
+			symbol: .Some(String::of(symbol)),
+			labels: Vec(),
+			addresses: sharedAddresses,
+		),
+		MachoData(
+			segment: "__DATA_CONST",
+			section: "__wip_frames",
+			flags: S_ATTR_LIVE_SUPPORT,
+			align: 3,
+			bytes: bytes,
+			symbol: .None,
+			labels: labels,
+			addresses: addresses,
+		),
+	]
+}
+
+/// `items`' bytes at the end of `bytes`, and where an address goes in them,
+/// and of what, at the end of `addresses`: a place in the piece is a
+/// distance from where the piece begins.
+fn itemBytes(items: &[Item], bytes: &var Vec<u8>, addresses: &var Vec<(u64, Address)>) = {
+	val start = bytes.len() as u64
 	for item in items {
 		match item {
 			.Word(word) => pushWord(&var bytes, word)
 			.Address(target) => {
 				val address: Address = match target {
-					.Function(name) => .Symbol(name.clone())
-					.Here(at) => .Here(at)
+					.Symbol(name) => .Symbol(name.clone())
+					.Here(at) => .Here(start + at)
 				}
 				addresses.push((bytes.len() as u64, address))
 				pushWord(&var bytes, 0)
@@ -663,13 +782,6 @@ fn elfWith(object: &[u8], items: &[Item]): Result<Vec<u8>, String> = {
 			}
 		}
 	}
-	val data = Data(
-		name: ".data.rel.ro.wip.frames",
-		bytes: bytes,
-		symbol: TABLES,
-		addresses: addresses,
-	)
-	return withData(&object, &data)
 }
 
 /// Bytes as an assembler's `.ascii` takes them.

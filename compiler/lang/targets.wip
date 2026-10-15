@@ -6,11 +6,13 @@
 // is checked — as with Rust's `cfg`, an item for another target is not
 // checked unless that target is checked for.
 //
-// A program is built for the machine the compiler runs on, and may be
-// checked for any target the standard library is written for: `wip check
-// --target linux` reads the items and files Linux takes.
+// A program is built for the machine the compiler runs on, or for an iPad
+// or the iOS simulator from a Mac, and may be checked for any target the
+// standard library is written for: `wip check --target linux` reads the
+// items and files Linux takes.
 
 import std::mem
+import std::process::{Command}
 import syntax::{
 	ANNOTATION,
 	Annotation,
@@ -32,6 +34,8 @@ pub enum Os {
 	Macos
 	Linux
 	Windows
+	/// An iPad's and an iPhone's.
+	Ios
 }
 
 /// A processor a program may be compiled for.
@@ -42,11 +46,13 @@ pub enum Arch {
 }
 
 /// The machine being compiled for: what `@target`'s keys are answered
-/// with.
+/// with, and, for iOS, whether it is the simulator on a Mac, which answers
+/// them as the device does.
 @derive(Eq, Clone)
 pub struct Target {
 	pub os: Os
 	pub arch: Arch
+	pub simulator: bool = false
 }
 
 /// The keys `@target` takes. What each one may be is `valuesOf`'s: the
@@ -54,7 +60,7 @@ pub struct Target {
 /// rather than a condition that is quietly false.
 val KEYS: [str; 3] = ["os", "arch", "vendor"]
 
-val OS_VALUES: [str; 3] = ["macos", "linux", "windows"]
+val OS_VALUES: [str; 4] = ["macos", "linux", "windows", "ios"]
 val ARCH_VALUES: [str; 2] = ["arm64", "x86_64"]
 val VENDOR_VALUES: [str; 1] = ["apple"]
 
@@ -70,6 +76,7 @@ extend Os {
 		.Macos => "macos"
 		.Linux => "linux"
 		.Windows => "windows"
+		.Ios => "ios"
 	}
 }
 
@@ -92,42 +99,103 @@ extend Target {
 	)
 
 	/// The targets the standard library is written for: what `--target
-	/// all` checks.
+	/// all` checks. The simulator answers as the device does, so checking
+	/// the device checks both.
 	pub static fn all(): Vec<Target> = [
 		Target(os: .Macos, arch: .Arm64),
 		Target(os: .Macos, arch: .X86_64),
 		Target(os: .Linux, arch: .Arm64),
 		Target(os: .Linux, arch: .X86_64),
+		Target(os: .Ios, arch: .Arm64),
 	]
 
-	/// What `--target` names: one of `Target::all` as `os-arch`, a system
-	/// alone on this machine's processor, or `all`.
+	/// Every target there is a name for: `all`'s, and the simulator.
+	static fn named(): Vec<Target> = {
+		var named = Target::all()
+		named.push(Target(os: .Ios, arch: .Arm64, simulator: true))
+		return named
+	}
+
+	/// What `--target` names: a target as `os-arch`, or `ios-arm64-simulator`;
+	/// a system alone, on this machine's processor, or `ios` for the device;
+	/// or `all`.
 	pub static fn parse(name: str): Result<Vec<Target>, String> = {
 		if name == "all" then return .Ok(Target::all())
 		if name == "windows" || name.startsWith("windows-") then
 			return .Err("`\(name)` is not a target to check: the standard library is not written for Windows")
-		val (os, arch) = match name.splitOnce("-") {
-			.Some((os, arch)) => (os, arch)
-			.None => (name, Target::host().arch.text())
-		}
-		for target in Target::all() {
-			if target.os.text() == os && target.arch.text() == arch then return .Ok([target])
+		val full: String =
+			if name == "ios" then String::of("ios-arm64")
+			else if !name.contains("-") then "\(name)-\(Target::host().arch.text())"
+			else String::of(name)
+		for target in Target::named() {
+			if target.name() == full then return .Ok([target])
 		}
 		var names = String()
-		val all = Target::all()
-		for (i, target) in all.forwards().enumerate() {
+		val named = Target::named()
+		for (i, target) in named.forwards().enumerate() {
 			if i > 0 then names.push(", ")
 			names.push("`\(target.name())`")
 		}
-		return .Err("`\(name)` is not a target: there are \(names), `macos` and `linux` for this machine's processor, and `all`")
+		return .Err("`\(name)` is not a target: there are \(names), `macos` and `linux` for this machine's processor, `ios` for the device, and `all`")
 	}
 
-	/// Its name, as `--target` takes it: `linux-x86_64`.
-	pub fn name(): String = "\(self.os.text())-\(self.arch.text())"
+	/// Its name, as `--target` takes it: `linux-x86_64`,
+	/// `ios-arm64-simulator`.
+	pub fn name(): String = {
+		val simulator = if self.simulator then "-simulator" else ""
+		return "\(self.os.text())-\(self.arch.text())\(simulator)"
+	}
 
-	/// `apple` for macOS and its siblings, and nothing elsewhere: what
-	/// `@framework` and Objective-C belong to.
-	pub fn vendor(): str = if self.os == .Macos then "apple" else ""
+	/// `apple` for macOS and iOS, and nothing elsewhere: what `@framework`
+	/// and Objective-C belong to.
+	pub fn vendor(): str = if self.isApple() then "apple" else ""
+
+	/// Whether it is one of Apple's systems.
+	pub fn isApple(): bool = self.os is .Macos | .Ios
+
+	/// Whether it is the machine the compiler runs on.
+	pub fn isHost(): bool = self == Target::host()
+
+	/// Whether this machine builds for it: itself, and from a Mac with
+	/// Apple's tools, iOS. Why not where it does not.
+	pub fn buildable(): Result<void, String> = {
+		if self.isHost() then return .Ok()
+		val host = Target::host()
+		if self.os == .Ios && host.os == .Macos {
+			if self.simulator && host.arch != .Arm64 then
+				return .Err("the simulator `ios-arm64-simulator` runs on a Mac with Apple silicon")
+			return .Ok()
+		}
+		return .Err("`\(self.name())` is not built for from this machine, which builds for itself and, from a Mac, for iOS; `wip check --target \(self.name())` checks for it")
+	}
+
+	/// The SDK Apple's tools build an iOS program against: the device's or
+	/// the simulator's.
+	pub fn sdk(): Option<str> = match self.os {
+		.Ios => .Some(if self.simulator then "iphonesimulator" else "iphoneos")
+		_ => .None
+	}
+
+	/// What `clang` is told of the target, for its code, its C and its
+	/// link, by iOS `minimum` and later: nothing for the machine it runs
+	/// on, whose build is as it always was; for iOS, the triple and the
+	/// SDK, which Xcode's `xcrun` finds.
+	pub fn clangFlags(minimum: str): Result<Vec<String>, String> = {
+		if self.isHost() then return .Ok(Vec())
+		if self.buildable() is .Err(why) then return .Err(why)
+		val .Some(sdk) = self.sdk() else return .Err("`\(self.name())` has no SDK")
+		val asked = Command::of("xcrun").args(["--sdk", sdk, "--show-sdk-path"]).output()
+		val .Ok(found) = asked else return .Err(noSdk(sdk))
+		if !found.exit.success() then return .Err(noSdk(sdk))
+		val path = found.stdout.toStr().trimEnd()
+		val simulator = if self.simulator then "-simulator" else ""
+		return .Ok([
+			String::of("-target"),
+			"arm64-apple-ios\(minimum)\(simulator)",
+			String::of("-isysroot"),
+			String::of(path),
+		])
+	}
 
 	fn answer(key: str): str = match key {
 		"os" => self.os.text()
@@ -135,6 +203,11 @@ extend Target {
 		_ => self.vendor()
 	}
 }
+
+/// Why there is no SDK `sdk` to build against.
+fn noSdk(
+	sdk: str,
+): String = "`xcrun --sdk \(sdk)` finds no SDK: building for iOS needs Xcode, with its iOS platform installed"
 
 /// Drops the items `target` does not take, and reports every `@target`
 /// that cannot be read — including on the items that are dropped, so that
@@ -148,8 +221,7 @@ pub fn keep(ast: &var Ast, interner: &Interner, target: Target): Vec<Diagnostic>
 		// An `extern` block's own declarations may each say what they are
 		// for: a library spells a function one way here and another there.
 		if taken is .Extern(..) {
-			val .Extern(block) = move taken else panic("an extern block")
-			var block = block
+			var .Extern(block) = taken else panic("an extern block")
 			var fns: Vec<ExternFn> = Vec()
 			for f in mem::replace(&var block.fns, Vec()) {
 				if wanted(&f.annotations, &interner, target, &var diagnostics) then fns.push(f)
@@ -360,7 +432,7 @@ pub fn prelude(target: Target): String = """
 
 	pub val TARGET_OS: str = "\(target.os.text())"
 	pub val TARGET_ARCH: str = "\(target.arch.text())"
-	/// `apple` on a Mac, and empty elsewhere.
+	/// `apple` on a Mac and on iOS, and empty elsewhere.
 	pub val TARGET_VENDOR: str = "\(target.vendor())"
 
 	"""

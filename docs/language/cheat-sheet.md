@@ -211,7 +211,7 @@ fn main() = {
 A `&var` lives for the call it is lent to; a `&` may also be kept in a
 view. [Page 7](07-references.md)
 
-## Views, projections, `keeps`
+## Views, projections, `from`, `keeps`, `empties`
 
 ```wip,run
 struct Board {
@@ -235,6 +235,23 @@ struct Words {
     }
 }
 
+view struct Line {
+    text: str
+    seen: i64 = 0
+
+    // What it answers borrows the text, not the line.
+    fn start(): str from self.text = self.text[0..1]
+}
+
+view struct Found {
+    words: Vec<str> = Vec()
+
+    // A call leaves it borrowing nothing.
+    var fn clear() empties = {
+        self.words.clear()
+    }
+}
+
 fn main() = {
     var board = Board(cells: [1, 2])
     board.at(0) = 10
@@ -244,10 +261,18 @@ fn main() = {
     var found: Vec<Word> = Vec()
     words.into(&var found)
     assert(found[1].text == "b")
+
+    var line = Line(text: "a b")
+    val start = line.start()
+    line.seen += 1
+    var found = Found()
+    found.words.push(start)
+    found.clear()
+    assert(start == "a" && found.words.isEmpty())
 }
 ```
 
-[Page 7](07-references.md#projections-lending-a-place-out-of-a-call)
+[Page 7](07-references.md#projections-lending-a-place-out-of-a-call), and [what a signature says about borrows](07-references.md#what-a-signature-says-about-borrows)
 
 ## Errors
 

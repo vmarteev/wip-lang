@@ -3,8 +3,9 @@
 // assumed, and no more.
 
 import std::io
+import std::path
 import std::process::{Command}
-import check::{Gate, read, run, wrong, write}
+import check::{Gate, isFile, read, run, wrong, write}
 
 /// The release build's IR of the program in `root`, or why there is none.
 fn irOf(gate: &Gate, root: str): Result<String, String> = {
@@ -252,4 +253,72 @@ fn atomicOrdersOnX86(gate: &Gate, root: str): Option<String> = {
 	if !assembly.contains("movq\t$7, (") || assembly.contains("movq\t$9, (") then
 		return .Some("on x86-64 the release store is not a plain `mov`, or the other is:\n\(assembly)")
 	return .None
+}
+
+/// A release build in parts drops a function every call to which was
+/// inlined: `aa::tiny`, a part's own, called only from a part after it,
+/// which copies it and inlines it. Its body is in no part's object once the
+/// linker has stripped what nothing reaches, as `nm` says where there is
+/// one; the debug build keeps it; and a panic lists the same calls in both,
+/// across the parts, as the table each part keeps says them.
+fn strippedInParts(gate: &Gate, root: str): Option<String> = {
+	write(root, "aa/aa.wip", "pub fn tiny(x: i64): i64 = x * 3 + 1\n")
+	var main = String::of("import aa\n")
+	val modules = 4
+	for m in 0..modules {
+		main.push("import m\(m)\n")
+		var text = String()
+		if m + 1 < modules then text.push("import m\(m + 1)\n") else text.push("import aa\n")
+		for f in 0..400 {
+			text.push("pub fn work\(f)(xs: &var Vec<i64>, n: i64): i64 = {\n\tvar total = 0\n\tfor i in 0..n {\n\t\txs.push(i * \(f + 1))\n\t\tif xs.len() > 50 then xs.clear()\n\t\ttotal += xs[xs.len() - 1] % 7\n\t}\n\treturn total\n}\n")
+		}
+		text.push("pub fn all(n: i64): i64 = {\n\tvar xs: Vec<i64> = Vec()\n\tvar total = 0\n")
+		for f in 0..400 {
+			text.push("\ttotal += work\(f)(&var xs, n)\n")
+		}
+		text.push("\treturn total\n}\n")
+		val next =
+			if m + 1 < modules then "m\(m + 1)::chain(xs, k + 1)" else "xs[k * 100] + aa::tiny(k)"
+		text.push("pub fn chain(xs: &Vec<i64>, k: i64): i64 = {\n\tval here = xs.len() + k\n\treturn \(next) + here\n}\n")
+		write(root, "m\(m)/m\(m).wip", text)
+	}
+	main.push("\nfn main(): i64 = {\n\tvar sum = 0\n")
+	for m in 0..modules {
+		main.push("\tsum += m\(m)::all(0)\n")
+	}
+	main.push("\tval ys = Vec::of([1, 2, 3])\n\treturn m0::chain(&ys, sum % 2)\n}\n")
+	write(root, "main.wip", main)
+	var ir = match irOf(gate, root) {
+		.Ok(ir) => ir
+		.Err(why) => return .Some(why)
+	}
+	// The parts after the first, beside it.
+	var part = 1
+	while isFile(root, "program.\(part).ll") {
+		ir.push(read(root, "program.\(part).ll"))
+		part += 1
+	}
+	if part < 3 then return .Some("the program is \(part) parts, too few to copy across")
+	if !ir.contains("define available_externally hidden i64 @\"wip.aa::tiny.") then
+		return .Some("no part copies `aa::tiny`")
+	val released = gate.wip(root, ["build", "--release", "main.wip", "-o", "released"])
+	if !released.exit.success() then return wrong("`wip build --release`", &released)
+	val debug = gate.wip(root, ["build", "main.wip", "-o", "debug"])
+	if !debug.exit.success() then return wrong("`wip build`", &debug)
+	val fromRelease = run(Command::of(path::join(root, "released")))
+	val fromDebug = run(Command::of(path::join(root, "debug")))
+	if !fromRelease.stderr.contains("in m3::chain") || fromRelease.stderr != fromDebug.stderr then
+		return .Some("the release build panics with\n\(fromRelease.stderr)\nthe debug build with\n\(fromDebug.stderr)")
+	val .Some(releaseSymbols) = symbolsOf(root, "released") else return .None
+	val debugSymbols = symbolsOf(root, "debug").unwrapOr(String())
+	if releaseSymbols.contains("aa::tiny") then return .Some("the release build keeps `aa::tiny`")
+	if !debugSymbols.contains("aa::tiny") then return .Some("the debug build has no `aa::tiny`")
+	return .None
+}
+
+/// What `nm` says the program `name` in `root` holds, where there is an `nm`.
+fn symbolsOf(root: str, name: str): Option<String> = {
+	val listed = run(Command::of("nm").args([path::join(root, name).toStr()]))
+	if !listed.exit.success() then return .None
+	return .Some(listed.stdout.clone())
 }

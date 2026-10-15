@@ -121,6 +121,11 @@ fn editorSees(gate: &Gate, above: str): Option<String> = {
 	val root = path::join(above, "prog")
 	write(root, "main.wip", "import shapes\n\nfn main() = {\n\tval x = shapes::area()\n}\n")
 	write(root, "shapes/area.wip", "pub fn area(): i64 = 1\n")
+	write(
+		root,
+		"shapes/area.test.wip",
+		"fn helperOfTests(): i64 = 2\n\n@test\nfn helperIsTwo() = assert(helperOfTests() == 2)\n",
+	)
 	val main = uri(path::join(root, "main.wip"))
 	val area = uri(path::join(root, "shapes/area.wip"))
 	val kept = uri(path::join(root, "kept.wip"))
@@ -319,9 +324,10 @@ fn edit(session: &var Session, main: str, area: str, kept: str): Result<void, St
 
 	// What `@derive` writes is placed at its argument, and an editor passes
 	// over it: a field is named where the program names it, and nowhere in
-	// the annotation.
+	// the annotation, which shows the implementation, with what it asks of
+	// the type's parameters.
 	val derived =
-		"@derive(Clone)\nstruct Point {\n\tone: i64\n}\n\nfn main() = {\n\tval p = Point { one: 1 }.clone()\n\tval n = p.one\n}\n"
+		"@derive(Clone)\nstruct Point {\n\tone: i64\n}\n\nfn main() = {\n\tval p = Point { one: 1 }.clone()\n\tval n = p.one\n}\n\n@derive(Eq)\nstruct Pair<T> {\n\tfirst: T\n}\n\n@derive(Eq)\nstruct Tag<T> {\n\tslot: u32\n}\n"
 	session.notify("textDocument/didChange", changed(main, 5, derived))?
 	val fields = session.request("textDocument/references", withDeclaration(main, 2, 2))?
 	var lines: Vec<i64> = Vec()
@@ -330,8 +336,15 @@ fn edit(session: &var Session, main: str, area: str, kept: str): Result<void, St
 	}
 	if lines.len() != 2 || lines[0] != 2 || lines[1] != 7 then
 		return .Err("the field is named at \(fields)")
-	val annotation = session.request("textDocument/hover", place(main, 0, 10))?
-	if !annotation.isNull() then return .Err("hover on `@derive` shows \(annotation)")
+	for (line, shown) in [
+		(0, "extend Point: Clone"),
+		(10, "extend Pair<T: Eq>: Eq"),
+		(15, "extend Tag<T>: Eq"),
+	] {
+		val annotation = session.request("textDocument/hover", place(main, line, 10))?
+		if !textAt(&annotation, ["contents", "value"]).contains(shown) then
+			return .Err("hover on `@derive` shows \(annotation)")
+	}
 
 	// A call's signature, at its second argument, before it is closed.
 	val unclosed =
@@ -344,7 +357,52 @@ fn edit(session: &var Session, main: str, area: str, kept: str): Result<void, St
 		textAt(&signature, ["documentation", "value"]) != "Times." {
 		return .Err("the signature is \(help)")
 	}
+
+	// A test file's names are its own: completion offers a test file's
+	// helper in that file, and not in its module's own file, nor after the
+	// module's name in another. The program imports `shapes` again, so that
+	// the module and its test file are in it.
+	val path = "\tval y = shapes::"
+	session.notify(
+		"textDocument/didChange",
+		changed(main, 7, "import shapes\n\nfn main() = {\n\(path)\n}\n"),
+	)?
+	val elsewhere = labelsAt(&var session, main, 3, path.len())?
+	if !elsewhere.any((label) => label == "area") ||
+		elsewhere.any((label) => label == "helperOfTests") {
+		return .Err("after `shapes::` another module is offered \(elsewhere)")
+	}
+	val tests = "\(area[0..area.len() - 4]).test.wip"
+	val typing = "\tval x = he"
+	session.notify(
+		"textDocument/didOpen",
+		opened(tests, "fn helperOfTests(): i64 = 2\n\n@test\nfn helperIsTwo() = {\n\(typing)\n}\n"),
+	)?
+	if !labelsAt(&var session, tests, 4, typing.len())?.any((label) => label == "helperOfTests") {
+		return .Err("the test file's helper is not offered in it")
+	}
+	session.notify(
+		"textDocument/didChange",
+		changed(area, 6, "pub fn area(): i64 = {\n\(typing)\n}\n"),
+	)?
+	if labelsAt(&var session, area, 1, typing.len())?.any((label) => label == "helperOfTests") then
+		return .Err("a test file's helper is offered in its module's own file")
 	return .Ok()
+}
+
+/// What completion offers at a place in `file`.
+fn labelsAt(
+	session: &var Session,
+	file: str,
+	line: i64,
+	character: i64,
+): Result<Vec<String>, String> = {
+	val list = session.request("textDocument/completion", place(file, line, character))?
+	var labels: Vec<String> = Vec()
+	for item in itemsOf(fieldOf(&list, ["items"])) {
+		labels.push(textAt(&item, ["label"]))
+	}
+	return .Ok(labels)
 }
 
 /// The diagnostics published next for `file` are none.

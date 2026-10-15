@@ -1,0 +1,238 @@
+// What a stale borrow's error offers: the word a callee's signature could
+// have said that would have kept the view good. A view stale because it
+// borrows through a call that answers it, where the callee says no `from`,
+// or because it is the receiver of a method that empties it and says no
+// `empties`. A word is offered only where the body would be held to it, and
+// where the caller, checked again supposing it said so, is no longer
+// refused there: a hint that does not fix teaches less than none.
+
+import std::collections::{Map}
+import hir::{Body, FnDef, FnId, LendFrom, LocalId, Ty}
+import syntax::{Edit, NOT_EMPTIED, STR_OUTLIVED_ITS_BYTES, Span}
+
+/// A word offered: what says it, and the edit that writes it.
+struct Hint {
+	help: String
+	edit: Edit
+}
+
+extend Checker {
+	/// The hint for `local`, stale and used at `span`, where there is one.
+	var fn staleHint(local: LocalId, span: Span): Option<Hint> = {
+		if !self.suppose.hints then return .None
+		if self.emptiesHint(local, span) is .Some(hint) then return .Some(hint)
+		return self.fromHint(local, span)
+	}
+
+	/// `empties`, where the use is the receiver of a call to a `var fn` of
+	/// the program that says no `empties` and whose body would be held to
+	/// it.
+	var fn emptiesHint(local: LocalId, span: Span): Option<Hint> = {
+		val .Some(callee) = self.receivedBy(local, span) else return .None
+		val def = &self.program.fns[callee]
+		if def.empties || def.receiver != .Some(.Var) || self.inLibrary(def) then return .None
+		val .Some((at, _)) = def.keepsAt else return .None
+		val .Some(body) = def.body.asRef() else return .None
+		val suppose = Suppose(empties: .Some(callee), hints: false)
+		val itself = self.checkSupposing(callee, &body, self.signatures, suppose.clone())
+		for d in itself.diagnostics {
+			if d.code == NOT_EMPTIED then return .None
+		}
+		if !self.fixedSupposing(self.signatures, suppose, span) then return .None
+		val name = self.fnText(&def)
+		val variable = self.interner.resolve(self.body.locals[local].name)
+		return .Some(Hint(
+			help: "\(name) leaves `\(variable)` holding nothing it held: say so with `empties`, after its signature",
+			edit: Edit::insert(at, " empties"),
+		))
+	}
+
+	/// The callee of a call whose receiver is `local`, lent where it is used
+	/// at `span`.
+	fn receivedBy(local: LocalId, span: Span): Option<FnId> = {
+		for expr in self.body.exprs {
+			val .Call(callee, args, ..) = expr.kind else continue
+			if args.isEmpty() then continue
+			val .Ref(place) = self.body.exprs[args[0]].kind else continue
+			if self.body.exprs[place].kind is .Local(l) &&
+				l == local &&
+				self.body.exprs[place].span == span {
+				return .Some(callee)
+			}
+		}
+		return .None
+	}
+
+	/// `from`, where `local` was given the result of a call to a function of
+	/// the program that says no `from`, and answers from less than its
+	/// signature says.
+	var fn fromHint(local: LocalId, span: Span): Option<Hint> = {
+		for callee in self.answeredBy(local) {
+			val def = &self.program.fns[callee]
+			if def.lendsFrom.isSome() || self.inLibrary(def) then continue
+			val .Some(ret) = def.retSpan else continue
+			val .Some(body) = def.body.asRef() else continue
+			val .Some(named) = self.narrowest(callee, &body) else continue
+			// The signature lends no less with it: nothing to offer.
+			val before = &self.signatures[callee.index()]
+			var after = before.clone()
+			for i in 0..after.len() {
+				val whole = named.contains(LendFrom::Param(i as u32))
+				after[i].place = after[i].place && whole
+				after[i].borrows =
+					after[i].borrows && (whole || named.contains(LendFrom::Borrowed(i as u32)))
+			}
+			if after == before then continue
+			val .Some(text) = self.fromText(&def, &body, &named) else continue
+			var signatures: Vec<Vec<Lends>> = self.signatures.toVec()
+			signatures[callee.index()] = after
+			if !self.fixedSupposing(&signatures, Suppose(hints: false), span) then continue
+			val name = self.fnText(&def)
+			val variable = self.interner.resolve(self.body.locals[local].name)
+			return .Some(Hint(
+				help: "\(name) says no `from`, so `\(variable)` borrows all it was given; it answers from `\(text)` alone: say so with `from \(text)` after its result type",
+				edit: Edit::insert(ret.hi, " from \(text)"),
+			))
+		}
+		return .None
+	}
+
+	/// The functions whose results `local` is given: by its `val` or `var`,
+	/// and by assignments.
+	fn answeredBy(local: LocalId): Vec<FnId> = {
+		var found: Vec<FnId> = Vec()
+		for stmt in self.body.stmts {
+			if stmt.kind is .Let(local: l, init) && l == local {
+				if self.body.exprs[init].kind is .Call(callee, ..) then found.push(callee)
+			}
+		}
+		for expr in self.body.exprs {
+			if expr.kind is .Assign(place, value, op: .None, ..) &&
+				self.body.exprs[place].kind is .Local(l) &&
+				l == local {
+				if self.body.exprs[value].kind is .Call(callee, ..) then found.push(callee)
+			}
+		}
+		return found
+	}
+
+	/// What `callee`'s body answers from, as `from` would name it: a
+	/// parameter whose place it answers from, whole, and one whose borrows
+	/// alone it answers from, by what it borrows.
+	var fn narrowest(callee: FnId, body: &Body): Option<Vec<LendFrom>> = {
+		val checked = self.checkSupposing(callee, &body, self.signatures, Suppose(
+			answers: true,
+			hints: false,
+		))
+		var named: Vec<LendFrom> = Vec()
+		for path in checked.answered {
+			val .Some(i) = body.params.indexOf(&path.local) else continue
+			val whole = LendFrom::Param(i as u32)
+			val borrowed = LendFrom::Borrowed(i as u32)
+			// What a parameter with no field that borrows lends is named by
+			// the parameter: `from a` of an `a: str`.
+			val byField = self.borrowingField(body.locals[path.local].ty).isSome()
+			if path.isLent() && byField {
+				if !named.contains(&whole) && !named.contains(&borrowed) then named.push(borrowed)
+			} else if !named.contains(&whole) {
+				named.retain((n) => n != borrowed)
+				named.push(whole)
+			}
+		}
+		return if named.isEmpty() then .None else .Some(named)
+	}
+
+	/// `named` as `from` writes it: a parameter by its name, and what one
+	/// borrows by a field of it that borrows, `self.ast`. Nothing where a
+	/// parameter whose borrows alone are named has no such field.
+	fn fromText(def: &FnDef, body: &Body, named: &[LendFrom]): Option<String> = {
+		var parts: Vec<String> = Vec()
+		for n in named {
+			val (index, whole) = match n {
+				.Param(index) => (index as i64, true)
+				.Borrowed(index) => (index as i64, false)
+			}
+			val param = body.params[index]
+			val written =
+				if index == 0 && def.receiver.isSome() then String::of("self")
+				else String::of(self.interner.resolve(body.locals[param].name))
+			if whole {
+				parts.push(written)
+				continue
+			}
+			val .Some(field) = self.borrowingField(body.locals[param].ty) else return .None
+			parts.push("\(written).\(field)")
+		}
+		return .Some(parts.join(", "))
+	}
+
+	/// A field of the struct `ty` is, or refers to, that borrows: a `&`, a
+	/// `str` or a view, which `from` may name.
+	fn borrowingField(ty: Ty): Option<String> = {
+		val pointee = match self.program.types.kind(ty) {
+			.Ref(inner, ..) => inner
+			_ => ty
+		}
+		val .Struct(id, ..) = self.program.types.kind(pointee) else return .None
+		for (i, field) in self.program.fieldTys(pointee).forwards().enumerate() {
+			if self.program.holdsView(field) then
+				return .Some(
+					String::of(self.interner.resolve(self.program.structs[id].fields[i].name)),
+				)
+		}
+		return .None
+	}
+
+	/// Whether `callee` says `empties`, or this check supposes it does.
+	fn saysEmpties(callee: FnId): bool =
+		self.program.fns[callee].empties || self.suppose.empties == .Some(callee)
+
+	/// A check of `id`'s body, supposing what `suppose` says.
+	var fn checkSupposing(
+		id: FnId,
+		body: &Body,
+		signatures: &[Vec<Lends>],
+		suppose: Suppose,
+	): BodyChecked = {
+		var lent: Map<(FnId, Ty), Vec<Lends>> = Map()
+		return checkBodyWith(
+			self.program,
+			self.interner,
+			&signatures,
+			self.cHolders,
+			&var lent,
+			id,
+			&body,
+			if id == self.id then self.implements else .None,
+			suppose,
+		)
+	}
+
+	/// Whether this body, checked again supposing what `suppose` and
+	/// `signatures` say, is no longer refused at `span` for a stale borrow.
+	var fn fixedSupposing(signatures: &[Vec<Lends>], suppose: Suppose, span: Span): bool = {
+		val checked = self.checkSupposing(self.id, self.body, &signatures, suppose)
+		for d in checked.diagnostics {
+			if d.code == STR_OUTLIVED_ITS_BYTES && d.primary.span == span then return false
+		}
+		return true
+	}
+
+	/// Whether `def` is the standard library's, whose signatures a program
+	/// does not change.
+	fn inLibrary(def: &FnDef): bool = {
+		val path = &self.program.modules[def.module as i64]
+		return path == "std" || path.startsWith("std::")
+	}
+
+	/// `Words.clear`, or `label`: a function as a message names it.
+	fn fnText(def: &FnDef): String = {
+		val name = self.interner.resolve(def.name)
+		return match def.owner {
+			.Some(.Struct(id)) =>
+				"`\(self.interner.resolve(self.program.structs[id].name)).\(name)`"
+			.Some(.Enum(id)) => "`\(self.interner.resolve(self.program.enums[id].name)).\(name)`"
+			_ => "`\(name)`"
+		}
+	}
+}

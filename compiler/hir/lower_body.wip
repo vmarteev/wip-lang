@@ -16,6 +16,7 @@ import syntax::{
 	MISSING_RETURN,
 	NOT_ITERABLE,
 	NO_VALUE,
+	REF_OUTSIDE_ARGUMENT,
 	RETURN_IN_DEFER,
 	Span,
 	Symbol,
@@ -36,8 +37,7 @@ fn chainWord(file: &ast::Ast, e: ast::ExprId): str =
 
 /// The `-` that an expression statement starts with, if any.
 fn leadingNeg(file: &ast::Ast, stmt: ast::StmtId): Option<Span> = {
-	val .Expr(start) = file.stmts[stmt].kind else return .None
-	var e = start
+	var .Expr(e) = file.stmts[stmt].kind else return .None
 	while true {
 		match file.exprs[e].kind {
 			.Unary(op: .Neg, opSpan, ..) => return .Some(opSpan)
@@ -760,6 +760,23 @@ extend Lowerer {
 		source: ast::ForSource,
 		body: &ast::Block,
 	): StmtKind = match source {
+		// `for x in &var c`: a loop walks a place, and writes its elements
+		// where it can be written; the `&` is refused, and the place walked.
+		.Elements(written) if self.ast.exprs[written].kind is .Unary(op: .Ref | .RefVar, ..) => {
+			val .Unary(op, operand, ..) = self.ast.exprs[written].kind else panic("a borrow")
+			val span = self.ast.exprs[written].span
+			val prefix = Span::new(span.lo, self.ast.exprs[operand].span.lo)
+			self.report(
+				Diagnostic::error(REF_OUTSIDE_ARGUMENT, "a `for` walks a place, not a reference to it", span, "`\(op.text())` before what is walked").withFix(
+					"remove the `\(op.text())`",
+					[Edit::replace(prefix, String())],
+				).withNote(
+					"a `for` lends each element of what it walks: for writing where the place can be written, a `var` or a `&var` parameter, and for reading where not",
+				),
+			)
+			self.takenApart(operand)
+			self.forLent(label, &binding, operand, &body)
+		}
 		.Elements(elements) => {
 			self.takenApart(elements)
 			// `for x in move c`: `c` gives up its elements, and each is the
@@ -914,7 +931,9 @@ extend Lowerer {
 		}
 		self.state.scopes.push(Map())
 		val local: Option<LocalId> = match binding.kind {
-			.Binding(symbol) => .Some(self.declare(symbol, ty, .Binding, binding.span))
+			.Binding(symbol, isVar) => .Some(
+				self.declare(symbol, ty, if isVar then .Var else .Binding, binding.span),
+			)
 			.Wildcard | .Error => .None
 			_ => {
 				self.report(

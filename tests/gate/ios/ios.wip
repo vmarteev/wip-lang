@@ -1,0 +1,161 @@
+// iOS, in the simulator, where this machine has one: the standard
+// library's tests, and every `ok` case, built for `ios-arm64-simulator` and
+// run there, which must print what it prints on a Mac — the case's
+// `run.snap`; and an app whose library has files of its own, which its
+// bundle carries. A machine without Apple's tools for iOS has nothing to
+// run them on, and the check says it is skipped.
+
+import std::io
+import std::process::{Command}
+import check::{Checked, Gate, across, listed, report, run, said, write}
+import snapshot
+
+val CASES = "tests/cases"
+
+/// The cases that are not iOS's, and why: what they show needs what an iOS
+/// system does not have.
+val NOT_ON_IOS: [(str, str); 1] = [
+	("ok/197_processes", "it starts the system's programs, `sh` and `cat`, which iOS has not"),
+]
+
+pub fn check(gate: &Gate): Checked = {
+	if !simulated() {
+		io::println("ios: skipped, since this machine has no iOS simulator")
+		return Checked::of(0, Vec())
+	}
+	var failed: Vec<String> = Vec()
+	var count = 0
+	// The library's tests first, alone: `wip test` boots the simulator the
+	// cases then run in.
+	if gate.takes("the library's tests") {
+		count += 1
+		val ran = gate.wip(".", [
+			"test",
+			"--color",
+			"never",
+			"--target",
+			"ios-arm64-simulator",
+			"tests/std/main.wip",
+		])
+		if !ran.exit.success() || !ran.stdout.contains(" tests passed") then
+			failed.push("the library's tests fail\(said(&ran))")
+	}
+	if gate.takes("an app carries its library's files") {
+		count += 1
+		if appWithFiles(&gate) is .Some(why) then failed.push(why)
+	}
+	var cases: Vec<String> = Vec()
+	for name in listed("\(CASES)/ok") {
+		val case = "ok/\(name)"
+		var left = false
+		for (out, _) in NOT_ON_IOS {
+			if out == case then left = true
+		}
+		if !left && gate.takes(case) then cases.push(case)
+	}
+	if !cases.isEmpty() {
+		if !booted() then return Checked::of(count + 1, ["ios: no simulator could be booted"])
+		for why in across(cases.len(), (index) => one(&gate, cases[index])) {
+			failed.push(why)
+		}
+		count += cases.len()
+	}
+	return Checked::of(count, failed)
+}
+
+/// Whether Apple's tools list a simulator of iOS here.
+fn simulated(): bool = {
+	val .Ok(listed) = Command::of("xcrun").args(["simctl", "list", "runtimes"]).output() else {
+		return false
+	}
+	return listed.exit.success() && listed.stdout.contains("iOS")
+}
+
+/// Whether a simulator is booted, which the cases run in: one is, after
+/// `wip test` for it.
+fn booted(): bool = {
+	val .Ok(listed) = Command::of("xcrun").args([
+		"simctl",
+		"list",
+		"devices",
+		"booted",
+	]).output() else {
+		return false
+	}
+	return listed.exit.success() && listed.stdout.contains("(Booted)")
+}
+
+/// A case built for the simulator, and run there in `tests/cases`, as on a
+/// Mac, so that what it names is named the same; its leaks are reported, as
+/// they are there; what it prints is compared with what it prints on a Mac.
+fn one(gate: &Gate, name: str): Option<String> = {
+	val main = "\(name)/main.wip"
+	val program = gate.work.join("ios-\(name.replace("/", "-"))")
+	val built = gate.wip(CASES, [
+		"build",
+		"--color",
+		"never",
+		"--target",
+		"ios-arm64-simulator",
+		main.toStr(),
+		"-o",
+		program.toStr(),
+	])
+	if !built.exit.success() then return .Some("\(name): it does not build for iOS\(said(&built))")
+	// The simulator's shell goes into the directory and starts the program
+	// as `wip run` does, with its own system's root for the loader.
+	val script = "cd \"$0\" && DYLD_ROOT_PATH=\"$SIMULATOR_ROOT\" exec \"$@\""
+	val cases = std::fs::realPath(CASES).unwrapOr(String::of(CASES))
+	val output = run(
+		Command::of("xcrun").args([
+			"simctl",
+			"spawn",
+			"booted",
+			"/bin/sh",
+			"-c",
+			script,
+			cases.toStr(),
+			program.toStr(),
+		]).env("SIMCTL_CHILD_WIP_CHECK_LEAKS", "1"),
+	)
+	// Compared, and never written: the snapshot is the Mac's.
+	return match snapshot::compare("\(CASES)/\(name)/run.snap", report(&output), false) {
+		.Some(why) => .Some("\(name): in the simulator it prints something else\n\(why)")
+		.None => .None
+	}
+}
+
+/// An app that depends on a library with files of its own: built for the
+/// simulator and run there, the library finding its files in the app's
+/// bundle, under its name, as the app finds its own.
+fn appWithFiles(gate: &Gate): Option<String> = {
+	val root = gate.work.join("ios-app-files")
+	write(root.toStr(), "lib/package.wip", "@files(\"data\")\npackage lib\n")
+	write(root.toStr(), "lib/data/note.txt", "from the library\n")
+	write(
+		root.toStr(),
+		"lib/lib.wip",
+		"import std::fs\n\npub fn note(): String = fs::readFile(package::besideProgram(\"data/note.txt\")).unwrapOr(String::of(\"missing\\n\"))\n",
+	)
+	write(
+		root.toStr(),
+		"app/package.wip",
+		"@depends(\"lib\", path = \"../lib\")\n@files(\"levels\")\n@app(id = \"com.example.files\")\npackage app\n",
+	)
+	write(root.toStr(), "app/levels/one.txt", "level one\n")
+	write(
+		root.toStr(),
+		"app/main.wip",
+		"import std::fs\nimport std::io\nimport lib\n\nfn main() = io::print(\"\\(lib::note())\\(fs::readFile(package::besideProgram(\"levels/one.txt\")).unwrap())\")\n",
+	)
+	val ran = gate.wip(
+		root.toStr(),
+		["run", "--color", "never", "--target", "ios-arm64-simulator", "app"],
+	)
+	// An app's output comes through the simulator's terminal, a line ended
+	// `\r\n`.
+	val printed = ran.stdout.replace("\r", "")
+	if !ran.exit.success() || !printed.contains("from the library\nlevel one\n") then
+		return .Some("an app carries its library's files: in the simulator it says otherwise\(said(&ran))")
+	return .None
+}

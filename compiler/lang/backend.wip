@@ -1,6 +1,7 @@
-// Building with LLVM through `clang`, which compiles every build: a debug
-// build at `-O0`, in parts compiled at once, and a release build at `-O2`, as
-// one module. `clang` is handed each module as bitcode, which a later `clang`
+// Building with LLVM through `clang`, which compiles every build in parts,
+// at once: a debug build at `-O0`, and a release build at `-O2`, each of its
+// parts with copies of the small functions it calls from others. `clang` is
+// handed each module as bitcode, which a later `clang`
 // reads as the one it was written for, where its text it may not. The
 // `clang` is version 15 or newer, found by asking it to compile a module of
 // one function.
@@ -17,7 +18,7 @@ import std::io
 import std::path
 import std::process
 import std::process::{Command}
-import llvm::{Ir, frameTableAssembly, withFrameTables}
+import llvm::{Ir, frameListAssembly, withFrameTables}
 import llvm
 
 /// A `clang` that compiles the LLVM backend's IR, and who it is: its name
@@ -94,17 +95,17 @@ fn isAppleClang(identity: &[u8]): bool = {
 	return false
 }
 
-/// The objects `clang` makes of the LLVM backend's IR, with the table a
-/// panic reads its calls from, which the program's DWARF says the contents
-/// of. A release build is one module, its table in its object; a debug build
-/// is parts compiled at once, its table an object of its own on a Mac and in
-/// the first part's object on ELF. `optimize` says which: `-O2` or `-O0`,
-/// unless `WIP_LLVM_OPT` says another level. Kept in the cache under what
-/// they depend on, a debug build's part by part, and taken from there when
-/// nothing has changed.
+/// The objects `clang` makes of the LLVM backend's IR, its parts compiled at
+/// once, with the tables a panic reads its calls from, which the program's
+/// DWARF says the contents of, and the list of them. A release build's part
+/// has its table in its object; a debug build's one table is an object of
+/// its own on a Mac and in the first part's object on ELF. `optimize` says
+/// which: `-O2` or `-O0`, unless `WIP_LLVM_OPT` says another level. Kept in
+/// the cache under what they depend on, part by part, and taken from there
+/// when nothing has changed.
 pub fn llvmObjects(
 	ir: &Ir,
-	cpu: &Cpu,
+	options: &BuildOptions,
 	optimize: bool,
 	unique: &Unique,
 ): Result<Vec<Vec<u8>>, BuildError> = {
@@ -112,19 +113,38 @@ pub fn llvmObjects(
 		.Ok(found) => found
 		.Err(message) => return .Err(.Link(message))
 	}
-	val llvm = Clang::new(&found, &cpu, optimize, &unique)
-	if !optimize then return llvm.parts(&ir.modules, &ir.files)
-	val module: Vec<u8> = if ir.modules.isEmpty() then Vec() else llvm::bitcode(&ir.modules[0])
-	val object = llvm.whole(&module, &ir.files)?
-	return .Ok([object])
+	val llvm = Clang::new(&found, &options, optimize, &unique)
+	return if optimize then llvm.optimized(&ir.modules, &ir.files)
+	else llvm.parts(&ir.modules, &ir.files)
+}
+
+/// The symbol of the table of what is kept under `key`: named by what it is
+/// made of, so that an object holding it is the same wherever its part is.
+fn tableSymbol(key: str): String = "wip.frame_table.\(key[..16])"
+
+/// The number the entries of what is kept under `key` hold, which the list
+/// finds their shared piece by: the key's first sixteen hexadecimal digits,
+/// which the piece's symbol is named by.
+fn tableKey(key: str): u64 = {
+	var number: u64 = 0
+	for i in 0..16 {
+		val digit = key[i]
+		val value: u64 =
+			if digit >= b'0' && digit <= b'9' then (digit - b'0') as u64
+			else (digit - b'a' + 10) as u64
+		number = number << 4 | value
+	}
+	return number
 }
 
 /// `clang`, and how it is asked to compile the LLVM backend's IR.
 view struct Clang {
 	found: &FoundClang
-	/// Code for where a position-independent program is loaded, for the
-	/// processor the program's C is built for.
+	/// Code for the system the program is for, where a position-independent
+	/// program is loaded, for the processor the program's C is built for.
 	target: Vec<String>
+	/// Whether the objects are Mach-O, Apple's, rather than ELF.
+	apple: bool
 	/// What compiles a module, before what it compiles.
 	compile: Vec<String>
 	/// This compiler, as far as an object depends on it.
@@ -133,10 +153,19 @@ view struct Clang {
 }
 
 extend Clang {
-	static fn new(found: &FoundClang, cpu: &Cpu, optimize: bool, unique: &Unique): Clang = {
+	static fn new(
+		found: &FoundClang,
+		options: &BuildOptions,
+		optimize: bool,
+		unique: &Unique,
+	): Clang = {
+		val apple = options.target.isApple()
 		var target: Vec<String> = Vec()
-		if TARGET_VENDOR != "apple" then target.push("-fPIC")
-		target.push(cpuFlag(&cpu))
+		for flag in options.targetFlags {
+			target.push(flag.clone())
+		}
+		if !apple then target.push("-fPIC")
+		target.push(cpuFlag(&options.cpu, &options.target))
 		// `WIP_LLVM_OPT` sets the level, to tell what optimising does from
 		// what the IR says.
 		val level = match io::env("WIP_LLVM_OPT") {
@@ -156,16 +185,22 @@ extend Clang {
 			compile.push("-Xclang")
 			compile.push("-fno-split-cold-code")
 		}
-		// An ELF object is written again with the table in it, by a writer
-		// that knows no table of the functions whose addresses are taken,
-		// which only a linker folding identical code reads.
-		if TARGET_VENDOR != "apple" then compile.push("-fno-addrsig")
+		// An object is written again with the table in it, by a writer that
+		// knows no table of the functions whose addresses are taken, which
+		// only a linker folding identical code reads, and which names them
+		// by numbers that the symbols a table adds to a Mach-O object change.
+		compile.push("-fno-addrsig")
+		// Each function in a section of its own on ELF, so that a release
+		// build's linker drops one that nothing reaches, and the table's
+		// entry for it, which is tied to its section.
+		if optimize && !apple then compile.push("-ffunction-sections")
 		for arg in target {
 			compile.push(arg.clone())
 		}
 		return Clang(
 			found: &found,
 			target: target,
+			apple: apple,
 			compile: compile,
 			compiler: thisCompiler(),
 			unique: &unique,
@@ -221,59 +256,75 @@ extend Clang {
 		return readObject(object)
 	}
 
-	/// A release build's one module, its bitcode compiled with its table.
-	fn whole(module: &[u8], files: &Map<String, String>): Result<Vec<u8>, BuildError> = {
-		val name = "\(self.key("an LLVM object", [module])).o"
-		val kept = path::join(cache(), name)
-		if readBytes(kept) is .Ok(object) then return .Ok(object)
+	/// A release build's parts, each compiled with its table at once with the
+	/// others and kept on its own, and the list of their tables.
+	fn optimized(
+		modules: &[llvm::Module],
+		files: &Map<String, String>,
+	): Result<Vec<Vec<u8>>, BuildError> = {
+		val built = future::map(&modules, (module) => self.optimizedPart(&module, &files))
+		var keys: Vec<String> = Vec()
+		var objects: Vec<Vec<u8>> = Vec()
+		for result in move built {
+			val (key, object) = result?
+			keys.push(key)
+			objects.push(object)
+		}
+		objects.push(self.list(&keys)?)
+		return .Ok(objects)
+	}
+
+	/// One part of a release build, its bitcode compiled with its table, from
+	/// the cache or compiled there, with the key the cache keeps it under.
+	fn optimizedPart(
+		part: &llvm::Module,
+		files: &Map<String, String>,
+	): Result<(String, Vec<u8>), BuildError> = {
+		val module = llvm::bitcode(&part)
+		val key = self.key("an optimised LLVM part", [module.items()])
+		val symbol = tableSymbol(key)
+		val kept = path::join(cache(), "\(key).o")
+		if readBytes(kept) is .Ok(object) then return .Ok((key, object))
 		val dir = temporaryDir(self.unique)?
 		val object = dir.join("program.o")
-		var built: Vec<u8> = Vec()
-		if TARGET_VENDOR == "apple" {
-			// Mach-O, which the compiler does not write back, and a release
-			// build, whose functions only its own object may name: the table
-			// follows the program's assembly.
-			val source = dir.join("program.bc")
-			val assembly = dir.join("program.s")
-			val first = dir.join("first.o")
-			if writeBytes(source, module) is .Err(error) then
-				return .Err(.Link("cannot write the bitcode: \(error)"))
-			self.invoke(&self.compile, ["-S", source.toStr(), "-o", assembly.toStr()])?
-			self.assemble(assembly, first)?
-			val firstObject = readObject(first)?
-			val tables = match frameTableAssembly([firstObject], &files) {
-				.Ok(tables) => tables
-				.Err(error) => return .Err(dwarf(error))
-			}
-			// Bytes, not text: what the program's strings and names hold is
-			// written as it is.
-			var text = match fs::readFile(assembly) {
-				.Ok(text) => text
-				.Err(error) => return .Err(.Link("cannot read the assembly clang wrote: \(error)"))
-			}
-			text.push(tables)
-			if fs::writeFile(assembly, text) is .Err(error) then
-				return .Err(.Link("cannot write the assembly: \(error)"))
-			self.assemble(assembly, object)?
-			built = readObject(object)?
-		} else {
-			// ELF: the object, written again with the table in it, with no
-			// assembly between, whose names an assembler may read as
-			// registers.
-			val compiled = self.object(module, &dir)?
-			built = match withFrameTables([compiled], &files) {
-				.Ok(built) => built
-				.Err(error) => return .Err(dwarf(error))
-			}
-			if writeBytes(object, &built) is .Err(error) then
-				return .Err(.Link("cannot write the object: \(error)"))
+		// The object, written again with the table in it, with no assembly
+		// between, whose names an assembler may read as registers.
+		val compiled = self.object(&module.items(), &dir)?
+		val built = match withFrameTables([compiled], &files, symbol, tableKey(key), true) {
+			.Ok(built) => built
+			.Err(error) => return .Err(dwarf(error))
 		}
+		if writeBytes(object, &built) is .Err(error) then
+			return .Err(.Link("cannot write the object: \(error)"))
 		keepObject(kept, object, self.unique)
-		return .Ok(built)
+		return .Ok((key, built))
+	}
+
+	/// The list of the tables, kept under `keys`: an object of its own, which
+	/// says only their numbers and their shared pieces' names, kept under
+	/// them.
+	fn list(keys: &[String]): Result<Vec<u8>, BuildError> = {
+		var all: Vec<&[u8]> = Vec()
+		var tables: Vec<(u64, String)> = Vec()
+		for key in keys {
+			all.push(key.toStr())
+			tables.push((tableKey(key), tableSymbol(key)))
+		}
+		val kept = path::join(cache(), "\(self.key("an LLVM list of tables", &all)).list.o")
+		if readBytes(kept) is .Ok(list) then return .Ok(list)
+		val dir = temporaryDir(self.unique)?
+		val assembly = dir.join("list.s")
+		val list = dir.join("list.o")
+		if fs::writeFile(assembly, frameListAssembly(&tables, self.apple)) is .Err(error) then
+			return .Err(.Link("cannot write the assembly: \(error)"))
+		self.assemble(assembly, list)?
+		keepObject(kept, list, self.unique)
+		return readObject(list)
 	}
 
 	/// A debug build's parts, each compiled straight to an object at once
-	/// with the others and kept on its own, and the table of them all.
+	/// with the others and kept on its own, the table of them all, and the
+	/// list of it.
 	fn parts(
 		modules: &[llvm::Module],
 		files: &Map<String, String>,
@@ -292,42 +343,38 @@ extend Clang {
 		for key in keys {
 			all.push(key.toStr())
 		}
-		val name = "\(self.key("an LLVM table", &all)).table.o"
-		val kept = path::join(cache(), name)
+		val key = self.key("an LLVM table", &all)
+		val kept = path::join(cache(), "\(key).table.o")
 		val table = match readBytes(kept) {
 			.Ok(table) => table
-			.Err(..) => self.table(&objects, &files, kept)?
+			.Err(..) => self.table(&objects, &files, key, kept)?
 		}
-		// On ELF the table is the first part, written again with it.
-		if TARGET_VENDOR == "apple" then objects.push(table) else objects[0] = table
+		// The table is the first part, written again with it.
+		objects[0] = table
+		objects.push(self.list([key])?)
 		return .Ok(objects)
 	}
 
-	/// The table of a debug build's parts, made and kept at `kept`.
+	/// The table of a debug build's parts, named by `key`, made and kept at
+	/// `kept`.
 	fn table(
 		objects: &[Vec<u8>],
 		files: &Map<String, String>,
+		key: str,
 		kept: str,
 	): Result<Vec<u8>, BuildError> = {
+		val symbol = tableSymbol(key)
 		val dir = temporaryDir(self.unique)?
 		val table = dir.join("table.o")
-		if TARGET_VENDOR == "apple" {
-			val tables = match frameTableAssembly(&objects, &files) {
-				.Ok(tables) => tables
-				.Err(error) => return .Err(dwarf(error))
-			}
-			val assembly = dir.join("table.s")
-			if fs::writeFile(assembly, tables) is .Err(error) then
-				return .Err(.Link("cannot write the assembly: \(error)"))
-			self.assemble(assembly, table)?
-		} else {
-			val first = match withFrameTables(&objects, &files) {
-				.Ok(first) => first
-				.Err(error) => return .Err(dwarf(error))
-			}
-			if writeBytes(table, &first) is .Err(error) then
-				return .Err(.Link("cannot write the object: \(error)"))
+		// Its entries name every part's functions, which, on ELF, none of
+		// their sections can be tied to in this object: a debug build strips
+		// nothing.
+		val first = match withFrameTables(&objects, &files, symbol, tableKey(key), false) {
+			.Ok(first) => first
+			.Err(error) => return .Err(dwarf(error))
 		}
+		if writeBytes(table, &first) is .Err(error) then
+			return .Err(.Link("cannot write the object: \(error)"))
 		keepObject(kept, table, self.unique)
 		return readObject(table)
 	}

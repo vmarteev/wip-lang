@@ -1,0 +1,211 @@
+// What a method that says `empties` leaves in its receiver. A call to one
+// gives the receiver no roots, so the body is held to leaving it holding no
+// view it held when the call began: each field of `self` that may hold one
+// is followed, from "may still hold what it held" to emptied — assigned a
+// value that holds nothing of `self`, or the receiver of a call that
+// empties — and back, where something of `self` is put in it again or it
+// is lent to a call that may. At every way out, none may still hold what it
+// held.
+//
+// Raw memory, `Slots<T>`, is the library's: what it holds is moved in and
+// out a slot at a time, which this does not follow, and a container built
+// on it says `empties` of what it knows it ends.
+
+import hir::{ExprId, FnId, LocalId, Ty}
+import syntax::{Diagnostic, NOT_EMPTIED, Span}
+
+extend Checker {
+	/// The fields of the receiver that may hold a view, each a path from it,
+	/// where the body says `empties`: every one may hold what it held.
+	var fn startEmptying(state: &var State) = {
+		val .Some(receiver) = self.emptying else return
+		val .Ref(inner, ..) = self.program.types.kind(self.body.locals[receiver].ty) else return
+		for path in self.viewFields(Path(local: receiver, projs: [Proj::Deref]), inner) {
+			state.filled.add(path)
+		}
+	}
+
+	/// The paths below `path`, a value of `ty`, that may hold a view: each
+	/// field of a struct that may, or the whole of any other type that may.
+	fn viewFields(path: Path, ty: Ty): Vec<Path> = {
+		var paths: Vec<Path> = Vec()
+		if !self.followed(ty) then return paths
+		if self.program.types.kind(ty) !is .Struct(..) {
+			paths.push(path)
+			return paths
+		}
+		for (i, field) in self.program.fieldTys(ty).forwards().enumerate() {
+			if !self.followed(field) then continue
+			var projs = path.projs.clone()
+			projs.push(Proj::Field(i as u32))
+			paths.push(Path(local: path.local, projs: projs))
+		}
+		return paths
+	}
+
+	/// Whether a value of `ty` may hold a view this follows: anything that
+	/// may, but raw memory.
+	fn followed(ty: Ty): bool =
+		self.program.mayHoldView(ty) && self.program.types.kind(ty) !is .Slots(..)
+
+	/// The type of the value at `path`, a path from the receiver.
+	fn tyAt(path: &Path): Ty = {
+		var ty = self.body.locals[path.local].ty
+		for proj in path.projs {
+			ty = match proj {
+				.Deref => match self.program.types.kind(ty) {
+					.Ref(inner, ..) | .Own(inner) => inner
+					_ => return ty
+				}
+				.Field(index) => self.program.fieldTys(ty)[index as i64]
+				_ => return ty
+			}
+		}
+		return ty
+	}
+
+	/// `path`, a place of the receiver, now holds nothing it held: a struct
+	/// that holds it is split into its fields until one is `path`, which
+	/// goes. A part of anything else is not followed, and its whole may
+	/// still hold what it held.
+	var fn emptied(path: &Path, state: &var State) = {
+		while true {
+			var outer: Option<Path> = .None
+			for filled in state.filled {
+				if path.within(&filled) && path.projs.len() > filled.projs.len() then
+					outer = .Some(filled.clone())
+			}
+			val .Some(whole) = outer else break
+			val ty = self.tyAt(&whole)
+			if self.program.types.kind(ty) !is .Struct(..) ||
+				path.projs[whole.projs.len()] !is .Field(..) {
+				return
+			}
+			state.filled = outside(&state.filled, &whole)
+			for part in self.viewFields(whole.clone(), ty) {
+				state.filled.add(part)
+			}
+		}
+		state.filled = outside(&state.filled, &path)
+	}
+
+	/// `path`, a place of the receiver, may hold again what the receiver
+	/// held.
+	var fn refilled(path: &Path, state: &var State) = {
+		// What holds no view, or what is not followed, holds nothing to
+		// put back.
+		if !self.followed(self.tyAt(&path)) then return
+		for filled in state.filled {
+			if path.within(&filled) then return
+		}
+		state.filled = outside(&state.filled, &path)
+		state.filled.add(path.clone())
+	}
+
+	/// The receiver's place `path` names, where it names one: the receiver
+	/// itself, written through, is its whole.
+	fn receiverPlace(path: &Path): Option<Path> = {
+		val .Some(receiver) = self.emptying else return .None
+		if path.local != receiver then return .None
+		if path.projs.isEmpty() then return .Some(Path(local: receiver, projs: [Proj::Deref]))
+		return .Some(path.clone())
+	}
+
+	/// An assignment to `place`: a place of the receiver given a value
+	/// that holds nothing of it is emptied, and one given a value that does
+	/// may hold again what it held.
+	var fn emptyingAssignment(place: ExprId, value: ExprId, state: &var State) = {
+		val .Some(receiver) = self.emptying else return
+		val .Some(path) = self.accessPath(place) else return
+		val holdsReceiver = self.heldBy(value, &self.receiverHolds).contains(&receiver)
+		match self.receiverPlace(&path) {
+			.Some(at) =>
+				if holdsReceiver then self.refilled(&at, &var state)
+				else self.emptied(&at, &var state)
+			.None => {}
+		}
+	}
+
+	/// A call given `args`: a place of the receiver lent `&var` to it is
+	/// emptied where it is the receiver of a call that empties. Otherwise it
+	/// may hold again what the receiver held where another argument holds
+	/// some of it, or where the place still holds some, which the call may
+	/// move: what was emptied, and is lent with nothing of the receiver
+	/// beside it, stays empty.
+	var fn emptyingCall(args: &[ExprId], callee: Option<FnId>, state: &var State) = {
+		val .Some(receiver) = self.emptying else return
+		val empties = match callee {
+			.Some(c) => self.saysEmpties(c)
+			.None => false
+		}
+		for (i, arg) in args.forwards().enumerate() {
+			if !self.isVarRef(self.body.exprs[arg].ty) then continue
+			val path = match self.body.exprs[arg].kind {
+				.Ref(place) => self.accessPath(place)
+				_ => self.accessPath(arg)
+			}
+			val .Some(written) = path else continue
+			val .Some(at) = self.receiverPlace(&written) else continue
+			if empties && i == 0 {
+				self.emptied(&at, &var state)
+				continue
+			}
+			var given = false
+			for (j, other) in args.forwards().enumerate() {
+				if j != i && self.heldBy(other, &self.receiverHolds).contains(&receiver) then
+					given = true
+			}
+			var holding = false
+			for filled in state.filled {
+				if filled.within(&at) || at.within(&filled) then holding = true
+			}
+			if given || holding then self.refilled(&at, &var state)
+		}
+	}
+
+	/// At a way out of a body that says `empties`: a field of the receiver
+	/// that may still hold what it held is reported (E0463).
+	var fn checkEmptied(exit: Span, state: &State) = {
+		if self.emptying.isNone() || self.quiet > 0 then return
+		var first: Option<Path> = .None
+		for filled in state.filled {
+			if first.isNone() then first = .Some(filled.clone())
+		}
+		val .Some(filled) = first else return
+		val field = self.fieldText(&filled)
+		self.report(
+			Diagnostic::error(
+				NOT_EMPTIED,
+				"`\(self.fnName)` says `empties`, and `\(field)` may still hold what it held",
+				exit,
+				"returns here",
+			).withNote(
+				"a call to a method that empties leaves the receiver holding no view, so each field that can hold one is assigned a value that borrows nothing, or emptied by a call, after the last thing put in it",
+			).withHelp("empty `\(field)` before this point: `\(field).clear()`, or assign it a new value"),
+		)
+	}
+
+	/// `self.field.inner`, for a path from the receiver.
+	fn fieldText(path: &Path): String = {
+		var text = String::of("self")
+		var at = Path(local: path.local, projs: Vec())
+		for proj in path.projs {
+			if proj is .Field(index) {
+				val ty = self.tyAt(&at)
+				if self.program.types.kind(ty) is .Struct(id, ..) then
+					text.push(".\(self.interner.resolve(self.program.structs[id].fields[index as i64].name))")
+			}
+			at.projs.push(proj.clone())
+		}
+		return text
+	}
+}
+
+/// `paths`, without `path` and what is inside it.
+fn outside(paths: &SortedSet<Path>, path: &Path): SortedSet<Path> = {
+	var kept: SortedSet<Path> = SortedSet()
+	for p in paths {
+		if !p.within(&path) then kept.add(p.clone())
+	}
+	return kept
+}

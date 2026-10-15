@@ -609,6 +609,87 @@ names there, to read: it cannot be written, `match move` takes nothing
 from behind a reference, and it borrows what the reference borrows, so it
 is not used after that changes.
 
+## `var` before a name
+
+`var` before a name in any pattern — an arm's, an `is`'s, a `val`'s, a
+`for`'s — makes that name a variable of its own, which holds its part as
+`var name = part` would and can be written without writing anything else.
+The pattern's other names are what they would be without it. A value
+matched there gives the variable its part, and a place copies plain data
+out and keeps its own:
+
+```wip,run
+struct Point {
+    x: i64
+    y: i64
+}
+
+fn opened(count: i64): Result<Vec<i64>, str> =
+    if count > 0 then .Ok([count]) else .Err("none")
+
+fn grow(list: &var Vec<i64>) = list.push(list.len())
+
+fn main() = {
+    val size = match opened(3) {
+        .Ok(var list) => {
+            grow(&var list)
+            list.len()
+        }
+        .Err(..) => 0
+    }
+    assert(size == 2)
+
+    if opened(2) is .Ok(var more) {
+        more.push(9)
+        assert(more.len() == 2)
+    }
+
+    val (count, var label) = (2, String::of("seen"))
+    label.push(" twice")
+    assert(count == 2 && label == "seen twice")
+
+    val points = [Point(x: 1, y: 2), Point(x: 3, y: 4)]
+    var total = 0
+    for (x, var y) in points {
+        y *= 10
+        total += x + y
+    }
+    assert(total == 64 && points[1].y == 4)
+}
+```
+
+A part that owns memory is never copied, so the variable takes it, and
+the place it was in is given up, as `var x = place` gives it. Matching
+through a reference nothing can be given up, and the arm is refused; it
+binds the part to read and clones what it changes. Nor can a guard follow
+such an arm: a guard that failed would leave the value half taken.
+
+```wip,error=E0404
+enum Shape {
+    Named(label: String)
+    Dot
+}
+
+fn main() = {
+    val shape = Shape::Named(label: String::of("tri"))
+    match shape {
+        .Named(var label) => label.push("angle")
+        .Dot => {}
+    }
+    assert(shape is .Dot) // given to `label` above
+}
+```
+
+In a `var` pattern every name is a variable already, and `var` before one
+is refused, with the fix that takes it out:
+
+```wip,error=E0136
+fn main() = {
+    var (a, var b) = (1, 2)
+    a += b
+}
+```
+
 ## Patterns that must always match
 
 A `val` without `else` and a `for` binding take every value apart, so their

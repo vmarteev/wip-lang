@@ -46,6 +46,11 @@ extend Checker {
 			args.push(params[i])
 		}
 		val mark = self.borrows.len()
+		// A call to a method that empties gives its receiver, a variable of
+		// the body's, no roots, as assigning it an empty value would; so it
+		// is no use of what the receiver borrowed, which may have changed.
+		val emptied = self.emptiedReceiver(params, callee)
+		if emptied is .Some(local) then state.stale.remove(&local)
 		// The places the call may change, through its `&var` arguments.
 		var changes: Vec<(Path, Span)> = Vec()
 		// The places lent when the call begins: each argument, and its place.
@@ -155,6 +160,7 @@ extend Checker {
 		// which leaves it as it was.
 		if !changes.isEmpty() {
 			self.checkCallStrs(&args, &state)
+			if emptied is .Some(local) then state.roots.put(local, SortedSet())
 			self.varTakesRoots(&params, callee, &var state)
 			var passed: Vec<LocalId> = Vec()
 			for arg in args {
@@ -171,6 +177,7 @@ extend Checker {
 				state.stale.remove(&local)
 			}
 		}
+		self.emptyingCall(params, callee, &var state)
 	}
 
 	/// Holds what an argument lends for the call: `paths`, each with whether
@@ -269,8 +276,7 @@ extend Checker {
 			.None => .Some(Path(local: local, projs: Vec()))
 		}
 		.Field(base, index) => match self.accessPath(base) {
-			.Some(path) => {
-				var further = path
+			.Some(var further) => {
 				further.projs.push(.Field(index))
 				Option::Some(further)
 			}
@@ -283,8 +289,7 @@ extend Checker {
 			// What a projection lends is somewhere in its argument.
 			if self.body.exprs[inner].kind is .Call(..) then return self.accessPath(inner)
 			match self.accessPath(inner) {
-				.Some(path) => {
-					var further = path
+				.Some(var further) => {
 					further.projs.push(.Deref)
 					Option::Some(further)
 				}
@@ -442,6 +447,19 @@ extend Checker {
 		.Some(.ThroughRef(reference)) =>
 			self.program.types.kind(self.ty(reference)) is .Ref(kind: .Shared, ..)
 		_ => false
+	}
+
+	/// The variable a call to a method that empties is given as its
+	/// receiver, where it is one of the body's own, written whole: a field's
+	/// emptying leaves the rest of what its variable borrows, and a
+	/// reference parameter's roots are its caller's.
+	fn emptiedReceiver(params: &[ExprId], callee: Option<FnId>): Option<LocalId> = {
+		val .Some(c) = callee else return .None
+		if !self.saysEmpties(c) || params.isEmpty() then return .None
+		val .Ref(place) = self.body.exprs[params[0]].kind else return .None
+		val .Local(local) = self.body.exprs[place].kind else return .None
+		if self.program.types.kind(self.body.locals[local].ty) is .Ref(..) then return .None
+		return .Some(local)
 	}
 
 	/// Checks that every `&var` parameter holds a value at an exit (E0415).

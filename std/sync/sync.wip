@@ -194,28 +194,25 @@ fn atomicSubtract<T>(at: &T, amount: T, order: Order): T
 /// long as a call.
 pub struct Mutex<T> {
 	state: ptr<MutexState>
+	/// The value, boxed; nothing once `take` has it.
+	value: ptr<T>
 }
 
-// The lock, what waits for a change, and the value, boxed: a pthread mutex
-// must not move once made, and a `Mutex` may.
+// The lock and what waits for a change, boxed: a pthread mutex must not move
+// once made, and a `Mutex` may.
 extern struct MutexState {
 	lock: Hidden
 	changed: Hidden
-	value: ptr<u8>
 }
 
 extend Mutex<T> {
 	/// A mutex holding `value`.
 	pub static fn of(value: T): Mutex<T> = {
-		val made = own MutexState(
-			lock: hidden(),
-			changed: hidden(),
-			value: intoAddress(own (value)),
-		)
+		val made = own MutexState(lock: hidden(), changed: hidden())
 		val state = intoAddress(made) as ptr<MutexState>
 		pthread_mutex_init(&var state.lock, null)
 		pthread_cond_init(&var state.changed, null)
-		return Mutex(state)
+		return Mutex(state: state, value: intoAddress(own (value)) as ptr<T>)
 	}
 
 	/// Runs `body` with what is inside, which no other thread reaches until
@@ -223,7 +220,7 @@ extend Mutex<T> {
 	/// `lockWhen` are told it may have changed.
 	pub fn lock<R>(body: &var (value: &var T) => R): R = {
 		pthread_mutex_lock(&var self.state.lock)
-		val answer = body(&var referenceAt<T>(self.state.value as ptr<void>))
+		val answer = body(&var referenceAt<T>(self.value as ptr<void>))
 		pthread_cond_broadcast(&var self.state.changed)
 		pthread_mutex_unlock(&var self.state.lock)
 		return answer
@@ -234,10 +231,10 @@ extend Mutex<T> {
 	/// with it, as `lock` does.
 	pub fn lockWhen<R>(ready: &(value: &T) => bool, body: &var (value: &var T) => R): R = {
 		pthread_mutex_lock(&var self.state.lock)
-		while !ready(&referenceAt<T>(self.state.value as ptr<void>)) {
+		while !ready(&referenceAt<T>(self.value as ptr<void>)) {
 			pthread_cond_wait(&var self.state.changed, &var self.state.lock)
 		}
-		val answer = body(&var referenceAt<T>(self.state.value as ptr<void>))
+		val answer = body(&var referenceAt<T>(self.value as ptr<void>))
 		pthread_cond_broadcast(&var self.state.changed)
 		pthread_mutex_unlock(&var self.state.lock)
 		return answer
@@ -245,16 +242,17 @@ extend Mutex<T> {
 
 	/// What is inside, taken out: the mutex is used up.
 	pub move fn take(): T = {
-		val boxed: own<T> = fromAddress(self.state.value)
-		self.state.value = null
+		var mutex = self
+		val boxed: own<T> = fromAddress(mutex.value as ptr<u8>)
+		mutex.value = null
 		return unbox(boxed)
 	}
 }
 
 extend Mutex<T>: Destroy {
 	var fn destroy() = {
-		if self.state.value != null {
-			val gone: own<T> = fromAddress(self.state.value)
+		if self.value != null {
+			val gone: own<T> = fromAddress(self.value as ptr<u8>)
 		}
 		pthread_cond_destroy(&var self.state.changed)
 		pthread_mutex_destroy(&var self.state.lock)

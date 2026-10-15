@@ -1,0 +1,565 @@
+// An app for iOS: the program put in a bundle with what the system reads of
+// it — its `Info.plist`, made from what the package's `@app` says, its
+// icons and its files — and signed; and run, on the simulator or on a
+// device, with the tools Xcode installs: `simctl` and `devicectl`.
+
+import std::fs
+import std::io
+import std::path
+import std::process::{Command, Exit}
+
+/// How an app is signed and where it runs, as the command line says: the
+/// identity, the provisioning profile, and the device or simulator.
+@derive(Clone)
+pub struct Shipping {
+	pub var identity: Option<String> = .None
+	pub var profile: Option<String> = .None
+	pub var device: Option<String> = .None
+}
+
+/// The least iOS version the loaded program runs on: what its app says,
+/// or the default.
+pub fn minimumOf(loaded: &Loaded): str = match loaded.packages[0].app {
+	.Some(app) => app.minimum.toStr()
+	.None => MINIMUM_IOS
+}
+
+/// The bundle at `bundle`, which holds the program `name` of the first of
+/// `packages` already, made the app `app` for `target`: every package's
+/// files put in it, beside the program, a dependency's under its name;
+/// finished; and signed, as `shipping` says.
+pub fn madeApp(
+	packages: &[Package],
+	app: &App,
+	bundle: str,
+	name: str,
+	target: &Target,
+	shipping: &Shipping,
+	unique: &Unique,
+): Result<void, String> = {
+	val package = &packages[0]
+	// A bundle's own directories are the system's.
+	for dependency in packages[1..packages.len()] {
+		if !dependency.files.isEmpty() &&
+			dependency.prefix.toStr() is "Frameworks" | "PlugIns" | "_CodeSignature" {
+			return .Err("`\(dependency.prefix)` is a directory an app's bundle has of its own, where the files of the package of that name would go")
+		}
+	}
+	placeFiles(&packages, bundle, false)?
+	val version: Option<str> = match package.version {
+		.Some(version) => .Some(version.toStr())
+		.None => .None
+	}
+	finishBundle(bundle, name, version, &app, package.dir, &target)?
+	val scratch = TempDir::new(&unique)?
+	return sign(bundle, &app, &target, &shipping, scratch.path)
+}
+
+/// The bundle at `bundle`, holding the program `name` already, made an app:
+/// its `Info.plist`, from `app` and `version`, for `target`; its icons; and
+/// the debug information the link left inside it moved beside it, where
+/// the system does not look and the debugger does.
+pub fn finishBundle(
+	bundle: str,
+	name: str,
+	version: Option<str>,
+	app: &App,
+	root: str,
+	target: &Target,
+): Result<void, String> = {
+	val symbols = path::join(bundle, "\(name).dSYM")
+	if fs::exists(symbols) {
+		val beside = "\(bundle).dSYM"
+		if fs::exists(beside) && fs::removeAll(beside) is .Err(error) then
+			return .Err("cannot replace `\(beside)`: \(error)")
+		if fs::rename(symbols, beside) is .Err(error) then
+			return .Err("cannot move `\(symbols)` beside the app: \(error)")
+	}
+	val icons = match app.icon {
+		.Some(icon) => iconsFor(path::join(root, icon), bundle)?
+		.None => Vec()
+	}
+	val plist = infoPlist(name, version.unwrapOr("0.1.0"), &app, &target, &icons)
+	val file = path::join(bundle, "Info.plist")
+	if fs::writeFile(file, plist) is .Err(error) then
+		return .Err("cannot write `\(file)`: \(error)")
+	return .Ok()
+}
+
+/// The icons iOS asks an app for, made from the square PNG `icon` with
+/// `sips` into `bundle`: their names, as `Info.plist` lists them, without
+/// the scale and the device each file's name ends with.
+fn iconsFor(icon: str, bundle: str): Result<Vec<(String, String)>, String> = {
+	// The name a size is listed by, and each file of it: its name and its
+	// side in pixels.
+	val sizes = [
+		("AppIcon60x60", "AppIcon60x60@2x.png", 120),
+		("AppIcon60x60", "AppIcon60x60@3x.png", 180),
+		("AppIcon76x76", "AppIcon76x76@2x~ipad.png", 152),
+		("AppIcon83.5x83.5", "AppIcon83.5x83.5@2x~ipad.png", 167),
+	]
+	var listed: Vec<(String, String)> = Vec()
+	for (listedAs, file, side) in sizes {
+		val out = path::join(bundle, file)
+		val pixels = "\(side)"
+		val made = Command::of("sips").args([
+			"-s",
+			"format",
+			"png",
+			"-z",
+			pixels.toStr(),
+			pixels.toStr(),
+			icon,
+			"--out",
+			out.toStr(),
+		]).output()
+		match made {
+			.Ok(result) =>
+				if !result.exit.success() then
+					return .Err("`sips` cannot make the icon from `\(icon)`:\n\(result.stderr)")
+			.Err(error) => return .Err("cannot run `sips`: \(error)")
+		}
+		val device = if file.contains("~ipad") then "ipad" else "iphone"
+		var seen = false
+		for (name, on) in listed {
+			if name == listedAs && on == device then seen = true
+		}
+		if !seen then listed.push((String::of(listedAs), String::of(device)))
+	}
+	return .Ok(listed)
+}
+
+/// What an app's `Info.plist` says, as XML: what it is, which program to
+/// start, what it runs on and which way up, and its icons, `icons` being
+/// each name and the device it is for.
+fn infoPlist(
+	name: str,
+	version: str,
+	app: &App,
+	target: &Target,
+	icons: &[(String, String)],
+): String = {
+	val shown = match app.name {
+		.Some(shown) => shown.toStr()
+		.None => name
+	}
+	// The build's number is the version's numbers alone, as the system
+	// compares it.
+	val number = match version.splitOnce("-") {
+		.Some((numbers, _)) => numbers
+		.None => match version.splitOnce("+") {
+			.Some((numbers, _)) => numbers
+			.None => version
+		}
+	}
+	val platform = if target.simulator then "iPhoneSimulator" else "iPhoneOS"
+	var out = String::of("""
+		<?xml version="1.0" encoding="UTF-8"?>
+		<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+		<plist version="1.0">
+		<dict>
+
+		""")
+	entry(&var out, "CFBundleDevelopmentRegion", "en")
+	entry(&var out, "CFBundleExecutable", name)
+	entry(&var out, "CFBundleIdentifier", &app.id)
+	entry(&var out, "CFBundleInfoDictionaryVersion", "6.0")
+	entry(&var out, "CFBundleName", shown)
+	entry(&var out, "CFBundleDisplayName", shown)
+	entry(&var out, "CFBundlePackageType", "APPL")
+	entry(&var out, "CFBundleShortVersionString", number)
+	entry(&var out, "CFBundleVersion", number)
+	entry(&var out, "MinimumOSVersion", &app.minimum)
+	out.push("\t<key>CFBundleSupportedPlatforms</key>\n\t<array><string>\(platform)</string></array>\n")
+	out.push("\t<key>LSRequiresIPhoneOS</key>\n\t<true/>\n")
+	// A launch screen of its own, empty, which is what gives an app the
+	// whole of the screen.
+	out.push("\t<key>UILaunchScreen</key>\n\t<dict/>\n")
+	out.push("\t<key>UIRequiresFullScreen</key>\n\t<true/>\n")
+	// A mouse or a trackpad on an iPad reaches the app as one, and not as
+	// a finger.
+	out.push("\t<key>UIApplicationSupportsIndirectInputEvents</key>\n\t<true/>\n")
+	out.push("\t<key>UIDeviceFamily</key>\n\t<array>\n")
+	if app.devices.toStr() is "iphone" | "both" then out.push("\t\t<integer>1</integer>\n")
+	if app.devices.toStr() is "ipad" | "both" then out.push("\t\t<integer>2</integer>\n")
+	out.push("\t</array>\n")
+	var ways: Vec<str> = Vec()
+	if app.orientation.toStr() is "portrait" | "any" then
+		ways.push("UIInterfaceOrientationPortrait")
+	if app.orientation.toStr() is "landscape" | "any" {
+		ways.push("UIInterfaceOrientationLandscapeLeft")
+		ways.push("UIInterfaceOrientationLandscapeRight")
+	}
+	for key in ["UISupportedInterfaceOrientations", "UISupportedInterfaceOrientations~ipad"] {
+		out.push("\t<key>\(key)</key>\n\t<array>\n")
+		for way in ways {
+			out.push("\t\t<string>\(way)</string>\n")
+		}
+		out.push("\t</array>\n")
+	}
+	for (key, device) in [("CFBundleIcons", "iphone"), ("CFBundleIcons~ipad", "ipad")] {
+		var names: Vec<str> = Vec()
+		for (name, on) in icons {
+			if on == device || device == "ipad" && on == "iphone" then names.push(name)
+		}
+		if names.isEmpty() then continue
+		out.push("\t<key>\(key)</key>\n\t<dict>\n\t\t<key>CFBundlePrimaryIcon</key>\n\t\t<dict>\n")
+		out.push("\t\t\t<key>CFBundleIconFiles</key>\n\t\t\t<array>\n")
+		for name in names {
+			out.push("\t\t\t\t<string>\(name)</string>\n")
+		}
+		out.push("\t\t\t</array>\n\t\t</dict>\n\t</dict>\n")
+	}
+	out.push("</dict>\n</plist>\n")
+	return out
+}
+
+/// `key` and its string `value`, a line each, at the end of `out`.
+fn entry(out: &var String, key: str, value: str) = {
+	out.push("\t<key>\(key)</key>\n\t<string>\(xmlText(value))</string>\n")
+}
+
+/// `text` as XML's text: `&`, `<` and `>` written as entities.
+fn xmlText(text: str): String = {
+	var out = String()
+	for c in text.chars() {
+		match c {
+			'&' => out.push("&amp;")
+			'<' => out.push("&lt;")
+			'>' => out.push("&gt;")
+			_ => out.pushChar(c)
+		}
+	}
+	return out
+}
+
+/// The bundle at `bundle` signed for `target`: ad hoc for the simulator,
+/// which asks nothing more; for a device, by the developer's identity
+/// under a provisioning profile that names `app`'s identifier, embedded in
+/// it, with the entitlements the profile grants. `scratch` is where what
+/// the profile says is written on the way.
+pub fn sign(
+	bundle: str,
+	app: &App,
+	target: &Target,
+	shipping: &Shipping,
+	scratch: str,
+): Result<void, String> = {
+	if target.simulator then
+		return tool("codesign", ["--force", "--sign", "-", "--timestamp=none", bundle])
+	val profile = match shipping.profile {
+		.Some(given) => String::of(given)
+		.None => findProfile(&app.id, scratch)?
+	}
+	val decoded = path::join(scratch, "profile.plist")
+	tool("security", ["cms", "-D", "-i", profile.toStr(), "-o", decoded.toStr()])?
+	val entitlements = path::join(scratch, "entitlements.plist")
+	tool("plutil", [
+		"-extract",
+		"Entitlements",
+		"xml1",
+		"-o",
+		entitlements.toStr(),
+		decoded.toStr(),
+	])?
+	val embedded = path::join(bundle, "embedded.mobileprovision")
+	if fs::copy(profile, embedded) is .Err(error) then
+		return .Err("cannot copy the profile `\(profile)` into the app: \(error)")
+	val named: Option<str> = match shipping.identity {
+		.Some(given) => .Some(given.toStr())
+		.None => .None
+	}
+	val identity = signingIdentity(named)?
+	return tool("codesign", [
+		"--force",
+		"--sign",
+		identity.toStr(),
+		"--entitlements",
+		entitlements.toStr(),
+		"--timestamp=none",
+		bundle,
+	])
+}
+
+/// Where Xcode keeps the provisioning profiles it has made or fetched: the
+/// directory of Xcode 16 and later, and the one before it.
+fn profileDirs(): Vec<String> = {
+	var dirs: Vec<String> = Vec()
+	val .Some(home) = io::env("HOME") else return dirs
+	dirs.push(path::join(home, "Library/Developer/Xcode/UserData/Provisioning Profiles"))
+	dirs.push(path::join(home, "Library/MobileDevice/Provisioning Profiles"))
+	return dirs
+}
+
+/// The installed provisioning profile whose app identifier is `id`'s, or
+/// failing that one that takes every app of its team, `*`; `scratch` is
+/// where each is read into. Why there is none, and how one is had, where
+/// there is none.
+fn findProfile(id: str, scratch: str): Result<String, String> = {
+	var wildcard: Option<String> = .None
+	for dir in profileDirs() {
+		val .Ok(entries) = fs::readDir(dir) else continue
+		for entry in entries {
+			if path::extension(entry.name) != .Some("mobileprovision") then continue
+			val file = path::join(dir, entry.name)
+			val decoded = path::join(scratch, "candidate.plist")
+			if tool("security", ["cms", "-D", "-i", file.toStr(), "-o", decoded.toStr()]) is .Err(
+				..,
+			) {
+				continue
+			}
+			val asked = Command::of("plutil").args([
+				"-extract",
+				"Entitlements.application-identifier",
+				"raw",
+				"-o",
+				"-",
+				decoded.toStr(),
+			]).output()
+			val .Ok(said) = asked else continue
+			if !said.exit.success() then continue
+			// `TEAM.com.example.game`, or `TEAM.*` for every app.
+			val .Some((_, named)) = said.stdout.toStr().trimEnd().splitOnce(".") else continue
+			if named == id then return .Ok(file)
+			if named == "*" && wildcard.isNone() then wildcard = .Some(file)
+		}
+	}
+	if wildcard is .Some(file) then return .Ok(file.clone())
+	return .Err("no provisioning profile names `\(id)`, which a device runs an app under: make one once in Xcode, with a project of that bundle identifier and signing left to Xcode, or from Apple's developer site, and `wip` finds it; or name one with `--profile FILE`")
+}
+
+/// The identity that signs for a device: the one `given` names part of, or
+/// the only one the keychain has.
+fn signingIdentity(given: Option<str>): Result<String, String> = {
+	val listed = match Command::of("security").args([
+		"find-identity",
+		"-v",
+		"-p",
+		"codesigning",
+	]).output() {
+		.Ok(listed) => listed
+		.Err(error) => return .Err("cannot run `security`: \(error)")
+	}
+	// `  1) 0123…ABCD "Apple Development: …"`: the hash, and the name.
+	var found: Vec<(String, String)> = Vec()
+	for line in listed.stdout.lines() {
+		val .Some((_, rest)) = line.splitOnce(") ") else continue
+		val .Some((hash, quoted)) = rest.splitOnce(" ") else continue
+		val name = quoted.trimMatches("\"")
+		if given is .Some(part) && !name.contains(part) && hash != part then continue
+		found.push((String::of(hash), String::of(name)))
+	}
+	if found.len() == 1 then return .Ok(found[0].0.clone())
+	if found.isEmpty() then
+		return .Err(
+			match given {
+				.Some(part) => "no identity that signs code is `\(part)`"
+				.None => String::of(
+					"the keychain has no identity that signs code: Xcode makes one, signed into an Apple account",
+				)
+			},
+		)
+	var names = String()
+	for (_, name) in found {
+		names.push("\n  \(name)")
+	}
+	return .Err("more than one identity signs code; `--sign NAME` chooses:\(names)")
+}
+
+/// Runs a tool of Apple's, saying what it said where it fails.
+fn tool(name: str, args: &[str]): Result<void, String> = {
+	val result = match Command::of(name).args(&args).output() {
+		.Ok(result) => result
+		.Err(error) => return .Err("cannot run `\(name)`: \(error)")
+	}
+	if !result.exit.success() then
+		return .Err("`\(name)` failed:\n\(result.stderr)\(result.stdout)")
+	return .Ok()
+}
+
+/// A simulator to run on, booted: the one `named` names, by its name or
+/// its identifier; else one already booted that the app is for; else the
+/// first iPad where `app` is for the iPad alone, or the first iPhone. Its
+/// identifier.
+pub fn simulator(named: &Option<String>, app: &Option<App>): Result<String, String> = {
+	val asked = Command::of("xcrun").args(["simctl", "list", "devices", "available"]).output()
+	val .Ok(said) = asked else return .Err(noSimulators())
+	if !said.exit.success() then return .Err(noSimulators())
+	val id = chosenSimulator(said.stdout, &named, &app)?
+	// Booting one that is booted already says so, and is not a failure.
+	if Command::of("xcrun").args(["simctl", "boot", id.toStr()]).output() is .Err(error) then
+		return .Err("cannot run `xcrun simctl`: \(error)")
+	tool("xcrun", ["simctl", "bootstatus", id.toStr(), "-b"])?
+	return .Ok(id)
+}
+
+/// The simulator to run on of those `listed` lists, as `xcrun simctl list
+/// devices available` writes them: the one `named` names, by its name or
+/// its identifier; else one already booted that `app` is for, an iPad for
+/// an app for the iPad alone and an iPhone for one for the iPhone alone;
+/// else the first iPad where `app` is for the iPad alone, or the first
+/// iPhone. Its identifier.
+fn chosenSimulator(
+	listed: str,
+	named: &Option<String>,
+	app: &Option<App>,
+): Result<String, String> = {
+	// `    iPad Air 11-inch (M2) (A4035909-…) (Shutdown) `, under a heading
+	// `-- iOS 26.5 --`.
+	var found: Vec<(String, String, bool)> = Vec()
+	var ios = false
+	for line in listed.lines() {
+		if line.startsWith("--") {
+			ios = line.startsWith("-- iOS")
+			continue
+		}
+		if !ios then continue
+		val trimmed = line.trim()
+		val .Some((before, state)) = trimmed.rsplitOnce(" (") else continue
+		val .Some((name, id)) = before.rsplitOnce(" (") else continue
+		val booted = state.startsWith("Booted")
+		found.push((String::of(name), String::of(id.trimEndMatches(")")), booted))
+	}
+	val devices = match app {
+		.Some(a) => a.devices.toStr()
+		.None => "both"
+	}
+	val suits = (name: &String) => match devices {
+		"ipad" => name.startsWith("iPad")
+		"iphone" => name.startsWith("iPhone")
+		_ => true
+	}
+	if named is .Some(want) {
+		for (name, id, _) in found {
+			if name == want || id == want then return .Ok(id.clone())
+		}
+		return .Err("no simulator is `\(want)`; `xcrun simctl list devices available` lists them")
+	}
+	for (name, id, booted) in found {
+		if booted && suits(&name) then return .Ok(id.clone())
+	}
+	val kind = if devices == "ipad" then "iPad" else "iPhone"
+	for (name, id, _) in found {
+		if name.startsWith(kind) then return .Ok(id.clone())
+	}
+	return .Err("there is no iOS simulator: Xcode's iOS platform installs them")
+}
+
+/// The program `program` run in the simulator `id` as a command is, in
+/// the directory `dir`, with `args`: how it ended, which the simulator
+/// hands back.
+pub fn spawnOnSimulator(id: str, program: str, dir: str, args: &[str]): Result<Exit, String> = {
+	var all: Vec<String> = Vec()
+	// The simulator's shell goes into the directory, and starts the program
+	// as the simulator starts one: with its own system's root for the
+	// loader, which a program started by another inside it is not given.
+	val script = "cd \"$0\" && DYLD_ROOT_PATH=\"$SIMULATOR_ROOT\" exec \"$@\""
+	for arg in ["simctl", "spawn", id, "/bin/sh", "-c", script] {
+		all.push(String::of(arg))
+	}
+	all.push(String::of(dir))
+	all.push(String::of(program))
+	for arg in args {
+		all.push(String::of(arg))
+	}
+	return match Command::of("xcrun").args(strs(&all)).run() {
+		.Ok(exit) => .Ok(exit)
+		.Err(error) => .Err("cannot run `xcrun simctl`: \(error)")
+	}
+}
+
+/// The app at `bundle` installed on the simulator `id` and run, with
+/// `args`, its output shown here until it ends.
+pub fn runOnSimulator(id: str, bundle: str, app: &App, args: &[str]): Result<Exit, String> = {
+	tool("xcrun", ["simctl", "install", id, bundle])?
+	var all: Vec<String> = Vec()
+	for arg in [
+		"simctl",
+		"launch",
+		"--console-pty",
+		"--terminate-running-process",
+		id,
+		app.id.toStr(),
+	] {
+		all.push(String::of(arg))
+	}
+	for arg in args {
+		all.push(String::of(arg))
+	}
+	return match Command::of("xcrun").args(strs(&all)).run() {
+		.Ok(exit) => .Ok(exit)
+		.Err(error) => .Err("cannot run `xcrun simctl`: \(error)")
+	}
+}
+
+/// The app at `bundle` installed on the connected device `named` names, or
+/// the only one connected, and run with `args`, its output shown here.
+pub fn runOnDevice(
+	bundle: str,
+	app: &App,
+	named: &Option<String>,
+	args: &[str],
+): Result<Exit, String> = {
+	val device = connectedDevice(named)?
+	tool("xcrun", ["devicectl", "device", "install", "app", "--device", device.toStr(), bundle])?
+	var all: Vec<String> = Vec()
+	for arg in [
+		"devicectl",
+		"device",
+		"process",
+		"launch",
+		"--console",
+		"--terminate-existing",
+		"--device",
+		device.toStr(),
+		app.id.toStr(),
+	] {
+		all.push(String::of(arg))
+	}
+	for arg in args {
+		all.push(String::of(arg))
+	}
+	return match Command::of("xcrun").args(strs(&all)).run() {
+		.Ok(exit) => .Ok(exit)
+		.Err(error) => .Err("cannot run `xcrun devicectl`: \(error)")
+	}
+}
+
+/// Why no simulator is listed.
+fn noSimulators(): String = String::of(
+	"`xcrun simctl` lists no simulators: running for iOS needs Xcode, with its iOS platform installed",
+)
+
+/// Why no device is listed.
+fn noDevices(): String = String::of(
+	"`xcrun devicectl` lists no devices: running on one needs Xcode 15 or later",
+)
+
+/// The identifier of the device `named` names, by its name or its
+/// identifier, or of the only one connected and paired.
+fn connectedDevice(named: &Option<String>): Result<String, String> = {
+	val asked = Command::of("xcrun").args(["devicectl", "list", "devices"]).output()
+	val .Ok(said) = asked else return .Err(noDevices())
+	if !said.exit.success() then return .Err(noDevices())
+	val listed = said.stdout.clone()
+	// A table: `Name   Hostname   Identifier   State   Model`, its columns
+	// apart by two spaces or more.
+	var found: Vec<(String, String)> = Vec()
+	for line in listed.lines() {
+		var columns: Vec<str> = Vec()
+		for column in line.split("  ") {
+			if !column.trim().isEmpty() then columns.push(column.trim())
+		}
+		if columns.len() < 4 || !columns[3].startsWith("available") then continue
+		found.push((String::of(columns[0]), String::of(columns[2])))
+	}
+	if named is .Some(want) {
+		for (name, id) in found {
+			if name == want || id == want then return .Ok(id.clone())
+		}
+		return .Err("no device connected is `\(want)`; `xcrun devicectl list devices` lists them")
+	}
+	if found.len() == 1 then return .Ok(found[0].1.clone())
+	if found.isEmpty() then return .Err("no device is connected and paired with this Mac")
+	return .Err("more than one device is connected; `--device NAME` chooses")
+}

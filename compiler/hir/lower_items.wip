@@ -11,6 +11,7 @@ import syntax::{
 	CANNOT_BE_GENERIC,
 	DUPLICATE_DEFINITION,
 	Diagnostic,
+	EMPTIES,
 	Edit,
 	IMPL_METHODS,
 	IMPL_TARGET,
@@ -118,15 +119,18 @@ extend Lowerer {
 							span: name.span,
 						))
 						when {
-							self.opaques().get(&name.sym) is .Some(first) => {
+							self.opaqueHere(name.sym) is .Some(first) => {
 								val previous = self.program.opaques[first].span
 								self.duplicate(name, previous)
 							}
-							self.types().get(&name.sym) is .Some((_, previous)) => self.duplicate(
+							self.typeHere(name.sym) is .Some((_, previous)) => self.duplicate(
 								name,
 								previous,
 							)
-							else => self.modules[self.current].opaques.put(name.sym, id)
+							else => self.modules[self.declaring(declared.isPub)].opaques.put(
+								name.sym,
+								id,
+							)
 						}
 					}
 					continue
@@ -247,6 +251,13 @@ extend Lowerer {
 		return .None
 	}
 
+	/// Whether a type is declared `pub`.
+	fn typeIsPub(def: TypeDef): bool = match def {
+		.Struct(id) => self.program.structs[id].isPub
+		.Enum(id) => self.program.enums[id].isPub
+		.Builtin(_) => true
+	}
+
 	/// Puts a type's name in this module's scope, where it is free: the
 	/// prelude's names are reserved, a built-in's cannot be taken, and a name
 	/// declared twice is reported.
@@ -262,8 +273,11 @@ extend Lowerer {
 					"built-in type name",
 				),
 			)
-			self.types().get(&name.sym) is .Some((_, first)) => self.duplicate(name, first)
-			else => self.modules[self.current].types.put(name.sym, (def, name.span))
+			self.typeHere(name.sym) is .Some((_, first)) => self.duplicate(name, first)
+			else => self.modules[self.declaring(self.typeIsPub(def))].types.put(
+				name.sym,
+				(def, name.span),
+			)
 		}
 	}
 
@@ -416,11 +430,11 @@ extend Lowerer {
 				)
 				continue
 			}
-			if self.types().get(&name.sym) is .Some((_, first)) {
+			if self.typeHere(name.sym) is .Some((_, first)) {
 				self.duplicate(name, first)
 				continue
 			}
-			if self.aliases().get(&name.sym) is .Some(existing) {
+			if self.aliasHere(name.sym) is .Some(existing) {
 				self.duplicate(name, existing.span)
 				continue
 			}
@@ -440,7 +454,7 @@ extend Lowerer {
 					),
 				)
 			}
-			self.modules[self.current].aliases.put(name.sym, AliasDef(
+			self.modules[self.declaring(alias.isPub)].aliases.put(name.sym, AliasDef(
 				ty: .None,
 				generics: generics,
 				isPub: alias.isPub,
@@ -456,7 +470,7 @@ extend Lowerer {
 		for item in file.items {
 			val .Type(decl) = item else continue
 			self.aliasSources.put(
-				(self.current, decl.name.sym),
+				(self.declaring(decl.isPub), decl.name.sym),
 				AliasSource(decl: &decl, ast: file, imports: self.imports.clone()),
 			)
 		}
@@ -467,14 +481,15 @@ extend Lowerer {
 	var fn resolveAliases() = {
 		val file = self.ast
 		for item in file.items {
-			if item is .Type(decl) then self.aliasBody(self.current, decl.name.sym)
+			if item is .Type(decl) then self.aliasBody(self.declaring(decl.isPub), decl.name.sym)
 		}
 	}
 
-	/// The type `module`'s alias `sym` stands for, resolved in the file that
-	/// wrote it the first time it is asked for, as a constant's value is. One
-	/// that is being resolved already names itself, through however many
-	/// others, and each alias of the cycle says so.
+	/// The type the alias `sym` of the scope `module` stands for — a
+	/// module's, or a test's — resolved in the file that wrote it the first
+	/// time it is asked for, as a constant's value is. One that is being
+	/// resolved already names itself, through however many others, and each
+	/// alias of the cycle says so.
 	var fn aliasBody(module: i64, sym: Symbol): Option<Ty> = {
 		val alias = self.modules[module].aliases.get(&sym)?.clone()
 		if alias.ty is .Some(ty) then return .Some(ty)
@@ -500,7 +515,7 @@ extend Lowerer {
 		val typeParams = mem::replace(&var self.typeParams, alias.generics.clone())
 		val selfTy = mem::replace(&var self.selfTy, .None)
 		self.aliasStack.push((module, sym))
-		self.enter(module, source.ast, source.imports.clone())
+		self.enter(self.moduleOf(module), source.ast, source.imports.clone())
 		val ty = self.resolveTy(source.decl.ty)
 		self.enter(hereModule, hereAst, hereImports)
 		self.aliasStack.pop()
@@ -545,16 +560,17 @@ extend Lowerer {
 	/// A use of a type alias: the type it names, with the arguments it was
 	/// given in place of its parameters.
 	var fn aliasType(sym: Symbol, args: &[ast::TypeId], span: Span): Option<Ty> = self.aliasTypeOf(
-		self.current,
+		self.aliasScope(sym)?,
 		sym,
 		&args,
 		span,
 	)
 
-	/// The same, for an alias of another module.
+	/// The same, for an alias of the scope `module`: another module's, or
+	/// one the current file sees.
 	var fn aliasTypeOf(module: i64, sym: Symbol, args: &[ast::TypeId], span: Span): Option<Ty> = {
 		val alias = self.modules[module].aliases.get(&sym)?.clone()
-		if module != self.current && !alias.isPub then
+		if self.moduleOf(module) != self.current && !alias.isPub then
 			self.privateItem(module, "type alias", ast::Name(sym: sym, span: span))
 		// Resolved here if nothing has asked for it before.
 		val body = self.aliasBody(module, sym).unwrapOr(ERROR)
@@ -769,8 +785,7 @@ extend Lowerer {
 					self.noVarRef(ty, f.ty, "a field") ||
 						self.noNever(ty, f.ty, "a field") ||
 						self.bareDyn(ty, f.ty) ||
-						self.bareSlice(ty, f.ty, false) ||
-						(!view && self.storedField(ty, f.ty, exported))
+						self.bareSlice(ty, f.ty, false)
 			}
 			if refused then ty = ERROR
 			val fieldAnnotations = self.annotations(&f.annotations, .Field)
@@ -795,6 +810,42 @@ extend Lowerer {
 			)
 		}
 		return defs
+	}
+
+	/// The fields of a file's structs and variants that borrow where their
+	/// type is not a view, once what every type holds is known: each is
+	/// refused, and its type made an error. An `extern struct`'s are left to
+	/// the check of what C can hold, which refuses them all.
+	var fn checkStoredFields(types: &[(Declared, TypeDef)]) = {
+		for (item, def) in types {
+			match def {
+				.Struct(id) => {
+					val .Some(s) = item.structDecl() else continue
+					if s.isView || s.isExtern then continue
+					for (i, f) in s.fields.forwards().enumerate() {
+						if i >= self.program.structs[id].fields.len() then break
+						val ty = self.program.structs[id].fields[i].ty
+						if ty == ERROR then continue
+						if self.storedField(ty, f.ty, false) then
+							self.program.structs[id].fields[i].ty = ERROR
+					}
+				}
+				.Enum(id) => {
+					val .Some(e) = item.enumDecl() else continue
+					if e.isView then continue
+					for (v, variant) in e.variants.forwards().enumerate() {
+						for (i, f) in variant.fields.forwards().enumerate() {
+							if i >= self.program.enums[id].variants[v].fields.len() then break
+							val ty = self.program.enums[id].variants[v].fields[i].ty
+							if ty == ERROR then continue
+							if self.storedField(ty, f.ty, true) then
+								self.program.enums[id].variants[v].fields[i].ty = ERROR
+						}
+					}
+				}
+				_ => {}
+			}
+		}
 	}
 
 	/// The packed structs of a file, once every type's fields are known:
@@ -1188,12 +1239,12 @@ extend Lowerer {
 				}
 				// A type's methods belong to it, not to the module.
 				.Struct(s) => {
-					val .Some((owner, _)) = self.types().get(&s.name.sym) else continue
+					val .Some((owner, _)) = self.typeHere(s.name.sym) else continue
 					val typeParams = self.typeGenerics(owner)
 					self.declareMethods(owner, &typeParams, &s.methods, &var bodies)
 				}
 				.Enum(e) => {
-					val .Some((owner, _)) = self.types().get(&e.name.sym) else continue
+					val .Some((owner, _)) = self.typeHere(e.name.sym) else continue
 					val typeParams = self.typeGenerics(owner)
 					self.declareMethods(owner, &typeParams, &e.methods, &var bodies)
 				}
@@ -1201,6 +1252,7 @@ extend Lowerer {
 				// implementation of an interface.
 				.Extend(block) => {
 					self.annotations(&block.annotations, .Extend)
+					if self.extendsBeyondTests(&block) then continue
 					// `extend Iterator<T: Ord> { … }`: methods every implementer
 					// has where its types meet the condition.
 					if self.extendedInterface(&block) is .Some(interfaceId) {
@@ -1231,6 +1283,36 @@ extend Lowerer {
 			}
 		}
 		return bodies
+	}
+
+	/// Whether `block`, in a test file, extends what no test file declares,
+	/// which is reported: a method comes with its type wherever the type is
+	/// used, so one a test gave its module's type would be found by the
+	/// module's own code, under `wip test` alone. What `@derive` wrote for a
+	/// test's type extends that type.
+	var fn extendsBeyondTests(block: &ast::ExtendBlock): bool = {
+		if !self.inTest() || block.derived.isSome() then return false
+		val name = block.path[block.path.len() - 1]
+		val ownType =
+			block.path.len() == 1 &&
+			block.sliceOf.isNone() &&
+			block.boxed.isNone() &&
+			self.holding(name.sym) != self.current
+		if ownType then return false
+		val text = String::of(self.text(name.sym))
+		self.report(
+			Diagnostic::error(
+				IMPL_TARGET,
+				"a test file extends `\(text)`, which no test file declares",
+				name.span,
+				"not a test's own type",
+			).withNote(
+				"a method comes with its type wherever the type is used, so one a test gave its module's type would be found by the module's own code when its tests are compiled, and not when it is built",
+			).withHelp(
+				"write the helper as a function of the test file, taking the value, or extend a type the test file declares",
+			),
+		)
+		return true
 	}
 
 	/// The methods of a type, declared with the type's parameters under the
@@ -1399,10 +1481,10 @@ extend Lowerer {
 			self.report(self.elsewhere(text, block.path[0].span.to(name.span)))
 			return .None
 		}
-		val .Some((owner, _)) = self.types().get(&name.sym) else {
+		val .Some((owner, _)) = self.typeHere(name.sym) else {
 			// `extend Id { … }`, where `Id` is another name for a type: the
 			// methods belong to the type itself.
-			if self.aliases().contains(&name.sym) {
+			if self.aliasScope(name.sym).isSome() {
 				self.report(
 					Diagnostic::error(
 						IMPL_TARGET,
@@ -1717,15 +1799,18 @@ extend Lowerer {
 		when {
 			// Reported; it keeps its own place in this module's scope.
 			self.preludeName(name, "a variable named") => {}
-			self.globals().get(&name.sym) is .Some(first) => self.duplicate(
+			self.globalHere(name.sym) is .Some(first) => self.duplicate(
 				name,
 				self.program.globals[first].span,
 			)
-			self.consts().get(&name.sym) is .Some(first) => self.duplicate(
+			self.constHere(name.sym) is .Some(first) => self.duplicate(
 				name,
 				self.program.consts[first].span,
 			)
-			else => self.modules[self.current].globals.put(name.sym, id)
+			else => self.modules[self.declaring(self.program.globals[id].isPub)].globals.put(
+				name.sym,
+				id,
+			)
 		}
 	}
 
@@ -1792,6 +1877,7 @@ extend Lowerer {
 		self.checkVariadic(&sig, isExtern)
 		val lendsFrom = self.lendsFrom(&sig, &params)
 		val keeps = self.keepsOf(&sig, &params)
+		val empties = self.emptiesOf(&sig, &member)
 		val exported = self.fnExported(&annotations, &params, &sig, ret)
 		val symbol = self.cSymbol(annotations.symbol)
 		val def = FnDef(
@@ -1843,6 +1929,7 @@ extend Lowerer {
 			lendsFrom: lendsFrom,
 			keeps: keeps,
 			keepsAt: .Some((sig.span.hi, !sig.keeps.isEmpty())),
+			empties: empties,
 			isLambda: false,
 			generator: .None,
 			isTailrec: annotations.tailrec,
@@ -1942,6 +2029,25 @@ extend Lowerer {
 	/// What `keeps` says a call may keep: the parameters, by index, each one
 	/// that is not `&var`, in a function that has a `&var` parameter to keep
 	/// them in.
+	/// Whether the signature says `empties`, where it may: on a `var fn`,
+	/// whose receiver the call changes.
+	var fn emptiesOf(sig: &ast::FnSig, member: &Option<Member>): bool = {
+		val .Some(span) = sig.empties else return false
+		if member is .Some(m) && m.receiver == .Var then return true
+		val fnName = String::of(self.text(sig.name.sym))
+		self.report(
+			Diagnostic::error(
+				EMPTIES,
+				"`\(fnName)` is not a `var fn`, and has no receiver to empty",
+				span,
+				"`empties` here",
+			).withNote(
+				"`empties` says a call leaves the receiver holding no view, so only a method that changes its receiver, a `var fn`, says it",
+			),
+		)
+		return false
+	}
+
 	var fn keepsOf(sig: &ast::FnSig, params: &[ParamDef]): Vec<u32> = {
 		if sig.keeps.isEmpty() then return Vec()
 		val note =
@@ -2481,7 +2587,7 @@ extend Lowerer {
 			.None if !isExtern && self.preludeName(sig.name, "a function named") => {}
 			.None => {
 				when {
-					self.fns().get(&sig.name.sym) is .Some(first) => {
+					self.fnHere(sig.name.sym) is .Some(first) => {
 						val firstSpan = self.program.fns[first].nameSpan
 						self.duplicate(sig.name, firstSpan)
 					}
@@ -2509,7 +2615,10 @@ extend Lowerer {
 							KnownFn::named(.None, self.text(sig.name.sym)) is .Some(known) {
 							self.program.preludeItems.setFunction(known, id)
 						}
-						self.modules[self.current].fns.put(sig.name.sym, id)
+						self.modules[self.declaring(self.program.fns[id].isPub)].fns.put(
+							sig.name.sym,
+							id,
+						)
 					}
 				}
 			}
@@ -2519,8 +2628,8 @@ extend Lowerer {
 	/// Where this module declares a struct, or an alias, called `sym`, which
 	/// `sym(…)` would build.
 	fn structNamed(sym: Symbol): Option<Span> = {
-		if self.types().get(&sym) is .Some((.Struct(..), span)) then return .Some(span)
-		return match self.aliases().get(&sym) {
+		if self.typeHere(sym) is .Some((.Struct(..), span)) then return .Some(span)
+		return match self.aliasHere(sym) {
 			.Some(alias) => .Some(alias.span)
 			.None => .None
 		}
@@ -2679,7 +2788,7 @@ extend Lowerer {
 		var namesOwnType = false
 		if block.interfaceName.isSome() && block.interfaceArgs is .Some(args) {
 			for arg in args.args {
-				if self.ast.types[arg].kind is .Named(name, ..) && self.types().contains(&name) then
+				if self.ast.types[arg].kind is .Named(name, ..) && self.typeHere(name).isSome() then
 					namesOwnType = true
 			}
 		}

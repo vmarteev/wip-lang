@@ -479,6 +479,8 @@ extend Printer {
 			}
 			parts.push(text(" keeps \(names)"))
 		}
+		// What a call leaves its receiver: `empties`.
+		if sig.empties.isSome() then parts.push(text(" empties"))
 		return concat(parts)
 	}
 
@@ -1378,7 +1380,9 @@ extend Printer {
 					.Some(i) => "\(i)"
 					.None => self.sym(name.sym)
 				}
-				concat([self.expr(base), text(".\(written)")])
+				if self.heldMember(id) then
+					concat([self.expr(base), indent(concat([.Hard, text(".\(written)")]))])
+				else concat([self.expr(base), text(".\(written)")])
 			}
 			.Call(callee, args, names, rest) => {
 				// `(a, b)`: the prelude's `Tuple2(a, b)`, written as the
@@ -1515,6 +1519,10 @@ extend Printer {
 			}
 		}
 		if calls < 3 then return .None
+		// A member kept on a line of its own is laid out one at a time.
+		for (field, _) in segments {
+			if self.heldMember(field) then return .None
+		}
 		segments.reverse()
 		val head = self.expr(at)
 		var first: Vec<Doc> = Vec()
@@ -1551,6 +1559,22 @@ extend Printer {
 			later.push(text(".\(name)"))
 		}
 		return .Some(group(concat([head, concat(first), indent(concat(later))])))
+	}
+
+	/// Whether the member `field` names began a line, its name capitalized:
+	/// `.Err(why)` written alone under a statement, meant as a variant and
+	/// read as a member of the line above, which the checker refuses and
+	/// says how to write. Joined to that line, it would look like a call
+	/// meant, and the checker's word on it would be another; so its line
+	/// break is kept. A C struct's field may begin with a capital, and keeps
+	/// the break it was written with.
+	fn heldMember(field: ExprId): bool = {
+		val .Field(base, name) = self.ast.exprs[field].kind else return false
+		val written = self.sym(name.sym)
+		if written.isEmpty() || written[0] < b'A' || written[0] > b'Z' then return false
+		val from = self.ast.exprs[base].span.hi as i64
+		val to = name.span.lo as i64
+		return from < to && self.src[from..to].contains("\n")
 	}
 
 	/// The `return`, `break` or `continue` an arm's block holds and
@@ -1663,12 +1687,13 @@ extend Printer {
 					.Some(inner) if b.field.sym == Symbol::positional() => self.pattern(&inner)
 					// `field: pattern`, or the field's name on its own
 					// where it binds that name.
-					.Some(inner) if !(inner.kind is .Binding(symbol) &&
+					.Some(inner) if !(inner.kind is .Binding(symbol, isVar: false) &&
 						symbol == b.field.sym &&
 						inner.span == b.field.span) => concat([
 						text("\(self.sym(b.field.sym)): "),
 						self.pattern(&inner),
 					])
+					_ if b.isVar => concat([text("var "), text(self.sym(b.field.sym))])
 					_ => text(self.sym(b.field.sym))
 				},
 			)
@@ -1679,7 +1704,8 @@ extend Printer {
 
 	var fn pattern(p: &Pattern): Doc = match p.kind {
 		.Wildcard => text("_")
-		.Binding(symbol) => text(self.sym(symbol))
+		.Binding(symbol, isVar: true) => concat([text("var "), text(self.sym(symbol))])
+		.Binding(symbol, ..) => text(self.sym(symbol))
 		.Int(..) | .Str(..) | .Char(..) | .Byte(..) => text(self.source(p.span))
 		.Bool(value) => text(if value then "true" else "false")
 		// `'a'..='z'`, `..0`, `10..`: its ends as written, with nothing
@@ -1836,8 +1862,7 @@ fn firstAnnotation(annotations: &[Annotation]): Option<Span> =
 
 /// A file of comments alone starts with them, not with a line break.
 fn stripLeadingBreak(doc: Doc): Doc = match move doc {
-	.Concat(parts) => {
-		var rest = parts
+	.Concat(var rest) => {
 		if !rest.isEmpty() && rest[0] is .Hard | .Blank then rest.remove(0)
 		return .Concat(parts: rest)
 	}

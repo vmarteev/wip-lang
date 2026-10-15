@@ -41,11 +41,38 @@ pub view struct ModuleAst {
 	/// its own.
 	pub var dir: Option<String>
 	pub var root: Option<String>
+	/// What the module's package names with `@files`, which a literal path
+	/// given to `package::besideProgram` is checked against.
+	pub var packageFiles: Vec<String> = Vec()
+	/// For each of `files`, the test file whose names it declares, by its
+	/// number among the module's test files; none for the module's own,
+	/// which share theirs. Empty where every file is the module's own.
+	pub var tests: Vec<Option<i64>> = Vec()
 }
 
-/// What one file's imports bind.
+extend ModuleAst {
+	/// The files whose declarations a file of test file `test` sees by name —
+	/// the module's own, and that test file's, where it is one — and, apart,
+	/// the other test files, whose `pub` items it sees too.
+	fn seenFiles(test: Option<i64>): (Vec<&ast::Ast>, Vec<&ast::Ast>) from self = {
+		var seen: Vec<&ast::Ast> = Vec()
+		var others: Vec<&ast::Ast> = Vec()
+		for j in 0..self.files.len() {
+			val its = if j < self.tests.len() then self.tests[j] else .None
+			if its.isNone() || its == test then seen.push(self.files[j])
+			else if test.isSome() then others.push(self.files[j])
+		}
+		return (seen, others)
+	}
+}
+
+/// What one file sees beyond its module's names: what its imports bind,
+/// and, for a test file, the scope of the names it declares.
 @derive(Clone)
 struct FileImports {
+	/// The scope of a test file's own names, among the lowerer's scopes;
+	/// none for a module's own file, whose names are its module's.
+	names: Option<i64> = .None
 	/// Modules, by the name the file gave them.
 	modules: Map<Symbol, i64> = Map()
 	/// Items of other modules, by the name the file gave them.
@@ -108,16 +135,25 @@ view struct DefaultSource {
 	generators: Map<ast::ExprId, StructId>
 }
 
-/// The names one module declares, and what it exports.
+/// The names one module declares, and what it exports; or, where it has a
+/// scope it is inside, the names one test file declares, which that file
+/// alone sees, inside the scope of what its module's test files mark
+/// `pub`, which they all see, inside the module's own.
 @derive(Clone)
 struct ModuleScope {
 	path: String
+	/// The scope a test's scope is inside: none for a module's own.
+	inside: Option<i64> = .None
+	/// For one test file's own names, which of its module's test files it
+	/// is, as `ModuleAst::tests` numbers them.
+	test: Option<i64> = .None
 	/// The module's package, as `ModuleAst` says.
 	prefix: String
 	depends: Vec<String>
 	/// Where its files are, and its package's root.
 	dir: Option<String>
 	root: Option<String>
+	packageFiles: Vec<String> = Vec()
 	types: Map<Symbol, (TypeDef, Span)> = Map()
 	/// The type aliases the module declares.
 	aliases: Map<Symbol, AliasDef> = Map()
@@ -131,6 +167,18 @@ struct ModuleScope {
 	/// The variables C owns that the module declares.
 	globals: Map<Symbol, GlobalId> = Map()
 }
+
+/// A scope of test files' names inside the scope `inside`, of `module`'s,
+/// named for messages as `what` of it, a name no import can write.
+fn testScope(module: &ModuleAst, inside: i64, what: str): ModuleScope = ModuleScope(
+	path: "\(module.path) (\(what))",
+	inside: .Some(inside),
+	prefix: module.prefix.clone(),
+	depends: module.depends.clone(),
+	dir: module.dir.clone(),
+	root: module.root.clone(),
+	packageFiles: module.packageFiles.clone(),
+)
 
 /// Lowers a program of one file, in the root module.
 pub fn lowerFile(file: &ast::Ast, interner: &Interner): Lowered = lower(
@@ -146,10 +194,17 @@ pub fn lowerFile(file: &ast::Ast, interner: &Interner): Lowered = lower(
 	],
 	&interner,
 	future::cores(),
+	Vec(),
 )
 
-/// Lowers a program, checking its bodies on up to `threads` threads.
-pub fn lower(modules: &[ModuleAst], interner: &Interner, threads: i64): Lowered = {
+/// Lowers a program, checking its bodies on up to `threads` threads, with
+/// the constants a build defines set as `defines` says.
+pub fn lower(
+	modules: &[ModuleAst],
+	interner: &Interner,
+	threads: i64,
+	defines: Vec<Define>,
+): Lowered = {
 	// Every file, with the module it belongs to.
 	var files: Vec<(i64, &ast::Ast)> = Vec()
 	for index in 0..modules.len() {
@@ -171,7 +226,36 @@ pub fn lower(modules: &[ModuleAst], interner: &Interner, threads: i64): Lowered 
 			depends: module.depends.clone(),
 			dir: module.dir.clone(),
 			root: module.root.clone(),
+			packageFiles: module.packageFiles.clone(),
 		))
+	}
+	// Each module's test files: a scope their `pub` names share, inside the
+	// module's, and inside that a scope of each one's own; and what each file
+	// sees beyond its module before its imports are read, which for a test
+	// file is its scope.
+	var seen: Vec<FileImports> = Vec()
+	for index in 0..modules.len() {
+		val module = &modules[index]
+		var shared: Option<i64> = .None
+		var ownScopes: Map<i64, i64> = Map()
+		for f in 0..module.files.len() {
+			val test = if f < module.tests.len() then module.tests[f] else .None
+			val .Some(k) = test else {
+				seen.push(FileImports())
+				continue
+			}
+			if shared.isNone() {
+				shared = .Some(scopes.len())
+				scopes.push(testScope(&module, index, "tests"))
+			}
+			if !ownScopes.contains(&k) {
+				ownScopes.put(k, scopes.len())
+				var scope = testScope(&module, shared.unwrap(), "test \(k)")
+				scope.test = .Some(k)
+				scopes.push(scope)
+			}
+			seen.push(FileImports(names: ownScopes.get(&k).map((scope) => scope.clone())))
+		}
 	}
 	var lowerer = Lowerer::new(files[0].1, &interner, program, scopes)
 	// The prelude is declared before anything else, so that a module that
@@ -189,8 +273,8 @@ pub fn lower(modules: &[ModuleAst], interner: &Interner, threads: i64): Lowered 
 	}
 	// Imports are resolved once, so their errors are reported once.
 	var imports: Vec<FileImports> = Vec()
-	for (module, file) in files {
-		lowerer.enter(module, file, FileImports())
+	for i in 0..files.len() {
+		lowerer.enter(files[i].0, files[i].1, seen[i].clone())
 		imports.push(lowerer.resolveImports())
 	}
 
@@ -204,23 +288,23 @@ pub fn lower(modules: &[ModuleAst], interner: &Interner, threads: i64): Lowered 
 		types.push(Vec())
 	}
 	for i in declarationOrder {
-		lowerer.enter(files[i].0, files[i].1, FileImports())
+		lowerer.enter(files[i].0, files[i].1, seen[i].clone())
 		interfaces[i] = lowerer.collectInterfaces()
 	}
 	for i in declarationOrder {
-		lowerer.enter(files[i].0, files[i].1, FileImports())
+		lowerer.enter(files[i].0, files[i].1, seen[i].clone())
 		types[i] = lowerer.collectTypes()
 	}
 	// The type aliases' names, before any body names one.
 	for i in declarationOrder {
-		lowerer.enter(files[i].0, files[i].1, FileImports())
+		lowerer.enter(files[i].0, files[i].1, seen[i].clone())
 		lowerer.collectAliases()
 	}
 	// With every type named, the items a file imports can be checked before
 	// anything uses them.
 	var checkedImports: Vec<FileImports> = Vec()
-	for _ in files {
-		checkedImports.push(FileImports())
+	for i in 0..files.len() {
+		checkedImports.push(seen[i].clone())
 	}
 	for i in declarationOrder {
 		lowerer.enter(files[i].0, files[i].1, mem::replace(&var imports[i], FileImports()))
@@ -262,6 +346,8 @@ pub fn lower(modules: &[ModuleAst], interner: &Interner, threads: i64): Lowered 
 		lowerer.enterFile(i, &files, &imports, &lambdas, &envs, &generators)
 		lowerer.declareConsts()
 	}
+	lowerer.matchDefines(&defines)
+	lowerer.defineList = defines
 	// The environment a named function lent as a closure carries, which holds
 	// nothing.
 	lowerer.program.fnClosureEnv = .Some(
@@ -356,6 +442,13 @@ pub fn lower(modules: &[ModuleAst], interner: &Interner, threads: i64): Lowered 
 		lowerer.enterFile(i, &files, &imports, &lambdas, &envs, &generators)
 		lowerer.resolveTypeBodies(&types[i])
 	}
+	// Whether a field borrows is a question of what the types it names
+	// hold, known once every type's fields are.
+	lowerer.program.findHeldParams()
+	for i in 0..files.len() {
+		lowerer.enterFile(i, &files, &imports, &lambdas, &envs, &generators)
+		lowerer.checkStoredFields(&types[i])
+	}
 	for i in 0..files.len() {
 		lowerer.enterFile(i, &files, &imports, &lambdas, &envs, &generators)
 		lowerer.checkPackedStructs(&types[i])
@@ -393,6 +486,7 @@ pub fn lower(modules: &[ModuleAst], interner: &Interner, threads: i64): Lowered 
 			paramDefaults[i].push(d)
 		}
 	}
+	lowerer.checkTestNames()
 	// Every generator is an `Iterator`, with the interface's other methods.
 	for i in declarationOrder {
 		lowerer.enterFile(i, &files, &imports, &lambdas, &envs, &generators)
@@ -404,8 +498,10 @@ pub fn lower(modules: &[ModuleAst], interner: &Interner, threads: i64): Lowered 
 		lowerer.enterFile(i, &files, &imports, &lambdas, &envs, &generators)
 		lowerer.declareEnumNumbers(&types[i])
 	}
-	// With every implementation declared, the types that asked for
-	// `@derive(Eq)` get the comparison the compiler writes.
+	// With every implementation declared, what each one `@derive` wrote asks
+	// of the type's parameters is worked out from the fields, and then the
+	// fields are checked.
+	lowerer.deriveConditions(&types)
 	for i in declarationOrder {
 		lowerer.enter(files[i].0, files[i].1, imports[i].clone())
 		lowerer.declareEquality(&types[i])
@@ -653,6 +749,9 @@ struct PendingConstraint {
 	written: Symbol
 	declared: Span
 	span: Span
+	/// The type parameters in scope where it was written, which a type that
+	/// mentions one is checked with.
+	params: Vec<GenericParamDef>
 }
 
 /// Why a place must be writable.
@@ -673,6 +772,9 @@ view struct Lowerer {
 	modules: Vec<ModuleScope>
 	/// The module whose file is being lowered.
 	current: i64
+	/// The scope the current file's names are declared in and looked for
+	/// in first: its module's, or a test file's own.
+	names: i64
 	/// What the current file's imports bind: names for modules, and for items
 	/// of other modules. Imports are file-scoped, as they are in Go and Odin.
 	imports: FileImports
@@ -724,6 +826,11 @@ view struct Lowerer {
 	constSources: Map<ConstId, ConstSource>
 	constStack: Vec<ConstId>
 	constsDone: Set<ConstId>
+	/// The constants that say `@define`; the build's defines; and which
+	/// define sets each constant a build sets.
+	definable: Vec<ConstId>
+	defineList: Vec<Define>
+	defines: Map<ConstId, i64>
 	/// Whether a top-level `assert` is being checked, where a file may be
 	/// embedded as in a constant.
 	checkingAssert: bool
@@ -857,6 +964,7 @@ extend Lowerer {
 			diagnostics: Vec(),
 			modules: modules,
 			current: 0,
+			names: 0,
 			imports: FileImports(),
 			state: BodyState(),
 			phase: .Declaring,
@@ -876,6 +984,9 @@ extend Lowerer {
 			constSources: Map(),
 			constStack: Vec(),
 			constsDone: Set(),
+			definable: Vec(),
+			defineList: Vec(),
+			defines: Map(),
 			checkingAssert: false,
 			embedded: Map(),
 			typeParams: Vec(),
@@ -898,21 +1009,117 @@ extend Lowerer {
 
 	var fn report(diagnostic: Diagnostic) = self.diagnostics.push(diagnostic)
 
-	/// The names the module being lowered declares.
-	fn types(): &Map<Symbol, (TypeDef, Span)> = lend self.modules[self.current].types
+	/// The scopes a bare name in the current file is looked for in, nearest
+	/// first: a test file's own, then its module's tests' shared; and its
+	/// module's, which a module's own file looks in alone.
+	fn here(): Vec<i64> = {
+		var scopes: Vec<i64> = Vec()
+		var at: Option<i64> = .Some(self.names)
+		while at is .Some(scope) {
+			scopes.push(scope)
+			at = self.modules[scope].inside
+		}
+		return scopes
+	}
 
-	/// The type aliases of this module.
-	fn aliases(): &Map<Symbol, AliasDef> = lend self.modules[self.current].aliases
+	/// The scope a name the current file declares goes in: a module's own
+	/// file's, its module's; a test file's, its own, or, where it is `pub`,
+	/// the one its module's test files share.
+	fn declaring(isPub: bool): i64 =
+		if self.names == self.current then self.current
+		else if isPub then self.modules[self.names].inside.unwrapOr(self.current)
+		else self.names
 
-	fn interfaces(): &Map<Symbol, (InterfaceId, Span)> = lend self.modules[self.current].interfaces
+	/// The module a scope is of: itself, for a module's own.
+	fn moduleOf(scope: i64): i64 = {
+		var at = scope
+		while self.modules[at].inside is .Some(outer) {
+			at = outer
+		}
+		return at
+	}
 
-	fn fns(): &Map<Symbol, FnId> = lend self.modules[self.current].fns
+	/// Where the current file finds `sym` written with no path: the nearest
+	/// of its scopes that declares it — a test file's own, its module's
+	/// tests' shared — or else its module's, which declares it or not.
+	fn holding(sym: Symbol): i64 = {
+		for scope in self.here() {
+			val names = &self.modules[scope]
+			if names.types.contains(&sym) ||
+				names.aliases.contains(&sym) ||
+				names.fns.contains(&sym) ||
+				names.consts.contains(&sym) ||
+				names.globals.contains(&sym) ||
+				names.opaques.contains(&sym) ||
+				names.interfaces.contains(&sym) {
+				return scope
+			}
+		}
+		return self.current
+	}
 
-	fn opaques(): &Map<Symbol, OpaqueId> = lend self.modules[self.current].opaques
+	/// Whether the current file is a test file.
+	fn inTest(): bool = self.names != self.current
 
-	fn consts(): &Map<Symbol, ConstId> = lend self.modules[self.current].consts
+	/// The type the current file sees by `sym`, and where it was declared.
+	fn typeHere(sym: Symbol): Option<(TypeDef, Span)> = {
+		for scope in self.here() {
+			if self.modules[scope].types.get(&sym) is .Some(found) then return .Some(found.clone())
+		}
+		return .None
+	}
 
-	fn globals(): &Map<Symbol, GlobalId> = lend self.modules[self.current].globals
+	/// The scope holding the type alias the current file sees by `sym`.
+	fn aliasScope(sym: Symbol): Option<i64> = {
+		for scope in self.here() {
+			if self.modules[scope].aliases.contains(&sym) then return .Some(scope)
+		}
+		return .None
+	}
+
+	/// The type alias the current file sees by `sym`.
+	fn aliasHere(sym: Symbol): Option<AliasDef> = {
+		val scope = self.aliasScope(sym)?
+		return .Some(self.modules[scope].aliases.get(&sym)?.clone())
+	}
+
+	fn interfaceHere(sym: Symbol): Option<(InterfaceId, Span)> = {
+		for scope in self.here() {
+			if self.modules[scope].interfaces.get(&sym) is .Some(found) then
+				return .Some(found.clone())
+		}
+		return .None
+	}
+
+	fn fnHere(sym: Symbol): Option<FnId> = {
+		for scope in self.here() {
+			if self.modules[scope].fns.get(&sym) is .Some(found) then return .Some(found.clone())
+		}
+		return .None
+	}
+
+	fn opaqueHere(sym: Symbol): Option<OpaqueId> = {
+		for scope in self.here() {
+			if self.modules[scope].opaques.get(&sym) is .Some(found) then
+				return .Some(found.clone())
+		}
+		return .None
+	}
+
+	fn constHere(sym: Symbol): Option<ConstId> = {
+		for scope in self.here() {
+			if self.modules[scope].consts.get(&sym) is .Some(found) then return .Some(found.clone())
+		}
+		return .None
+	}
+
+	fn globalHere(sym: Symbol): Option<GlobalId> = {
+		for scope in self.here() {
+			if self.modules[scope].globals.get(&sym) is .Some(found) then
+				return .Some(found.clone())
+		}
+		return .None
+	}
 
 	/// Whether the module being lowered is the standard library's, which
 	/// alone may name what holds memory that holds nothing, or turn an `own`
@@ -925,6 +1132,7 @@ extend Lowerer {
 	/// Moves to a file of `module`, with the imports that file wrote.
 	var fn enter(module: i64, file: &ast::Ast, imports: FileImports) keeps file = {
 		self.current = module
+		self.names = imports.names.unwrapOr(module)
 		self.ast = &file
 		self.imports = imports
 	}
@@ -1094,6 +1302,70 @@ extend Lowerer {
 		self.lambdas = lambdas[i].clone()
 		self.lambdaEnvs = envs[i].clone()
 		self.generators = generators[i].clone()
+	}
+
+	/// What the test files declare, once all of them have: a name of one
+	/// test file's own that another's `pub` item has, which that file would
+	/// see two of; and two tests of one module of the same name, wherever
+	/// they are written, since a test is run and reported by its module and
+	/// its name.
+	var fn checkTestNames() = {
+		var tests: Map<(u32, Symbol), Span> = Map()
+		for id in self.program.fns.ids() {
+			val def = &self.program.fns[id]
+			if def.test.isNone() then continue
+			val key = (def.module, def.name)
+			val span = def.nameSpan
+			match tests.get(&key) {
+				.Some(first) => self.duplicate(ast::Name(sym: key.1, span: span), first.clone())
+				.None => tests.put(key, span)
+			}
+		}
+		for scope in 0..self.modules.len() {
+			val .Some(outer) = self.modules[scope].inside else continue
+			// A test file's own scope is inside the tests' shared one, which is
+			// inside its module.
+			if self.modules[outer].inside.isNone() then continue
+			val mine = self.modules[scope].clone()
+			val shared = &self.modules[outer]
+			var clashes: Vec<(ast::Name, Span)> = Vec()
+			for i in 0..mine.fns.len() {
+				val sym = mine.fns.keyAt(i).clone()
+				if shared.fns.get(&sym) is .Some(first) then
+					clashes.push(
+						(
+							ast::Name(
+								sym: sym,
+								span: self.program.fns[mine.fns.valueAt(i).clone()].nameSpan,
+							),
+							self.program.fns[first].nameSpan,
+						),
+					)
+			}
+			for i in 0..mine.types.len() {
+				val sym = mine.types.keyAt(i).clone()
+				if shared.types.get(&sym) is .Some((_, first)) then
+					clashes.push(
+						(ast::Name(sym: sym, span: mine.types.valueAt(i).1), first.clone()),
+					)
+			}
+			for i in 0..mine.consts.len() {
+				val sym = mine.consts.keyAt(i).clone()
+				if shared.consts.get(&sym) is .Some(first) then
+					clashes.push(
+						(
+							ast::Name(
+								sym: sym,
+								span: self.program.consts[mine.consts.valueAt(i).clone()].span,
+							),
+							self.program.consts[first].span,
+						),
+					)
+			}
+			for (name, first) in clashes {
+				self.duplicate(name, first)
+			}
+		}
 	}
 
 	var fn duplicate(name: ast::Name, first: Span) = {

@@ -1,0 +1,530 @@
+// A Mach-O object, read as far as adding to it needs, and added to:
+// sections of data, the symbols that name places in them, and the
+// relocations of the addresses in them. What a part's table adds, as
+// `elf.wip` adds it to an ELF object.
+//
+// A Mach-O object cannot only grow at its end, as an ELF object does: its
+// sections are listed in the one segment command at its head, which grows
+// with each, and its symbols are kept in three groups — local, then defined,
+// then undefined, the last two sorted by name — so a symbol added moves those
+// after it. So the object is laid out again: its header and commands, its
+// sections' bytes as they were, moved by as much as the commands grew and a
+// multiple of the largest alignment a section asks, so that none is
+// misaligned, the added sections' after them, at addresses after every
+// section's; then each section's relocations, every one that names a symbol
+// renumbered; the linker's data, the symbols and their names. What a command
+// says of where something is is said again of where it now is.
+
+import std::collections::{Map}
+
+val MH_MAGIC_64: u32 = 0xfeedfacf
+val MH_OBJECT: u32 = 1
+val CPU_TYPE_ARM64: u32 = 0x0100000c
+val CPU_TYPE_X86_64: u32 = 0x01000007
+
+val LC_SYMTAB: u32 = 0x2
+val LC_DYSYMTAB: u32 = 0xb
+val LC_SEGMENT_64: u32 = 0x19
+val LC_VERSION_MIN_MACOSX: u32 = 0x24
+val LC_VERSION_MIN_IPHONEOS: u32 = 0x25
+val LC_DATA_IN_CODE: u32 = 0x29
+val LC_LINKER_OPTION: u32 = 0x2d
+val LC_LINKER_OPTIMIZATION_HINT: u32 = 0x2e
+val LC_BUILD_VERSION: u32 = 0x32
+
+/// The sizes of the header, a segment command before its sections, a
+/// section, a symbol and a relocation.
+val MACH_HEADER: i64 = 32
+val SEGMENT: i64 = 72
+val SECTION: i64 = 80
+val NLIST: i64 = 16
+val RELOCATION: i64 = 8
+
+val N_STAB: u8 = 0xe0
+val N_EXT: u8 = 0x01
+val N_PEXT: u8 = 0x10
+val N_SECT: u8 = 0x0e
+
+/// A section whose bytes are not in the file: zero filled.
+val S_ZEROFILL: u32 = 0x1
+val S_GB_ZEROFILL: u32 = 0xc
+val S_THREAD_LOCAL_ZEROFILL: u32 = 0x12
+
+/// A section of pieces the linker keeps only where they keep something
+/// live: the unwinder's tables, and a panic's.
+val S_ATTR_LIVE_SUPPORT: u32 = 0x08000000
+
+/// An address of 64 bits, a symbol's or a section's: the same number on
+/// arm64 and on x86-64.
+val RELOC_UNSIGNED: u32 = 0
+
+/// A section of data to add: where it goes, its flags and its alignment as a
+/// power of two, its bytes, the symbol at its start where it has one —
+/// defined, and private to the program — the local symbols at places in it,
+/// and where in it an address goes, and of what.
+struct MachoData {
+	segment: String
+	section: String
+	flags: u32
+	align: u32
+	bytes: Vec<u8>
+	symbol: Option<String>
+	labels: Vec<(u64, String)>
+	addresses: Vec<(u64, Address)>
+}
+
+/// A section of the object, as its header says, with the header itself.
+struct MachoSection {
+	header: Vec<u8>
+	address: u64
+	size: u64
+	offset: i64
+	align: u32
+	reloff: i64
+	nreloc: i64
+	inFile: bool
+}
+
+/// A symbol of the object.
+@derive(Clone)
+struct Nlist {
+	name: String
+	kind: u8
+	section: u8
+	desc: u16
+	value: u64
+}
+
+/// The object's commands: each one's bytes, the segment's sections, and
+/// where the symbols and the linker's data are.
+struct Commands {
+	all: Vec<Vec<u8>>
+	segment: i64
+	sections: Vec<MachoSection>
+	symtab: i64
+	dysymtab: i64
+}
+
+/// `object`, a Mach-O object, with each of `added` as a section of its own.
+fn withMachoData(object: &[u8], added: &[MachoData]): Result<Vec<u8>, String> = {
+	if object.len() < MACH_HEADER || u32At(&object, 0) != MH_MAGIC_64 then
+		return .Err("not a Mach-O object of 64 bits, little-endian")
+	val cpu = u32At(&object, 4)
+	if cpu != CPU_TYPE_ARM64 && cpu != CPU_TYPE_X86_64 then
+		return .Err("no relocation for an address on CPU \(cpu)")
+	if u32At(&object, 12) != MH_OBJECT then return .Err("a Mach-O file that is not an object")
+	val commands = readCommands(&object)?
+	for s in commands.sections {
+		if fixedName(&s.header, 0) == "__llvm_addrsig" then
+			return .Err(
+				"an object with `__llvm_addrsig`, whose symbols' numbers this does not keep",
+			)
+	}
+
+	// The symbols, in their groups.
+	val symtab = &commands.all[commands.symtab]
+	val dysymtab = &commands.all[commands.dysymtab]
+	for field in [36, 44, 52, 60, 68, 76] {
+		if u32At(&dysymtab, field) != 0 then
+			return .Err("an object with tables of symbols this does not write")
+	}
+	val symoff = u32At(&symtab, 8) as i64
+	val nsyms = u32At(&symtab, 12) as i64
+	val stroff = u32At(&symtab, 16) as i64
+	val nlocal = u32At(&dysymtab, 12) as i64
+	val nextdef = u32At(&dysymtab, 20) as i64
+	val nundef = u32At(&dysymtab, 28) as i64
+	if nlocal + nextdef + nundef != nsyms then
+		return .Err("an object whose symbols are not each in one group")
+	var old: Vec<Nlist> = Vec()
+	for i in 0..nsyms {
+		val n = symoff + i * NLIST
+		old.push(Nlist(
+			name: cString(&object, stroff + u32At(&object, n) as i64),
+			kind: object[n + 4],
+			section: object[n + 5],
+			desc: u16At(&object, n + 6),
+			value: u64At(&object, n + 8),
+		))
+	}
+
+	// Where each added section goes: after every section, by address.
+	var end: u64 = 0
+	for s in commands.sections {
+		if s.address + s.size > end then end = s.address + s.size
+	}
+	val first = commands.sections.len()
+	var addresses: Vec<u64> = Vec()
+	for data in added {
+		end = alignUp(end, 1 << data.align as u64)
+		addresses.push(end)
+		end += data.bytes.len() as u64
+	}
+
+	// The symbols added: each label a local, each section's symbol defined,
+	// and each address of a symbol the object does not have, undefined.
+	var locals = old[0..nlocal].toVec()
+	var defined = old[nlocal..(nlocal + nextdef)].toVec()
+	var undefined = old[(nlocal + nextdef)..nsyms].toVec()
+	var known: Map<String, bool> = Map()
+	for symbol in old {
+		if symbol.kind & N_STAB == 0 then known.put(symbol.name.clone(), true)
+	}
+	for (i, data) in added.forwards().enumerate() {
+		val section = (first + i + 1) as u8
+		for (at, name) in data.labels {
+			locals.push(Nlist(
+				name: name.clone(),
+				kind: N_SECT,
+				section: section,
+				desc: 0,
+				value: addresses[i] + at,
+			))
+		}
+		if data.symbol is .Some(name) {
+			insertSorted(&var defined, Nlist(
+				name: "_\(name)",
+				kind: N_SECT | N_EXT | N_PEXT,
+				section: section,
+				desc: 0,
+				value: addresses[i],
+			))
+			known.put("_\(name)", true)
+		}
+		for (_, address) in data.addresses {
+			if address is .Symbol(name) && !known.contains(&name) {
+				insertSorted(&var undefined, Nlist(
+					name: name.clone(),
+					kind: N_EXT,
+					section: 0,
+					desc: 0,
+					value: 0,
+				))
+				known.put(name.clone(), true)
+			}
+		}
+	}
+	// Each old symbol's new number, and each symbol's by name: a defined one
+	// before an undefined one of its name.
+	var all: Vec<Nlist> = Vec()
+	for s in locals {
+		all.push(s.clone())
+	}
+	for s in defined {
+		all.push(s.clone())
+	}
+	for s in undefined {
+		all.push(s.clone())
+	}
+	var byName: Map<String, u32> = Map()
+	var defs: Map<(String, u8, u64), u32> = Map()
+	for (i, s) in all.forwards().enumerate() {
+		if s.kind & N_STAB != 0 then continue
+		if !byName.contains(&s.name) || s.kind & N_SECT == N_SECT then
+			byName.put(s.name.clone(), i as u32)
+		defs.put((s.name.clone(), s.kind, s.value), i as u32)
+	}
+	var renumbered: Vec<u32> = Vec()
+	for (i, s) in old.forwards().enumerate() {
+		// A symbol keeps its place in its group, and the others are added
+		// after it, or sorted among the defined and undefined.
+		val number =
+			if i < nlocal then i as u32
+			else match defs.get((s.name.clone(), s.kind, s.value)) {
+				.Some(n) => n
+				.None => return .Err("a symbol `\(s.name)` lost from its group")
+			}
+		renumbered.push(number)
+	}
+
+	// The layout: the commands, grown by the added sections' headers; the
+	// old sections' bytes, moved; the added sections' bytes.
+	val grown = SECTION * added.len()
+	val sizeofcmds = u32At(&object, 20) as i64 + grown
+	val headerEnd = MACH_HEADER + sizeofcmds
+	var dataStart = headerEnd
+	var dataEnd = headerEnd
+	var widest: i64 = 8
+	var anyData = false
+	for s in commands.sections {
+		if !s.inFile then continue
+		if !anyData || s.offset < dataStart then dataStart = s.offset
+		if !anyData || s.offset + s.size as i64 > dataEnd then dataEnd = s.offset + s.size as i64
+		anyData = true
+		if (1 << s.align as i64) > widest then widest = 1 << s.align as i64
+	}
+	if !anyData {
+		dataStart = headerEnd
+		dataEnd = headerEnd
+	}
+	val shift = if headerEnd > dataStart then alignUpI(headerEnd - dataStart, widest) else 0
+	var out: Vec<u8> = Vec()
+	for _ in 0..(dataStart + shift) {
+		out.push(0)
+	}
+	for i in dataStart..dataEnd {
+		out.push(object[i])
+	}
+	var placed: Vec<i64> = Vec()
+	for data in added {
+		placed.push(place(&var out, &data.bytes, 1 << data.align as i64) as i64)
+	}
+	val segmentEnd = out.len()
+
+	// The relocations: the old sections', their symbols renumbered, and the
+	// added sections', with each address's value in place.
+	var reloffs: Vec<i64> = Vec()
+	for s in commands.sections {
+		var block: Vec<u8> = Vec()
+		for r in 0..s.nreloc {
+			val at = s.reloff + r * RELOCATION
+			val address = u32At(&object, at)
+			if address & 0x80000000 != 0 then
+				return .Err("a scattered relocation, which a 64-bit object does not have")
+			var info = u32At(&object, at + 4)
+			if (info >> 27) & 1 == 1 {
+				val symbol = (info & 0xffffff) as i64
+				if symbol >= renumbered.len() then
+					return .Err("a relocation of a symbol that is not there")
+				info = (info & 0xff000000) | renumbered[symbol]
+			}
+			pushHalfWord(&var block, address)
+			pushHalfWord(&var block, info)
+		}
+		reloffs.push(if s.nreloc == 0 then 0 else place(&var out, &block, 8) as i64)
+	}
+	var addedRelocs: Vec<(i64, i64)> = Vec()
+	for (i, data) in added.forwards().enumerate() {
+		var block: Vec<u8> = Vec()
+		for (offset, address) in data.addresses {
+			val at = placed[i] + offset as i64
+			val info = match address {
+				.Symbol(name) => {
+					val .Some(symbol) = byName.get(&name) else {
+						return .Err("no symbol `\(name)` in the object")
+					}
+					// External: a symbol's address, with nothing added.
+					symbol | 3 << 25 | 1 << 27 | RELOC_UNSIGNED << 28
+				}
+				.Here(place) => {
+					// A section's address, the place's written where it goes.
+					writeWord(&var out, at, addresses[i] + place)
+					(first + i + 1) as u32 | 3 << 25 | RELOC_UNSIGNED << 28
+				}
+			}
+			pushHalfWord(&var block, offset as u32)
+			pushHalfWord(&var block, info)
+		}
+		val count = data.addresses.len()
+		addedRelocs.push((if count == 0 then 0 else place(&var out, &block, 8) as i64, count))
+	}
+
+	// The linker's data, which says where things are by their offsets in the
+	// file: each block again, at its new place.
+	var linkedit: Map<i64, i64> = Map()
+	for (c, command) in commands.all.forwards().enumerate() {
+		val kind = u32At(&command, 0)
+		if kind == LC_DATA_IN_CODE || kind == LC_LINKER_OPTIMIZATION_HINT {
+			val at = u32At(&command, 8) as i64
+			val size = u32At(&command, 12) as i64
+			linkedit.put(c, place(&var out, &object[at..(at + size)], 8) as i64)
+		}
+	}
+
+	// The symbols and their names: the names first written once each.
+	var strings: Vec<u8> = Vec::of([0 as u8])
+	var named: Map<String, u32> = Map()
+	var symbols: Vec<u8> = Vec()
+	for s in all {
+		val strx =
+			if s.name.isEmpty() then 0 as u32
+			else match named.get(&s.name) {
+				.Some(at) => at
+				.None => {
+					val at = strings.len() as u32
+					for i in 0..s.name.len() {
+						strings.push(s.name[i])
+					}
+					strings.push(0)
+					named.put(s.name.clone(), at)
+					at
+				}
+			}
+		pushHalfWord(&var symbols, strx)
+		symbols.push(s.kind)
+		symbols.push(s.section)
+		symbols.push(s.desc as u8)
+		symbols.push((s.desc >> 8) as u8)
+		pushWord(&var symbols, s.value)
+	}
+	while strings.len() % 8 != 0 {
+		strings.push(0)
+	}
+	val symbolsAt = place(&var out, &symbols, 8)
+	val stringsAt = place(&var out, &strings, 8)
+
+	// The header and the commands, each saying where things now are.
+	var head: Vec<u8> = object[0..MACH_HEADER].toVec()
+	setU32(&var head, 20, sizeofcmds as u32)
+	for (c, command) in commands.all.forwards().enumerate() {
+		var written = command.clone()
+		if c == commands.segment {
+			written = command[0..SEGMENT].toVec()
+			setU32(
+				&var written,
+				4,
+				(SEGMENT + SECTION * (commands.sections.len() + added.len())) as u32,
+			)
+			setU64(&var written, 32, end - u64At(&command, 24))
+			setU64(&var written, 40, (dataStart + shift) as u64)
+			setU64(&var written, 48, (segmentEnd - dataStart - shift) as u64)
+			setU32(&var written, 64, (commands.sections.len() + added.len()) as u32)
+			for (i, s) in commands.sections.forwards().enumerate() {
+				var header = s.header.clone()
+				if s.inFile then setU32(&var header, 48, (s.offset + shift) as u32)
+				setU32(&var header, 56, reloffs[i] as u32)
+				written.append(header)
+			}
+			for (i, data) in added.forwards().enumerate() {
+				val (reloff, nreloc) = addedRelocs[i]
+				written.append(sectionHeader(&data, addresses[i], placed[i], reloff, nreloc))
+			}
+		} else if c == commands.symtab {
+			setU32(&var written, 8, symbolsAt as u32)
+			setU32(&var written, 12, all.len() as u32)
+			setU32(&var written, 16, stringsAt as u32)
+			setU32(&var written, 20, strings.len() as u32)
+		} else if c == commands.dysymtab {
+			setU32(&var written, 8, 0)
+			setU32(&var written, 12, locals.len() as u32)
+			setU32(&var written, 16, locals.len() as u32)
+			setU32(&var written, 20, defined.len() as u32)
+			setU32(&var written, 24, (locals.len() + defined.len()) as u32)
+			setU32(&var written, 28, undefined.len() as u32)
+		} else if linkedit.get(&c) is .Some(at) then setU32(&var written, 8, at as u32)
+		head.append(written)
+	}
+	if head.len() != headerEnd then
+		return .Err("the commands came to \(head.len()) bytes, not \(headerEnd)")
+	for i in 0..head.len() {
+		out[i] = head[i]
+	}
+	return .Ok(out)
+}
+
+/// The object's commands, and which are the segment, the symbols and the
+/// groups of symbols. A command that says where something is in the file
+/// and is not one of those this writes again is refused.
+fn readCommands(object: &[u8]): Result<Commands, String> = {
+	val ncmds = u32At(&object, 16) as i64
+	val sizeofcmds = u32At(&object, 20) as i64
+	if MACH_HEADER + sizeofcmds > object.len() then
+		return .Err("commands past the end of the object")
+	var all: Vec<Vec<u8>> = Vec()
+	var segment: Option<i64> = .None
+	var symtab: Option<i64> = .None
+	var dysymtab: Option<i64> = .None
+	var sections: Vec<MachoSection> = Vec()
+	var at = MACH_HEADER
+	for c in 0..ncmds {
+		val kind = u32At(&object, at)
+		val size = u32At(&object, at + 4) as i64
+		if size < 8 || at + size > MACH_HEADER + sizeofcmds then
+			return .Err("a command past the commands' end")
+		val command = object[at..(at + size)].toVec()
+		match kind {
+			LC_SEGMENT_64 => {
+				if segment.isSome() then return .Err("an object of more than one segment")
+				segment = .Some(c)
+				val count = u32At(&command, 64) as i64
+				if SEGMENT + count * SECTION != size then
+					return .Err("a segment whose sections do not fill it")
+				for i in 0..count {
+					val s = SEGMENT + i * SECTION
+					val flags = u32At(&command, s + 64)
+					val kind = flags & 0xff
+					sections.push(MachoSection(
+						header: command[s..(s + SECTION)].toVec(),
+						address: u64At(&command, s + 32),
+						size: u64At(&command, s + 40),
+						offset: u32At(&command, s + 48) as i64,
+						align: u32At(&command, s + 52),
+						reloff: u32At(&command, s + 56) as i64,
+						nreloc: u32At(&command, s + 60) as i64,
+						inFile: kind != S_ZEROFILL &&
+							kind != S_GB_ZEROFILL &&
+							kind != S_THREAD_LOCAL_ZEROFILL &&
+							u64At(&command, s + 40) > 0,
+					))
+				}
+			}
+			LC_SYMTAB => symtab = .Some(c)
+			LC_DYSYMTAB => dysymtab = .Some(c)
+			LC_DATA_IN_CODE | LC_LINKER_OPTIMIZATION_HINT | LC_BUILD_VERSION | LC_VERSION_MIN_MACOSX
+			| LC_VERSION_MIN_IPHONEOS | LC_LINKER_OPTION => {}
+			_ => return .Err("a command, 0x\(kind, radix: 16), this does not write again")
+		}
+		all.push(command)
+		at += size
+	}
+	val .Some(s) = segment else return .Err("an object with no segment")
+	val .Some(t) = symtab else return .Err("an object with no symbol table")
+	val .Some(d) = dysymtab else return .Err("an object with no groups of symbols")
+	return .Ok(Commands(all: all, segment: s, sections: sections, symtab: t, dysymtab: d))
+}
+
+/// `symbol` among `group`, which is sorted by its names' bytes: after every
+/// one whose name is not greater.
+fn insertSorted(group: &var Vec<Nlist>, symbol: Nlist) = {
+	var at = group.len()
+	for (i, s) in group.forwards().enumerate() {
+		if s.name.toStr() > symbol.name.toStr() {
+			at = i
+			break
+		}
+	}
+	group.insert(at, symbol)
+}
+
+/// The header of an added section.
+fn sectionHeader(data: &MachoData, address: u64, offset: i64, reloff: i64, nreloc: i64): Vec<u8> = {
+	var header: Vec<u8> = Vec()
+	pushName(&var header, data.section)
+	pushName(&var header, data.segment)
+	pushWord(&var header, address)
+	pushWord(&var header, data.bytes.len() as u64)
+	pushHalfWord(&var header, offset as u32)
+	pushHalfWord(&var header, data.align)
+	pushHalfWord(&var header, reloff as u32)
+	pushHalfWord(&var header, nreloc as u32)
+	pushHalfWord(&var header, data.flags)
+	pushHalfWord(&var header, 0)
+	pushHalfWord(&var header, 0)
+	pushHalfWord(&var header, 0)
+	return header
+}
+
+/// `name` in sixteen bytes, as a section's or a segment's.
+fn pushName(out: &var Vec<u8>, name: str) = {
+	for i in 0..16 {
+		out.push(if i < name.len() then name[i] else 0)
+	}
+}
+
+fn setU32(bytes: &var Vec<u8>, at: i64, value: u32) = {
+	for i in 0..4 {
+		bytes[at + i] = (value >> (8 * i as u32)) as u8
+	}
+}
+
+fn setU64(bytes: &var Vec<u8>, at: i64, value: u64) = {
+	for i in 0..8 {
+		bytes[at + i] = (value >> (8 * i as u64)) as u8
+	}
+}
+
+fn writeWord(out: &var Vec<u8>, at: i64, value: u64) = setU64(&var out, at, value)
+
+fn alignUp(value: u64, align: u64): u64 = (value + align - 1) / align * align
+
+fn alignUpI(value: i64, align: i64): i64 = (value + align - 1) / align * align

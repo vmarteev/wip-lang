@@ -34,7 +34,36 @@ pub struct Package {
 	/// The packages it depends on: the name, which package, and where the
 	/// `@depends` was written.
 	pub depends: Vec<(String, i64, Span)>
+	/// What `@files` names, the files and directories it reads while it
+	/// runs, each as written, from its root: what a build puts beside the
+	/// program, at the same paths for the program's own package and under a
+	/// directory of its name for a dependency.
+	pub files: Vec<String>
+	/// The app it is, where it says so with `@app`: what an iOS build makes
+	/// a bundle of.
+	pub app: Option<App> = .None
 }
+
+/// What `@app` says of the app a package is.
+@derive(Clone)
+pub struct App {
+	/// The bundle's identifier, reverse-DNS: `com.example.marble`.
+	pub id: String
+	/// What the home screen shows.
+	pub name: Option<String> = .None
+	/// `ipad`, `iphone` or `both`.
+	pub devices: String = String::of("both")
+	/// `landscape`, `portrait` or `any`.
+	pub orientation: String = String::of("any")
+	/// A square PNG of the package, from its root.
+	pub icon: Option<String> = .None
+	/// The least iOS version it runs on.
+	pub minimum: String = String::of(MINIMUM_IOS)
+}
+
+/// The least iOS version an app runs on where it does not say: every iPad
+/// sold since 2018 runs it.
+pub val MINIMUM_IOS = "17.0"
 
 /// What a `package.wip` says.
 struct Manifest {
@@ -43,6 +72,12 @@ struct Manifest {
 	/// The name each dependency is imported by, where its root is relative
 	/// to this package's, and where the `@depends` was written.
 	depends: Vec<(String, String, Span)>
+	/// What `@files` names, each found below the root, and where each was
+	/// written.
+	files: Vec<String>
+	fileSpans: Vec<Span> = Vec()
+	/// What `@app` says.
+	app: Option<App> = .None
 }
 
 /// One argument of a package's annotation: its key, where it has one, its
@@ -75,7 +110,10 @@ fn manifest(dir: str, loaded: &var Loaded, overlay: &Overlay): Option<Manifest> 
 		},
 		version: .None,
 		depends: Vec(),
+		files: Vec(),
 	)
+	var filesSaid = false
+	var appSaid = false
 	for annotation in parsed.annotations {
 		val what = String::of(loaded.interner.resolve(annotation.name.sym))
 		var strings: Vec<Said> = Vec()
@@ -189,6 +227,93 @@ fn manifest(dir: str, loaded: &var Loaded, overlay: &Overlay): Option<Manifest> 
 				}
 				manifest.depends.push((name, dependency, annotation.span))
 			}
+			"files" => {
+				if filesSaid {
+					loaded.diagnostics.push(
+						Diagnostic::error(
+							PACKAGE,
+							"a package names its files once",
+							annotation.span,
+							"a second `@files`",
+						).withHelp("name them all in one: `@files(\"levels\", \"sounds\")`"),
+					)
+					continue
+				}
+				filesSaid = true
+				if strings.isEmpty() then
+					loaded.diagnostics.push(
+						Diagnostic::error(
+							PACKAGE,
+							"`@files` names no file",
+							annotation.span,
+							"nothing named",
+						).withHelp("write `@files(\"levels\")`, a path from the package's root"),
+					)
+				for said in strings {
+					val written = match said.value {
+						.Some(written) if said.key.isNone() => written.clone()
+						_ => {
+							loaded.diagnostics.push(
+								Diagnostic::error(
+									PACKAGE,
+									"`@files` takes paths, each a string",
+									said.span,
+									"not a path",
+								).withHelp("write `@files(\"levels\", \"help.txt\")`"),
+							)
+							continue
+						}
+					}
+					match packageFile(written, dir) {
+						.Ok(found) => {
+							if holdsCode(found) {
+								loaded.diagnostics.push(
+									Diagnostic::error(
+										PACKAGE,
+										"`\(written)` holds Wip's code",
+										said.span,
+										"a `.wip` file",
+									).withNote(
+										"a package's files are what it reads while it runs, not its modules; a dependency's are put in the program's package, where one would be read as a module of it",
+									).withHelp(
+										"name the directories below it that hold no `.wip` file",
+									),
+								)
+							} else {
+								manifest.files.push(written.clone())
+								manifest.fileSpans.push(said.span)
+							}
+						}
+						.Err((message, label)) => loaded.diagnostics.push(
+							Diagnostic::error(PACKAGE, message, said.span, label).withNote(
+								"the files a package names are put beside its program by every build of it, so each is the package's own",
+							),
+						)
+					}
+				}
+			}
+			"app" => {
+				if appSaid {
+					loaded.diagnostics.push(
+						Diagnostic::error(
+							PACKAGE,
+							"a package is one app",
+							annotation.span,
+							"a second `@app`",
+						),
+					)
+					continue
+				}
+				appSaid = true
+				match appOf(&strings, dir, annotation.span) {
+					.Ok(app) => manifest.app = .Some(app)
+					.Err(wrong) => {
+						for diagnostic in wrong {
+							loaded.diagnostics.push(diagnostic.clone())
+						}
+					}
+				}
+			}
 			// How `wip fmt` lays the package out, which the formatter reads
 			// for itself.
 			"format" => {
@@ -210,13 +335,217 @@ fn manifest(dir: str, loaded: &var Loaded, overlay: &Overlay): Option<Manifest> 
 						annotation.span,
 						"not a package's annotation",
 					).withHelp(
-						"a `package.wip` takes `@version(\"1.4.0\")`, `@depends(\"engine\", path = \"../engine\")` and `@format(width = 120)`",
+						"a `package.wip` takes `@version(\"1.4.0\")`, `@depends(\"engine\", path = \"../engine\")`, `@files(\"levels\")`, `@app(id = \"com.example.game\")` and `@format(width = 120)`",
 					),
 				)
 			}
 		}
 	}
 	return .Some(manifest)
+}
+
+/// What `@app`'s arguments, `said`, make of the app, the package's root
+/// `dir`: each a key and a string, `id` among them; or every mistake, at
+/// `span` where it is not one argument's.
+fn appOf(said: &[Said], dir: str, span: Span): Result<App, Vec<Diagnostic>> = {
+	var app = App(id: String())
+	var hasId = false
+	var wrong: Vec<Diagnostic> = Vec()
+	for arg in said {
+		val mistake = (message: str, label: str) => Diagnostic::error(
+			PACKAGE,
+			message,
+			arg.span,
+			label,
+		).withHelp(
+			"write `@app(id = \"com.example.game\", name = \"The Game\")`, and `devices`, `orientation`, `icon` and `minimum` where they are not the default",
+		)
+		val .Some(key) = arg.key else {
+			wrong.push(mistake("`@app` takes `key = \"value\"`", "no key"))
+			continue
+		}
+		val .Some(value) = arg.value else {
+			wrong.push(mistake("`\(key)` is a string", "not a string"))
+			continue
+		}
+		match key.toStr() {
+			"id" => {
+				hasId = true
+				if isBundleId(value) then app.id = value.clone()
+				else wrong.push(
+					mistake(
+						"`\(value)` is not an app's identifier",
+						"not reverse-DNS, as `com.example.game`",
+					),
+				)
+			}
+			"name" => app.name = .Some(value.clone())
+			"devices" => {
+				if value.toStr() is "ipad" | "iphone" | "both" then app.devices = value.clone()
+				else wrong.push(mistake("`devices` is `ipad`, `iphone` or `both`", "not a device"))
+			}
+			"orientation" => {
+				if value.toStr() is "landscape" | "portrait" | "any" then
+					app.orientation = value.clone()
+				else wrong.push(
+					mistake(
+						"`orientation` is `landscape`, `portrait` or `any`",
+						"not an orientation",
+					),
+				)
+			}
+			"icon" => {
+				if path::extension(value) != .Some("png") then
+					wrong.push(mistake("an app's icon is a PNG", "not a `.png`"))
+				else if packageFile(value, dir) is .Err((message, label)) then
+					wrong.push(mistake(message, label))
+				else app.icon = .Some(value.clone())
+			}
+			"minimum" => {
+				if isVersion(value) then app.minimum = value.clone()
+				else wrong.push(
+					mistake("`minimum` is an iOS version, as `\"17.0\"`", "not a version"),
+				)
+			}
+			_ => wrong.push(mistake("`@app` knows no `\(key)`", "not what an app says"))
+		}
+	}
+	if !hasId then
+		wrong.push(
+			Diagnostic::error(PACKAGE, "an app says its identifier", span, "no `id`").withHelp(
+				"write `@app(id = \"com.example.game\")`: reverse-DNS, unique to the app",
+			),
+		)
+	return if wrong.isEmpty() then .Ok(app) else .Err(wrong)
+}
+
+/// Whether `text` is an app's identifier: two names or more, each of
+/// letters, digits and `-`, joined by dots.
+fn isBundleId(text: str): bool = {
+	var parts = 0
+	for part in text.split(".") {
+		if part.isEmpty() then return false
+		for byte in part {
+			if !(byte.isAsciiAlphanumeric() || byte == b'-') then return false
+		}
+		parts += 1
+	}
+	return parts >= 2
+}
+
+/// Whether `text` is a version of numbers joined by dots: `17`, `17.2`.
+fn isVersion(text: str): bool = {
+	for part in text.split(".") {
+		if part.isEmpty() then return false
+		for byte in part {
+			if !byte.isDigit() then return false
+		}
+	}
+	return !text.isEmpty()
+}
+
+/// Where a path `@files` names is, written from the package's root `dir`:
+/// a file or a directory below it, which it does not leave.
+fn packageFile(written: str, dir: str): Result<String, (String, String)> = {
+	if written.startsWith("/") then
+		return .Err(
+			(
+				"`\(written)` is a whole path; a package's file is named from its root",
+				"not relative to the root",
+			),
+		)
+	val joined = path::join(dir, written)
+	val .Ok(found) = fs::realPath(joined) else {
+		return .Err(("there is no `\(written)` in the package", "looked for `\(joined)`"))
+	}
+	val root = identity(dir)
+	if !path::isWithin(found, root) || found == root then
+		return .Err(
+			(
+				"`\(written)` is outside the package, which its files may not leave",
+				"outside `\(root)`",
+			),
+		)
+	return .Ok(found)
+}
+
+/// Whether `path`, a file or a directory, is or holds a `.wip` file.
+fn holdsCode(path: str): bool = {
+	if !isDirectory(path) then return path::extension(path) == .Some("wip")
+	val .Ok(entries) = fs::readDir(path) else return false
+	return entries.any((entry) => holdsCode(path::join(path, entry.name)))
+}
+
+/// The files every package of a program names, put beside the program
+/// built into `dir`: the program's own package's, `packages[0]`, at their
+/// own paths, and each dependency's under a directory of its name. Linked
+/// to each package's own where `link` says, and where `dir` is the
+/// program's package's root, so that one edited while the program runs is
+/// the one it reads; copied otherwise, but for a file as it was copied
+/// before.
+pub fn placeFiles(packages: &[Package], dir: str, link: bool): Result<void, String> = {
+	if packages.isEmpty() then return .Ok()
+	val inRoot = identity(dir) == packages[0].identity
+	// The program's own: nothing to do in its root, which holds them.
+	if !inRoot then placed(&packages[0], dir, link)?
+	for i in 1..packages.len() {
+		val package = &packages[i]
+		if package.files.isEmpty() then continue
+		val under = path::join(dir, package.prefix)
+		if isFile(under) then
+			return .Err("the program is `\(under)`, where `\(package.prefix)`'s files go beside it: write it elsewhere, or by another name")
+		placed(&package, under, link || inRoot)?
+	}
+	return .Ok()
+}
+
+/// The files `package` names put in `dir`, at their paths from its root:
+/// linked to its own where `link` says, and copied otherwise.
+fn placed(package: &Package, dir: str, link: bool): Result<void, String> = {
+	for written in package.files {
+		val from = path::join(package.identity, written)
+		val to = path::join(dir, written)
+		val within = path::parent(to)
+		if !within.isEmpty() && fs::makeDirs(within) is .Err(error) then
+			return .Err("cannot make `\(within)`, where `\(written)` goes: \(error)")
+		if !link {
+			copyTree(from, to)?
+			continue
+		}
+		// A link made before, by a build before this one, is kept where it
+		// leads where it should, and made again where it does not.
+		if fs::linkMeta(to) is .Ok(there) {
+			if there.kind != .Link then
+				return .Err("`\(to)` is in the way of a link to `\(from)`: move it, and build again")
+			if fs::realPath(to) == .Ok(String::of(from)) then continue
+			if fs::removeFile(to) is .Err(error) then
+				return .Err("cannot replace the link `\(to)`: \(error)")
+		}
+		if fs::makeLink(from, to) is .Err(error) then
+			return .Err("cannot link `\(to)` to `\(from)`: \(error)")
+	}
+	return .Ok()
+}
+
+/// `from` copied to `to`, a directory with all it holds, over what is there;
+/// a file that holds what it would be given is left as it is.
+fn copyTree(from: str, to: str): Result<void, String> = {
+	if isDirectory(from) {
+		if fs::makeDirs(to) is .Err(error) then return .Err("cannot make `\(to)`: \(error)")
+		val entries = match fs::readDir(from) {
+			.Ok(entries) => entries
+			.Err(error) => return .Err("cannot read `\(from)`: \(error)")
+		}
+		for entry in entries {
+			copyTree(path::join(from, entry.name), path::join(to, entry.name))?
+		}
+		return .Ok()
+	}
+	if fs::readFile(to) is .Ok(there) && fs::readFile(from) is .Ok(here) && there == here then
+		return .Ok()
+	if fs::copy(from, to) is .Err(error) then
+		return .Err("cannot copy `\(from)` to `\(to)`: \(error)")
+	return .Ok()
 }
 
 /// What a `@format(…)` says, over the default style: `width`,
@@ -383,8 +712,34 @@ fn packages(root: str, loaded: &var Loaded, overlay: &Overlay): Vec<Package> = {
 			identity: identity(root),
 			prefix: String(),
 			depends: Vec(),
+			files: match ownManifest {
+				.Some(m) => m.files.clone()
+				.None => Vec()
+			},
+			app: match ownManifest {
+				.Some(m) => m.app.clone()
+				.None => .None
+			},
 		),
 	])
+	// The program's own files beside it may not meet a dependency's, which
+	// go under a directory of the dependency's name.
+	if ownManifest is .Some(m) {
+		for (i, written) in m.files.forwards().enumerate() {
+			val first = written.toStr().split("/").next().unwrapOr("")
+			if !m.depends.any((dependency) => dependency.0 == first) then continue
+			loaded.diagnostics.push(
+				Diagnostic::error(
+					PACKAGE,
+					"`\(written)` is where `\(first)`'s files go",
+					m.fileSpans[i],
+					"a dependency's name",
+				).withNote(
+					"beside the program, each package it depends on has a directory of its name, holding the files it names",
+				).withHelp("put these files in a directory of another name"),
+			)
+		}
+	}
 	var queue: Deque<(i64, Manifest)> = Deque()
 	if ownManifest is .Some(..) {
 		val .Some(m) = move ownManifest else panic("a manifest")
@@ -490,6 +845,7 @@ fn packages(root: str, loaded: &var Loaded, overlay: &Overlay): Vec<Package> = {
 				identity: id,
 				prefix: name.clone(),
 				depends: Vec(),
+				files: theirs.files.clone(),
 			))
 			packages[owner].depends.push((name, index, span))
 			queue.pushBack((index, theirs))
@@ -596,7 +952,10 @@ pub fn importAcrossPackages(
 	for (name, _, _) in packages[owner].depends {
 		if name == first then depends = true
 	}
-	if depends && isDirectory(moduleDir(packages[owner].dir, first)) then
+	// A directory of the dependency's name that holds no code is no module:
+	// the dependency's files put beside a program built in the package's
+	// root are one.
+	if depends && holdsCode(moduleDir(packages[owner].dir, first)) then
 		return .Some(
 			Diagnostic::error(
 				PACKAGE,

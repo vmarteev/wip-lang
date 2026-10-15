@@ -2,6 +2,96 @@
 
 Each version published, newest first.
 
+## 0.7.0 — 2026-10-15
+
+Programs written for 0.6 compile as they did, but where marked
+**breaking**; the compiler's errors say what to write instead.
+
+**The language**
+
+- **A name a pattern binds may be a variable:** `.Ok(var gpu) =>
+  run(&var gpu)`, in a `match`, an `is` test or a `for`, where the part
+  was copied into a `var` on the next line before.
+- **A method may say it empties what it is called on:** `var fn clear()
+  empties`. After the call the receiver borrows nothing it borrowed, so a
+  list of views kept from one line, one frame or one round to the next is
+  cleared and filled again while what it borrowed changes. The library's
+  `clear` of `Vec`, `Deque`, `Map`, `Set` and `Arena`, and `takeAll`,
+  say so.
+- **A type borrows what its fields hold,** read through the types they
+  name: a type argument makes a generic type a view only where a field
+  holds a value of it. A `Handle<str>` is plain data, a struct of handles
+  generic over a GPU borrows nothing, and a body is asked to name in
+  `keeps` only what it keeps.
+- **What `@derive` asks of a type's parameters is what its fields need of
+  them,** worked out through each field's type, not every parameter for
+  every interface. A `Handle<T>` compares, orders, hashes and prints
+  whatever `T` is, so it keys a map of values that do not compare; a
+  struct of a GPU's handles clones and compares whatever the GPU is. A use
+  that fails a derived condition is told which field asks it, and hover on
+  `@derive` shows the conditions.
+- **Constants a build defines:** `@define val EDITOR: bool = true`, set
+  by `wip build --define EDITOR=false`, read as any constant. A branch a
+  constant condition never takes is checked in every build and compiled
+  in none, so a release without the editor carries none of its code.
+  Text compared in a constant folds, as numbers do: `EDITOR && TARGET_OS
+  != "ios"` is known where it is written.
+- **A test file's names are its own:** what a `.test.wip` file declares
+  is seen in that file alone, so two test files of one module may each
+  have a `WIDTH` and a `pixel`, and the module's own code never sees a
+  test's names. A test file sees all its module declares, and may declare
+  none of it again. **Breaking:** a helper one test file uses from another
+  is marked `pub`, which shares it with the module's test files and
+  nothing else; a test file extends only a type a test file declares
+  (E0338); two tests of one module may not share a name.
+- **Breaking:** a `for` over `&var c` or `&c` is refused, with the fix
+  that removes the borrow: a `for` walks a place, writing its elements
+  where it can be written (E0411).
+- A slice read through a reference and given for a type parameter is held
+  as the reference: `Option::Some(bytes)` of a `&[u8]` is an
+  `Option<&[u8]>`.
+
+**Building**
+
+- **iOS:** `wip build`, `wip run` and `wip test` take `--target ios-arm64`
+  and `--target ios-arm64-simulator` from a Mac with Xcode.
+  `@target(os = "ios")` and `TARGET_OS == "ios"` say iOS's code. A package
+  that says `@app(id = …, name = …)` is built into an app, signed, and run
+  on the device or on a simulator of its kind.
+- **The files a program reads, beside it:** a package names them in its
+  `package.wip`, `@files("levels")`, and every build puts them beside the
+  program; a library's go under a directory of its name, so a program
+  using the engine finds `engine/shaders/…` there. A package's code finds
+  its own with `package::besideProgram(path)`. **Breaking:** `@files` may
+  not name a `.wip` file, and a literal path given to `besideProgram` must
+  be one it names, or below one.
+- **Release builds in parts:** a release build is optimised in parts, on
+  every core, each part with a copy of what it calls from the others, and
+  runs as fast as one optimised whole; the linker strips what every call
+  inlined. A debug build of the compiler takes 2.0 seconds where it took
+  3.3, and a release build a quarter less.
+
+**Errors**
+
+- A stale borrow (E0436) names the word a signature could have said —
+  `from` on a result, `empties` on a method — and offers it.
+- A borrow left out of a generic call is said to be left out, rather than
+  its type parameter not inferable.
+- A field refused for what it holds is said once, not again where a value
+  of its type is built.
+
+**The library**
+
+- `fs::readBytes`, a whole file as bytes.
+- `Handle` and the arenas derive what they implement.
+
+**Tools**
+
+- **`wip fmt`** keeps a variant written alone under a statement on its own
+  line.
+- **The editor** offers a test file's names in it, and none in its
+  module's own files.
+
 ## 0.6.0 — 2026-10-13
 
 Programs written for 0.5 may need changes where marked **breaking**; the

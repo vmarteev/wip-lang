@@ -155,6 +155,54 @@ fn checkBody(
 	body: &Body,
 	implements: Option<FnId>,
 ): (Vec<Diagnostic>, Vec<ExprId>) = {
+	val checked = checkBodyWith(
+		&program,
+		&interner,
+		&signatures,
+		&cHolders,
+		&var lent,
+		id,
+		&body,
+		implements,
+		Suppose(),
+	)
+	return (checked.diagnostics, checked.given)
+}
+
+/// What a check of a body supposes that is not so, to see what saying it
+/// would change: what a hint to a stale borrow asks before it offers a word.
+@derive(Clone)
+struct Suppose {
+	/// The body's result is collected rather than held to its signature:
+	/// what it answers from, for the `from` it could say.
+	answers: bool = false
+	/// This function says `empties`.
+	empties: Option<FnId> = .None
+	/// Hints are worked out, which a check that supposes does not do.
+	hints: bool = true
+}
+
+/// What a check of a body found: its diagnostics, the places it uses as
+/// values that are moved there, and, where it collects them, what its
+/// result is made of.
+struct BodyChecked {
+	diagnostics: Vec<Diagnostic>
+	given: Vec<ExprId>
+	answered: SortedSet<Path>
+}
+
+/// `checkBody`, supposing what `suppose` says.
+fn checkBodyWith(
+	program: &Program,
+	interner: &Interner,
+	signatures: &[Vec<Lends>],
+	cHolders: &CHolders,
+	lent: &var Map<(FnId, Ty), Vec<Lends>>,
+	id: FnId,
+	body: &Body,
+	implements: Option<FnId>,
+	suppose: Suppose,
+): BodyChecked = {
 	val def = &program.fns[id]
 	var lends = signatures[id.index()].clone()
 	if implements is .Some(declared) {
@@ -206,11 +254,23 @@ fn checkBody(
 		given: Set(),
 		givenAt: Map(),
 		lent: mem::replace(&var lent, Map()),
+		emptying: if (def.empties || suppose.empties == .Some(id)) && !body.params.isEmpty() then
+			.Some(body.params[0])
+		else .None,
+		receiverHolds: Map(),
+		id: id,
+		suppose: suppose.clone(),
+		answered: SortedSet(),
 	)
 	var state = State()
+	if checker.emptying is .Some(receiver) {
+		checker.receiverHolds = checker.holders([receiver])
+		checker.startEmptying(&var state)
+	}
 	// Where `from` says what the result borrows, what each parameter
-	// borrows is a root of its own, so the body is held to it.
-	if def.lendsFrom.isSome() {
+	// borrows is a root of its own, so the body is held to it; and so it is
+	// where the result is collected, to say which.
+	if def.lendsFrom.isSome() || suppose.answers {
 		for param in body.params {
 			val ty = body.locals[param].ty
 			if program.holdsView(ty) || cHolders.holds(&program, ty) {
@@ -228,6 +288,7 @@ fn checkBody(
 		val span = body.exprs[value].span
 		val end = Span::new(lo: span.hi.saturatingSub(1), hi: span.hi)
 		checker.checkVarParams(end, &state)
+		checker.checkEmptied(end, &state)
 	}
 	checker.checkGenericKeeps()
 	checker.checkPackedLends()
@@ -237,7 +298,7 @@ fn checkBody(
 	for id in checker.given {
 		given.push(id)
 	}
-	return (checker.diagnostics, given)
+	return BodyChecked(diagnostics: checker.diagnostics, given: given, answered: checker.answered)
 }
 
 /// The expression that answers a function's result: the value of its
@@ -428,6 +489,9 @@ struct State {
 	/// not read since: a copy that nothing reads the variable after could
 	/// have been a move.
 	copied: SortedMap<LocalId, Vec<Span>> = SortedMap()
+	/// In a method that says `empties`, the places of the receiver that may
+	/// still hold what they held when the call began.
+	filled: SortedSet<Path> = SortedSet()
 }
 
 /// What a place expression refers to, as far as ownership is concerned.
@@ -531,6 +595,15 @@ view struct Checker {
 	/// refers to, by the callee and that value's type: a signature lends the
 	/// same at every call.
 	lent: Map<(FnId, Ty), Vec<Lends>>
+	/// The receiver, where the method says `empties`; and the locals that
+	/// may hold what it holds.
+	emptying: Option<LocalId>
+	receiverHolds: Map<LocalId, Set<LocalId>>
+	/// The function whose body this is, and what its check supposes.
+	id: FnId
+	suppose: Suppose
+	/// Where the check collects them, the parts of what the body answers.
+	answered: SortedSet<Path>
 }
 
 /// A place that must stay as it is for a while: borrowed by a reference
@@ -633,8 +706,7 @@ extend Checker {
 		.Local(local) => .Some(.Path(Path(local: local, projs: Vec())))
 		.Field(base, index) => .Some(
 			match self.place(base) {
-				.Some(.Path(path)) => {
-					var further = path
+				.Some(.Path(var further)) => {
 					further.projs.push(.Field(index))
 					Place::Path(further)
 				}
@@ -657,8 +729,7 @@ extend Checker {
 					..,
 				) => Place::ThroughRef(inner)
 				_ => match self.place(inner) {
-					.Some(.Path(path)) => {
-						var further = path
+					.Some(.Path(var further)) => {
 						further.projs.push(.Deref)
 						Place::Path(further)
 					}

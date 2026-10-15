@@ -95,7 +95,7 @@ extend Lowerer {
 	/// once every type is named.
 	var fn resolveImports(): FileImports = {
 		val file = self.ast
-		var imports = FileImports()
+		var imports = FileImports(names: self.imports.names)
 		var firstSeen: Map<Symbol, Span> = Map()
 		for item in file.items {
 			val .Import(decl) = item else continue
@@ -256,13 +256,15 @@ extend Lowerer {
 			ty = .Some(("type alias", alias.isPub))
 		if ty.isNone() && self.modules[module].opaques.get(&name.sym) is .Some(id) then
 			ty = .Some(("C type", self.program.opaques[id].isPub))
-		val func = declaredFn(&modules[module].files, name.sym)
+		// Another module's own files: its tests' items are its tests' alone.
+		val (itsOwn, _) = modules[module].seenFiles(.None)
+		val func = declaredFn(&itsOwn, name.sym)
 		// A top-level `val` is an item too.
-		val konst: Option<bool> = match declaredVal(&modules[module].files, name.sym) {
+		val konst: Option<bool> = match declaredVal(&itsOwn, name.sym) {
 			.Some((_, isPub)) => .Some(isPub)
 			.None => .None
 		}
-		val global: Option<bool> = match declaredGlobal(&modules[module].files, name.sym) {
+		val global: Option<bool> = match declaredGlobal(&itsOwn, name.sym) {
 			.Some((_, isPub)) => .Some(isPub)
 			.None => .None
 		}
@@ -305,7 +307,8 @@ extend Lowerer {
 						if self.program.interfaces[interfaces.valueAt(i).0].isPub then
 							candidates.push(self.text(interfaces.keyAt(i).clone()))
 					}
-					for file in modules[module].files {
+					val (itsOwn, _) = modules[module].seenFiles(.None)
+					for file in itsOwn {
 						for item in file.items {
 							match item {
 								.Fn(f) if f.isPub => candidates.push(self.text(f.sig.name.sym))
@@ -333,14 +336,17 @@ extend Lowerer {
 		// The module's own names come first, so the import would never be
 		// used: a type or an interface, a function, a constant.
 		var declared = self.declaredAt(bound.sym)
-		if declared.isNone() &&
-			declaredFn(&modules[self.current].files, bound.sym) is .Some((found, _, _)) {
+		// Those of the files this one sees, and the `pub` ones of the other
+		// test files, where it is one.
+		val (seen, others) = modules[self.current].seenFiles(self.modules[self.names].test)
+		if declared.isNone() && declaredFn(&seen, bound.sym) is .Some((found, _, _)) then
 			declared = .Some(found.span)
-		}
-		if declared.isNone() &&
-			declaredVal(&modules[self.current].files, bound.sym) is .Some((found, _)) {
+		if declared.isNone() && declaredVal(&seen, bound.sym) is .Some((found, _)) then
 			declared = .Some(found.span)
-		}
+		if declared.isNone() && declaredFn(&others, bound.sym) is .Some((found, true, _)) then
+			declared = .Some(found.span)
+		if declared.isNone() && declaredVal(&others, bound.sym) is .Some((found, true)) then
+			declared = .Some(found.span)
 		if declared is .Some(declared) {
 			val boundText = String::of(self.text(bound.sym))
 			self.report(
@@ -364,9 +370,9 @@ extend Lowerer {
 	/// used. Nothing if nothing was imported under the name, or the current
 	/// module declares the name itself.
 	fn imported(name: ast::Name): Option<ImportedItem> = {
-		if self.types().contains(&name.sym) ||
-			self.fns().contains(&name.sym) ||
-			self.consts().contains(&name.sym) {
+		if self.typeHere(name.sym).isSome() ||
+			self.fnHere(name.sym).isSome() ||
+			self.constHere(name.sym).isSome() {
 			return .None
 		}
 		return match self.imports.items.get(&name.sym) {
@@ -381,7 +387,7 @@ extend Lowerer {
 
 	/// Whether an item of `module` may be named here: a module sees all of
 	/// its own declarations, and only what other modules export.
-	fn visible(module: i64, isPub: bool): bool = module == self.current || isPub
+	fn visible(module: i64, isPub: bool): bool = self.moduleOf(module) == self.current || isPub
 
 	/// Reports an item that another module keeps to itself.
 	var fn privateItem(module: i64, what: str, name: ast::Name) = {

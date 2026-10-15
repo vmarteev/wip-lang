@@ -54,7 +54,8 @@ output is byte for byte the C library's.
 
 What it does not have yet:
 
-- **Targets** beyond Apple arm64 and Linux on arm64 and x86-64. There is
+- **Targets** beyond Apple arm64 — a Mac, and from a Mac an iPad, an
+  iPhone and the iOS simulator — and Linux on arm64 and x86-64. There is
   no Windows.
 - **Packages fetched from anywhere:** a program depends on another by its
   path, and nothing is downloaded.
@@ -63,7 +64,8 @@ What it does not have yet:
 
 ## Installing
 
-Wip runs on macOS on Apple silicon and on Linux on arm64 and x86-64. Every
+Wip runs on macOS on Apple silicon and on Linux on arm64 and x86-64, and
+builds from a Mac for iOS, where Xcode is installed. Every
 program it builds goes through a `clang` 15 or newer, which it looks for
 as `clang`, or as `WIP_CLANG` names it, and is linked by the system's C
 compiler, `cc`. On a Mac, the Command Line Tools have both

@@ -97,7 +97,7 @@ extend Ir {
 }
 
 /// The program as LLVM IR, for a release build where `optimize` says so and
-/// for a debug build where it does not.
+/// for a debug build where it does not, calling C by the rules of `arch`.
 pub fn compile(
 	program: &Program,
 	interner: &Interner,
@@ -105,8 +105,9 @@ pub fn compile(
 	locations: &(at: Span) => (String, u32, u32),
 	optimize: bool,
 	threads: i64,
+	arch: Option<Arch>,
 ): Ir = {
-	var llvm = Llvm::new(&program, &interner, locations, optimize)
+	var llvm = Llvm::new(&program, &interner, locations, optimize, arch)
 	for id in program.fns.ids() {
 		if program.fns[id].exportsC && program.isCompiled(id) then llvm.symbol(id)
 	}
@@ -158,8 +159,7 @@ fn bodyOf(
 	optimize: bool,
 ): Option<Body> = match waiting {
 	.Fn(id) => {
-		val .Some(lowered) = functionBody(program, interner, id) else return .None
-		var body = lowered
+		var .Some(body) = functionBody(program, interner, id) else return .None
 		// A release build's MIR splits its scalars out; a debug build's
 		// keeps each variable whole, for the debugger.
 		if optimize then scalars(program, &var body)
@@ -295,6 +295,9 @@ view struct Llvm {
 	/// them; a function's is nothing where it has no body.
 	madeFns: Map<FnId, Option<Body>>
 	madeDrops: Map<(Ty, bool), Body>
+	/// Each function's signature, worked out once: every call of it, and its
+	/// definition, asks for it.
+	signatures: Map<FnId, Sig>
 	/// The runtime's functions, which C's names reach: `wip_alloc`,
 	/// `wip_panic_index` and the rest.
 	runtimeFns: Map<String, FnId>
@@ -306,6 +309,7 @@ extend Llvm {
 		interner: &Interner,
 		locations: &(at: Span) => (String, u32, u32),
 		optimize: bool,
+		arch: Option<Arch>,
 	): Llvm = {
 		var runtime: Map<String, FnId> = Map()
 		for id in program.fns.ids() {
@@ -321,8 +325,8 @@ extend Llvm {
 			interner: &interner,
 			locations: locations,
 			layouts: Layouts::new(),
-			shimmed: shimmed(&program, Arch::host()),
-			arch: Arch::host(),
+			shimmed: shimmed(&program, arch),
+			arch: arch,
 			noalias: noalias,
 			optimize: optimize,
 			cCalls: Map(),
@@ -347,6 +351,7 @@ extend Llvm {
 			pendingDrops: Vec(),
 			madeFns: Map(),
 			madeDrops: Map(),
+			signatures: Map(),
 			runtimeFns: runtime,
 		)
 		llvm.global("@wip_runtime_words")
@@ -421,7 +426,7 @@ extend Llvm {
 			flags: self.debug.flags,
 			nodes: self.debug.nodes,
 		)
-		val modules = if self.optimize then Vec::of([module]) else split(module, &self.files)
+		val modules = split(module, &self.files, self.optimize)
 		return Ir(modules: modules, files: self.debug.paths)
 	}
 
@@ -481,12 +486,6 @@ extend Llvm {
 		return file
 	}
 
-	/// The linkage of a function the program keeps to itself: kept to the
-	/// module in a release build, so that LLVM may change or drop it, and
-	/// hidden in a debug build, where nothing is changed and an object of its
-	/// own may name it.
-	fn ownLinkage(): Linkage = if self.optimize then .Internal else .Hidden
-
 	fn kind(ty: Ty): TyKind = self.program.types.kind(ty)
 
 	var fn layout(ty: Ty): Layout = self.layouts.of(self.program, ty)
@@ -534,8 +533,7 @@ extend Llvm {
 	/// reads it as `malloc`'s promise of memory nothing else reaches, which a
 	/// projection's `&var` into its argument is not.
 	fn result(ty: Ty): Option<Slot> = {
-		val .Some(found) = self.slot(ty) else return .None
-		var slot = found
+		var .Some(slot) = self.slot(ty) else return .None
 		val noalias = Attr::NoAlias
 		if slot.attrs.contains(&noalias) then slot.attrs = Vec()
 		return .Some(slot)
@@ -664,7 +662,15 @@ extend Llvm {
 		.None => Vec()
 	}
 
+	/// The signature of the function `id`, worked out on its first use.
 	var fn signature(id: FnId): Sig = {
+		if self.signatures.get(&id) is .Some(known) then return known.clone()
+		val sig = self.signatureOf(id)
+		self.signatures.put(id, sig.clone())
+		return sig
+	}
+
+	var fn signatureOf(id: FnId): Sig = {
 		if self.cCall(id) is .Some(cCall) then return self.cSignature(id, &cCall)
 		val def = &self.program.fns[id]
 		var params: Vec<Ty> = Vec()
@@ -1075,8 +1081,7 @@ extend Llvm {
 	var fn defineFunction(id: FnId) = {
 		val program = self.program
 		val def = &program.fns[id]
-		val .Some(.Some(lowered)) = self.madeFns.remove(&id) else return
-		var body = lowered
+		var .Some(.Some(body)) = self.madeFns.remove(&id) else return
 		// For finding what MIR reads before it writes.
 		if io::env("WIP_MIR_UNWRITTEN").isSome() {
 			for (local, block) in readsBeforeWrites(&body) {
@@ -1090,7 +1095,7 @@ extend Llvm {
 		}
 		var sig = self.signature(id)
 		var symbol = self.symbol(id)
-		var linkage = if def.exportsC then Linkage::External else self.ownLinkage()
+		var linkage = if def.exportsC then Linkage::External else Linkage::Hidden
 		val name = program.fnName(id, self.interner)
 		// C's side of a function C passes a struct by value to, or is answered
 		// one by, is a function of its own, and the function is Wip's as any
@@ -1106,7 +1111,7 @@ extend Llvm {
 			}
 			sig = self.signatureWith(&params, def.ret, true, false)
 			symbol = bodySymbol
-			linkage = self.ownLinkage()
+			linkage = .Hidden
 		}
 		val at = def.span
 		val subprogram = self.debug.subprogram(name, .Some(at))
@@ -1133,7 +1138,7 @@ extend Llvm {
 		val sig = Sig(params: [Slot::of(.Ptr)], ret: .None, sret: false, parts: .None)
 		val name = "drop<\(self.program.tyName(ty, self.interner))>"
 		val subprogram = self.debug.subprogram(name, .None)
-		val linkage = self.ownLinkage()
+		val linkage = Linkage::Hidden
 		val function = defineFn(
 			&var self,
 			&body,

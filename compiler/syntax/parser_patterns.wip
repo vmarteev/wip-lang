@@ -103,6 +103,11 @@ extend Parser {
 				self.bump()
 				PatternKind::Wildcard
 			}
+			// `var name`: a variable of its own.
+			.Var => match self.varName() {
+				.Some(name) => PatternKind::Binding(symbol: name.sym, isVar: true)
+				.None => .Error
+			}
 			// `.Variant`, whose enum is the type being matched.
 			.Dot => {
 				self.bump()
@@ -135,7 +140,7 @@ extend Parser {
 				}
 				_ => {
 					self.bump()
-					PatternKind::Binding(symbol: symbol)
+					PatternKind::Binding(symbol: symbol, isVar: false)
 				}
 			}
 			// `(x, y)`: a tuple taken apart by position, or a struct by its
@@ -155,6 +160,58 @@ extend Parser {
 			}
 		}
 		return Pattern(kind: kind, span: start.to(self.prevSpan()))
+	}
+
+	/// The name after `var` in a pattern, at the `var`: only a name may
+	/// follow it, since only a name is a variable.
+	var fn varName(): Option<Name> = {
+		self.bump()
+		if self.peek() is .Ident(symbol) && self.nth(1) !is .LParen | .ColonColon then
+			return .Some(Name(sym: symbol, span: self.bump()))
+		val diagnostic = self.expected("a name after `var`").withNote(
+			"`var` before a name in a pattern makes it a variable; a pattern taken apart is `var` where it is declared, `var (a, b) = value`",
+		)
+		self.report(diagnostic)
+		if self.peek() is .Ident(..) then self.bump()
+		return .None
+	}
+
+	/// Reports each `var` before a name in a `var` pattern, whose names are
+	/// all variables already, with the fix that takes it out.
+	var fn varInVarPattern(pattern: &Pattern) = match pattern.kind {
+		.Binding(isVar: true, ..) => self.varSaidTwice(pattern.span)
+		.Variant(binders: .Some(binders), ..) | .Parens(binders, ..) => {
+			for b in binders {
+				if b.isVar then self.varSaidTwice(b.span)
+				if b.pattern is .Some(inner) then self.varInVarPattern(&inner)
+			}
+		}
+		.Any(alternatives) => {
+			for alternative in alternatives {
+				self.varInVarPattern(&alternative)
+			}
+		}
+		.Slice(elements) => {
+			for element in elements {
+				if element is .Pattern(inner) then self.varInVarPattern(&inner)
+			}
+		}
+		_ => {}
+	}
+
+	var fn varSaidTwice(span: Span): void = {
+		// `var` and the space after it, up to the name.
+		val written = self.text(span)
+		val end = written.len() - written[3..].trimStart().len()
+		val keyword = Span::new(span.lo, span.lo + 3)
+		self.report(
+			Diagnostic::error(
+				VAR_IN_VAR_PATTERN,
+				"every name of a `var` pattern is a variable already",
+				keyword,
+				"said again here",
+			).withFix("take it out", [Edit::replace(Span::new(span.lo, span.lo + end as u32), "")]),
+		)
 	}
 
 	/// `[a, b]`, `[first, ..rest]`, `[.., last]`, at the `[`. `..` with a name
@@ -384,6 +441,17 @@ extend Parser {
 				field: field,
 				pattern: pattern,
 				span: field.span.to(self.prevSpan()),
+			)))
+		}
+		// `var field`: the field, bound to a variable of its own.
+		.Var => {
+			val start = self.span()
+			val field = self.varName()?
+			return .Some(.Field(binder: Binder(
+				field: field,
+				pattern: .None,
+				span: start.to(self.prevSpan()),
+				isVar: true,
 			)))
 		}
 		// A pattern where a field name could stand: the one field the

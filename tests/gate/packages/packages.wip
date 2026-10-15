@@ -4,7 +4,8 @@
 
 import std::fs
 import std::path
-import check::{Checked, Gate, across, isFile, read, write, wrong}
+import std::process::{Command}
+import check::{Checked, Gate, across, isFile, read, run, write, wrong}
 
 /// What is checked, each by what it shows.
 val ITEMS = [
@@ -24,6 +25,11 @@ val ITEMS = [
 	"standard input is formatted as its package says",
 	"a file that says so is left as written",
 	"a format it does not know is refused",
+	"the files a package names are beside its program",
+	"files a package may not name are refused",
+	"what an app may say",
+	"a library's files are beside every program that uses it",
+	"files a library's program may not take are refused",
 ]
 
 pub fn check(gate: &Gate): Checked = {
@@ -80,6 +86,26 @@ fn one(gate: &Gate, index: i64, root: str): Option<String> = match index {
 	15 => refusedFor(gate, root, "@format(indent = \"both\")\npackage bad\n", "fn main() = {}\n", [
 		"neither `\"tabs\"` nor `\"spaces\"`",
 	])
+	16 => filesBesideTheProgram(gate, root)
+	17 => refusedFor(gate, root, "@files(\"../game\", \"/etc\", \"nothere\", 3)\n@files(\"main.wip\")\npackage bad\n", "fn main() = {}\n", [
+		"`../game` is outside the package",
+		"`/etc` is a whole path",
+		"there is no `nothere` in the package",
+		"`@files` takes paths, each a string",
+		"a package names its files once",
+	])
+	18 => refusedFor(gate, root, "@app(id = \"game\", devices = \"tv\", orientation = \"sideways\", icon = \"main.wip\", minimum = \"seventeen\", colour = \"red\", \"loose\")\n@app(name = \"No id\")\npackage bad\n", "fn main() = {}\n", [
+		"`game` is not an app's identifier",
+		"`devices` is `ipad`, `iphone` or `both`",
+		"`orientation` is `landscape`, `portrait` or `any`",
+		"an app's icon is a PNG",
+		"`minimum` is an iOS version",
+		"`@app` knows no `colour`",
+		"`@app` takes `key = \"value\"`",
+		"a package is one app",
+	])
+	19 => libraryFiles(gate, root)
+	20 => libraryFilesRefused(gate, root)
 	_ => .Some("there is no such item")
 }
 
@@ -345,5 +371,165 @@ fn leftAsWritten(gate: &Gate, root: str): Option<String> = {
 	val unparsed = "// wip fmt: off\nfn main( = {\n"
 	val echoed = gate.wipReading(unparsed, root, ["fmt", "-", "--stdin-path", "main.wip"])
 	if !echoed.exit.success() || echoed.stdout != unparsed then return wrong("`wip fmt -`", &echoed)
+	return .None
+}
+
+/// What `@files` names is beside the program wherever it is built: copied
+/// beside it by `wip build -o`, again where it changed, and found from
+/// another directory; linked beside it by `wip run` and `wip test`, so
+/// that what the program reads is the package's own; and nothing copied
+/// where the program is built into the package.
+fn filesBesideTheProgram(gate: &Gate, root: str): Option<String> = {
+	write(root, "game/package.wip", "@files(\"levels\", \"help.txt\")\npackage game\n")
+	write(root, "game/levels/first.txt", "first\n")
+	write(root, "game/help.txt", "help\n")
+	write(
+		root,
+		"game/main.wip",
+		"import std::fs\nimport std::io\nimport std::process\n\nfn main() = io::print(fs::readFile(process::besideProgram(\"levels/first.txt\")).unwrap())\n",
+	)
+	write(
+		root,
+		"game/main.test.wip",
+		"import std::fs\nimport std::process\n\n@test\nfn levelsAreLinkedBesideTheTests() = assert(fs::linkMeta(process::besideProgram(\"levels\")) is .Ok(about) && about.kind == .Link)\n",
+	)
+	val ran = gate.wip(root, ["run", "game"])
+	if ran.stdout != "first\n" then return wrong("`wip run game`", &ran)
+	val built = gate.wip(root, ["build", "game", "-o", "out/game"])
+	if !built.exit.success() ||
+		!isFile(root, "out/levels/first.txt") ||
+		!isFile(root, "out/help.txt") {
+		return wrong("`wip build game -o out/game`", &built)
+	}
+	val elsewhere = run(
+		Command::of(path::join(root, "out/game")).directory(path::join(root, "game/levels")),
+	)
+	if elsewhere.stdout != "first\n" then return wrong("`out/game`, run from elsewhere", &elsewhere)
+	write(root, "game/levels/first.txt", "second\n")
+	val again = gate.wip(root, ["build", "game", "-o", "out/game"])
+	if !again.exit.success() || read(root, "out/levels/first.txt") != "second\n" then
+		return wrong("`wip build game -o out/game`, after a level changed", &again)
+	val tested = gate.wip(root, ["test", "game"])
+	if !tested.stdout.contains("levelsAreLinkedBesideTheTests ... ok") then
+		return wrong("`wip test game`", &tested)
+	if read(root, "game/levels/first.txt") != "second\n" then
+		return .Some("the package's own level is gone after `wip run` and `wip test`")
+	val inPlace = gate.wip(root, ["build", "game"])
+	if !inPlace.exit.success() || !isFile(root, "game/game") then
+		return wrong("`wip build game`", &inPlace)
+	return .None
+}
+
+/// A library's `@files` are put beside every program that uses it, under a
+/// directory of its name, and its code finds them with
+/// `package::besideProgram`, which knows which it is: through `ui`, which
+/// depends on `engine` too, as `engine` is placed once, beside `ui`;
+/// copied by `wip build -o`, linked by `wip run`, by `wip test` and where a
+/// program is built in its root, which builds again; and found by the
+/// library's own tests, where it is the program.
+fn libraryFiles(gate: &Gate, root: str): Option<String> = {
+	write(root, "engine/package.wip", "@files(\"shaders/metal\")\npackage engine\n")
+	write(root, "engine/shaders/metal/lit.txt", "lit\n")
+	// The directory above the one it names, which is beside the program
+	// where that is.
+	write(
+		root,
+		"engine/engine.wip",
+		"import std::fs\nimport std::path\n\npub fn shader(): String = fs::readFile(path::join(package::besideProgram(\"shaders\"), \"metal/lit.txt\")).unwrapOr(String::of(\"missing\\n\"))\n",
+	)
+	write(
+		root,
+		"engine/engine.test.wip",
+		"@test\nfn theShaderIsFoundInTheLibrarysOwnTests() = assert(shader() == \"lit\\n\")\n",
+	)
+	write(
+		root,
+		"ui/package.wip",
+		"@depends(\"engine\", path = \"../engine\")\n@files(\"fonts\")\npackage ui\n",
+	)
+	write(root, "ui/fonts/small.txt", "small\n")
+	write(
+		root,
+		"ui/ui.wip",
+		"import std::fs\n\npub fn font(): String = fs::readFile(package::besideProgram(\"fonts/small.txt\")).unwrapOr(String::of(\"missing\\n\"))\n",
+	)
+	write(
+		root,
+		"game/package.wip",
+		"@depends(\"engine\", path = \"../engine\")\n@depends(\"ui\", path = \"../ui\")\n@files(\"levels\")\npackage game\n",
+	)
+	write(root, "game/levels/one.txt", "one\n")
+	write(
+		root,
+		"game/main.wip",
+		"import std::fs\nimport std::io\nimport engine\nimport ui\n\nfn main() = io::print(\"\\(engine::shader())\\(ui::font())\\(fs::readFile(package::besideProgram(\"levels/one.txt\")).unwrap())\")\n",
+	)
+	val all = "lit\nsmall\none\n"
+	val ran = gate.wip(root, ["run", "game"])
+	if ran.stdout != all then return wrong("`wip run game`", &ran)
+	val built = gate.wip(root, ["build", "game", "-o", "out/game"])
+	if !built.exit.success() ||
+		!isFile(root, "out/engine/shaders/metal/lit.txt") ||
+		!isFile(root, "out/ui/fonts/small.txt") ||
+		!isFile(root, "out/levels/one.txt") ||
+		isFile(root, "out/ui/engine/shaders/metal/lit.txt") {
+		return wrong("`wip build game -o out/game`", &built)
+	}
+	val elsewhere = run(Command::of(path::join(root, "out/game")).directory(root))
+	if elsewhere.stdout != all then return wrong("`out/game`, run from elsewhere", &elsewhere)
+	for time in ["first", "second"] {
+		val inRoot = gate.wip(root, ["build", "game"])
+		if !inRoot.exit.success() then return wrong("`wip build game`, the \(time) time", &inRoot)
+		if !(fs::linkMeta(path::join(root, "game/engine/shaders/metal")) is .Ok(about) &&
+			about.kind == .Link) {
+			return .Some("the engine's shaders are not linked beside the program built in its root")
+		}
+	}
+	val there = run(Command::of(path::join(root, "game/game")).directory(root))
+	if there.stdout != all then return wrong("`game/game`, built in its root", &there)
+	val tested = gate.wip(root, ["test", "engine"])
+	if !tested.stdout.contains("theShaderIsFoundInTheLibrarysOwnTests ... ok") then
+		return wrong("`wip test engine`", &tested)
+	return .None
+}
+
+/// What a library's files make the program refuse: a `.wip` file named, a
+/// path of the program's own begun as a dependency's name, a literal path
+/// given to `package::besideProgram` that `@files` does not name, and the
+/// program's file where a dependency's files go.
+fn libraryFilesRefused(gate: &Gate, root: str): Option<String> = {
+	write(root, "engine/package.wip", "@files(\"shaders\")\npackage engine\n")
+	write(root, "engine/shaders/lit.txt", "lit\n")
+	write(
+		root,
+		"engine/engine.wip",
+		"pub fn shader(): String = package::besideProgram(\"meshes/cube.obj\")\n",
+	)
+	write(
+		root,
+		"bad/package.wip",
+		"@depends(\"engine\", path = \"../engine\")\n@files(\"engine\", \"main.wip\")\npackage bad\n",
+	)
+	write(root, "bad/engine/notes.txt", "mine\n")
+	write(root, "bad/main.wip", "import engine\n\nfn main() = {\n    engine::shader()\n}\n")
+	val checked = gate.wip(root, ["check", "--color", "never", "bad/main.wip"])
+	for said in [
+		"`engine` is where `engine`'s files go",
+		"`main.wip` holds Wip's code",
+		"`meshes/cube.obj` is not a file the package names",
+	] {
+		if checked.exit.success() || !checked.stderr.contains(said) then
+			return wrong("it does not say \"\(said)\"", &checked)
+	}
+	write(
+		root,
+		"engine/engine.wip",
+		"pub fn shader(): String = package::besideProgram(\"shaders/lit.txt\")\n",
+	)
+	write(root, "good/package.wip", "@depends(\"engine\", path = \"../engine\")\npackage good\n")
+	write(root, "good/main.wip", "import engine\n\nfn main() = {\n    engine::shader()\n}\n")
+	val named = gate.wip(root, ["build", "good", "-o", "out/engine"])
+	if named.exit.success() || !named.stderr.contains("where `engine`'s files go beside it") then
+		return wrong("`wip build good -o out/engine`", &named)
 	return .None
 }

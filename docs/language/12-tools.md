@@ -52,6 +52,21 @@ wip test engine                  # each package's tests, in its own root
 wip test game
 ```
 
+What a program reads while it runs — levels, sounds, a help text, a
+library's shaders — each package names with `@files` ([page
+2](02-modules.md)), and every build puts beside the program: the
+program's own package's at the same paths from it as from the package's
+root, and each dependency's under a directory of its name, once, however
+far down it is depended on. `wip build game` writes the program into the
+package, where its own files are already, and links its dependencies'
+beside it; `wip build game -o out/game` copies them all into `out/`,
+again where one has changed; and `wip run` and `wip test`, which build
+the program in a directory of their own, link them there, so that a file
+edited while the program runs is the one it reads. Each package's code
+finds its own with `package::besideProgram("levels")`, wherever the
+program is run from, and a directory `-o` wrote is all a program handed to
+someone needs.
+
 The standard library is beside the compiler, so nothing is fetched. There
 is no package manager and no build file: the
 directories are the build, and a `package.wip` only names a package and
@@ -61,7 +76,7 @@ says which others it uses.
 
 | Command | Does |
 |---|---|
-| `wip run file.wip [args]` | compiles to a temporary place and runs it, passing the arguments on and exiting with its code |
+| `wip run file.wip [args]` | compiles to a temporary place and runs it, passing the arguments on and exiting with its code; `--target` runs it on iOS ([below](#ios)) |
 | `wip build file.wip` | writes an executable, named after the file unless `-o` says otherwise |
 | `wip build dir` | builds the package whose root is `dir`, named as the package names itself, into that root |
 | `wip test file.wip [filter]` | compiles the program with its `.test.wip` files and runs the `@test` functions; given a package, only that package's |
@@ -77,17 +92,62 @@ says which others it uses.
 | `wip parse file.wip` | prints the syntax tree of one file |
 | `wip lex file.wip` | prints the tokens of one file |
 
-A program is built for the machine `wip` runs on, and may be checked for any
-target the standard library is written for: `wip check --target linux` reads
-the items under `@target(os = "linux")` and the `.linux.wip` files ([page
-2](02-modules.md)) on a Mac, and checks them as Linux would. The names are
-`macos-arm64`, `macos-x86_64`, `linux-arm64` and `linux-x86_64`; `macos` and
-`linux` alone are on this machine's processor; `all` is the four, and
-`--target` may be given more than once. A mistake several targets find is
-said once, and one that not every target finds says which did. What a check
-cannot see is what only the target's machine knows — how its C lays a struct
-out, which symbols its libraries have — and building for another target is
-not yet there.
+`build`, `run`, `test`, `check` and `mir` take `--define NAME=VALUE`, as
+many as are given, which sets a constant that says `@define` ([page
+2](02-modules.md#constants-a-build-defines)); `--time` says them.
+
+A program is built for the machine `wip` runs on, or from a Mac for iOS
+([below](#ios)), and may be checked for any target the standard library is
+written for: `wip check --target linux` reads the items under
+`@target(os = "linux")` and the `.linux.wip` files ([page 2](02-modules.md))
+on a Mac, and checks them as Linux would. The names are `macos-arm64`,
+`macos-x86_64`, `linux-arm64`, `linux-x86_64`, `ios-arm64` and
+`ios-arm64-simulator`; `macos` and `linux` alone are on this machine's
+processor, and `ios` is the device; `all` is every one but the simulator,
+which answers as the device does, and `--target` may be given more than
+once. A mistake several targets find is said once, and one that not every
+target finds says which did. What a check cannot see is what only the
+target's machine knows — how its C lays a struct out, which symbols its
+libraries have.
+
+### iOS
+
+From a Mac with Xcode, `wip build`, `wip run` and `wip test` build for an
+iPad or an iPhone, `--target ios-arm64`, and for the simulator on a Mac
+with Apple silicon, `--target ios-arm64-simulator`:
+
+```sh
+wip run --target ios-arm64-simulator game        # in the simulator
+wip run --target ios-arm64 game                  # on the iPad on the cable
+wip build --target ios-arm64 --release game      # game/game.app
+wip test --target ios-arm64-simulator game       # its tests, on iOS
+```
+
+- **What is built for iOS** is Xcode's SDK for it, with the triple and
+  the least version the program runs on, which is iOS 17 unless the app
+  says a later one; for the processor of the oldest device that version
+  runs on, the A10, or the Mac's, for the simulator. The program, its C
+  and its libraries are built for it; a library linked must have been
+  built for iOS too.
+- **A package that says `@app`** ([page 2](02-modules.md)) is an app:
+  `wip build` writes `game/game.app`, or where `-o` says, a bundle holding
+  the program, its `Info.plist`, its icons, and every package's `@files`
+  beside the program, as on a Mac, where `package::besideProgram` finds
+  them. A device
+  runs only an app; the simulator runs a program that is not one as a
+  command, which is what `wip test` builds.
+- **Signed:** for the simulator, as every program a Mac builds is. For a
+  device, by the developer's identity, under a provisioning profile that
+  names the app's `id`, which `wip` finds among those Xcode keeps and puts
+  in the app; Xcode makes one, once, for a project of that identifier
+  with its signing left to Xcode. `--sign NAME` chooses the identity
+  where the keychain has more than one, and `--profile FILE` the profile.
+- **Run:** `wip run` installs an app on a simulator, booting one where
+  none is — an iPad's, where the app is for the iPad — or on the device
+  that is connected, and launches it, its output shown until it ends;
+  `--device NAME` chooses either. A program that is not an app runs in
+  the simulator as a command, where it is typed, as on a Mac, and its
+  exit code is the command's; so do the tests, in their package's root.
 
 `--color auto|always|never` and `--threads N` work everywhere; compiling
 uses one thread per core by default. `wip --version` names the compiler
@@ -110,20 +170,24 @@ build says so before it reads the program:
 error: wip builds with a clang 15 or newer: `clang` is not a clang 15 or newer, or is not there; WIP_CLANG names one
 ```
 
-A debug build is compiled at `-O0`, in parts of about a megabyte of LLVM's
-IR, each compiled at once with the others and kept in the cache, so that a
-program built again after an edit compiles only the parts the edit
-changed: a program of ten thousand lines builds in half a second, and
-again after an edit in less. A release build is one part, which LLVM
-optimises across the whole program: it runs some two times faster, and
-takes some seconds to build. The program does the same either way, and a
-panic lists the same calls.
+Every build is compiled in parts of about a megabyte of LLVM's IR, each
+compiled at once with the others and kept in the cache, so that a program
+built again after an edit compiles only the parts the edit changed. A
+debug build is compiled at `-O0`: a program of ten thousand lines builds
+in half a second, and again after an edit in less. A release build is
+compiled at `-O2`, and each of its parts holds a copy of each small
+function of the others that it calls, which LLVM inlines as if the
+program were one module and never compiles twice, and the linker drops
+what no call reaches once that is inlined: it runs some two times faster,
+and takes some seconds to build. The program does the same either
+way, and a panic lists the same calls.
 
 Every build is for a **processor**, which `--cpu` names.
-By default it is the baseline of the machine's kind — x86-64-v2, which
+By default it is the baseline of the target's kind — x86-64-v2, which
 every x86-64 processor since 2008's Nehalem and 2011's Bulldozer has; the
-M1 on a Mac with Apple silicon; and Armv8.0 elsewhere, which is a
-Raspberry Pi 4 — so that a program built on one machine runs on another.
+M1 on a Mac with Apple silicon, and for the simulator; the A10 for an
+iPad; and Armv8.0 elsewhere, which is a Raspberry Pi 4 — so that a program
+built on one machine runs on another.
 `--cpu native` builds for this machine alone, with every feature it has,
 and a level may be named, as `x86-64-v3` or `armv8.1`. The program does
 the same on each, only faster where the processor has an instruction for
@@ -190,12 +254,11 @@ that led there, and a debugger sees only the names of functions.
 `--cpu` goes with `wip run` and `wip test` too, as `--release` does.
 
 `--emit llvm-ir` writes what the compiler hands LLVM, as text, and stops
-there: no `clang` is run, so it works on a machine without one. A release
-build is one module, `main.ll`; a debug build is cut into parts that are
-compiled at once, and writes each, `main.ll` and beside it `main.1.ll`,
-`main.2.ll` and on. `--emit llvm-bc` writes the same modules as LLVM's
-bitcode, which is what `clang` is given to compile: `main.bc`, and in a
-debug build `main.1.bc` and on.
+there: no `clang` is run, so it works on a machine without one. A build is
+cut into parts that are compiled at once, and writes each, `main.ll` and
+beside it `main.1.ll`, `main.2.ll` and on; a small program is one part.
+`--emit llvm-bc` writes the same modules as LLVM's bitcode, which is what
+`clang` is given to compile: `main.bc`, and `main.1.bc` and on.
 
 ## Formatting
 
@@ -347,6 +410,40 @@ fn theBoardStartsEmpty() = {
     assert(board.count() == 0, "a new board holds nothing")
 }
 ```
+
+A test file's names are its own. What it declares — a helper, a
+constant, a type — is seen in that file alone, so two test files of one
+module may each have a `WIDTH` and a `pixel`, and the module's own code
+never sees a test's names: it is checked under `wip test`, and in an
+editor, as `wip build` checks it. A test file sees everything its module
+declares, and may not declare any of it again; it is refused there, at the
+test. An item a test file marks `pub` is seen by every test file of its
+module, and by nothing else:
+
+```wip,ignore
+// board/fixtures.test.wip
+/// A board of nine with a ball in its corner, for the tests to start from.
+pub fn cornered(): Board = {
+    var board = Board::new(9)
+    board.place(0, 0)
+    return board
+}
+
+// board/moves.test.wip
+val SIDE = 9
+
+@test
+fn aBallMovesAlongAnEmptyRow() = {
+    var board = cornered()
+    assert(board.move((0, 0), (SIDE - 1, 0)))
+}
+```
+
+A method comes with its type wherever the type is used, so a test file
+extends only a type a test file declares (E0338): a method it gave one of
+its module's types would be found by the module's own code under `wip test`
+alone. Tests are named by their module, so two tests of one module may not
+share a name, whichever files they are in.
 
 A test takes nothing and answers nothing. `wip test main.wip` builds one
 program, runs each test in the order it is declared, and prints a line per

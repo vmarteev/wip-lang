@@ -2,13 +2,12 @@
 // nothing gets.
 //
 // What `@derive` writes is code of the module's own, expanded before the
-// module is checked; here each type that asked has its fields asked for the
-// interface, where the code is written, and a field that lacks it is
-// reported where it is written. `count` and `fromIndex` are declared here as
+// module is checked; here what each implementation asks of the type's
+// parameters is worked out from what its fields need, and a field that
+// cannot have the interface is reported where it is written. `count` and `fromIndex` are declared here as
 // methods of the type, with `FnDef::generated` saying which body the code
 // generator is to write.
 
-import std::mem
 import syntax as ast
 import syntax::{
 	Code,
@@ -29,6 +28,16 @@ view struct Lacking {
 	label: str
 	writes: str
 	note: str
+}
+
+/// A condition said of one of the type parameters in scope, as what a type
+/// needs of them to implement an interface: `T: Clone`, as the parameter's
+/// index, the interface, and the types it takes.
+@derive(Eq, Clone)
+struct Need {
+	param: i64
+	interfaceId: InterfaceId
+	args: Vec<Ty>
 }
 
 extend Lowerer {
@@ -57,6 +66,174 @@ extend Lowerer {
 					self.deriveOwners.put(arg.span, def)
 				}
 			}
+		}
+	}
+
+	/// What each implementation `@derive` wrote asks of the type's
+	/// parameters: what its fields need of them, worked down through their
+	/// types' implementations until it is said of a parameter. A `Vec<T>`
+	/// field asks `T: Clone` of a clone, a `Handle<T>` field nothing, and a
+	/// parameter no field needs anything of is asked nothing. A type may hold
+	/// itself, directly or through others, so every derived implementation
+	/// starts asking nothing more than the type's own constraints, and asks
+	/// more as its fields do, until none asks more: what is asked only grows,
+	/// and there are finitely many parameters and interfaces to ask. The
+	/// methods it wrote are then given the same conditions, which their
+	/// bodies are checked with. A field that needs what cannot be said of a
+	/// parameter is reported as the fields are checked, after this.
+	var fn deriveConditions(types: &[Vec<(Declared, TypeDef)>]) = {
+		var derivedImpls: Vec<(i64, TypeDef, Derived, InterfaceId)> = Vec()
+		for declared in types {
+			for (item, def) in declared {
+				val annotations = item.annotationsOf()
+				if annotations.isEmpty() then continue
+				for wanted in Derived::all() {
+					if self.derives(&annotations, wanted).isNone() then continue
+					val known = wanted.known()
+					val .Some(interfaceId) = self.program.preludeItems.interfaceOf(known) else {
+						continue
+					}
+					// Nothing was written where the implementation was refused.
+					val .Some(at) = self.derivedImplAt(def, interfaceId) else continue
+					derivedImpls.push((at, def, wanted, interfaceId))
+				}
+			}
+		}
+		var growing = true
+		while growing {
+			growing = false
+			for (at, def, wanted, interfaceId) in derivedImpls {
+				self.typeParams = self.typeGenerics(def)
+				for (name, ty, span) in self.fieldsOf(def) {
+					val .Some(needs) = self.fieldNeeds(wanted, interfaceId, ty) else continue
+					for need in needs {
+						val param = need.param
+						val constraint = Constraint(
+							interfaceId: need.interfaceId,
+							args: self.program.types.internList(&need.args),
+						)
+						if self.program.impls[at].conditions[param].interfaces.contains(
+							&constraint,
+						) {
+							continue
+						}
+						self.program.impls[at].conditions[param].interfaces.push(constraint.clone())
+						self.program.derivedAsks.push(DerivedAsk(
+							at: at,
+							param: param,
+							constraint: constraint,
+							field: name,
+							ty: ty,
+							span: span,
+						))
+						growing = true
+					}
+				}
+			}
+		}
+		self.typeParams.clear()
+		// The methods are checked with what the implementation asks, and a
+		// call that does not meet it is shown the field that asks it.
+		for (at, _, _, _) in derivedImpls {
+			val conditions = self.program.impls[at].conditions.clone()
+			for m in self.program.impls[at].methods.clone() {
+				if !self.program.derived.contains(&m) then continue
+				for param in 0..conditions.len() {
+					if param >= self.program.fns[m].generics.len() then break
+					self.program.fns[m].generics[param].interfaces = conditions[param].interfaces.clone()
+					if self.firstAsk(at, param) is .Some(span) then
+						self.program.fns[m].generics[param].span = span
+				}
+			}
+		}
+	}
+
+	/// Where the first field to ask anything of the parameter is written, of
+	/// what `@derive` wrote as the implementation at `at`.
+	fn firstAsk(at: i64, param: i64): Option<Span> = {
+		for ask in self.program.derivedAsks {
+			if ask.at == at && ask.param == param then return .Some(ask.span)
+		}
+		return .None
+	}
+
+	/// The field that asks a parameter for `interfaceId`, where the
+	/// parameter is declared at `declared` and is one of the type's in what
+	/// `@derive` wrote: its methods' parameters are placed at the first
+	/// field that asks anything of them.
+	fn askingAt(declared: Span, interfaceId: InterfaceId): Option<&DerivedAsk> = {
+		for first in self.program.derivedAsks {
+			if first.span != declared then continue
+			for ask in self.program.derivedAsks {
+				if ask.at == first.at &&
+					ask.param == first.param &&
+					ask.constraint.interfaceId == interfaceId {
+					return .Some(&ask)
+				}
+			}
+		}
+		return .None
+	}
+
+	/// The field of `outer` that asks `inside`, one of its arguments, for
+	/// `condition`, where `outer`'s implementation of `wanted` is one
+	/// `@derive` wrote: `` `first: T` ``.
+	fn askedBy(outer: Ty, wanted: Constraint, inside: Ty, condition: Constraint): Option<String> = {
+		val owner = self.implOwner(outer)?
+		val args = self.ownerArgs(outer)
+		for (at, i) in self.program.impls.forwards().enumerate() {
+			if i.interfaceId != wanted.interfaceId ||
+				i.ty != owner ||
+				!argsMatch(&self.program.types, i.args, &args, wanted.args) {
+				continue
+			}
+			for ask in self.program.derivedAsks {
+				if ask.at == at &&
+					ask.param < args.len() &&
+					args[ask.param] == inside &&
+					ask.constraint.interfaceId == condition.interfaceId {
+					return .Some(self.askedField(&ask))
+				}
+			}
+			return .None
+		}
+		return .None
+	}
+
+	/// A field that asks something, as it is declared: `` `first: T` ``.
+	fn askedField(
+		ask: &DerivedAsk,
+	): String = "`\(self.text(ask.field)): \(self.program.tyName(ask.ty, self.interner))`"
+
+	/// What one field needs of the type's parameters for what `@derive`
+	/// writes of `wanted`; `None` where it cannot have it, which the field
+	/// is reported for. What an `own<T>` or a reference points at may have
+	/// it, which a call looks through to; the field itself does not. A clone
+	/// is asked of the field's own type, whose `clone` a `&T` has; so is
+	/// decoding, which a reference cannot be read into.
+	var fn fieldNeeds(wanted: Derived, interfaceId: InterfaceId, ty: Ty): Option<Vec<Need>> = {
+		val kind = self.kind(ty)
+		val none: Vec<Need> = Vec()
+		val nothing: [Ty; 0] = []
+		// Whether it is plain data is read from its fields' types.
+		completeType(&var self.program, ty)
+		if self.isPoisoned(ty) then return .Some(none)
+		// Two pointers compare by where they point.
+		if wanted == .Eq && kind is .Ptr(..) then return .Some(none)
+		return match wanted {
+			// A format is given an `own<T>` as the prelude's implementation for
+			// it says, and a reference as what it refers to.
+			.Encode => match self.conditionsFor(ty, interfaceId, &nothing) {
+				.Some(asked) => .Some(asked)
+				.None => match kind {
+					.Ref(inner, ..) => self.conditionsFor(inner, interfaceId, &nothing)
+					_ => .None
+				}
+			}
+			.Decode | .Clone => self.conditionsFor(ty, interfaceId, &nothing)
+			_ =>
+				if kind is .Own(..) | .Ref(..) then .None
+				else self.conditionsFor(ty, interfaceId, &nothing)
 		}
 	}
 
@@ -98,60 +275,20 @@ extend Lowerer {
 	/// `clone`, as code of the module's own — asks each field for the
 	/// interface. This says which field keeps it from applying, where the
 	/// field is written rather than at the annotation the code is placed at,
-	/// and then leaves the code unchecked.
+	/// and then leaves the code unchecked. A field whose need can be said of
+	/// the type's parameters has it, as its implementation's conditions.
 	var fn checkDerivedFields(owner: TypeDef, at: Span, wanted: Derived) = {
-		val known: KnownInterface = match wanted {
-			.Eq => .Eq
-			.Ord => .Ord
-			.Hash => .Hash
-			.Text => .Text
-			.Clone => .Clone
-			.Encode => .Encode
-			.Decode => .Decode
-		}
-		val .Some(interfaceId) = self.program.preludeItems.interfaceOf(known) else return
+		val .Some(interfaceId) = self.program.preludeItems.interfaceOf(wanted.known()) else return
 		// Nothing was written where the implementation was refused, as a
 		// second one of the type's, and reported.
 		val .Some(written) = self.derivedImpl(owner, interfaceId) else return
-		// Each field is asked where the method is written, whose type
-		// parameters are bound by the interface too: a `Vec<T>` field has it
-		// where `T` does.
-		val outer = mem::replace(
-			&var self.typeParams,
-			self.program.fns[written[0]].generics.clone(),
-		)
 		var applies = true
 		for (name, ty, span) in self.fieldsOf(owner) {
-			val kind = self.kind(ty)
-			// What an `own<T>` or a reference points at may have it, which a
-			// call looks through to; the field itself does not. A clone is
-			// asked of the field's own type, whose `clone` a `&T` has; so is
-			// decoding, which a reference cannot be read into.
-			val pointer = wanted != .Clone && wanted != .Decode && kind is .Own(..) | .Ref(..)
-			// Whether it is plain data is read from its fields' types.
-			completeType(&var self.program, ty)
-			// Two pointers compare by where they point.
-			val compared = wanted == .Eq && kind is .Ptr(..)
-			// A format is given an `own<T>` as the prelude's implementation for
-			// it says, and a reference as what it refers to.
-			val formatted = match wanted {
-				.Encode =>
-					self.implements(ty, interfaceId) ||
-						(kind is .Ref(inner, ..) && self.implements(inner, interfaceId))
-				.Decode => self.implements(ty, interfaceId)
-				_ => false
-			}
-			if self.isPoisoned(ty) ||
-				compared ||
-				formatted ||
-				(wanted !is .Encode | .Decode && !pointer && self.implements(ty, interfaceId)) {
-				continue
-			}
+			if self.fieldNeeds(wanted, interfaceId, ty).isSome() then continue
 			applies = false
 			val diagnostic = self.fieldLacks(wanted, interfaceId, name, ty, span, at)
 			self.report(diagnostic)
 		}
-		self.typeParams = outer
 		if !applies {
 			for id in written {
 				self.withheld.add(id)
@@ -240,6 +377,11 @@ extend Lowerer {
 				diagnostic = diagnostic.withHelp("write `@derive(\(named))` on \(inside) too, or an `extend` block that implements `\(named)` for it")
 		} else if self.declaresFields(ty) then
 			diagnostic = diagnostic.withHelp("write `@derive(\(named))` on \(typeName) too, or an `extend` block that implements `\(named)` for it")
+		// A type an implementation decides is not one of the type's
+		// parameters, so what it needs cannot be asked of them.
+		val innermost = if chain.isEmpty() then ty else chain[chain.len() - 1].0
+		if self.kind(innermost) is .Assoc(..) then
+			diagnostic = diagnostic.withHelp("what `@derive` writes asks its conditions of the type's parameters, and \(self.tyName(innermost)) is decided by one; write the implementation by hand, or take it as a parameter of the type's own, which a condition can name")
 		return diagnostic
 	}
 
@@ -284,24 +426,29 @@ extend Lowerer {
 	/// defaults the implementation has with them.
 	fn derivedImpl(owner: TypeDef, interfaceId: InterfaceId): Option<Vec<FnId>> = {
 		val derived = &self.program.derived
-		// An interface's default methods are the implementation's too, and
-		// nothing derived them, as `Text`'s: the implementation is the derived
-		// one where `@derive` wrote any of it, and those come first.
-		for i in self.program.impls {
+		val i = &self.program.impls[self.derivedImplAt(owner, interfaceId)?]
+		var methods: Vec<FnId> = Vec()
+		for m in i.methods {
+			if derived.contains(&m) then methods.push(m)
+		}
+		for m in i.methods {
+			if !derived.contains(&m) then methods.push(m)
+		}
+		return .Some(methods)
+	}
+
+	/// Where among the program's implementations is `owner`'s of
+	/// `interfaceId`, where `@derive` wrote it. An interface's default
+	/// methods are the implementation's too, and nothing derived them, as
+	/// `Text`'s: the implementation is the derived one where `@derive` wrote
+	/// any of it.
+	fn derivedImplAt(owner: TypeDef, interfaceId: InterfaceId): Option<i64> = {
+		val derived = &self.program.derived
+		for (at, i) in self.program.impls.forwards().enumerate() {
 			if i.ty != owner || i.interfaceId != interfaceId then continue
-			var any = false
 			for m in i.methods {
-				if derived.contains(&m) then any = true
+				if derived.contains(&m) then return .Some(at)
 			}
-			if !any then continue
-			var methods: Vec<FnId> = Vec()
-			for m in i.methods {
-				if derived.contains(&m) then methods.push(m)
-			}
-			for m in i.methods {
-				if !derived.contains(&m) then methods.push(m)
-			}
-			return .Some(methods)
 		}
 		return .None
 	}

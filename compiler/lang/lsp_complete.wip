@@ -79,7 +79,7 @@ val COMPLETE_ENUM_MEMBER = 20
 val COMPLETE_CONSTANT = 21
 val COMPLETE_STRUCT = 22
 
-val KEYWORDS: [str; 38] = [
+val KEYWORDS: [str; 39] = [
 	"fn",
 	"val",
 	"var",
@@ -110,6 +110,7 @@ val KEYWORDS: [str; 38] = [
 	"lend",
 	"from",
 	"keeps",
+	"empties",
 	"implicit",
 	"defer",
 	"assert",
@@ -125,6 +126,10 @@ view struct Candidates {
 	interner: &Interner
 	/// The module the cursor is in, which sees what it does not export.
 	module: u32
+	/// Where each item was declared, and the file the cursor is in: a test
+	/// file's names are its own, and its `pub` ones its module's test files'.
+	sources: &Sources
+	file: String
 }
 
 /// The items gathered so far, each label once, and a method's apart from a
@@ -149,6 +154,18 @@ extend Candidates {
 	fn name(sym: Symbol): String = self.interner.resolve(sym)
 
 	fn sees(module: u32, isPub: bool): bool = isPub || module == self.module
+
+	/// Whether an item of `module`, exported or not as `isPub` says and
+	/// declared at `span`, may be named where the cursor is: one of a test
+	/// file in that file alone, or, where it is `pub`, in its module's test
+	/// files; never in a module's own file, nor in another module.
+	fn seesAt(module: u32, isPub: bool, span: Span): bool = {
+		if !self.sees(module, isPub) then return false
+		val .Some((declared, _, _)) = self.sources.of(span) else return true
+		if !declared.endsWith(".test.wip") then return true
+		if module != self.module then return false
+		return declared == self.file || isPub && self.file.endsWith(".test.wip")
+	}
 
 	/// What can follow `value.`: its fields, and its methods.
 	fn members(given: Ty, out: &var Listed) = {
@@ -235,7 +252,7 @@ extend Candidates {
 			if free &&
 				def.instanceOf.isNone() &&
 				def.module == module &&
-				self.sees(module, def.isPub) {
+				self.seesAt(module, def.isPub, def.nameSpan) {
 				self.push(&var out, self.name(def.name), COMPLETE_FUNCTION, .Some(.Fn(id)))
 			}
 		}
@@ -244,7 +261,7 @@ extend Candidates {
 			// What the compiler made — a closure's environment, a generator —
 			// has no name to write.
 			if def.module == module &&
-				self.sees(module, def.isPub) &&
+				self.seesAt(module, def.isPub, def.span) &&
 				!def.isEnv &&
 				!def.isTuple &&
 				def.generator.isNone() {
@@ -253,21 +270,21 @@ extend Candidates {
 		}
 		for id in p.enums.ids() {
 			val def = &p.enums[id]
-			if def.module == module && self.sees(module, def.isPub) then
+			if def.module == module && self.seesAt(module, def.isPub, def.span) then
 				self.push(&var out, self.name(def.name), COMPLETE_ENUM, .Some(.Enum(id)))
 		}
 		for def in p.interfaces {
-			if def.module == module && self.sees(module, def.isPub) then
+			if def.module == module && self.seesAt(module, def.isPub, def.span) then
 				self.push(&var out, self.name(def.name), COMPLETE_INTERFACE, .None)
 		}
 		for id in p.consts.ids() {
 			val def = &p.consts[id]
-			if def.module == module && self.sees(module, def.isPub) then
+			if def.module == module && self.seesAt(module, def.isPub, def.span) then
 				self.push(&var out, self.name(def.name), COMPLETE_CONSTANT, .Some(.Const(id)))
 		}
 		for id in p.globals.ids() {
 			val def = &p.globals[id]
-			if def.module == module && self.sees(module, def.isPub) then
+			if def.module == module && self.seesAt(module, def.isPub, def.span) then
 				self.push(&var out, self.name(def.name), COMPLETE_VARIABLE, .Some(.Global(id)))
 		}
 	}
@@ -278,12 +295,12 @@ extend Candidates {
 		var found: Vec<(u32, TypeDef)> = Vec()
 		for id in p.structs.ids() {
 			val d = &p.structs[id]
-			if self.interner.resolve(d.name) == name && self.sees(d.module, d.isPub) then
+			if self.interner.resolve(d.name) == name && self.seesAt(d.module, d.isPub, d.span) then
 				found.push((d.module, .Struct(id)))
 		}
 		for id in p.enums.ids() {
 			val d = &p.enums[id]
-			if self.interner.resolve(d.name) == name && self.sees(d.module, d.isPub) then
+			if self.interner.resolve(d.name) == name && self.seesAt(d.module, d.isPub, d.span) then
 				found.push((d.module, .Enum(id)))
 		}
 		for (module, def) in found {
@@ -376,7 +393,17 @@ pub fn completionItems(
 			.None => 0
 		}
 	}
-	val items = Candidates(program: &program, interner: &loaded.interner, module: module)
+	val cursorFile = match loaded.sources.of(Span::at(base)) {
+		.Some((name, _, _)) => String::of(name)
+		.None => String()
+	}
+	val items = Candidates(
+		program: &program,
+		interner: &loaded.interner,
+		module: module,
+		sources: &loaded.sources,
+		file: cursorFile,
+	)
 	var listed = Listed()
 	match asked(file.text, cursor) {
 		.Member(dot) => {

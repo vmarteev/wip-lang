@@ -275,10 +275,46 @@ fn main() = {
 ```
 
 A field compares by whatever its type implements — a `Vec<String>`, an
-array — and a generic type compares where its parameters do: a
-`Pair<T>` that derives `Eq` is equal where `T` is. Two
-values of an enum are ordered by the order its variants are written in,
-and then by their fields.
+array — and two values of an enum are ordered by the order its variants
+are written in, and then by their fields.
+
+What a derived implementation asks of a generic type's parameters is what
+its fields need of them, worked out through each field's type: a
+`Pair<T>` that derives `Eq` is equal where `T` is, since its fields are
+`T`s, and a `Vec<T>` field asks of `T` what `Vec` does. A parameter no
+field needs anything of is asked nothing, so an id of two numbers
+compares whatever it names. A use that does not meet what is asked is told
+which field asks it. A field whose type an implementation decides,
+`G::Texture`, needs what cannot be said of a parameter, and is reported
+where it is written:
+
+```wip,run
+import std::collections::{Map}
+
+@derive(Eq, Hash)
+struct Id<T> {
+    number: u32
+}
+
+@derive(Eq)
+struct Pair<T> {
+    first: T
+    second: T
+}
+
+// A value that does not compare.
+struct Node {
+    name: String
+}
+
+fn main() = {
+    var names: Map<Id<Node>, String> = Map()
+    names.put(Id(number: 1), "root")
+    val root: Id<Node> = Id(number: 1)
+    assert(names.get(&root).isSome())
+    assert(Pair(first: 1, second: 2) == Pair(first: 1, second: 2))
+}
+```
 
 `Eq` is needed beside `Hash`, since a map is wrong the moment two equal
 values hash differently. A type whose equality is not its fields writes
@@ -289,11 +325,12 @@ turn, a `String`'s bytes and a `Vec`'s elements copied, so that changing
 the copy leaves the original as it was. What owns no memory — a number,
 a `bool`, a `char`, a `str`, a plain struct, a tuple or an array of them —
 is its own clone without being told: its clone is a copy, and it is taken
-where `Clone` is asked for. A generic type clones where
-its parameters do, so a `Vec<T>` field clones where `T` does.
+where `Clone` is asked for. A generic type clones where its
+fields do, so a `Vec<T>` field clones where `T` does.
 Each field is cloned as a value of its own type —
 `cloneOf(&self.field)`, which the prelude has — so a view's field that is
-a `&T` is the reference copied, and what the view owns is cloned.
+a `&T` is the reference copied, which asks nothing of `T`, and what the
+view owns is cloned.
 A field whose type does not clone — an `own<T>` among
 them — is reported where it is written:
 

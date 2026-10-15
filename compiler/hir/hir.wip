@@ -106,6 +106,9 @@ pub struct Program {
 	/// The methods `@derive` wrote as code: checked as the program's own,
 	/// but placed at the annotation, so an editor passes over them.
 	pub var derived: Set<FnId>
+	/// What each implementation `@derive` wrote asks of the type's
+	/// parameters, by the field that asks it, for a message.
+	pub var derivedAsks: Vec<DerivedAsk>
 	/// The instance of one of those two that this program's entry point
 	/// calls, made by the monomorphizer.
 	pub var entryReport: Option<FnId>
@@ -174,6 +177,7 @@ extend Program {
 		fnOwnedClosureEnv: .None,
 		lentHalves: Set(),
 		derived: Set(),
+		derivedAsks: Vec(),
 		entryReport: .None,
 		builtins: Map(),
 		dropFns: Map(),
@@ -619,21 +623,148 @@ extend Program {
 
 	/// Whether a value of `ty` borrows: a `str`, a `view struct`, a
 	/// reference, or anything that holds one — an array of them, or a
-	/// generic type given one. Such a value is kept to parameters, locals and
-	/// results, and to the fields of a view.
+	/// generic type given one for a parameter its fields hold. Such a value
+	/// is kept to parameters, locals and results, and to the fields of a
+	/// view.
 	pub fn holdsView(ty: Ty): bool = match self.types.kind(ty) {
 		.Str | .Ref(..) => true
-		.Struct(id, args) => self.structs[id].isView || self.anyHoldsView(args)
-		.Enum(id, args) => self.enums[id].isView || self.anyHoldsView(args)
+		.Struct(id, args) =>
+			self.structs[id].isView || self.heldHoldView(args, &self.structs[id].holds)
+		.Enum(id, args) => self.enums[id].isView || self.heldHoldView(args, &self.enums[id].holds)
 		.Array(elem: inner, ..) | .Own(inner) | .Slice(elem: inner) => self.holdsView(inner)
 		_ => false
 	}
 
-	fn anyHoldsView(args: TyList): bool = {
-		for a in self.types.list(args) {
-			if self.holdsView(a) then return true
+	/// Whether an argument of `args` that its type holds, as `holds` says,
+	/// holds a view.
+	fn heldHoldView(args: TyList, holds: &[bool]): bool = {
+		for (i, a) in self.types.list(args).forwards().enumerate() {
+			if (i >= holds.len() || holds[i]) && self.holdsView(a) then return true
 		}
 		return false
+	}
+
+	/// Whether a value of `ty` may hold a view in some instance of the code
+	/// it is in: it does, or it holds a value of a type parameter or of an
+	/// associated type, which an instance may make a view, or a function
+	/// value or a `dyn`, whose contents are not known.
+	pub fn mayHoldView(ty: Ty): bool = match self.types.kind(ty) {
+		.Str | .Ref(..) | .Param(..) | .Assoc(..) | .Fn(..) | .Dyn(..) => true
+		.Struct(id, args) =>
+			self.structs[id].isView || self.heldMayHoldView(args, &self.structs[id].holds)
+		.Enum(id, args) =>
+			self.enums[id].isView || self.heldMayHoldView(args, &self.enums[id].holds)
+		.Array(elem: inner, ..) | .Own(inner) | .Slice(elem: inner) | .Slots(inner) => self.mayHoldView(
+			inner,
+		)
+		_ => false
+	}
+
+	fn heldMayHoldView(args: TyList, holds: &[bool]): bool = {
+		for (i, a) in self.types.list(args).forwards().enumerate() {
+			if (i >= holds.len() || holds[i]) && self.mayHoldView(a) then return true
+		}
+		return false
+	}
+
+	/// Works out which type parameters each struct's and each enum's fields
+	/// hold, once every type's fields are known: none to begin with, then
+	/// what each field's type holds, through the types it names, until
+	/// nothing grows.
+	pub var fn findHeldParams() = {
+		val structs = self.structs.ids()
+		val enums = self.enums.ids()
+		for id in structs {
+			self.structs[id].holds = Vec::filled(self.structs[id].generics.len(), false)
+		}
+		for id in enums {
+			self.enums[id].holds = Vec::filled(self.enums[id].generics.len(), false)
+		}
+		while true {
+			var grew = false
+			for id in structs {
+				var holds = self.structs[id].holds.clone()
+				for field in self.structs[id].fields {
+					self.markHeld(field.ty, &var holds)
+				}
+				if holds != self.structs[id].holds {
+					self.structs[id].holds = holds
+					grew = true
+				}
+			}
+			for id in enums {
+				var holds = self.enums[id].holds.clone()
+				for variant in self.enums[id].variants {
+					for field in variant.fields {
+						self.markHeld(field.ty, &var holds)
+					}
+				}
+				if holds != self.enums[id].holds {
+					self.enums[id].holds = holds
+					grew = true
+				}
+			}
+			if !grew then return
+		}
+	}
+
+	/// Marks in `holds` each type parameter a value of `ty` holds a value
+	/// of: itself, an associated type of it, and through what a generic type
+	/// holds of its arguments, and elements, `own`, references and pointers,
+	/// since a type that keeps its values in memory of its own keeps them
+	/// through a `ptr<T>`. A function value and a `dyn` hold every one they
+	/// name, since a closure may capture any.
+	fn markHeld(ty: Ty, holds: &var Vec<bool>) = match self.types.kind(ty) {
+		.Param(param) => {
+			if param.index as i64 < holds.len() then holds[param.index as i64] = true
+		}
+		.Assoc(base, ..) => self.markHeld(base, &var holds)
+		.Struct(id, args) => self.markHeldArgs(args, &self.structs[id].holds, &var holds)
+		.Enum(id, args) => self.markHeldArgs(args, &self.enums[id].holds, &var holds)
+		.Array(elem: inner, ..) | .Own(inner) | .Slice(elem: inner) | .Slots(inner)
+		| .Ref(inner, ..) | .Ptr(inner) => self.markHeld(inner, &var holds)
+		.Fn(params, ret) => {
+			for p in self.types.list(params) {
+				self.markNamed(p, &var holds)
+			}
+			self.markNamed(ret, &var holds)
+		}
+		.Dyn(args, ..) => {
+			for a in self.types.list(args) {
+				self.markNamed(a, &var holds)
+			}
+		}
+		_ => {}
+	}
+
+	fn markHeldArgs(args: TyList, held: &[bool], holds: &var Vec<bool>) = {
+		for (i, a) in self.types.list(args).forwards().enumerate() {
+			if i >= held.len() || held[i] then self.markHeld(a, &var holds)
+		}
+	}
+
+	/// Marks every type parameter `ty` names, wherever.
+	fn markNamed(ty: Ty, holds: &var Vec<bool>) = match self.types.kind(ty) {
+		.Param(param) => {
+			if param.index as i64 < holds.len() then holds[param.index as i64] = true
+		}
+		.Assoc(base, ..) | .Array(elem: base, ..) | .Own(inner: base) | .Slice(elem: base)
+		| .Slots(inner: base) | .Ref(inner: base, ..) | .Ptr(inner: base) => self.markNamed(
+			base,
+			&var holds,
+		)
+		.Struct(args, ..) | .Enum(args, ..) | .Dyn(args, ..) => {
+			for a in self.types.list(args) {
+				self.markNamed(a, &var holds)
+			}
+		}
+		.Fn(params, ret) => {
+			for p in self.types.list(params) {
+				self.markNamed(p, &var holds)
+			}
+			self.markNamed(ret, &var holds)
+		}
+		_ => {}
 	}
 
 	/// Whether dropping a value of type `ty` does anything: it owns heap
@@ -783,6 +914,20 @@ pub struct ImplDef {
 	pub span: Span
 }
 
+/// A condition an implementation `@derive` wrote asks of a type parameter,
+/// and the field that asks it: the implementation, by its place among the
+/// program's, the parameter, by its index, the condition, and the field's
+/// name, type and place.
+@derive(Clone)
+pub struct DerivedAsk {
+	pub at: i64
+	pub param: i64
+	pub constraint: Constraint
+	pub field: Symbol
+	pub ty: Ty
+	pub span: Span
+}
+
 /// A type's table of methods for an interface, as code generation needs it:
 /// every method concrete, in the interface's order.
 @derive(Clone)
@@ -898,6 +1043,11 @@ pub struct StructDef {
 	pub var accessors: Vec<(FnId, FnId)>
 	/// Its type parameters, which its fields' types refer to.
 	pub var generics: Vec<GenericParamDef>
+	/// For each type parameter, whether its fields hold a value of it: a
+	/// `Handle<T>` holds two numbers, and no `T`. Empty until worked out,
+	/// and for a type the compiler makes later, which is taken to hold
+	/// every one.
+	pub var holds: Vec<bool> = Vec()
 	pub var fields: Vec<FieldDef>
 	/// Its methods and static functions, in source order.
 	pub var methods: Vec<FnId>
@@ -955,6 +1105,9 @@ pub struct FieldDef {
 pub struct EnumDef {
 	pub name: Symbol
 	pub var generics: Vec<GenericParamDef>
+	/// For each type parameter, whether its variants hold a value of it, as
+	/// a struct's `holds`.
+	pub var holds: Vec<bool> = Vec()
 	pub var variants: Vec<VariantDef>
 	/// Its methods and static functions, in source order.
 	pub var methods: Vec<FnId>
@@ -1046,6 +1199,9 @@ pub struct FnDef {
 	/// of the signature, and whether a `keeps` is written there already.
 	/// Nothing for a function the compiler writes.
 	pub keepsAt: Option<(u32, bool)>
+	/// `empties`: a call leaves the receiver, a `var fn`'s, holding no view,
+	/// and the body is held to it.
+	pub empties: bool = false
 	/// A projection lends a place that belongs to one of its reference
 	/// parameters, or to a constant table. Once the body has been checked,
 	/// this says which; a projection's return type is a reference.

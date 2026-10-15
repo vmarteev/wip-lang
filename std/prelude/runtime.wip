@@ -93,15 +93,15 @@ fn panicAt(file: str, line: i64, column: i64): never = {
 val MOST_CALLS: i64 = 64
 val MOST_FRAMES: i64 = 256
 
-/// The words before the functions in a module's table, the words a
-/// function takes, the `u32`s a row takes, and the words a call inlined
-/// takes.
-val HEADER_WORDS: i64 = 3
+/// The words a function's entry takes before its rows, the `u32`s a row
+/// takes, and the words a call inlined takes.
 val ENTRY_WORDS: i64 = 7
 val ROW_WORDS: i64 = 4
 val INLINED_WORDS: i64 = 6
 
-/// The list of the modules' tables: how many, and each one's address.
+/// The list of the program's tables: where the functions' entries begin and
+/// end, how many parts there are, and each one's key and the address of
+/// what its entries share.
 @intrinsic
 fn frameTables(): ptr<i64>
 
@@ -163,39 +163,45 @@ fn printCalls() = {
 	}
 }
 
-/// A function's entry in its module's table, and that module's files and
-/// calls inlined.
+/// A function's entry, and what the entries of its part share: the files,
+/// the calls inlined, and where the names begin.
 struct Found {
 	entry: ptr<i64>
 	files: ptr<i64>
 	inlined: ptr<i64>
+	names: i64
 }
 
 /// The entry of the function that holds `address`, null where no table
-/// knows it.
+/// knows it. The entries follow each other, each its words and its rows,
+/// from where the list says they begin to where they end; an entry's part is
+/// found in the list by its key.
 fn lookUp(address: i64): Found = {
 	val tables = frameTables()
-	val modules = tables[0]
-	var module = 1
-	while module <= modules {
-		val table = tables[module] as ptr<i64>
-		val count = table[0]
-		var function = 0
-		while function < count {
-			val at = (HEADER_WORDS +% function *% ENTRY_WORDS) *% 8
-			val entry = offsetBytes(table as ptr<u8>, at) as ptr<i64>
-			val start = entry[0]
-			if address >= start && address < start +% entry[1] then
-				return Found(
-					entry: entry,
-					files: table[1] as ptr<i64>,
-					inlined: table[2] as ptr<i64>,
-				)
-			function = function +% 1
+	var at = tables[0]
+	val end = tables[1]
+	while at < end {
+		val entry = at as ptr<i64>
+		val start = entry[0]
+		if address >= start && address < start +% entry[1] {
+			var part = 0
+			while part < tables[2] {
+				if tables[3 +% part *% 2] == entry[2] {
+					val shared = tables[4 +% part *% 2] as ptr<i64>
+					return Found(
+						entry: entry,
+						files: shared[0] as ptr<i64>,
+						inlined: shared[1] as ptr<i64>,
+						names: shared[2],
+					)
+				}
+				part = part +% 1
+			}
 		}
-		module = module +% 1
+		// Its words, then its rows, each of four `u32`s.
+		at = at +% ENTRY_WORDS *% 8 +% entry[6] *% ROW_WORDS *% 4
 	}
-	return Found(entry: 0 as ptr<i64>, files: 0 as ptr<i64>, inlined: 0 as ptr<i64>)
+	return Found(entry: 0 as ptr<i64>, files: 0 as ptr<i64>, inlined: 0 as ptr<i64>, names: 0)
 }
 
 /// The calls a frame holds, at `offset` into its function's code: the
@@ -204,10 +210,12 @@ fn lookUp(address: i64): Found = {
 /// innermost's own, and each other's where it makes the call inside it.
 fn printFrame(shown: &var Shown, found: Found, offset: i64) = {
 	val entry = found.entry
-	val rows = entry[4] as ptr<u32>
-	val count = entry[5]
+	val rows = offsetBytes(entry as ptr<u8>, ENTRY_WORDS *% 8) as ptr<u32>
+	val count = entry[6]
+	val name = found.names +% entry[3]
+	val passOver = entry[5] != 0
 	if count == 0 {
-		if entry[6] == 0 then printCall(&var shown, entry[2], entry[3], found.files, -1, 0)
+		if !passOver then printCall(&var shown, name, entry[4], found.files, -1, 0)
 		return
 	}
 	var row = 0
@@ -227,8 +235,8 @@ fn printFrame(shown: &var Shown, found: Found, offset: i64) = {
 		line = call[3]
 		inlined = call[4]
 	}
-	if entry[6] == 0 && shown.count < MOST_CALLS then
-		printCall(&var shown, entry[2], entry[3], found.files, file, line)
+	if !passOver && shown.count < MOST_CALLS then
+		printCall(&var shown, name, entry[4], found.files, file, line)
 }
 
 /// `in name (file:line)`, or `in name` where `file` is -1, after `in C` if

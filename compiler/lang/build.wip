@@ -21,9 +21,9 @@ pub enum Emit {
 	Static
 	/// A shared library: `.dylib` on macOS, `.so` elsewhere.
 	Dynamic
-	/// The program's LLVM IR, as text, which `clang` is not run on: a release
-	/// build's one module, and a debug build's parts, the first where the
-	/// output says and the rest beside it, numbered.
+	/// The program's LLVM IR, as text, which `clang` is not run on: its
+	/// parts, the first where the output says and the rest beside it,
+	/// numbered.
 	LlvmIr
 	/// The same, as LLVM's bitcode.
 	LlvmBc
@@ -97,6 +97,12 @@ pub struct BuildOptions {
 	/// Whether it carries debug information: the lines a panic lists, and
 	/// what a debugger reads.
 	pub var debugInfo: bool = true
+	/// The constants it defines, `--define NAME=VALUE`.
+	pub var defines: Vec<(String, String)> = Vec()
+	/// The machine it is built for, and what `clang` is told of it: nothing
+	/// for the machine the compiler runs on.
+	pub var target: Target = Target::host()
+	pub var targetFlags: Vec<String> = Vec()
 }
 
 /// Why a build did not finish: what is wrong in the program, or what went
@@ -150,7 +156,8 @@ fn writeBinary(
 	timings: &var Timings,
 ): Result<void, BuildError> = {
 	// What C cannot be given to call.
-	val refused = mir::refusedExports(&program, &loaded.interner, mir::Arch::host())
+	val arch = abiOf(&options.target)
+	val refused = mir::refusedExports(&program, &loaded.interner, arch)
 	if !refused.isEmpty() then return .Err(.Diagnostics(refused))
 	val optimize = options.profile.optimizes()
 	val sources = &loaded.sources
@@ -162,6 +169,7 @@ fn writeBinary(
 		(span) => sources.locate(span),
 		optimize,
 		loaded.threads,
+		arch,
 	)
 	if !options.debugInfo then ir.dropDebugInfo()
 	timings.record("codegen", started)
@@ -178,7 +186,7 @@ fn writeBinary(
 		return .Ok()
 	}
 	started = Instant::now()
-	val compiled = llvmObjects(&ir, &options.cpu, optimize, &unique)
+	val compiled = llvmObjects(&ir, &options, optimize, &unique)
 	timings.record("codegen", started)
 	val objects = compiled?
 	started = Instant::now()
@@ -204,7 +212,7 @@ fn linkProgram(
 	options: &BuildOptions,
 	unique: &Unique,
 ): Result<void, BuildError> = {
-	val shims = shims(&program, &loaded.interner)
+	val shims = shims(&program, &loaded.interner, &options.target)
 	var dirs: Vec<String> = Vec()
 	for module in loaded.modules {
 		dirs.push(module.dir.clone())
@@ -215,7 +223,7 @@ fn linkProgram(
 	// `@define`. All are known only once the program is checked, which
 	// is why they join the files here rather than where the modules were
 	// read.
-	val cFiles = cSources(&program, &dirs, &loaded.cFiles)?
+	val cFiles = cSources(&program, &dirs, &loaded.cFiles, &options.target)?
 	val linking = Linking(
 		cFiles: &cFiles,
 		shims: match shims {
@@ -229,6 +237,8 @@ fn linkProgram(
 		emit: options.emit.clone(),
 		profile: options.profile.clone(),
 		cpu: &options.cpu,
+		target: &options.target,
+		targetFlags: &options.targetFlags,
 	)
 	return link(&objects, &linking, output, &unique)
 }
@@ -269,6 +279,8 @@ pub fn buildTests(
 		header: .None,
 		profile: move profile,
 		cpu: options.cpu.clone(),
+		target: options.target.clone(),
+		targetFlags: options.targetFlags.clone(),
 	)
 	writeBinary(&loaded, &program, .Some(.Tests(tests)), output, &written, &unique, &var timings)?
 	return .Ok((diagnostics, count))
@@ -320,6 +332,7 @@ fn cSources(
 	program: &Program,
 	dirs: &[String],
 	found: &[String],
+	target: &Target,
 ): Result<Vec<CFile>, BuildError> = {
 	var files: Vec<CFile> = Vec()
 	for file in found {
@@ -350,7 +363,7 @@ fn cSources(
 		c.standard = standard.clone()
 		// Objective-C and Objective-C++ are Apple's, as they are for a file
 		// found beside the module's own.
-		if c.language.isApples() && TARGET_VENDOR != "apple" then continue
+		if c.language.isApples() && !target.isApple() then continue
 		c.prefix = prefixOf(&program, &dirs, module)
 		c.defines = definesOf(&program, module)
 		files.push(c)
@@ -432,7 +445,12 @@ fn cIncludeDirs(
 /// What the linker is given besides the objects: where to look for
 /// libraries, the libraries the extern blocks name, and on an Apple target
 /// the frameworks.
-fn linkArgs(libraryPaths: &[String], libraries: &[String], frameworks: &[String]): Vec<String> = {
+fn linkArgs(
+	libraryPaths: &[String],
+	libraries: &[String],
+	frameworks: &[String],
+	target: &Target,
+): Vec<String> = {
 	var args: Vec<String> = Vec()
 	for dir in libraryPaths {
 		args.push("-L\(dir)")
@@ -442,9 +460,9 @@ fn linkArgs(libraryPaths: &[String], libraries: &[String], frameworks: &[String]
 	}
 	// The runtime starts threads: a Linux whose C library does not have them
 	// in it has them in a library of their own. A Mac has them in libSystem.
-	if TARGET_OS == "linux" then args.push("-lpthread")
+	if target.os == Os::Linux then args.push("-lpthread")
 	// No other system has frameworks, so elsewhere they are not asked for.
-	if TARGET_VENDOR == "apple" {
+	if target.isApple() {
 		for name in frameworks {
 			args.push("-framework")
 			args.push(name.clone())
@@ -470,13 +488,23 @@ view struct Linking {
 	emit: Emit
 	profile: Profile
 	cpu: &Cpu
+	target: &Target
+	targetFlags: &[String]
 }
 
 /// The C the compiler writes for the calls it cannot make itself: the ones
-/// `c_abi` leaves to a wrapper on this target.
-fn shims(program: &Program, interner: &Interner): Option<String> = {
-	val shimmed = mir::shimmed(&program, mir::Arch::host())
+/// `c_abi` leaves to a wrapper on `target`.
+fn shims(program: &Program, interner: &Interner, target: &Target): Option<String> = {
+	val shimmed = mir::shimmed(&program, abiOf(&target))
 	return mir::writeShims(&program, &interner, &shimmed)
+}
+
+/// The rules C calls by on `target`, where they are written: Apple's arm64
+/// packs what goes on the stack, as Linux's does not.
+fn abiOf(target: &Target): Option<mir::Arch> = match (target.os.clone(), target.arch.clone()) {
+	(.Windows, _) => .None
+	(_, .X86_64) => .Some(.X86_64)
+	(_, .Arm64) => .Some(if target.isApple() then .AppleArm64 else .Arm64)
 }
 
 /// Compiles the program's C, each file once, and links it with the modules'
@@ -534,7 +562,7 @@ fn link(
 	}
 	// Code in a shared library is placed wherever the library is loaded;
 	// Apple's compilers make all code so.
-	val positionIndependent = linking.emit == Emit::Dynamic && TARGET_VENDOR != "apple"
+	val positionIndependent = linking.emit == Emit::Dynamic && !linking.target.isApple()
 	val compiled = match compile(
 		&files,
 		&includes,
@@ -542,6 +570,8 @@ fn link(
 		positionIndependent,
 		linking.profile.optimizes(),
 		linking.cpu,
+		linking.target,
+		linking.targetFlags,
 		&unique,
 	) {
 		.Ok(compiled) => compiled
@@ -566,16 +596,24 @@ fn link(
 		return run(ar, strs(&args))
 	}
 	var args: Vec<String> = Vec()
+	for flag in linking.targetFlags {
+		args.push(flag.clone())
+	}
 	// A shared library has no entry point, and each platform spells it
 	// differently.
 	if linking.emit == Emit::Dynamic then
-		args.push(if TARGET_OS == "macos" then "-dynamiclib" else "-shared")
+		args.push(if linking.target.isApple() then "-dynamiclib" else "-shared")
 	args.push("-o")
 	args.push(output)
 	for member in members {
 		args.push(member.clone())
 	}
-	for arg in linkArgs(&linking.search.libraryPaths, linking.libraries, linking.frameworks) {
+	for arg in linkArgs(
+		&linking.search.libraryPaths,
+		linking.libraries,
+		linking.frameworks,
+		linking.target,
+	) {
 		args.push(arg)
 	}
 	// C++ compiled with the program needs the C++ library, which a C
@@ -585,7 +623,18 @@ fn link(
 	for file in linking.cFiles {
 		if file.language.isCxx() then cxx = true
 	}
-	if cxx then args.push(if TARGET_VENDOR == "apple" then "-lc++" else "-lstdc++")
+	if cxx then args.push(if linking.target.isApple() then "-lc++" else "-lstdc++")
+	// A release build is stripped of what nothing reaches: a function every
+	// call to which was inlined, in a part another names. The table of a
+	// panic's calls keeps none alive, its entry for each tied to the
+	// function; on ELF, only where the reference to its section's start is
+	// not taken to keep every entry, which `-z start-stop-gc` says.
+	if linking.profile.optimizes() {
+		if linking.target.isApple() then args.push("-Wl,-dead_strip") else {
+			args.push("-Wl,--gc-sections")
+			args.push("-Wl,-z,start-stop-gc")
+		}
+	}
 	val cc = compiler()
 	run(cc, strs(&args))?
 	// Apple's linker leaves the debug information in the objects and names
@@ -594,7 +643,7 @@ fn link(
 	// in the program, naming the objects, is then of no use, and is taken
 	// out, as Xcode does for a release: the debugger finds the `.dSYM` by the
 	// program's UUID.
-	if TARGET_VENDOR == "apple" {
+	if linking.target.isApple() {
 		val symbols = "\(output).dSYM"
 		run("dsymutil", [output, "-o", symbols.toStr()])?
 		return run("strip", ["-S", output])

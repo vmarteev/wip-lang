@@ -284,7 +284,8 @@ extend Lowerer {
 		elementBinds: Vec<Binds>,
 		binds: Binds,
 	): Pattern = match pattern.kind {
-		.Binding(sym) if self.patternConst(ast::Name(sym: sym, span: pattern.span)).isNone() => {
+		.Binding(symbol: sym, isVar) if isVar ||
+			self.patternConst(ast::Name(sym: sym, span: pattern.span)).isNone() => {
 			val name = String::of(self.text(sym))
 			self.report(
 				Diagnostic::error(
@@ -485,7 +486,8 @@ extend Lowerer {
 		// A pattern that leaves nothing out always matches, so an `else` beside
 		// it never runs, and one that can fail has no path to take without it.
 		val irrefutable = self.alwaysMatches(&lowered, scrutTy)
-		if elseHir.isSome() && irrefutable {
+		// A pattern already refused says nothing more.
+		if elseHir.isSome() && irrefutable && lowered !is .Error {
 			val at = elseBlock.unwrap().span
 			self.report(
 				Diagnostic::error(
@@ -493,7 +495,9 @@ extend Lowerer {
 					"this pattern always matches, so `else` cannot run",
 					at,
 					"never reached",
-				).withNote("a struct has one shape, so taking it apart cannot fail"),
+				).withNote(
+					"a pattern that leaves nothing out — a name, or a struct or a tuple taken apart — cannot fail",
+				),
 			)
 		} else if elseHir.isNone() && !irrefutable && lowered !is .Error then
 			self.report(
@@ -642,7 +646,7 @@ extend Lowerer {
 		source: Option<ExprId>,
 	): Pattern = match pattern.kind {
 		.Wildcard => .Wildcard
-		.Binding(sym) => {
+		.Binding(symbol: sym, isVar: false) => {
 			val local = self.declare(sym, elementTy, .Binding, pattern.span)
 			if self.kind(elementTy) is .Ref(..) then self.state.body.aliasBindings.add(local)
 			Pattern::Binding(local)
@@ -682,12 +686,18 @@ extend Lowerer {
 	/// takes it apart in turn.
 	var fn binder(b: &ast::Binder, fieldTy: Ty, binds: Binds): Binder = {
 		val .Some(pattern) = b.pattern else {
+			if b.isVar then return .Bind(self.varBinding(b.field.sym, fieldTy, b.span, binds))
 			return .Bind(self.declareBinding(b.field.sym, fieldTy, b.span, binds))
 		}
 		return match pattern.kind {
 			// `field: name` binds it under that name, which is what a bare name
 			// in a pattern always means.
-			.Binding(sym) => .Bind(self.declareBinding(sym, fieldTy, pattern.span, binds))
+			.Binding(symbol: sym, isVar: true) => .Bind(
+				self.varBinding(sym, fieldTy, pattern.span, binds),
+			)
+			.Binding(symbol: sym, ..) => .Bind(
+				self.declareBinding(sym, fieldTy, pattern.span, binds),
+			)
 			.Wildcard | .Error => .Ignored
 			// A pattern inside a pattern tests what its field holds, to any
 			// depth.
@@ -779,7 +789,7 @@ extend Lowerer {
 
 	/// The names a pattern binds, for recovery.
 	fn namesOf(pattern: &ast::Pattern, out: &var Vec<(Symbol, Span)>) = match pattern.kind {
-		.Binding(sym) => out.push((sym, pattern.span))
+		.Binding(symbol: sym, ..) => out.push((sym, pattern.span))
 		.Variant(binders, ..) => { if binders is .Some(all) then self.bindersNames(&all, &var out) }
 		.Parens(binders, ..) => self.bindersNames(&binders, &var out)
 		// Any one of several: each binds the same names, or is reported.
@@ -821,13 +831,16 @@ extend Lowerer {
 		span: Span,
 		guard: ast::ExprId,
 	) = {
-		if alias.isSome() then return
+		// Matching a place, the bindings alias it and take nothing, but a
+		// `var` name's, which holds its part.
 		var locals: Vec<LocalId> = Vec()
 		pattern.locals(&var locals)
 		var taken: Option<LocalId> = .None
 		for local in locals {
 			val ty = self.state.body.locals[local].ty
-			if taken.isNone() && !self.isPoisoned(ty) && self.owns(ty) then taken = .Some(local)
+			val holds = alias.isNone() || self.state.body.locals[local].kind == .Var
+			if taken.isNone() && holds && !self.isPoisoned(ty) && self.owns(ty) then
+				taken = .Some(local)
 		}
 		val .Some(local) = taken else return
 		val name = String::of(self.text(self.state.body.locals[local].name))
@@ -839,7 +852,11 @@ extend Lowerer {
 				self.ast.exprs[guard].span,
 				"a guard",
 			).withSecondary(span, "`\(name)` is \(typeName), which owns memory")
-				.withHelp("match without `move`, and take what the arm needs in its body")
+				.withHelp(
+					if alias.isSome() then
+						"bind it without `var`, and take what the arm needs in its body"
+					else "match without `move`, and take what the arm needs in its body",
+				)
 				.withNote(
 					"a guard runs once the pattern has taken the value apart, so a guard that fails would leave it half taken",
 				),
@@ -994,7 +1011,7 @@ extend Lowerer {
 	/// constant is no more a pattern than it is a value.
 	fn patternConst(name: ast::Name): Option<ConstId> = {
 		val id = self.constNamed(name)?
-		val ownConst = match self.consts().get(&name.sym) {
+		val ownConst = match self.constHere(name.sym) {
 			.Some(found) => found == id
 			.None => false
 		}
@@ -1097,6 +1114,29 @@ extend Lowerer {
 			self.reportInferredMove(self.ast.exprs[value].span, self.ast.exprs[operand].span)
 	}
 
+	/// `var name`: a variable of its own, holding its part as `var name =
+	/// part` would. Plain data is copied, and the place keeps its own; a part
+	/// that owns memory, which is never copied, is taken, and the place it is
+	/// in given up, as `var x = place` gives it.
+	var fn varBinding(name: Symbol, ty: Ty, span: Span, binds: Binds): LocalId = {
+		val variables = Binds(
+			alias: .None,
+			source: binds.source,
+			copy: true,
+			settle: false,
+			variables: true,
+		)
+		val local = self.declareBinding(name, ty, span, variables)
+		if binds.alias.isSome() &&
+			!self.isPoisoned(ty) &&
+			self.owns(ty) &&
+			binds.source is .Some(scrut) &&
+			self.rootsInLocal(scrut) {
+			self.state.body.moveAt(scrut)
+		}
+		return local
+	}
+
 	/// Declares a binding of a value of type `ty`: an alias for it, a
 	/// reference to it, where `binds` aliases and it is not copied, and the
 	/// value itself otherwise. It records which, and the place an alias
@@ -1182,7 +1222,10 @@ extend Lowerer {
 				val how = Alternative::Plain(scrutTy: scrutTy, binds: binds)
 				self.anyPattern(&alternatives, &how)
 			}
-			.Binding(sym) => self.bindingPattern(sym, scrutTy, pattern.span, binds)
+			.Binding(symbol: sym, isVar: true) => .Binding(
+				self.varBinding(sym, scrutTy, pattern.span, binds),
+			)
+			.Binding(symbol: sym, ..) => self.bindingPattern(sym, scrutTy, pattern.span, binds)
 			.Variant(leadingDot, segments, binders, rest) => {
 				val written: Option<&[ast::Binder]> = match binders {
 					.Some(b) => .Some(&b.items())
@@ -1340,7 +1383,7 @@ extend Lowerer {
 			val name = segments[0]
 			// The file's own types, then what it imported, then the prelude's,
 			// as a type name resolves anywhere else.
-			var declared: Option<TypeDef> = match self.types().get(&name.sym) {
+			var declared: Option<TypeDef> = match self.typeHere(name.sym) {
 				.Some((def, _)) => .Some(def)
 				.None => .None
 			}
@@ -1500,7 +1543,8 @@ extend Lowerer {
 	/// passing over it: a constant's name tests, as its value does.
 	fn testsAValue(pattern: &ast::Pattern): bool = match pattern.kind {
 		.Wildcard | .Error => false
-		.Binding(sym) => self.patternConst(ast::Name(sym: sym, span: pattern.span)).isSome()
+		.Binding(symbol: sym, isVar) =>
+			!isVar && self.patternConst(ast::Name(sym: sym, span: pattern.span)).isSome()
 		_ => true
 	}
 

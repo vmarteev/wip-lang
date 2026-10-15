@@ -91,7 +91,7 @@ extend Lowerer {
 			// A variable of the function around a lambda is called as the value
 			// it is, below, whatever a function of the module is called.
 			.Name(sym) if self.lookup(sym).isNone() && !self.namesAround(sym) => {
-				if self.fns().get(&sym) is .Some(f) then return self.call(f, used)
+				if self.fnHere(sym) is .Some(f) then return self.call(f, used)
 				// A function of another module, imported by name.
 				val imported = self.imported(ast::Name(sym: sym, span: calleeExpr.span))
 				match imported {
@@ -104,7 +104,7 @@ extend Lowerer {
 				if self.preludeFn(sym) is .Some(id) then return self.call(id, used)
 				// A closure a closure or a generator captured is called as a
 				// value, below.
-				if !self.types().contains(&sym) && imported.isNone() && !self.namedAround(sym) {
+				if !self.typeHere(sym).isSome() && imported.isNone() && !self.namedAround(sym) {
 					val diagnostic = self.unknownName(sym, calleeExpr.span)
 					self.report(diagnostic)
 					return self.giveUp(&args, span)
@@ -333,6 +333,7 @@ extend Lowerer {
 		}
 		val explicit = self.callTypeArgs(callee, nameSym, &generics, &item)
 		var inference = Inference::new(explicit)
+		inference.explained = hint is .Some(h) && self.isPoisoned(h)
 		if item.ownerTy is .Some(ownerTy) then
 			self.ownerTypeArgs(callee, &generics, ownerTy, &var inference)
 		// A call through a constraint knows the interface's own types, which
@@ -657,7 +658,7 @@ extend Lowerer {
 	fn namesStruct(sym: Symbol): bool = {
 		if self.lookup(sym).isSome() ||
 			self.namesAround(sym) ||
-			self.fns().contains(&sym) ||
+			self.fnHere(sym).isSome() ||
 			self.preludeFn(sym).isSome() {
 			return false
 		}
@@ -669,8 +670,8 @@ extend Lowerer {
 						self.modules[module].aliases.contains(&item.sym))
 			_ =>
 				self.text(sym) == "Self" ||
-					self.types().contains(&sym) ||
-					self.modules[self.current].aliases.contains(&sym) ||
+					self.typeHere(sym).isSome() ||
+					self.aliasScope(sym).isSome() ||
 					self.preludeModule(sym).isSome()
 		}
 	}
@@ -755,7 +756,7 @@ extend Lowerer {
 				used.nameSegment = segments.len() - 2
 				// `T::name(…)` is a function of an interface the type parameter
 				// requires.
-				if module == self.current &&
+				if self.moduleOf(module) == self.current &&
 					self.constrainedStatic(typeName, member, used) is .Some(call) {
 					return call
 				}
@@ -859,7 +860,8 @@ extend Lowerer {
 			.None => .None
 		}
 		// A function of the prelude, where the path named this module.
-		if found.isNone() && module == self.current then found = self.preludeFn(item.sym)
+		if found.isNone() && self.moduleOf(module) == self.current then
+			found = self.preludeFn(item.sym)
 		val .Some(id) = found else {
 			val path = self.modules[module].path.clone()
 			// The module of `package::NAME` holds `VERSION` only where the
@@ -886,7 +888,7 @@ extend Lowerer {
 			}
 			// A path that names no module is a name of this one: said as an
 			// unknown name is, with what left the prelude.
-			if module == self.current && leftThePrelude(&name) is .Some(help) {
+			if self.moduleOf(module) == self.current && leftThePrelude(&name) is .Some(help) {
 				self.report(
 					Diagnostic::error(
 						UNKNOWN_NAME,
@@ -913,7 +915,50 @@ extend Lowerer {
 		}
 		if !self.visible(module, self.program.fns[id].isPub) then
 			self.privateItem(module, "fn", item)
+		// `package::besideProgram("shaders")`: a path written out is one the
+		// package names with `@files`, or one below it, or no build puts it
+		// beside the program.
+		if used.args is .Some(args) && args.len() == 1 && self.text(item.sym) == "besideProgram" {
+			val modulePath = self.modules[module].path.clone()
+			if modulePath == "package" || modulePath.endsWith("::package") {
+				if self.ast.exprs[args[0]].kind is .Str(symbol) then
+					self.namedFile(
+						module,
+						String::of(self.text(symbol)),
+						self.ast.exprs[args[0]].span,
+					)
+			}
+		}
 		return if used.args.isSome() then self.call(id, used) else self.fnValue(id, used, .None)
+	}
+
+	/// The path `written`, given to the `besideProgram` of the package whose
+	/// generated module is `module`, said where no path its `@files` names
+	/// is it, holds it, or is below it: `"shaders"` is the directory that
+	/// holds `shaders/metal` and `shaders/spirv`, and is beside the program
+	/// where they are.
+	var fn namedFile(module: i64, written: String, span: Span) = {
+		val files = self.modules[module].packageFiles.clone()
+		val wanted = written.toStr().trimStartMatches("./").trimEndMatches("/")
+		for file in files {
+			val named = file.toStr().trimStartMatches("./").trimEndMatches("/")
+			if wanted == named || wanted.startsWith("\(named)/") || named.startsWith("\(wanted)/") {
+				return
+			}
+		}
+		val help =
+			if files.isEmpty() then "write `@files(\"\(wanted)\")` in the package's `package.wip`"
+			else "add it to `@files` in the package's `package.wip`, which names \(files.map((f) => "`\(f)`").join(", "))"
+		self.report(
+			Diagnostic::error(
+				PACKAGE,
+				"`\(wanted)` is not a file the package names",
+				span,
+				"not in its `@files`",
+			).withNote(
+				"a build puts beside the program the files each package names with `@files`, and only those",
+			).withHelp(help),
+		)
 	}
 
 	/// A function of a type reached through an alias of the type knows what
@@ -1056,6 +1101,7 @@ extend Lowerer {
 		var ty = self.intern(.Fn(params: params, ret: ret))
 		val explicit = self.explicitTypeArgs(nameSym, &generics, item.typeArgs, item.nameSegment)
 		var inference = Inference::new(explicit)
+		inference.explained = item.hint is .Some(h) && self.isPoisoned(h)
 		if item.ownerTy is .Some(ownerTy) then
 			self.ownerTypeArgs(id, &generics, ownerTy, &var inference)
 		// Where a closure is wanted, lent or owned, the function it would be

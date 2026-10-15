@@ -41,6 +41,9 @@ struct Inference {
 	/// Which were known at the start: written, or taken from a type that was
 	/// checked where it was made. They are not checked again.
 	given: Vec<bool>
+	/// Whether what was expected of the use is an error, which has been
+	/// said: what could not be inferred from it is not said again.
+	explained: bool = false
 }
 
 extend Inference {
@@ -645,8 +648,7 @@ extend Lowerer {
 			// A reference to an `own` stands for a reference to what it owns
 			// (the `&own<T>` to `&T` coercion), and an array or buffer for a
 			// slice of its elements.
-			(.Ref(inner: d, ..), .Ref(inner: f, ..)) => {
-				var under = f
+			(.Ref(inner: d, ..), .Ref(inner: var under, ..)) => {
 				while true {
 					val declaredOwn = types.kind(d) is .Own(..) | .Param(..)
 					match types.kind(under) {
@@ -712,6 +714,10 @@ extend Lowerer {
 				self.unifyLists(d, f, &var solution)
 				self.unify(dRet, fRet, &var solution)
 			}
+			// A value given without the `&` a reference is declared with says
+			// what it refers to, as elements do for a slice, so that what is
+			// reported is the borrow left out.
+			(.Ref(inner: d, ..), _) => self.unify(d, found, &var solution)
 			_ => {}
 		}
 	}
@@ -733,6 +739,15 @@ extend Lowerer {
 		if self.state.body.exprs[inner].kind !is .Local(..) then return .None
 		return if self.kind(self.tyOf(inner)) is .Ref(..) then .Some(inner) else .None
 	}
+
+	/// What an argument inferred as `inferred` gives where `declared` is
+	/// taken: a slice read through a reference is the reference, where what
+	/// is taken is not a reference itself, since a slice has no size of its
+	/// own to be held by — `Some(bytes)` of a `bytes: &[u8]` is an
+	/// `Option<&[u8]>`, and `(name, bytes)` a tuple that holds the reference.
+	fn keptFor(inferred: ExprId, declared: Ty): ExprId =
+		if self.kind(declared) is .Ref(..) then inferred
+		else self.keptReference(inferred).unwrapOr(inferred)
 
 	/// Whether every type parameter `ty` mentions has a type argument.
 	fn resolved(ty: Ty, solution: &[Option<Ty>]): bool =
@@ -824,7 +839,7 @@ extend Lowerer {
 		return match self.imported(ast::Name(sym: sym, span: span)) {
 			.Some(.Item(module, name)) => self.modules[module].consts.contains(&name.sym)
 			.Some(.Broken) => false
-			.None => self.consts().contains(&sym)
+			.None => self.constHere(sym).isSome()
 		}
 	}
 
@@ -889,14 +904,15 @@ extend Lowerer {
 							self.heldReference(inferred).isSome()) {
 						declared = inner
 					}
+					val kept = self.keptFor(inferred, operand.declared)
 					// A list given where a `Vec<T>` is taken says `T` by its
 					// elements, and is made the vector once it is known.
-					match self.listLiteralElement(inferred, declared) {
+					match self.listLiteralElement(kept, declared) {
 						.Some((wanted, elem)) => self.unify(wanted, elem, &var solution)
-						.None => self.unify(declared, self.tyOf(inferred), &var solution)
+						.None => self.unify(declared, self.tyOf(kept), &var solution)
 					}
 					unconverted.push(i)
-					inferred
+					kept
 				}
 				done[i] = .Some(id)
 			}
@@ -1003,9 +1019,9 @@ extend Lowerer {
 		for i in 0..generics.len() {
 			if solution[i].isNone() then missing.push(self.text(generics[i].name))
 		}
-		// An error inside the use, in an argument, is why nothing could be
-		// inferred from it, and has been said.
-		var explained = false
+		// An error inside the use, in an argument, or in what was expected
+		// of it, is why nothing could be inferred, and has been said.
+		var explained = inference.explained
 		for d in self.diagnostics {
 			if d.isError() && d.primary.span.lo >= span.lo && d.primary.span.hi <= span.hi then
 				explained = true

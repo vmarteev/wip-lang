@@ -13,6 +13,7 @@ import syntax::{
 	ANNOTATION,
 	DUPLICATE_IMPL,
 	Diagnostic,
+	EMPTIES,
 	EXTENSION,
 	Edit,
 	IMPL_METHODS,
@@ -76,7 +77,7 @@ extend Lowerer {
 			}
 			match self.declaredAt(decl.name.sym) {
 				.Some(first) => self.duplicate(decl.name, first)
-				.None => self.modules[self.current].interfaces.put(
+				.None => self.modules[self.declaring(decl.isPub)].interfaces.put(
 					decl.name.sym,
 					(id, decl.name.span),
 				)
@@ -161,8 +162,8 @@ extend Lowerer {
 
 	/// Where a name is already a type or an interface of this module.
 	fn declaredAt(name: Symbol): Option<Span> = {
-		if self.types().get(&name) is .Some((_, span)) then return .Some(span)
-		return match self.interfaces().get(&name) {
+		if self.typeHere(name) is .Some((_, span)) then return .Some(span)
+		return match self.interfaceHere(name) {
 			.Some((_, span)) => .Some(span)
 			.None => .None
 		}
@@ -171,7 +172,7 @@ extend Lowerer {
 	/// The interface a constraint names, here or in the module it was
 	/// imported from.
 	fn interfaceNamed(name: ast::Name): Option<InterfaceId> = {
-		if self.interfaces().get(&name.sym) is .Some((id, _)) then return .Some(id)
+		if self.interfaceHere(name.sym) is .Some((id, _)) then return .Some(id)
 		// An interface of the prelude, which every file sees without an import.
 		if self.prelude is .Some(prelude) &&
 			prelude != self.current &&
@@ -305,8 +306,8 @@ extend Lowerer {
 		if block.sliceOf.isSome() ||
 			block.boxed.isSome() ||
 			block.derived.isSome() ||
-			self.types().contains(&name.sym) ||
-			self.aliases().contains(&name.sym) {
+			self.typeHere(name.sym).isSome() ||
+			self.aliasScope(name.sym).isSome() {
 			return .None
 		}
 		return self.interfaceNamed(name)
@@ -1103,20 +1104,7 @@ extend Lowerer {
 		if self.program.referred(ty) is .Some(inner) then
 			return self.program.answeredThroughReferences(interfaceId) &&
 				self.implementsArgs(inner, interfaceId, &wanted)
-		// A decided type asked as the type's own, `I::Item` of `I: Iterator`,
-		// is whatever its implementation decides: it asks nothing.
-		val generics = &self.program.interfaces[interfaceId].generics
-		var open: Vec<bool> = Vec()
-		for at in 0..wanted.len() {
-			val decided = at < generics.len() && generics[at].decided
-			open.push(
-				decided &&
-					self.kind(wanted[at]) is .Assoc(base, interfaceId: i, index) &&
-					base == ty &&
-					i == interfaceId &&
-					index == at,
-			)
-		}
+		val open = self.openArgs(ty, interfaceId, &wanted)
 		if self.kind(ty) is .Param(param) {
 			if param.index >= self.typeParams.len() then return false
 			for c in self.typeParams[param.index].interfaces {
@@ -1149,6 +1137,83 @@ extend Lowerer {
 			if self.unmetCondition(at, &ownerArgs).isNone() then return true
 		}
 		return false
+	}
+
+	/// Which of the interface's arguments asked of `ty` are whatever its
+	/// implementation decides: a decided type asked as the type's own,
+	/// `I::Item` of `I: Iterator`, asks nothing.
+	fn openArgs(ty: Ty, interfaceId: InterfaceId, wanted: &[Ty]): Vec<bool> = {
+		val generics = &self.program.interfaces[interfaceId].generics
+		var open: Vec<bool> = Vec()
+		for at in 0..wanted.len() {
+			val decided = at < generics.len() && generics[at].decided
+			open.push(
+				decided &&
+					self.kind(wanted[at]) is .Assoc(base, interfaceId: i, index) &&
+					base == ty &&
+					i == interfaceId &&
+					index == at,
+			)
+		}
+		return open
+	}
+
+	/// What `ty` needs of the type parameters in scope to implement the
+	/// interface, where `implementsArgs` answers whether it does: each
+	/// condition said of a parameter, and none where the parameter's own
+	/// constraints promise it. A `Vec<T>` needs `T: Clone` to clone, and a
+	/// `Handle<T>` nothing, as their implementations say. `None` where no
+	/// condition on a parameter would do: a type with no implementation, or
+	/// one an implementation decides, `G::Texture`.
+	fn conditionsFor(ty: Ty, interfaceId: InterfaceId, wanted: &[Ty]): Option<Vec<Need>> = {
+		val none: Vec<Need> = Vec()
+		if self.program.isClone(interfaceId) && self.program.clonesByCopy(ty) then
+			return .Some(none)
+		if self.program.referred(ty) is .Some(inner) {
+			if !self.program.answeredThroughReferences(interfaceId) then return .None
+			return self.conditionsFor(inner, interfaceId, &wanted)
+		}
+		if self.kind(ty) is .Param(param) {
+			if param.index >= self.typeParams.len() then return .None
+			if self.implementsArgs(ty, interfaceId, &wanted) then return .Some(none)
+			return .Some([Need(param: param.index, interfaceId: interfaceId, args: wanted.toVec())])
+		}
+		if self.holdsItsValueElsewhere(ty) then return .None
+		val owner = self.implOwner(ty)?
+		val ownerArgs = self.ownerArgs(ty)
+		val open = self.openArgs(ty, interfaceId, &wanted)
+		for (at, i) in self.program.impls.forwards().enumerate() {
+			if i.interfaceId == interfaceId &&
+				i.ty == owner &&
+				argsMatchOpen(&self.program.types, i.args, &ownerArgs, &wanted, &open) &&
+				self.conditionsOfImpl(at, &ownerArgs) is .Some(needs) {
+				return .Some(needs)
+			}
+		}
+		return .None
+	}
+
+	/// What an implementation's conditions need of the parameters in scope,
+	/// asked of these arguments of its type: `unmetCondition`, with each
+	/// condition worked down to the parameters rather than answered.
+	fn conditionsOfImpl(at: i64, args: &[Ty]): Option<Vec<Need>> = {
+		var needs: Vec<Need> = Vec()
+		val conditions = &self.program.impls[at].conditions
+		var i = 0
+		while i < conditions.len() && i < args.len() {
+			for constraint in conditions[i].interfaces {
+				val types = &self.program.types
+				var wanted: Vec<Ty> = Vec()
+				for t in types.list(constraint.args) {
+					wanted.push(types.trySubstFind(t, &args)?)
+				}
+				for need in self.conditionsFor(args[i], constraint.interfaceId, &wanted)? {
+					if !needs.contains(&need) then needs.push(need)
+				}
+			}
+			i += 1
+		}
+		return .Some(needs)
 	}
 
 	/// A type's own type arguments: what an implementation's conditions are
@@ -1221,9 +1286,13 @@ extend Lowerer {
 		var text = "\(self.tyName(ty)) implements `\(asked)`"
 		for (index, (inside, constraint)) in chain.forwards().enumerate() {
 			val name = self.constraintName(constraint, inside)
-			if index > 0 then text.push(", \(self.tyName(chain[index - 1].0))")
+			val (outer, outerWanted) = if index > 0 then chain[index - 1] else (ty, wanted)
+			if index > 0 then text.push(", \(self.tyName(outer))")
 			val what = if name == asked then String::of("does") else "implements `\(name)`"
 			text.push(" where \(self.tyName(inside)) \(what)")
+			// What `@derive` wrote asks it because a field needs it.
+			if self.askedBy(outer, outerWanted, inside, constraint) is .Some(field) then
+				text.push(", as its field \(field) asks")
 			asked = name
 		}
 		if !chain.isEmpty() then
@@ -1323,11 +1392,13 @@ extend Lowerer {
 			constraints.push(Constraint(interfaceId: declared.interfaceId, args: args))
 		}
 		// Nothing implements anything until the `extend` blocks are declared,
-		// so a type written before then — a field's, an alias's — is checked
-		// once they are. A type that mentions a type parameter is not one of
-		// those: what it implements is what the parameter promises, which is
-		// known here and forgotten later.
-		if self.phase < .ImplsDeclared && !self.program.types.isGeneric(ty) {
+		// and what `@derive` wrote asks nothing until its conditions are worked
+		// out, so a type written before then — a field's, an alias's, a
+		// signature's — is checked once they are. A type that mentions a type
+		// parameter implements what the parameter promises, which is kept with
+		// it.
+		if self.phase < .ImplsDeclared {
+			val params = if self.program.types.isGeneric(ty) then self.typeParams.clone() else Vec()
 			for constraint in constraints {
 				self.pendingConstraints.push(PendingConstraint(
 					ty: ty,
@@ -1335,6 +1406,7 @@ extend Lowerer {
 					written: param.written,
 					declared: param.span,
 					span: span,
+					params: params.clone(),
 				))
 			}
 			return
@@ -1400,6 +1472,7 @@ extend Lowerer {
 		self.phase = .ImplsDeclared
 		self.oneWayByPosition()
 		for pending in mem::replace(&var self.pendingConstraints, Vec()) {
+			self.typeParams = pending.params
 			self.checkOneConstraint(
 				pending.ty,
 				pending.constraint,
@@ -1408,6 +1481,7 @@ extend Lowerer {
 				pending.span,
 			)
 		}
+		self.typeParams.clear()
 	}
 
 	/// One constraint, against the type given for the parameter.
@@ -1444,12 +1518,20 @@ extend Lowerer {
 			}
 			else => "a type implements an interface by `extend …: \(name)`"
 		}
+		// What `@derive` wrote asks what a field needs, and says which.
+		val (askedAt, asked) = match self.askingAt(declared, interfaceId) {
+			.Some(ask) => (
+				ask.span,
+				"the field \(self.askedField(&ask)) asks `\(paramName): \(name)`",
+			)
+			.None => (declared, "`\(paramName): \(name)` declared here")
+		}
 		var diagnostic = Diagnostic::error(
 			UNSATISFIED_CONSTRAINT,
 			"\(self.tyName(ty)) does not implement `\(name)`",
 			span,
 			"`\(paramName)` requires `\(name)`",
-		).withSecondary(declared, "`\(paramName): \(name)` declared here").withNote(note)
+		).withSecondary(askedAt, asked).withNote(note)
 		// Text is left out of the sequences on purpose, and says so.
 		val isText = self.kind(ty) == .Str || self.program.isString(ty)
 		if isText && self.program.preludeItems.interfaceOf(.Sequence) == .Some(interfaceId) then
@@ -1642,6 +1724,19 @@ extend Lowerer {
 			)
 			break
 		}
+		// A call through the interface takes the receiver to hold nothing
+		// after it, so an implementation must empty it too.
+		if wanted.empties && !gotDef.empties then
+			self.report(
+				Diagnostic::error(
+					EMPTIES,
+					"`\(method)` does not say `empties`, and `\(interfaceName)` says it does",
+					name.span,
+					"says nothing of emptying",
+				).withSecondary(wanted.nameSpan, "declared here, with `empties`").withNote(
+					"a call through the interface leaves the receiver holding no view, so each implementation empties it",
+				),
+			)
 	}
 
 	/// An implementation's method that does not match its interface's.

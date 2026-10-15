@@ -511,6 +511,88 @@ fn targetsChoose(gate: &Gate, root: str): Option<String> = {
 	return .None
 }
 
+/// A constant that says `@define` takes what `--define` gives it, by its
+/// name or by its module's path, and its value otherwise; what a constant
+/// condition does not take is not compiled, even in a debug build, where the
+/// condition is a define, a target, or a constant built of them; and a
+/// define nothing declares, a value not of its type, a name two constants
+/// share and a name given twice are refused.
+fn definesSetConstants(gate: &Gate, root: str): Option<String> = {
+	write(
+		root,
+		"main.wip",
+		"import std::io\nimport world\n\n@define\nval EDITOR: bool = true\n\n@define\nval LEVEL: i64 = 1\n\n@define\nval TITLE: str = \"Marble\"\n\n@define\nval SHARED: bool = false\n\nval TOOLS: bool = EDITOR && TARGET_OS != \"nowhere\"\n\nfn editorOnly(n: i64): i64 = n * 7\n\nfn toolsOnly(n: i64): i64 = n * 3\n\nfn windowsOnly(n: i64): i64 = n * 11\n\nfn main() = {\n    if EDITOR then io::println(\"editor \\(editorOnly(6))\")\n    if TOOLS then io::println(\"tools \\(toolsOnly(2))\")\n    if TARGET_OS == \"windows\" then io::println(\"\\(windowsOnly(2))\")\n    io::println(\"\\(TITLE) \\(LEVEL) \\(world::DEBUG) \\(SHARED)\")\n}\n",
+	)
+	write(
+		root,
+		"world/world.wip",
+		"@define\npub val DEBUG: bool = false\n\n@define\npub val SHARED: bool = false\n",
+	)
+	val built = gate.wip(root, ["build", "main.wip", "-o", "program"])
+	if !built.exit.success() then return wrong("`wip build main.wip`", &built)
+	val ran = run(Command::of(path::join(root, "program")))
+	if ran.stdout != "editor 42\ntools 6\nMarble 1 false false\n" then
+		return wrong("the program", &ran)
+	val program = read(root, "program")
+	if !program.contains("wip.editorOnly.") then
+		return .Some("`editorOnly` is reached, and is not in the program")
+	if program.contains("wip.windowsOnly.") && TARGET_OS != "windows" then
+		return .Some("`windowsOnly` is in a branch no target here takes, and is in the program")
+	val defined = gate.wip(root, [
+		"build",
+		"--define",
+		"EDITOR=false",
+		"--define",
+		"LEVEL=-3",
+		"--define",
+		"TITLE=A demo",
+		"--define",
+		"world::DEBUG=true",
+		"--define",
+		"world::SHARED=true",
+		"main.wip",
+		"-o",
+		"defined",
+	])
+	if !defined.exit.success() then return wrong("`wip build --define …`", &defined)
+	val ranDefined = run(Command::of(path::join(root, "defined")))
+	if ranDefined.stdout != "A demo -3 true false\n" then
+		return wrong("the program built with defines", &ranDefined)
+	if read(root, "defined").contains("wip.editorOnly.") then
+		return .Some(
+			"`editorOnly` is in a branch `EDITOR=false` does not take, and is in the program",
+		)
+	if read(root, "defined").contains("wip.toolsOnly.") then
+		return .Some(
+			"`toolsOnly` is in a branch a constant built of `EDITOR=false` does not take, and is in the program",
+		)
+	for (given, said) in [
+		("EDTIOR=false", "`--define EDTIOR` names no constant that says `@define`"),
+		("LEVEL=many", "`--define LEVEL=many` is not `i64`"),
+		("SHARED=true", "`--define SHARED` names 2 constants"),
+	] {
+		val refused = gate.wip(root, ["check", "--color", "never", "--define", given, "main.wip"])
+		if refused.exit.success() || !refused.stderr.contains(said) then
+			return wrong("`wip check --define \(given)`", &refused)
+	}
+	val twice = gate.wip(root, [
+		"check",
+		"--color",
+		"never",
+		"--define",
+		"LEVEL=2",
+		"--define",
+		"LEVEL=3",
+		"main.wip",
+	])
+	if twice.exit.success() || !twice.stderr.contains("`LEVEL` is defined twice") then
+		return wrong("`wip check --define LEVEL=2 --define LEVEL=3`", &twice)
+	val formatted = gate.wip(root, ["fmt", "--define", "LEVEL=2", "main.wip"])
+	if formatted.exit.success() || !formatted.stderr.contains("`--define` is an option of") then
+		return wrong("`wip fmt --define …`", &formatted)
+	return .None
+}
+
 /// `wip check --target` checks the program as another target compiles it,
 /// from this machine: an item or a file for Linux is read on a Mac, and a
 /// Mac's on Linux. Each mistake is said once, and, where not every target
@@ -596,10 +678,10 @@ fn cacheCleaned(gate: &Gate, root: str): Option<String> = {
 }
 
 /// `build --emit llvm-ir` writes the program's IR and runs no `clang`: a
-/// release build's one module where the output says, and a debug build's
-/// parts, the first there and each after it beside it, numbered before the
-/// extension. How many parts there are is decided by what the functions
-/// hold: every one written, and more than one.
+/// build's parts, the first where the output says and each after it beside
+/// it, numbered before the extension. How many parts there are is decided by
+/// what the functions hold: every one written, and more than one for a debug
+/// build of the example.
 fn irWithoutClang(gate: &Gate, root: str): Option<String> = {
 	val example = fs::realPath("examples/json-pretty/main.wip").unwrapOr(String())
 	val noClang = (arguments: &[str]) => run(
@@ -617,7 +699,6 @@ fn irWithoutClang(gate: &Gate, root: str): Option<String> = {
 	if !release.exit.success() then return wrong("`wip build --release --emit llvm-ir`", &release)
 	if !read(root, "pretty.ll").contains("\ndefine ") then
 		return .Some("the release build's IR defines nothing")
-	if isFile(root, "pretty.1.ll") then return .Some("a release build is one module")
 	val debug = noClang(["build", "--emit", "llvm-ir", example.toStr()])
 	if !debug.exit.success() then return wrong("`wip build --emit llvm-ir`", &debug)
 	var parts: Vec<String> = Vec()

@@ -315,7 +315,11 @@ method      = annotation* "pub"? ( "var" | "move" | "static" | "lend" )? fnDecl 
                                             method does with its receiver;
                                             `lend` both ways *)
 
-fnDecl      = "fn" IDENT generics? "(" params? ")" ( ":" type lendsFrom? )? keeps? "=" expr ;
+fnDecl      = "fn" IDENT generics? "(" params? ")" ( ":" type lendsFrom? )? keeps?
+              "empties"? "=" expr ;
+                                         (* `empties`: a call leaves the
+                                            receiver, a `var fn`'s, holding no
+                                            view; a word here alone *)
 lendsFrom   = "from" lendPath ( "," lendPath )* ;
                                          (* what the result borrows, and
                                             nothing else; `from` is a word
@@ -533,6 +537,10 @@ pattern     = onePattern ( "|" onePattern )* ;
                                             same names, each of one type *)
 onePattern  = "_"
             | IDENT
+            | "var" IDENT                (* a variable of its own, holding its
+                                            part as `var x = part` would; in a
+                                            `var` pattern, whose names are all
+                                            variables, it is refused, E0136 *)
             | "-"? INT | "true" | "false" | STRING | CHAR | BYTE
                                          (* a value the scrutinee must equal;
                                             a float is reported *)
@@ -560,12 +568,13 @@ sliceElem   = pattern | ".." IDENT? ;      (* `..rest` binds the elements
 bound       = "-"? INT | CHAR | BYTE | path ;
                                          (* a literal, or a constant's name *)
 binders     = ( binder ( "," binder )* ( "," ".." )? | ".." ) ","? ;
-binder      = IDENT ( ":" pattern )? | pattern ;
+binder      = IDENT ( ":" pattern )? | "var" IDENT | pattern ;
                                          (* a field, or field: pattern — a name renames
                                             it, and a pattern takes the field apart or
-                                            tests it; a pattern alone is the one field
-                                            the variant or the struct has, or a
-                                            tuple's element *)
+                                            tests it; `var field`, the field bound to a
+                                            variable of its own; a pattern alone is the
+                                            one field the variant or the struct has, or
+                                            a tuple's element *)
 
 args        = arg ( "," arg )* ( "," ".." expr )? ","?
             | ".." expr ","? ;
@@ -727,6 +736,8 @@ Each has its own diagnostic rather than a generic "unexpected token"
   name (E0121).
 - A positional argument after a named one (E0122).
 - A pattern that can fail, after `val` or `var`, without `else` (E0123).
+- `var` before a name in a pattern after `var` (E0136), with a fix that
+  takes it out; `var` before anything but a name (E0101).
 - The R4 diagnostic (E0104), and a struct written with braces (E0133).
 
 Left to later phases: whether an assignment target is a place, whether
