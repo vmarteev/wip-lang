@@ -195,14 +195,15 @@ fn main() = {
 what picks an element where it lies lends it — `first`, `last`, `find`,
 `minBy` and `maxBy`, the element whose key is least or greatest, the first
 of equals, and `take` and `skip`, a part of the slice — for any elements;
-what works out a value answers it, of plain data — `min`, `max`, `sum`,
-`product`, `count`, `countWhere`. `find` answers what it finds, and a
+what works out a value answers it — `min` and `max` a clone, `sum` and
+`product` of plain data, `count`, `countWhere`. `find` answers what it finds, and a
 position is `indexOf`, on a slice, text, a `Map` and a `Set` alike. `sum` and `product`
 add up and multiply elements that implement `Add` and `Zero`, or
 `Multiply` and `One`, as every number does: nothing sums to zero and
-multiplies to one. `filter`, `partition`, `min` and `max` copy the
-elements they answer, so they are there for plain data; a vector of values
-that own memory keeps what it wants with `retain`. `join` writes each
+multiplies to one. `filter`, `partition`, `min` and `max` clone the
+elements they answer, as `toVec` does, so they are there for any element
+that clones: plain data is copied, and a value that owns memory cloned; a
+vector that would clone none keeps what it wants in place with `retain`. `join` writes each
 element as text, and `joinTo(&var out, separator)` writes them onto a
 `String` there is; every sequence has `joinToBy`, which writes each element
 as a closure says — a `Deque`, a map's values, a slice of pairs.
@@ -218,6 +219,37 @@ fn main() = {
     val names = parts.map((part) => String::of(part))
     val rest = names.skip(1).toVec()
     assert(rest.len() == 2 && rest[0] == "local")
+}
+```
+
+### `InlineVec<T, N>`
+
+`InlineVec<T, N>` holds at most `N` values where it is — in a local, a
+field, an element — and never allocates: a draw's constants, a buffer of a
+few kilobytes before it is sent, the return addresses of a trace. It has a
+`Vec`'s methods but those that would grow it: `push` panics where it is
+full, and `tryPush` answers `false`; `capacity()` is `N`, and `isFull()`
+says whether it is reached. It lends its values as a slice, so what is
+written for `&[T]` works on it, and `for x in v` walks it. It holds what
+owns memory as well as plain data, and ends what it holds where it ends;
+where its element is plain data, so is it, and it is copied with what
+holds it. `InlineVec::of(items)` and `pushAll` clone what they are given:
+
+```wip,run
+struct Draw {
+    constants: InlineVec<u8, 16>
+    count: i64
+}
+
+fn main() = {
+    val draw = Draw(constants: InlineVec::of([1, 2, 3]), count: 3)
+    val again = draw // plain data: copied
+    assert(again.constants.len() == 3 && draw.constants[2] == 3)
+    var names: InlineVec<String, 2> = InlineVec()
+    names.push(String::of("one"))
+    assert(names.tryPush(String::of("two")))
+    assert(!names.tryPush(String::of("three")) && names.isFull())
+    assert(names.items() == ["one", "two"])
 }
 ```
 

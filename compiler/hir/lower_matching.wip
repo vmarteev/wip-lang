@@ -95,6 +95,32 @@ struct Binds {
 	variables: bool = false
 }
 
+/// A place an arm or an `is` test matched as one variant, for the code it
+/// guards: the scope it was matched in, the place, and the variant.
+struct MatchedPlace {
+	depth: i64
+	place: ExprId
+	id: EnumId
+	variant: u32
+}
+
+/// The variant a pattern matches, where it matches only one: through a
+/// reference, and through alternatives that are each that variant.
+fn onlyVariant(pattern: &Pattern): Option<u32> = match pattern {
+	.Variant(variant, ..) => .Some(variant)
+	.Deref(inner) => onlyVariant(&inner)
+	.Any(alternatives, ..) => {
+		var found: Option<u32> = .None
+		for alternative in alternatives {
+			val variant = onlyVariant(&alternative)?
+			if found is .Some(earlier) && earlier != variant then return .None
+			found = .Some(variant)
+		}
+		found
+	}
+	_ => .None
+}
+
 /// What the alternatives of one `|` bind: the first's names, which every
 /// other binds again, and the one being checked's.
 @derive(Clone)
@@ -189,12 +215,15 @@ extend Lowerer {
 				)
 				.None => self.pattern(&arm.pattern, scrutTy, binds)
 			}
+			if places.isNone() && onlyVariant(&pattern) is .Some(variant) then
+				self.noteMatched(scrut, variant)
 			// `if …` after the pattern: the bindings are in scope for it, and it
 			// decides whether the arm matches.
 			if arm.guard is .Some(written) then
 				self.guardTakesNothing(&pattern, alias, arm.pattern.span, written)
 			val guard: Option<ExprId> = arm.guard.map((g) => self.check(g, BOOL))
 			if result.isNone() && self.takesTypeBeside(arm.body) {
+				self.takeMatched()
 				val .Some(bindings) = self.state.scopes.pop() else panic("the arm's scope")
 				waiting.push((slots.len(), bindings, pattern, guard))
 				slots.push(.None)
@@ -217,19 +246,21 @@ extend Lowerer {
 			}
 			val ty = self.tyOf(body)
 			if result.isNone() && ty != NEVER then result = .Some(ty)
-			self.state.scopes.pop()
+			self.endScope()
 			slots.push(.Some(Arm(pattern: pattern, guard: guard, body: body, span: arm.span)))
 		}
 		for (at, bindings, pattern, guard) in move waiting {
 			val arm = &arms[at]
 			self.state.scopes.push(bindings)
+			if places.isNone() && onlyVariant(&pattern) is .Some(variant) then
+				self.noteMatched(scrut, variant)
 			val body = match result {
 				.Some(t) => self.check(arm.body, t)
 				.None => self.infer(arm.body, .None)
 			}
 			val ty = self.tyOf(body)
 			if result.isNone() && ty != NEVER then result = .Some(ty)
-			self.state.scopes.pop()
+			self.endScope()
 			slots[at] = .Some(Arm(pattern: pattern, guard: guard, body: body, span: arm.span))
 		}
 		var hirArms: Vec<Arm> = Vec()
@@ -521,7 +552,17 @@ extend Lowerer {
 		val span = file.exprs[e].span
 		return match file.exprs[e].kind {
 			.Paren(inner) => self.bindingCondition(inner)
-			.Is(scrutinee, pattern, negated: false) => self.isExpr(scrutinee, &pattern, true, span)
+			.Is(scrutinee, pattern, negated: false) => {
+				val test = self.isExpr(scrutinee, &pattern, true, span)
+				val variant = match self.state.body.exprs[test].kind {
+					.Is(scrutinee: place, pattern: matched) => Option::Some(
+						(place, onlyVariant(&matched)),
+					)
+					_ => Option::None
+				}
+				if variant is .Some((place, .Some(v))) then self.noteMatched(place, v)
+				test
+			}
 			.Binary(op: .And, lhs, rhs, ..) => {
 				val l = self.bindingCondition(lhs)
 				val r = self.bindingCondition(rhs)
@@ -549,7 +590,7 @@ extend Lowerer {
 		}
 		self.state.scopes.push(Map())
 		val cond = self.bindingCondition(e)
-		self.state.scopes.pop()
+		self.endScope()
 		val yes = self.alloc(.Bool(true), BOOL, span)
 		val thenBlock = Block(stmts: Vec(), value: .Some(yes), span: span)
 		val no = self.alloc(.Bool(false), BOOL, span)
@@ -2067,10 +2108,11 @@ extend Lowerer {
 	/// each use reads it, and nothing borrowed of it can outlive the arm. Its
 	/// local takes the value's type, each read of it becomes a read of the
 	/// local, and it is no longer an alias, so the place it came from is free
-	/// to change.
+	/// to change. Each alias binding left, that nothing writes through, is
+	/// marked as only read, which holds its place to its last use.
 	var fn settleBindings() = {
 		val settling = mem::replace(&var self.state.settling, Vec())
-		if settling.isEmpty() then return
+		if settling.isEmpty() && self.state.body.aliasBindings.isEmpty() then return
 		// What is lent to a call that answers nothing that borrows, whose
 		// borrow ends with the call; a copy may be lent there as well as the
 		// place.
@@ -2091,6 +2133,10 @@ extend Lowerer {
 		// Each local: how often it is named, and how often read through.
 		var uses: Map<LocalId, (u32, u32)> = Map()
 		var written: Set<LocalId> = Set()
+		// What is written through, in place: an alias only read is checked
+		// as a view, which a reference made from it borrows in turn, so a
+		// reference that may be kept does not hold it.
+		var writtenThrough: Set<LocalId> = Set()
 		for id in self.state.body.exprs.ids() {
 			val expr = &self.state.body.exprs[id]
 			match expr.kind {
@@ -2105,10 +2151,16 @@ extend Lowerer {
 					}
 				}
 				.Assign(place, ..) | .Lend(place) => {
-					if self.bindingThrough(place) is .Some(local) then written.add(local)
+					if self.bindingThrough(place) is .Some(local) {
+						written.add(local)
+						writtenThrough.add(local)
+					}
 				}
 				.Ref(place) if self.kind(expr.ty) is .Ref(kind: .Var, ..) => {
-					if self.bindingThrough(place) is .Some(local) then written.add(local)
+					if self.bindingThrough(place) is .Some(local) {
+						written.add(local)
+						writtenThrough.add(local)
+					}
 				}
 				// A reference to it that may be kept — in a view built, an
 				// answer that borrows, a local — is to the place: a copy would
@@ -2123,6 +2175,12 @@ extend Lowerer {
 		for local in settling {
 			val (named, read) = usesOf(&uses, local)
 			if !written.contains(&local) && named == read then copies.add(local)
+		}
+		// What stays an alias and is only read holds its place to its last
+		// use.
+		for local in self.state.body.aliasBindings {
+			if !copies.contains(&local) && !writtenThrough.contains(&local) then
+				self.state.body.readAliases.add(local)
 		}
 		if copies.isEmpty() then return
 		var reads: Vec<ExprId> = Vec()
@@ -2161,5 +2219,60 @@ extend Lowerer {
 			}
 		}
 		return .None
+	}
+}
+
+extend Lowerer {
+	/// Notes that the code checked next, in the scope innermost now, runs
+	/// where `place` matched as `variant`: a literal of it there may take
+	/// its fields from the place.
+	var fn noteMatched(place: ExprId, variant: u32) = {
+		val .Enum(id, ..) = self.kind(self.underRefs(self.tyOf(place))) else return
+		self.state.matched.push(MatchedPlace(
+			depth: self.state.scopes.len(),
+			place: place,
+			id: id,
+			variant: variant,
+		))
+	}
+
+	/// Ends the innermost scope, and what was matched in it.
+	var fn endScope() = {
+		self.state.scopes.pop()
+		self.takeMatched()
+	}
+
+	/// What was matched in the innermost scope, taken out while the scope
+	/// is put aside.
+	var fn takeMatched(): Vec<MatchedPlace> = {
+		var taken: Vec<MatchedPlace> = Vec()
+		val depth = self.state.scopes.len()
+		while self.state.matched.last() is .Some(m) && m.depth >= depth {
+			taken.push(self.state.matched.pop().unwrap())
+		}
+		taken.reverse()
+		return taken
+	}
+
+	/// Whether `base` is a place an arm or a test around matched as variant
+	/// `variant` of enum `id`.
+	fn matchedAs(base: ExprId, id: EnumId, variant: u32): bool = {
+		for m in self.state.matched {
+			if m.id == id && m.variant == variant && self.samePlace(m.place, base) then return true
+		}
+		return false
+	}
+
+	/// Whether two expressions name the same place: the same local, the
+	/// same fields of it, through references.
+	fn samePlace(a: ExprId, b: ExprId): bool = {
+		val exprs = &self.state.body.exprs
+		return match (exprs[a].kind, exprs[b].kind) {
+			(.Move(inner), _) | (.Deref(inner), _) => self.samePlace(inner, b)
+			(_, .Deref(inner)) => self.samePlace(a, inner)
+			(.Local(x), .Local(y)) => x == y
+			(.Field(base: x, index: i), .Field(base: y, index: j)) => i == j && self.samePlace(x, y)
+			_ => false
+		}
 	}
 }

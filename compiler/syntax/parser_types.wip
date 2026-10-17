@@ -3,6 +3,37 @@
 extend Parser {
 	var fn ty(): TypeId = self.tyWithArgs(true)
 
+	/// A lambda's result type, after its `:`. The `=>` after it is the
+	/// lambda's, so a `(` there opens a tuple — `(n: i64): (i64, i64) =>
+	/// (n, n)` — unless it opens a function type, whose parameters are
+	/// named, or which has none.
+	var fn lambdaResultTy(): TypeId = {
+		val next = self.nth(1)
+		val named = (isIdent(next) || next == .Underscore) && self.nth(2) == .Colon
+		if !self.at(.LParen) || next == .RParen || named then return self.ty()
+		val start = self.span()
+		val kind = self.tupleType(start)
+		return self.allocType(kind, start.to(self.prevSpan()))
+	}
+
+	/// `(A, B)` from its `(`, begun at `start`: a tuple, the prelude's
+	/// `TupleN`.
+	var fn tupleType(start: Span): TypeKind = {
+		val open = self.bump()
+		val (elems, _) = self.list(
+			open,
+			.RParen,
+			"a type",
+			(kind) => canStartType(kind),
+			(p) => .Some(p.ty()),
+		)
+		val span = start.to(self.prevSpan())
+		return match self.tupleName(elems.len(), span, "type") {
+			.Some(name) => .Named(name: name, args: elems)
+			.None => .Error
+		}
+	}
+
 	/// A type after `as`. `x as i64 < y` compares, so a `<` there does not
 	/// start type arguments — except after `ptr`, which is the one generic
 	/// name a cast's target may have: `p as ptr<Db>`.
@@ -84,21 +115,7 @@ extend Parser {
 			// function type is the other thing a `(` opens here: its `)` is
 			// followed by `=>`, or its parameters are named.
 			.LParen if !(self.parenBefore(.FatArrow) ||
-				(isIdent(self.nth(1)) && self.nth(2) == .Colon)) => {
-				val open = self.bump()
-				val (elems, _) = self.list(
-					open,
-					.RParen,
-					"a type",
-					(kind) => canStartType(kind),
-					(p) => .Some(p.ty()),
-				)
-				val span = start.to(self.prevSpan())
-				match self.tupleName(elems.len(), span, "type") {
-					.Some(name) => .Named(name: name, args: elems)
-					.None => .Error
-				}
-			}
+				(isIdent(self.nth(1)) && self.nth(2) == .Colon)) => self.tupleType(start)
 			.LParen => {
 				val open = self.bump()
 				val (params, _) = self.list(
@@ -168,6 +185,12 @@ extend Parser {
 				self.report(diagnostic)
 				return self.allocType(.Error, span)
 			}
+			// A number, as a length parameter's argument: `InlineVec<u8, 256>`.
+			.Int => {
+				val span = self.bump()
+				val value = self.intValue(span)
+				TypeKind::Length(value: if value > U64_MAX as u128 then U64_MAX else value as u64)
+			}
 			.LBracket => {
 				val open = self.bump()
 				val elem = self.ty()
@@ -189,6 +212,20 @@ extend Parser {
 							),
 						) is .Some(value) {
 							len = .Some(.Int(value: value))
+						}
+						// `[T; N + 1]`: a length is worked out where it is
+						// written, and a generic is checked once.
+						if self.peek() is .Plus | .Minus | .Star | .Slash | .Percent {
+							val diagnostic = Diagnostic::error(
+								LENGTH,
+								"an array's length is a number, a constant or a length parameter",
+								self.span(),
+								"arithmetic in a type",
+							).withNote(
+								"a length is known where the type is written, and a generic is checked once, for every length; work it out in a constant, `val SIDE = WIDE + 1`",
+							)
+							self.report(diagnostic)
+							self.skipUntil((kind, lineBreak) => kind == .RBracket || lineBreak)
 						}
 					} else {
 						val diagnostic = self.expected("`;` and a length").withHelp(
@@ -228,7 +265,7 @@ extend Parser {
 			open,
 			.Gt,
 			"a type",
-			(kind) => canStartType(kind),
+			(kind) => canStartType(kind) || kind == .Int,
 			(q) => .Some(q.ty()),
 		))
 		return (args, open.to(close))
@@ -281,10 +318,13 @@ extend Parser {
 				open,
 				.Gt,
 				"a type parameter",
-				(kind) => isIdent(kind) || kind == .Type,
+				(kind) => isIdent(kind) || kind == .Type || kind == .Val,
 				(q) => {
 					// `type Item`: a type each implementation decides.
 					val decided: Option<Span> = if q.at(.Type) then .Some(q.bump()) else .None
+					// `val N`: a length.
+					val length: Option<Span> =
+						if decided.isNone() && q.at(.Val) then .Some(q.bump()) else .None
 					val name = q.name("a type parameter")?
 					val bounds = q.bounds()?
 					// `K = T`: what a use that leaves it out means.
@@ -294,7 +334,8 @@ extend Parser {
 						name: name,
 						bounds: bounds,
 						default: default,
-						span: decided.unwrapOr(name.span).to(q.prevSpan()),
+						span: decided.or(length).unwrapOr(name.span).to(q.prevSpan()),
+						length: length,
 					))
 				},
 			),

@@ -266,6 +266,7 @@ extend Checker {
 	/// does not: they stand for the place itself.
 	fn isKeptRef(local: LocalId): bool = {
 		val def = &self.body.locals[local]
+		if self.isReadAlias(local) then return true
 		if !self.isSharedRef(def.ty) then return false
 		return match def.kind {
 			.Param => false
@@ -274,6 +275,20 @@ extend Checker {
 			.Let(..) | .Var => true
 		}
 	}
+
+	/// What a reference into `reference` borrows of a place, where it is an
+	/// alias binding only read: the place it aliases, and what that holds.
+	fn readPlaceRoots(reference: ExprId, state: &State): Roots = {
+		val .Local(local) = self.body.exprs[reference].kind else return Roots()
+		val .Some(place) = self.readPlaces.get(&local) else return Roots()
+		return self.placeRoots(place.clone(), &state)
+	}
+
+	/// Whether `local` is an alias binding only read, which is kept as a view
+	/// of its place whatever kind of reference it is: an alias of a place
+	/// that may be written is a `&var`, through which nothing writes.
+	fn isReadAlias(local: LocalId): bool =
+		self.body.readAliases.contains(&local) && self.keptBindings.contains(&local)
 
 	/// The reference `place` lies behind, where that reference is kept — in a
 	/// local, a view's field, an element, or the place an alias refers to —
@@ -286,13 +301,12 @@ extend Checker {
 			match self.body.exprs[e].kind {
 				.Field(base, ..) | .Index(base, ..) | .SubSlice(base, ..) => e = base
 				.Deref(inner) => {
-					val kept =
-						self.isSharedRef(self.ty(inner)) &&
-						match self.body.exprs[inner].kind {
-							.Local(local) => self.isKeptRef(local)
-							.Field(..) | .Index(..) | .Deref(..) => true
-							_ => false
-						}
+					val kept = match self.body.exprs[inner].kind {
+						.Local(local) if self.isReadAlias(local) => true
+						.Local(local) => self.isSharedRef(self.ty(inner)) && self.isKeptRef(local)
+						.Field(..) | .Index(..) | .Deref(..) => self.isSharedRef(self.ty(inner))
+						_ => false
+					}
 					if kept then return .Some(inner)
 					e = inner
 				}
@@ -426,9 +440,17 @@ extend Checker {
 		var roots = Roots()
 		match body.exprs[id].kind {
 			// A variable, an element of one, or a `for` binding that refers to
-			// an element: what the variable borrows.
+			// an element: what the variable borrows. An alias only read borrows
+			// what it was bound to, its place.
 			.Local(..) | .Index(..) | .Deref(..) | .Field(..) => {
-				if self.accessPath(id) is .Some(path) {
+				val path = match body.exprs[id].kind {
+					.Local(local) if self.readPlaces.contains(&local) => Option::Some(Path(
+						local: local,
+						projs: Vec(),
+					))
+					_ => self.accessPath(id)
+				}
+				if path is .Some(path) {
 					if state.roots.get(&path.local) is .Some(paths) {
 						for p in paths {
 							roots.paths.add(p.clone())
@@ -536,7 +558,10 @@ extend Checker {
 				// borrows, and not in what holds it.
 				if lends.place {
 					match self.keptReferenceBehind(inner) {
-						.Some(reference) => roots.add(self.strRoots(reference, &state))
+						.Some(reference) => {
+							roots.add(self.strRoots(reference, &state))
+							roots.add(self.readPlaceRoots(reference, &state))
+						}
 						.None => match self.accessPath(inner) {
 							.Some(path) => roots.add(self.placeRoots(path, &state))
 							.None => {
@@ -550,8 +575,12 @@ extend Checker {
 					}
 				}
 			}
-			// A reference kept in a variable points where its roots are.
-			.Local(local) if self.isKeptRef(local) => roots = self.strRoots(e, &state)
+			// A reference kept in a variable points where its roots are; an
+			// alias only read, into its place as well.
+			.Local(local) if self.isKeptRef(local) => {
+				roots = self.strRoots(e, &state)
+				roots.add(self.readPlaceRoots(e, &state))
+			}
 			// A reference parameter, or a binding that refers into a place:
 			// the place, and what it borrows.
 			.Local(..) => {
@@ -645,7 +674,15 @@ extend Checker {
 		if views.isEmpty() then return
 		val roots = self.strRoots(scrutinee, &state)
 		for local in views {
-			state.roots.put(local, roots.paths.clone())
+			// An alias only read that is no view refers to its place alone.
+			val held = match self.readPlaces.get(&local) {
+				.Some(place) if !self.isView(self.body.locals[local].ty) => {
+					val placed = self.placeRoots(place.clone(), &state)
+					placed.paths
+				}
+				_ => roots.paths.clone()
+			}
+			state.roots.put(local, held)
 			state.stale.remove(&local)
 		}
 	}
@@ -788,6 +825,10 @@ extend Checker {
 		for (i, local) in state.roots.keys().forwards().enumerate() {
 			if state.roots.values()[i].items().any((root) => root.overlaps(&path)) then
 				stale.push(local)
+		}
+		// An alias only read refers to its place, as a view does.
+		for entry in self.readPlaces {
+			if entry.value.overlaps(&path) then stale.push(entry.key)
 		}
 		for local in stale {
 			state.stale.put(local, Stale(
@@ -972,10 +1013,27 @@ extend Checker {
 			self.report(diagnostic)
 			return
 		}
+		val what = if stale.how == .Dropped then "dropped" else "changed"
+		// A binding of a pattern only read refers to its place to its last
+		// use.
+		if self.readPlaces.contains(&local) {
+			val diagnostic = Diagnostic::error(
+				STR_OUTLIVED_ITS_BYTES,
+				"`\(name)` is used after `\(root)`, which it refers to, \(verb) \(what)",
+				span,
+				"used here",
+			).withSecondary(stale.change, "`\(root)` \(stale.how.text()) here")
+				.withSecondary(def.span, "`\(variable)` refers to `\(root)`")
+				.withNote(
+					"a binding of a pattern on a place refers to the place, so the place must not change while the binding is still used",
+				)
+				.withHelp("use `\(name)` before `\(root)` changes, or take what is needed from it before then")
+			self.report(diagnostic)
+			return
+		}
 		// The word a callee could have said, where it would have kept the
 		// view good: the fix, which comes before the help.
 		val hint = self.staleHint(local, span)
-		val what = if stale.how == .Dropped then "dropped" else "changed"
 		val borrowing = self.borrowing(def.ty)
 		var diagnostic = Diagnostic::error(
 			STR_OUTLIVED_ITS_BYTES,

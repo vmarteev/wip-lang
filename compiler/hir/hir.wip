@@ -189,6 +189,12 @@ extend Program {
 
 	/// Whether `ty` is the prelude's `String`, which text patterns and `==`
 	/// treat as the text it holds.
+	/// Whether `ty` is the prelude's `InlineSlots`, whose first `len` slots
+	/// alone hold values to drop.
+	pub fn isInlineSlots(ty: Ty): bool =
+		self.types.kind(ty) is .Struct(id, ..) &&
+		self.preludeItems.structure(.InlineSlots) == .Some(id)
+
 	pub fn isString(ty: Ty): bool =
 		self.types.kind(ty) is .Struct(id, ..) && self.preludeItems.structure(.String) == .Some(id)
 
@@ -313,6 +319,9 @@ extend Program {
 		.Ref(inner, kind: .Shared) => "&\(self.nameOf(inner, &interner, symbol))"
 		.Ref(inner, kind: .Var) => "&var \(self.nameOf(inner, &interner, symbol))"
 		.Array(elem, len) => "[\(self.nameOf(elem, &interner, symbol)); \(len)]"
+		.ArrayOf(elem, len) =>
+			"[\(self.nameOf(elem, &interner, symbol)); \(interner.resolve(len.name))]"
+		.Count(value) => "\(value)"
 		.Slice(elem) => "[\(self.nameOf(elem, &interner, symbol))]"
 	}
 
@@ -354,7 +363,7 @@ extend Program {
 
 	/// The type of an array's or a slice's elements.
 	pub fn elementTy(ty: Ty): Ty = match self.types.kind(ty) {
-		.Array(elem, ..) | .Slice(elem) => elem
+		.Array(elem, ..) | .ArrayOf(elem, ..) | .Slice(elem) => elem
 		_ => panic("elements of a type that is not an array or a slice")
 	}
 
@@ -437,6 +446,12 @@ extend Program {
 		if self.referred(ty) is .Some(inner) then
 			return self.answeredThroughReferences(interfaceId) &&
 				self.implements(inner, interfaceId)
+		// An array's own, `extend [T; N]`.
+		if self.types.kind(ty) is .Array(..) {
+			for i in self.impls {
+				if i.interfaceId == interfaceId && i.ty == .Builtin(.Array) then return true
+			}
+		}
 		val owner: TypeDef = match self.typeDef(ty) {
 			.Some(def) => def
 			.None => match BuiltinOwner::of(self.types.kind(ty)) {
@@ -529,6 +544,7 @@ extend Program {
 				!seen.add(ty) || self.allPlain(&fields, args, &var seen)
 			}
 			.Array(elem, len) => len == 0 || self.plain(elem, &var seen)
+			.ArrayOf(elem, ..) => self.plain(elem, &var seen)
 			_ => true
 		}
 	}
@@ -631,7 +647,9 @@ extend Program {
 		.Struct(id, args) =>
 			self.structs[id].isView || self.heldHoldView(args, &self.structs[id].holds)
 		.Enum(id, args) => self.enums[id].isView || self.heldHoldView(args, &self.enums[id].holds)
-		.Array(elem: inner, ..) | .Own(inner) | .Slice(elem: inner) => self.holdsView(inner)
+		.Array(elem: inner, ..) | .ArrayOf(elem: inner, ..) | .Own(inner) | .Slice(elem: inner) => self.holdsView(
+			inner,
+		)
 		_ => false
 	}
 
@@ -654,9 +672,8 @@ extend Program {
 			self.structs[id].isView || self.heldMayHoldView(args, &self.structs[id].holds)
 		.Enum(id, args) =>
 			self.enums[id].isView || self.heldMayHoldView(args, &self.enums[id].holds)
-		.Array(elem: inner, ..) | .Own(inner) | .Slice(elem: inner) | .Slots(inner) => self.mayHoldView(
-			inner,
-		)
+		.Array(elem: inner, ..) | .ArrayOf(elem: inner, ..) | .Own(inner) | .Slice(elem: inner)
+		| .Slots(inner) => self.mayHoldView(inner)
 		_ => false
 	}
 
@@ -721,8 +738,8 @@ extend Program {
 		.Assoc(base, ..) => self.markHeld(base, &var holds)
 		.Struct(id, args) => self.markHeldArgs(args, &self.structs[id].holds, &var holds)
 		.Enum(id, args) => self.markHeldArgs(args, &self.enums[id].holds, &var holds)
-		.Array(elem: inner, ..) | .Own(inner) | .Slice(elem: inner) | .Slots(inner)
-		| .Ref(inner, ..) | .Ptr(inner) => self.markHeld(inner, &var holds)
+		.Array(elem: inner, ..) | .ArrayOf(elem: inner, ..) | .Own(inner) | .Slice(elem: inner)
+		| .Slots(inner) | .Ref(inner, ..) | .Ptr(inner) => self.markHeld(inner, &var holds)
 		.Fn(params, ret) => {
 			for p in self.types.list(params) {
 				self.markNamed(p, &var holds)
@@ -748,8 +765,8 @@ extend Program {
 		.Param(param) => {
 			if param.index as i64 < holds.len() then holds[param.index as i64] = true
 		}
-		.Assoc(base, ..) | .Array(elem: base, ..) | .Own(inner: base) | .Slice(elem: base)
-		| .Slots(inner: base) | .Ref(inner: base, ..) | .Ptr(inner: base) => self.markNamed(
+		.Assoc(base, ..) | .Array(elem: base, ..) | .ArrayOf(elem: base, ..) | .Own(inner: base)
+		| .Slice(elem: base) | .Slots(inner: base) | .Ref(inner: base, ..) | .Ptr(inner: base) => self.markNamed(
 			base,
 			&var holds,
 		)
@@ -803,6 +820,7 @@ extend Program {
 				false
 			}
 			.Array(elem, len) => len > 0 && self.owning(elem, &var seen)
+			.ArrayOf(elem, ..) => self.owning(elem, &var seen)
 			_ => false
 		}
 	}
@@ -828,6 +846,9 @@ pub struct GenericParamDef {
 	/// What it is where a use of the type leaves it out.
 	pub var default: ParamDefault
 	pub span: Span
+	/// Declared `val N`: a length, which stands where an array's length may,
+	/// and whose arguments are numbers.
+	pub length: bool = false
 }
 
 /// What a struct's or an enum's type parameter is where a use leaves it
@@ -960,6 +981,9 @@ pub enum BuiltinOwner {
 	Str
 	Cstring
 	Slice
+	/// `[T; N]`, an array, whose own methods and implementations, `extend
+	/// [T; N]`, come before its slice's, which it has too.
+	Array
 	/// `Slots<T>`, the prelude's uninitialized storage.
 	Slots
 	/// `void`, whose one value compares, hashes and is written.
@@ -998,6 +1022,7 @@ extend BuiltinOwner {
 		.Str => "str"
 		.Cstring => "cstring"
 		.Slice => "slice"
+		.Array => "array"
 		.Slots => "Slots"
 		.Void => "void"
 		.Own => "own"
@@ -1262,6 +1287,15 @@ pub enum Intrinsic {
 	/// `slots.release()`: the slots are left holding no block, and the block
 	/// is not freed: what slots over elements they do not own end with.
 	SlotsRelease
+	/// `InlineSlots::empty()`: slots in place, holding nothing, their bytes
+	/// zero.
+	InlineEmpty
+	/// `slots.moveIn(index, value)`: the value goes in the slot in place,
+	/// which held nothing, so nothing is dropped.
+	InlineMoveIn
+	/// `slots.moveOut(index)`: the value comes out of the slot in place,
+	/// which holds nothing again.
+	InlineMoveOut
 	/// `str::fromBytes(bytes)`: the bytes, seen as text. A `str` and a
 	/// `&[u8]` are the same pair — a pointer and a length — so this copies it
 	/// and says nothing about what the bytes mean.
@@ -1596,6 +1630,15 @@ pub struct Body {
 	/// binding refers into the walked container, which the step holds, as a
 	/// `for` over a slice does.
 	pub var sequenceWalks: Set<ExprId> = Set()
+	/// The alias bindings that nothing writes through — no assignment, no
+	/// `&var`, no lending, no reference to them that may be kept — which
+	/// hold the place they alias only to their last use: the analysis
+	/// checks each as a view of that place, stale once the place changes.
+	pub var readAliases: Set<LocalId> = Set()
+	/// What `..base` takes from `base`: a struct's field read from it, or
+	/// the whole of it, where a variant takes a field that owns memory. A
+	/// move of one that cannot be made says how `..` can take it.
+	pub var restTaken: Set<ExprId> = Set()
 	/// The bindings that took a copy of plain data: a `val … else`'s, so that
 	/// a write through one says where it would go, and a `match`'s or an
 	/// `is`'s that nothing writes through.
@@ -1803,6 +1846,9 @@ pub enum ExprKind {
 	/// The value's bits, truncated to the width of its type; a negative value
 	/// is in two's complement.
 	Int(value: u128)
+	/// `N`, a length parameter, as a value in the item that declares it, of
+	/// the length type it holds: an `i64`, the number each instance makes it.
+	LengthOf(length: Ty)
 	Float(value: f64)
 	Bool(value: bool)
 	Str(symbol: Symbol)
@@ -1967,8 +2013,8 @@ extend ExprKind {
 	/// A walk written against this keeps working when a kind is added: the
 	/// structure of an expression is described here, once.
 	pub fn children(): Vec<ExprId> = match self {
-		.Int(..) | .Float(..) | .Bool(..) | .Str(..) | .Table(..) | .Null | .Zeroed | .Local(..)
-		| .FnRef(..) | .DropRef(..) | .Error => Vec()
+		.Int(..) | .LengthOf(..) | .Float(..) | .Bool(..) | .Str(..) | .Table(..) | .Null | .Zeroed
+		| .Local(..) | .FnRef(..) | .DropRef(..) | .Error => Vec()
 		.Panic(note, ..) => match note {
 			.Some(e) => [e]
 			.None => Vec()

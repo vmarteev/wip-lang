@@ -109,6 +109,9 @@ extend Builder {
 				self.dropOwned(ptr, ty, inner)
 				self.push(.Zero(place.clone()))
 			}
+			// Slots in place drop those that hold a value, as many as their
+			// count says.
+			.Struct(..) if self.program.isInlineSlots(ty) => self.dropHeld(&place, ty)
 			.Struct(..) | .Array(..) => {
 				val parts = self.parts(ty)
 				for (projection, part) in parts.backwards() {
@@ -138,6 +141,44 @@ extend Builder {
 			}
 			_ => {}
 		}
+	}
+
+	/// Drops what slots in place hold: the first of them, as many as their
+	/// count says, last first. Nothing is freed: they are where they lie.
+	var fn dropHeld(place: &Place, ty: Ty) = {
+		val elem = match self.kind(self.program.fieldTys(ty)[0]) {
+			.Array(elem, ..) => elem
+			_ => panic("slots in place are an array")
+		}
+		if !self.needsDrop(elem) then return
+		val items = place.project(.Field(0))
+		val i = self.temp(I64)
+		self.assign(Place::of(i), .Use(.Copy(place.project(.Field(1)))))
+		val header = self.newBlock()
+		val body = self.newBlock()
+		val exit = self.newBlock()
+		self.terminate(.Goto(header))
+		self.switchTo(header)
+		val done = self.value(BOOL, .Binary(
+			op: .Le,
+			lhs: .Copy(Place::of(i)),
+			rhs: Builder::int(0, I64),
+		))
+		self.terminate(.Branch(cond: done, thenBlock: exit, otherwise: body))
+		self.switchTo(body)
+		val previous = self.value(I64, .Binary(
+			op: .Sub,
+			lhs: .Copy(Place::of(i)),
+			rhs: Builder::int(1, I64),
+		))
+		self.assign(Place::of(i), .Use(previous))
+		// In line: slots in place cannot hold themselves but through an
+		// `own`, whose drop is its own.
+		val slot = items.project(.Index(i))
+		self.dropPlace(&slot, elem)
+		self.terminate(.Goto(header))
+		self.switchTo(exit)
+		self.push(.Zero(place.project(.Field(1))))
 	}
 
 	/// Drops a buffer: its elements, last first, then its allocation. A
@@ -704,6 +745,11 @@ extend Builder {
 				self.push(.Free(.Copy(Place::of(chain.node))))
 				self.assign(Place::of(chain.node), .Use(next))
 				self.terminate(.Goto(chain.again))
+			}
+			.Struct(..) if self.program.isInlineSlots(ty) => {
+				self.dropHeld(&place, ty)
+				val none: Vec<DropPart> = Vec()
+				self.dropPartsLast(place, &none, chain)
 			}
 			.Struct(..) | .Array(..) => {
 				val parts = self.parts(ty)

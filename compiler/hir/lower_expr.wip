@@ -129,6 +129,18 @@ extend Lowerer {
 			)
 			.Array(elems) => self.arrayLit(&elems, hint, span)
 			.ArrayRepeat(elem, count: .Literal(count)) => self.arrayRepeat(elem, count, hint, span)
+			// `[x; N]` of a length parameter: an array of its length, which each
+			// instance knows.
+			.ArrayRepeat(elem, count: .Expr(count)) if self.lengthCount(count).isSome() => {
+				val .Some(length) = self.lengthCount(count) else panic("just asked")
+				val elemHint = self.elementHint(hint)
+				val checked = match elemHint {
+					.Some(t) => self.check(elem, t)
+					.None => self.infer(elem, .None)
+				}
+				val ty = self.program.types.arrayOfLength(self.tyOf(checked), length)
+				self.alloc(.ArrayRepeat(elem: checked, count: 0), ty, span)
+			}
 			// `[0; SIZE]`: a count that names a constant is known where it is
 			// written, as a type's length is.
 			.ArrayRepeat(elem, count: .Expr(count)) if self.constantCount(count).isSome() => {
@@ -359,7 +371,7 @@ extend Lowerer {
 			return .Some((items, elem))
 		}
 		return match self.kind(ty) {
-			.Array(elem, ..) => {
+			.Array(elem, ..) | .ArrayOf(elem, ..) => {
 				val slice = self.intern(.Slice(elem))
 				Option::Some(
 					(self.alloc(.SubSlice(base: e, lo: .None, hi: .None), slice, span), elem),
@@ -424,15 +436,26 @@ extend Lowerer {
 	}
 
 	var fn name(sym: Symbol, hint: Option<Ty>, span: Span): ExprId = {
+		// A length parameter is its number, an `i64`, in each instance.
+		if self.lookup(sym).isNone() && self.lengthParam(sym) is .Some(length) then
+			return self.alloc(.LengthOf(length), I64, span)
 		if self.lookup(sym) is .Some(local) {
 			// The first use of a local waiting for its type: what is expected
 			// here says it.
-			if !self.state.pendingLocals.isEmpty() && self.state.pendingLocals.contains(&local) {
+			if !self.state.pendingLocals.isEmpty() &&
+				self.state.pendingLocals.get(&local) is .Some(pending) {
 				val found = match hint {
 					.Some(h) => self.underRefs(h)
 					.None => ERROR
 				}
-				self.decide(local, found, span)
+				if !pending.literal then self.decide(local, found, span)
+				else self.decideLiteral(
+					local,
+					if found == ERROR then .None else .Some(found),
+					into: true,
+					from: false,
+					at: span,
+				)
 			}
 			val ty = self.state.body.locals[local].ty
 			val e = self.alloc(.Local(local), ty, span)
@@ -705,7 +728,7 @@ extend Lowerer {
 			_ => h
 		}
 		return match self.kind(wanted) {
-			.Array(elem, ..) | .Slice(elem) => .Some(elem)
+			.Array(elem, ..) | .ArrayOf(elem, ..) | .Slice(elem) => .Some(elem)
 			_ => .None
 		}
 	}
@@ -722,6 +745,14 @@ extend Lowerer {
 	}
 
 	/// The name of a repeat count that is a constant, not a variable.
+	/// The length parameter a repeat count names, as a type.
+	var fn lengthCount(count: ast::ExprId): Option<Ty> = {
+		val expr = &self.ast.exprs[count]
+		val .Name(sym) = expr.kind else return .None
+		if self.lookup(sym).isSome() then return .None
+		return self.lengthParam(sym)
+	}
+
 	fn constantCount(count: ast::ExprId): Option<ast::Name> = {
 		val expr = &self.ast.exprs[count]
 		val .Name(sym) = expr.kind else return .None
@@ -938,7 +969,14 @@ extend Lowerer {
 		// nothing of what is shifted, whose type is the answer's — `1 << n` of
 		// a `u32` amount is the `1` expected, or an `i64`.
 		val shift = op is .Shl | .Shr
-		val (left, right) = if self.takesOther(lhs) && !self.takesOther(rhs) && !shift {
+		// What takes its type from beside it is checked second, on the left
+		// as on the right: a literal, an `if` of literals, a local waiting
+		// for its first use to say what number it is.
+		val leftWaits = self.waitingLiteral(lhs)
+		val rightWaits = self.waitingLiteral(rhs)
+		val leftTakes = self.takesOther(lhs) || self.numberShaped(lhs) || leftWaits.isSome()
+		val rightTakes = self.takesOther(rhs) || self.numberShaped(rhs) || rightWaits.isSome()
+		val (left, right) = if leftTakes && !rightTakes && !shift {
 			val r = self.comparedOperand(op, rhs, hint)
 			val rt = self.tyOf(r)
 			var left: Option<Ty> = .None
@@ -946,6 +984,9 @@ extend Lowerer {
 				val builtins = self.operatorLhsBuiltins(w, rt)
 				left = onlyOne(&builtins)
 			}
+			// A literal's variable takes what the literal would.
+			if leftWaits is .Some(local) then
+				self.decideBeside(local, r, left.unwrapOr(rt), self.ast.exprs[lhs].span)
 			val l = self.comparedOperand(op, lhs, .Some(left.unwrapOr(rt)))
 			(l, r)
 		} else {
@@ -956,6 +997,16 @@ extend Lowerer {
 				var tys = self.operatorRhsTys(w, lt)
 				tys.retain((t) => t != lt)
 				right = onlyOne(&tys)
+			}
+			// A literal's variable takes what the literal would; a shift's
+			// amount says nothing of what is shifted.
+			if rightWaits is .Some(local) {
+				val at = self.ast.exprs[rhs].span
+				val wanted = right.unwrapOr(lt)
+				if shift then self.decideLiteral(local, .None, into: false, from: false, at: at)
+				else if leftTakes then
+					self.decideLiteral(local, .Some(wanted), into: true, from: false, at: at)
+				else self.decideBeside(local, l, wanted, at)
 			}
 			val r = self.comparedOperand(op, rhs, .Some(right.unwrapOr(lt)))
 			(l, r)
@@ -1022,7 +1073,7 @@ extend Lowerer {
 		// slices of their elements. A mistake is reported with the operands as
 		// written.
 		val written = (l, r)
-		val compared = comparison(op) && (lt != rt || self.kind(lt) is .Array(..))
+		val compared = comparison(op) && (lt != rt || self.kind(lt) is .Array(..) | .ArrayOf(..))
 		if compared {
 			val left = self.asElements(l)
 			val right = self.asElements(r)
@@ -1134,9 +1185,9 @@ extend Lowerer {
 		argument: bool,
 	): ExprId = {
 		val kind: RefKind = if op == .RefVar then .Var else .Shared
-		// A `val`'s whole value: this `&`, and no `&` inside it.
-		val local = self.state.localReference
-		self.state.localReference = false
+		// A `val`'s whole value, or a branch's that is: this `&`, and no `&`
+		// inside it.
+		val local = kind == .Shared && self.state.localReferences.contains(&operand)
 		var innerHint: Option<Ty> = .None
 		if hint is .Some(h) && self.kind(h) is .Ref(inner: t, ..) then innerHint = .Some(t)
 		// The operand may be a range of elements.
@@ -1393,7 +1444,7 @@ extend Lowerer {
 		val call = self.compareCall(compare, ty, answerTy, l, r, span)
 		// `.Less` is the first variant of `Ordering`, `.Same` the second and
 		// `.More` the third.
-		val variant: u32 = if op is .Lt | .Ge then 0 else 2
+		val variant = if op is .Lt | .Ge then 0 else 2
 		val negated = op is .Ge | .Le
 		val test = self.alloc(
 			.Is(scrutinee: call, pattern: .Variant(variant: variant, binders: Vec())),
@@ -1524,6 +1575,8 @@ extend Lowerer {
 			rspan,
 			self.tyName(rt),
 		)
+		// A number literal's local that kept its own type, beside another.
+		if lt != rt then diagnostic = self.withKeptOwn(self.withKeptOwn(diagnostic, l, rt), r, lt)
 		// A type of a program's own answers an arithmetic operator by
 		// implementing its interface, with the type on the other side its
 		// argument where it is another.
@@ -1613,7 +1666,7 @@ extend Lowerer {
 					"a type whose order is not its fields writes `extend …: Ord` itself instead",
 				)
 			}
-			op is .Eq | .Ne && self.kind(lt) is .Array(..) =>
+			op is .Eq | .Ne && self.kind(lt) is .Array(..) | .ArrayOf(..) =>
 				diagnostic = diagnostic.withHelp("compare the elements one by one")
 		}
 		self.report(diagnostic)

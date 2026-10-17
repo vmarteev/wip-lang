@@ -24,6 +24,36 @@ assert(small == 3)
 assert(ratio > 0.0)
 ```
 
+Beside an operator, on either side, so does what takes its type as a
+literal does: a literal in parentheses, an `if`, a `match` or a block of
+literals. `(if c then 1.0 else -1.0) * x` is of `x`'s type, as `x * (if c
+then 1.0 else -1.0)` is.
+
+A variable whose value is such a literal is one until the first place
+after it that names it, and takes the type the literal would take there:
+beside an operand, an argument, a field, a `return`, a place lent, or a
+value assigned to it. So naming a number does not change what it is.
+Where that first place says nothing of a type — a method called on it, a
+shift's amount, a lambda, an integer that widens to the other operand's —
+it is `i64` or `f64`, and a later use that wants another is an error that
+says where the first use was:
+
+```wip,run
+fn half(x: f32): f32 = x / 2.0
+
+fn main() = {
+    val width: f32 = 4.0
+    var sum = 0.0
+    for x in [width, 1.0] {
+        sum += x // an f32: what is added to it says so
+    }
+    val side = if sum > 0.0 then 1.0 else -1.0
+    val reach = side * width // an f32 too
+    val size = 3.0
+    assert(half(size) == 1.5 && reach == 4.0 && sum == 5.0)
+}
+```
+
 An integer constant is as the literal it stands for: where an integer of
 another type is expected, or beside one in an operator, it is that type,
 if its value fits, and an error if it does not. A constant is a top-level
@@ -490,6 +520,31 @@ fn main() = {
 }
 ```
 
+A field may be named by a keyword — `type`, `when`, `in` — as a format or
+a C header names it, since where a field's name stands nothing else can:
+declared, after `.`, and before the `:` of a literal's value or a
+pattern's. A keyword names nothing else, so a pattern binds such a field
+under a name of its own:
+
+```wip,run
+enum Kind {
+    Key
+    Mouse
+}
+
+struct Event {
+    type: Kind
+    when: i64
+}
+
+fn main() = {
+    val event = Event(type: .Mouse, when: 120)
+    assert(event.type is .Mouse && event.when == 120)
+    val (when: at, ..) = event
+    assert(at == 120)
+}
+```
+
 A field is changed through a `var` binding or a `&var`, as `age` is
 above, and by the module that declares the type: there, every field is
 read and written. `var` on a field says who else may write it. `pub var`
@@ -512,6 +567,54 @@ fn main() = {
     val second = Queue()
     assert(first.waiting.len() == 1 && second.waiting.len() == 0)
 }
+```
+
+`..base` takes each field the literal does not name from `base`, as the
+field written out would, `field: base.field`, before any default: plain
+data is copied, and a field that owns memory is moved out of `base`,
+whose fields the literal named stay its own. `base` may also be a value
+that is no place — a call, `..defaults()`, or a copy, `..m.clone()` —
+which the literal holds while it takes what it needs, and drops after:
+
+```wip,run
+struct Job {
+    done: bool
+    name: String
+    steps: Vec<i64>
+}
+
+fn main() = {
+    var job = Job(
+        done: false,
+        name: String::of("parse"),
+        steps: Vec::of([1, 2]),
+    )
+    job.done = true
+    // `name` and `steps` are moved out of `job`; `done` was named.
+    val retried = Job(done: false, ..job)
+    assert(!retried.done && retried.name == "parse" && retried.steps.len() == 2)
+    assert(job.done)
+
+    val kept = Job(done: true, name: String::of("link"), steps: Vec())
+    val again = Job(done: false, ..Job(steps: Vec::of([3]), ..kept))
+    assert(again.steps.len() == 1 && again.name == "link")
+}
+```
+
+Behind a reference, a field that owns memory cannot be moved out, as
+`name: base.name` cannot: the literal is built from a copy, `..base.clone()`,
+or from a value the function owns. And building a value writes every
+field, so `..` takes only the fields the literal's module may write.
+
+```wip,error=E0405
+struct Job {
+    done: bool
+    name: String
+}
+
+fn retried(job: &Job): Job = Job(done: false, ..job)
+
+fn main() = {}
 ```
 
 A struct with no fields is its name alone, as a variant with none is: the
@@ -656,6 +759,47 @@ fn main() = {
 }
 ```
 
+A variant is built from another value the same way, `.Rect(width: 5,
+..shape)`, where `shape` is known to be that variant: in the arm of a
+`match` on it whose pattern is the variant, or in the block of an `is`
+test on it. Plain data is copied; where a field that owns memory is
+taken, the whole of `shape` is given up, as a `move fn`'s `self` is
+here:
+
+```wip,run
+enum Thing {
+    Lamp(name: String, turn: i64)
+    Door(name: String, turn: i64, open: bool)
+    Rock
+}
+
+extend Thing {
+    move fn turned(degrees: i64): Thing = match self {
+        .Lamp(turn, ..) => .Lamp(turn: (turn + degrees) % 360, ..self)
+        .Door(turn, ..) => .Door(turn: (turn + degrees) % 360, ..self)
+        _ => self
+    }
+}
+
+fn main() = {
+    val door = Thing::Door(name: String::of("gate"), turn: 300, open: false)
+    assert(door.turned(90) is .Door(name: "gate", turn: 30, open: false))
+}
+```
+
+Elsewhere the variant is not known, and `..` is refused (E0130):
+
+```wip,error=E0130
+enum Thing {
+    Lamp(name: String, turn: i64)
+    Rock
+}
+
+fn turned(thing: Thing): Thing = .Lamp(turn: 90, ..thing)
+
+fn main() = {}
+```
+
 An enum whose variants carry nothing is numbered in the order they are
 written, and answers `count()`, `fromIndex(n)` and `all()`, every variant
 as an array:
@@ -766,6 +910,58 @@ fn main() = {
 A function has no defaults: its type arguments are inferred where it is
 called. An `extend` block names every parameter, defaults too.
 
+A parameter may be a length instead of a type: `val N`, an `i64` known
+where the program compiles. It stands wherever an array's length may,
+`[T; N]`, and in the code it is a value, the number each use gives. A use
+gives it a number, a constant's name or a length parameter of its own, or
+leaves it to be inferred from an array, as a type parameter is:
+
+```wip,run
+val SIDE = 3
+
+struct Ring<T, val N> {
+    items: [T; N]
+    at: i64 = 0
+}
+
+extend Ring<T: copy, N> {
+    fn capacity(): i64 = N
+    fn last(): T = self.items[N - 1]
+}
+
+fn filled<T: copy, val N>(value: T): [T; N] = [value; N]
+
+fn total<val N>(numbers: [i64; N]): i64 = {
+    var sum = 0
+    for n in numbers {
+        sum += n
+    }
+    return sum
+}
+
+fn main() = {
+    val small: Ring<f32, 2> = Ring(items: [0.5, 1.5])
+    val square: Ring<u8, SIDE> = Ring(items: filled(7))
+    assert(small.capacity() == 2 && small.last() == 1.5)
+    assert(square.capacity() == 3 && square.last() == 7)
+    assert(total([1, 2, 3, 4]) == 10)
+}
+```
+
+A length is the number it is given, and a generic is checked once, for
+every length: so a type does no arithmetic on one, `[T; N + 1]`, which
+would have to be shown equal to another type without its number. The code
+does, since there `N` is a value. A number is a length's argument in a
+type; among an expression's type arguments a length is given by a
+constant's name, since `f(a < 3, b > (c))` compares. An interface takes
+types alone. An array has methods of its own in the prelude, `extend [T;
+N]`, which may answer an array of the same length, and a module may
+implement its own interface for every array so:
+
+```wip,error=E0369
+fn widened<val N>(numbers: [i64; N]): [i64; N + 1] = [0; N + 1]
+```
+
 An empty container, or a `.None`, says nothing of what it will hold. A
 `val` or a `var` whose value leaves type arguments open takes them from
 the first place after it that names it: a method called on it, whose
@@ -773,7 +969,8 @@ arguments say them as a generic function's arguments say its own; the type
 expected there, of an argument, a field or a `return`; or a value assigned
 to it. A parameter that place leaves open takes its default. The type is
 then what it would be had it been written, and the language server shows
-it:
+it. A number literal's variable waits the same way, for its type
+([Numbers](#numbers)):
 
 ```wip,run
 import std::collections::{Map}

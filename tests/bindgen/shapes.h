@@ -39,6 +39,13 @@ union Value {
     uint8_t bytes[8];
 };
 
+/* Fields named as Wip's keywords, which keep their names: a keyword
+   names a field. */
+struct Event {
+    int type;
+    float when;
+};
+
 /* Declared, never defined: a handle a library hands back. */
 struct Canvas;
 

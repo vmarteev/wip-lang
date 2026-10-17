@@ -73,6 +73,12 @@ pub enum TyKind {
 	Own(inner: Ty)
 	Ref(inner: Ty, kind: RefKind)
 	Array(elem: Ty, len: u64)
+	/// `[T; N]` where `N` is a length parameter, inside the generic item
+	/// that declares it: an array, once the item's arguments say how long.
+	ArrayOf(elem: Ty, len: TyParam)
+	/// A length as a type's argument, for a length parameter: the 256 of
+	/// `InlineVec<u8, 256>`. No value is of it.
+	Count(value: u64)
 	/// `[T]`: elements of a number known only at run time. Only behind a
 	/// reference.
 	Slice(elem: Ty)
@@ -363,8 +369,8 @@ extend Types {
 		self.numbers.put(kind.clone(), index as u32)
 		self.log.push(.Ty)
 		val parts: Vec<Ty> = match kind {
-			.Own(inner: t) | .Ref(inner: t, ..) | .Array(elem: t, ..) | .Slice(elem: t)
-			| .Ptr(inner: t) | .Slots(inner: t) | .Assoc(base: t, ..) => [t]
+			.Own(inner: t) | .Ref(inner: t, ..) | .Array(elem: t, ..) | .ArrayOf(elem: t, ..)
+			| .Slice(elem: t) | .Ptr(inner: t) | .Slots(inner: t) | .Assoc(base: t, ..) => [t]
 			.Struct(args, ..) | .Enum(args, ..) => self.list(args).toVec()
 			.Fn(params, ret) => {
 				var parts = self.list(params).toVec()
@@ -374,7 +380,7 @@ extend Types {
 			_ => Vec()
 		}
 		var facts = Facts(
-			generic: kind is .Param(..),
+			generic: kind is .Param(..) | .ArrayOf(..),
 			error: kind == .Error,
 			reference: kind is .Ref(..),
 			depth: 1,
@@ -396,6 +402,10 @@ extend Types {
 		if kind is .Own(inner) && self.kind(inner) is .Slice(elem) then self.intern(.Own(elem))
 		if kind is .Struct(..) | .Enum(..) | .Array(..) && !self.facts[index].generic then
 			self.intern(.Own(Ty(number: index as u32)))
+		// An array's length, and an array's length parameter, are there for
+		// `bind` to find, which interns nothing.
+		if kind is .Array(len, ..) then self.intern(.Count(len))
+		if kind is .ArrayOf(len, ..) then self.intern(.Param(len))
 		return Ty(number: index as u32)
 	}
 
@@ -433,6 +443,7 @@ extend Types {
 					.Own(inner) => .Own(map.get(inner))
 					.Ref(inner, kind) => .Ref(inner: map.get(inner), kind: kind)
 					.Array(elem, len) => .Array(elem: map.get(elem), len: len)
+					.ArrayOf(elem, len) => .ArrayOf(elem: map.get(elem), len: len)
 					.Slice(elem) => .Slice(map.get(elem))
 					.Ptr(inner) => .Ptr(map.get(inner))
 					.Slots(inner) => .Slots(map.get(inner))
@@ -480,6 +491,8 @@ extend Types {
 		return match kind {
 			.Own(inner: t) | .Ref(inner: t, ..) | .Ptr(inner: t) | .Slots(inner: t)
 			| .Array(elem: t, ..) | .Slice(elem: t) | .Assoc(base: t, ..) => self.any(t, test)
+			// The length is a parameter too.
+			.ArrayOf(elem: t, len: p) => test(.Param(param: p)) || self.any(t, test)
 			.Struct(args, ..) | .Enum(args, ..) => {
 				for t in self.list(args) {
 					if self.any(t, test) then return true
@@ -517,6 +530,10 @@ extend Types {
 			.Own(inner: t) => .Own(self.subst(t, &args))
 			.Ref(inner: t, kind: k) => .Ref(inner: self.subst(t, &args), kind: k)
 			.Array(elem: t, len: n) => .Array(elem: self.subst(t, &args), len: n)
+			.ArrayOf(elem: t, len: p) => {
+				val elem = self.subst(t, &args)
+				return self.arrayOfLength(elem, args[p.index])
+			}
 			.Slice(elem: t) => .Slice(self.subst(t, &args))
 			.Ptr(inner: t) => .Ptr(self.subst(t, &args))
 			.Slots(inner: t) => .Slots(self.subst(t, &args))
@@ -547,6 +564,11 @@ extend Types {
 			.Own(inner: t) => .Own(self.replaceParam(t, name, with))
 			.Ref(inner: t, kind: k) => .Ref(inner: self.replaceParam(t, name, with), kind: k)
 			.Array(elem: t, len: n) => .Array(elem: self.replaceParam(t, name, with), len: n)
+			.ArrayOf(elem: t, len: p) => {
+				val elem = self.replaceParam(t, name, with)
+				return if p.name == name then self.arrayOfLength(elem, with)
+				else self.intern(.ArrayOf(elem: elem, len: p))
+			}
 			.Slice(elem: t) => .Slice(self.replaceParam(t, name, with))
 			.Ptr(inner: t) => .Ptr(self.replaceParam(t, name, with))
 			.Slots(inner: t) => .Slots(self.replaceParam(t, name, with))
@@ -563,6 +585,15 @@ extend Types {
 			_ => panic("only types with parts can contain a type parameter")
 		}
 		return self.intern(kind)
+	}
+
+	/// An array of `elem`, as long as `length` says: a known length makes an
+	/// array, a length parameter an array of its length; anything else, an
+	/// error, which has been said where it was written.
+	pub var fn arrayOfLength(elem: Ty, length: Ty): Ty = match self.kind(length) {
+		.Count(value) => self.intern(.Array(elem: elem, len: value))
+		.Param(param) => self.intern(.ArrayOf(elem: elem, len: param))
+		_ => ERROR
 	}
 
 	/// `replaceParam` over each type of a list.
@@ -597,6 +628,15 @@ extend Types {
 			.Own(inner: t) => .Own(self.trySubstFind(t, &args)?)
 			.Ref(inner: t, kind: k) => .Ref(inner: self.trySubstFind(t, &args)?, kind: k)
 			.Array(elem: t, len: n) => .Array(elem: self.trySubstFind(t, &args)?, len: n)
+			.ArrayOf(elem: t, len: p) => {
+				val elem = self.trySubstFind(t, &args)?
+				if p.index >= args.len() then return .None
+				return match self.kind(args[p.index]) {
+					.Count(value) => self.find(.Array(elem: elem, len: value))
+					.Param(param: q) => self.find(.ArrayOf(elem: elem, len: q))
+					_ => .None
+				}
+			}
 			.Slice(elem: t) => .Slice(self.trySubstFind(t, &args)?)
 			.Ptr(inner: t) => .Ptr(self.trySubstFind(t, &args)?)
 			.Slots(inner: t) => .Slots(self.trySubstFind(t, &args)?)
@@ -711,21 +751,18 @@ extend Types {
 	/// Whether `ty` has the shape of `pattern`, binding each of the
 	/// pattern's parameters to the part of `ty` where it stands.
 	fn bind(pattern: Ty, ty: Ty, bound: &var Vec<Option<Ty>>): bool = {
-		if self.kind(pattern) is .Param(param: p) {
-			val at = p.index as i64
-			while bound.len() <= at {
-				bound.push(.None)
-			}
-			return match bound[at] {
-				.Some(earlier) => earlier == ty
-				.None => {
-					bound[at] = .Some(ty)
-					true
-				}
-			}
-		}
+		if self.kind(pattern) is .Param(param: p) then return bindParam(p, ty, &var bound)
 		if !self.isGeneric(pattern) then return pattern == ty
 		return match (self.kind(pattern), self.kind(ty)) {
+			// An array of a length parameter binds the parameter to the length.
+			(.ArrayOf(elem: a, len: p), .Array(elem: b, len: n)) => match self.find(.Count(n)) {
+				.Some(length) => self.bind(a, b, &var bound) && bindParam(p, length, &var bound)
+				.None => false
+			}
+			(.ArrayOf(elem: a, len: p), .ArrayOf(elem: b, len: q)) => match self.find(.Param(q)) {
+				.Some(length) => self.bind(a, b, &var bound) && bindParam(p, length, &var bound)
+				.None => false
+			}
 			(.Own(inner: a), .Own(inner: b)) | (.Array(elem: a, ..), .Array(elem: b, ..))
 			| (.Slice(elem: a), .Slice(elem: b)) | (.Ptr(inner: a), .Ptr(inner: b))
 			| (.Slots(inner: a), .Slots(inner: b)) => self.bind(a, b, &var bound)
@@ -815,5 +852,21 @@ extend Types {
 	pub fn intTy(ty: Ty): Option<IntTy> = match self.kind(ty) {
 		.Int(int: t) => .Some(t)
 		_ => .None
+	}
+}
+
+/// Binds the pattern's parameter `p` to `ty`, or answers whether an earlier
+/// binding of it is `ty`.
+fn bindParam(p: TyParam, ty: Ty, bound: &var Vec<Option<Ty>>): bool = {
+	val at = p.index as i64
+	while bound.len() <= at {
+		bound.push(.None)
+	}
+	return match bound[at] {
+		.Some(earlier) => earlier == ty
+		.None => {
+			bound[at] = .Some(ty)
+			true
+		}
 	}
 }

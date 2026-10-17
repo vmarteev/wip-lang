@@ -321,11 +321,16 @@ can hold what the answer refers to, by the callee's signature: a `&Node`
 cannot point into a `str`, so a lookup by name borrows the tree and not
 the name. A reference argument whose type holds it as
 its own lends its place; one that reaches it through a borrow lends what
-it borrows, so `words.next()` borrows the text and not `words`:
+it borrows, so `words.next()` borrows the text and not `words`. A closure
+it is given lends only what calling it may give back — its result, and what
+it writes through a `&var` it is passed — so a test answering `bool`
+lends nothing it captured, and `self.nodes.find((node) => node.name ==
+name)` borrows `self` and not `name`:
 
 ```wip,run
 struct Node {
     size: i64
+    name: String
 }
 
 struct Tree {
@@ -338,14 +343,21 @@ view struct Found {
 
 extend Tree {
     fn first(name: str): Found = Found(node: &self.nodes[0])
+
+    fn named(name: str): Option<&Node> from self = self.nodes.find((node) =>
+        node.name == name)
 }
 
 fn main() = {
-    val tree = Tree([Node(size: 3)])
+    val tree = Tree([Node(size: 3, name: String::of("root"))])
     var name = String::of("a")
     val found = tree.first(name.toStr())
     name.clear()
     assert(found.node.size == 3)
+    var wanted = String::of("root")
+    val root = tree.named(wanted.toStr())
+    wanted.clear()
+    assert(root is .Some(node) && node.size == 3)
 }
 ```
 
@@ -390,8 +402,10 @@ A `&` reference is a view. It may be a type argument — `Option<&Node>`,
 borrows what it points into, as a `str` borrows its bytes. `&place` is
 written wherever a reference is expected: a local's value, an assignment to
 one, a variant's payload. A local whose whole value is `&place` holds a
-reference without its type written; a `&` that is part of a value — a
-tuple's element — needs the type said. A slice has nothing of fixed size to
+reference without its type written, and so does one whose whole value is
+an `if` or a `match` each branch of which ends in one — `val shown = if
+lit then &bright else &dim`; a `&` that is part of a value — a tuple's
+element — needs the type said. A slice has nothing of fixed size to
 copy, so a local or an array given a slice read through a reference — a
 parameter `bytes: &[u8]`, a constant of embedded bytes or a list, a call
 that lends one — holds the reference: `val all = bytes`, `[bytes, rest]`,
@@ -425,6 +439,9 @@ fn main() = {
     assert(at.size == 1)
     at = &tree.nodes[1]
     assert(at.size == 2)
+    val first = tree.nodes[0].size
+    val larger = if first > 1 then &tree.nodes[0] else &tree.nodes[1]
+    assert(larger.size == 2)
 }
 ```
 

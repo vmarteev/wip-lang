@@ -55,7 +55,11 @@ pub fn check(gate: &Gate): Checked = {
 	}
 	if !cases.isEmpty() {
 		if !booted() then return Checked::of(count + 1, ["ios: no simulator could be booted"])
-		for why in across(cases.len(), (index) => one(&gate, cases[index])) {
+		val starts = match launcher(&gate) {
+			.Ok(starts) => starts
+			.Err(why) => return Checked::of(count + 1, ["ios: \(why)"])
+		}
+		for why in across(cases.len(), (index) => one(&gate, cases[index], starts)) {
 			failed.push(why)
 		}
 		count += cases.len()
@@ -85,10 +89,52 @@ fn booted(): bool = {
 	return listed.exit.success() && listed.stdout.contains("(Booted)")
 }
 
+/// What starts a program in the simulator in a directory, as `wip run` has
+/// one do: it goes into its first argument and becomes the program its
+/// second names. The simulator starts a program in a directory of its own,
+/// and has no shell to go elsewhere first.
+val LAUNCHER = """
+	#include <stdio.h>
+	#include <unistd.h>
+
+	int main(int argc, char **argv) {
+	    if (argc < 3) return 2;
+	    if (chdir(argv[1]) != 0) {
+	        perror(argv[1]);
+	        return 2;
+	    }
+	    execv(argv[2], argv + 2);
+	    perror(argv[2]);
+	    return 2;
+	}
+	"""
+
+/// The launcher, built for the simulator by Xcode's `clang`.
+fn launcher(gate: &Gate): Result<String, String> = {
+	val source = gate.work.join("ios-launcher.c")
+	val exe = gate.work.join("ios-launcher")
+	write(gate.work.path, "ios-launcher.c", LAUNCHER)
+	val built = Command::of("xcrun").args([
+		"--sdk",
+		"iphonesimulator",
+		"clang",
+		"-target",
+		"arm64-apple-ios17.0-simulator",
+		source.toStr(),
+		"-o",
+		exe.toStr(),
+	]).output()
+	return match built {
+		.Ok(done) if done.exit.success() => .Ok(exe)
+		.Ok(done) => .Err("the simulator's launcher does not build: \(done.stderr)")
+		.Err(error) => .Err("cannot run `xcrun clang`: \(error)")
+	}
+}
+
 /// A case built for the simulator, and run there in `tests/cases`, as on a
 /// Mac, so that what it names is named the same; its leaks are reported, as
 /// they are there; what it prints is compared with what it prints on a Mac.
-fn one(gate: &Gate, name: str): Option<String> = {
+fn one(gate: &Gate, name: str, starts: str): Option<String> = {
 	val main = "\(name)/main.wip"
 	val program = gate.work.join("ios-\(name.replace("/", "-"))")
 	val built = gate.wip(CASES, [
@@ -102,18 +148,15 @@ fn one(gate: &Gate, name: str): Option<String> = {
 		program.toStr(),
 	])
 	if !built.exit.success() then return .Some("\(name): it does not build for iOS\(said(&built))")
-	// The simulator's shell goes into the directory and starts the program
-	// as `wip run` does, with its own system's root for the loader.
-	val script = "cd \"$0\" && DYLD_ROOT_PATH=\"$SIMULATOR_ROOT\" exec \"$@\""
+	// The launcher goes into the directory and becomes the program, as
+	// `wip run` has it do.
 	val cases = std::fs::realPath(CASES).unwrapOr(String::of(CASES))
 	val output = run(
 		Command::of("xcrun").args([
 			"simctl",
 			"spawn",
 			"booted",
-			"/bin/sh",
-			"-c",
-			script,
+			starts,
 			cases.toStr(),
 			program.toStr(),
 		]).env("SIMCTL_CHILD_WIP_CHECK_LEAKS", "1"),

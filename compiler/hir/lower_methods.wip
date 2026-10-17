@@ -55,7 +55,7 @@ extend Lowerer {
 		.Ref(inner, ..) | .Own(inner) => self.ownerOf(inner)
 		// An array has a slice's methods: what they take is `&[T]`, and an
 		// array lends one.
-		.Array(..) => {
+		.Array(..) | .ArrayOf(..) => {
 			val slice: BuiltinOwner = .Slice
 			if self.program.builtins.contains(&slice) then .Some(.Builtin(.Slice)) else .None
 		}
@@ -297,7 +297,7 @@ extend Lowerer {
 		if self.text(name.sym) == "len" &&
 			noArgs &&
 			item.names.isEmpty() &&
-			self.kind(held) is .Array(..) | .Str | .Slice(..) {
+			self.kind(held) is .Array(..) | .ArrayOf(..) | .Str | .Slice(..) {
 			val value = self.autoderef(receiver)
 			return .Some(self.alloc(.Len(value), I64, item.span))
 		}
@@ -347,6 +347,13 @@ extend Lowerer {
 			val textOwner = self.ownerOf(textTy).unwrap()
 			return self.dispatch(text, textOwner, name, item)
 		}
+		// An array's own methods, `extend [T; N]`, before its slice's.
+		if self.arrayArgs(self.underRefs(ty)).isSome() {
+			val array: TypeDef = .Builtin(.Array)
+			val (offered, _) = self.offered(array, ty, name.sym)
+			if self.methodOf(array, name.sym).isSome() || !offered.isEmpty() then
+				return self.dispatch(receiver, array, name, item)
+		}
 		return self.dispatch(receiver, owner, name, item)
 	}
 
@@ -384,7 +391,7 @@ extend Lowerer {
 			if !missed.isEmpty() then unmet = .Some(missed[0].clone())
 			if found.isNone() && !offered.isEmpty() then found = .Some(offered[0].method)
 		}
-		val .Some(id) = found else return self.noMethod(owner, name, item, unmet)
+		val .Some(id) = found else return self.noMethod(receiver, owner, name, item, unmet)
 		// `destroy` runs where a value ends; a program that could call it
 		// could run it twice.
 		if self.program.dropMethod(self.underRefs(ty)) == .Some(id) {
@@ -452,6 +459,7 @@ extend Lowerer {
 	/// condition is not met, a field of function type, or a name that is
 	/// not there.
 	var fn noMethod(
+		receiver: ExprId,
 		owner: TypeDef,
 		name: ast::Name,
 		item: ItemUse,
@@ -504,6 +512,10 @@ extend Lowerer {
 			)
 			return .Some(self.giveUpItem(item))
 		}
+		if self.listAnswer(receiver, owner, name, item.span) is .Some(answered) {
+			self.report(answered)
+			return .Some(self.giveUpItem(item))
+		}
 		val typeName = self.typeName(owner)
 		val text = String::of(self.text(name.sym))
 		val names = self.memberNames(owner)
@@ -513,20 +525,63 @@ extend Lowerer {
 			name.span,
 			"unknown method",
 		)
-		if suggest(&text, &names) is .Some(similar) {
+		if suggest(&text, &names) is .Some(similar) then
 			diagnostic = diagnostic.withFix(
 				"did you mean `\(similar)`?",
 				[Edit::replace(name.span, similar)],
 			)
-		} else if !names.isEmpty() {
-			var quoted: Vec<String> = Vec()
-			for n in names {
-				quoted.push("`\(n)`")
-			}
-			diagnostic = diagnostic.withNote("`\(typeName)` has \(quoted.join(", "))")
-		}
+		else if self.methodsNote(owner, &text) is .Some(note) then
+			diagnostic = diagnostic.withNote(note)
 		self.report(diagnostic)
 		return .Some(self.giveUpItem(item))
+	}
+
+	/// `count` or `toVec` asked of a list, as an iterator is asked them,
+	/// where `call` asks it: a list knows its length, `len`, and what
+	/// `filter` keeps is counted by `countWhere`, which builds no list;
+	/// `map` and `filter` answer a `Vec`, which is one already.
+	fn listAnswer(
+		receiver: ExprId,
+		owner: TypeDef,
+		name: ast::Name,
+		call: Span,
+	): Option<Diagnostic> = {
+		val text = self.text(name.sym)
+		val typeName = self.typeName(owner)
+		val names = self.memberNames(owner)
+		val asked = Diagnostic::error(
+			NOT_A_METHOD,
+			"no method `\(text)` on `\(typeName)`",
+			name.span,
+			"unknown method",
+		)
+		if text == "count" && names.contains("len") {
+			val filtered =
+				self.state.body.exprs[receiver].kind is .Call(callee, ..) &&
+				self.text(self.program.fns[callee].name) == "filter"
+			if filtered && names.contains("countWhere") then
+				return .Some(
+					asked.withNote("`filter` answers a `\(typeName)` of what it keeps, which is counted by `len`").withHelp(
+						"count what the predicate keeps with `countWhere(…)`, which builds no list",
+					),
+				)
+			return .Some(
+				asked.withNote("a `\(typeName)` knows its length, `len()`; `count()` is an iterator's, which counts as it walks").withFix("write `len`", [
+					Edit::replace(name.span, "len"),
+				]),
+			)
+		}
+		if text == "toVec" &&
+			owner is .Struct(id) &&
+			self.program.preludeItems.structure(.Vec) == .Some(id) {
+			val written = Span::new(self.state.body.exprs[receiver].span.hi, call.hi)
+			return .Some(
+				asked.withNote(
+					"this is a `Vec` already: `map` and `filter` answer one",
+				).withFix("remove `.toVec()`", [Edit::replace(written, "")]),
+			)
+		}
+		return .None
 	}
 
 	/// The interface's own type arguments for a call of its default method
@@ -554,7 +609,12 @@ extend Lowerer {
 		val written = self.program.types.list(self.program.impls[at].args).toVec()
 		// They are written in the type's own parameters, which are this
 		// value's type arguments: a slice's element is its one.
-		val ownArgs = self.ownerArgs(self.underRefs(ty))
+		val under = self.underRefs(ty)
+		val ownArgs = match owner {
+			// An array's own are its element and its length.
+			.Builtin(.Array) => self.arrayArgs(under).unwrapOr(self.ownerArgs(under))
+			_ => self.ownerArgs(under)
+		}
 		var args: Vec<Ty> = Vec()
 		for arg in written {
 			args.push(self.program.types.subst(arg, &ownArgs))
@@ -823,7 +883,7 @@ extend Lowerer {
 				}
 				// An array lends a slice of all of it, which is what a slice's
 				// methods take.
-				if asSlice && self.kind(ty) is .Array(elem, ..) {
+				if asSlice && self.kind(ty) is .Array(elem, ..) | .ArrayOf(elem, ..) {
 					ty = self.intern(.Slice(elem))
 					place = self.alloc(.SubSlice(base: place, lo: .None, hi: .None), ty, span)
 				}
@@ -1146,6 +1206,61 @@ extend Lowerer {
 		.Builtin(_) | .Enum(_) => false
 	}
 
+	/// What a note says of a type's methods where none is named `asked`:
+	/// all of them, where they are few; where they are many, those named
+	/// like it, and how many there are. What the language calls in a
+	/// program's place is left out.
+	fn methodsNote(owner: TypeDef, asked: str): Option<String> = {
+		var names: Vec<str> = Vec()
+		for id in self.declaredMethods(owner) {
+			if self.program.fns[id].receiver is .None | .Some(.Static) then continue
+			if !self.methodIsVisible(id) || self.calledForTheProgram(owner, id) then continue
+			val name = self.text(self.program.fns[id].name)
+			if !names.contains(&name) then names.push(name)
+		}
+		if names.isEmpty() then return .None
+		val typeName = self.typeName(owner)
+		if names.len() <= FEW_METHODS then return .Some("`\(typeName)` has \(quotedNames(&names))")
+		var like: Vec<str> = Vec()
+		for name in names {
+			if like.len() < FEW_METHODS && namedLike(name, asked) then like.push(name)
+		}
+		if like.isEmpty() then
+			return .Some("`\(typeName)` has \(names.len()) methods, none named like `\(asked)`; an editor lists them after the `.`")
+		val verb = if like.len() == 1 then "is" else "are"
+		return .Some("of `\(typeName)`'s \(names.len()) methods, \(quotedNames(&like)) \(verb) named like `\(asked)`")
+	}
+
+	/// Whether a method is one the language calls in a program's place: where
+	/// a value ends, for a map's hash, for a format, for `for … in move`,
+	/// and what interpolation writes a value with — all of `Text` but
+	/// `toString`, which a program asks for.
+	fn calledForTheProgram(owner: TypeDef, id: FnId): bool = {
+		val .Some(interfaceId) = self.interfaceOfMethod(owner, id) else return false
+		val known = [
+			KnownInterface::Destroy,
+			KnownInterface::Hash,
+			KnownInterface::Encode,
+			KnownInterface::Decode,
+			KnownInterface::IntoIterator,
+		]
+		for which in known {
+			if self.program.preludeItems.interfaceOf(which) == .Some(interfaceId) then return true
+		}
+		return self.program.preludeItems.interfaceOf(.Text) == .Some(interfaceId) &&
+			self.text(self.program.fns[id].name) != "toString"
+	}
+
+	/// The interface a type's method belongs to: its own default, or the
+	/// implementation that holds it.
+	fn interfaceOfMethod(owner: TypeDef, id: FnId): Option<InterfaceId> = {
+		if self.program.fns[id].interfaceId is .Some(interfaceId) then return .Some(interfaceId)
+		for i in self.program.impls {
+			if i.ty == owner && i.methods.contains(&id) then return .Some(i.interfaceId)
+		}
+		return .None
+	}
+
 	/// The names of a type's methods and static functions, for a suggestion.
 	fn memberNames(owner: TypeDef): Vec<str> = {
 		// A static function is not a method: it is called through the type
@@ -1154,8 +1269,11 @@ extend Lowerer {
 		var names: Vec<str> = Vec()
 		for id in self.declaredMethods(owner) {
 			if self.program.fns[id].receiver is .None | .Some(.Static) then continue
-			// What could not be called here is not offered.
+			// What could not be called here is not offered, nor `destroy`,
+			// which runs where a value ends and is never called.
 			if !self.methodIsVisible(id) then continue
+			val destroy = self.program.preludeItems.interfaceOf(.Destroy)
+			if destroy.isSome() && self.interfaceOfMethod(owner, id) == destroy then continue
 			val name = self.text(self.program.fns[id].name)
 			if !names.contains(&name) then names.push(name)
 		}
@@ -1176,4 +1294,16 @@ extend Lowerer {
 		)
 		.Builtin(builtin) => builtin.text()
 	}
+}
+
+/// How many methods a note lists, at most.
+val FEW_METHODS = 8
+
+/// Names, each quoted, in a list.
+fn quotedNames(names: &[str]): String = {
+	var quoted: Vec<String> = Vec()
+	for n in names {
+		quoted.push("`\(n)`")
+	}
+	return quoted.join(", ")
 }

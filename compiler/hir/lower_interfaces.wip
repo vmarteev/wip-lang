@@ -1056,6 +1056,15 @@ extend Lowerer {
 			return false
 		}
 		if self.holdsItsValueElsewhere(ty) then return false
+		if self.arrayArgs(ty) is .Some(arrayArgs) {
+			for (at, i) in self.program.impls.forwards().enumerate() {
+				if i.interfaceId == interfaceId &&
+					i.ty == .Builtin(.Array) &&
+					self.unmetCondition(at, &arrayArgs).isNone() {
+					return true
+				}
+			}
+		}
 		val .Some(owner) = self.implOwner(ty) else return false
 		val ownerArgs: Vec<Ty> = match self.kind(ty) {
 			.Struct(args, ..) | .Enum(args, ..) => self.program.types.list(args).toVec()
@@ -1086,6 +1095,29 @@ extend Lowerer {
 	fn implOwner(ty: Ty): Option<TypeDef> = match self.kind(ty) {
 		.Own(..) => .Some(.Builtin(.Own))
 		_ => self.ownerOf(ty)
+	}
+
+	/// An array's own arguments, its element and its length, where the
+	/// program has `extend [T; N]`: what an array's own implementations are
+	/// asked of.
+	fn arrayArgs(ty: Ty): Option<Vec<Ty>> = {
+		val array: BuiltinOwner = .Array
+		if !self.program.builtins.contains(&array) then return .None
+		val types = &self.program.types
+		return match self.kind(ty) {
+			.Array(elem, len) => Option::Some([elem, types.find(.Count(len))?])
+			.ArrayOf(elem, len) => .Some([elem, types.find(.Param(len))?])
+			_ => .None
+		}
+	}
+
+	/// The owners whose implementations `ty` has, each with the arguments
+	/// its implementations are asked of: an array's own before its slice's.
+	fn implOwners(ty: Ty): Vec<(TypeDef, Vec<Ty>)> = {
+		var owners: Vec<(TypeDef, Vec<Ty>)> = Vec()
+		if self.arrayArgs(ty) is .Some(args) then owners.push((.Builtin(.Array), args))
+		if self.implOwner(ty) is .Some(owner) then owners.push((owner, self.ownerArgs(ty)))
+		return owners
 	}
 
 	/// The same, for an interface that takes types: the implementation must
@@ -1119,22 +1151,22 @@ extend Lowerer {
 			return false
 		}
 		if self.holdsItsValueElsewhere(ty) then return false
-		val .Some(owner) = self.implOwner(ty) else return false
 		// An implementation of a generic type is written in that type's
 		// parameters — `extend Vec<T>: Items<T>` — so its arguments are read
 		// with the type's own.
-		val ownerArgs = self.ownerArgs(ty)
-		var candidates: Vec<i64> = Vec()
-		for (at, i) in self.program.impls.forwards().enumerate() {
-			if i.interfaceId == interfaceId &&
-				i.ty == owner &&
-				argsMatchOpen(&self.program.types, i.args, &ownerArgs, &wanted, &open) {
-				candidates.push(at)
+		for (owner, ownerArgs) in self.implOwners(ty) {
+			var candidates: Vec<i64> = Vec()
+			for (at, i) in self.program.impls.forwards().enumerate() {
+				if i.interfaceId == interfaceId &&
+					i.ty == owner &&
+					argsMatchOpen(&self.program.types, i.args, &ownerArgs, &wanted, &open) {
+					candidates.push(at)
+				}
 			}
-		}
-		// An implementation may hold only for some type arguments.
-		for at in candidates {
-			if self.unmetCondition(at, &ownerArgs).isNone() then return true
+			// An implementation may hold only for some type arguments.
+			for at in candidates {
+				if self.unmetCondition(at, &ownerArgs).isNone() then return true
+			}
 		}
 		return false
 	}
@@ -1179,15 +1211,15 @@ extend Lowerer {
 			return .Some([Need(param: param.index, interfaceId: interfaceId, args: wanted.toVec())])
 		}
 		if self.holdsItsValueElsewhere(ty) then return .None
-		val owner = self.implOwner(ty)?
-		val ownerArgs = self.ownerArgs(ty)
 		val open = self.openArgs(ty, interfaceId, &wanted)
-		for (at, i) in self.program.impls.forwards().enumerate() {
-			if i.interfaceId == interfaceId &&
-				i.ty == owner &&
-				argsMatchOpen(&self.program.types, i.args, &ownerArgs, &wanted, &open) &&
-				self.conditionsOfImpl(at, &ownerArgs) is .Some(needs) {
-				return .Some(needs)
+		for (owner, ownerArgs) in self.implOwners(ty) {
+			for (at, i) in self.program.impls.forwards().enumerate() {
+				if i.interfaceId == interfaceId &&
+					i.ty == owner &&
+					argsMatchOpen(&self.program.types, i.args, &ownerArgs, &wanted, &open) &&
+					self.conditionsOfImpl(at, &ownerArgs) is .Some(needs) {
+					return .Some(needs)
+				}
 			}
 		}
 		return .None
@@ -1221,7 +1253,7 @@ extend Lowerer {
 	fn ownerArgs(ty: Ty): Vec<Ty> = match self.kind(ty) {
 		.Struct(args, ..) | .Enum(args, ..) => self.program.types.list(args).toVec()
 		// An array has a slice's implementations.
-		.Slice(elem) | .Array(elem, ..) => [elem]
+		.Slice(elem) | .Array(elem, ..) | .ArrayOf(elem, ..) => [elem]
 		// A box's implementations are written in what it holds.
 		.Own(inner) => [inner]
 		_ => Vec()
@@ -1231,12 +1263,12 @@ extend Lowerer {
 	/// implementation holds: `extend Option<T: Eq>: Eq` gives `equals` to an
 	/// `Option<i64>` and to no `Option<T>` whose `T` has none.
 	fn methodOfImpl(ty: Ty, interfaceId: InterfaceId): Option<FnId> = {
-		val owner = self.implOwner(ty)?
-		val args = self.ownerArgs(ty)
-		for (at, i) in self.program.impls.forwards().enumerate() {
-			if i.interfaceId == interfaceId && i.ty == owner {
-				if self.unmetCondition(at, &args).isSome() then return .None
-				return if i.methods.isEmpty() then .None else .Some(i.methods[0])
+		for (owner, args) in self.implOwners(ty) {
+			for (at, i) in self.program.impls.forwards().enumerate() {
+				if i.interfaceId == interfaceId && i.ty == owner {
+					if self.unmetCondition(at, &args).isSome() then return .None
+					return if i.methods.isEmpty() then .None else .Some(i.methods[0])
+				}
 			}
 		}
 		return .None
@@ -1245,13 +1277,13 @@ extend Lowerer {
 	/// The condition that keeps a type from implementing an interface it
 	/// otherwise would, for a message.
 	fn unmetFor(ty: Ty, wanted: Constraint): Option<(Ty, Constraint)> = {
-		val owner = self.implOwner(ty)?
-		val args = self.ownerArgs(ty)
-		for (at, i) in self.program.impls.forwards().enumerate() {
-			if i.interfaceId == wanted.interfaceId &&
-				i.ty == owner &&
-				argsMatch(&self.program.types, i.args, &args, wanted.args) {
-				return self.unmetCondition(at, &args)
+		for (owner, args) in self.implOwners(ty) {
+			for (at, i) in self.program.impls.forwards().enumerate() {
+				if i.interfaceId == wanted.interfaceId &&
+					i.ty == owner &&
+					argsMatch(&self.program.types, i.args, &args, wanted.args) {
+					return self.unmetCondition(at, &args)
+				}
 			}
 		}
 		return .None

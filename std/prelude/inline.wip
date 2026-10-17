@@ -1,0 +1,193 @@
+// A vector held where it is, of at most so many values. `InlineVec<T, N>`
+// is written here, in Wip, on top of one primitive: `InlineSlots<T, N>`,
+// `N` slots in place, the first `len` of which hold values. Only the
+// prelude may name it; its drop, which ends those values alone, and three
+// of its operations are the compiler's.
+
+/// `N` slots in place, the first `len` of which hold values. The compiler
+/// knows it: where it ends, it ends what those hold, and nothing past them.
+struct InlineSlots<T, val N> {
+	items: [T; N]
+	len: i64
+}
+
+// These three bodies are the compiler's: a slot is written and read with
+// nothing dropped, since a slot past `len` holds nothing.
+extend InlineSlots<T, N> {
+	/// Slots holding nothing.
+	@intrinsic
+	static fn empty(): InlineSlots<T, N>
+
+	/// The value goes into the slot. Nothing is dropped: the slot held
+	/// nothing.
+	@intrinsic
+	var fn moveIn(index: i64, value: T) keeps value
+
+	/// The value comes out, and the slot holds nothing again.
+	@intrinsic
+	var fn moveOut(index: i64): T
+}
+
+/// Values of one type, one after another, at most `N` of them, held where
+/// the vector is — in a local, a field, an element — and never allocating.
+/// `InlineVec()` is an empty one.
+pub struct InlineVec<T, val N> {
+	slots: InlineSlots<T, N> = InlineSlots<T, N>::empty()
+}
+
+// The values it holds, lent as a slice to read or to write: everything
+// written for `&[T]` works on one, and `for x in v` walks it.
+extend InlineVec<T, N>: Items<T> {
+	@inline
+	lend fn items(): &[T] = lend self.slots.items[0..self.slots.len]
+}
+
+// A sequence: `v.len()`, and `v[0]`, `v[0] = x` and `v.at(0)`.
+extend InlineVec<T, N>: Sequence<T> {
+	/// How many values it holds.
+	@inline
+	fn len(): i64 = self.slots.len
+
+	/// The element at `index`, which must be one it holds: checked against
+	/// its length, and lent where it lies.
+	@inline
+	lend fn at(index: i64): &T = {
+		if (index as u64) >= (self.slots.len as u64) then
+			panic("index \(index) is out of bounds for length \(self.slots.len)")
+		lend self.slots.items[index]
+	}
+}
+
+extend InlineVec<T, N> {
+	/// How many values it holds at most: `N`.
+	@inline
+	pub fn capacity(): i64 = N
+
+	/// Whether it holds nothing.
+	@inline
+	pub fn isEmpty(): bool = self.slots.len == 0
+
+	/// Whether it holds as many as it can.
+	@inline
+	pub fn isFull(): bool = self.slots.len == N
+
+	/// The value, at the end; a full one panics.
+	pub var fn push(value: T) keeps value = {
+		if self.slots.len == N then panic("push to a full InlineVec of \(N)")
+		self.slots.moveIn(self.slots.len, value)
+		self.slots.len += 1
+	}
+
+	/// The value, at the end, where there is room: whether there was. Where
+	/// there is none, the value ends here.
+	pub var fn tryPush(value: T): bool keeps value = {
+		if self.slots.len == N then return false
+		self.slots.moveIn(self.slots.len, value)
+		self.slots.len += 1
+		return true
+	}
+
+	/// The last value, taken out, or nothing where there is none.
+	pub var fn pop(): Option<T> = {
+		if self.slots.len == 0 then return .None
+		self.slots.len -= 1
+		return .Some(self.slots.moveOut(self.slots.len))
+	}
+
+	/// The value at `index`, with the last one put in its place: the order
+	/// of what is left changes.
+	pub var fn swapRemove(index: i64): T = {
+		if index < 0 || index >= self.slots.len then
+			panic("index out of bounds for removing from an InlineVec")
+		self.slots.len -= 1
+		val last = self.slots.moveOut(self.slots.len)
+		if index == self.slots.len then return last
+		val taken = self.slots.moveOut(index)
+		self.slots.moveIn(index, last)
+		return taken
+	}
+
+	/// The value at `index`, with the ones after it moved down one, so the
+	/// order of what is left is kept.
+	pub var fn remove(index: i64): T = {
+		if index < 0 || index >= self.slots.len then
+			panic("index out of bounds for removing from an InlineVec")
+		val taken = self.slots.moveOut(index)
+		for i in index..self.slots.len - 1 {
+			val next = self.slots.moveOut(i + 1)
+			self.slots.moveIn(i, next)
+		}
+		self.slots.len -= 1
+		return taken
+	}
+
+	/// `value` at `index`, with the ones from there moved up one; a full one
+	/// panics. An index of `len` pushes it.
+	pub var fn insert(index: i64, value: T) keeps value = {
+		if index < 0 || index > self.slots.len then
+			panic("index out of bounds for inserting into an InlineVec")
+		if self.slots.len == N then panic("insert into a full InlineVec of \(N)")
+		var i = self.slots.len
+		while i > index {
+			val before = self.slots.moveOut(i - 1)
+			self.slots.moveIn(i, before)
+			i -= 1
+		}
+		self.slots.moveIn(index, value)
+		self.slots.len += 1
+	}
+
+	/// Keeps the first `count` values, and ends the rest.
+	pub var fn truncate(count: i64) = {
+		while self.slots.len > count && self.slots.len > 0 {
+			self.slots.len -= 1
+			destroy(self.slots.moveOut(self.slots.len))
+		}
+	}
+
+	/// Keeps the values `keep` answers true for, in their order, and ends
+	/// the rest.
+	pub var fn retain(keep: &(x: &T) => bool) = {
+		var kept = 0
+		for i in 0..self.slots.len {
+			val value = self.slots.moveOut(i)
+			if keep(&value) {
+				self.slots.moveIn(kept, value)
+				kept += 1
+			} else destroy(value)
+		}
+		self.slots.len = kept
+	}
+
+	/// Ends what it holds.
+	pub var fn clear() = self.truncate(0)
+}
+
+// What is given is cloned, and plain data is its own clone.
+extend InlineVec<T: Clone, N> {
+	/// Clones of `items`, which must be no more than it holds: more panics.
+	pub static fn of(items: &[T]): InlineVec<T, N> = {
+		if items.len() > N then panic("\(items.len()) values for an InlineVec of \(N)")
+		var all: InlineVec<T, N> = InlineVec()
+		for item in items {
+			all.slots.moveIn(all.slots.len, item.clone())
+			all.slots.len += 1
+		}
+		return all
+	}
+
+	/// Clones of `items`, at the end; more than there is room for panics.
+	pub var fn pushAll(items: &[T]) keeps items = {
+		if self.slots.len + items.len() > N then
+			panic("\(items.len()) more values for an InlineVec of \(self.slots.len) of \(N)")
+		for item in items {
+			self.slots.moveIn(self.slots.len, item.clone())
+			self.slots.len += 1
+		}
+	}
+}
+
+// A clone holds clones of what it holds.
+extend InlineVec<T: Clone, N>: Clone {
+	fn clone(): InlineVec<T, N> = InlineVec::of(&self.items())
+}

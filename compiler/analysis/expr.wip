@@ -46,12 +46,13 @@ extend Checker {
 				// What an `is` on the right binds is named only where the right
 				// operand ran and matched, which bound it afresh: where it did
 				// not run, what the binding held on an earlier pass of a loop is
-				// no value anything reads.
+				// no value anything reads, moved or stale.
 				var bound: Vec<LocalId> = Vec()
 				self.boundByTests(rhs, &var bound)
 				for local in bound {
 					val whole = Path(local: local, projs: Vec())
 					state.reinit(&whole)
+					state.stale.remove(&local)
 				}
 			}
 			.Binary(lhs, rhs, ..) | .StrCmp(lhs, rhs) | .StrEq(lhs, rhs) => {
@@ -247,8 +248,8 @@ extend Checker {
 			// A constant table is kept once and never written, and what is
 			// read from it is copied. A C pointer is plain data: it is copied,
 			// never dropped, and the move checker leaves it alone.
-			.Int(..) | .Float(..) | .Bool(..) | .Str(..) | .Table(..) | .Null | .Zeroed | .FnRef(..)
-			| .Error => {}
+			.Int(..) | .LengthOf(..) | .Float(..) | .Bool(..) | .Str(..) | .Table(..) | .Null
+			| .Zeroed | .FnRef(..) | .Error => {}
 			// A panic ends the program: nothing after it runs, and nothing is
 			// dropped. A note built for it is read there.
 			.Panic(note, ..) => { if note is .Some(n) then self.expr(n, .Value, &var state) }
@@ -590,12 +591,19 @@ extend Checker {
 		// A `str` is read wherever it is used, and so is the reference a place
 		// lies behind, where it is kept.
 		if ctx != .Assign {
-			val holder =
-				if self.isView(ty) || self.isKeptClosure(ty) then self.accessPath(id)
-				else match self.keptReferenceBehind(id) {
-					.Some(reference) => self.accessPath(reference)
+			val holder = if self.isView(ty) || self.isKeptClosure(ty) then self.accessPath(id) else {
+				match self.keptReferenceBehind(id) {
+					// An alias only read is stale itself, not its place.
+					.Some(reference) => match body.exprs[reference].kind {
+						.Local(local) if self.readPlaces.contains(&local) => Option::Some(Path(
+							local: local,
+							projs: Vec(),
+						))
+						_ => self.accessPath(reference)
+					}
 					.None => Option::None
 				}
+			}
 			if holder is .Some(path) then self.checkStale(path.local, &name, span, &state)
 		}
 		// A place a kept closure writes is its until the closure's last use.
@@ -639,7 +647,8 @@ extend Checker {
 				// the matched value was behind: `match move` takes nothing from
 				// there either.
 				val kept = match body.exprs[reference].kind {
-					.Local(l) => binding && self.keptBindings.contains(&l)
+					.Local(l) =>
+						binding && self.keptBindings.contains(&l) && !self.readPlaces.contains(&l)
 					_ => false
 				}
 				// What a closure captured: its own, and kept, since it may be
@@ -672,6 +681,19 @@ extend Checker {
 					label,
 				).withNote("a reference can read a value but cannot take ownership of it")
 				when {
+					body.restTaken.contains(&id) => {
+						// What `..base` took: a field read from `base`, or
+						// `base` itself, taken apart for a variant.
+						val base = match body.exprs[id].kind {
+							.Field(base, ..) => self.display(base)
+							_ => name.clone()
+						}
+						val help =
+							if body.exprs[id].kind is .Field(..) then
+								"build from a copy, `..\(base).clone()`, or take `\(base)` by value: a `move fn`'s `self`, or a parameter that owns it"
+							else "take `\(base)` by value, for `..` to take its fields from: a `move fn`'s `self`, or a parameter that owns it"
+						diagnostic = diagnostic.withHelp(help)
+					}
 					kept =>
 						diagnostic = diagnostic.withHelp(
 							"it lies behind a reference, which neither `move` nor `match move` takes from; copy it with `clone()`",
@@ -733,10 +755,12 @@ extend Checker {
 	}
 
 	/// Binds a pattern's names to the fields of `scrutinee`, the value tested.
-	/// An alias binding refers into the place, which must not change while
-	/// the bindings are in scope, so a borrow is pushed, for the caller to
-	/// release; an owned binding is a new variable. A place behind a kept `&`
-	/// reference is not this function's: its aliases are kept references too,
+	/// An alias binding written through refers into the place, which must
+	/// not change while the bindings are in scope, so a borrow is pushed,
+	/// for the caller to release; one only read is a view of the place, held
+	/// to its last use; an owned binding is a new variable. A place behind a
+	/// kept `&` reference is not this function's: its aliases are kept
+	/// references too,
 	/// which borrow what that one does and hold nothing of the variable, which
 	/// may be pointed somewhere else while they are used.
 	var fn bindPattern(pattern: &Pattern, scrutinee: ExprId, holder: Holder, state: &var State) = {
@@ -772,8 +796,18 @@ extend Checker {
 			if body.aliasBindings.contains(&local) {
 				match move path {
 					.Some(found) => {
-						self.aliases.put(local, found)
-						aliased = true
+						// An alias only read holds its place to its last use:
+						// it is kept as a view of the place, which goes stale
+						// where the place changes, so that a use after is
+						// refused.
+						if body.readAliases.contains(&local) {
+							self.keptBindings.add(local)
+							self.readPlaces.put(local, found)
+							state.stale.remove(&local)
+						} else {
+							self.aliases.put(local, found)
+							aliased = true
+						}
 					}
 					.None => {}
 				}

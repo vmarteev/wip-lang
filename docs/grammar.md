@@ -118,6 +118,11 @@ for  if  import  in  interface  is  lend  match  move  null  own  pub  return
 self  static  struct  then  true  type  val  var  when  while  yield
 ```
 
+A keyword is a name in one place: a field's, where only a field's name
+can stand — declared, after `.`, and before the `:` of a literal's value
+or a pattern's binder (`fieldName` below) — so a format's or a C
+header's `type` or `when` is a field's name as it is written there.
+
 `let` and `impl` are **reserved**: neither is part of the language, and
 the parser reports each with a fix — `let` to `val` and
 `impl` to `extend`. `yield` where a value is expected is
@@ -271,7 +276,13 @@ structDecl  = ( "extern" | "view" )? "struct" IDENT generics?
                             (* `extern struct` is C's layout, and takes no
                                generics *)
                                          (* a member is a field or a method *)
-field       = annotation* ( "pub" "var"? )? IDENT ":" type ( "=" expr )? ;
+field       = annotation* ( "pub" "var"? )? fieldName ":" type ( "=" expr )? ;
+fieldName   = IDENT | keyword ;          (* `keyword`: a word of the keywords'
+                                            list. A keyword names a field where only a
+                                            field's name stands — here, a
+                                            variant's field, after `.`, before a
+                                            literal's and a binder's `:` — and
+                                            nothing else *)
                                          (* a struct's field may carry
                                             annotations, `@align(16)`; a
                                             variant's may not *)
@@ -286,7 +297,8 @@ enumDecl    = "view"? "enum" IDENT generics? "{" ( member ( lsep member )* lsep?
                                          (* a member is a variant or a method *)
                                          (* `view enum`: its variants may borrow. `view` is a word
                                             only here. *)
-variant     = IDENT ( "(" params ")" )? ;
+variant     = IDENT ( "(" variantField ( "," variantField )* ","? ")" )? ;
+variantField = fieldName ":" type ( "=" expr )? ;
                                          (* a field's `= value` is its default,
                                             as a parameter's *)
 
@@ -297,6 +309,9 @@ extendType  = path generics?              (* a type of this module, or an
                                              a condition on its types *)
             | "[" IDENT bounds? "]"       (* a slice, whose element is named
                                              here; the prelude's *)
+            | "[" IDENT ";" IDENT "]"     (* an array, its element and its
+                                             length named here; the prelude's,
+                                             or a module's own interface *)
             | "own" generics ;            (* a box, whose one parameter is
                                              what it holds *)
             (* a type's methods, outside its declaration, and after ":" the
@@ -333,7 +348,11 @@ keepName    = IDENT | "self" ;
                                             `keeps` is a word here alone *)
 generics    = "<" typeParam ( "," typeParam )* ","? ">" ;
 typeParam   = "type"? IDENT ( ":" constraint ( "+" constraint )* )?
-              ( "=" type )? ;
+              ( "=" type )?
+            | "val" IDENT ( "=" typeArg )? ;
+                                         (* `val N`: a length, an `i64` known
+                                            where the program compiles; not
+                                            an interface's *)
                                          (* a default: a struct's or an
                                             enum's, last; `type`: an
                                             interface's, which each
@@ -385,8 +404,9 @@ type        = "own" "<" type ">"           (* `own<(…) => R>` is an owned
                                               `&(…) => R` is a closure, lent for
                                               one call *)
             | "[" type ";" ( INT | IDENT ) "]"
-                                           (* a length is a literal or a
-                                              constant *)
+                                           (* a length is a literal, a
+                                              constant or a length parameter;
+                                              no arithmetic *)
             | "[" type "]"                 (* a slice: only behind "&" *)
             | "dyn" path typeArgs?         (* some type that implements the interface:
                                               only behind "&" *)
@@ -399,7 +419,12 @@ type        = "own" "<" type ">"           (* `own<(…) => R>` is an owned
             | path typeArgs? ;             (* a module's type is `a::b::Point`;
                                               `I::Item`, what the
                                               implementation of `I` decides *)
-typeArgs    = "<" type ( "," type )* ","? ">" ;
+typeArgs    = "<" typeArg ( "," typeArg )* ","? ">" ;
+typeArg     = type | INT ;               (* a number is a length parameter's
+                                            argument, in a type; among an
+                                            expression's type arguments a
+                                            length is a constant's name, since
+                                            `f(a < 3, b > (c))` compares *)
 
 (* ---- blocks and statements ---- *)
 
@@ -455,7 +480,7 @@ unary       = ( "-" | "!" | "&" "var"? | "move" | "own" ) unary
             | postfix ;
             (* `own` before a lambda makes an owned closure, which holds what
                it captured on the heap *)
-postfix     = primary ( "." IDENT | "." INT | "(" args? ")" | "[" index "]" | "?" )* ;
+postfix     = primary ( "." fieldName | "." INT | "(" args? ")" | "[" index "]" | "?" )* ;
             (* `pair.0` is a tuple's element *)
             (* `expr?` is the value, or an early return of the other variant
                of an `Option` or a `Result` *)
@@ -568,7 +593,7 @@ sliceElem   = pattern | ".." IDENT? ;      (* `..rest` binds the elements
 bound       = "-"? INT | CHAR | BYTE | path ;
                                          (* a literal, or a constant's name *)
 binders     = ( binder ( "," binder )* ( "," ".." )? | ".." ) ","? ;
-binder      = IDENT ( ":" pattern )? | "var" IDENT | pattern ;
+binder      = IDENT ( ":" pattern )? | keyword ":" pattern | "var" IDENT | pattern ;
                                          (* a field, or field: pattern — a name renames
                                             it, and a pattern takes the field apart or
                                             tests it; `var field`, the field bound to a
@@ -578,10 +603,10 @@ binder      = IDENT ( ":" pattern )? | "var" IDENT | pattern ;
 
 args        = arg ( "," arg )* ( "," ".." expr )? ","?
             | ".." expr ","? ;
-arg         = ( IDENT ":" )? expr ;     (* a named argument; positional ones come first *)
-            (* a call whose callee names a struct builds it, its arguments its
-               fields; `..base` gives the fields it does not name, last and
-               once *)
+arg         = ( fieldName ":" )? expr ; (* a named argument; positional ones come first *)
+            (* a call whose callee names a struct or a variant builds it, its
+               arguments its fields; `..base` gives the fields it does not
+               name, last and once *)
 ```
 
 **The value of a block** is the value of its last statement, if that

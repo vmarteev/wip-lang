@@ -5,6 +5,7 @@
 
 import std::fs
 import std::io
+import std::digest::{Sha256}
 import std::path
 import std::process::{Command, Exit}
 
@@ -447,14 +448,13 @@ fn chosenSimulator(
 
 /// The program `program` run in the simulator `id` as a command is, in
 /// the directory `dir`, with `args`: how it ended, which the simulator
-/// hands back.
+/// hands back. The simulator starts a program in a directory of its own,
+/// and has no shell to go elsewhere first, so the launcher is started,
+/// which goes into `dir` and becomes the program.
 pub fn spawnOnSimulator(id: str, program: str, dir: str, args: &[str]): Result<Exit, String> = {
+	val starts = simulatorLauncher()?
 	var all: Vec<String> = Vec()
-	// The simulator's shell goes into the directory, and starts the program
-	// as the simulator starts one: with its own system's root for the
-	// loader, which a program started by another inside it is not given.
-	val script = "cd \"$0\" && DYLD_ROOT_PATH=\"$SIMULATOR_ROOT\" exec \"$@\""
-	for arg in ["simctl", "spawn", id, "/bin/sh", "-c", script] {
+	for arg in ["simctl", "spawn", id, starts.toStr()] {
 		all.push(String::of(arg))
 	}
 	all.push(String::of(dir))
@@ -466,6 +466,75 @@ pub fn spawnOnSimulator(id: str, program: str, dir: str, args: &[str]): Result<E
 		.Ok(exit) => .Ok(exit)
 		.Err(error) => .Err("cannot run `xcrun simctl`: \(error)")
 	}
+}
+
+/// What starts a program in the simulator where it is asked to: it goes
+/// into the directory its first argument names, and becomes the program
+/// its second names, with the rest. A program started so has what the
+/// simulator gives one it starts, the loader's root among it, and passes
+/// it on to any it starts.
+pub val LAUNCHER = """
+	#include <stdio.h>
+	#include <unistd.h>
+
+	int main(int argc, char **argv) {
+	    if (argc < 3) {
+	        fprintf(stderr, "usage: launcher DIRECTORY PROGRAM [ARGUMENTS]\\n");
+	        return 2;
+	    }
+	    if (chdir(argv[1]) != 0) {
+	        perror(argv[1]);
+	        return 2;
+	    }
+	    execv(argv[2], argv + 2);
+	    perror(argv[2]);
+	    return 2;
+	}
+	"""
+
+/// The launcher, built for the simulator by Xcode's `clang` into the cache
+/// the first time it is asked for, and found there after.
+fn simulatorLauncher(): Result<String, String> = {
+	val target = Target(os: .Ios, arch: .Arm64, simulator: true)
+	val flags = target.clangFlags(MINIMUM_IOS)?
+	var hasher = Sha256()
+	field(&var hasher, LAUNCHER)
+	for flag in flags {
+		field(&var hasher, flag.toStr())
+	}
+	val dir = path::join(
+		path::join(path::join(cacheDir(), "tools"), "launcher"),
+		hex(hasher.finish()),
+	)
+	val exe = path::join(dir, "launcher")
+	if isFile(exe) then return .Ok(exe)
+	// Built beside where it goes and moved into place, so that two runs at
+	// once never find half of one.
+	val partial = "\(dir).partial\(std::process::id())"
+	fs::removeAll(partial)
+	if fs::makeDirs(partial) is .Err(error) then return .Err("cannot make `\(partial)`: \(error)")
+	val source = path::join(partial, "launcher.c")
+	if fs::writeFile(source, LAUNCHER) is .Err(error) then
+		return .Err("cannot write `\(source)`: \(error)")
+	var compiled: Vec<String> = Vec()
+	for arg in ["--sdk", "iphonesimulator", "clang"] {
+		compiled.push(String::of(arg))
+	}
+	for flag in flags {
+		compiled.push(flag.clone())
+	}
+	for arg in [source.toStr(), "-o", path::join(partial, "launcher").toStr()] {
+		compiled.push(String::of(arg))
+	}
+	val built = tool("xcrun", strs(&compiled))
+	if built is .Err(message) {
+		fs::removeAll(partial)
+		return .Err("cannot build the simulator's launcher: \(message)")
+	}
+	// Where another run moved its own into place first, that one is kept.
+	if fs::rename(partial, dir).isErr() then fs::removeAll(partial)
+	if isFile(exe) then return .Ok(exe)
+	return .Err("cannot keep the simulator's launcher in `\(dir)`")
 }
 
 /// The app at `bundle` installed on the simulator `id` and run, with

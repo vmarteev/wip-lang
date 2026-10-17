@@ -506,7 +506,9 @@ argument's type implements: with `I: Iterator<(K, V)>`, an iterator that
 hands out `(str, i64)` says `K` and `V`, as `Map::fromPairs` is called with
 no type written. A variable's are also inferred from the first place that
 names it ([page 1](01-types.md#generic-types)): `var counts = Map()`, then
-`counts.put(word, 1)`. Where they cannot be, they are written at the call:
+`counts.put(word, 1)`. A length parameter, `val N`, is inferred from the
+length of an array given where `[T; N]` is taken: `total([1, 2, 3])` is
+`total<3>`, which a call writes with a constant's name, `total<SIDE>(…)`. Where they cannot be, they are written at the call:
 `firstEqual<i64>(…)`. A generic type's static
 function is called through the type, and the type's arguments are written
 after its name, `Pair<i64>::zero()`; the function's own are still inferred.

@@ -25,6 +25,8 @@ extend Builder {
 		if self.isAggregate(expr.ty) then return .Place(self.aggregate(id))
 		return match expr.kind {
 			.Int(value) => .Scalar(Builder::int(value, expr.ty))
+			// Made a number in each instance, which is all the MIR sees.
+			.LengthOf(..) => panic("a length in a generic body")
 			.Float(value) => .Scalar(.Const(.Float(value: value, ty: expr.ty)))
 			.Bool(value) => .Scalar(.Const(.Bool(value)))
 			// A null C pointer is the zero of its type.
@@ -737,6 +739,39 @@ extend Builder {
 				self.assign(place.clone(), .Use(.Copy(elements)))
 				Value::Place(place)
 			}
+			// `InlineSlots::empty()`: zero, the slots hold nothing, and their
+			// count says so.
+			.InlineEmpty => {
+				val place = self.destOr(dest, ty)
+				self.push(.Zero(place.clone()))
+				Value::Place(place)
+			}
+			// `slots.moveIn(index, value)`: the slot held nothing, so nothing is
+			// dropped.
+			.InlineMoveIn => {
+				val slot = self.inlineSlot(args[0], args[1], at)
+				self.storeExpr(args[2], slot)
+				Value::Unit
+			}
+			// `slots.moveOut(index)`: the value comes out and the slot is left
+			// holding nothing, which its zeros say.
+			.InlineMoveOut => {
+				val slot = self.inlineSlot(args[0], args[1], at)
+				val value = match move dest {
+					.Some(place) => {
+						self.assign(place.clone(), .Use(.Copy(slot.clone())))
+						Value::Place(place)
+					}
+					.None if self.isAggregate(ty) => {
+						val temp = Place::of(self.temp(ty))
+						self.assign(temp.clone(), .Use(.Copy(slot.clone())))
+						Value::Place(temp)
+					}
+					.None => Value::Scalar(self.value(ty, .Use(.Copy(slot.clone()))))
+				}
+				self.push(.Zero(slot))
+				value
+			}
 			// `slots.release()`: zeroed, the slots free nothing when they are
 			// dropped, and the block stays its owner's.
 			.SlotsRelease => {
@@ -762,7 +797,7 @@ extend Builder {
 			// the address a thread is given.
 			.ClosureCode | .ClosureCaptures => {
 				val closure = self.place(args[0])
-				val field: u32 = if which is .ClosureCaptures then 0 else 1
+				val field = if which is .ClosureCaptures then 0 else 1
 				self.answer(.Use(.Copy(closure.project(.Field(field)))), ty, dest)
 			}
 			// `text.items()`: the pointer and the length a `str` already is,
@@ -1079,6 +1114,25 @@ extend Builder {
 
 	/// The place of one slot, checked against how many there are. The first
 	/// argument is the block, behind the `&var` a method takes.
+	/// The slot at `index` of the slots in place `slots` refers to, checked
+	/// against how many there are, which their type says.
+	var fn inlineSlot(slots: ExprId, index: ExprId, at: Span): Place = {
+		val block = self.behindReference(slots)
+		val items = block.project(.Field(0))
+		val operand = self.scalar(index)
+		val slotsTy = match self.kind(self.ty(slots)) {
+			.Ref(inner, ..) => inner
+			other => self.ty(slots)
+		}
+		val count = match self.kind(self.program.fieldTys(slotsTy)[0]) {
+			.Array(len, ..) => len
+			_ => panic("slots in place are an array")
+		}
+		self.checkUnsigned(.Ge, operand.clone(), Builder::int(count as u128, I64), at)
+		val local = self.localOf(operand, I64)
+		return items.project(.Index(local))
+	}
+
 	var fn slotPlace(slots: ExprId, index: ExprId, at: Span): Place = {
 		val block = self.behindReference(slots)
 		val operand = self.scalar(index)

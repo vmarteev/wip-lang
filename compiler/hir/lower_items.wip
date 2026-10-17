@@ -1422,6 +1422,14 @@ extend Lowerer {
 		// A built-in type: `extend [T]`, `extend str`, `extend i64` — the
 		// prelude's to give methods to.
 		if block.sliceOf is .Some(elem) {
+			// `extend [T; N]`: an array, of its element and its length.
+			if block.arrayLength.isSome() {
+				val generics = self.genericParams(&block.generics)
+				return match self.builtinOwner(&block, .Array, generics.clone(), elem.span) {
+					.Some(owner) => .Some((owner, generics))
+					.None => .None
+				}
+			}
 			// The element, with what the block asks of it.
 			val param =
 				if block.generics.isEmpty() then
@@ -1603,6 +1611,7 @@ extend Lowerer {
 					// `Pool<i64>` does; the block itself names every one.
 					default: declared[i].default,
 					span: written[i].name.span,
+					length: declared[i].length,
 				),
 			)
 		}
@@ -2359,6 +2368,7 @@ extend Lowerer {
 	var fn fnIntrinsic(sig: &ast::FnSig, member: &Option<Member>): Option<Intrinsic> = {
 		val name = String::of(self.text(sig.name.sym))
 		val path = self.modules[self.current].path.clone()
+		val inlineSlots = self.program.preludeItems.structure(.InlineSlots)
 		val known: Option<Intrinsic> = match member {
 			.Some(m) => match m.owner {
 				.Type(.Builtin(.Slots)) => match name.toStr() {
@@ -2370,6 +2380,13 @@ extend Lowerer {
 					"takeFrom" => .Some(.SlotsTakeFrom)
 					"over" => .Some(.SlotsOver)
 					"release" => .Some(.SlotsRelease)
+					_ => .None
+				}
+				// The prelude's slots in place, which `InlineVec` is made of.
+				.Type(.Struct(id)) if inlineSlots == .Some(id) => match name.toStr() {
+					"empty" => .Some(.InlineEmpty)
+					"moveIn" => .Some(.InlineMoveIn)
+					"moveOut" => .Some(.InlineMoveOut)
 					_ => .None
 				}
 				.Type(.Builtin(.Str)) => match name.toStr() {
@@ -2850,6 +2867,10 @@ extend Lowerer {
 				.Str => STR
 				.Cstring => CSTRING
 				.Slice => self.intern(.Slice(first))
+				.Array => self.program.types.arrayOfLength(
+					first,
+					if args.len() > 1 then args[1] else ERROR,
+				)
 				.Slots => self.intern(.Slots(first))
 				.Void => UNIT
 				.Own => self.intern(.Own(first))
@@ -2899,7 +2920,7 @@ extend Lowerer {
 			.Slice(elem) => self.cCompatible(elem, false)
 			// An array is passed where it is, as C's `T x[N]` parameter is: the
 			// address of its first element.
-			.Array(..) => self.cElement(inner)
+			.Array(..) | .ArrayOf(..) => self.cElement(inner)
 			.Dyn(..) => false
 			_ => self.cCompatible(inner, false)
 		}
@@ -2938,7 +2959,7 @@ extend Lowerer {
 	/// What C can hold as the elements of an array it is lent: what crosses
 	/// by itself, an `extern struct`, or an array of those.
 	fn cElement(ty: Ty): bool = match self.kind(ty) {
-		.Array(elem, ..) => self.cElement(elem)
+		.Array(elem, ..) | .ArrayOf(elem, ..) => self.cElement(elem)
 		.Struct(id, ..) => self.program.structs[id].isExtern
 		.Str | .Fn(..) | .Ref(..) => false
 		_ => self.cCompatible(ty, false)
@@ -2949,7 +2970,7 @@ extend Lowerer {
 	var fn checkCField(ty: Ty, span: Span, inUnion: bool) = {
 		val what = if inUnion then "an `extern union`" else "an `extern struct`"
 		val ok = match self.kind(ty) {
-			.Array(elem, ..) => {
+			.Array(elem, ..) | .ArrayOf(elem, ..) => {
 				self.checkCField(elem, span, inUnion)
 				return
 			}

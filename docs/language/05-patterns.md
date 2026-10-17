@@ -545,6 +545,56 @@ fn main() = {
 }
 ```
 
+A binding that owns memory, or holds a view, cannot be copied for free, so
+it stays the place; where it is only read, it holds the place to its last
+use, as a `str` holds its bytes, and not to the end of its arm or block.
+After its last use, the place may be assigned, moved or lent as `&var` —
+the shape of a step that reads a value out of its own state, decides, and
+changes the state:
+
+```wip,run
+struct Talk {
+    who: String
+}
+
+struct Game {
+    talking: Option<Talk>
+    said: String
+}
+
+extend Game {
+    var fn say(text: str) = {
+        self.said = String::of(text)
+    }
+}
+
+fn main() = {
+    var game = Game(
+        talking: .Some(Talk(who: String::of("Ada"))),
+        said: String::of(""),
+    )
+    if game.talking is .Some(talk) {
+        val greeting = "hello, \(talk.who)"
+        game.say(greeting.toStr()) // `talk` is not used again
+        game.talking = .None
+    }
+    assert(game.said == "hello, Ada" && game.talking.isNone())
+}
+```
+
+A use of the binding after the place changed is refused where it is,
+since it would read what is no longer there:
+
+```wip,error=E0436
+fn main() = {
+    var slot: Option<String> = .Some(String::of("slot1.json"))
+    if slot is .Some(path) {
+        slot = .None
+        assert(path.len() > 0) // `slot` changed above
+    }
+}
+```
+
 ### Two things matched together
 
 A tuple written as a `match`'s scrutinee is not built: each element is

@@ -130,6 +130,7 @@ extend Lowerer {
 		self.state.byteLiterals = Set()
 		self.state.scopes = [Map()]
 		self.state.pendingLocals = Map()
+		self.state.keptOwn = Map()
 		self.state.taking = Set()
 		self.state.function = .Some(id)
 		self.state.lends = 0
@@ -443,7 +444,15 @@ extend Lowerer {
 				val (value, valueTy) = self.letValue(mutable, written, init)
 				// A value that leaves type arguments undecided waits for the
 				// first place that names the local: `var shapes = Vec()`.
-				val waits = written.isNone() && !isImplicit && self.leavesTypeOpen(&mark, value)
+				val open = written.isNone() && !isImplicit && self.leavesTypeOpen(&mark, value)
+				// So does a number literal, for the type its first use says:
+				// `var sum = 0.0`, then `sum += sample`.
+				val literal =
+					written.isNone() &&
+					!isImplicit &&
+					!open &&
+					self.waitsAsLiteral(init, &mark, value)
+				val waits = open || literal
 				val (checkedInit, checkedTy) =
 					if waits then (self.standIn(&mark, value), valueTy) else (value, valueTy)
 				// A slice read through a reference is kept as the reference;
@@ -475,6 +484,7 @@ extend Lowerer {
 						standIn: checkedInit,
 						name: name,
 						mutable: mutable,
+						literal: literal,
 					))
 					waiting = .Some(local)
 				}
@@ -533,7 +543,7 @@ extend Lowerer {
 				self.pushLoop(label.asRef())
 				val (checkedBody, _) = self.checkBlock(&body, .Some(UNIT))
 				val (_, breaks) = self.state.loops.pop().unwrap()
-				self.state.scopes.pop()
+				self.endScope()
 				// `while true` with no `break` never finishes normally.
 				(.While(cond: checkedCond, body: checkedBody), forever && !breaks)
 			}
@@ -581,11 +591,15 @@ extend Lowerer {
 		}
 		// `val f = (x) => …` may keep what it captures.
 		self.state.keepingClosure = !mutable && file.exprs[init].kind is .Lambda(..)
-		// `val r = &place` holds a reference, as `val r: &T = &place` does.
-		self.state.localReference = file.exprs[init].kind is .Unary(op: .Ref, ..)
+		// `val r = &place` holds a reference, as `val r: &T = &place` does;
+		// and so does `val r = if c then &a else &b`, each branch's `&` the
+		// variable's whole value.
+		var references: Vec<ast::ExprId> = Vec()
+		wholeReferences(&file, init, &var references)
+		self.state.localReferences = references
 		val checked = self.infer(init, .None)
 		self.state.keepingClosure = false
-		self.state.localReference = false
+		self.state.localReferences = Vec()
 		var ty = self.state.body.exprs[checked].ty
 		// `val r = if c { 1 }`: an `if` without `else` has no value to give,
 		// which is said here rather than where `r` is first used.
@@ -843,7 +857,7 @@ extend Lowerer {
 			return self.walkIterator(label, &binding, taken, next, &body)
 		var elem: Option<Ty> = .None
 		match self.kind(ty) {
-			.Array(elem: t, ..) | .Slice(elem: t) => elem = .Some(t)
+			.Array(elem: t, ..) | .ArrayOf(elem: t, ..) | .Slice(elem: t) => elem = .Some(t)
 			_ if self.isPoisoned(ty) => {}
 			// A container is walked through the elements it lends.
 			_ => match self.itemsOf(e, ty) {
@@ -1119,7 +1133,7 @@ extend Lowerer {
 				_ => .Some(UNIT)
 			}
 			val (checked, _) = self.checkBlock(&thenBlock, wanted)
-			self.state.scopes.pop()
+			self.endScope()
 			return self.alloc(
 				.If(cond: condition, thenBlock: checked, elseBlock: .None),
 				UNIT,
@@ -1136,7 +1150,7 @@ extend Lowerer {
 				_ => .Some(UNIT)
 			}
 			val (checkedThen, _) = self.checkBlock(&thenBlock, wanted)
-			self.state.scopes.pop()
+			self.endScope()
 			val (checkedElse, _) = self.elseBlock(elseAt, wanted)
 			return self.alloc(
 				.If(cond: condition, thenBlock: checkedThen, elseBlock: .Some(checkedElse)),
@@ -1148,13 +1162,15 @@ extend Lowerer {
 		// the `else` branch's: checked after it, with the condition's
 		// bindings put back in scope for it.
 		if hint.isNone() && self.blockTakesTypeBeside(&thenBlock) && !self.takesTypeBeside(elseAt) {
+			val matched = self.takeMatched()
 			val .Some(bindings) = self.state.scopes.pop() else panic("the condition's scope")
 			val (checkedElse, elseTy) = self.elseBlock(elseAt, .None)
 			self.state.scopes.push(bindings)
+			self.state.matched.append(matched)
 			val expected: Option<Ty> = if elseTy != NEVER then .Some(elseTy) else .None
 			val reported = self.errorsReported()
 			val (checkedThen, thenTy) = self.checkBlock(&thenBlock, expected)
-			self.state.scopes.pop()
+			self.endScope()
 			// A branch that could not take the other's type has been reported,
 			// and the `if` says nothing more of its type.
 			val ty = when {
@@ -1174,7 +1190,7 @@ extend Lowerer {
 			)
 		}
 		val (checkedThen, thenTy) = self.checkBlock(&thenBlock, hint)
-		self.state.scopes.pop()
+		self.endScope()
 		if hint.isNone() && self.program.types.isInteger(thenTy) then
 			return self.ifOfIntegers(condition, checkedThen, thenTy, elseAt, span)
 		// Without an expected type, the `then` branch sets the type of the
@@ -1257,5 +1273,31 @@ extend Lowerer {
 		}
 		val ty = self.tyOf(value)
 		return (Block(stmts: Vec(), value: .Some(value), span: expr.span), ty)
+	}
+}
+
+/// The operands of the `&place`s that `value` is, where a variable holds it
+/// whole, at the end of `found`: `value` itself where it is one, inside
+/// parentheses, or the value of each branch of an `if` or a `match` it is,
+/// and of a block's last expression.
+fn wholeReferences(file: &ast::Ast, value: ast::ExprId, found: &var Vec<ast::ExprId>) = {
+	match file.exprs[value].kind {
+		.Unary(op: .Ref, operand: operand, ..) => found.push(operand)
+		.Paren(inner) => wholeReferences(&file, inner, &var found)
+		.Block(block) => {
+			if blockValue(&file, &block) is .Some(last) then
+				wholeReferences(&file, last, &var found)
+		}
+		.If(thenBlock: thenBlock, elseBranch: .Some(otherwise), ..) => {
+			if blockValue(&file, &thenBlock) is .Some(last) then
+				wholeReferences(&file, last, &var found)
+			wholeReferences(&file, otherwise, &var found)
+		}
+		.Match(arms: arms, ..) => {
+			for arm in arms {
+				wholeReferences(&file, arm.body, &var found)
+			}
+		}
+		_ => {}
 	}
 }

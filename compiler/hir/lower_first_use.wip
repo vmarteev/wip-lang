@@ -1,7 +1,10 @@
 // A local whose value leaves some of its type arguments undecided, given
 // them by the first place after it that names it: `var shapes = Vec()`, then
 // `shapes.push(move shape)`. The value is checked again then, as if its type
-// had been written.
+// had been written. So is a local whose value is a number literal, which
+// takes the type the literal would take where the local is first named:
+// `var sum = 0.0`, then `sum += sample`, of an `f32`; where that place says
+// none, it is the literal's own, `i64` or `f64`.
 
 import std::collections::{Map}
 import std::mem
@@ -19,6 +22,21 @@ struct PendingLocal {
 	stmt: Option<StmtId>
 	/// What stands for the value until then.
 	standIn: ExprId
+	name: ast::Name
+	mutable: bool
+	/// Whether its value is a number literal, whose own type it has until
+	/// its first use says another.
+	literal: bool = false
+	/// Whether a literal's first use has been, and decided its type. Its
+	/// value is checked against it where its scope ends, so that deciding
+	/// adds nothing that checking another local's value could take back.
+	decided: bool = false
+}
+
+/// A number literal that kept its own type: where its first use was, which
+/// said nothing of it, and how it was declared.
+struct KeptOwn {
+	firstUse: Span
 	name: ast::Name
 	mutable: bool
 }
@@ -72,6 +90,48 @@ extend Lowerer {
 		return inferring
 	}
 
+	/// Whether a local's value, checked since `mark`, is a number literal that
+	/// waits for its first use to say its type: a literal, or an `if`, a
+	/// `match` or a block of them, which checking added nothing to but
+	/// expressions, and of no error.
+	fn waitsAsLiteral(init: ast::ExprId, mark: &CheckMark, value: ExprId): bool = {
+		if !self.numberShaped(init) || !self.program.types.isNumeric(self.tyOf(value)) then
+			return false
+		return self.state.body.locals.len() == mark.locals &&
+			self.state.body.stmts.len() == mark.stmts &&
+			self.program.fns.len() == mark.fns &&
+			self.state.unsettledDefaults.len() == mark.unsettled &&
+			self.state.pendingLocals.len() == mark.pending &&
+			self.diagnostics.len() == mark.diagnostics
+	}
+
+	/// Whether `e` is a number literal, negated or in parentheses, or an
+	/// `if`, a `match` or a block all of whose values are.
+	fn numberShaped(e: ast::ExprId): bool = {
+		val file = self.ast
+		return match file.exprs[e].kind {
+			.Int(..) | .Float(..) => true
+			.Unary(op: .Neg, operand, ..) | .Paren(inner: operand) => self.numberShaped(operand)
+			.If(thenBlock, elseBranch, ..) => match elseBranch {
+				.Some(other) => self.blockNumberShaped(&thenBlock) && self.numberShaped(other)
+				.None => false
+			}
+			.Block(block) => self.blockNumberShaped(&block)
+			.Match(arms, ..) => {
+				for arm in arms {
+					if !self.numberShaped(arm.body) then return false
+				}
+				!arms.isEmpty()
+			}
+			_ => false
+		}
+	}
+
+	fn blockNumberShaped(block: &ast::Block): bool = match blockValue(self.ast, &block) {
+		.Some(value) => self.numberShaped(value)
+		.None => false
+	}
+
 	/// Takes back what checking `value` added since `mark`, and answers what
 	/// stands for it until its local's first use: an error of what is known
 	/// of its type. The expressions it added are the arena's last.
@@ -90,7 +150,75 @@ extend Lowerer {
 		if self.state.pendingLocals.isEmpty() then return .None
 		val .Name(sym) = self.ast.exprs[e].kind else return .None
 		val local = self.lookup(sym)?
-		return if self.state.pendingLocals.contains(&local) then .Some(local) else .None
+		return match self.state.pendingLocals.get(&local) {
+			.Some(pending) if !pending.decided => .Some(local)
+			_ => .None
+		}
+	}
+
+	/// The local `e` names, where it is a number literal waiting for its
+	/// type.
+	fn waitingLiteral(e: ast::ExprId): Option<LocalId> = {
+		val local = self.waitingLocal(e)?
+		return if self.state.pendingLocals.at(&local).literal then .Some(local) else .None
+	}
+
+	/// The first use of a local that is a number literal, where `found` is
+	/// the type the use says, if any. It takes that type where its literal
+	/// would: a type of the literal's kind, integer or float, where the
+	/// literal's own would not do — not where its own widens to the type
+	/// expected, `into`, nor where a value of the type found widens to its
+	/// own, `from`, which compile as they are. Otherwise it keeps its own.
+	var fn decideLiteral(local: LocalId, found: Option<Ty>, into: bool, from: bool, at: Span) = {
+		val .Some(pending) = self.state.pendingLocals.get(&local) else return
+		if pending.decided then return
+		val standIn = pending.standIn
+		val kept = KeptOwn(firstUse: at, name: pending.name, mutable: pending.mutable)
+		val itsOwn = self.state.body.locals[local].ty
+		val types = &self.program.types
+		val ty: Option<Ty> = match found {
+			.Some(t) if t != itsOwn &&
+				types.isNumeric(t) &&
+				types.isInteger(t) == types.isInteger(itsOwn) &&
+				!(into && types.widens(itsOwn, t)) &&
+				!(from && types.widens(t, itsOwn)) => .Some(t)
+			_ => .None
+		}
+		if ty is .Some(t) {
+			self.state.body.locals[local].ty = t
+			self.state.body.exprs[standIn].ty = t
+		} else self.state.keptOwn.put(local, kept)
+		self.state.pendingLocals.at(&local).decided = true
+	}
+
+	/// `diagnostic`, about `e` where a number of type `wanted` is: where `e`
+	/// is a number literal's local that kept its own type, why, and how to
+	/// say the type.
+	fn withKeptOwn(diagnostic: Diagnostic, e: ExprId, wanted: Ty): Diagnostic = {
+		val .Local(local) = self.state.body.exprs[e].kind else return diagnostic
+		val .Some(kept) = self.state.keptOwn.get(&local) else return diagnostic
+		val types = &self.program.types
+		val itsOwn = self.state.body.locals[local].ty
+		if !types.isNumeric(wanted) || types.isInteger(wanted) != types.isInteger(itsOwn) then
+			return diagnostic
+		val name = self.text(kept.name.sym)
+		val keyword = if kept.mutable then "var" else "val"
+		val said =
+			if kept.firstUse == self.state.body.exprs[e].span then diagnostic
+			else diagnostic.withSecondary(
+				kept.firstUse,
+				"its first use, which says nothing of its type",
+			)
+		return said.withNote("`\(name)` is \(self.tyName(itsOwn)), its literal's own: a variable of a number literal takes its type from its first use, where that says one").withHelp("write it where `\(name)` is declared: `\(keyword) \(name): \(self.program.tyName(wanted, self.interner)) = …`")
+	}
+
+	/// The first use of a local that is a number literal, as an operand
+	/// beside `other`, where a literal would take `wanted`: that, unless the
+	/// other is a constant, which takes its type from beside it as the
+	/// literal does.
+	var fn decideBeside(local: LocalId, other: ExprId, wanted: Ty, span: Span) = {
+		val found: Option<Ty> = if self.constantShaped(other) then .None else .Some(wanted)
+		self.decideLiteral(local, found, into: true, from: true, at: span)
 	}
 
 	/// The first use of a local waiting for its type, where `found` is the
@@ -139,7 +267,11 @@ extend Lowerer {
 		}
 		for local in ending {
 			val pending = self.state.pendingLocals.remove(&local).unwrap()
-			self.recheck(local, pending, .None)
+			// A number literal is checked against the type its first use
+			// decided, or its own.
+			val ty: Option<Ty> =
+				if pending.literal then .Some(self.state.body.locals[local].ty) else .None
+			self.recheck(local, pending, ty)
 		}
 	}
 
@@ -266,6 +398,18 @@ extend Lowerer {
 	/// a generic function's arguments say its own. They are checked here,
 	/// and kept for where the call checks them.
 	var fn decideByMethod(local: LocalId, base: ast::ExprId, name: ast::Name, item: &ItemUse) = {
+		// A method says nothing of a number literal's type: the method is
+		// found by it.
+		if self.state.pendingLocals.at(&local).literal {
+			self.decideLiteral(
+				local,
+				.None,
+				into: false,
+				from: false,
+				at: self.ast.exprs[base].span,
+			)
+			return
+		}
 		val known = self.state.body.locals[local].ty
 		var found = ERROR
 		if self.ownerOf(known) is .Some(owner) {

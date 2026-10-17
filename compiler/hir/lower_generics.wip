@@ -6,6 +6,7 @@ import std::mem
 import syntax as ast
 import syntax::{
 	BUILTIN_REDEFINED,
+	LENGTH,
 	CANNOT_INFER,
 	DECIDED_TYPE,
 	Diagnostic,
@@ -208,6 +209,28 @@ extend Lowerer {
 						"`interface Iterator<type Item>` says each implementation decides `Item`; a struct's, an enum's and a function's parameters are given where they are used",
 					),
 				)
+			// A length is a number: an interface takes types alone, and a
+			// number answers no constraint.
+			if param.length is .Some(span) && isInterface then
+				self.report(
+					Diagnostic::error(
+						LENGTH,
+						"an interface takes types, not lengths",
+						span,
+						"a length",
+					).withNote(
+						"`val N` is a length, which a struct, an enum or a function may take",
+					),
+				)
+			if param.length.isSome() && !param.bounds.isEmpty() then
+				self.report(
+					Diagnostic::error(
+						LENGTH,
+						"a length has no constraints",
+						param.bounds[0].span.to(param.bounds[param.bounds.len() - 1].span),
+						"constrains a length",
+					).withNote("`val N` is an `i64`, known where the program compiles"),
+				)
 			defs.push(GenericParamDef(
 				decided: isInterface && param.decided.isSome(),
 				name: param.name.sym,
@@ -217,6 +240,7 @@ extend Lowerer {
 				default: if param.default.isSome() && declared then ParamDefault::Pending
 				else ParamDefault::None,
 				span: param.name.span,
+				length: param.length.isSome() && !isInterface,
 			))
 		}
 		if !declared then self.constrain(&params, &var defs)
@@ -416,7 +440,7 @@ extend Lowerer {
 		}
 		var written: Vec<Ty> = Vec()
 		for i in 0..args.len() {
-			val ty = self.typeArg(args[i])
+			val ty = self.typeArgFor(args[i], &generics[i])
 			self.checkCopy(ty, &generics[i], self.ast.types[args[i]].span)
 			written.push(ty)
 		}
@@ -445,10 +469,107 @@ extend Lowerer {
 	/// C type, as what a `ptr` points at may: what is refused is a value of
 	/// one, where an instance holds it.
 	var fn typeArg(id: ast::TypeId): Ty = {
+		if self.lengthArg(id) is .Some(length) then return length
 		val ty = self.resolvePointee(id)
 		if self.noVarRef(ty, id, "a type argument") || self.bareSlice(ty, id, false) then
 			return ERROR
 		return ty
+	}
+
+	/// A type argument for `param`: the error type where it is a length and
+	/// `param` takes a type, or the other way round, which is reported.
+	var fn typeArgFor(id: ast::TypeId, param: &GenericParamDef): Ty = {
+		val ty = self.typeArg(id)
+		return if self.lengthMismatch(ty, &param, self.ast.types[id].span) then ERROR else ty
+	}
+
+	/// A length, as a type argument: a number, a length parameter, or the
+	/// name of a constant where no type has it, which is known where it is
+	/// written as an array's length is. Nothing for anything else.
+	var fn lengthArg(id: ast::TypeId): Option<Ty> = {
+		val file = self.ast
+		val span = file.types[id].span
+		return match file.types[id].kind {
+			.Length(value) => .Some(self.intern(.Count(value)))
+			.Named(name: sym, args) if args.isEmpty() => {
+				if self.lengthParam(sym) is .Some(param) then return .Some(param)
+				if self.typeParam(sym).isSome() ||
+					self.builtin(sym).isSome() ||
+					self.namesType(sym) {
+					return .None
+				}
+				val name = ast::Name(sym: sym, span: span)
+				if self.constNamed(name).isNone() then return .None
+				match self.arrayLen(.Name(name: name)) {
+					.Some(value) => Option::Some(self.intern(.Count(value)))
+					.None => .Some(ERROR)
+				}
+			}
+			_ => .None
+		}
+	}
+
+	/// Whether `sym` names a type here: the module's, an import's, an
+	/// alias, a C type, or the prelude's.
+	fn namesType(sym: Symbol): bool = {
+		if self.typeHere(sym).isSome() ||
+			self.aliasScope(sym).isSome() ||
+			self.opaqueHere(sym).isSome() ||
+			self.preludeType(sym).isSome() {
+			return true
+		}
+		return match self.imports.items.get(&sym) {
+			.Some(.Item(module, name: item)) => self.modules[module].types.get(&item.sym).isSome()
+			_ => false
+		}
+	}
+
+	/// The length parameter `sym` names here, as a type.
+	var fn lengthParam(sym: Symbol): Option<Ty> = {
+		for (index, param) in self.typeParams.forwards().enumerate() {
+			if param.written == sym && param.length then
+				return .Some(
+					self.intern(
+						.Param(TyParam(index: index as u32, name: param.name, copy: param.copy)),
+					),
+				)
+		}
+		return .None
+	}
+
+	/// Whether `ty` is a length: a number, or a length parameter.
+	fn isLength(ty: Ty): bool = match self.kind(ty) {
+		.Count(..) => true
+		.Param(param) =>
+			param.index < self.typeParams.len() &&
+				self.typeParams[param.index].length &&
+				self.typeParams[param.index].name == param.name
+		_ => false
+	}
+
+	/// Reports a length given where `param` takes a type, or a type where it
+	/// takes a length; whether it did.
+	var fn lengthMismatch(ty: Ty, param: &GenericParamDef, span: Span): bool = {
+		if self.isPoisoned(ty) || param.length == self.isLength(ty) then return false
+		val name = String::of(self.text(param.name))
+		self.report(
+			if param.length then
+				Diagnostic::error(
+					LENGTH,
+					"`\(name)` is a length, and \(self.tyName(ty)) is a type",
+					span,
+					"not a length",
+				).withNote(
+					"a length is given as a number, `256`, or a constant's name, or a length parameter",
+				)
+			else Diagnostic::error(
+				LENGTH,
+				"`\(name)` is a type, and `\(self.program.tyName(ty, self.interner))` is a length",
+				span,
+				"not a type",
+			).withNote("a parameter declared `val N` takes a length; one without `val`, a type"),
+		)
+		return true
 	}
 
 	/// Reports the wrong number of type arguments for `name`.
@@ -474,6 +595,7 @@ extend Lowerer {
 	/// `copy`. While type bodies are still being resolved, whether a type
 	/// owns memory is not known yet, so the check waits until they are.
 	var fn checkCopy(ty: Ty, param: &GenericParamDef, span: Span) = {
+		if self.lengthMismatch(ty, &param, span) then return
 		if !param.copy || self.isPoisoned(ty) then return
 		if self.phase < .TypesResolved {
 			self.pendingCopy.push((ty, param.name, span))
@@ -581,7 +703,7 @@ extend Lowerer {
 		var written: Vec<Ty> = Vec()
 		for i in 0..given {
 			val arg = typeArgs.args[i]
-			val ty = self.typeArg(arg)
+			val ty = self.typeArgFor(arg, &generics[i])
 			self.checkCopy(ty, &generics[i], self.ast.types[arg].span)
 			self.checkConstraints(ty, &generics[i], self.ast.types[arg].span)
 			written.push(ty)
@@ -633,7 +755,8 @@ extend Lowerer {
 			// A slice is matched by the elements of an array or buffer, as the
 			// coercions allow.
 			(.Own(inner: d), .Own(inner: f)) => {
-				if types.kind(d) is .Slice(elem) && types.kind(f) is .Array(elem: foundElem, ..) {
+				if types.kind(d) is .Slice(elem) &&
+					types.kind(f) is .Array(elem: foundElem, ..) | .ArrayOf(elem: foundElem, ..) {
 					self.unify(elem, foundElem, &var solution)
 					return
 				}
@@ -642,7 +765,10 @@ extend Lowerer {
 			// An array where a list on the heap is declared is reported where
 			// it is checked, with `own` to write; its elements say what the
 			// list's are.
-			(.Own(inner: d), .Array(elem: foundElem, ..)) if types.kind(d) is .Slice(..) => {
+			(
+				.Own(inner: d),
+				.Array(elem: foundElem, ..) | .ArrayOf(elem: foundElem, ..),
+			) if types.kind(d) is .Slice(..) => {
 				if types.kind(d) is .Slice(elem) then self.unify(elem, foundElem, &var solution)
 			}
 			// A reference to an `own` stands for a reference to what it owns
@@ -657,7 +783,8 @@ extend Lowerer {
 					}
 				}
 				if types.kind(d) is .Slice(elem) &&
-					types.kind(under) is .Array(elem: foundElem, ..) | .Slice(elem: foundElem) {
+					types.kind(under) is .Array(elem: foundElem, ..) | .ArrayOf(elem: foundElem, ..)
+					| .Slice(elem: foundElem) {
 					self.unify(elem, foundElem, &var solution)
 					return
 				}
@@ -675,7 +802,8 @@ extend Lowerer {
 			// which is lent as them.
 			(
 				.Ref(inner: d, ..),
-				.Slice(elem: foundElem) | .Array(elem: foundElem, ..),
+				.Slice(elem: foundElem) | .Array(elem: foundElem, ..)
+				| .ArrayOf(elem: foundElem, ..),
 			) if types.kind(d) is .Slice(..) => {
 				if types.kind(d) is .Slice(elem) then self.unify(elem, foundElem, &var solution)
 			}
@@ -683,6 +811,17 @@ extend Lowerer {
 				if types.kind(d) is .Slice(elem) && self.itemsElement(found) is .Some(foundElem) {
 					self.unify(elem, foundElem, &var solution)
 				}
+			}
+			// An array of a length parameter says the length.
+			(.ArrayOf(elem: d, len: p), .Array(elem: f, len: n)) => {
+				self.unify(d, f, &var solution)
+				if solution[p.index].isNone() && types.find(.Count(n)) is .Some(length) then
+					solution[p.index] = .Some(length)
+			}
+			(.ArrayOf(elem: d, len: p), .ArrayOf(elem: f, len: q)) => {
+				self.unify(d, f, &var solution)
+				if solution[p.index].isNone() && types.find(.Param(q)) is .Some(length) then
+					solution[p.index] = .Some(length)
 			}
 			// A temporary lent where `&[T]` is declared is matched against
 			// `[T]`, which an array's elements answer.
@@ -954,7 +1093,7 @@ extend Lowerer {
 			if param.interfaces.isEmpty() then continue
 			if i >= solution.len() then continue
 			val .Some(ty) = solution[i] else continue
-			val .Array(elem, ..) = self.kind(ty) else continue
+			val .Array(elem, ..) | .ArrayOf(elem, ..) = self.kind(ty) else continue
 			// The same question the constraint check asks, with the arguments
 			// known so far; one that is not known yet asks only whether the
 			// type implements the interface at all.

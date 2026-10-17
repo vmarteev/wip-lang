@@ -35,6 +35,16 @@ function commaSep(rule) {
   return optional(seq(rule, repeat(seq(',', rule)), optional(',')));
 }
 
+/** The words the lexer keeps, which name a field where only a field's name
+ * can stand. */
+const KEYWORDS = [
+  'as', 'assert', 'become', 'break', 'continue', 'defer', 'dyn', 'else',
+  'enum', 'extern', 'false', 'fn', 'for', 'if', 'impl', 'import', 'in',
+  'interface', 'is', 'lend', 'let', 'match', 'move', 'null', 'own', 'pub',
+  'return', 'self', 'static', 'struct', 'then', 'true', 'type', 'val', 'var',
+  'when', 'while', 'yield',
+];
+
 function commaSep1(rule) {
   return seq(rule, repeat(seq(',', rule)), optional(','));
 }
@@ -64,6 +74,9 @@ module.exports = grammar({
     // `Some(x)`: a name bound, or a variant taken apart; the checker knows.
     [$.identifier_pattern, $.variant_pattern],
     [$.identifier_pattern, $.binder],
+    // `pub var fn` or `pub var fn: bool`: a method, or a field a keyword
+    // names; the `:` after says.
+    [$.receiver, $.field_declaration],
     [$.variant_pattern],
     // `implicit val x = …`, or an expression that starts with a name: the
     // `val` after it says.
@@ -202,13 +215,14 @@ module.exports = grammar({
     parameter: $ => seq(
       optional(field('modifier', alias($.identifier, $.modifier))),
       optional('var'),
-      field('name', $.identifier),
+      // A variant's field may be named by a keyword, as a struct's may.
+      field('name', choice($.identifier, $._keyword_field)),
       ':',
       field('type', $._type),
       optional(seq('=', field('default', $._expression))),
     ),
 
-    type_parameters: $ => seq('<', commaSep1($.type_parameter), '>'),
+    type_parameters: $ => seq('<', commaSep1(choice($.type_parameter, $.length_parameter)), '>'),
 
     // `T: Ord + Hash`, and `K = T`, a default naming the parameters
     // before it; `type Item`, an interface's, which each implementation
@@ -218,6 +232,14 @@ module.exports = grammar({
       field('name', $._type_identifier),
       optional(seq(':', $.constraint, repeat(seq('+', $.constraint)))),
       optional(seq('=', field('default', $._type))),
+    ),
+
+    // `val N`: a length, an `i64` known where the program compiles, which
+    // stands where an array's length may; `val N = 16`, with a default.
+    length_parameter: $ => seq(
+      'val',
+      field('name', $._type_identifier),
+      optional(seq('=', field('default', choice($.integer, $._type)))),
     ),
 
     // An interface is named as a type is: `Area`, or another module's by
@@ -275,7 +297,7 @@ module.exports = grammar({
     field_declaration: $ => seq(
       repeat($.annotation),
       optional(seq($.visibility, optional('var'))),
-      field('name', $._field_identifier),
+      field('name', $._field_name),
       ':',
       field('type', $._type),
       optional(seq('=', field('default', $._expression))),
@@ -303,7 +325,7 @@ module.exports = grammar({
       field('type', choice(
         seq($.scoped_type_identifier, optional($.type_parameters)),
         seq($._type_identifier, optional($.type_parameters)),
-        seq('[', $.type_parameter, ']'),
+        seq('[', $.type_parameter, optional(seq(';', field('length', $._type_identifier))), ']'),
         seq('own', $.type_parameters),
       )),
       optional(seq(':', field('interface', $._interface_name), optional($.type_arguments))),
@@ -373,7 +395,8 @@ module.exports = grammar({
       field('type_arguments', $.type_arguments),
     )),
 
-    type_arguments: $ => seq('<', commaSep1($._type), '>'),
+    // A number among them is a length parameter's: `InlineVec<u8, 256>`.
+    type_arguments: $ => seq('<', commaSep1(choice($._type, $.integer)), '>'),
 
     reference_type: $ => prec.right(seq('&', optional('var'), field('type', $._type))),
 
@@ -584,12 +607,16 @@ module.exports = grammar({
 
     rest_argument: $ => seq('..', $._expression),
 
-    named_argument: $ => seq(field('name', $.identifier), ':', field('value', $._expression)),
+    named_argument: $ => seq(
+      field('name', choice($.identifier, $._keyword_field)),
+      ':',
+      field('value', $._expression),
+    ),
 
     field_expression: $ => prec(PREC.postfix, seq(
       field('value', $._expression),
       '.',
-      field('field', choice($._field_identifier, $.integer)),
+      field('field', choice($._field_name, $.integer)),
     )),
 
     index_expression: $ => prec(PREC.postfix, seq(
@@ -846,6 +873,7 @@ module.exports = grammar({
 
     binder: $ => choice(
       seq(field('field', $.identifier), optional(seq(':', field('pattern', $._pattern)))),
+      seq(field('field', $._keyword_field), ':', field('pattern', $._pattern)),
       $._pattern,
     ),
 
@@ -862,6 +890,11 @@ module.exports = grammar({
     _type_identifier: $ => alias($.identifier, $.type_identifier),
 
     _field_identifier: $ => alias($.identifier, $.field_identifier),
+
+    // A keyword where only a field's name can stand: `talk.when`.
+    _keyword_field: $ => alias(choice(...KEYWORDS), $.field_identifier),
+
+    _field_name: $ => choice($._field_identifier, $._keyword_field),
 
     self: _ => 'self',
 

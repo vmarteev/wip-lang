@@ -341,6 +341,15 @@ extend Parser {
 		// `extend [T: Ord] { … }`: methods a slice has where its element
 		// answers the constraint.
 		val bounds = self.bounds()?
+		// `extend [T; N] { … }`: methods of an array, its length named.
+		var length: Option<Name> = .None
+		if self.eat(.Semi) {
+			length = self.name("the length's name")
+			if length.isNone() {
+				self.skipToItem()
+				return .None
+			}
+		}
 		self.expectClosing(.RBracket, open)
 		val (interfaceModule, interfaceName, interfaceArgs) = self.extendedInterface()?
 		val body = self.itemBodyOpen()?
@@ -359,15 +368,26 @@ extend Parser {
 			default: .None,
 			span: elem.span.to(self.prevSpan()),
 		)
+		var generics = Vec::of([param])
+		if length is .Some(name) then
+			generics.push(GenericParam(
+				decided: .None,
+				name: name,
+				bounds: Vec(),
+				default: .None,
+				span: name.span,
+				length: .Some(name.span),
+			))
 		return .Some(ExtendBlock(
 			annotations: annotations,
 			sliceOf: .Some(elem),
+			arrayLength: length,
 			boxed: .None,
 			interfaceName: interfaceName,
 			interfaceModule: interfaceModule,
 			interfaceArgs: interfaceArgs,
 			path: [elem],
-			generics: [param],
+			generics: generics,
 			methods: methods,
 			derived: .None,
 			span: start.to(close),
@@ -623,8 +643,9 @@ extend Parser {
 	var fn structField(pubSpan: Option<Span>, annotations: Vec<Annotation>): Option<Field> = {
 		// `pub var x: i64` is written by anyone; `pub x: i64` is
 		// read by anyone and written where it is declared.
-		val varSpan: Option<Span> = if self.at(.Var) then .Some(self.bump()) else .None
-		var field = self.field("a field name")?
+		val varSpan: Option<Span> =
+			if self.at(.Var) && !self.keywordField() then .Some(self.bump()) else .None
+		var field = self.fieldAfter(self.fieldName("a field name")?)?
 		field.annotations = annotations
 		field.isPub = pubSpan.isSome()
 		field.isVar = varSpan.isSome()
@@ -726,20 +747,25 @@ extend Parser {
 		val annotations = self.annotations()
 		val isPub = self.at(.Pub)
 		val pubSpan: Option<Span> = if isPub then .Some(self.bump()) else .None
-		var receiver: Option<Receiver> = match self.peek() {
-			.Fn => .Some(.Read)
-			.Var => .Some(.Var)
-			.Move => .Some(.Move)
-			.Static => .Some(.Static)
-			// `lend fn`: both halves of a lending pair.
-			.Lend if self.nth(1) == .Fn => .Some(.Lend)
-			_ => .None
+		var receiver: Option<Receiver> = if self.keywordField() then .None else {
+			match self.peek() {
+				.Fn => .Some(.Read)
+				.Var => .Some(.Var)
+				.Move => .Some(.Move)
+				.Static => .Some(.Static)
+				// `lend fn`: both halves of a lending pair.
+				.Lend if self.nth(1) == .Fn => .Some(.Lend)
+				_ => .None
+			}
 		}
 		// `pub var x: i64`: a field another module may write, not a
 		// method. `var` before a name is the field's;
 		// before `fn` it is the method's receiver.
-		if receiver == .Some(.Var) && isIdent(self.nth(1)) && self.nth(2) == .Colon then
+		if receiver == .Some(.Var) &&
+			(isIdent(self.nth(1)) || isKeyword(self.nth(1))) &&
+			self.nth(2) == .Colon {
 			receiver = .None
+		}
 		val .Some(declared) = receiver else {
 			// `pub` on a field exports it; what the
 			// element is decides whether it may carry one, and annotations.
@@ -790,13 +816,15 @@ extend Parser {
 				"a field",
 				(kind) => canStartType(kind),
 				(p): Option<Field> => {
-					val named = isIdent(p.peek()) && (p.nth(1) == .Colon || canStartType(p.nth(1)))
+					val named =
+						isIdent(p.peek()) && (p.nth(1) == .Colon || canStartType(p.nth(1))) ||
+						p.keywordField()
 					if !named {
 						val ty = p.ty()
 						unnamed.push(p.ast.types[ty].span)
 						return .None
 					}
-					var field = p.field("a field name")?
+					var field = p.fieldAfter(p.fieldName("a field name")?)?
 					p.fieldDefault(&var field)
 					return .Some(field)
 				},

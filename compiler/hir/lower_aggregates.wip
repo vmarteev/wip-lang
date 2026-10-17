@@ -9,6 +9,7 @@ import syntax::{
 	Edit,
 	OPAQUE_VALUE,
 	PACKAGE,
+	REST_NOT_LAST,
 	SELF_OUTSIDE_METHOD,
 	STRUCT_LITERAL_FIELDS,
 	Span,
@@ -93,17 +94,21 @@ extend Lowerer {
 		return self.structLitOf(module, name, path.len() - 1, lit)
 	}
 
-	/// The fields a literal did not name, read from the value after `..`. It
-	/// must be a value that is there — a variable, a field, an element — since
-	/// each field is read from it where it lies, and each must be one that
-	/// copies.
+	/// The fields a literal did not name, taken from the value after `..`,
+	/// as each would be were it written out, `field: base.field`: plain data
+	/// copied, and a field that owns memory moved out of `base`. A value
+	/// that is not a place is held in a local of the literal's own, the
+	/// statement that gives it its value answered beside the fields, and
+	/// what the literal does not take of it is dropped with it. A field the
+	/// literal's module may not write is not taken, and is reported as one
+	/// the literal leaves out.
 	var fn restFields(
 		rest: ast::ExprId,
 		ty: Ty,
 		taken: &[i64],
 		name: ast::Name,
 		span: Span,
-	): Vec<(i64, ExprId)> = {
+	): (Vec<(i64, ExprId)>, Option<StmtId>) = {
 		val context: Option<(Span, str)> = .Some((name.span, "the literal's type"))
 		val value = self.checkIn(rest, ty, context)
 		val restSpan = self.state.body.exprs[value].span
@@ -112,20 +117,7 @@ extend Lowerer {
 		// them missing as well.
 		if self.tyOf(value) != ty {
 			// Reported by the check above.
-			return self.restBroken(taken, restSpan)
-		}
-		if !self.state.body.isPlace(value) {
-			self.report(
-				Diagnostic::error(
-					STRUCT_LITERAL_FIELDS,
-					"`..` takes the rest of the fields from a value that is there",
-					restSpan,
-					"not a variable, a field or an element",
-				).withHelp("put it in a variable first, and name that after `..`").withNote(
-					"each field is copied from where it lies, so the value is read and not built",
-				),
-			)
-			return self.restBroken(taken, restSpan)
+			return (self.restBroken(taken, restSpan), .None)
 		}
 		var fields: Vec<(i64, ExprId)> = Vec()
 		if taken.isEmpty() {
@@ -137,35 +129,34 @@ extend Lowerer {
 					"every field is named already",
 				),
 			)
-			return fields
+			return (fields, .None)
 		}
+		var base = value
+		var held: Option<StmtId> = .None
+		if !self.state.body.isPlace(value) {
+			val local = self.state.body.locals.add(Local(
+				name: Symbol::ignored(),
+				ty: ty,
+				kind: .Var,
+				span: restSpan,
+			))
+			held = .Some(
+				self.state.body.stmts.add(Stmt(
+					kind: .Let(local: local, init: value),
+					span: restSpan,
+				)),
+			)
+			base = self.alloc(.Local(local), ty, restSpan)
+		}
+		val .Struct(id, ..) = self.kind(ty) else panic("a struct literal's type is a struct")
 		for i in taken {
+			if !self.fieldSettable(id, i) then continue
 			val fieldTy = self.program.fieldTy(ty, i as u32)
-			// A field that owns memory would be moved out of a value that goes
-			// on living, which nothing else in the language does.
-			if self.owns(fieldTy) {
-				val .Struct(id, ..) = self.kind(ty) else {
-					panic("a struct literal's type is a struct")
-				}
-				val field = String::of(self.text(self.program.structs[id].fields[i].name))
-				self.report(
-					Diagnostic::error(
-						STRUCT_LITERAL_FIELDS,
-						"`\(field)` is \(self.tyName(fieldTy)), which owns memory",
-						restSpan,
-						"not a field `..` can copy",
-					).withHelp("give `\(field)` a value of its own in the literal, or build the whole value with `move`").withNote(
-						"`..` copies the fields it takes, and a value that owns memory has one owner",
-					),
-				)
-				// Reported here, so it is not reported again as missing.
-				fields.push((i, self.errorExpr(restSpan)))
-				continue
-			}
-			val read = self.alloc(.Field(base: value, index: i as u32), fieldTy, span)
+			val read = self.alloc(.Field(base: base, index: i as u32), fieldTy, restSpan)
+			self.state.body.restTaken.add(read)
 			fields.push((i, read))
 		}
-		return fields
+		return (fields, held)
 	}
 
 	/// The fields `..` would have given, each an error of its own.
@@ -286,7 +277,7 @@ extend Lowerer {
 	/// reference, which is never null.
 	fn zeroable(ty: Ty): bool = match self.kind(ty) {
 		.Int(..) | .Float(..) | .Bool | .Char | .Ptr(..) | .Cstring | .Unit => true
-		.Array(elem, ..) => self.zeroable(elem)
+		.Array(elem, ..) | .ArrayOf(elem, ..) => self.zeroable(elem)
 		.Struct(id, args) if self.program.structs[id].isExtern => {
 			val list = self.program.types.list(args).toVec()
 			for f in self.program.structs[id].fields {
@@ -534,17 +525,20 @@ extend Lowerer {
 			list = self.program.types.internList(&tys)
 		}
 		val ty = self.intern(.Struct(id: id, args: list))
-		// `..value`: the fields the literal does not name are copied from a
+		// `..value`: the fields the literal does not name are taken from a
 		// value that has them.
+		var held: Option<StmtId> = .None
 		if lit.rest is .Some(rest) {
 			var taken: Vec<i64> = Vec()
 			for i in 0..decls.len() {
 				if values[i].isNone() then taken.push(i)
 			}
-			for (i, value) in self.restFields(rest, ty, &taken, name, span) {
+			val (fields, statement) = self.restFields(rest, ty, &taken, name, span)
+			for (i, value) in fields {
 				values[i] = .Some(value)
 				written.push(i as u32)
 			}
+			held = statement
 		}
 		// A field that is still not set takes its default, evaluated here. The
 		// value after `..` comes first: it is what the literal names, and a
@@ -606,7 +600,19 @@ extend Lowerer {
 				},
 			)
 		}
-		return self.alloc(.Struct(id: id, fields: fieldValues, order: orderOf(written)), ty, span)
+		val built = self.alloc(
+			.Struct(id: id, fields: fieldValues, order: orderOf(written)),
+			ty,
+			span,
+		)
+		return match held {
+			.Some(statement) => self.alloc(
+				.Block(Block(stmts: [statement], value: .Some(built), span: span)),
+				ty,
+				span,
+			)
+			.None => built
+		}
 	}
 
 	/// The enum and variant that `Enum::Variant` or `.Variant` names. Without
@@ -770,8 +776,10 @@ extend Lowerer {
 		val hint = item.hint
 		val span = item.span
 		val .Some((id, index)) = self.resolveVariant(enumName, variant, hint) else {
+			if item.rest is .Some(rest) then self.infer(rest, .None)
 			return self.giveUpItem(item)
 		}
+		if item.rest is .Some(rest) then return self.variantFromBase(id, index, variant, rest, item)
 		// Defaults that are code, called with the variant's type arguments once
 		// they are known.
 		val defaults = self.state.unsettledDefaults.len()
@@ -851,6 +859,152 @@ extend Lowerer {
 		return self.alloc(.Variant(id: id, variant: index, args: hirArgs, order: order), ty, span)
 	}
 
+	/// `.Variant(field: value, ..base)`, where an arm or a test around
+	/// matched `base` as the variant: the fields not named are `base`'s. The
+	/// values named are kept first, in the order written; then `base` is
+	/// taken apart as a `var` pattern takes a place apart, plain data copied
+	/// and the whole of it given up where a field taken owns memory. A
+	/// `base` that has become another variant since it was matched panics.
+	var fn variantFromBase(
+		id: EnumId,
+		index: u32,
+		variant: ast::Name,
+		rest: ast::ExprId,
+		item: ItemUse,
+	): ExprId = {
+		val span = item.span
+		val restSpan = self.ast.exprs[rest].span
+		val enumSym = self.program.enums[id].name
+		val path = "\(self.text(enumSym))::\(self.text(variant.sym))"
+		// The value itself, through any reference to it.
+		var base = self.infer(rest, .None)
+		while self.kind(self.tyOf(base)) is .Ref(inner, ..) | .Own(inner) {
+			base = self.alloc(.Deref(base), inner, restSpan)
+		}
+		val baseTy = self.tyOf(base)
+		// The values named, checked against the variant's fields whether or
+		// not `base` can give the rest, so that a refusal of it is the only
+		// one: the type's arguments are `base`'s, where it is of the enum.
+		val start: Vec<Option<Ty>> = match self.kind(baseTy) {
+			.Enum(id: baseId, args: baseArgs) if baseId == id => {
+				var known: Vec<Option<Ty>> = Vec()
+				for t in self.program.types.list(baseArgs).toVec() {
+					known.push(.Some(t))
+				}
+				known
+			}
+			_ => self.expectedArgs(.Enum(id), item.hint.map((h) => self.underRefs(h)))
+		}
+		var inference = Inference::new(start)
+		val fields = self.program.enums[id].variants[index].fields.clone()
+		val isView = self.program.enums[id].isView
+		val written: &[ast::ExprId] = match item.args {
+			.Some(a) => a
+			.None => &noArgs()
+		}
+		val (matched, _, checked) = self.variantOperands(
+			&path,
+			&fields,
+			written,
+			item,
+			isView,
+			&var inference,
+			span,
+			true,
+		)
+		if self.isPoisoned(baseTy) then return self.errorExpr(span)
+		if !self.matchedAs(base, id, index) {
+			val name = self.text(variant.sym)
+			self.report(
+				Diagnostic::error(
+					REST_NOT_LAST,
+					"`..` builds `\(path)` only from a value matched as `.\(name)`",
+					restSpan,
+					"not known here to be `.\(name)`",
+				).withNote(
+					"a value is known to be a variant in the arm of a `match` on it whose pattern is that variant, and in the block of an `is` test on it that is",
+				).withHelp("build it in the arm or the block that matched it as `.\(name)(…)`"),
+			)
+			return self.errorExpr(span)
+		}
+		val .Enum(args: baseArgs, ..) = self.kind(baseTy) else panic("matched as a variant")
+		val tys = self.program.types.list(baseArgs).toVec()
+		// The values named, in the order written, each kept in a local of the
+		// literal's own until `base` is taken apart.
+		var stmts: Vec<StmtId> = Vec()
+		var values: Vec<Option<ExprId>> = Vec()
+		for _ in 0..fields.len() {
+			values.push(.None)
+		}
+		var given: Vec<(i64, i64)> = Vec()
+		for (slot, arg) in matched.slots.forwards().enumerate() {
+			if arg is .Some(a) then given.push((a, slot))
+		}
+		given.sortUnstable()
+		for (arg, slot) in given {
+			val .Some(value) = checked[arg] else continue
+			val ty = self.tyOf(value)
+			val at = self.state.body.exprs[value].span
+			val local = self.state.body.locals.add(Local(
+				name: fields[slot].name,
+				ty: ty,
+				kind: .Var,
+				span: at,
+			))
+			stmts.push(
+				self.state.body.stmts.add(Stmt(kind: .Let(local: local, init: value), span: at)),
+			)
+			values[slot] = .Some(self.alloc(.Local(local), ty, at))
+		}
+		// The fields not named, bound from `base` as `var` names.
+		var binders: Vec<Binder> = Vec()
+		var owning = false
+		for (i, f) in fields.forwards().enumerate() {
+			if values[i].isSome() {
+				binders.push(.Ignored)
+				continue
+			}
+			val ty = self.program.types.subst(f.ty, &tys)
+			if !self.isPoisoned(ty) && self.owns(ty) then owning = true
+			val local = self.state.body.locals.add(Local(
+				name: f.name,
+				ty: ty,
+				kind: .Var,
+				span: restSpan,
+			))
+			binders.push(.Bind(local))
+			values[i] = .Some(self.alloc(.Local(local), ty, restSpan))
+		}
+		if owning && self.rootsInLocal(base) {
+			self.state.body.moveAt(base)
+			if self.state.body.exprs[base].kind is .Move(taken) then
+				self.state.body.restTaken.add(taken)
+		}
+		var args: Vec<ExprId> = Vec()
+		for value in values {
+			args.push(value.unwrap())
+		}
+		val ty = self.intern(.Enum(id: id, args: baseArgs))
+		val literal = self.alloc(
+			.Variant(id: id, variant: index, args: args, order: Vec()),
+			ty,
+			span,
+		)
+		val panicked = self.alloc(.Panic(note: .None, message: .None), NEVER, span)
+		val arms = Vec::of([
+			Arm(
+				pattern: .Variant(variant: index, binders: binders),
+				guard: .None,
+				body: literal,
+				span: span,
+			),
+			Arm(pattern: .Wildcard, guard: .None, body: panicked, span: span),
+		])
+		val taken = self.alloc(.Match(scrutinee: base, arms: arms), ty, span)
+		if stmts.isEmpty() then return taken
+		return self.alloc(.Block(Block(stmts: stmts, value: .Some(taken), span: span)), ty, span)
+	}
+
 	/// `.Variant` written without the fields it has.
 	var fn variantWithoutFields(
 		enumName: Option<(i64, ast::Name)>,
@@ -910,14 +1064,41 @@ extend Lowerer {
 		inference: &var Inference,
 		span: Span,
 	): (Vec<ExprId>, Vec<u32>) = {
+		val (matched, slots, checked) = self.variantOperands(
+			path,
+			&fields,
+			args,
+			item,
+			isView,
+			&var inference,
+			span,
+			false,
+		)
+		return self.arrangeArguments(&slots, &matched, &checked, span, "")
+	}
+
+	/// The values a variant is given, matched to its fields and checked, each
+	/// at the place it was written. A field left out takes its default, as a
+	/// parameter does; where `fromBase`, it is `..base`'s instead, and not
+	/// missing.
+	var fn variantOperands(
+		path: str,
+		fields: &[FieldDef],
+		args: &[ast::ExprId],
+		item: ItemUse,
+		isView: bool,
+		inference: &var Inference,
+		span: Span,
+		fromBase: bool,
+	): (Matched, Vec<Slot>, Vec<Option<ExprId>>) = {
 		val names = self.fieldNames(path, &fields, args, item.argNames())
-		// A field left out takes its default, as a parameter does.
 		var slots: Vec<Slot> = Vec()
 		for f in fields {
-			slots.push(Slot(name: f.name, ty: f.ty, span: f.span, default: f.default.clone()))
+			val default = if fromBase then Option::None else f.default.clone()
+			slots.push(Slot(name: f.name, ty: f.ty, span: f.span, default: default))
 		}
 		val matched = self.matchArguments(&slots, args, &names, "field", path)
-		val missing = matched.missing(&slots)
+		val missing: Vec<i64> = if fromBase then Vec() else matched.missing(&slots)
 		if !missing.isEmpty() || matched.extra > 0 {
 			// Where a field has a default, the count says nothing: what is
 			// missing is named.
@@ -976,7 +1157,7 @@ extend Lowerer {
 		for arg in matched.unmatched {
 			self.infer(args[arg], .None)
 		}
-		return self.arrangeArguments(&slots, &matched, &checked, span, "")
+		return (matched, slots, checked)
 	}
 
 	/// Whether every field holds nothing in this instance.

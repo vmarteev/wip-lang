@@ -2,6 +2,86 @@
 
 Each version published, newest first.
 
+## 0.8.0 — 2026-10-17
+
+Programs written for 0.7 compile as they did, but where marked
+**breaking**; the compiler's errors say what to write instead.
+
+**The language**
+
+- **Generics over a length:** a struct, an enum or a function may take
+  `val N` among its type parameters, an `i64` known where the program
+  compiles. It stands wherever an array's length may, `[T; N]`, and in
+  the code it is the number each use gives. A use gives a number in a
+  type, `Ring<f32, 4>`, a constant's name, or leaves it to be inferred
+  from an array, `total([1, 2, 3])`. A type does no arithmetic on a
+  length, `[T; N + 1]`, and an interface takes none (E0369, which also
+  refuses a length where a type is expected, and a type where a length
+  is). `extend [T; N]` gives every array the methods of a module's own
+  interface.
+- **A local of a literal takes its type from its first use:** `var sum =
+  0.0`, then `sum += sample` of an `f32`, is an `f32`; so is `val side =
+  if dx >= 0.0 then 1.0 else -1.0` before `side * halfX`. The first use
+  decides as the literal written there would — an operand, an argument,
+  a field, a `return`, a place lent to Wip or to C, a value assigned —
+  and where it says nothing, the local is `i64` or `f64` as before, and a
+  later use that wants another says where the first use was and what to
+  write. Nothing that compiled changes its meaning.
+- **On an operator's left as on its right,** what takes its type from
+  beside it takes it: `(if c then 1.0 else -1.0) * x` and `(1.0) * x`,
+  which were refused, are of `x`'s type.
+- **A copy with fields changed takes what it owns:** `Name(field: value,
+  ..base)` moves out of `base` each field it does not name that owns
+  memory, as writing the field out would, where it copied plain data
+  alone; and `.Variant(field: value, ..self)` builds a variant from the
+  one a `match` or an `is` around it matched.
+- **A binding only read holds its place to its last use,** not to the end
+  of its arm or block: after `if node is .Leaf(value)` and the last use of
+  `value`, the place may be assigned, moved or lent `&var`.
+- **A keyword names a field where a field's name is expected:** `when`,
+  `then`, `type` and the rest, declared, after a `.`, in a literal and in
+  a pattern; a derived `Decode` reads a format whose keys are keywords.
+- **A closure given to a call lends the result only what calling it may
+  give back,** so `self.items.find((x) => x.name == name)` borrows `self`
+  and not `name`.
+- **A reference chosen by a branch** is held in a `val` without its type
+  written, as one `&place` alone was.
+- **A lambda's result may be a tuple:** `(n: i64): (i64, i64) => (n, n +
+  1)`.
+- **A guard broken after any operator** goes on to its next line, where
+  only `&&`, `||` and `|` let it.
+
+**The library**
+
+- **`InlineVec<T, N>`:** at most `N` values held where the vector is —
+  in a local, a field, an element — never allocating, with a `Vec`'s
+  methods but those that would grow it: `push` panics where it is full,
+  `tryPush` answers `false`. It holds what owns memory as well as plain
+  data, and is plain data where its element is.
+- **What keeps elements clones them:** `filter`, `partition`, `min` and
+  `max` of a slice or a `Vec` are there for any element that clones,
+  answering clones, where they were for plain data alone.
+
+**Errors**
+
+- A method not found names the methods named like it, not every method
+  of its type.
+- A list asked for `count` or `toVec` is told it has `len`, or is one
+  already, with the fix.
+- A variant's `..base` refused is the one error, the values it names
+  still checked.
+
+**Tools**
+
+- **`wip fmt`** does not break a guard's chain before its dots, where a
+  line that starts with `.` would begin the next arm.
+- **`wip bindgen`** writes a C field named like a keyword as C names it.
+  **Breaking:** a binding written again names it `type` where it named it
+  `type_`.
+- **iOS:** a program in the simulator is started by a launcher `wip`
+  builds with Xcode, where the Mac's shell, which an iOS 26 simulator
+  refuses, started it.
+
 ## 0.7.0 — 2026-10-15
 
 Programs written for 0.6 compile as they did, but where marked
