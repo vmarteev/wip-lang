@@ -1,0 +1,130 @@
+// A ring between two threads: one fills it and one drains it, neither
+// waiting, locking or allocating, which is what a thread that must never
+// wait — an audio callback — is handed its work through. Its slots are
+// allocated once, as it is made, in a block the two ends share and the
+// last of them frees. Each end counts what it has done, the filler what it
+// pushed and the drainer what it took, and reads the other's count to know
+// whether there is room, or a value. A count only ever grows, and the slot
+// it names is the count modulo the capacity.
+//
+// Each count is written by its own end alone, so a store of it is all an
+// end needs, with no compare-and-swap: a value is written into its slot
+// before the count that hands it over is stored, `Release`, and read by
+// the other end after it loads that count, `Acquire`, so it is seen whole.
+// Each end reads its own count `Relaxed`, since no other thread writes it.
+
+/// The end of a ring that fills it. There is one, and one thread at a time
+/// has it.
+pub struct Filler<T> {
+	block: ptr<RingBlock<T>>
+}
+
+/// The end of a ring that drains it. There is one, and one thread at a
+/// time has it.
+pub struct Drainer<T> {
+	block: ptr<RingBlock<T>>
+}
+
+/// What the two ends share, boxed: the slots, a value or nothing in each;
+/// the two counts; and how many ends there still are.
+struct RingBlock<T> {
+	slots: Vec<Option<T>>
+	capacity: i64
+	/// How many values the filler has pushed, ever.
+	pushed: Atomic<i64>
+	/// How many the drainer has taken, ever.
+	taken: Atomic<i64>
+	/// The ends not yet gone: the last frees the block.
+	ends: Atomic<i64>
+}
+
+/// A ring of `capacity` slots, one at least, between two threads: the end
+/// that fills it and the end that drains it, each to be moved to, or lent
+/// to, its thread. Values come out in the order they went in.
+pub fn ring<T>(capacity: i64): (Filler<T>, Drainer<T>) = {
+	if capacity < 1 then panic("a ring of \(capacity) slots: it has one at least")
+	var slots: Vec<Option<T>> = Vec::withCapacity(capacity)
+	for _ in 0..capacity {
+		slots.push(.None)
+	}
+	val made = own RingBlock(
+		slots: slots,
+		capacity: capacity,
+		pushed: Atomic::of(0 as i64),
+		taken: Atomic::of(0 as i64),
+		ends: Atomic::of(2 as i64),
+	)
+	val block = intoAddress(made) as ptr<RingBlock<T>>
+	return (Filler(block), Drainer(block))
+}
+
+extend Filler<T> {
+	/// Puts `value` in the next slot, or, where every slot holds one still,
+	/// hands it back: what becomes of a value that does not fit is the
+	/// caller's. It never waits.
+	pub var fn push(value: T): Result<void, T> = referenceAt<RingBlock<T>>(
+		self.block as ptr<void>,
+	).push(value)
+
+	/// How many values it holds, as far as this end has seen.
+	pub fn len(): i64 = held(self.block)
+
+	/// How many it can hold.
+	pub fn capacity(): i64 = referenceAt<RingBlock<T>>(self.block as ptr<void>).capacity
+}
+
+extend Drainer<T> {
+	/// Takes the oldest value, or answers nothing where there is none. It
+	/// never waits.
+	pub var fn pop(): Option<T> = referenceAt<RingBlock<T>>(self.block as ptr<void>).pop()
+
+	/// How many values it holds, as far as this end has seen.
+	pub fn len(): i64 = held(self.block)
+
+	/// How many it can hold.
+	pub fn capacity(): i64 = referenceAt<RingBlock<T>>(self.block as ptr<void>).capacity
+}
+
+extend RingBlock<T> {
+	/// `value` into the next slot, or handed back where every slot holds
+	/// one: the filler's, alone.
+	var fn push(value: T): Result<void, T> keeps value = {
+		val pushed = self.pushed.load(.Relaxed)
+		if pushed - self.taken.load(.Acquire) >= self.capacity then return .Err(value)
+		self.slots[pushed % self.capacity] = .Some(value)
+		self.pushed.store(pushed + 1, .Release)
+		return .Ok()
+	}
+
+	/// The oldest value, taken out, or nothing: the drainer's, alone.
+	var fn pop(): Option<T> = {
+		val taken = self.taken.load(.Relaxed)
+		if taken == self.pushed.load(.Acquire) then return .None
+		val value = self.slots[taken % self.capacity].take()
+		self.taken.store(taken + 1, .Release)
+		return value
+	}
+}
+
+extend Filler<T>: Destroy {
+	var fn destroy() = ended(self.block)
+}
+
+extend Drainer<T>: Destroy {
+	var fn destroy() = ended(self.block)
+}
+
+/// How many values the ring at `block` holds.
+fn held<T>(block: ptr<RingBlock<T>>): i64 = {
+	val ring = &referenceAt<RingBlock<T>>(block as ptr<void>)
+	return ring.pushed.load(.Acquire) - ring.taken.load(.Acquire)
+}
+
+/// One end of the ring at `block` gone; where it was the last, the block is
+/// freed, and the values still in its slots end with it.
+fn ended<T>(block: ptr<RingBlock<T>>) = {
+	val ring = &referenceAt<RingBlock<T>>(block as ptr<void>)
+	if ring.ends.subtract(1) == 1 {
+		val gone: own<RingBlock<T>> = fromAddress(block as ptr<u8>)
+	}
+}

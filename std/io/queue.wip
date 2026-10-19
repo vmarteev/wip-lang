@@ -1,0 +1,381 @@
+// An event queue: the descriptors a program waits on, each with what it
+// waits for and a number of the program's own, and a wait that answers
+// which are ready. kqueue on a Mac and on iOS, epoll on Linux, each told of
+// a descriptor while it is ready, as `poll` is, so that a program that
+// does not read everything at once is told again.
+
+import std::collections::{Map}
+import std::libc
+import std::time::{Duration}
+
+/// What a descriptor is waited for.
+@derive(Eq, Clone)
+pub enum Interest {
+	Read
+	Write
+	Both
+}
+
+extend Interest {
+	fn reads(): bool = self != Interest::Write
+	fn writes(): bool = self != Interest::Read
+}
+
+/// A descriptor that is ready: the token it was added with, what it is
+/// ready for, and whether the other end hung up or it failed — what is
+/// left is read, and it is let go.
+@derive(Eq, Clone, Text)
+pub struct Event {
+	pub token: u64
+	pub readable: bool
+	pub writable: bool
+	pub closed: bool
+}
+
+/// The descriptors a program waits on, closed where it ends.
+pub struct EventQueue {
+	fd: c_int
+	/// Room for what one wait answers, as the system lays it out.
+	raw: Vec<RawEvent>
+	/// What it waits on each descriptor for: what kqueue's filters are
+	/// added and taken away by.
+	interests: Map<i32, Interest> = Map()
+}
+
+extend EventQueue: Destroy {
+	var fn destroy() = {
+		libc::close(self.fd)
+	}
+}
+
+extend EventQueue {
+	/// A queue waiting on nothing.
+	pub static fn new(): Result<EventQueue, IoError> = {
+		val fd = created()
+		if fd < 0 then return .Err(lastError())
+		return .Ok(EventQueue(fd: fd, raw: Vec()))
+	}
+
+	/// Waits on `descriptor` for `interest`, and tells of it by `token`.
+	pub var fn add(descriptor: i32, interest: Interest, token: u64): Result<void, IoError> = {
+		added(self.fd, descriptor, interest.clone(), token)?
+		self.interests.put(descriptor, interest)
+		return .Ok()
+	}
+
+	/// Waits on `descriptor`, added already, for `interest` instead.
+	pub var fn change(descriptor: i32, interest: Interest, token: u64): Result<void, IoError> = {
+		val was: Interest = match self.interests.get(&descriptor) {
+			.Some(known) => known.clone()
+			.None => interest.clone()
+		}
+		changed(self.fd, descriptor, was, interest.clone(), token)?
+		self.interests.put(descriptor, interest)
+		return .Ok()
+	}
+
+	/// No longer waits on `descriptor`.
+	pub var fn remove(descriptor: i32): Result<void, IoError> = {
+		val was: Interest = match self.interests.get(&descriptor) {
+			.Some(known) => known.clone()
+			.None => Interest::Both
+		}
+		removed(self.fd, descriptor, was)?
+		self.interests.remove(&descriptor)
+		return .Ok()
+	}
+
+	/// Sleeps until a descriptor is ready, or `timeout` has passed — `.None`
+	/// waits as long as it takes, and no time only looks — and puts what is
+	/// ready into `into`, emptied first, one event a descriptor. A wait a
+	/// signal cuts short answers nothing.
+	pub var fn wait(timeout: Option<Duration>, into: &var Vec<Event>): Result<void, IoError> = {
+		into.clear()
+		val room = (self.interests.len() * 2).max(16)
+		while self.raw.len() < room {
+			self.raw.push(blank())
+		}
+		val count = waited(self.fd, &var self.raw.items(), timeout)
+		if count < 0 {
+			if lastError() == .Interrupted then return .Ok()
+			return .Err(lastError())
+		}
+		for i in 0..count {
+			val event = eventOf(&self.raw[i])
+			// kqueue tells of reading and writing apart: one event a
+			// descriptor.
+			match into.items().indexWhere((seen) => seen.token == event.token) {
+				.Some(at) => {
+					into[at].readable = into[at].readable || event.readable
+					into[at].writable = into[at].writable || event.writable
+					into[at].closed = into[at].closed || event.closed
+				}
+				.None => into.push(event)
+			}
+		}
+		return .Ok()
+	}
+}
+
+// A Mac's and iOS's: a kqueue, each descriptor with a filter for reading
+// and one for writing, the one not waited for disabled.
+
+@target(vendor = "apple")
+extern "C" {
+	fn kqueue(): c_int
+	/// The changes, and the room for events: what two slices cross as.
+	@symbol("kevent")
+	fn keventChange(
+		queue: c_int,
+		changes: &[RawEvent],
+		events: &var [RawEvent],
+		timeout: ptr<u8>,
+	): c_int
+	@symbol("kevent")
+	fn keventWait(
+		queue: c_int,
+		changes: &[RawEvent],
+		events: &var [RawEvent],
+		timeout: &Timespec,
+	): c_int
+}
+
+@target(vendor = "apple")
+extern struct RawEvent {
+	ident: u64 = 0
+	filter: i16 = 0
+	flags: u16 = 0
+	fflags: u32 = 0
+	data: i64 = 0
+	udata: u64 = 0
+}
+
+@target(vendor = "apple")
+extern struct Timespec {
+	seconds: i64
+	nanos: i64
+}
+
+@target(vendor = "apple")
+val EVFILT_READ: i16 = -1
+@target(vendor = "apple")
+val EVFILT_WRITE: i16 = -2
+@target(vendor = "apple")
+val EV_ADD: u16 = 0x1
+@target(vendor = "apple")
+val EV_DELETE: u16 = 0x2
+@target(vendor = "apple")
+val EV_ENABLE: u16 = 0x4
+@target(vendor = "apple")
+val EV_ERROR: u16 = 0x4000
+@target(vendor = "apple")
+val EV_EOF: u16 = 0x8000
+
+@target(vendor = "apple")
+fn blank(): RawEvent = RawEvent()
+
+/// A kqueue, which no program this one starts is given: a child never has
+/// its parent's.
+@target(vendor = "apple")
+fn created(): c_int = kqueue()
+
+/// The changes that take what a descriptor is waited for from `was` to
+/// `now`: a filter added for each it waits for now, and one taken away for
+/// each it waited for and waits for no longer. Only what is waited for has
+/// a filter, since some descriptors — a kqueue's own — take no other.
+@target(vendor = "apple")
+fn filters(fd: i32, was: Option<Interest>, now: Option<Interest>, token: u64): Vec<RawEvent> = {
+	var changes: Vec<RawEvent> = Vec()
+	for (filter, reading) in [(EVFILT_READ, true), (EVFILT_WRITE, false)] {
+		val wanted = match now {
+			.Some(interest) => if reading then interest.reads() else interest.writes()
+			.None => false
+		}
+		val had = match was {
+			.Some(interest) => if reading then interest.reads() else interest.writes()
+			.None => false
+		}
+		if wanted then
+			changes.push(RawEvent(
+				ident: fd as u64,
+				filter: filter,
+				flags: EV_ADD | EV_ENABLE,
+				udata: token,
+			))
+		else if had then changes.push(RawEvent(ident: fd as u64, filter: filter, flags: EV_DELETE))
+	}
+	return changes
+}
+
+@target(vendor = "apple")
+fn applied(queue: c_int, changes: &[RawEvent]): Result<void, IoError> = {
+	var none: Vec<RawEvent> = Vec()
+	if keventChange(queue, &changes, &var none.items(), null) < 0 then return .Err(lastError())
+	return .Ok()
+}
+
+@target(vendor = "apple")
+fn added(queue: c_int, fd: i32, interest: Interest, token: u64): Result<void, IoError> = applied(
+	queue,
+	&filters(fd, .None, .Some(interest), token).items(),
+)
+
+@target(vendor = "apple")
+fn changed(
+	queue: c_int,
+	fd: i32,
+	was: Interest,
+	now: Interest,
+	token: u64,
+): Result<void, IoError> = applied(queue, &filters(fd, .Some(was), .Some(now), token).items())
+
+@target(vendor = "apple")
+fn removed(queue: c_int, fd: i32, was: Interest): Result<void, IoError> = applied(
+	queue,
+	&filters(fd, .Some(was), .None, 0).items(),
+)
+
+@target(vendor = "apple")
+fn waited(queue: c_int, room: &var [RawEvent], timeout: Option<Duration>): i64 = {
+	var none: Vec<RawEvent> = Vec()
+	val count = match timeout {
+		.Some(length) => {
+			val nanos = length.asNanos().max(0)
+			val until = Timespec(seconds: nanos / 1000000000, nanos: nanos % 1000000000)
+			keventWait(queue, &none, &var room, &until)
+		}
+		.None => keventChange(queue, &none, &var room, null)
+	}
+	return count as i64
+}
+
+@target(vendor = "apple")
+fn eventOf(raw: &RawEvent): Event = Event(
+	token: raw.udata,
+	readable: raw.filter == EVFILT_READ,
+	writable: raw.filter == EVFILT_WRITE,
+	closed: (raw.flags & (EV_EOF | EV_ERROR)) != 0,
+)
+
+// Linux's: an epoll instance.
+
+@target(os = "linux")
+extern "C" {
+	fn epoll_create1(flags: c_int): c_int
+	fn epoll_ctl(queue: c_int, operation: c_int, fd: c_int, event: &RawEvent): c_int
+	/// The room for events, and how long to wait, in milliseconds, or -1.
+	fn epoll_wait(queue: c_int, events: &var [RawEvent], timeout: c_int): c_int
+}
+
+// `struct epoll_event` is packed on x86-64, where the token starts four
+// bytes in, and laid out as usual on arm64, where it starts at eight.
+@target(os = "linux", arch = "x86_64")
+extern struct RawEvent {
+	events: u32 = 0
+	low: u32 = 0
+	high: u32 = 0
+}
+
+@target(os = "linux", arch = "arm64")
+extern struct RawEvent {
+	events: u32 = 0
+	padding: u32 = 0
+	data: u64 = 0
+}
+
+@target(os = "linux", arch = "x86_64")
+fn rawOf(events: u32, token: u64): RawEvent = RawEvent(
+	events: events,
+	low: (token & 0xffffffff) as u32,
+	high: (token >> 32) as u32,
+)
+
+@target(os = "linux", arch = "arm64")
+fn rawOf(events: u32, token: u64): RawEvent = RawEvent(events: events, data: token)
+
+@target(os = "linux", arch = "x86_64")
+fn tokenOf(raw: &RawEvent): u64 = (raw.low as u64) | ((raw.high as u64) << 32)
+
+@target(os = "linux", arch = "arm64")
+fn tokenOf(raw: &RawEvent): u64 = raw.data
+
+@target(os = "linux")
+val EPOLLIN: u32 = 0x1
+@target(os = "linux")
+val EPOLLOUT: u32 = 0x4
+@target(os = "linux")
+val EPOLLERR: u32 = 0x8
+@target(os = "linux")
+val EPOLLHUP: u32 = 0x10
+/// The other end shut its writing down.
+@target(os = "linux")
+val EPOLLRDHUP: u32 = 0x2000
+@target(os = "linux")
+val EPOLL_CLOEXEC: c_int = 0o2000000
+@target(os = "linux")
+val EPOLL_CTL_ADD: c_int = 1
+@target(os = "linux")
+val EPOLL_CTL_DEL: c_int = 2
+@target(os = "linux")
+val EPOLL_CTL_MOD: c_int = 3
+
+@target(os = "linux")
+fn blank(): RawEvent = rawOf(0, 0)
+
+@target(os = "linux")
+fn created(): c_int = epoll_create1(EPOLL_CLOEXEC)
+
+@target(os = "linux")
+fn bitsOf(interest: Interest): u32 =
+	EPOLLRDHUP |
+	(if interest.reads() then EPOLLIN else 0) |
+	(if interest.writes() then EPOLLOUT else 0)
+
+@target(os = "linux")
+fn controlled(queue: c_int, operation: c_int, fd: i32, event: RawEvent): Result<void, IoError> = {
+	if epoll_ctl(queue, operation, fd, &event) < 0 then return .Err(lastError())
+	return .Ok()
+}
+
+@target(os = "linux")
+fn added(queue: c_int, fd: i32, interest: Interest, token: u64): Result<void, IoError> = controlled(
+	queue,
+	EPOLL_CTL_ADD,
+	fd,
+	rawOf(bitsOf(interest), token),
+)
+
+@target(os = "linux")
+fn changed(
+	queue: c_int,
+	fd: i32,
+	was: Interest,
+	now: Interest,
+	token: u64,
+): Result<void, IoError> = controlled(queue, EPOLL_CTL_MOD, fd, rawOf(bitsOf(now), token))
+
+@target(os = "linux")
+fn removed(queue: c_int, fd: i32, was: Interest): Result<void, IoError> = controlled(
+	queue,
+	EPOLL_CTL_DEL,
+	fd,
+	blank(),
+)
+
+@target(os = "linux")
+fn waited(queue: c_int, room: &var [RawEvent], timeout: Option<Duration>): i64 = {
+	// Milliseconds, rounded up, so that a wait is never cut short.
+	val millis = match timeout {
+		.Some(length) => ((length.asNanos().max(0) + 999999) / 1000000).min(i32::MAX as i64)
+		.None => -1
+	}
+	return epoll_wait(queue, &var room, millis as c_int) as i64
+}
+
+@target(os = "linux")
+fn eventOf(raw: &RawEvent): Event = Event(
+	token: tokenOf(&raw),
+	readable: (raw.events & EPOLLIN) != 0,
+	writable: (raw.events & EPOLLOUT) != 0,
+	closed: (raw.events & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) != 0,
+)

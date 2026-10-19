@@ -191,7 +191,10 @@ fn main() = {
 ```
 
 `map`, `flatMap`, `fold`, `indexWhere` and `lastIndexWhere`, `take` and
-`skip` work on any elements. A slice's methods answer by what they do:
+`skip` work on any elements. An array has these methods too, and its
+`map` answers an array of its length, allocating nothing: `[1, 2,
+3].map((n) => n * 10)` is an `[i64; 3]`; a part of it, `xs[0..2]`, maps
+to a vector, as a slice does. A slice's methods answer by what they do:
 what picks an element where it lies lends it — `first`, `last`, `find`,
 `minBy` and `maxBy`, the element whose key is least or greatest, the first
 of equals, and `take` and `skip`, a part of the slice — for any elements;
@@ -250,6 +253,23 @@ fn main() = {
     assert(names.tryPush(String::of("two")))
     assert(!names.tryPush(String::of("three")) && names.isFull())
     assert(names.items() == ["one", "two"])
+}
+```
+
+What is read is read into one where it lies, for plain data:
+`readInto(most, blank, read)` gives each of up to `most` slots past what
+it holds the value `blank`, lends them to `read`, and holds as many as
+`read` answers it filled, or nothing more where it fails:
+
+```wip,run
+fn main() = {
+    var buffer: InlineVec<u8, 16> = InlineVec()
+    val got: Result<i64, str> = buffer.readInto(16, 0, (room) => {
+        room[0] = b'o'
+        room[1] = b'k'
+        return .Ok(2)
+    })
+    assert(got == .Ok(2) && str::fromBytes(&buffer.items()) == "ok")
 }
 ```
 
@@ -822,6 +842,50 @@ fn main() = {
 }
 ```
 
+A thread that must never wait — an audio callback, which a late answer
+makes a click — is handed its work through a ring, `sync::ring<T>(capacity)`:
+a fixed number of slots, allocated once, between one thread that fills it
+and one that drains it, answered as the two ends, a `Filler<T>` and a
+`Drainer<T>`. `push` puts a value in, or, where every slot is full, hands
+it back as `Err(value)`; `pop` takes the oldest, or answers nothing; and
+neither waits, locks or allocates, so a channel, which does all three, is
+for what may wait. Neither end is copied or shared, and both `push` and
+`pop` take their end `var`, so one thread at a time fills and one drains;
+the values still in the ring end with it, once both ends are gone:
+
+```wip,run
+import std::future
+import std::sync
+
+fn main() = {
+    var (sounds, mixer) = sync::ring<String>(2)
+    assert(sounds.push("coin").isOk() && sounds.push("door").isOk())
+    assert(sounds.push("step") == .Err(String::of("step"))) // full
+    assert(mixer.pop() == .Some(String::of("coin")) && mixer.len() == 1)
+
+    var (samples, played) = sync::ring<i64>(8)
+    val (_, total) = future::together(
+        () => {
+            for i in 1..1001 {
+                while samples.push(i).isErr() {}
+            }
+        },
+        () => {
+            var total = 0
+            var heard = 0
+            while heard < 1000 {
+                if played.pop() is .Some(sample) {
+                    total += sample
+                    heard += 1
+                }
+            }
+            return total
+        },
+    )
+    assert(total == 500500)
+}
+```
+
 A slice lends two parts of itself at once, which do not overlap, with
 `split(at, (first, second) => …)`: what `each` gives each thread.
 
@@ -1083,6 +1147,33 @@ fn main() = {
 }
 ```
 
+A program catches signals with `Signals::catch`: Ctrl-C at its terminal,
+`.Interrupt`; a request to end, `.Terminate`, as `kill` sends; its
+terminal gone, `.Hangup`; Ctrl-\\, `.Quit`; and a program it started
+ending, `.Child`. A signal caught ends nothing: the system keeps it, and
+`received()` answers what came since it was last asked, without waiting,
+as a program in a terminal asks each turn of its loop, to save before it
+quits, and `wait()` waits for the next. `number()` is what the system
+numbers one, which `libc::kill` sends to pass it on. `descriptor()` is ready while one waits, for an event queue.
+No handler runs at a moment of the system's choosing, so what a program
+does about a signal is ordinary code. Where the `Signals` ends, each is as
+it was; a program started meanwhile handles them as it would have. On
+Linux a signal is held back in the thread that catches it and those it
+starts after, so a program catches what it wants as it begins:
+
+```wip,run
+import std::libc
+import std::process
+import std::process::{Signal, Signals}
+
+fn main() = {
+    var signals = Signals::catch([Signal::Interrupt, .Terminate]).unwrap()
+    assert(signals.received().isEmpty())
+    libc::kill(process::id() as c_int, libc::SIGINT) // as Ctrl-C would
+    assert(signals.wait() == .Interrupt) // and the program goes on
+}
+```
+
 ## `std::collections`
 
 `Map<K, V>` and `Set<K>` keep what they hold in the order it went in, and
@@ -1203,6 +1294,31 @@ the one that says what a ball is — the second type is one that code can
 name: `Arena<Ball, Balls>` gives `Handle<Balls>`, with `Balls` declared
 beside the rules.
 
+`PriorityQueue<T, P>` takes the value of the smallest priority first, of
+any `P` that is `Ord`, a float among them: what finding a path, a queue of
+timers or a simulation's next event asks. `push(value, priority)` puts
+one in; `pop()` takes the first with its priority, `Option<(T, P)>`;
+`first()` and `firstPriority()` lend them without taking; values of equal
+priority come out in the order they were pushed, so a queue gives the same
+order on every run. It is a binary heap, each push and pop a logarithm of
+how many it holds, and it is not walked: what is wanted in order is
+popped.
+
+```wip,run
+import std::collections::{PriorityQueue}
+
+fn main() = {
+    var due: PriorityQueue<str, f64> = PriorityQueue()
+    due.push("bell", 2.5)
+    due.push("door", 0.5)
+    due.push("light", 2.5)
+    assert(due.first() == .Some(&"door") && due.firstPriority() == .Some(&0.5))
+    assert(due.pop() == .Some(("door", 0.5)))
+    assert(due.pop() == .Some(("bell", 2.5))) // pushed before "light"
+    assert(due.pop() == .Some(("light", 2.5)) && due.isEmpty())
+}
+```
+
 ## Values several owners hold: `std::shared`
 
 `Shared<T>` is a value on the heap that several owners hold and read.
@@ -1273,8 +1389,82 @@ fn main() = {
 closed answers `.BrokenPipe`, and no signal ends the program.
 `setBlocking(false)` makes `accept`, `read` and `write` answer
 `.WouldBlock` where they would wait, and `descriptor()` is the number an
-event queue watches; the queue is the program's own. `accept`, `read` and
+event queue watches. `accept`, `read` and
 `write` take `&self`, so several threads may accept from one listener.
+
+An `io::EventQueue` serves many connections on one thread: it is given
+each descriptor a program waits on — a listener, its connections, a
+watcher's — with what it waits for, `.Read`, `.Write` or `.Both`, and a
+`token`, a `u64` of the program's own, such as a slot; `wait(timeout,
+&var events)` sleeps until one is ready, or the timeout passes — `.None`
+waits as long as it takes, and no time only looks — and fills `events`
+with each that is: its `token`, whether it is `readable` and `writable`,
+and whether it is `closed`, the other end gone or the descriptor failed.
+A descriptor is told of while it is ready, every wait, until it is read
+or written to `.WouldBlock`, so one read a wait is never left unread.
+`change` waits on one for something else, and `remove` no longer. It is
+kqueue on a Mac and on iOS, and epoll on Linux:
+
+```wip,run
+import std::io
+import std::net::{Listener, Stream}
+import std::time::{Duration}
+
+fn main() = {
+    val listener = Listener::tcp(.Some("127.0.0.1"), 0).unwrap()
+    val .Ok(.V4(port: port, ..)) = listener.localAddress() else return
+    var queue = io::EventQueue::new().unwrap()
+    assert(queue.add(listener.descriptor(), .Read, 0).isOk())
+    var events: Vec<io::Event> = Vec()
+
+    val client = Stream::tcp("127.0.0.1", port).unwrap()
+    assert(queue.wait(.Some(Duration::seconds(5)), &var events).isOk())
+    assert(events[0].token == 0 && events[0].readable) // a connection came
+    val (served, _) = listener.accept().unwrap()
+    assert(queue.add(served.descriptor(), .Read, 1).isOk())
+
+    client.writeText("hi").unwrap()
+    assert(queue.wait(.Some(Duration::seconds(5)), &var events).isOk())
+    assert(events.len() == 1 && events[0].token == 1 && events[0].readable)
+    assert(queue.wait(.Some(Duration::millis(0)), &var events).isOk())
+    assert(events.len() == 1) // told again, while it is unread
+}
+```
+
+## Watching files: `std::watch`
+
+A `Watcher` is told by the system when what it watches changes, and
+answers which, when it is asked: `watch(path)` watches a directory for
+what is made, written, renamed or removed in it — not what is deeper — or
+a file for itself, written or replaced under its name, as an editor saves;
+`changed()` answers each watched path that changed since it was last
+asked, once, as it was given, and never waits; `pending()` says whether it
+would answer anything; `unwatch(path)` lets one go. Writing a file is many
+changes, and they are told once or twice, not once each; what changed a
+moment before a path was watched may be told of too. `descriptor()` is
+ready to read while a change waits, for an event queue. It is FSEvents on
+a Mac and inotify on Linux; on iOS, which lets an app watch nothing,
+`Watcher::new()` answers `.Unsupported`:
+
+```wip,run
+import std::fs
+import std::time::{Duration, Instant, sleep}
+import std::watch::{Watcher}
+
+fn main() = {
+    val .Ok(var watcher) = Watcher::new() else return // iOS
+    val dir = fs::TempDir::new().unwrap()
+    assert(watcher.watch(dir.path).isOk())
+    sleep(Duration::millis(200))
+    watcher.changed() // what came just before
+    assert(fs::writeFile(dir.join("level.txt"), "o..o").isOk())
+    val began = Instant::now()
+    while !watcher.pending() && began.elapsed() < Duration::seconds(5) {
+        sleep(Duration::millis(10))
+    }
+    assert(watcher.changed() == [dir.path.clone()].toVec())
+}
+```
 
 ## Regular expressions: `std::regex`
 
@@ -1360,10 +1550,15 @@ name written twice answers the one written last.
 ## Bytes: `std::bytes`
 
 A model's file, a texture's header, a save and a packet are numbers laid
-out in bytes in a known order. A `bytes::Reader` reads them from a slice,
-`u8`, `i16le`, `u32be`, `f32le` and the rest, each answering nothing past
-the end, and `seek`s; a `bytes::Writer` appends them to a `Vec<u8>`, which
-`take()` hands over.
+out in bytes in a known order, little-endian (`le`) or big-endian (`be`).
+`bytes::u32le(&header, 4)` reads the number at a place —
+`u16le`, `i16be`, `u32be`, `f32le` and the rest — and
+`bytes::putU32le(&var header, 4, size)` writes one there; each panics
+where its bytes are not all there, as an index past the end does, and
+checks once, where an index for each byte would check each. A
+`bytes::Reader` reads them from a slice in turn, `u8` and the same
+numbers, each answering nothing past the end, and `seek`s; a
+`bytes::Writer` appends them to a `Vec<u8>`, which `take()` hands over.
 
 `bytes::encode(&value)` writes any value that implements `Encode` in a
 binary format of its own, and `bytes::decode<T>(&bytes)` reads it back,
@@ -1398,6 +1593,13 @@ fn main() = {
     var read = Reader::of(&written.items())
     assert(read.u32le() == .Some(0x46424C47) && read.f32le() == .Some(0.5))
     assert(read.u16be() == .Some(300) && read.u8().isNone())
+
+    var header = [0 as u8; 8]
+    bytes::putU16be(&var header, 2, 300)
+    bytes::putF32le(&var header, 4, 0.5)
+    assert(header[2] == 1 && header[3] == 44)
+    assert(bytes::u16be(&header, 2) == 300 && bytes::f32le(&header, 4) == 0.5)
+    assert(bytes::u32le(&written, 0) == 0x46424C47)
 
     val old = bytes::encode(SaveBefore(name: "ann", lives: 3))
     val loaded = bytes::decode<Save>(&old.items()).unwrap()
@@ -1463,6 +1665,38 @@ directory, and `removeAll` a directory and everything in it, or a file;
 and its permission bits to another, and answers how many bytes;
 `makeLink(target, at)` makes a symbolic link, which `removeAll` removes
 without what it names.
+
+`writeFile` writes text as the whole of a file and `writeBytes` bytes
+that need not be text, each making the file or emptying it first. A file
+that must never be found half written — a save, a document — is replaced
+with `replaceFile` or `replaceBytes` instead: the new file is written
+beside it, handed to the disk, and renamed into its place at once, so that
+whoever opens it, and a program started after a crash, finds the old one
+or the new one; it keeps the old one's permission bits, and where the path
+is a symbolic link, the file the link names is replaced and the link
+kept. A `TempDir` is a new directory of the system's temporary files,
+named for the program and readable by its owner alone, removed with
+everything in it where the value ends; `temporaryRoot()` is where such
+directories are made, `$TMPDIR` or `/tmp`:
+
+```wip,run
+import std::fs
+
+fn main() = {
+    val dir = fs::TempDir::new().unwrap()
+    val picture = dir.join("picture")
+    assert(fs::writeBytes(picture, [0 as u8, 255, 0]).isOk())
+    assert(fs::readBytes(picture).unwrap().len() == 3)
+
+    val save = dir.join("save.json")
+    assert(fs::replaceFile(save, "{\"coins\": 1}").isOk())
+    assert(fs::replaceFile(save, "{\"coins\": 2}").isOk())
+    assert(fs::readFile(save) == .Ok(String::of("{\"coins\": 2}")))
+    assert(fs::readDir(dir.path).unwrap().len() == 2) // nothing left beside
+    assert(dir.path.startsWith(fs::temporaryRoot().trimEndMatches("/")))
+}
+```
+
 `std::process` answers the program's own `currentDir()`, `executable()` —
 the absolute path of the file it was started from — `besideProgram(path)`,
 where `path` is beside that file, which is where the files a package names
@@ -1672,21 +1906,23 @@ fn main() = {
 | Module | What is in it |
 |---|---|
 | `std::args` | `Arguments`, `Argument` and `ArgumentError`: the program's arguments, read as options |
-| `std::io` | `print`, `println`, `printInt`, `eprintln`, `flush`, `stdin`, `Reader`, `env`, `isTerminal`, `IoError` |
-| `std::fs` | whole files, reading a directory, and what the filesystem says about a path |
+| `std::io` | `print`, `println`, `printInt`, `eprintln`, `flush`, `stdin`, `Reader`, `env`, `isTerminal`, `IoError`, and `EventQueue` with its `Interest` and `Event` |
+| `std::fs` | whole files, written, read and replaced; reading a directory; what the filesystem says about a path; directories for a while |
+| `std::process` | `Command`, `Child` and `Exit`: other programs started and waited for; the program's own `currentDir`, `executable`, `besideProgram` and `id`; `Signals` and `Signal`: Ctrl-C and its like, caught |
 | `std::path` | a path joined, and taken apart: its name, parent, extension and stem |
 | `std::mem` | `replace`, a place's value taken out with another left in, and `swap`, two places' values exchanged |
 | `std::digest` | `sha256(bytes)`, the SHA-256 digest of bytes in hand, and `Sha256`, one written in pieces and then finished |
 | `std::c` | a value lent to C as a callback's `void *`, and had back in the callback; `Pinned`, a value C holds until it lets go; a slice's address for C to read; C's `sizeof` and `_Alignof` |
 | `std::embed` | a file's bytes or text, read when the program is compiled, as a constant |
-| `std::sync` | `Atomic<T>` and `Mutex<T>`: what several threads may change at once |
+| `std::watch` | `Watcher`: which files and directories changed, as the system tells |
+| `std::sync` | `Atomic<T>` and `Mutex<T>`: what several threads may change at once; `ring`, its `Filler` and `Drainer`: values handed between two threads without waiting |
 | `std::shared` | `Shared<T>` and `Weak<T>`: a value several owners hold and read |
 | `std::random` | `Random`: numbers seeded or from the system, not for cryptography |
 | `std::net` | `Listener`, `Stream` and `Address`: TCP and Unix-domain connections |
 | `std::math` | `PI`, `TAU` and `E`, and the vectors, matrices, rotations and shapes above; the functions are methods of `f64` and `f32`, `x.sin()`, written in Wip so that a `@comptime` constant computes the program's bits |
 | `std::text` | `ParseError`, and the `Split`, `Lines` and `Chars` types the prelude's methods answer |
 | `std::iter` | `Walk`, `Forwards`, `Backwards`, `Taking` (what a `Vec` gives up to `for x in move v`), and the adapter types `Mapped`, `Filtered`, `FilterMapped`, `FlatMapped`, `Chained`, `Enumerated`, `Taken`, `TakenWhile`, `Skipped`, `Zipped`, `Peekable` |
-| `std::collections` | `Map`, `Set`, `MapEntry`, `Deque`, and `Arena` with its `Handle`, `ArenaEntry` and `ArenaValues` |
+| `std::collections` | `Map`, `Set`, `MapEntry`, `Deque`, `PriorityQueue`, and `Arena` with its `Handle`, `ArenaEntry` and `ArenaValues` |
 | `std::time` | `Duration`, a length of time; `Instant`, a moment on a clock that only goes forward; `sleep`; `FixedStep`, a game's updates at a steady rate; `now`, the date it is; `Utc`, a moment as a calendar has it, and `Local`, as it has it where the program runs |
 | `std::bytes` | `Reader` and `Writer`, numbers read from bytes and written to them in a known order, and a binary format for `Encode` and `Decode` |
 | `std::libc` | the C library as std calls it: `printf`, `fwrite`, `stdout`, `read`, `open` and its flags, `getentropy`, `errno()` — C's, promising nothing C does not |

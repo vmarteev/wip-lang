@@ -2,6 +2,80 @@
 
 Each version published, newest first.
 
+## 0.9.0 — 2026-10-18
+
+Programs written for 0.8 compile as they did, but where marked
+**breaking**; the compiler's errors say what to write instead.
+
+**The language**
+
+- **A range is a value:** `lo..hi` and `lo..=hi` stand wherever an
+  expression may, of the prelude's `Range<T>`, which is an iterator:
+  `(0..4).any((i) => taken[i])`, `(1..=n).sum()`, `val counted = 0..n`.
+  A `for` counts a range and a slice takes one, as before; the operator
+  binds looser than every other but assignment.
+- **Constants of a type:** a `val` among a type's members — in a
+  struct's or an enum's body, or an `extend` block — is a constant of
+  the type, reached as `Type::NAME`, as its static functions are. Every
+  integer type has `MIN` and `MAX`, `i64::MAX`; `f32` and `f64` have
+  `INFINITY`, `NAN`, `MAX`, `MIN` and `EPSILON`. A type with
+  parameters, and a block that implements an interface, hold none
+  (E0370).
+- **A module's own names come before the prelude's:** a name a module
+  declares or imports is the module's, and the prelude's item of that
+  name is reached by its path, `std::prelude::Text`. A program may name
+  its own `Index` or `Range`, and the prelude can grow without taking a
+  program's names.
+- **An array maps to an array:** `xs.map(f)` of a `[T; N]` answers a
+  `[U; N]`. **Breaking:** where it was kept as a `Vec`, write
+  `xs.copies().map(f).toVec()`.
+
+**The library**
+
+- **`std::watch`:** a `Watcher` says which of the files and directories
+  it watches changed since it was last asked — FSEvents on a Mac,
+  inotify on Linux — and its `descriptor()` is ready while a change
+  waits.
+- **`io::EventQueue`:** a program waits on many descriptors at once — a
+  listener, its connections, a watcher, a pipe — each with a number of
+  its own, until one is ready or a time passes. kqueue on a Mac, epoll
+  on Linux.
+- **`process::Signals`:** Ctrl-C, a request to end, the terminal going,
+  Ctrl-\ and a child's ending, caught and told when the program asks,
+  with no handler running at a moment of the system's choosing.
+- **`sync::ring<T>(capacity)`:** a ring between two threads, one filling
+  and one draining, without waiting, a lock or an allocation: what an
+  audio callback is handed its work through.
+- **`PriorityQueue<T, P: Ord>`** in `std::collections`, the smallest
+  priority first, equal ones in the order pushed.
+- **`std::fs`:** `writeBytes`; `replaceFile` and `replaceBytes`, which
+  replace a file so that a reader, or a program stopped while writing,
+  finds the old file or the new one and never part of either; and
+  `TempDir`, a directory of the system's temporary files removed with
+  what it holds where the value ends.
+- **Numbers at a place in bytes:** `bytes::u32le(&header, 4)` and
+  `bytes::putU32le(&var header, 4, size)`, for every number a
+  `bytes::Reader` reads, each checked once and one load or one store.
+  A `Reader` reads through the same, faster.
+- **`InlineVec`'s `readInto`** lends the room past what it holds to a
+  read, and holds as many as the read filled.
+
+**Faster**
+
+- A slice's, a text's and a vector's length is known never to be
+  negative, so the optimiser drops the bounds checks it implies.
+- `str.indexOf` and a byte's search go through C's `memchr`.
+- A copy of a few bytes is a load and a store: `std::libc`'s `memmove`
+  answers its destination, as C declares it, so the optimiser knows it.
+
+**Tools**
+
+- **A release build describes every variable** to a debugger, even one
+  the optimiser dropped every use of; a value held in pieces may show as
+  it was.
+- **`wip fmt`**, completion after `Type::`, `wip doc` and the editors'
+  grammar know a type's constants; the grammar knows a range as a value.
+
 ## 0.8.0 — 2026-10-17
 
 Programs written for 0.7 compile as they did, but where marked

@@ -305,19 +305,46 @@ pub fn size(): i64 = 10
 ## The prelude
 
 Some names are in scope in every file without an import: the types
-`Option`, `Result`, `Ordering`, `Vec`, `String`, `Hasher`, `Align`,
-`InRadix`, `WithPrecision` and the tuple structs; the interfaces
-`Eq`, `Ord`, `Hash`, `Text`, `Clone`, `Items`, `Iterator`,
+`Option`, `Result`, `Ordering`, `Vec`, `String`, `InlineVec`, `Range`,
+`Hasher`, `Align`, `InRadix`, `WithPrecision` and the tuple structs; the
+interfaces `Eq`, `Ord`, `Hash`, `Text`, `Clone`, `Items`, `Iterator`,
 `IntoIterator`, `Sequence`, `Index`, `Destroy` and `From`, the operators'
 `Add`, `Subtract`, `Multiply`, `Divide`, `Remainder`, `Negate` and `Not`,
 the numbers' `Zero` and `One`, and `Encode`, `Decode`, `Encoder` and
 `Decoder`; the functions `destroy` and `cloneOf`; and `assert` and
-`panic` as forms of the language. That list is closed and the compiler knows it: a
-module may not declare or import a name the prelude has.
+`panic` as forms of the language.
+
+The prelude is the outermost scope, read only for a name found nowhere
+nearer: a name a module declares, or imports, is the module's own, of
+whatever kind, and the prelude's of that name is reached there by its
+path, `std::prelude::Text`. What the compiler writes — an interpolation, a
+tuple, `x[i]`, a `for`, an operator, `?`, a derive — is the prelude's in
+every module, whatever the module names. So the prelude grows without
+breaking a program, and a program may use the words it happens to hold:
+
+```wip,run
+/// A line of glyphs: this module's `Text`.
+struct Text {
+    glyphs: i64
+}
+
+extend Text: std::prelude::Text {
+    fn appendTo(out: &var String) = out.push("\(self.glyphs) glyphs")
+}
+
+fn main() = {
+    val line = Text(glyphs: 3)
+    assert("\(line)" == "3 glyphs") // interpolation: the prelude's `Text`
+}
+```
+
+The tuples are the one exception: `(a, b)` is written as the prelude's
+`Tuple2` by its name, so `Tuple2`, `Tuple3` and `Tuple4` may not be a
+module's own.
 
 ```wip,error=E0345
-struct Option {
-    taken: bool
+struct Tuple2 {
+    first: i64
 }
 ```
 
@@ -439,3 +466,47 @@ What it computes is what a constant may hold: numbers, `bool`, `char`,
 would point into memory the compiler used while it ran; a list is kept only
 where it is written. Such a constant is not known while types are checked,
 so it cannot be an array's length.
+
+A constant may belong to a type: a `val` written among the type's
+members — in its body, beside its fields and methods, or in an `extend`
+block — is reached through the type, `Type::NAME`, as a static function
+is, as the numbers' limits are, `i64::MAX`. It is a constant as one at the top level is, with the same rules,
+`pub` to be used outside its module. Its name is one of the type's
+members, which no method, static function or variant of it may share:
+
+```wip,run
+struct Money {
+    cents: i64
+
+    /// None at all.
+    pub val ZERO: Money = Money(cents: 0)
+
+    pub fn plus(other: Money): Money = Money(cents: self.cents + other.cents)
+}
+
+extend Money {
+    pub val DOLLAR: Money = Money(cents: 100)
+    val COINS: [i64; 4] = [1, 5, 10, 25]
+}
+
+fn main() = {
+    val total = Money::ZERO.plus(Money::DOLLAR)
+    assert(total.cents == 100 && Money::COINS[3] == 25)
+}
+```
+
+A block that implements an interface holds only what the interface
+declares, and an interface declares no constant; and a type with
+parameters has none, since `Pair::ORIGIN` would not say which `Pair` it
+is (E0370):
+
+```wip,error=E0370
+struct Pair<T> {
+    a: T
+    b: T
+
+    val ORIGIN: i64 = 0
+}
+
+fn main() = {}
+```

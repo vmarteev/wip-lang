@@ -5,6 +5,8 @@
 
 import std::io
 import std::libc
+import std::path
+import std::process
 
 /// An open file, closed where it ends.
 pub struct File {
@@ -79,6 +81,13 @@ extend File {
 		return .Ok()
 	}
 
+	/// What was written handed to the disk, C's `fsync`: there before
+	/// anything done after it, a rename among them.
+	pub fn sync(): Result<void, io::IoError> = {
+		if libc::fsync(io::descriptorOf(&self.reader)) != 0 then return .Err(io::lastError())
+		return .Ok()
+	}
+
 	/// Reads up to `into.len()` bytes from `offset`, and answers how many,
 	/// `0` at the end: C's `pread`. Nothing later reads from where it
 	/// stopped, so threads may read one file at once, each where it asks.
@@ -122,9 +131,76 @@ pub fn readBytes(path: str): Result<Vec<u8>, io::IoError> = {
 }
 
 /// The text, as the whole of a file that is made or emptied first.
-pub fn writeFile(path: str, text: str): Result<void, io::IoError> = {
+pub fn writeFile(path: str, text: str): Result<void, io::IoError> = writeBytes(path, &text)
+
+/// The bytes, as the whole of a file that is made or emptied first: a
+/// picture, a sound.
+pub fn writeBytes(path: str, bytes: &[u8]): Result<void, io::IoError> = {
 	var file = File::create(path)?
-	file.write(text)?
+	file.writeBytes(&bytes)?
+	return .Ok()
+}
+
+/// The file at `path` replaced by one holding `text`, whole or not at all:
+/// whoever opens it, and a program started after a crash, finds the old
+/// file or the new one, never part of either. The new one is written
+/// beside it, handed to the disk and renamed into its place, with the old
+/// one's permission bits; a link at `path` is followed, and the file it
+/// names replaced. Where it fails, nothing has changed.
+pub fn replaceFile(path: str, text: str): Result<void, io::IoError> = replaceBytes(path, &text)
+
+/// The same, for bytes that are not text.
+pub fn replaceBytes(path: str, bytes: &[u8]): Result<void, io::IoError> = {
+	// The file a link names, which is what an editor's save replaces.
+	val target = match linkMeta(path) {
+		.Ok(about) if about.kind == .Link => realPath(path)?
+		_ => String::of(path)
+	}
+	val mode = match meta(target) {
+		.Ok(about) => Option::Some(about.mode)
+		.Err(..) => .None
+	}
+	// Beside it, so that a rename moves it, hidden, and new: two writers
+	// never share one.
+	var attempt = 0
+	while true {
+		attempt += 1
+		val name = ".\(path::name(target)).replacing-\(process::id())-\(attempt)"
+		val beside = path::join(path::parent(target), name)
+		match File::createNew(beside) {
+			.Ok(file) => return placed(file, beside, target, &bytes, mode)
+			.Err(.AlreadyExists) => {}
+			.Err(why) => return .Err(why)
+		}
+	}
+	return .Ok()
+}
+
+/// `file`, new at `beside`, given `bytes` and renamed to `target`, or
+/// removed wherever that fails.
+fn placed(
+	file: File,
+	beside: str,
+	target: str,
+	bytes: &[u8],
+	mode: Option<i64>,
+): Result<void, io::IoError> = {
+	var done = filled(file, beside, &bytes, mode)
+	if done.isOk() then done = rename(beside, target)
+	if done.isErr() then removeFile(beside)
+	return done
+}
+
+/// `file`, at `path`, given `bytes`, handed to the disk, closed, and given
+/// `mode` where there is one.
+fn filled(file: File, path: str, bytes: &[u8], mode: Option<i64>): Result<void, io::IoError> = {
+	var open = file
+	open.writeBytes(&bytes)?
+	open.sync()?
+	if mode is .Some(bits) {
+		var name = String::of(path)
+		if libc::chmod(name.toCstring(), bits as c_uint) != 0 then return .Err(io::lastError())
+	}
 	return .Ok()
 }
 
@@ -376,6 +452,49 @@ pub fn removeFile(path: str): Result<void, io::IoError> = {
 	var name = String::of(path)
 	if libc::unlink(name.toCstring()) != 0 then return .Err(io::lastError())
 	return .Ok()
+}
+
+/// A directory of the system's temporary files, made new for a while and
+/// removed, with all it holds, where the value ends: what a build, a test
+/// or an unpacking works in.
+pub struct TempDir {
+	/// Where it is.
+	pub path: String
+}
+
+extend TempDir {
+	/// A new directory in `temporaryRoot()`, named for the program and six
+	/// characters the system chooses where nothing is, and readable by its
+	/// owner alone, so that no other process is given it or makes it
+	/// first: `/tmp/marble-k2Jd8w`.
+	pub static fn new(): Result<TempDir, io::IoError> = {
+		val program = match process::executable() {
+			.Ok(file) => String::of(path::name(file))
+			.Err(..) => String::of("wip")
+		}
+		var template = path::join(temporaryRoot(), "\(program)-XXXXXX")
+		val made = libc::mkdtemp(template.toCstring())
+		if made.isNull then return .Err(io::lastError())
+		return .Ok(TempDir(path: String::of(made.toStr())))
+	}
+
+	/// A path in it.
+	pub fn join(name: str): String = path::join(self.path, name)
+}
+
+extend TempDir: Destroy {
+	var fn destroy() = {
+		// A cleanup has no one to answer: what cannot be removed is left.
+		removeAll(self.path)
+	}
+}
+
+/// The system's directory of temporary files: `$TMPDIR` where it is set,
+/// and `/tmp` where it is not. What is kept there across runs, a cache, is
+/// put in it by name; what is wanted for a while is a `TempDir`.
+pub fn temporaryRoot(): String = {
+	if io::env("TMPDIR") is .Some(dir) && !dir.isEmpty() then return dir
+	return "/tmp"
 }
 
 fn metaOf(path: str, following: bool): Result<Meta, io::IoError> = {

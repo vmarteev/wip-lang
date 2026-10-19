@@ -2,7 +2,7 @@
 // a few instructions, every block a label.
 
 import std::mem
-import hir::{Access, BOOL, FnId, I64, IntTy, Layout, STR, Tag, Ty, TyKind}
+import hir::{Access, BOOL, FnId, I64, IntTy, Layout, STR, Tag, Ty, TyKind, isSlicePointer}
 import mir::{
 	Answer,
 	Part,
@@ -189,6 +189,7 @@ extend FnGen {
 		}
 		variables.sortBy((a, b) => declaredBefore(&a, &b))
 		var open: Vec<(u32, i64)> = Vec()
+		var described: Vec<i64> = Vec()
 		for (local, source, param) in variables {
 			val slot = self.addressSlots[local.index].clone()
 			val storage = match slot {
@@ -227,6 +228,7 @@ extend FnGen {
 				line: line,
 				typeNode: diType,
 			))
+			described.push(variable)
 			// Through the slot that keeps its address, where it has one, and
 			// through the address it holds, where it is a binding of one.
 			val expression: Expression =
@@ -245,6 +247,9 @@ extend FnGen {
 				at: .Some(place),
 			))
 		}
+		// Kept by the subprogram, so that an optimised build describes each,
+		// where it keeps nothing of its value.
+		m.debug.retain(self.subprogram.node, &described)
 	}
 
 	/// The innermost variable's block whose scope holds code written at `lo`,
@@ -454,6 +459,31 @@ extend FnGen {
 		)
 	}
 
+	/// Whether `place` is how many elements a slice, a `str` or a block of
+	/// slots has: its second word.
+	fn isLength(m: &Llvm, place: &Place): bool = {
+		val count = place.projections.len()
+		if count == 0 || !(place.projections[count - 1] is .Field(index: 1)) then return false
+		var container = self.body.local(place.local).ty
+		for projection in place.projections[0..count - 1] {
+			container = projectTy(m.program, container, projection.clone())
+		}
+		return m.kind(container) is .Str | .Slice(..) || isSlicePointer(m.program, container)
+	}
+
+	/// A length read from memory, with what LLVM may assume of it: that it is
+	/// not negative. It cannot prove that `i + 1 < length` follows from `i <
+	/// length - 1` without it, and checks an index it need not.
+	var fn loadLength(m: &var Llvm, addr: Value): Val = {
+		val range = m.debug.constant(
+			.Tuple([
+				MetaItem::Int(bits: 64, value: 0),
+				MetaItem::Int(bits: 64, value: 9223372036854775807),
+			]),
+		)
+		return self.value(.Load(t: .I(64), address: addr, align: 8, assumes: .Range(range)), .I(64))
+	}
+
 	var fn store(value: &Val, addr: Value, align: u32) = self.emit(.Store(
 		value: value.clone(),
 		address: addr,
@@ -581,6 +611,7 @@ extend FnGen {
 			val addr = self.placeAddr(&var m, &place)
 			match m.referent(ty) {
 				.Some(layout) => self.loadReference(&var m, addr, layout)
+				.None if self.isLength(&m, &place) => self.loadLength(&var m, addr)
 				.None => self.load(addr, lt, align)
 			}
 		}

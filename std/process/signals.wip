@@ -1,0 +1,245 @@
+// Signals a program catches: Ctrl-C at its terminal, a request to end, its
+// terminal gone. A program asks for the ones it wants with `Signals::catch`,
+// and is told of each as it is asked, the way an event queue tells of a
+// connection, with no handler running at a moment of the system's choosing:
+// the system holds each signal back and keeps it, and the program reads
+// what it kept. That is a kqueue on a Mac and on iOS, where a signal caught
+// is otherwise ignored, so that it ends nothing, and a `signalfd` on Linux,
+// where it is held back. Where the `Signals` ends, each is as it was
+// before.
+
+import std::bytes
+import std::io
+import std::libc
+
+/// A signal a program may be sent, and catch.
+@derive(Eq, Clone, Text)
+pub enum Signal {
+	/// Ctrl-C at its terminal: `SIGINT`.
+	Interrupt
+	/// Asked to end, as `kill` asks: `SIGTERM`.
+	Terminate
+	/// Its terminal gone: `SIGHUP`.
+	Hangup
+	/// Ctrl-\ at its terminal: `SIGQUIT`.
+	Quit
+	/// A program it started ended or stopped: `SIGCHLD`.
+	Child
+}
+
+extend Signal {
+	/// What the system numbers it: what `libc::kill` sends, to pass a
+	/// signal on.
+	pub fn number(): c_int = match self {
+		.Interrupt => libc::SIGINT
+		.Terminate => libc::SIGTERM
+		.Hangup => libc::SIGHUP
+		.Quit => libc::SIGQUIT
+		.Child => libc::SIGCHLD
+	}
+
+	/// The signal the system numbers `number`, of those a program catches.
+	static fn numbered(number: i64): Option<Signal> = {
+		for signal in [Signal::Interrupt, .Terminate, .Hangup, .Quit, .Child] {
+			if signal.number() as i64 == number then return .Some(signal)
+		}
+		return .None
+	}
+}
+
+/// The signals a program catches, which the system keeps for it until it
+/// asks; as each was before where this ends.
+pub struct Signals {
+	fd: c_int
+	caught: Vec<Signal>
+}
+
+extend Signals {
+	/// Catches `signals`: from now on each ends nothing and is kept until
+	/// asked for. On Linux they are held back in this thread and the ones it
+	/// starts after this, so a program catches them as it begins, before it
+	/// starts a thread. A program it starts handles them as it would have.
+	pub static fn catch(signals: &[Signal]): Result<Signals, io::IoError> = {
+		val fd = caughtBy(&signals)?
+		return .Ok(Signals(fd: fd, caught: signals.toVec()))
+	}
+
+	/// The signals that came since it was last asked, without waiting; one
+	/// that came several times is told of at least once.
+	pub var fn received(): Vec<Signal> = taken(self.fd, false)
+
+	/// The next signal, waiting for it.
+	pub var fn wait(): Signal = {
+		while true {
+			val came = taken(self.fd, true)
+			if !came.isEmpty() then return came[0]
+		}
+		return .Interrupt
+	}
+
+	/// A descriptor that is ready to read while a signal waits, for an
+	/// event queue; `received` takes what it holds.
+	pub fn descriptor(): i32 = self.fd
+}
+
+extend Signals: Destroy {
+	var fn destroy() = {
+		released(self.fd, &self.caught.items())
+	}
+}
+
+// A Mac's and iOS's: a kqueue, each signal a filter of its own, and the
+// signal ignored, which the filter sees all the same.
+
+@target(vendor = "apple")
+extern "C" {
+	fn kqueue(): c_int
+	@symbol("kevent")
+	fn keventOf(
+		queue: c_int,
+		changes: &[SignalEvent],
+		events: &var [SignalEvent],
+		timeout: ptr<u8>,
+	): c_int
+	@symbol("kevent")
+	fn keventWithin(
+		queue: c_int,
+		changes: &[SignalEvent],
+		events: &var [SignalEvent],
+		timeout: &Moment,
+	): c_int
+}
+
+@target(vendor = "apple")
+extern struct SignalEvent {
+	ident: u64 = 0
+	filter: i16 = 0
+	flags: u16 = 0
+	fflags: u32 = 0
+	data: i64 = 0
+	udata: u64 = 0
+}
+
+@target(vendor = "apple")
+extern struct Moment {
+	seconds: i64
+	nanos: i64
+}
+
+/// kqueue's filter for a signal, and what adds one.
+@target(vendor = "apple")
+val EVFILT_SIGNAL: i16 = -6
+@target(vendor = "apple")
+val EV_ADD: u16 = 0x1
+
+@target(vendor = "apple")
+fn caughtBy(signals: &[Signal]): Result<c_int, io::IoError> = {
+	val queue = kqueue()
+	if queue < 0 then return .Err(io::lastError())
+	var changes: Vec<SignalEvent> = Vec()
+	for signal in signals {
+		// A child's end ends nothing already, and ignored, the system would
+		// wait for no child: what it was would be lost.
+		if signal != Signal::Child then libc::signal(signal.number(), libc::SIG_IGN)
+		changes.push(SignalEvent(
+			ident: signal.number() as u64,
+			filter: EVFILT_SIGNAL,
+			flags: EV_ADD,
+		))
+	}
+	var none: Vec<SignalEvent> = Vec()
+	if keventOf(queue, &changes.items(), &var none.items(), null) < 0 {
+		val why = io::lastError()
+		released(queue, &signals)
+		return .Err(why)
+	}
+	return .Ok(queue)
+}
+
+@target(vendor = "apple")
+fn taken(queue: c_int, waiting: bool): Vec<Signal> = {
+	var room: Vec<SignalEvent> = Vec()
+	for _ in 0..8 {
+		room.push(SignalEvent())
+	}
+	var none: Vec<SignalEvent> = Vec()
+	val count =
+		if waiting then keventOf(queue, &none.items(), &var room.items(), null)
+		else keventWithin(queue, &none.items(), &var room.items(), Moment(seconds: 0, nanos: 0))
+	var came: Vec<Signal> = Vec()
+	for i in 0..(count as i64).max(0) {
+		if Signal::numbered(room[i].ident as i64) is .Some(signal) then came.push(signal)
+	}
+	return came
+}
+
+@target(vendor = "apple")
+fn released(queue: c_int, signals: &[Signal]) = {
+	for signal in signals {
+		if signal != Signal::Child then libc::signal(signal.number(), libc::SIG_DFL)
+	}
+	libc::close(queue)
+}
+
+// Linux's: the signals held back in this thread, and read from a
+// `signalfd`, a record of 128 bytes a signal, its number first.
+
+@target(os = "linux")
+extern "C" {
+	fn signalfd(fd: c_int, mask: &libc::Hidden, flags: c_int): c_int
+}
+
+@target(os = "linux")
+val SFD_NONBLOCK: c_int = 0o4000
+@target(os = "linux")
+val SFD_CLOEXEC: c_int = 0o2000000
+/// How long a `signalfd_siginfo` is.
+@target(os = "linux")
+val RECORD: i64 = 128
+
+@target(os = "linux")
+fn maskOf(signals: &[Signal]): libc::Hidden = {
+	var mask = libc::hidden()
+	libc::sigemptyset(&var mask)
+	for signal in signals {
+		libc::sigaddset(&var mask, signal.number())
+	}
+	return mask
+}
+
+@target(os = "linux")
+fn caughtBy(signals: &[Signal]): Result<c_int, io::IoError> = {
+	val mask = maskOf(&signals)
+	var before = libc::hidden()
+	libc::pthread_sigmask(libc::SIG_BLOCK, &mask, &var before)
+	val fd = signalfd(-1, &mask, SFD_NONBLOCK | SFD_CLOEXEC)
+	if fd < 0 {
+		val why = io::lastError()
+		libc::pthread_sigmask(libc::SIG_UNBLOCK, &mask, &var before)
+		return .Err(why)
+	}
+	return .Ok(fd)
+}
+
+@target(os = "linux")
+fn taken(fd: c_int, waiting: bool): Vec<Signal> = {
+	if waiting {
+		var fds = [libc::PollFd(fd: fd, events: libc::POLLIN, answered: 0)]
+		libc::poll(&var fds, -1)
+	}
+	var came: Vec<Signal> = Vec()
+	var record = [0 as u8; 128]
+	while libc::read(fd, &var record) as i64 == RECORD {
+		val number = bytes::u32le(&record, 0) as i64
+		if Signal::numbered(number) is .Some(signal) then came.push(signal)
+	}
+	return came
+}
+
+@target(os = "linux")
+fn released(fd: c_int, signals: &[Signal]) = {
+	libc::close(fd)
+	val mask = maskOf(&signals)
+	var before = libc::hidden()
+	libc::pthread_sigmask(libc::SIG_UNBLOCK, &mask, &var before)
+}

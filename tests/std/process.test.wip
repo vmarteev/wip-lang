@@ -7,6 +7,7 @@
 import std::fs
 import std::net::{Listener}
 import std::io
+import std::libc
 import std::path
 import std::process
 import std::process::{Command}
@@ -151,4 +152,86 @@ fn processEndsAProgramTalkedToWhereItIsDropped() = {
 fn processFindsWhatIsBesideTheProgram() = {
 	val .Ok(program) = process::executable() else panic("a program has a file")
 	assert(process::besideProgram("levels") == "\(path::parent(program))/levels")
+}
+
+/// What `signals` received within five seconds, until it has `count`.
+fn receivedWithin(signals: &var process::Signals, count: i64): Vec<process::Signal> = {
+	var got: Vec<process::Signal> = Vec()
+	val began = Instant::now()
+	while got.len() < count && began.elapsed() < Duration::seconds(5) {
+		for signal in signals.received() {
+			if !got.contains(&signal) then got.push(signal)
+		}
+		sleep(Duration::millis(5))
+	}
+	return got
+}
+
+/// A signal caught ends nothing, and is told of when asked.
+@test
+fn aSignalCaughtIsToldOfAndEndsNothing() = {
+	var signals = process::Signals::catch([process::Signal::Interrupt, .Terminate]).unwrap()
+	assert(signals.received().isEmpty(), "none yet")
+	libc::kill(process::id() as c_int, libc::SIGINT)
+	libc::kill(process::id() as c_int, libc::SIGTERM)
+	val got = receivedWithin(&var signals, 2)
+	assert(
+		got.contains(process::Signal::Interrupt) && got.contains(process::Signal::Terminate),
+		"both told of",
+	)
+}
+
+/// A signal is waited for, and waits in an event queue.
+@test
+fn aSignalIsWaitedForAndWaitsInAQueue() = {
+	var signals = process::Signals::catch([process::Signal::Hangup]).unwrap()
+	libc::kill(process::id() as c_int, libc::SIGHUP)
+	assert(signals.wait() == .Hangup)
+	var queue = io::EventQueue::new().unwrap()
+	assert(queue.add(signals.descriptor(), .Read, 9).isOk())
+	var events: Vec<io::Event> = Vec()
+	libc::kill(process::id() as c_int, libc::SIGHUP)
+	assert(queue.wait(.Some(Duration::seconds(5)), &var events).isOk())
+	assert(events.len() == 1 && events[0].token == 9, "ready")
+	assert(receivedWithin(&var signals, 1) == [process::Signal::Hangup].toVec())
+}
+
+/// Where the `Signals` ends, a signal is as it was: neither ignored nor
+/// held back.
+@test
+fn aSignalLetGoIsAsItWas() = {
+	{
+		val signals = process::Signals::catch([process::Signal::Quit]).unwrap()
+	}
+	assert(libc::signal(libc::SIGQUIT, libc::SIG_DFL) == libc::SIG_DFL, "not ignored")
+	var none = libc::hidden()
+	libc::sigemptyset(&var none)
+	var held = libc::hidden()
+	libc::pthread_sigmask(libc::SIG_BLOCK, &none, &var held)
+	assert(libc::sigismember(&held, libc::SIGQUIT) == 0, "not held back")
+}
+
+/// A program started while a signal is caught handles it as it would: a
+/// Ctrl-C ends it.
+@target(os = "macos")
+@target(os = "linux")
+@test
+fn aProgramStartedHandlesACaughtSignalAsItWould() = {
+	val signals = process::Signals::catch([process::Signal::Interrupt]).unwrap()
+	val child = Command::of("sleep").arg("10").start().unwrap()
+	sleep(Duration::millis(100))
+	libc::kill(child.id() as c_int, libc::SIGINT)
+	assert(child.wait() == .Signal(libc::SIGINT as i64), "ended by it")
+}
+
+/// A child's end is told of, and the child is still waited for, its code
+/// kept.
+@target(os = "macos")
+@target(os = "linux")
+@test
+fn aChildsEndIsToldOfAndItsCodeKept() = {
+	var signals = process::Signals::catch([process::Signal::Child]).unwrap()
+	val child = Command::of("sh").args(["-c", "exit 3"]).start().unwrap()
+	assert(receivedWithin(&var signals, 1) == [process::Signal::Child].toVec(), "told of")
+	assert(child.wait() == .Code(3), "waited for, its code kept")
 }

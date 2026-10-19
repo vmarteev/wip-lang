@@ -200,12 +200,16 @@ lldb and gdb stop at `main.wip:12`, step by line, and name the function
 and line of every frame, and a profiler gives time to lines. A debug build
 describes its variables and parameters too, with their types: each is
 kept in memory while it is in scope, where the debugger shows it and may
-change it. A release build describes them as well,
+change it. A release build describes every one of them as well,
 where the optimised code keeps them: a variable whose value is in a
 register for part of its scope is shown there, one LLVM computed away is
 `<optimized out>`, and so is one it kept only in part — a `String` whose
-length it kept and whose bytes' address it did not — rather than shown as
-what it does not hold.
+length it kept and whose bytes' address it did not. A value held in
+several pieces, as a `Vec` or a `Map` is, may be shown as it was rather
+than as it is: where the optimised code keeps a piece in a register and
+never stores it back, LLVM may still say the piece is in memory, and the
+debugger reads what was stored there last. Optimised C and C++ carry the
+same caveat; a debug build has none.
 
 `wip debug program` starts the debugger with **formatters**, small scripts
 the compiler carries, that show a value as Wip means it rather than as it

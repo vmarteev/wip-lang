@@ -14,7 +14,18 @@
 import std::collections::{Map}
 import std::mem
 import syntax as ast
-import syntax::{BinaryOp, COMPTIME_MARK, DEFINE, Diagnostic, Edit, NOT_A_CONSTANT, Span, Symbol}
+import syntax::{
+	BinaryOp,
+	COMPTIME_MARK,
+	DEFINE,
+	DUPLICATE_DEFINITION,
+	Diagnostic,
+	Edit,
+	NOT_A_CONSTANT,
+	Span,
+	Symbol,
+	TYPE_CONSTANT
+}
 
 /// Where a diagnostic of what a build was given is: in no file, so it is
 /// shown without an excerpt.
@@ -66,8 +77,6 @@ extend Lowerer {
 				isPub: decl.isPub,
 				span: decl.name.span,
 			))
-			// Reported where it is; it keeps its place in this module's scope.
-			self.preludeName(decl.name, "a constant named")
 			match self.constHere(decl.name.sym) {
 				.Some(first) => {
 					val previous = self.program.consts[first].span
@@ -91,6 +100,136 @@ extend Lowerer {
 			self.constSources.put(id, source)
 			if annotations.defined.isSome() then self.definable.push(id)
 		}
+	}
+
+	/// Declares the constants of the file's types, each a `val` among a
+	/// type's members, beside the module's and before any type's body, since
+	/// a length may be worked out from one. A block whose type is not found
+	/// here is reported by the pass that declares its methods.
+	var fn declareTypeConsts() = {
+		val file = self.ast
+		for item in file.items {
+			match item {
+				.Struct(decl) => if !decl.consts.isEmpty() {
+					val .Some((owner, _)) = self.typeHere(decl.name.sym) else continue
+					val generic = !decl.generics.isEmpty()
+					for constant in decl.consts {
+						self.declareTypeConst(owner, &constant, generic, false)
+					}
+				}
+				.Enum(decl) => if !decl.consts.isEmpty() {
+					val .Some((owner, _)) = self.typeHere(decl.name.sym) else continue
+					val generic = !decl.generics.isEmpty()
+					for constant in decl.consts {
+						self.declareTypeConst(owner, &constant, generic, false)
+					}
+				}
+				.Extend(block) => if !block.consts.isEmpty() {
+					val generic =
+						!block.generics.isEmpty() || block.sliceOf.isSome() || block.boxed.isSome()
+					val implements = block.interfaceName.isSome() || self.namesInterface(&block)
+					val .Some(owner) = self.constOwner(&block, generic || implements) else continue
+					for constant in block.consts {
+						self.declareTypeConst(owner, &constant, generic, implements)
+					}
+				}
+				_ => {}
+			}
+		}
+	}
+
+	/// The type an `extend` block that holds constants is for, where this
+	/// module may give it some: its own type, or a built-in one where it is
+	/// the prelude. One that holds them where none may be is still found, so
+	/// that each is reported.
+	fn constOwner(block: &ast::ExtendBlock, refused: bool): Option<TypeDef> = {
+		if block.derived.isSome() || block.path.len() != 1 then return .None
+		val name = block.path[0]
+		if refused && (block.sliceOf.isSome() || block.boxed.isSome()) then
+			return .Some(.Builtin(if block.sliceOf.isSome() then .Slice else .Own))
+		if self.builtin(name.sym) is .Some(ty) &&
+			BuiltinOwner::of(self.kind(ty)) is .Some(builtin) {
+			return if self.prelude == .Some(self.current) || refused then .Some(.Builtin(builtin))
+			else .None
+		}
+		val (owner, _) = self.typeHere(name.sym)?
+		return .Some(owner)
+	}
+
+	/// Whether an `extend` block's type is an interface, whose implementers
+	/// it gives methods to: `extend Iterator<T: Ord> { … }`.
+	fn namesInterface(block: &ast::ExtendBlock): bool =
+		block.path.len() == 1 &&
+		block.sliceOf.isNone() &&
+		block.boxed.isNone() &&
+		self.interfaceNamed(block.path[0]).isSome()
+
+	/// Declares one constant of a type, or reports why it cannot be one.
+	var fn declareTypeConst(
+		owner: TypeDef,
+		decl: &ast::ValDecl,
+		generic: bool,
+		implements: bool,
+	) keeps decl = {
+		val annotations = self.annotations(&decl.annotations, .Val)
+		if implements || generic {
+			val (message, label, note) =
+				if implements then
+					(
+						"a constant in a block that implements an interface",
+						"not one of the interface's methods",
+						"such a block holds what the interface declares, and an interface declares no constant; write it in a block of its own, `extend Type { … }`",
+					)
+				else (
+					"a constant of a type with parameters",
+					"no type to make it of",
+					"`Type::NAME` gives the type no arguments, so it would not say which of the type's instances the constant is",
+				)
+			self.report(
+				Diagnostic::error(TYPE_CONSTANT, message, decl.name.span, label).withNote(note),
+			)
+			return
+		}
+		if annotations.defined is .Some(at) then
+			self.report(
+				Diagnostic::error(
+					DEFINE,
+					"a constant of a type is not one a build sets",
+					at,
+					"`@define` on a type's constant",
+				).withNote(
+					"a build sets a constant of a module, by its name or its module's path: `@define val LEVEL: i64 = 1`",
+				),
+			)
+		val id = self.program.consts.add(ConstDef(
+			name: decl.name.sym,
+			ty: ERROR,
+			value: .None,
+			code: .None,
+			module: self.current as u32,
+			isPub: decl.isPub,
+			span: decl.name.span,
+			owner: .Some(owner),
+		))
+		val key = (owner, decl.name.sym)
+		match self.program.typeConsts.get(&key) {
+			.Some(first) => {
+				val previous = self.program.consts[first].span
+				self.duplicate(decl.name, previous)
+			}
+			.None => self.program.typeConsts.put(key, id)
+		}
+		self.constSources.put(id, ConstSource(
+			decl: &decl,
+			comptime: annotations.comptime,
+			defined: .None,
+			ast: self.ast,
+			module: self.current,
+			imports: self.imports.clone(),
+			lambdas: self.lambdas.clone(),
+			lambdaEnvs: self.lambdaEnvs.clone(),
+			generators: self.generators.clone(),
+		))
 	}
 
 	/// Which constant each of the build's defines sets, by its name alone or
@@ -206,9 +345,38 @@ extend Lowerer {
 				ids.push(consts.valueAt(i).clone())
 			}
 		}
+		// And its types' constants, each of which may share no name with a
+		// variant of its type, which is not declared when they are.
+		for i in 0..self.program.typeConsts.len() {
+			val id = self.program.typeConsts.valueAt(i).clone()
+			if self.program.consts[id].module != self.current as u32 then continue
+			ids.push(id)
+			self.checkTypeConstName(id)
+		}
 		ids.sortBy((a, b) => a.index() < b.index())
 		for id in ids {
 			self.constValue(id)
+		}
+	}
+
+	/// Reports a type's constant that shares its name with a variant of the
+	/// type.
+	var fn checkTypeConstName(id: ConstId) = {
+		val name = self.program.consts[id].name
+		val span = self.program.consts[id].span
+		val .Some(.Enum(enumId)) = self.program.consts[id].owner else return
+		for variant in self.program.enums[enumId].variants.clone() {
+			if variant.name == name then
+				self.report(
+					Diagnostic::error(
+						DUPLICATE_DEFINITION,
+						"`\(self.text(name))` is a variant of the type and a constant of it",
+						span,
+						"a constant of that name",
+					).withSecondary(variant.span, "the variant").withNote(
+						"`Type::NAME` names either, so the two cannot share a name",
+					),
+				)
 		}
 	}
 

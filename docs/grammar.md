@@ -275,7 +275,8 @@ structDecl  = ( "extern" | "view" )? "struct" IDENT generics?
                                             `view` or `extern` one has its braces *)
                             (* `extern struct` is C's layout, and takes no
                                generics *)
-                                         (* a member is a field or a method *)
+                                         (* a member is a field, a method or a
+                                            constant *)
 field       = annotation* ( "pub" "var"? )? fieldName ":" type ( "=" expr )? ;
 fieldName   = IDENT | keyword ;          (* `keyword`: a word of the keywords'
                                             list. A keyword names a field where only a
@@ -294,7 +295,8 @@ fieldName   = IDENT | keyword ;          (* `keyword`: a word of the keywords'
                                             constant *)
 
 enumDecl    = "view"? "enum" IDENT generics? "{" ( member ( lsep member )* lsep? )? "}" ;
-                                         (* a member is a variant or a method *)
+                                         (* a member is a variant, a method or a
+                                            constant *)
                                          (* `view enum`: its variants may borrow. `view` is a word
                                             only here. *)
 variant     = IDENT ( "(" variantField ( "," variantField )* ","? ")" )? ;
@@ -303,7 +305,7 @@ variantField = fieldName ":" type ( "=" expr )? ;
                                             as a parameter's *)
 
 extendBlock = "extend" extendType ( ":" path typeArgs? )?
-              "{" ( method ( lsep method )* lsep? )? "}" ;
+              "{" ( ( method | typeConst ) ( lsep ( method | typeConst ) )* lsep? )? "}" ;
 extendType  = path generics?              (* a type of this module, or an
                                              interface of it, extended under
                                              a condition on its types *)
@@ -324,7 +326,11 @@ ifaceMethod = ( "var" | "move" | "static" )? "fn" IDENT generics?
               "(" params? ")" ( ":" type )? ( "=" expr )? ;
             (* `= expr` is a default body *)
 
-member      = field | variant | method ;   (* in any order *)
+member      = field | variant | method | typeConst ;   (* in any order *)
+typeConst   = annotation* "pub"? valDecl ;   (* a constant of the type,
+                                            `Type::NAME`; not in a block that
+                                            implements an interface, nor of a
+                                            type with parameters *)
 method      = annotation* "pub"? ( "var" | "move" | "static" | "lend" )? fnDecl ;
                                          (* the word before `fn` says what the
                                             method does with its receiver;
@@ -445,7 +451,8 @@ yieldStmt   = "yield" expr ;             (* to the list being built,
                                             in *)
 whileStmt   = ( IDENT ":" )? "while" cond block ;
                                          (* a name, which `break name` leaves *)
-forStmt     = ( IDENT ":" )? "for" pattern "in" cond ( ( ".." | "..=" ) cond )? block ;
+forStmt     = ( IDENT ":" )? "for" pattern "in" cond block ;
+                                         (* a `cond` that is a range counts *)
                                          (* a name, `_`, or a struct taken
                                             apart *)
 breakStmt   = "break" IDENT? ;           (* a loop's name *)
@@ -457,10 +464,14 @@ cond        = expr ;                     (* its `{` begins the block, see R1 *)
 
 expr        = "lend" expr             (* a projection lends a place *)
             | assign ;
-assign      = logicOr ( assignOp assign )? ;
+assign      = range ( assignOp assign )? ;
 assignOp    = "=" | "+=" | "-=" | "*=" | "/=" | "%=" | "&=" | "|=" | "^="
             | "<<=" | ">>=" | "+%=" | "-%=" | "*%=" ;
                                          (* the last five, two adjacent tokens *)
+range       = logicOr ( ( ".." | "..=" ) logicOr )? ;
+                                         (* `lo..hi`, a `Range` value; also
+                                            what a `for` counts and a slice
+                                            takes *)
 logicOr     = logicAnd ( "||" logicAnd )* ;
 logicAnd    = equality ( "&&" equality )* ;
 equality    = comparison ( ( "==" | "!=" ) comparison )* ;
@@ -486,7 +497,7 @@ postfix     = primary ( "." fieldName | "." INT | "(" args? ")" | "[" index "]" 
                of an `Option` or a `Result` *)
             (* `x.name(…)` calls a method of `x`'s type, or a field of
                function type; `Type::name(…)` a static function *)
-index       = expr | expr? ".." expr? | expr? "..=" expr ;  (* a range must be borrowed: &xs[lo..hi];
+index       = expr | ".." expr? | expr ".." | "..=" expr ;  (* a range must be borrowed: &xs[lo..hi];
                                            on a type of one's own, `x[i]` calls the
                                            `at` of `Index` *)
 primary     = lambda
@@ -546,7 +557,7 @@ exprPath    = IDENT typeArgs? ( "::" IDENT typeArgs? )* ;
 
 arrayLit    = "[" ( element ( ";" expr | ( "," element )* ","? ) )? "]" ;
 element     = expr | forElement ;
-forElement  = "for" pattern "in" expr ( ( ".." | "..=" ) expr )? block ;
+forElement  = "for" pattern "in" expr block ;
                             (* an element that yields — a `for`, or an `if`,
                                `match` or block with `yield` inside — makes
                                the length known only as the list is built:
@@ -646,7 +657,8 @@ From tightest to loosest. All binary operators are left-associative except
 | 11 | `==`  `!=` | left |
 | 12 | `&&` | left |
 | 13 | `\|\|` | left |
-| 14 | `=` | right |
+| 14 | `..`  `..=` | none |
+| 15 | `=` | right |
 
 `if`, `match` and blocks are primaries, so `if a { 1 } else { 2 } + 3` adds
 3 to the result of the `if`.
@@ -657,6 +669,8 @@ From tightest to loosest. All binary operators are left-associative except
   (p.next)`.
 - `-x as i64` is `(-x) as i64`; `a * b as f64` is `a * (b as f64)`.
 - `x & MASK == 0` is `(x & MASK) == 0`, unlike in C.
+- `0..n + 1` is `0..(n + 1)`; `(0..4).any(f)` walks the range, where
+  `0..4.any(f)` would be `0..(4.any(f))`.
 
 ---
 

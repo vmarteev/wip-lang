@@ -1,5 +1,6 @@
 import std::c
 import std::future
+import std::shared::{Shared}
 import std::sync
 import std::sync::{Atomic, LoadOrder, Order, StoreOrder}
 
@@ -137,4 +138,92 @@ fn fencesOrderRelaxedOperations() = {
 	for order in [Order::Relaxed, .Acquire, .Release, .AcqRel, .SeqCst] {
 		sync::fence(order)
 	}
+}
+
+/// Values come out of a ring in the order they went in; a full ring hands
+/// the value back, and an empty one answers nothing.
+@test
+fn aRingGivesBackWhatDoesNotFit() = {
+	var (fill, drain) = sync::ring<String>(2)
+	assert(drain.pop().isNone(), "nothing in a new ring")
+	assert(fill.push("a").isOk() && fill.push("b").isOk())
+	assert(fill.push("c") == .Err(String::of("c")), "full: the value comes back")
+	assert(fill.len() == 2 && drain.len() == 2 && fill.capacity() == 2)
+	assert(drain.pop() == .Some(String::of("a")))
+	assert(fill.push("d").isOk(), "room again, past the ring's end")
+	assert(drain.pop() == .Some(String::of("b")))
+	assert(drain.pop() == .Some(String::of("d")))
+	assert(drain.pop().isNone() && drain.len() == 0)
+}
+
+/// A value that counts, in an atomic it shares, that it has ended.
+struct Tally {
+	ends: Shared<Atomic<i64>>
+}
+
+extend Tally: Destroy {
+	var fn destroy() = {
+		self.ends.value().add(1)
+	}
+}
+
+/// What is still in a ring ends with it, once both its ends are gone,
+/// whichever goes first; an end alone goes on working.
+@test
+fn aRingEndsWhatItStillHolds() = {
+	for drainerFirst in [true, false] {
+		val ends = Shared::of(Atomic::of(0 as i64))
+		var (fill, drain) = sync::ring<Tally>(4)
+		for _ in 0..3 {
+			assert(fill.push(Tally(ends: ends.share())).isOk())
+		}
+		destroy(drain.pop())
+		assert(ends.value().load() == 1, "what was taken is the taker's")
+		if drainerFirst {
+			destroy(drain)
+			assert(fill.push(Tally(ends: ends.share())).isOk(), "nothing drains, and room is left")
+			assert(ends.value().load() == 1, "the ring lives while an end does")
+			destroy(fill)
+			assert(ends.value().load() == 4, "the three left end with it")
+		} else {
+			destroy(fill)
+			destroy(drain.pop())
+			assert(ends.value().load() == 2, "nothing fills, and what is there comes out")
+			destroy(drain)
+			assert(ends.value().load() == 3, "the one left ends with it")
+		}
+	}
+}
+
+/// Two threads pass a hundred thousand values through a ring of eight,
+/// each seen once and in order.
+@test
+fn aRingCarriesValuesBetweenThreads() = {
+	var (fill, drain) = sync::ring<i64>(8)
+	val count = 100000
+	var seen = 0
+	var inOrder = true
+	future::together(
+		() => {
+			for i in 0..count {
+				while fill.push(i).isErr() {}
+			}
+		},
+		() => {
+			while seen < count {
+				if drain.pop() is .Some(value) {
+					if value != seen then inOrder = false
+					seen += 1
+				}
+			}
+		},
+	)
+	assert(seen == count && inOrder)
+	assert(drain.pop().isNone())
+}
+
+/// A ring has a slot at least.
+@test(panics = "a ring of 0 slots: it has one at least")
+fn aRingOfNoSlotsIsRefused() = {
+	val ends = sync::ring<i64>(0)
 }

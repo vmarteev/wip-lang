@@ -14,20 +14,21 @@
 const PREC = {
   assign: 1,
   lend: 2,
-  or: 3,
-  and: 4,
-  equality: 5,
-  comparison: 6,
-  bit_or: 7,
-  bit_xor: 8,
-  bit_and: 9,
-  shift: 10,
-  additive: 11,
-  multiplicative: 12,
-  cast: 13,
-  unary: 14,
-  postfix: 15,
-  path: 16,
+  range: 3,
+  or: 4,
+  and: 5,
+  equality: 6,
+  comparison: 7,
+  bit_or: 8,
+  bit_xor: 9,
+  bit_and: 10,
+  shift: 11,
+  additive: 12,
+  multiplicative: 13,
+  cast: 14,
+  unary: 15,
+  postfix: 16,
+  path: 17,
 };
 
 /** `rule`, separated by commas, with a trailing comma allowed. */
@@ -270,12 +271,13 @@ module.exports = grammar({
       field('body', $.enum_variant_list),
     ),
 
-    /// `{ … }` of fields and methods, separated by line breaks or commas.
+    /// `{ … }` of fields, methods and constants, separated by line breaks or
+    /// commas.
     declaration_list: $ => seq(
       '{',
       optional($._list_separators),
       repeat(seq(
-        choice($.field_declaration, $.function_declaration),
+        choice($.field_declaration, $.function_declaration, $.val_declaration),
         optional($._list_separators),
       )),
       '}',
@@ -285,7 +287,7 @@ module.exports = grammar({
       '{',
       optional($._list_separators),
       repeat(seq(
-        choice($.enum_variant, $.function_declaration),
+        choice($.enum_variant, $.function_declaration, $.val_declaration),
         optional($._list_separators),
       )),
       '}',
@@ -490,7 +492,6 @@ module.exports = grammar({
       field('pattern', $._pattern),
       'in',
       field('value', $._expression),
-      optional(seq(choice('..', '..='), field('end', $._expression))),
       field('body', $.block),
     )),
 
@@ -525,6 +526,7 @@ module.exports = grammar({
       $.try_expression,
       $.unary_expression,
       $.binary_expression,
+      $.range_expression,
       $.cast_expression,
       $.is_expression,
       $.assignment_expression,
@@ -573,7 +575,6 @@ module.exports = grammar({
       field('pattern', $._pattern),
       'in',
       field('value', $._expression),
-      optional(seq(choice('..', '..='), field('end', $._expression))),
       field('body', $.block),
     ),
 
@@ -623,10 +624,13 @@ module.exports = grammar({
       $._expression,
       '[',
       choice(
+        // `xs[i]`, and `xs[lo..hi]`, whose range is an expression.
         $._expression,
-        seq(optional($._expression), '..', optional($._expression)),
-        // `xs[lo..=hi]` takes `hi` too, so it needs one.
-        seq(optional($._expression), '..=', $._expression),
+        // A range open at either end, or both.
+        seq('..', optional($._expression)),
+        seq($._expression, '..'),
+        // `xs[..=hi]` takes `hi` too, so it needs one.
+        seq('..=', $._expression),
       ),
       ']',
     )),
@@ -661,6 +665,14 @@ module.exports = grammar({
         field('right', $._expression),
       ))));
     },
+
+    // `lo..hi` and `lo..=hi`, a range as a value; also what a `for`
+    // counts and a slice takes.
+    range_expression: $ => prec.left(PREC.range, seq(
+      field('start', $._expression),
+      field('operator', choice('..', '..=')),
+      field('end', $._expression),
+    )),
 
     cast_expression: $ => prec.left(PREC.cast, seq(
       field('value', $._expression),

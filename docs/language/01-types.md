@@ -11,6 +11,18 @@ The integers are `i8`, `i16`, `i32`, `i64`, `i128` and `isize`, and `u8`,
 `u16`, `u32`, `u64`, `u128` and `usize`. The floats are `f32` and `f64`.
 None of the names is a keyword.
 
+Each integer type's smallest and largest values are constants of the
+type, `MIN` and `MAX`. A float type has `INFINITY` and `NAN`, `MAX`, its
+largest finite value, `MIN`, that value's negative, and `EPSILON`, how
+far 1 is from the next larger:
+
+```wip,run
+assert(i64::MAX == 9223372036854775807 && u8::MAX == 255 && i8::MIN == -128)
+assert(i64::MAX +% 1 == i64::MIN)
+assert(f64::INFINITY > f64::MAX && f32::NAN.isNaN())
+assert(1.0 + f64::EPSILON > 1.0 && 1.0 + f64::EPSILON / 2.0 == 1.0)
+```
+
 A literal takes the type expected of it — the other operand's beside an
 operator, the other branch's in an `if` ([page 4](04-expressions.md)) —
 and `i64` where nothing expects anything:

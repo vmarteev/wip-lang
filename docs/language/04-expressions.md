@@ -570,6 +570,24 @@ for b in 0 as u8..=255 {
 assert(bytes == 256)
 ```
 
+A range is also a value of its own, a `Range<T>` of the integers it counts,
+and an iterator, so every walk an iterator has is a range's: `(0..4).any(…)`
+asks whether any of the first four counts, without a loop and a flag. It
+binds looser than every operator but assignment, so `0..n + 1` counts to
+`n + 1`, and a method of a range is called on it in parentheses. Its
+`start` is the next it gives, and `end` and `inclusive` say where it stops:
+
+```wip,run
+val pressed = [false, true, false, false]
+assert((0..4).any((i) => pressed[i]))
+assert((1..=10).sum() == 55)
+assert((1..=4).map((n) => n * n).toVec() == [1, 4, 9, 16])
+
+val n = 3
+val counted = 0..n + 1
+assert(counted.count() == 4 && counted.end == 4 && !counted.inclusive)
+```
+
 `break` leaves a loop and `continue` starts its next turn. A loop may be
 named, and then both may say which loop they mean:
 

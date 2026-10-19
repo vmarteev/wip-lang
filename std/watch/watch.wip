@@ -1,0 +1,477 @@
+// Watching files: a `Watcher` is told by the system when a file or a
+// directory it watches changes, and answers which, when it is asked. It is
+// FSEvents on a Mac and inotify on Linux; iOS has neither, and a watcher
+// there cannot be made. A directory is watched for its entries, not for
+// what is deeper; a file is watched through its directory, by its name, so
+// that a file replaced under its name — as an editor saves — is still the
+// file watched.
+//
+// It is a module of its own because FSEvents is in CoreServices, which a
+// Mac program links only where it watches.
+
+import std::bytes
+import std::c
+import std::fs
+import std::io
+import std::libc
+import std::path
+import std::sync::{Atomic}
+
+/// Files and directories watched, and what tells of their changes. Asked,
+/// it answers which changed; it never waits.
+pub struct Watcher {
+	source: Source
+	watched: Vec<Watched>
+}
+
+/// A path watched, as it was given.
+struct Watched {
+	path: String
+	/// A file's name in its directory; none for a directory.
+	name: Option<String>
+	handle: Handle
+	/// Told of since `changed` last answered it.
+	fired: bool = false
+}
+
+extend Watcher {
+	/// A watcher watching nothing yet; `.Unsupported` on a system that
+	/// cannot watch.
+	pub static fn new(): Result<Watcher, io::IoError> = .Ok(Watcher(
+		source: opened()?,
+		watched: Vec(),
+	))
+
+	/// Watches `path`, a directory for what is made, written, renamed or
+	/// removed in it, or a file for itself, written, removed or replaced.
+	/// It must be there; watched already, it is one watch. What changed a
+	/// moment before may be told of too, where the system's news of it
+	/// arrives after.
+	pub var fn watch(path: str): Result<void, io::IoError> = {
+		if self.watched.any((one) => one.path == path) then return .Ok()
+		val about = fs::meta(path)?
+		val name: Option<String> =
+			if about.isDirectory() then .None else .Some(String::of(path::name(path)))
+		val directory: String = match name {
+			.Some(..) =>
+				if path::parent(path).isEmpty() then String::of(".")
+				else String::of(path::parent(path))
+			.None => String::of(path)
+		}
+		val handle = started(&var self.source, directory, &name)?
+		self.watched.push(Watched(path: String::of(path), name: name, handle: handle))
+		return .Ok()
+	}
+
+	/// No longer watches `path`.
+	pub var fn unwatch(path: str) = {
+		val .Some(at) = self.watched.items().indexWhere((one) => one.path == path) else return
+		val gone = self.watched.remove(at)
+		stopped(&var self.source, gone.handle, &self.watched.items())
+	}
+
+	/// Each path watched that changed since it was last asked, once, as it
+	/// was given and in the order it was watched. Where the system lost
+	/// track of what changed, every one. It never waits.
+	pub var fn changed(): Vec<String> = {
+		gathered(&var self.source, &var self.watched.items())
+		var out: Vec<String> = Vec()
+		for i in 0..self.watched.len() {
+			if !self.watched[i].fired then continue
+			self.watched[i].fired = false
+			out.push(self.watched[i].path.clone())
+		}
+		return out
+	}
+
+	/// Whether `changed` would answer anything, which it leaves to answer.
+	pub fn pending(): bool =
+		self.watched.any((one) => one.fired) || waiting(&self.source, &self.watched.items())
+
+	/// A descriptor that is ready to read while a change waits to be
+	/// answered: what an event queue waits on, beside a program's sockets.
+	pub fn descriptor(): i32 = descriptorOf(&self.source)
+}
+
+extend Watcher: Destroy {
+	var fn destroy() = {
+		while self.watched.pop() is .Some(gone) {
+			stopped(&var self.source, gone.handle, &self.watched.items())
+		}
+		closed(&var self.source)
+	}
+}
+
+// A Mac's: FSEvents, a stream for each path watched, of its directory,
+// telling of each item that changed. A stream tells on a dispatch queue's
+// thread, where its callback counts what is the watch's into an atomic and
+// writes a byte to a pipe, whose other end is the watcher's descriptor;
+// `changed` compares each count with the last it saw. Nothing else is
+// shared between the two threads.
+
+@target(os = "macos")
+@framework("CoreServices")
+extern "C" {
+	fn CFStringCreateWithCString(allocator: ptr<u8>, text: cstring, encoding: u32): ptr<u8>
+	/// The values, and how many: what a slice crosses as.
+	fn CFArrayCreate(allocator: ptr<u8>, values: &[ptr<u8>], callbacks: ptr<u8>): ptr<u8>
+	fn CFRelease(object: ptr<u8>)
+	fn FSEventStreamCreate(
+		allocator: ptr<u8>,
+		callback: (stream: ptr<u8>, info: ptr<u8>, count: size_t, paths: ptr<ptr<u8>>, flags: ptr<u32>, ids: ptr<u64>) => void,
+		context: &StreamContext,
+		directories: ptr<u8>,
+		since: u64,
+		latency: f64,
+		flags: u32,
+	): ptr<u8>
+	fn FSEventStreamSetDispatchQueue(stream: ptr<u8>, queue: ptr<u8>)
+	fn FSEventStreamStart(stream: ptr<u8>): u8
+	fn FSEventStreamStop(stream: ptr<u8>)
+	fn FSEventStreamInvalidate(stream: ptr<u8>)
+	fn FSEventStreamRelease(stream: ptr<u8>)
+	fn dispatch_queue_create(label: cstring, attributes: ptr<u8>): ptr<u8>
+	fn dispatch_sync_f(queue: ptr<u8>, context: ptr<u8>, work: (context: ptr<u8>) => void)
+	fn dispatch_release(object: ptr<u8>)
+}
+
+/// What a stream is made with, and copies.
+@target(os = "macos")
+extern struct StreamContext {
+	version: i64
+	info: ptr<u8>
+	retain: ptr<u8>
+	release: ptr<u8>
+	describe: ptr<u8>
+}
+
+@target(os = "macos")
+val kCFStringEncodingUTF8: u32 = 0x08000100
+@target(os = "macos")
+val kFSEventStreamEventIdSinceNow: u64 = 0xFFFFFFFFFFFFFFFF
+/// The first change after a quiet moment is told at once, and those after
+/// it are held together.
+@target(os = "macos")
+val kFSEventStreamCreateFlagNoDefer: u32 = 0x2
+/// Each item that changed is told of, not only its directory.
+@target(os = "macos")
+val kFSEventStreamCreateFlagFileEvents: u32 = 0x10
+/// The stream missed some, and anything may have changed.
+@target(os = "macos")
+val MISSED: u32 = 0x1 | 0x2 | 0x4
+/// How long, in seconds, changes are held together before they are told.
+@target(os = "macos")
+val LATENCY: f64 = 0.05
+
+/// The pipe a stream's callback writes to, and the watcher reads from.
+@target(os = "macos")
+struct Source {
+	reading: c_int
+	writing: c_int
+}
+
+/// What a stream's callback and the watcher share: how many changes were
+/// the watch's; the directory's real path, as FSEvents tells paths, and a
+/// file's name in it; and the pipe's end to wake the watcher with.
+@target(os = "macos")
+struct Told {
+	count: Atomic<i64>
+	directory: String
+	name: Option<String>
+	writing: c_int
+}
+
+@target(os = "macos")
+struct Handle {
+	stream: ptr<u8>
+	queue: ptr<u8>
+	told: c::Pinned<Told>
+	directories: ptr<u8>
+	text: ptr<u8>
+	/// The count when the watcher last looked.
+	seen: i64
+}
+
+@target(os = "macos")
+fn opened(): Result<Source, io::IoError> = {
+	var ends = libc::Pipe(reading: 0, writing: 0)
+	if libc::pipe(&var ends) != 0 then return .Err(io::lastError())
+	for fd in [ends.reading, ends.writing] {
+		libc::closeOnExec(fd)
+		libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK)
+	}
+	return .Ok(Source(reading: ends.reading, writing: ends.writing))
+}
+
+@target(os = "macos")
+fn closed(source: &var Source) = {
+	libc::close(source.reading)
+	libc::close(source.writing)
+}
+
+@target(os = "macos")
+fn descriptorOf(source: &Source): i32 = source.reading
+
+@target(os = "macos")
+fn started(
+	source: &var Source,
+	directory: str,
+	name: &Option<String>,
+): Result<Handle, io::IoError> = {
+	val real = fs::realPath(directory)?
+	val told = c::Pinned::of(Told(
+		count: Atomic::of(0 as i64),
+		directory: real.clone(),
+		name: name.clone(),
+		writing: source.writing,
+	))
+	var label = real.clone()
+	val text = CFStringCreateWithCString(null, label.toCstring(), kCFStringEncodingUTF8)
+	val directories = CFArrayCreate(null, [text], null)
+	val context = StreamContext(
+		version: 0,
+		info: told.address() as ptr<u8>,
+		retain: null,
+		release: null,
+		describe: null,
+	)
+	val stream = FSEventStreamCreate(
+		null,
+		toldOf,
+		&context,
+		directories,
+		kFSEventStreamEventIdSinceNow,
+		LATENCY,
+		kFSEventStreamCreateFlagNoDefer | kFSEventStreamCreateFlagFileEvents,
+	)
+	var queueName = String::of("std.watch")
+	val queue = dispatch_queue_create(queueName.toCstring(), null)
+	val handle = Handle(
+		stream: stream,
+		queue: queue,
+		told: told,
+		directories: directories,
+		text: text,
+		seen: 0,
+	)
+	FSEventStreamSetDispatchQueue(stream, queue)
+	if FSEventStreamStart(stream) == 0 {
+		stopped(&var source, handle, [])
+		return .Err(.Other(0))
+	}
+	return .Ok(handle)
+}
+
+/// The stream stopped and let go: what it was telling as it stopped is
+/// waited for, on its queue, before what it tells into is freed.
+@target(os = "macos")
+fn stopped(source: &var Source, handle: Handle, others: &[Watched]) = {
+	FSEventStreamStop(handle.stream)
+	FSEventStreamInvalidate(handle.stream)
+	dispatch_sync_f(handle.queue, null, drained)
+	FSEventStreamRelease(handle.stream)
+	dispatch_release(handle.queue)
+	CFRelease(handle.directories)
+	CFRelease(handle.text)
+}
+
+/// Nothing: what `dispatch_sync_f` runs once what was queued before it is
+/// done.
+@target(os = "macos")
+fn drained(context: ptr<u8>) = {}
+
+@target(os = "macos")
+fn gathered(source: &var Source, watched: &var [Watched]) = {
+	// The pipe emptied: the counts say what changed.
+	var bytes = [0 as u8; 256]
+	while libc::read(source.reading, &var bytes) > 0 {}
+	for i in 0..watched.len() {
+		val count = watched[i].handle.told.value().count.load()
+		if count == watched[i].handle.seen then continue
+		watched[i].handle.seen = count
+		watched[i].fired = true
+	}
+}
+
+@target(os = "macos")
+fn waiting(source: &Source, watched: &[Watched]): bool = watched.any((one) =>
+	one.handle.told.value().count.load() != one.handle.seen)
+
+/// What a stream tells, on its queue's thread: which items changed. One
+/// that is the watch's — the directory, an entry of it, or the file — is
+/// counted, and the watcher woken.
+@target(os = "macos")
+fn toldOf(
+	stream: ptr<u8>,
+	info: ptr<u8>,
+	count: size_t,
+	paths: ptr<ptr<u8>>,
+	flags: ptr<u32>,
+	ids: ptr<u64>,
+) = {
+	c::pinnedAt<Told, void>(
+		info as ptr<void>,
+		(told) => {
+			for i in 0..(count as i64) {
+				val item = str::fromBytes(&paths[i][0..libc::strlen(paths[i]) as i64])
+				if (flags[i] & MISSED) != 0 || isTheWatchs(&told, item) {
+					told.count.add(1)
+					libc::write(told.writing, [1 as u8])
+					return
+				}
+			}
+		},
+	)
+}
+
+/// Whether a change to `item` is the watch's: for a directory, the
+/// directory or an entry in it; for a file, the file.
+@target(os = "macos")
+fn isTheWatchs(told: &Told, item: str): bool = match told.name {
+	.Some(name) => path::parent(item) == told.directory && path::name(item) == name
+	.None => item == told.directory || path::parent(item) == told.directory
+}
+
+// Linux's: inotify, one descriptor, which is the watcher's, and a watch of
+// each directory, which a directory and the files in it watched share.
+
+@target(os = "linux")
+extern "C" {
+	fn inotify_init1(flags: c_int): c_int
+	fn inotify_add_watch(fd: c_int, path: cstring, mask: u32): c_int
+	fn inotify_rm_watch(fd: c_int, wd: c_int): c_int
+}
+
+@target(os = "linux")
+val IN_NONBLOCK: c_int = 0o4000
+@target(os = "linux")
+val IN_CLOEXEC: c_int = 0o2000000
+/// What changes a directory's entries: one written, its mode or times
+/// changed, closed after writing, renamed out or in, made or removed; and
+/// the directory itself removed or renamed.
+@target(os = "linux")
+val WATCHED: u32 = 0x2 | 0x4 | 0x8 | 0x40 | 0x80 | 0x100 | 0x200 | 0x400 | 0x800
+/// The directory itself removed, renamed, or no longer watched.
+@target(os = "linux")
+val ITSELF: u32 = 0x400 | 0x800 | 0x8000
+/// Only a directory is watched.
+@target(os = "linux")
+val IN_ONLYDIR: u32 = 0x01000000
+/// More happened than the kernel kept: anything may have changed.
+@target(os = "linux")
+val IN_Q_OVERFLOW: u32 = 0x4000
+
+@target(os = "linux")
+struct Source {
+	fd: c_int
+}
+
+@target(os = "linux")
+struct Handle {
+	wd: c_int
+}
+
+@target(os = "linux")
+fn opened(): Result<Source, io::IoError> = {
+	val fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC)
+	if fd < 0 then return .Err(io::lastError())
+	return .Ok(Source(fd: fd))
+}
+
+@target(os = "linux")
+fn closed(source: &var Source) = {
+	libc::close(source.fd)
+}
+
+@target(os = "linux")
+fn descriptorOf(source: &Source): i32 = source.fd
+
+@target(os = "linux")
+fn started(
+	source: &var Source,
+	directory: str,
+	name: &Option<String>,
+): Result<Handle, io::IoError> = {
+	var text = String::of(directory)
+	val wd = inotify_add_watch(source.fd, text.toCstring(), WATCHED | IN_ONLYDIR)
+	if wd < 0 then return .Err(io::lastError())
+	return .Ok(Handle(wd: wd))
+}
+
+/// The directory's watch let go, where nothing else watched shares it.
+@target(os = "linux")
+fn stopped(source: &var Source, handle: Handle, others: &[Watched]) = {
+	if !others.any((one) => one.handle.wd == handle.wd) then inotify_rm_watch(source.fd, handle.wd)
+}
+
+/// Every event waiting read, and each watched path it is about marked.
+@target(os = "linux")
+fn gathered(source: &var Source, watched: &var [Watched]) = {
+	var buffer = own [0 as u8; 4096]
+	while true {
+		val got = libc::read(source.fd, &var buffer) as i64
+		if got <= 0 then break
+		// Each event: its watch, its mask, a cookie, the length of the
+		// name after it, and the name, ended by a NUL.
+		var at = 0
+		while at + 16 <= got {
+			val wd = bytes::i32le(&buffer, at) as c_int
+			val mask = bytes::u32le(&buffer, at + 4)
+			val length = bytes::u32le(&buffer, at + 12) as i64
+			var end = at + 16
+			while end < at + 16 + length && buffer[end] != 0 {
+				end += 1
+			}
+			val item = str::fromBytes(&buffer[at + 16..end])
+			for i in 0..watched.len() {
+				val about =
+					(mask & IN_Q_OVERFLOW) != 0 ||
+					watched[i].handle.wd == wd &&
+						(mask & ITSELF != 0 ||
+							watched[i].name is .None ||
+							watched[i].name is .Some(name) && name == item)
+				if about then watched[i].fired = true
+			}
+			at += 16 + length
+		}
+	}
+}
+
+@target(os = "linux")
+fn waiting(source: &Source, watched: &[Watched]): bool = {
+	var fds = [libc::PollFd(fd: source.fd, events: libc::POLLIN, answered: 0)]
+	return libc::poll(&var fds, 0) > 0
+}
+
+// iOS has no way for an app to watch files: a watcher cannot be made there.
+
+@target(os = "ios")
+struct Source
+
+@target(os = "ios")
+struct Handle
+
+@target(os = "ios")
+fn opened(): Result<Source, io::IoError> = .Err(.Unsupported)
+
+@target(os = "ios")
+fn closed(source: &var Source) = {}
+
+@target(os = "ios")
+fn descriptorOf(source: &Source): i32 = -1
+
+@target(os = "ios")
+fn started(
+	source: &var Source,
+	directory: str,
+	name: &Option<String>,
+): Result<Handle, io::IoError> = .Err(.Unsupported)
+
+@target(os = "ios")
+fn stopped(source: &var Source, handle: Handle, others: &[Watched]) = {}
+
+@target(os = "ios")
+fn gathered(source: &var Source, watched: &var [Watched]) = {}
+
+@target(os = "ios")
+fn waiting(source: &Source, watched: &[Watched]): bool = false

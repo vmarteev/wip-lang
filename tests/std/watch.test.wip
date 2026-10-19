@@ -1,0 +1,120 @@
+// `std::watch`: a directory watched for its entries, a file for itself,
+// each told of once, by the path it was given, and nothing told of a path
+// no longer watched. The system takes a moment to tell, so each test waits
+// for what it expects, a few seconds at most.
+
+import std::fs
+import std::io
+import std::time::{Duration, Instant, sleep}
+import std::watch::{Watcher}
+
+/// What `watcher` says changed, once it says anything, or after `seconds`.
+fn told(watcher: &var Watcher, seconds: i64): Vec<String> = {
+	val began = Instant::now()
+	while began.elapsed() < Duration::seconds(seconds) {
+		if watcher.pending() then break
+		sleep(Duration::millis(10))
+	}
+	// A burst may still be arriving: what comes in a moment is the same
+	// change.
+	sleep(Duration::millis(100))
+	return watcher.changed()
+}
+
+/// What was changed just before a watch began may still be told of: the
+/// system's own news of it can arrive after. A moment, and it is let go.
+fn settled(watcher: &var Watcher) = {
+	sleep(Duration::millis(200))
+	watcher.changed()
+}
+
+/// A watcher, where the system has one: on iOS, none, and nothing to test.
+fn watcherHere(): Option<Watcher> = match Watcher::new() {
+	.Ok(watcher) => .Some(watcher)
+	.Err(why) => {
+		assert(why == .Unsupported, "a watcher, or the system has none")
+		Option::None
+	}
+}
+
+@test
+fn aDirectoryIsWatchedForItsEntries() = {
+	val .Some(var watcher) = watcherHere() else return
+	val dir = fs::TempDir::new().unwrap()
+	assert(fs::makeDir(dir.join("deeper")).isOk())
+	assert(watcher.watch(dir.path).isOk())
+	settled(&var watcher)
+	assert(!watcher.pending() && watcher.changed().isEmpty(), "nothing yet")
+
+	assert(fs::writeFile(dir.join("made"), "one").isOk())
+	assert(told(&var watcher, 5) == [dir.path.clone()].toVec(), "an entry made")
+	assert(watcher.changed().isEmpty(), "told once")
+
+	assert(fs::rename(dir.join("made"), dir.join("renamed")).isOk())
+	assert(told(&var watcher, 5) == [dir.path.clone()].toVec(), "an entry renamed")
+	assert(fs::removeFile(dir.join("renamed")).isOk())
+	assert(told(&var watcher, 5) == [dir.path.clone()].toVec(), "an entry removed")
+
+	assert(fs::writeFile(dir.join("deeper/note"), "deep").isOk())
+	assert(told(&var watcher, 1).isEmpty(), "what is deeper is not its")
+}
+
+@test
+fn aFileIsWatchedAcrossItsReplacing() = {
+	val .Some(var watcher) = watcherHere() else return
+	val dir = fs::TempDir::new().unwrap()
+	val save = dir.join("save.json")
+	assert(fs::writeFile(save, "{}").isOk())
+	assert(fs::writeFile(dir.join("other"), "x").isOk())
+	assert(watcher.watch(save).isOk())
+	settled(&var watcher)
+
+	assert(fs::writeFile(dir.join("other"), "y").isOk())
+	assert(told(&var watcher, 1).isEmpty(), "another file in its directory is not it")
+
+	assert(fs::writeFile(save, "{\"coins\": 1}").isOk())
+	assert(told(&var watcher, 5) == [save.clone()].toVec(), "written in place")
+	assert(fs::replaceFile(save, "{\"coins\": 2}").isOk())
+	assert(told(&var watcher, 5) == [save.clone()].toVec(), "replaced under its name")
+	assert(fs::writeFile(save, "{\"coins\": 3}").isOk())
+	assert(told(&var watcher, 5) == [save.clone()].toVec(), "and watched on")
+}
+
+@test
+fn whatIsNoLongerWatchedIsNotToldOf() = {
+	val .Some(var watcher) = watcherHere() else return
+	val dir = fs::TempDir::new().unwrap()
+	val first = dir.join("first")
+	val second = dir.join("second")
+	assert(fs::makeDir(first).isOk() && fs::makeDir(second).isOk())
+	assert(watcher.watch(first).isOk() && watcher.watch(second).isOk())
+	assert(watcher.watch(dir.join("missing")) == .Err(.NotFound))
+	watcher.unwatch(first)
+	settled(&var watcher)
+	assert(fs::writeFile(path(first, "a"), "a").isOk())
+	assert(fs::writeFile(path(second, "b"), "b").isOk())
+	assert(told(&var watcher, 5) == [second.clone()].toVec())
+}
+
+/// A watcher's descriptor waits in an event queue, ready while a change
+/// waits to be answered.
+@test
+fn aWatcherWaitsInAQueue() = {
+	val .Some(var watcher) = watcherHere() else return
+	val dir = fs::TempDir::new().unwrap()
+	assert(watcher.watch(dir.path).isOk())
+	settled(&var watcher)
+	var queue = io::EventQueue::new().unwrap()
+	assert(queue.add(watcher.descriptor(), .Read, 3).isOk())
+	var events: Vec<io::Event> = Vec()
+	assert(queue.wait(.Some(Duration::millis(0)), &var events).isOk() && events.isEmpty())
+	assert(fs::writeFile(dir.join("new"), "n").isOk())
+	assert(queue.wait(.Some(Duration::seconds(5)), &var events).isOk())
+	assert(events.len() == 1 && events[0].token == 3 && events[0].readable)
+	sleep(Duration::millis(100))
+	assert(watcher.changed() == [dir.path.clone()].toVec())
+	assert(queue.wait(.Some(Duration::millis(0)), &var events).isOk())
+	assert(events.isEmpty(), "answered: no longer ready")
+}
+
+fn path(dir: str, name: str): String = "\(dir)/\(name)"

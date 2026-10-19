@@ -13,12 +13,14 @@ import syntax::{
 	MISMATCHED_TYPES,
 	NAMED_ARGUMENT_TO_VALUE,
 	NAMED_VARIADIC_ARGUMENT,
+	NOT_A_METHOD,
 	NO_SUCH_FIELD,
 	NOT_A_VALUE,
 	NOT_CALLABLE,
 	NOT_C_COMPATIBLE,
 	PACKAGE,
 	PANIC_ARGUMENT,
+	PRIVATE_ITEM,
 	REST_NOT_LAST,
 	Span,
 	Symbol,
@@ -771,6 +773,16 @@ extend Lowerer {
 					if item.rest is .Some(r) then self.restWithoutStruct(r)
 					return call
 				}
+				// `Type::NAME`, where the type has a constant of that name.
+				if self.typeConst(module, typeName, member, used) is .Some(value) {
+					if item.rest is .Some(r) then self.restWithoutStruct(r)
+					return value
+				}
+				// A struct or a built-in type has no variants to name.
+				if self.constOwnerNamed(module, typeName) is .Some(owner) && owner !is .Enum(..) {
+					self.noTypeMember(owner, member)
+					return self.giveUpItem(used)
+				}
 				self.variantLit(.Some((module, typeName)), member, used)
 			}
 			.Broken => {
@@ -820,6 +832,81 @@ extend Lowerer {
 			])
 		}
 		return .Some(diagnostic)
+	}
+
+	/// `Type::NAME`: a constant of the type, where it has one of that name.
+	var fn typeConst(
+		module: i64,
+		typeName: ast::Name,
+		member: ast::Name,
+		used: ItemUse,
+	): Option<ExprId> = {
+		val owner = self.constOwnerNamed(module, typeName)?
+		val id = self.program.typeConsts.get((owner, member.sym))?.clone()
+		self.program.names.push((typeName.span, .Owner(owner)))
+		val name = String::of(self.text(member.sym))
+		if !self.program.consts[id].isPub && self.program.consts[id].module != self.current as u32 {
+			self.report(
+				Diagnostic::error(
+					PRIVATE_ITEM,
+					"`\(name)` of `\(self.typeName(owner))` is not exported",
+					member.span,
+					"not `pub`",
+				).withNote("a constant of a type is used outside its module only if it is `pub`"),
+			)
+		}
+		if used.args.isSome() {
+			self.report(
+				Diagnostic::error(
+					NOT_CALLABLE,
+					"`\(name)` is a constant, not a function",
+					used.span,
+					"called here",
+				),
+			)
+			return .Some(self.giveUpItem(used))
+		}
+		val value = self.constUse(id, member.span)
+		return .Some(self.referent(value, used.hint, member.span))
+	}
+
+	/// Reports `Type::name` where the type, which is not an enum, has no
+	/// static function or constant of that name.
+	var fn noTypeMember(owner: TypeDef, member: ast::Name) = {
+		val typeName = self.typeName(owner)
+		val name = String::of(self.text(member.sym))
+		var candidates: Vec<str> = Vec()
+		for id in self.declaredMethods(owner) {
+			if self.program.fns[id].receiver == .Some(.Static) then
+				candidates.push(self.text(self.program.fns[id].name))
+		}
+		for i in 0..self.program.typeConsts.len() {
+			val (of, constant) = self.program.typeConsts.keyAt(i).clone()
+			if of == owner then candidates.push(self.text(constant))
+		}
+		var diagnostic = Diagnostic::error(
+			NOT_A_METHOD,
+			"`\(typeName)` has no static function or constant `\(name)`",
+			member.span,
+			"not a member of `\(typeName)`",
+		)
+		if suggest(name, &candidates) is .Some(similar) then
+			diagnostic = diagnostic.withFix(
+				"did you mean `\(similar)`?",
+				[Edit::replace(member.span, similar)],
+			)
+		self.report(diagnostic)
+	}
+
+	/// The type a path names before `::NAME`: a type of that module, or,
+	/// where the path named this module, the prelude's or a built-in one.
+	fn constOwnerNamed(module: i64, typeName: ast::Name): Option<TypeDef> = {
+		if self.modules[module].types.get(&typeName.sym) is .Some((owner, _)) then
+			return .Some(owner)
+		if self.moduleOf(module) != self.current then return .None
+		if self.preludeType(typeName.sym) is .Some(owner) then return .Some(owner)
+		val ty = self.builtin(typeName.sym)?
+		return .Some(.Builtin(BuiltinOwner::of(self.kind(ty))?))
 	}
 
 	/// A function named through its module: `io::print(1)`.

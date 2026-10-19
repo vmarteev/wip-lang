@@ -262,3 +262,60 @@ fn netAcceptsOnEightThreadsFromOneListener() = {
 		assert(answer == "got 5")
 	}
 }
+
+/// An event queue tells of a listener when a connection comes, of the
+/// connection when it can be read and written, and that it closed when the
+/// other end goes, each by the token it was added with; a wait with no time
+/// only looks.
+@test
+fn aQueueTellsWhatIsReady() = {
+	val listener = Listener::tcp(.Some("127.0.0.1"), 0).unwrap()
+	assert(listener.setBlocking(false).isOk())
+	var queue = io::EventQueue::new().unwrap()
+	assert(queue.add(listener.descriptor(), .Read, 7).isOk())
+	var events: Vec<io::Event> = Vec()
+	assert(queue.wait(.Some(Duration::millis(0)), &var events).isOk())
+	assert(events.isEmpty(), "nothing yet, and no waiting for it")
+
+	val client = Stream::tcp("127.0.0.1", portOf(&listener)).unwrap()
+	assert(queue.wait(.Some(Duration::seconds(5)), &var events).isOk())
+	assert(events.len() == 1 && events[0].token == 7 && events[0].readable, "a connection came")
+	val (served, _) = listener.accept().unwrap()
+	assert(queue.remove(listener.descriptor()).isOk())
+
+	assert(queue.add(served.descriptor(), .Both, 1 << 40).isOk())
+	assert(queue.wait(.Some(Duration::seconds(5)), &var events).isOk())
+	assert(events.len() == 1 && events[0].token == 1 << 40, "a token of any size comes back")
+	assert(events[0].writable && !events[0].readable, "room to write, nothing to read")
+
+	assert(queue.change(served.descriptor(), .Read, 2).isOk())
+	client.writeText("hi").unwrap()
+	assert(queue.wait(.Some(Duration::seconds(5)), &var events).isOk())
+	assert(events.len() == 1 && events[0].token == 2 && events[0].readable)
+	assert(!events[0].writable, "no longer waited for")
+	// Told while it is ready: nothing was read, so it is told again.
+	assert(queue.wait(.Some(Duration::millis(0)), &var events).isOk())
+	assert(events.len() == 1 && events[0].readable, "told again, unread")
+
+	var bytes: [u8; 8] = [0; 8]
+	assert(served.read(&var bytes) == .Ok(2))
+	destroy(client)
+	assert(queue.wait(.Some(Duration::seconds(5)), &var events).isOk())
+	assert(events.len() == 1 && events[0].closed, "the other end is gone")
+	assert(queue.remove(served.descriptor()).isOk())
+	assert(queue.wait(.Some(Duration::millis(0)), &var events).isOk() && events.isEmpty())
+}
+
+/// A wait that is given a time comes back once it has passed, telling of
+/// nothing.
+@test
+fn aQueueWaitsNoLongerThanItIsTold() = {
+	var queue = io::EventQueue::new().unwrap()
+	val listener = Listener::tcp(.Some("127.0.0.1"), 0).unwrap()
+	assert(queue.add(listener.descriptor(), .Read, 1).isOk())
+	var events: Vec<io::Event> = Vec()
+	val began = std::time::Instant::now()
+	assert(queue.wait(.Some(Duration::millis(30)), &var events).isOk())
+	assert(events.isEmpty())
+	assert(began.elapsed() >= Duration::millis(25), "it waited")
+}
