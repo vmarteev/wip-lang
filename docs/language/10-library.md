@@ -715,10 +715,10 @@ owned closure cannot hold a reference or a view, so nothing two threads
 could both reach is ever shared, and nothing needs a lock. A future that is
 dropped waits for its thread, so work never outlives what started it.
 
-## Work that borrows: `together`, `each`, `map` and `std::sync`
+## Work that borrows: `both`, `each`, `map` and `std::sync`
 
 Work may also borrow what is around it, where the call that runs it waits
-for it. `future::together(first, second)` runs `first` on
+for it. `future::both(first, second)` runs `first` on
 a thread of its own and `second` on this one, and answers both results
 once both are done; `future::each(items, work)` and `future::map(items,
 work)` split a slice among the processors, as many as `future::cores()`
@@ -748,7 +748,7 @@ fn sum(values: &[i64]): i64 = {
 
 fn main() = {
     val numbers = [1, 2, 3, 4, 5, 6, 7, 8]
-    val (low, high) = future::together(
+    val (low, high) = future::both(
         () => sum(&numbers[0..4]),
         () => sum(&numbers[4..]),
     )
@@ -764,7 +764,7 @@ fn main() = {
     assert(future::cores() >= 1)
 
     val names: Mutex<Vec<String>> = Mutex::of(Vec())
-    future::together(
+    future::both(
         () => names.lock((all) => all.push("ann")),
         () => names.lock((all) => all.push("bob")),
     )
@@ -818,7 +818,7 @@ extend Mailbox {
 
 fn main() = {
     val mailbox = Mailbox()
-    val (_, total) = future::together(
+    val (_, total) = future::both(
         () => {
             for i in 1..101 {
                 mailbox.send(i)
@@ -864,7 +864,7 @@ fn main() = {
     assert(mixer.pop() == .Some(String::of("coin")) && mixer.len() == 1)
 
     var (samples, played) = sync::ring<i64>(8)
-    val (_, total) = future::together(
+    val (_, total) = future::both(
         () => {
             for i in 1..1001 {
                 while samples.push(i).isErr() {}
@@ -1174,6 +1174,61 @@ fn main() = {
 }
 ```
 
+A server that starts as root takes what it needs of root's and then gives
+it up, and `std::process` has each step. `userId()` and `groupId()` are
+whom the program acts as, 0 for root; `std::users` finds a `User` or a
+`Group` by name or by number, `User::named("www")`, with its `id`, its
+group, its home and its shell, or nothing where the system has none.
+`fs::setOwner(path, user, group)` gives a file to them, and `fs::meta`
+says whose a file is, `meta.user` and `meta.group`; `fs::setMode(path,
+0o644)` sets its permission bits. `limit(resource)` and
+`setLimit(resource, limit)` read and set how much the program may hold —
+`.OpenFiles`, `.Processes`, `.CoreFile`, `.Stack` — as a `Limit` of what
+it holds to now, `current`, and the most it may raise that to, `most`,
+each nothing for no limit; any program may lower either, and only root
+raise the most.
+
+`fork()` copies the program: it answers `.Parent(child)` here, the copy
+a `Child` as a program started is, and `.Child` in the copy, which goes
+on from the same place. Only the thread that asks goes on in the copy,
+so a program forks before it starts any. `newGroup()` makes the program
+a group of its own, and `sendToGroup(signal)` passes a signal on to every
+process in it. Then, in the copy that will serve, `changeRoot(path)`
+makes a directory the program's `/`, moving into it, and
+`becomeUser(user, group)` goes on as that user of that group alone, for
+good, in the order that works; each is root's to do, and is refused
+otherwise with `.Denied`:
+
+```wip,run
+import std::fs
+import std::libc
+import std::process
+import std::process::{Resource}
+import std::users::{User}
+
+fn main() = {
+    val root = User::named("root").unwrap()
+    assert(root.id == 0 && User::withId(0).unwrap().name == "root")
+    val me = User::withId(process::userId()).unwrap()
+
+    val dir = fs::TempDir::new().unwrap()
+    val note = dir.join("note")
+    assert(fs::writeFile(&note, "x").isOk())
+    assert(fs::meta(&note).unwrap().user == me.id)
+    assert(fs::setMode(&note, 0o600).isOk())
+    assert(fs::meta(&note).unwrap().mode == 0o600)
+
+    val files = process::limit(Resource::OpenFiles).unwrap()
+    assert(process::setLimit(Resource::OpenFiles, files.clone()).isOk())
+
+    match process::fork().unwrap() {
+        .Parent(copy) => assert(copy.wait() == .Code(3))
+        .Child => libc::exitAtOnce(3)
+    }
+    if me.id != 0 then assert(process::becomeUser(0, 0) == .Err(.Denied))
+}
+```
+
 ## `std::collections`
 
 `Map<K, V>` and `Set<K>` keep what they hold in the order it went in, and
@@ -1363,15 +1418,15 @@ fn main() = {
     // Port 0: the system chooses one, and `localAddress` says which.
     val listener = Listener::tcp(.Some("127.0.0.1"), 0).unwrap()
     val .Ok(.V4(port: port, ..)) = listener.localAddress() else return
-    val (_, answer) = future::together(
+    val (_, answer) = future::both(
         () => {
-            val (stream, from) = listener.accept().unwrap()
+            var (stream, from) = listener.accept().unwrap()
             var request: [u8; 64] = [0; 64]
             val count = stream.read(&var request).unwrap()
             stream.writeText("got \(count) bytes from \(from.host())").unwrap()
         },
         () => {
-            val stream = Stream::tcp("127.0.0.1", port).unwrap()
+            var stream = Stream::tcp("127.0.0.1", port).unwrap()
             stream.writeText("hello").unwrap()
             var reply: [u8; 64] = [0; 64]
             val count = stream.read(&var reply).unwrap()
@@ -1383,14 +1438,18 @@ fn main() = {
 ```
 
 `Listener::tcp(.None, port)` listens on the loopback, and `"0.0.0.0"` or
-`"::"` on every address. `read` answers `0` once the other end has closed;
-`write` may write fewer bytes than it was given, and `writeAll` and
-`writeText` write them all. A write to a connection the other end has
+`"::"` on every address. `Stream::tcp` waits as long as the system does
+for a host to answer, and `Stream::tcpWithin(host, port, duration)` at
+most that long for each of its addresses, answering `.TimedOut`. A
+`Stream` is an `io::Read` and an `io::Write`: `read` answers `0` once the
+other end has closed, and `writeAll` and `writeText` write all they are
+given, each through `var`, as a file's do; `write` may write fewer
+bytes, and takes `&self`. A write to a connection the other end has
 closed answers `.BrokenPipe`, and no signal ends the program.
 `setBlocking(false)` makes `accept`, `read` and `write` answer
 `.WouldBlock` where they would wait, and `descriptor()` is the number an
-event queue watches. `accept`, `read` and
-`write` take `&self`, so several threads may accept from one listener.
+event queue watches. `accept` takes `&self`, so several threads may
+accept from one listener.
 
 An `io::EventQueue` serves many connections on one thread: it is given
 each descriptor a program waits on — a listener, its connections, a
@@ -1417,7 +1476,7 @@ fn main() = {
     assert(queue.add(listener.descriptor(), .Read, 0).isOk())
     var events: Vec<io::Event> = Vec()
 
-    val client = Stream::tcp("127.0.0.1", port).unwrap()
+    var client = Stream::tcp("127.0.0.1", port).unwrap()
     assert(queue.wait(.Some(Duration::seconds(5)), &var events).isOk())
     assert(events[0].token == 0 && events[0].readable) // a connection came
     val (served, _) = listener.accept().unwrap()
@@ -1428,6 +1487,105 @@ fn main() = {
     assert(events.len() == 1 && events[0].token == 1 && events[0].readable)
     assert(queue.wait(.Some(Duration::millis(0)), &var events).isOk())
     assert(events.len() == 1) // told again, while it is unread
+}
+```
+
+## HTTP: `std::http`
+
+`http::get(url)` fetches a URL and answers its `Response`: its `status`,
+its `headers`, its `body`, `text()` and `json<T>()`, and `header(name)`,
+which finds a header in any case. A status is an answer, not an error:
+a `404` is a `Response`, and an `HttpError` is what kept an answer from
+coming — a URL it cannot send to, the connection, TLS, a timeout, too
+many redirects, or an answer that is not HTTP.
+
+A `Client` sends any `Request` — `Request::get(url)`, `post`, `put`,
+`patch`, `delete`, `head`, each given `.header(name, value)` and a body
+of `.body(bytes)`, `.text(text)`, `.json(&value)` or `.file(path)` — and
+keeps a connection to each host between requests, follows redirects up
+to its `redirects`, ten unless set, and stops waiting after its
+`timeout`, where one is set. It asks for gzip, and undoes a body sent so.
+`https` is the system's TLS, which refuses a server whose certificate it
+does not trust; `Client::overUnix(path)` sends every request over one
+Unix-domain socket. `client.open(request)` answers once the status and
+the headers have come, with the body an `io::Read` that comes as it is
+read, so that a body larger than memory is never held whole;
+`client.upload(request, &var source)` sends a body read from any
+`io::Read` as it is sent:
+
+```wip,run
+import std::future
+import std::http::{Client, Request}
+import std::net::{Listener}
+
+fn main() = {
+    val listener = Listener::tcp(.Some("127.0.0.1"), 0).unwrap()
+    val .Ok(.V4(port: port, ..)) = listener.localAddress() else return
+    val (_, response) = future::both(
+        () => {
+            var (stream, _) = listener.accept().unwrap()
+            var room = [0 as u8; 4096]
+            stream.read(&var room).unwrap()
+            val reply =
+                "HTTP/1.1 201 Created\r\nContent-Length: 7\r\n\r\n[1,2,3]"
+            stream.writeText(reply).unwrap()
+        },
+        () => {
+            var client = Client()
+            val item = [1, 2, 3]
+            val url = "http://127.0.0.1:\(port)/items"
+            return client.send(Request::post(url).json(&item)).unwrap()
+        },
+    )
+    assert(response.status == 201 && response.isSuccess())
+    val numbers: Vec<i64> = response.json().unwrap()
+    assert(numbers == [1, 2, 3])
+}
+```
+
+`std::tls` is the connection under `https`, for any protocol: a
+`TlsStream::connect(host, port)` is an `io::Read` and an `io::Write`, the
+server's certificate checked against the system's roots and the host's
+name, and a `TlsError` says what refused it — the connection, the
+certificate, or the handshake. It is OpenSSL on Linux, and
+Network.framework on a Mac and iOS:
+
+```wip
+import std::io
+import std::tls::{TlsStream}
+
+fn firstLine(host: str): String = {
+    val .Ok(stream) = TlsStream::connect(host, 443) else return String()
+    var secure = stream
+    val request = "HEAD / HTTP/1.1\r\nHost: \(host)\r\nConnection: close\r\n\r\n"
+    if secure.writeAll(&request).isErr() then return String()
+    var room = [0 as u8; 64]
+    val got = secure.read(&var room).unwrapOr(0)
+    return String::of(str::fromBytes(&room[0..got]))
+}
+
+fn main() = io::println(firstLine("example.com"))
+```
+
+## Compression: `std::compress`
+
+`compress::gzip(bytes)` compresses as a `.gz` file holds, and
+`gunzip(bytes)` undoes it; `zlib` and `unzlib` are zlib's wrapping, which
+a PNG and HTTP's `deflate` hold, and `deflate` and `inflate` none. What
+cannot be undone answers a `CompressError`: cut short, or not the format.
+An `Inflater` and a `Deflater` take bytes in pieces, appending what each
+makes to a `Vec<u8>`, so that nothing larger than a piece is held. It is
+the system's zlib:
+
+```wip,run
+import std::compress
+
+fn main() = {
+    val text = "the same words, the same words, the same words"
+    val packed = compress::gzip(&text)
+    assert(packed[0] == 31 && packed[1] == 139)
+    assert(str::fromBytes(compress::gunzip(&packed).unwrap()) == text)
+    assert(compress::gunzip(&packed[0..10]).isErr())
 }
 ```
 
@@ -1608,6 +1766,46 @@ fn main() = {
 }
 ```
 
+## Bytes as text: `std::base64`, `std::hex` and `std::url`
+
+Bytes that must travel as text — in JSON, a header, a URL, a line a
+person copies — are written in one of three ways. `base64::encode(bytes)`
+writes each three bytes as four characters, as RFC 4648 has it, with
+`alphabet: .Url` for the alphabet a URL and a file name hold, and
+`padded: false` where a format leaves out the `=`; `base64::decode(text)`
+reads it, with its padding or without. `hex::encode(bytes)` writes two
+digits a byte, in lower case unless `upper: true`, and `hex::decode`
+reads either case. `url::encode(text)` writes every byte of `text` but
+letters, digits, `-`, `.`, `_` and `~` as `%` and two digits, so that it
+may stand in any part of a URL; what is passed as `keep` is left, a
+path's `/`. `url::decode` undoes it, and leaves a `+` as it is. Each
+decoding answers an error that says where the text went wrong:
+
+```wip,run
+import std::base64
+import std::base64::{Base64Error}
+import std::hex
+import std::url
+
+fn main() = {
+    val token = base64::encode("wip:secret")
+    assert(token == "d2lwOnNlY3JldA==")
+    val back = base64::decode(&token).unwrap()
+    assert(str::fromBytes(&back) == "wip:secret")
+    val ends = [251 as u8, 255]
+    assert(base64::encode(&ends, alphabet: .Url, padded: false) == "-_8")
+    assert(base64::decode("d2lw OnNl") == .Err(Base64Error::NotInAlphabet(4)))
+
+    assert(hex::encode([0 as u8, 15, 255]) == "000fff")
+    assert(hex::decode("CAFE").unwrap() == [202 as u8, 254])
+
+    val query = "q=\(url::encode("crème brûlée & tea"))"
+    assert(query == "q=cr%C3%A8me%20br%C3%BBl%C3%A9e%20%26%20tea")
+    assert(url::encode("/a b/c", keep: "/") == "/a%20b/c")
+    assert(url::decode("cr%C3%A8me") == .Ok(String::of("crème")))
+}
+```
+
 ## Files and directories
 
 `std::fs` reads and writes a whole file, lists a directory, and answers
@@ -1657,6 +1855,51 @@ still means what it did. Entries come in the order the filesystem gives
 them, without `.` and `..`, and sorting is the caller's. `realPath`
 answers where a path really is: absolute, with no `.`, `..` or link on the
 way.
+
+Bytes as they come are `std::io`'s two interfaces. `io::Read` is what
+bytes are read from: an open `File`, standard input and a program's output
+(`io::Reader`), a connection (`net::Stream`); its `read(&var into)` puts
+what comes next at the start of `into` and answers how many bytes, 0 only
+at the end. A `File` and an `io::Reader` read bytes from the same buffer
+they read lines from, so the two may follow each other. `io::Write` is
+what bytes are written to — a `File`, a connection, a program's input,
+and standard output and standard error as `io::stdout()` and
+`io::stderr()` give them, which write through the buffer `print` writes
+through, in order with it — and its `writeAll(bytes)` writes all of
+them, carrying on where a write was cut short. A function that reads or writes without knowing which
+takes a `&var dyn io::Read` or a `&var dyn io::Write`, and
+`io::copy(&var from, &var to)` writes everything one reads to the other,
+as it comes, and answers how many bytes:
+
+```wip,run
+import std::fs
+import std::io
+
+/// How many bytes are left to read, whatever they are read from.
+fn counted(from: &var dyn io::Read): i64 = {
+    var room = [0 as u8; 4]
+    var total = 0
+    while true {
+        val got = from.read(&var room).unwrap()
+        if got == 0 then break
+        total += got
+    }
+    return total
+}
+
+fn main() = {
+    val dir = fs::TempDir::new().unwrap()
+    var first = fs::File::create(dir.join("first")).unwrap()
+    assert(first.writeAll([1 as u8, 2, 3, 4, 5, 6, 7]).isOk())
+    var from = fs::File::open(dir.join("first")).unwrap()
+    var to = fs::File::create(dir.join("second")).unwrap()
+    assert(io::copy(&var from, &var to) == .Ok(7))
+    var again = fs::File::open(dir.join("second")).unwrap()
+    assert(counted(&var again) == 7)
+    var out = io::stdout()
+    assert(out.writeAll("done\n").isOk())
+}
+```
 
 `makeDirs` makes a directory and every one above it that is missing, with
 none an error where it is there already; `removeDir` removes an empty
@@ -1906,12 +2149,13 @@ fn main() = {
 | Module | What is in it |
 |---|---|
 | `std::args` | `Arguments`, `Argument` and `ArgumentError`: the program's arguments, read as options |
-| `std::io` | `print`, `println`, `printInt`, `eprintln`, `flush`, `stdin`, `Reader`, `env`, `isTerminal`, `IoError`, and `EventQueue` with its `Interest` and `Event` |
-| `std::fs` | whole files, written, read and replaced; reading a directory; what the filesystem says about a path; directories for a while |
-| `std::process` | `Command`, `Child` and `Exit`: other programs started and waited for; the program's own `currentDir`, `executable`, `besideProgram` and `id`; `Signals` and `Signal`: Ctrl-C and its like, caught |
+| `std::io` | `print`, `println`, `printInt`, `eprintln`, `flush`, `stdin`, `Reader`, `env`, `isTerminal`, `IoError`; `Read` and `Write`, what bytes are read from and written to, `copy`, and `stdout`, `stderr` and their `Printer`; and `EventQueue` with its `Interest` and `Event` |
+| `std::fs` | whole files, written, read and replaced; reading a directory; what the filesystem says about a path, its owner among it; a path's mode and owner set; directories for a while |
+| `std::process` | `Command`, `Child` and `Exit`: other programs started and waited for; the program's own `currentDir`, `setCurrentDir`, `executable`, `besideProgram` and `id`; `Signals` and `Signal`: Ctrl-C and its like, caught; `fork`, `newGroup` and `sendToGroup`; `userId`, `becomeUser` and `changeRoot`; `limit` and `setLimit` |
+| `std::users` | `User` and `Group`: the system's users and groups, found by name or by number |
 | `std::path` | a path joined, and taken apart: its name, parent, extension and stem |
 | `std::mem` | `replace`, a place's value taken out with another left in, and `swap`, two places' values exchanged |
-| `std::digest` | `sha256(bytes)`, the SHA-256 digest of bytes in hand, and `Sha256`, one written in pieces and then finished |
+| `std::digest` | `sha256(bytes)`, the SHA-256 digest of bytes in hand, and `Sha256`, one written in pieces and then finished; `crc32(bytes)` and `adler32(bytes)`, the checksums gzip, zip, PNG and zlib end their data with, and `Crc32` and `Adler32`, written in pieces and read after any |
 | `std::c` | a value lent to C as a callback's `void *`, and had back in the callback; `Pinned`, a value C holds until it lets go; a slice's address for C to read; C's `sizeof` and `_Alignof` |
 | `std::embed` | a file's bytes or text, read when the program is compiled, as a constant |
 | `std::watch` | `Watcher`: which files and directories changed, as the system tells |
@@ -1919,12 +2163,18 @@ fn main() = {
 | `std::shared` | `Shared<T>` and `Weak<T>`: a value several owners hold and read |
 | `std::random` | `Random`: numbers seeded or from the system, not for cryptography |
 | `std::net` | `Listener`, `Stream` and `Address`: TCP and Unix-domain connections |
+| `std::tls` | `TlsStream` and `TlsError`: a TLS connection, the server's certificate checked by the system |
+| `std::http` | `get`, `Client`, `Request`, `Response` and `Incoming`: HTTP/1.1 requests, a body read whole or as it comes, undone where it was sent gzipped, sent from bytes, a file or any `io::Read` |
+| `std::compress` | `gzip` and `gunzip`, `zlib` and `unzlib`, `deflate` and `inflate`, and `Inflater` and `Deflater` for bytes in pieces: deflate, through the system's zlib |
 | `std::math` | `PI`, `TAU` and `E`, and the vectors, matrices, rotations and shapes above; the functions are methods of `f64` and `f32`, `x.sin()`, written in Wip so that a `@comptime` constant computes the program's bits |
 | `std::text` | `ParseError`, and the `Split`, `Lines` and `Chars` types the prelude's methods answer |
 | `std::iter` | `Walk`, `Forwards`, `Backwards`, `Taking` (what a `Vec` gives up to `for x in move v`), and the adapter types `Mapped`, `Filtered`, `FilterMapped`, `FlatMapped`, `Chained`, `Enumerated`, `Taken`, `TakenWhile`, `Skipped`, `Zipped`, `Peekable` |
 | `std::collections` | `Map`, `Set`, `MapEntry`, `Deque`, `PriorityQueue`, and `Arena` with its `Handle`, `ArenaEntry` and `ArenaValues` |
 | `std::time` | `Duration`, a length of time; `Instant`, a moment on a clock that only goes forward; `sleep`; `FixedStep`, a game's updates at a steady rate; `now`, the date it is; `Utc`, a moment as a calendar has it, and `Local`, as it has it where the program runs |
-| `std::bytes` | `Reader` and `Writer`, numbers read from bytes and written to them in a known order, and a binary format for `Encode` and `Decode` |
+| `std::bytes` | numbers read and written at a place in bytes, `u32le` and `putU32le`; `Reader` and `Writer`, the same in turn; and a binary format for `Encode` and `Decode` |
+| `std::base64` | `encode` and `decode`, in the standard alphabet or the one for URLs, padded or not, and `Base64Error` |
+| `std::hex` | `encode` and `decode`, two digits a byte, and `HexError` |
+| `std::url` | `encode` and `decode`, percent-encoding for any part of a URL, and `UrlError` |
 | `std::libc` | the C library as std calls it: `printf`, `fwrite`, `stdout`, `read`, `open` and its flags, `getentropy`, `errno()` — C's, promising nothing C does not |
 
 ```wip,run
@@ -1941,6 +2191,8 @@ fn main() = {
     assert(mem::replace(&var state, "idle") == "reading" && state == "idle")
     val text = "abc"
     assert(digest::sha256(&text)[0] == 0xBA)
+    assert(digest::crc32(&text) == 0x352441C2)
+    assert(digest::adler32(&text) == 0x024D0127)
 }
 ```
 

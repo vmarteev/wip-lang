@@ -319,7 +319,13 @@ extend Parser {
 						if kind.isNone() then break
 					} else {
 						val .Some(name) = self.fieldName("a field name") else break
-						kind = .Some(.Field(base: e, name: name))
+						// `x.decode<T>(…)`: a method's type arguments.
+						var typeArgs: Option<TypeArgs> = .None
+						if self.methodTypeArgsAt(0) {
+							val (args, span) = self.typeArgList()
+							typeArgs = .Some(TypeArgs(after: 0, args: args, span: span))
+						}
+						kind = .Some(.Field(base: e, name: name, typeArgs: typeArgs))
 					}
 				}
 				next == .LParen && !self.lineBreak() => {
@@ -636,7 +642,11 @@ extend Parser {
 	var fn writtenAs(value: ExprId, written: Written): ExprId = {
 		val span = self.exprSpan(value)
 		val callee = self.allocExpr(
-			.Field(base: value, name: Name(sym: written.method, span: written.span)),
+			.Field(
+				base: value,
+				name: Name(sym: written.method, span: written.span),
+				typeArgs: .None,
+			),
 			span,
 		)
 		var args = Vec::of([written.value])
@@ -655,7 +665,11 @@ extend Parser {
 		val out = self.allocExpr(.Name(symbol: Symbol::text()), span)
 		val reference = self.allocExpr(.Unary(op: .RefVar, opSpan: span, operand: out), span)
 		val callee = self.allocExpr(
-			.Field(base: value, name: Name(sym: Symbol::appendFitted(), span: span)),
+			.Field(
+				base: value,
+				name: Name(sym: Symbol::appendFitted(), span: span),
+				typeArgs: .None,
+			),
 			span,
 		)
 		val [width, fill, align] = Symbol::fittingOptions()
@@ -696,7 +710,7 @@ extend Parser {
 		val out = self.allocExpr(.Name(symbol: Symbol::text()), span)
 		val reference = self.allocExpr(.Unary(op: .RefVar, opSpan: span, operand: out), span)
 		val callee = self.allocExpr(
-			.Field(base: value, name: Name(sym: Symbol::appendTo(), span: span)),
+			.Field(base: value, name: Name(sym: Symbol::appendTo(), span: span), typeArgs: .None),
 			span,
 		)
 		val call = self.allocExpr(
@@ -709,7 +723,10 @@ extend Parser {
 	/// `text#.name(arg)`.
 	var fn methodCall(name: Symbol, arg: ExprId, span: Span): ExprId = {
 		val receiver = self.allocExpr(.Name(symbol: Symbol::text()), span)
-		val callee = self.allocExpr(.Field(base: receiver, name: Name(sym: name, span: span)), span)
+		val callee = self.allocExpr(
+			.Field(base: receiver, name: Name(sym: name, span: span), typeArgs: .None),
+			span,
+		)
 		return self.allocExpr(.Call(callee: callee, args: [arg], names: [.None], rest: .None), span)
 	}
 
@@ -822,12 +839,34 @@ extend Parser {
 	/// cannot be ordered, neither functions nor types can be compared, and a
 	/// comparison needs a right operand.
 	var fn typeArgsAt(n: i64): bool = {
-		if self.nth(n) != .Lt then return false
+		val close = self.typeArgsEnd(n)
+		if close < 0 then return false
+		return match self.nth(close + 1) {
+			.LParen | .ColonColon => true
+			.LBrace => !self.noStruct && !self.lineBreakAt(close + 1)
+			.RParen | .Comma | .RBracket | .RBrace | .Semi | .Eof => true
+			_ => self.lineBreakAt(close + 1)
+		}
+	}
+
+	/// Whether the `<` `n` tokens ahead, after a method's name, starts its
+	/// type arguments: as `typeArgsAt` says, but only where the call's `(`
+	/// follows on the same line, since a method is not named as a value.
+	var fn methodTypeArgsAt(n: i64): bool = {
+		val close = self.typeArgsEnd(n)
+		return close >= 0 && self.nth(close + 1) == .LParen && !self.lineBreakAt(close + 1)
+	}
+
+	/// How many tokens ahead the `>` is that closes type arguments at the
+	/// `<` `n` tokens ahead, where the tokens between can be types; -1 where
+	/// they cannot, or the `<` is half of `<<`.
+	var fn typeArgsEnd(n: i64): i64 = {
+		if self.nth(n) != .Lt then return -1
 		// `<<` is a shift, whatever follows.
 		if self.pos + n + 1 < self.tokens.len() {
 			val open = self.tokens[self.pos + n]
 			val next = self.tokens[self.pos + n + 1]
-			if next.kind == .Lt && next.span.lo == open.span.hi then return false
+			if next.kind == .Lt && next.span.lo == open.span.hi then return -1
 		}
 		// Each token must be able to follow the one before it in a type, so
 		// that `a < xs[i], c > (d)` or `a < (b), c > (d)` stay comparisons.
@@ -867,7 +906,7 @@ extend Parser {
 			// type, so `Vec<(A, B)>` and `Map<(A, B), C>` read as types
 			// while `a < (b), c > (d)` stays a comparison.
 			fits = fits && (prev != .RParen || kind == .FatArrow || tuple)
-			if !fits then return false
+			if !fits then return -1
 			tuple = false
 			match kind {
 				.Lt => angles += 1
@@ -885,12 +924,7 @@ extend Parser {
 			prev = kind
 			i += 1
 		}
-		return match self.nth(i + 1) {
-			.LParen | .ColonColon => true
-			.LBrace => !self.noStruct && !self.lineBreakAt(i + 1)
-			.RParen | .Comma | .RBracket | .RBrace | .Semi | .Eof => true
-			_ => self.lineBreakAt(i + 1)
-		}
+		return i
 	}
 
 	/// A call's arguments, and its `..base`, which comes last and once.
@@ -1025,7 +1059,11 @@ extend Parser {
 				val whole = self.exprSpan(at).to(span)
 				at = self.allocExpr(made.clone(), whole)
 			}
-			kind = .Some(.Field(base: at, name: Name(sym: Symbol::tupleField(index), span: span)))
+			kind = .Some(.Field(
+				base: at,
+				name: Name(sym: Symbol::tupleField(index), span: span),
+				typeArgs: .None,
+			))
 		}
 		return kind
 	}

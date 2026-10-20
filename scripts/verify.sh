@@ -7,9 +7,15 @@
 # `tests/gate`, on the second. Prints ALL OK when they all pass, and how
 # long each step took, so that a run that has grown slower says where.
 #
-#   scripts/verify.sh              everything
+#   scripts/verify.sh              everything but the iOS simulator's check
+#   scripts/verify.sh --full       everything, as a release is checked
 #   scripts/verify.sh --fast       the language's own cases, and nothing else
 #   scripts/verify.sh --with WIP   stage 1 built by WIP
+#
+# The iOS simulator's check runs the library's tests and the cases again,
+# in the simulator, which takes minutes and finds what the Mac's run does
+# not only where iOS differs: a release runs it (scripts/publish.sh), and a
+# change to what iOS does asks for it.
 #
 # Stage 1 is built by the `wip` `--with` names, or by the one
 # `scripts/bootstrap.sh` builds from this system's seed, which is kept and
@@ -21,16 +27,18 @@
 set -uo pipefail
 cd "$(dirname "$0")/.." || exit 1
 fast=false
+full=false
 with=()
 while [ $# -gt 0 ]; do
     case $1 in
     --fast) fast=true ;;
+    --full) full=true ;;
     --with)
         with=(--with "$2")
         shift
         ;;
     *)
-        echo "usage: scripts/verify.sh [--fast] [--with WIP]" >&2
+        echo "usage: scripts/verify.sh [--fast] [--full] [--with WIP]" >&2
         exit 2
         ;;
     esac
@@ -182,7 +190,9 @@ fi
 # and what was found writes itself beside a snapshot that differs.
 if [ -x "$out/gate" ]; then
     step=$SECONDS
-    if "$out/gate" "$wip" </dev/null >"$out/checks" 2>&1; then
+    left=()
+    $full || left=(--except ios)
+    if "$out/gate" "$wip" "${left[@]+"${left[@]}"}" </dev/null >"$out/checks" 2>&1; then
         say "the gate's checks" "ok" $((SECONDS - step))
         sed 's/^/  /' "$out/checks"
     else

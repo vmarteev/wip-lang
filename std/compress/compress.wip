@@ -1,0 +1,299 @@
+// Compression: deflate, the format gzip, zlib, PNG and HTTP compress
+// with, in its three wrappings — gzip's, zlib's, and none — through the
+// system's zlib, which every system Wip targets has and keeps up to date.
+// Bytes in hand are compressed or undone in one call; bytes that come in
+// pieces go through an `Inflater` or a `Deflater`, which hold nothing
+// larger than a piece.
+//
+// zlib keeps its state beside a stream struct it points back to, so the
+// struct is on the heap, where it does not move, and the `Inflater` or
+// `Deflater` holds its address.
+
+import std::c
+import std::libc
+
+@link("z")
+extern "C" {
+	fn zlibVersion(): cstring
+	fn inflateInit2_(stream: ptr<ZStream>, windowBits: c_int, version: cstring, size: c_int): c_int
+	@symbol("inflate")
+	fn zInflate(stream: ptr<ZStream>, flush: c_int): c_int
+	fn inflateEnd(stream: ptr<ZStream>): c_int
+	fn deflateInit2_(
+		stream: ptr<ZStream>,
+		level: c_int,
+		method: c_int,
+		windowBits: c_int,
+		memLevel: c_int,
+		strategy: c_int,
+		version: cstring,
+		size: c_int,
+	): c_int
+	@symbol("deflate")
+	fn zDeflate(stream: ptr<ZStream>, flush: c_int): c_int
+	fn deflateEnd(stream: ptr<ZStream>): c_int
+}
+
+/// zlib's `z_stream`, the same on every 64-bit system Wip targets: where
+/// the input is and how much is left of it, where the output goes and how
+/// much room is left, and zlib's own.
+extern struct ZStream {
+	nextIn: ptr<u8>
+	availIn: u32
+	totalIn: u64
+	nextOut: ptr<u8>
+	availOut: u32
+	totalOut: u64
+	message: cstring
+	state: ptr<u8>
+	alloc: ptr<u8>
+	free: ptr<u8>
+	opaque: ptr<u8>
+	dataType: c_int
+	adler: u64
+	reserved: u64
+}
+
+val Z_OK: c_int = 0
+val Z_STREAM_END: c_int = 1
+val Z_NEED_DICT: c_int = 2
+val Z_BUF_ERROR: c_int = -5
+val Z_MEM_ERROR: c_int = -4
+val Z_NO_FLUSH: c_int = 0
+val Z_FINISH: c_int = 4
+val Z_DEFLATED: c_int = 8
+
+/// How compressed bytes are wrapped.
+@derive(Eq, Clone, Text)
+pub enum Format {
+	/// gzip's: a header, the compressed bytes, a CRC-32 and the length.
+	Gzip
+	/// zlib's: two bytes, the compressed bytes, an Adler-32; what HTTP calls
+	/// `deflate`, and what a PNG holds.
+	Zlib
+	/// No wrapping: the compressed bytes alone, as a zip file holds them.
+	Deflate
+}
+
+extend Format {
+	/// zlib's way of saying which: the window's size, 15, and gzip's or
+	/// none's mark on it.
+	fn windowBits(): c_int = match self {
+		.Gzip => 31
+		.Zlib => 15
+		.Deflate => -15
+	}
+}
+
+/// What compressed bytes could not be undone with, or compressing could
+/// not be done for.
+@derive(Eq, Clone)
+pub enum CompressError {
+	/// The bytes are not the format: zlib's reason.
+	Corrupt(reason: String)
+	/// The bytes end before the compressed stream does.
+	CutShort
+	/// zlib could not have the memory it asked for.
+	Memory
+}
+
+extend CompressError: Text {
+	fn toString(): String = match self {
+		.Corrupt(reason) => "not compressed data: \(reason)"
+		.CutShort => "compressed data cut short"
+		.Memory => "out of memory"
+	}
+}
+
+/// How much is undone or compressed at a time, into room of the call's own.
+val PIECE: i64 = 65536
+
+/// Undoes compressed bytes that come in pieces: each given, and what it
+/// makes appended to a `Vec<u8>`.
+pub struct Inflater {
+	stream: ptr<ZStream>
+	ended: bool = false
+}
+
+extend Inflater: Destroy {
+	var fn destroy() = {
+		inflateEnd(self.stream)
+		libc::free(self.stream as ptr<u8>)
+	}
+}
+
+extend Inflater {
+	/// One for bytes of `format`.
+	pub static fn of(format: Format): Result<Inflater, CompressError> = {
+		val stream = newStream()?
+		val got = inflateInit2_(stream, format.windowBits(), zlibVersion(), STREAM_SIZE)
+		if got != Z_OK {
+			libc::free(stream as ptr<u8>)
+			return .Err(
+				if got == Z_MEM_ERROR then .Memory
+				else .Corrupt(String::of("zlib refused to begin")),
+			)
+		}
+		return .Ok(Inflater(stream: stream))
+	}
+
+	/// `input` undone, after what was given before, and appended to
+	/// `output`; how many of its bytes were the stream's — fewer than all
+	/// where the stream ended within them.
+	pub var fn give(input: &[u8], output: &var Vec<u8>): Result<i64, CompressError> = {
+		if self.ended then return .Ok(0)
+		var room = [0 as u8; PIECE]
+		self.stream.nextIn = c::pointerTo<u8>(input)
+		self.stream.availIn = input.len() as u32
+		while true {
+			self.stream.nextOut = addressOf<u8>(&var room[0]) as ptr<u8>
+			self.stream.availOut = PIECE as u32
+			val got = zInflate(self.stream, Z_NO_FLUSH)
+			val made = PIECE - self.stream.availOut as i64
+			output.pushAll(&room[0..made])
+			if got == Z_STREAM_END {
+				self.ended = true
+				break
+			}
+			if got == Z_BUF_ERROR then break
+			if got != Z_OK then return .Err(failedWith(self.stream, got))
+			if self.stream.availIn == 0 && made < PIECE then break
+		}
+		return .Ok(input.len() - self.stream.availIn as i64)
+	}
+
+	/// Whether the compressed stream's end has come.
+	pub fn ended(): bool = self.ended
+}
+
+/// Compresses bytes that come in pieces: each given, what it makes
+/// appended to a `Vec<u8>`, then finished.
+pub struct Deflater {
+	stream: ptr<ZStream>
+}
+
+extend Deflater: Destroy {
+	var fn destroy() = {
+		deflateEnd(self.stream)
+		libc::free(self.stream as ptr<u8>)
+	}
+}
+
+extend Deflater {
+	/// One that writes `format`, at `level` from 0, which stores, to 9,
+	/// which compresses most; 6 is zlib's balance.
+	pub static fn of(format: Format, level: i64): Result<Deflater, CompressError> = {
+		val stream = newStream()?
+		val got = deflateInit2_(
+			stream,
+			level.max(0).min(9) as c_int,
+			Z_DEFLATED,
+			format.windowBits(),
+			8,
+			0,
+			zlibVersion(),
+			STREAM_SIZE,
+		)
+		if got != Z_OK {
+			libc::free(stream as ptr<u8>)
+			return .Err(
+				if got == Z_MEM_ERROR then .Memory
+				else .Corrupt(String::of("zlib refused to begin")),
+			)
+		}
+		return .Ok(Deflater(stream: stream))
+	}
+
+	/// `input`, compressed after what was given before, what it makes
+	/// appended to `output`.
+	pub var fn give(input: &[u8], output: &var Vec<u8>): Result<void, CompressError> = self.run(
+		input,
+		&var output,
+		Z_NO_FLUSH,
+	)
+
+	/// The end: what is held, and the format's trailer, appended.
+	pub move fn finish(output: &var Vec<u8>): Result<void, CompressError> = {
+		var deflater = self
+		val nothing = [0 as u8; 0]
+		return deflater.run(&nothing, &var output, Z_FINISH)
+	}
+
+	var fn run(input: &[u8], output: &var Vec<u8>, flush: c_int): Result<void, CompressError> = {
+		var room = [0 as u8; PIECE]
+		self.stream.nextIn = c::pointerTo<u8>(input)
+		self.stream.availIn = input.len() as u32
+		while true {
+			self.stream.nextOut = addressOf<u8>(&var room[0]) as ptr<u8>
+			self.stream.availOut = PIECE as u32
+			val got = zDeflate(self.stream, flush)
+			val made = PIECE - self.stream.availOut as i64
+			output.pushAll(&room[0..made])
+			if got == Z_STREAM_END then break
+			if got != Z_OK && got != Z_BUF_ERROR then return .Err(failedWith(self.stream, got))
+			if flush == Z_NO_FLUSH && self.stream.availIn == 0 && made < PIECE then break
+		}
+		return .Ok()
+	}
+}
+
+/// `bytes` compressed in `format`, at zlib's balance of size and time.
+fn compressed(bytes: &[u8], format: Format): Vec<u8> = {
+	var out: Vec<u8> = Vec()
+	val .Ok(deflater) = Deflater::of(format, 6) else panic("zlib has the memory to compress")
+	var running = deflater
+	running.give(bytes, &var out).unwrap()
+	running.finish(&var out).unwrap()
+	return out
+}
+
+/// `bytes` undone from `format`, which must be all of one stream.
+fn undone(bytes: &[u8], format: Format): Result<Vec<u8>, CompressError> = {
+	var inflater = Inflater::of(format)?
+	var out: Vec<u8> = Vec()
+	val used = inflater.give(bytes, &var out)?
+	if !inflater.ended() then return .Err(.CutShort)
+	if used != bytes.len() then
+		return .Err(.Corrupt(String::of("bytes after the end of the stream")))
+	return .Ok(out)
+}
+
+/// `bytes`, gzip's way: what a `.gz` file holds.
+pub fn gzip(bytes: &[u8]): Vec<u8> = compressed(bytes, .Gzip)
+
+/// A `.gz` file's bytes undone.
+pub fn gunzip(bytes: &[u8]): Result<Vec<u8>, CompressError> = undone(bytes, .Gzip)
+
+/// `bytes`, zlib's way.
+pub fn zlib(bytes: &[u8]): Vec<u8> = compressed(bytes, .Zlib)
+
+/// zlib's way undone.
+pub fn unzlib(bytes: &[u8]): Result<Vec<u8>, CompressError> = undone(bytes, .Zlib)
+
+/// `bytes` compressed with no wrapping.
+pub fn deflate(bytes: &[u8]): Vec<u8> = compressed(bytes, .Deflate)
+
+/// Compressed bytes with no wrapping, undone.
+pub fn inflate(bytes: &[u8]): Result<Vec<u8>, CompressError> = undone(bytes, .Deflate)
+
+/// How large a `z_stream` is, as zlib checks.
+val STREAM_SIZE: c_int = 112
+
+/// A stream struct on the heap, zeroed: zlib's allocator and the rest as
+/// zlib's defaults.
+fn newStream(): Result<ptr<ZStream>, CompressError> = {
+	val made = libc::calloc(1, STREAM_SIZE as size_t)
+	if made.isNull then return .Err(.Memory)
+	return .Ok(made as ptr<ZStream>)
+}
+
+/// What zlib said went wrong, with its message where it gave one.
+fn failedWith(stream: ptr<ZStream>, code: c_int): CompressError = {
+	if code == Z_MEM_ERROR then return .Memory
+	if code == Z_NEED_DICT then return .Corrupt(String::of("a dictionary is asked for"))
+	if stream.message.isNull then return .Corrupt("zlib error \(code)")
+	return .Corrupt(String::of(stream.message.toStr()))
+}
+
+@intrinsic
+fn addressOf<T>(value: &var T): ptr<void>

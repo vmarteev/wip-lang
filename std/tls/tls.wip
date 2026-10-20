@@ -1,0 +1,297 @@
+// TLS: a connection whose bytes no one between its ends can read or
+// change, to a server whose certificate the system trusts for the name
+// asked for. It is the system's own: OpenSSL on Linux, as every
+// distribution ships and updates it, and Network.framework on a Mac and
+// iOS. Nothing is left unchecked — a server's certificate that the system
+// does not trust, or that is not for the host, is refused — and a program
+// that must trust one adds it to the system, as any other program would.
+//
+// It is a module of its own because each system's TLS is a library of its
+// own, which a program that never makes a TLS connection does not link.
+
+import std::c
+import std::io
+import std::libc
+import std::net::{Stream}
+import std::time::{Duration, Instant}
+
+/// What kept a TLS connection from being made.
+@derive(Eq, Clone)
+pub enum TlsError {
+	/// The connection under it failed, or the host was not found.
+	Io(error: io::IoError)
+	/// The server's certificate is not one the system trusts, or not for
+	/// the host asked for.
+	Certificate(reason: String)
+	/// The two ends could not agree, or the server broke off.
+	Handshake(reason: String)
+}
+
+extend TlsError: Text {
+	fn toString(): String = match self {
+		.Io(error) => "\(error)"
+		.Certificate(reason) => "the server's certificate is refused: \(reason)"
+		.Handshake(reason) => "TLS failed: \(reason)"
+	}
+}
+
+/// A TLS connection to a server: an `io::Read` and an `io::Write`, as a
+/// `net::Stream` is.
+@target(os = "linux")
+pub struct TlsStream {
+	stream: Stream
+	ssl: ptr<u8>
+	context: ptr<u8>
+	/// How many milliseconds a read waits; -1 waits as long as it takes.
+	timeout: i64 = -1
+}
+
+extend TlsStream {
+	/// A TCP connection to `port` of `host`, and a TLS handshake over it.
+	pub static fn connect(host: str, port: u16): Result<TlsStream, TlsError> = connected(
+		host,
+		port,
+		.None,
+	)
+
+	/// The same, waiting at most `within` for the connection and its
+	/// handshake both; longer answers `.Io(.TimedOut)`.
+	pub static fn connectWithin(
+		host: str,
+		port: u16,
+		within: Duration,
+	): Result<TlsStream, TlsError> = connected(host, port, .Some(within))
+
+	/// How long a read waits for something to come before it answers
+	/// `.TimedOut`; nothing waits as long as it takes.
+	pub var fn setTimeout(length: Option<Duration>) = {
+		self.timeout = millisOf(length)
+	}
+}
+
+/// How many milliseconds `length` is, -1 for none.
+fn millisOf(length: Option<Duration>): i64 = match length {
+	.Some(length) => length.asMillis().max(0)
+	.None => -1
+}
+
+/// Whether `host` is an address written out, rather than a name: a name is
+/// what a certificate is checked against and what the server is told.
+fn isAddress(host: str): bool = {
+	if host.contains(":") then return true
+	for at in 0..host.len() {
+		val byte = host[at]
+		if byte != '.' as u8 && (byte < '0' as u8 || byte > '9' as u8) then return false
+	}
+	return !host.isEmpty()
+}
+
+// Linux: OpenSSL 3, over a `net::Stream`.
+
+@target(os = "linux")
+@link("ssl", "crypto")
+extern "C" {
+	fn TLS_client_method(): ptr<u8>
+	fn SSL_CTX_new(method: ptr<u8>): ptr<u8>
+	fn SSL_CTX_free(context: ptr<u8>)
+	fn SSL_CTX_set_default_verify_paths(context: ptr<u8>): c_int
+	fn SSL_CTX_set_verify(context: ptr<u8>, mode: c_int, callback: ptr<u8>)
+	fn SSL_CTX_set_options(context: ptr<u8>, options: u64): u64
+	fn SSL_new(context: ptr<u8>): ptr<u8>
+	fn SSL_free(ssl: ptr<u8>)
+	fn SSL_set_fd(ssl: ptr<u8>, fd: c_int): c_int
+	/// What `SSL_set_tlsext_host_name` is in C: the name a server is told.
+	fn SSL_ctrl(ssl: ptr<u8>, command: c_int, number: i64, name: cstring): i64
+	fn SSL_set1_host(ssl: ptr<u8>, host: cstring): c_int
+	fn SSL_get0_param(ssl: ptr<u8>): ptr<u8>
+	fn X509_VERIFY_PARAM_set1_ip_asc(parameters: ptr<u8>, address: cstring): c_int
+	fn SSL_connect(ssl: ptr<u8>): c_int
+	fn SSL_get_error(ssl: ptr<u8>, answer: c_int): c_int
+	fn SSL_get_verify_result(ssl: ptr<u8>): i64
+	fn X509_verify_cert_error_string(code: i64): cstring
+	fn ERR_get_error(): u64
+	fn ERR_error_string_n(code: u64, into: ptr<u8>, length: size_t)
+	fn ERR_clear_error()
+	fn SSL_read(ssl: ptr<u8>, into: ptr<u8>, count: c_int): c_int
+	fn SSL_write(ssl: ptr<u8>, bytes: ptr<u8>, count: c_int): c_int
+	fn SSL_pending(ssl: ptr<u8>): c_int
+	fn SSL_shutdown(ssl: ptr<u8>): c_int
+}
+
+@target(os = "linux")
+val SSL_VERIFY_PEER: c_int = 1
+@target(os = "linux")
+val SSL_CTRL_SET_TLSEXT_HOSTNAME: c_int = 55
+@target(os = "linux")
+val SSL_OP_IGNORE_UNEXPECTED_EOF: u64 = 128
+@target(os = "linux")
+val SSL_ERROR_SSL: c_int = 1
+@target(os = "linux")
+val SSL_ERROR_WANT_READ: c_int = 2
+@target(os = "linux")
+val SSL_ERROR_WANT_WRITE: c_int = 3
+@target(os = "linux")
+val SSL_ERROR_SYSCALL: c_int = 5
+@target(os = "linux")
+val SSL_ERROR_ZERO_RETURN: c_int = 6
+@target(os = "linux")
+val X509_V_OK: i64 = 0
+
+@target(os = "linux")
+fn connected(host: str, port: u16, within: Option<Duration>): Result<TlsStream, TlsError> = {
+	val started = Instant::now()
+	val opened = match within {
+		.Some(length) => Stream::tcpWithin(host, port, length)
+		.None => Stream::tcp(host, port)
+	}
+	var stream = match move opened {
+		.Ok(stream) => stream
+		.Err(error) => return .Err(.Io(error))
+	}
+	val context = SSL_CTX_new(TLS_client_method())
+	if context.isNull then return .Err(.Handshake(lastSslError()))
+	SSL_CTX_set_default_verify_paths(context)
+	SSL_CTX_set_verify(context, SSL_VERIFY_PEER, null)
+	SSL_CTX_set_options(context, SSL_OP_IGNORE_UNEXPECTED_EOF)
+	val ssl = SSL_new(context)
+	if ssl.isNull {
+		SSL_CTX_free(context)
+		return .Err(.Handshake(lastSslError()))
+	}
+	var tls = TlsStream(stream: stream, ssl: ssl, context: context, timeout: millisOf(within))
+	SSL_set_fd(ssl, tls.stream.descriptor())
+	var name = String::of(host)
+	if isAddress(host) then X509_VERIFY_PARAM_set1_ip_asc(SSL_get0_param(ssl), name.toCstring()) else {
+		SSL_ctrl(ssl, SSL_CTRL_SET_TLSEXT_HOSTNAME, 0, name.toCstring())
+		SSL_set1_host(ssl, name.toCstring())
+	}
+	// With a time to keep to, the handshake does not block: it stops where
+	// it waits for the server, and waits as long as is left. Without one,
+	// it stops only where it failed.
+	val timed = within.isSome()
+	if timed then tls.stream.setBlocking(false).mapErr((error) => TlsError::Io(error))?
+	ERR_clear_error()
+	while true {
+		val answer = quietly(() => SSL_connect(ssl))
+		if answer == 1 then break
+		val kind = SSL_get_error(ssl, answer)
+		if timed && (kind == SSL_ERROR_WANT_READ || kind == SSL_ERROR_WANT_WRITE) {
+			val left = millisOf(within) - started.elapsed().asMillis()
+			if left <= 0 then return .Err(.Io(.TimedOut))
+			val events = if kind == SSL_ERROR_WANT_READ then libc::POLLIN else libc::POLLOUT
+			var fds = [libc::PollFd(fd: tls.stream.descriptor(), events: events, answered: 0)]
+			val ready = libc::poll(&var fds, left as c_int)
+			if ready == 0 then return .Err(.Io(.TimedOut))
+			if ready < 0 && io::lastError() != .Interrupted then return .Err(.Io(io::lastError()))
+			continue
+		}
+		val verified = SSL_get_verify_result(ssl)
+		if verified != X509_V_OK then
+			return .Err(.Certificate(String::of(X509_verify_cert_error_string(verified).toStr())))
+		if kind == SSL_ERROR_SYSCALL then return .Err(.Io(io::lastError()))
+		return .Err(.Handshake(lastSslError()))
+	}
+	if timed then tls.stream.setBlocking(true).mapErr((error) => TlsError::Io(error))?
+	return .Ok(tls)
+}
+
+/// What OpenSSL answers for `call`, which may write to the socket: with
+/// `SIGPIPE` held back, which Linux raises in the thread that writes to a
+/// connection the server has closed, and which would end the program; the
+/// write answers `EPIPE` instead. The error the call left is kept.
+@target(os = "linux")
+fn quietly(call: &() => c_int): c_int = {
+	val held = libc::holdPipeSignal()
+	val answer = call()
+	val error = libc::errno()
+	libc::releasePipeSignal(&held)
+	libc::errnoAt()[0] = error
+	return answer
+}
+
+/// What OpenSSL last said went wrong.
+@target(os = "linux")
+fn lastSslError(): String = {
+	val code = ERR_get_error()
+	if code == 0 then return String::of("the connection ended")
+	var room = [0 as u8; 256]
+	ERR_error_string_n(code, addressOf<u8>(&var room[0]) as ptr<u8>, 256)
+	val zero: u8 = 0
+	val end = room.indexOf(&zero).unwrapOr(256)
+	return String::of(str::fromBytes(&room[0..end]))
+}
+
+@target(os = "linux")
+extend TlsStream {
+	/// Waits, as long as the timeout says, for bytes to read: OpenSSL may
+	/// hold some already, read from the socket with a record before them.
+	fn waitReadable(): Result<void, io::IoError> = {
+		if self.timeout < 0 || SSL_pending(self.ssl) > 0 then return .Ok()
+		var fds = [libc::PollFd(fd: self.stream.descriptor(), events: libc::POLLIN, answered: 0)]
+		while true {
+			val ready = libc::poll(&var fds, self.timeout as c_int)
+			if ready > 0 then return .Ok()
+			if ready == 0 then return .Err(.TimedOut)
+			if io::lastError() != .Interrupted then return .Err(io::lastError())
+		}
+		return .Ok()
+	}
+}
+
+@target(os = "linux")
+extend TlsStream: io::Read {
+	var fn read(into: &var [u8]): Result<i64, io::IoError> = {
+		if into.isEmpty() then return .Ok(0)
+		self.waitReadable()?
+		ERR_clear_error()
+		val count = into.len().min(0x7FFFFFFF) as c_int
+		val ssl = self.ssl
+		val room = addressOf<u8>(&var into[0]) as ptr<u8>
+		val got = quietly(() => SSL_read(ssl, room, count))
+		if got > 0 then return .Ok(got as i64)
+		val kind = SSL_get_error(self.ssl, got)
+		if kind == SSL_ERROR_ZERO_RETURN then return .Ok(0)
+		// A socket that ended with no word from TLS is an end too, as
+		// servers often close.
+		if kind == SSL_ERROR_SYSCALL {
+			if libc::errno() == 0 then return .Ok(0)
+			return .Err(io::lastError())
+		}
+		return .Err(.InvalidData)
+	}
+}
+
+@target(os = "linux")
+extend TlsStream: io::Write {
+	var fn writeAll(bytes: &[u8]): Result<void, io::IoError> = {
+		var at = 0
+		while at < bytes.len() {
+			ERR_clear_error()
+			val count = (bytes.len() - at).min(0x7FFFFFFF) as c_int
+			val ssl = self.ssl
+			val from = c::pointerTo<u8>(&bytes[at..]) as ptr<u8>
+			val put = quietly(() => SSL_write(ssl, from, count))
+			if put > 0 {
+				at += put as i64
+				continue
+			}
+			val kind = SSL_get_error(self.ssl, put)
+			if kind == SSL_ERROR_SYSCALL then return .Err(io::lastError())
+			return .Err(.BrokenPipe)
+		}
+		return .Ok()
+	}
+}
+
+@target(os = "linux")
+extend TlsStream: Destroy {
+	var fn destroy() = {
+		val ssl = self.ssl
+		quietly(() => SSL_shutdown(ssl))
+		SSL_free(self.ssl)
+		SSL_CTX_free(self.context)
+	}
+}
+
+@intrinsic
+fn addressOf<T>(value: &var T): ptr<void>

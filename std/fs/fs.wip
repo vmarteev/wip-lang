@@ -19,6 +19,28 @@ extend File: Destroy {
 	}
 }
 
+// Bytes as they come, from the same buffer lines are read from.
+extend File: io::Read {
+	var fn read(into: &var [u8]): Result<i64, io::IoError> = self.reader.read(&var into)
+}
+
+extend File: io::Write {
+	var fn writeAll(bytes: &[u8]): Result<void, io::IoError> = {
+		val fd = io::descriptorOf(&self.reader)
+		var start = 0
+		while start < bytes.len() {
+			val put = libc::write(fd, &bytes[start..bytes.len()])
+			if put < 0 {
+				// Cut short by a signal, which is tried again.
+				if io::lastError() == .Interrupted then continue
+				return .Err(io::lastError())
+			}
+			start += put
+		}
+		return .Ok()
+	}
+}
+
 /// How a file is opened.
 enum Opening {
 	/// An existing file, to read.
@@ -61,25 +83,8 @@ extend File {
 	/// The rest of the file, appended. What comes back is how many bytes.
 	pub var fn readAll(into: &var String): Result<i64, io::IoError> = self.reader.readAll(&var into)
 
-	/// The text, all of it: a write cut short is carried on with, since a
-	/// caller that has to loop for itself will one day forget.
-	pub var fn write(text: str): Result<void, io::IoError> = self.writeBytes(&text)
-
-	/// The same, for bytes that are not text.
-	pub var fn writeBytes(bytes: &[u8]): Result<void, io::IoError> = {
-		val fd = io::descriptorOf(&self.reader)
-		var start = 0
-		while start < bytes.len() {
-			val put = libc::write(fd, &bytes[start..bytes.len()])
-			if put < 0 {
-				// Cut short by a signal, which is tried again.
-				if io::lastError() == .Interrupted then continue
-				return .Err(io::lastError())
-			}
-			start += put
-		}
-		return .Ok()
-	}
+	/// The text, all of it, as `writeAll` writes bytes.
+	pub var fn write(text: str): Result<void, io::IoError> = self.writeAll(&text)
 
 	/// What was written handed to the disk, C's `fsync`: there before
 	/// anything done after it, a rename among them.
@@ -137,7 +142,7 @@ pub fn writeFile(path: str, text: str): Result<void, io::IoError> = writeBytes(p
 /// picture, a sound.
 pub fn writeBytes(path: str, bytes: &[u8]): Result<void, io::IoError> = {
 	var file = File::create(path)?
-	file.writeBytes(&bytes)?
+	file.writeAll(&bytes)?
 	return .Ok()
 }
 
@@ -195,7 +200,7 @@ fn placed(
 /// `mode` where there is one.
 fn filled(file: File, path: str, bytes: &[u8], mode: Option<i64>): Result<void, io::IoError> = {
 	var open = file
-	open.writeBytes(&bytes)?
+	open.writeAll(&bytes)?
 	open.sync()?
 	if mode is .Some(bits) {
 		var name = String::of(path)
@@ -266,6 +271,10 @@ pub struct Meta {
 	pub modifiedNanos: i64
 	/// The permission bits, as `chmod` writes them: `0o755`.
 	pub mode: i64
+	/// The number of the user who owns it, as `users::User` has it.
+	pub user: u32
+	/// The number of its group.
+	pub group: u32
 	/// The filesystem it is on, as the system numbers it.
 	pub device: i64
 	/// Its number on that filesystem. `device` and `inode` together are
@@ -302,6 +311,23 @@ pub fn meta(path: str): Result<Meta, io::IoError> = metaOf(path, true)
 
 /// The same, about the link itself rather than what it points at.
 pub fn linkMeta(path: str): Result<Meta, io::IoError> = metaOf(path, false)
+
+/// Sets the permission bits of `path`, as `chmod` writes them: `0o644`.
+/// Its owner may, and root.
+pub fn setMode(path: str, mode: i64): Result<void, io::IoError> = {
+	var name = String::of(path)
+	if libc::chmod(name.toCstring(), mode as c_uint) != 0 then return .Err(io::lastError())
+	return .Ok()
+}
+
+/// Gives `path` to the user numbered `user`, in the group numbered `group`,
+/// as `users::User` and `users::Group` number them. Root may give it to
+/// anyone; its owner may only change its group to one of its own.
+pub fn setOwner(path: str, user: u32, group: u32): Result<void, io::IoError> = {
+	var name = String::of(path)
+	if libc::chown(name.toCstring(), user, group) != 0 then return .Err(io::lastError())
+	return .Ok()
+}
 
 /// Whether there is anything at `path`.
 pub fn exists(path: str): bool = meta(path).isOk()
@@ -428,7 +454,7 @@ pub fn copy(from: str, to: str): Result<i64, io::IoError> = {
 	while true {
 		val got = source.readAt(copied, &var block.items())?
 		if got == 0 then break
-		target.writeBytes(&block[0..got])?
+		target.writeAll(&block[0..got])?
 		copied += got
 	}
 	var name = String::of(to)
@@ -519,6 +545,8 @@ fn metaOf(path: str, following: bool): Result<Meta, io::IoError> = {
 		modified: stated.modified,
 		modifiedNanos: stated.modifiedNanos,
 		mode: mode & 0o7777,
+		user: stated.user,
+		group: stated.group,
 		device: stated.device,
 		inode: stated.inode,
 	))
@@ -529,6 +557,8 @@ fn metaOf(path: str, following: bool): Result<Meta, io::IoError> = {
 /// file it is.
 struct Stated {
 	mode: i64
+	user: u32
+	group: u32
 	size: i64
 	modified: i64
 	modifiedNanos: i64
@@ -639,6 +669,8 @@ fn statInto(call: &(info: ptr<Stat>) => c_int): Result<Stated, io::IoError> = {
 		if got == 0 then
 			.Ok(Stated(
 				mode: info.mode,
+				user: info.user,
+				group: info.group,
 				size: info.size,
 				modified: info.modified[0],
 				modifiedNanos: info.modified[1],
@@ -731,6 +763,8 @@ fn statInto(call: &(info: ptr<Statx>) => c_int): Result<Stated, io::IoError> = {
 		if got == 0 then
 			.Ok(Stated(
 				mode: info.mode as i64,
+				user: info.user,
+				group: info.group,
 				size: info.size as i64,
 				modified: info.modified[0],
 				modifiedNanos: info.modified[1],

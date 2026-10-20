@@ -1,0 +1,97 @@
+// `io::Read` and `io::Write`: a file, a connection, a program's input and
+// output, each read or written through the interface without knowing which
+// it is; bytes and lines read one after the other from one buffer; and
+// `io::copy` between any two.
+
+import std::fs
+import std::future
+import std::io
+import std::net::{Address, Listener, Stream}
+import std::process::{Command}
+
+/// Everything `from` reads, a few bytes at a time.
+fn drained(from: &var dyn io::Read): Vec<u8> = {
+	var room = [0 as u8; 3]
+	var all: Vec<u8> = Vec()
+	while true {
+		val got = from.read(&var room).unwrap()
+		if got == 0 then break
+		all.pushAll(&room[0..got])
+	}
+	return all
+}
+
+/// `bytes` written to `to`, whatever it is.
+fn writeTo(to: &var dyn io::Write, bytes: &[u8]): Result<void, io::IoError> = to.writeAll(bytes)
+
+@test
+fn aFileIsWrittenAndReadThroughTheInterfaces() = {
+	val dir = fs::TempDir::new().unwrap()
+	var file = fs::File::create(dir.join("bytes")).unwrap()
+	assert(writeTo(&var file, [1 as u8, 2, 3, 4, 5, 6, 7, 8]).isOk())
+	var again = fs::File::open(dir.join("bytes")).unwrap()
+	assert(drained(&var again) == [1 as u8, 2, 3, 4, 5, 6, 7, 8])
+	var nothing = [0 as u8; 0]
+	assert(again.read(&var nothing) == .Ok(0), "nothing asked for, nothing read")
+}
+
+@test
+fn bytesAndLinesFollowEachOther() = {
+	val dir = fs::TempDir::new().unwrap()
+	assert(fs::writeFile(dir.join("mixed"), "ab\ncd\nef").isOk())
+	var file = fs::File::open(dir.join("mixed")).unwrap()
+	var line = String()
+	assert(file.readLine(&var line) == .Ok(true) && line == "ab")
+	var two = [0 as u8; 2]
+	assert(file.read(&var two) == .Ok(2) && str::fromBytes(&two) == "cd")
+	line.clear()
+	assert(file.readLine(&var line) == .Ok(true) && line == "", "the rest of the line `cd` was on")
+	assert(str::fromBytes(drained(&var file)) == "ef")
+}
+
+@test
+fn aCopyGoesThroughAConnectionAndBack() = {
+	val dir = fs::TempDir::new().unwrap()
+	var made = fs::File::create(dir.join("from")).unwrap()
+	var bytes: Vec<u8> = Vec()
+	for i in 0..200000 {
+		bytes.push((i * 7919 % 251) as u8)
+	}
+	assert(made.writeAll(&bytes).isOk())
+	val listener = Listener::tcp(.Some("127.0.0.1"), 0).unwrap()
+	val .Ok(.V4(port: port, ..)) = listener.localAddress() else panic("an IPv4 address")
+	val (sent, received) = future::both(
+		() => {
+			var (stream, _) = listener.accept().unwrap()
+			var from = fs::File::open(dir.join("from")).unwrap()
+			val count = io::copy(&var from, &var stream).unwrap()
+			stream.shutdown().unwrap()
+			return count
+		},
+		() => {
+			var stream = Stream::tcp("127.0.0.1", port).unwrap()
+			var to = fs::File::create(dir.join("to")).unwrap()
+			return io::copy(&var stream, &var to).unwrap()
+		},
+	)
+	assert(sent == 200000 && received == 200000)
+	assert(fs::readBytes(dir.join("to")).unwrap() == bytes)
+}
+
+/// It starts a program, which iOS does not.
+@target(os = "macos")
+@target(os = "linux")
+@test
+fn aProgramIsWrittenToAndReadFromThroughTheInterfaces() = {
+	var cat = Command::of("cat").connect().unwrap()
+	val text = "through cat"
+	assert(writeTo(&var cat, &text).isOk())
+	cat.closeInput()
+	assert(str::fromBytes(drained(&var cat.output())) == "through cat")
+}
+
+@test
+fn theNewFailuresSayWhatTheyAre() = {
+	assert("\(io::IoError::InvalidData)" == "invalid data")
+	assert("\(io::IoError::TimedOut)" == "timed out")
+}

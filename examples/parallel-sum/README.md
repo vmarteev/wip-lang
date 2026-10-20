@@ -13,7 +13,7 @@ What it shows:
 
 - **`future::map`:** each part on a thread of its own, their answers in
   a `Vec`, in order.
-- **`future::together`:** two pieces of work at once, both answers back.
+- **`future::both`:** two pieces of work at once, both answers back.
 - **`future::each` with an `Atomic`:** every thread adds to one total,
   through a `&`, without a lock.
 - **Threads that borrow.** Each call waits for its threads before it

@@ -82,6 +82,11 @@ pub enum IoError {
 	NotConnected
 	/// What was asked is not something this system does.
 	Unsupported
+	/// What was read is not what it should be: a part of a format that is
+	/// not the format.
+	InvalidData
+	/// Nothing came within the time given.
+	TimedOut
 	Other(code: i32)
 }
 
@@ -98,6 +103,8 @@ extend IoError: Text {
 		.BrokenPipe => "broken pipe"
 		.NotConnected => "not connected"
 		.Unsupported => "not supported on this system"
+		.InvalidData => "invalid data"
+		.TimedOut => "timed out"
 		.Other(code) => "input or output failed, error \(code)"
 	}
 }
@@ -108,7 +115,7 @@ extend IoError: Text {
 pub fn lastError(): IoError = {
 	val code = libc::errno()
 	if code == libc::ENOENT then return .NotFound
-	if code == libc::EACCES then return .Denied
+	if code == libc::EACCES || code == libc::EPERM then return .Denied
 	if code == libc::EEXIST then return .AlreadyExists
 	if code == libc::EINTR then return .Interrupted
 	if code == libc::EAGAIN then return .WouldBlock
@@ -117,7 +124,66 @@ pub fn lastError(): IoError = {
 	if code == libc::ECONNRESET then return .ConnectionReset
 	if code == libc::EPIPE then return .BrokenPipe
 	if code == libc::ENOTCONN then return .NotConnected
+	if code == libc::ETIMEDOUT then return .TimedOut
 	return .Other(code)
+}
+
+/// What bytes are read from, whichever it is: a file, standard input, a
+/// connection, a response's body. A program that reads without knowing
+/// which takes a `&var dyn Read`.
+pub interface Read {
+	/// What comes next, put from the start of `into`: how many bytes, at
+	/// most its length, and 0 only at the end, or where `into` holds none.
+	var fn read(into: &var [u8]): Result<i64, IoError>
+}
+
+/// What bytes are written to, whichever it is: a file, a connection, a
+/// program's input.
+pub interface Write {
+	/// All of `bytes`: a write cut short is carried on with, since a caller
+	/// that has to loop for itself will one day forget.
+	var fn writeAll(bytes: &[u8]): Result<void, IoError>
+}
+
+/// Everything `from` reads, written to `to` as it comes, through a buffer
+/// of its own, until `from` ends; and how many bytes. What either fails
+/// with ends it.
+pub fn copy(from: &var dyn Read, to: &var dyn Write): Result<i64, IoError> = {
+	var room = [0 as u8; 65536]
+	var total = 0
+	while true {
+		val got = from.read(&var room)?
+		if got == 0 then break
+		to.writeAll(&room[0..got])?
+		total += got
+	}
+	return .Ok(total)
+}
+
+/// Standard output or standard error, written to as a `Write`: through the
+/// buffer `print` writes through, or as `eprint` writes, standard output
+/// emptied first, so that what is written arrives in order with what is
+/// printed. It owns nothing, so nothing is closed where it ends.
+pub struct Printer {
+	errors: bool
+}
+
+/// Standard output, as a `Write`, which `io::copy` writes a body to as it
+/// comes, or a function that takes any `&var dyn Write`.
+pub fn stdout(): Printer = Printer(errors: false)
+
+/// Standard error, as a `Write`.
+pub fn stderr(): Printer = Printer(errors: true)
+
+extend Printer: Write {
+	var fn writeAll(bytes: &[u8]): Result<void, IoError> = {
+		if bytes.isEmpty() then return .Ok()
+		if self.errors then libc::fflush(libc::stdout)
+		val stream = if self.errors then libc::stderr else libc::stdout
+		// The bytes cross as their pointer and their length: one of them.
+		val wrote = libc::fwriteBytes(bytes, 1, stream)
+		return if wrote == 1 then .Ok() else .Err(lastError())
+	}
 }
 
 /// A descriptor, and the bytes read from it but not yet given out.
@@ -146,6 +212,30 @@ pub fn reader(fd: i32): Reader = Reader(fd: fd, held: Vec(), given: 0, ended: fa
 
 /// The descriptor a reader reads from, for the module that owns it.
 pub fn descriptorOf(reader: &Reader): i32 = reader.fd
+
+// Bytes as they come: what is held first, then straight from the
+// descriptor into what the caller lends, so that a large read is not
+// copied twice. Bytes and lines may be read one after the other.
+extend Reader: Read {
+	var fn read(into: &var [u8]): Result<i64, IoError> = {
+		if into.isEmpty() then return .Ok(0)
+		if self.given < self.held.len() {
+			val count = (self.held.len() - self.given).min(into.len())
+			into[0..count].copyFrom(&self.held.items()[self.given..self.given + count])
+			self.given += count
+			return .Ok(count)
+		}
+		if self.ended then return .Ok(0)
+		if self.timeout >= 0 && !self.ready()? then return .Err(.WouldBlock)
+		var got = libc::read(self.fd, &var into)
+		while got < 0 && lastError() == .Interrupted {
+			got = libc::read(self.fd, &var into)
+		}
+		if got < 0 then return .Err(lastError())
+		if got == 0 then self.ended = true
+		return .Ok(got as i64)
+	}
+}
 
 extend Reader {
 	/// How long a read waits for something to come before it answers

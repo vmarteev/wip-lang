@@ -26,9 +26,6 @@ import std::libc::{
 	PollFd,
 	Pipe,
 	SIGKILL,
-	SIGPIPE,
-	SIG_BLOCK,
-	SIG_SETMASK,
 	WNOHANG,
 	calloc,
 	close,
@@ -41,6 +38,7 @@ import std::libc::{
 	getcwd,
 	getpid,
 	hidden,
+	holdPipeSignal,
 	kill,
 	malloc,
 	pipe,
@@ -54,14 +52,11 @@ import std::libc::{
 	posix_spawnp,
 	pthread_create,
 	pthread_detach,
-	pthread_sigmask,
 	read,
 	realpath,
+	releasePipeSignal,
 	sigaddset,
 	sigemptyset,
-	sigismember,
-	sigpending,
-	sigwait,
 	strlen,
 	waitpid,
 	write
@@ -307,6 +302,7 @@ extend Command {
 				free(envp as ptr<u8>)
 				return .Err(failed)
 			}
+			quietEnd(input.writing)
 			posix_spawn_file_actions_adddup2(&var actions, input.reading, 0)
 			posix_spawn_file_actions_addclose(&var actions, input.reading)
 			posix_spawn_file_actions_addclose(&var actions, input.writing)
@@ -461,6 +457,19 @@ fn openedPipe(ends: &var Pipe): c_int = {
 	return made
 }
 
+/// The writing end of the pipe to a program's input, made to answer
+/// `EPIPE` once the program stops reading rather than raise `SIGPIPE`,
+/// which would end this program. A Mac raises it for the whole process,
+/// where any thread that does not hold it back takes it, so the descriptor
+/// itself is told; Linux raises it in the thread that wrote, which holds it
+/// back while it writes.
+@target(vendor = "apple")
+fn quietEnd(writing: c_int) = {
+	fcntl(writing, libc::F_SETNOSIGPIPE, 1)
+}
+@target(os = "linux")
+fn quietEnd(writing: c_int) = {}
+
 /// Starts the program: on Linux, as `posix_spawnp` does, each descriptor
 /// this program opened marked to be closed in it.
 @target(os = "linux")
@@ -557,35 +566,6 @@ fn writeSome(input: &var i64, text: str, written: &var i64) = {
 		closeEnd(input as c_int)
 		input = -1
 	}
-}
-
-// Holds back `SIGPIPE` on this thread, which a write to a pipe no one
-// reads raises and which would end the program: the write answers `EPIPE`
-// instead. The signals held back before, to be put back.
-fn holdPipeSignal(): Hidden = {
-	var pipeSignal = hidden()
-	sigemptyset(&var pipeSignal)
-	sigaddset(&var pipeSignal, SIGPIPE)
-	var before = hidden()
-	pthread_sigmask(SIG_BLOCK, &pipeSignal, &var before)
-	return before
-}
-
-// Puts back the signals held back `before`, having taken a `SIGPIPE` the
-// writing raised, so that it is not let through afterwards.
-fn releasePipeSignal(before: &Hidden) = {
-	var pending = hidden()
-	sigemptyset(&var pending)
-	sigpending(&var pending)
-	if sigismember(&pending, SIGPIPE) == 1 && sigismember(before, SIGPIPE) != 1 {
-		var pipeSignal = hidden()
-		sigemptyset(&var pipeSignal)
-		sigaddset(&var pipeSignal, SIGPIPE)
-		var taken = 0
-		sigwait(&pipeSignal, &var taken)
-	}
-	var ignored = hidden()
-	pthread_sigmask(SIG_SETMASK, before, &var ignored)
 }
 
 // This program's environment, with each `NAME=value` of `sets` in place of
@@ -711,15 +691,12 @@ extend Child {
 	}
 }
 
-extend Connected {
-	/// Its process number.
-	pub fn id(): i64 = self.id
-
-	/// Writes all of `bytes` to its standard input, waiting while the pipe
-	/// is full. A program that has stopped reading, or has ended, answers
-	/// `.BrokenPipe`, as does writing after `closeInput()`: the write holds
-	/// back the signal that would end this program for it.
-	pub fn writeAll(bytes: &[u8]): Result<void, io::IoError> = {
+// Writes all of `bytes` to its standard input, waiting while the pipe is
+// full. A program that has stopped reading, or has ended, answers
+// `.BrokenPipe`, as does writing after `closeInput()`: the write holds back
+// the signal that would end this program for it.
+extend Connected: io::Write {
+	var fn writeAll(bytes: &[u8]): Result<void, io::IoError> = {
 		if self.input < 0 then return .Err(.BrokenPipe)
 		var written = 0
 		val held = holdPipeSignal()
@@ -734,9 +711,15 @@ extend Connected {
 		releasePipeSignal(&held)
 		return .Ok()
 	}
+}
 
-	/// Writes all of `text` to its standard input.
-	pub fn writeText(text: str): Result<void, io::IoError> = self.writeAll(&text)
+extend Connected {
+	/// Its process number.
+	pub fn id(): i64 = self.id
+
+	/// Writes all of `text` to its standard input, as `writeAll` writes
+	/// bytes.
+	pub var fn writeText(text: str): Result<void, io::IoError> = self.writeAll(&text)
 
 	/// What it writes on its standard output, read as any `io::Reader` is:
 	/// a line, a length, or all of it, and waiting at most what
@@ -801,6 +784,14 @@ pub fn currentDir(): Result<String, io::IoError> = {
 	val found = getcwd(null, 0)
 	if found.isNull then return .Err(io::lastError())
 	return .Ok(takenFrom(found))
+}
+
+/// Moves this program into `path`, from which a relative path is read
+/// after.
+pub fn setCurrentDir(path: str): Result<void, io::IoError> = {
+	var named = String::of(path)
+	if libc::chdir(named.toCstring()) != 0 then return .Err(io::lastError())
+	return .Ok()
 }
 
 /// The file this program was started from, as an absolute path with no

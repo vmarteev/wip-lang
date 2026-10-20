@@ -1,0 +1,107 @@
+// `std::compress` against bytes Python's `gzip` and `zlib` wrote; each
+// format both ways; in pieces of every size; and what is cut short,
+// corrupted, or followed by more refused.
+
+import std::compress
+import std::compress::{CompressError, Deflater, Format, Inflater}
+
+val TEXT = "hello from wip, compressed by Python's zlib"
+
+val GZIPPED: [u8; 63] = [
+	31, 139, 8, 0, 0, 0, 0, 0, 2, 255, 203, 72, 205, 201, 201, 87, 72, 43, 202, 207, 85, 40, 207,
+	44, 208, 81, 72, 206, 207, 45, 40, 74, 45, 46, 78, 77, 81, 72, 170, 84, 8, 168, 44, 201, 200,
+	207, 83, 47, 86, 168, 202, 201, 76, 2, 0, 161, 14, 46, 246, 43, 0, 0, 0,
+]
+
+val ZLIBBED: [u8; 51] = [
+	120, 156, 203, 72, 205, 201, 201, 87, 72, 43, 202, 207, 85, 40, 207, 44, 208, 81, 72, 206, 207,
+	45, 40, 74, 45, 46, 78, 77, 81, 72, 170, 84, 8, 168, 44, 201, 200, 207, 83, 47, 86, 168, 202,
+	201, 76, 2, 0, 94, 140, 15, 226,
+]
+
+val DEFLATED: [u8; 45] = [
+	203, 72, 205, 201, 201, 87, 72, 43, 202, 207, 85, 40, 207, 44, 208, 81, 72, 206, 207, 45, 40,
+	74, 45, 46, 78, 77, 81, 72, 170, 84, 8, 168, 44, 201, 200, 207, 83, 47, 86, 168, 202, 201, 76,
+	2, 0,
+]
+
+@test
+fn whatPythonCompressedIsUndone() = {
+	val gzipped = GZIPPED
+	val zlibbed = ZLIBBED
+	val deflated = DEFLATED
+	assert(str::fromBytes(compress::gunzip(&gzipped).unwrap()) == TEXT)
+	assert(str::fromBytes(compress::unzlib(&zlibbed).unwrap()) == TEXT)
+	assert(str::fromBytes(compress::inflate(&deflated).unwrap()) == TEXT)
+}
+
+/// Bytes that repeat and do not, many of them.
+fn sample(): Vec<u8> = {
+	var bytes: Vec<u8> = Vec()
+	for i in 0..300000 {
+		bytes.push(if i % 1000 < 500 then (i % 7) as u8 else (i * 7919 % 251) as u8)
+	}
+	return bytes
+}
+
+@test
+fn eachFormatComesBackAsItWent() = {
+	val bytes = sample()
+	val gzipped = compress::gzip(&bytes)
+	assert(gzipped.len() < bytes.len() && gzipped[0] == 31 && gzipped[1] == 139)
+	assert(compress::gunzip(&gzipped).unwrap() == bytes)
+	assert(compress::unzlib(compress::zlib(&bytes)).unwrap() == bytes)
+	assert(compress::inflate(compress::deflate(&bytes)).unwrap() == bytes)
+	val nothing: Vec<u8> = Vec()
+	assert(compress::gunzip(compress::gzip(&nothing)).unwrap().isEmpty())
+}
+
+@test
+fn piecesOfEverySizeComeBackWhole() = {
+	val bytes = sample()
+	for size in [1, 7, 100, 4096, 65536, 100000] {
+		var deflater = Deflater::of(.Gzip, 9).unwrap()
+		var packed: Vec<u8> = Vec()
+		var at = 0
+		while at < bytes.len() {
+			val end = (at + size).min(bytes.len())
+			deflater.give(&bytes[at..end], &var packed).unwrap()
+			at = end
+		}
+		deflater.finish(&var packed).unwrap()
+		var inflater = Inflater::of(.Gzip).unwrap()
+		var unpacked: Vec<u8> = Vec()
+		at = 0
+		while at < packed.len() {
+			val end = (at + size).min(packed.len())
+			assert(inflater.give(&packed[at..end], &var unpacked).unwrap() == end - at)
+			at = end
+		}
+		assert(inflater.ended() && unpacked == bytes, "pieces of \(size)")
+	}
+}
+
+@test
+fn whatIsNotWholeOrNotTheFormatIsRefused() = {
+	val gzipped = GZIPPED
+	assert(compress::gunzip(&gzipped[0..30]) == .Err(CompressError::CutShort))
+	var corrupted = gzipped
+	corrupted[20] = corrupted[20] ^ 0xFF
+	assert(compress::gunzip(&corrupted) is .Err(.Corrupt(..)))
+	var longer = gzipped.toVec()
+	longer.push(0)
+	assert(compress::gunzip(&longer) is .Err(.Corrupt(..)), "a byte after the end")
+	val zlibbed = ZLIBBED
+	assert(compress::gunzip(&zlibbed) is .Err(.Corrupt(..)), "zlib's is not gzip's")
+}
+
+@test
+fn anInflaterSaysWhereTheStreamEnded() = {
+	val gzipped = GZIPPED
+	var both = gzipped.toVec()
+	both.pushAll([9 as u8, 9, 9])
+	var inflater = Inflater::of(Format::Gzip).unwrap()
+	var out: Vec<u8> = Vec()
+	assert(inflater.give(&both, &var out) == .Ok(63) && inflater.ended())
+	assert(str::fromBytes(&out) == TEXT)
+}

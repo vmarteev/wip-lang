@@ -895,7 +895,7 @@ longer, and still borrows what it did.
 
 A reference lives for the call it is lent to, so a thread may borrow
 where the call that starts it does not answer until it has ended:
-`future::together`, `each` and `map`. The closures they
+`future::both`, `each` and `map`. The closures they
 run are checked as a call's arguments are, which is what keeps threads
 from racing: a place one writes, no other reaches, and a place several
 reach, all only read. The one way to change a place through a `&` is

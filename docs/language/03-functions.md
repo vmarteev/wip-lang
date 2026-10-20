@@ -532,6 +532,41 @@ fn main() = {
 }
 ```
 
+What the call's value is expected to be says them too, as a `val`'s type
+does: `val numbers: Vec<i64> = json::decode(text)?`. The type expected
+passes through `?` to what the `Option` or the `Result` holds, and through
+a method called on the value to what that method answers, read in the
+type the value is — `.unwrap()` answers a `Result<T, E>`'s `T` — where
+the call's own arguments do not say. A method's own type arguments are
+written after its name, `answer.read<Vec<i64>>()`:
+
+```wip,run
+import std::json
+import std::json::{DecodeError}
+
+struct Answer {
+    text: String
+}
+
+extend Answer {
+    fn read<T: Decode>(): Result<T, DecodeError> = json::decode(&self.text)
+}
+
+fn total(answer: &Answer): Result<i64, DecodeError> = {
+    val numbers: Vec<i64> = answer.read()?
+    return .Ok(numbers.sum())
+}
+
+fn main() = {
+    val answer = Answer(text: String::of("[1, 2, 3]"))
+    assert(total(&answer) == .Ok(6))
+    val numbers: Vec<i64> = answer.read().unwrap()
+    assert(numbers.len() == 3)
+    val words = answer.read<Vec<String>>()
+    assert(words.isErr())
+}
+```
+
 ## `@tailrec` and `@inline`
 
 Two annotations say how a function is compiled:

@@ -17,6 +17,7 @@
 import std::bytes
 import std::io
 import std::libc
+import std::time::{Duration}
 
 /// Where a connection is: an IPv4 or IPv6 address and a port, or a
 /// Unix-domain socket's path, empty for one with no name.
@@ -104,6 +105,33 @@ extend Listener {
 	pub fn descriptor(): i32 = self.descriptor
 }
 
+// Reads what has come, up to `into.len()` bytes, and answers how many;
+// `0` where the other end has closed.
+extend Stream: io::Read {
+	var fn read(into: &var [u8]): Result<i64, io::IoError> = {
+		val got = libc::read(self.descriptor, &var into)
+		if got < 0 then return .Err(io::lastError())
+		return .Ok(got as i64)
+	}
+}
+
+// Writes all of `bytes`, waiting as it needs to. On a stream that does not
+// block it answers `.WouldBlock` where the connection would make it wait,
+// having written some of them.
+extend Stream: io::Write {
+	var fn writeAll(bytes: &[u8]): Result<void, io::IoError> = {
+		var written = 0
+		while written < bytes.len() {
+			match self.write(&bytes[written..]) {
+				.Ok(count) => written += count
+				.Err(.Interrupted) => {}
+				.Err(error) => return .Err(error)
+			}
+		}
+		return .Ok()
+	}
+}
+
 extend Stream {
 	/// A connection to `port` of `host`, the first of its addresses that
 	/// answers.
@@ -113,6 +141,21 @@ extend Stream {
 				.Some(host),
 				port,
 				(fd, address, length) => connectTo(fd, address, length) == 0,
+			)?
+		quiet(fd)
+		return .Ok(Stream(fd))
+	}
+
+	/// The same, waiting at most `within` for each of the host's addresses
+	/// to answer, where `tcp` waits as long as the system does: none that
+	/// answers in time is `.TimedOut`. Finding the addresses is not timed.
+	pub static fn tcpWithin(host: str, port: u16, within: Duration): Result<Stream, io::IoError> = {
+		val millis = within.asMillis().max(0).min(0x7FFFFFFF) as c_int
+		val fd =
+			resolved(
+				.Some(host),
+				port,
+				(fd, address, length) => connectWithin(fd, address, length, millis),
 			)?
 		quiet(fd)
 		return .Ok(Stream(fd))
@@ -133,14 +176,6 @@ extend Stream {
 		return .Ok(Stream(fd))
 	}
 
-	/// Reads what has come, up to `into.len()` bytes, and answers how many;
-	/// `0` where the other end has closed.
-	pub fn read(into: &var [u8]): Result<i64, io::IoError> = {
-		val got = libc::read(self.descriptor, &var into)
-		if got < 0 then return .Err(io::lastError())
-		return .Ok(got as i64)
-	}
-
 	/// Writes what the connection takes now of `bytes`, and answers how
 	/// many; it may be fewer than given.
 	pub fn write(bytes: &[u8]): Result<i64, io::IoError> = {
@@ -149,23 +184,8 @@ extend Stream {
 		return .Ok(sent as i64)
 	}
 
-	/// Writes all of `bytes`, waiting as it needs to. On a stream that does
-	/// not block it answers `.WouldBlock` where the connection would make it
-	/// wait, having written some of them.
-	pub fn writeAll(bytes: &[u8]): Result<void, io::IoError> = {
-		var written = 0
-		while written < bytes.len() {
-			match self.write(&bytes[written..]) {
-				.Ok(count) => written += count
-				.Err(.Interrupted) => {}
-				.Err(error) => return .Err(error)
-			}
-		}
-		return .Ok()
-	}
-
-	/// Writes all of `text`.
-	pub fn writeText(text: str): Result<void, io::IoError> = self.writeAll(&text)
+	/// Writes all of `text`, as `writeAll` writes bytes.
+	pub var fn writeText(text: str): Result<void, io::IoError> = self.writeAll(&text)
 
 	/// Ends the connection in both directions; the descriptor stays open
 	/// until the stream ends.
@@ -379,6 +399,7 @@ extern "C" {
 	fn accept(fd: c_int, address: &var SockAddr, length: &var u32): c_int
 	fn getsockname(fd: c_int, address: &var SockAddr, length: &var u32): c_int
 	fn setsockopt(fd: c_int, level: c_int, name: c_int, value: &c_int, length: u32): c_int
+	fn getsockopt(fd: c_int, level: c_int, name: c_int, value: &var c_int, length: &var u32): c_int
 	fn shutdown(fd: c_int, how: c_int): c_int
 	fn send(fd: c_int, bytes: &[u8], flags: c_int): ssize_t
 	fn getaddrinfo(
@@ -414,6 +435,19 @@ val F_GETFL: c_int = 3
 val SOL_SOCKET: c_int = 0xffff
 @target(os = "linux")
 val SOL_SOCKET: c_int = 1
+
+/// What a socket's connection that did not wait failed with, once it is
+/// done.
+@target(vendor = "apple")
+val SO_ERROR: c_int = 0x1007
+@target(os = "linux")
+val SO_ERROR: c_int = 4
+
+/// A connection begun on a socket that does not wait, still being made.
+@target(vendor = "apple")
+val EINPROGRESS: c_int = 36
+@target(os = "linux")
+val EINPROGRESS: c_int = 115
 
 @target(vendor = "apple")
 val SO_REUSEADDR: c_int = 4
@@ -500,6 +534,34 @@ fn resolved(
 	}
 	freeaddrinfo(answers)
 	return .Err(error)
+}
+
+/// `fd` connected to `address`, waiting at most `millis`: the connection
+/// begun without waiting, then waited for with `poll`. Where it fails, or
+/// takes longer, `errno` says why.
+fn connectWithin(fd: c_int, address: ptr<u8>, length: u32, millis: c_int): bool = {
+	if setBlockingOf(fd, false).isErr() then return false
+	if connectTo(fd, address, length) != 0 {
+		if libc::errno() != EINPROGRESS then return false
+		var fds = [libc::PollFd(fd: fd, events: libc::POLLOUT, answered: 0)]
+		var ready = libc::poll(&var fds, millis)
+		while ready < 0 && libc::errno() == libc::EINTR {
+			ready = libc::poll(&var fds, millis)
+		}
+		if ready < 0 then return false
+		if ready == 0 {
+			libc::errnoAt()[0] = libc::ETIMEDOUT
+			return false
+		}
+		var failed: c_int = 0
+		var size: u32 = 4
+		if getsockopt(fd, SOL_SOCKET, SO_ERROR, &var failed, &var size) != 0 then return false
+		if failed != 0 {
+			libc::errnoAt()[0] = failed
+			return false
+		}
+	}
+	return setBlockingOf(fd, true).isOk()
 }
 
 fn setOption(fd: c_int, name: c_int) = {

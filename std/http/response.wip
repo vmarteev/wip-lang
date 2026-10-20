@@ -1,0 +1,156 @@
+// What comes back: a `Response`, its body read whole, or an `Incoming`,
+// its body read as it comes. A body comes as many bytes as `Content-Length`
+// says, in chunks, or until the server closes the connection; nothing is
+// held of it that the program has not asked for.
+
+import std::compress::{Format, Inflater}
+import std::io
+import std::json
+
+/// A header, as it was sent.
+@derive(Eq, Clone)
+pub struct Header {
+	pub name: String
+	pub value: String
+}
+
+/// An answer, its body read whole.
+pub struct Response {
+	/// What the server answered: 200, 404.
+	pub status: i64
+	pub headers: Vec<Header>
+	pub body: Vec<u8>
+}
+
+extend Response {
+	/// Whether the status is from 200 to 299.
+	pub fn isSuccess(): bool = self.status >= 200 && self.status < 300
+
+	/// The value of the header `name`, in any case: the first, where it was
+	/// sent more than once.
+	pub fn header(name: str): Option<str> = headerOf(&self.headers, name)
+
+	/// The body as text, where it is UTF-8.
+	pub fn text(): Result<String, HttpError> = {
+		val text = str::fromBytes(&self.body)
+		if !text.isValidUtf8() then return .Err(.NotText)
+		return .Ok(String::of(text))
+	}
+
+	/// The body read as JSON of a `T`.
+	pub fn json<T: Decode>(): Result<T, HttpError> = {
+		val text = str::fromBytes(&self.body)
+		if !text.isValidUtf8() then return .Err(.NotText)
+		return match json::decode<T>(text) {
+			.Ok(value) => .Ok(value)
+			.Err(error) => .Err(.Json(error))
+		}
+	}
+}
+
+/// An answer whose status and headers have come, its body read as it comes
+/// with `read`, as any `io::Read` is. A body sent compressed is read
+/// undone. The connection it came on ends with it.
+pub struct Incoming {
+	/// What the server answered.
+	pub status: i64
+	pub headers: Vec<Header>
+	wire: Wire
+	framing: Framing
+	/// Whether the connection may carry another request once the body is
+	/// read: the server keeps it, and the body ends before it does.
+	keeps: bool
+	/// Which kept connections it is one of.
+	key: String
+	/// What undoes a body sent compressed, where it was.
+	decoder: Option<Inflater>
+	/// What it has undone and not yet given out.
+	decoded: Vec<u8> = Vec()
+	given: i64 = 0
+}
+
+extend Incoming {
+	/// Whether the status is from 200 to 299.
+	pub fn isSuccess(): bool = self.status >= 200 && self.status < 300
+
+	/// The value of the header `name`, in any case.
+	pub fn header(name: str): Option<str> = headerOf(&self.headers, name)
+
+	/// The rest of the body, read, with the status and the headers.
+	pub move fn readAll(): Result<Response, HttpError> = {
+		val (response, _) = self.drained()?
+		return .Ok(response)
+	}
+
+	/// The rest of the body read, and the connection, where it may carry
+	/// another request.
+	move fn drained(): Result<(Response, Option<Wire>), HttpError> = {
+		var incoming = self
+		var body: Vec<u8> = Vec()
+		var room = [0 as u8; 16384]
+		while true {
+			val got = match incoming.read(&var room) {
+				.Ok(got) => got
+				.Err(error) => return .Err(failed(error))
+			}
+			if got == 0 then break
+			body.pushAll(&room[0..got])
+		}
+		val response = Response(status: incoming.status, headers: incoming.headers, body: body)
+		val kept = if incoming.keeps then .Some(incoming.wire) else .None
+		return .Ok((response, kept))
+	}
+}
+
+// The body, as it comes: what the framing says is left of it, and nothing
+// past its end; undone as it comes where it was sent compressed. What
+// follows a compressed stream's end in the body is read and let go, so that
+// the connection is where the next answer begins.
+extend Incoming: io::Read {
+	var fn read(into: &var [u8]): Result<i64, io::IoError> = {
+		if self.decoder.isNone() then return self.framing.read(&var self.wire, &var into)
+		if into.isEmpty() then return .Ok(0)
+		var room = [0 as u8; 16384]
+		while self.given == self.decoded.len() {
+			self.decoded.clear()
+			self.given = 0
+			if self.decoder.get().ended() {
+				while self.framing.read(&var self.wire, &var room)? > 0 {}
+				return .Ok(0)
+			}
+			val got = self.framing.read(&var self.wire, &var room)?
+			if got == 0 then return .Err(.InvalidData)
+			if self.decoder.get().give(&room[0..got], &var self.decoded).isErr() then
+				return .Err(.InvalidData)
+		}
+		val count = (self.decoded.len() - self.given).min(into.len())
+		into[0..count].copyFrom(&self.decoded.items()[self.given..self.given + count])
+		self.given += count
+		return .Ok(count)
+	}
+}
+
+/// What undoes the body of an answer with `head`: an `Inflater` where it
+/// says it was sent as gzip or as deflate, and nothing where it says nothing
+/// else, or has no body.
+fn decoderOf(head: &Head, framing: &Framing): Result<Option<Inflater>, HttpError> = {
+	if framing is .Nothing then return .Ok(.None)
+	val .Some(encoding) = headerOf(&head.headers, "Content-Encoding") else return .Ok(.None)
+	val format: Format = match encoding.trim().toAsciiLower().toStr() {
+		"gzip" | "x-gzip" => .Gzip
+		"deflate" => .Zlib
+		_ => return .Ok(.None)
+	}
+	return match Inflater::of(format) {
+		.Ok(inflater) => .Ok(.Some(inflater))
+		.Err(error) => .Err(.Malformed("a compressed body that cannot be undone: \(error)"))
+	}
+}
+
+/// The value of the header `name` among `headers`, in any case.
+fn headerOf(headers: &[Header], name: str): Option<str> = {
+	for header in headers {
+		if sameName(header.name, name) then return .Some(header.value.toStr())
+	}
+	return .None
+}

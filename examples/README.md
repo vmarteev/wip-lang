@@ -13,7 +13,8 @@ its tests run, with every change to the compiler.
 | [life](life) | Conway's Life: a lending `at`, a generator, a constant worked out while compiling, terminal frames |
 | [report-formats](report-formats) | dynamic dispatch with `&dyn`, beside the same code generic, and an interface's default method |
 | [http-hello](http-hello) | a tiny web server: `std::net`, threads that borrow with `future::each`, an `Atomic` |
-| [parallel-sum](parallel-sum) | work on several threads three ways: `future::map`, `together` and `each` |
+| [fetch](fetch) | a URL fetched with `std::http`, its body streamed through `io::copy` to a file or the terminal, over `https` too |
+| [parallel-sum](parallel-sum) | work on several threads three ways: `future::map`, `both` and `each` |
 | [shapes-package](shapes-package) | a program that is a package, depending on a library package, with `internal/` |
 | [sqlite](sqlite) | calling a C library directly: `@link`, `extern "C"`, opaque types, `defer` |
 | [scene](scene) | a camera and a cube with `std::math`: vectors, a rotation, the matrices a GPU multiplies, and pixels |

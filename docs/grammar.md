@@ -491,12 +491,14 @@ unary       = ( "-" | "!" | "&" "var"? | "move" | "own" ) unary
             | postfix ;
             (* `own` before a lambda makes an owned closure, which holds what
                it captured on the heap *)
-postfix     = primary ( "." fieldName | "." INT | "(" args? ")" | "[" index "]" | "?" )* ;
+postfix     = primary ( "." fieldName typeArgs? | "." INT | "(" args? ")" | "[" index "]" | "?" )* ;
             (* `pair.0` is a tuple's element *)
             (* `expr?` is the value, or an early return of the other variant
                of an `Option` or a `Result` *)
             (* `x.name(…)` calls a method of `x`'s type, or a field of
                function type; `Type::name(…)` a static function *)
+            (* typeArgs after a fieldName where R7 allows: the method's own,
+               `x.decode<T>(…)` *)
 index       = expr | ".." expr? | expr ".." | "..=" expr ;  (* a range must be borrowed: &xs[lo..hi];
                                            on a type of one's own, `x[i]` calls the
                                            `at` of `Index` *)
@@ -724,6 +726,12 @@ bool>`. In an expression, `<` after a name starts type arguments when:
   is for a generic function named as a value, as in `sort(&var xs,
   less<i64>)`;
 - and the `<` is not half of `<<`.
+
+After a method's name, `x.name<`, the same holds, but the token after the
+matching `>` must be the call's `(`, on the same line: a method is not
+named as a value. `f(a.x < b, c > (d))` reads as `a.x<b, c>(d)`, and is
+refused where `x` is a field, with a fix that puts `a.x < b` in
+parentheses.
 
 ### R8 — `(` before `=>`
 

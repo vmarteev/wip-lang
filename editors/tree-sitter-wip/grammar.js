@@ -72,6 +72,8 @@ module.exports = grammar({
     [$._expression, $.lambda_parameter],
     // `a::b<T>` or `a::b < x` (R7).
     [$.scoped_identifier, $.generic_segment],
+    // `x.m<T>(…)` or `x.m < y` (R7).
+    [$.field_expression],
     // `Some(x)`: a name bound, or a variant taken apart; the checker knows.
     [$.identifier_pattern, $.variant_pattern],
     [$.identifier_pattern, $.binder],
@@ -614,10 +616,18 @@ module.exports = grammar({
       field('value', $._expression),
     ),
 
+    // `x.decode<T>(…)`: a method's type arguments, which win where the
+    // tokens can be read either way, as the compiler reads them (grammar.md R7).
     field_expression: $ => prec(PREC.postfix, seq(
       field('value', $._expression),
       '.',
-      field('field', choice($._field_name, $.integer)),
+      choice(
+        field('field', choice($._field_name, $.integer)),
+        seq(
+          field('field', $._field_name),
+          prec.dynamic(1, field('type_arguments', $.type_arguments)),
+        ),
+      ),
     )),
 
     index_expression: $ => prec(PREC.postfix, seq(

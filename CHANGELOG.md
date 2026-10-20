@@ -2,6 +2,68 @@
 
 Each version published, newest first.
 
+## 0.10.0 — 2026-10-19
+
+Programs written for 0.9 compile as they did, but where marked
+**breaking**; the compiler's errors say what to write instead.
+
+**The language**
+
+- **A method's type arguments** are written after its name where the
+  call's `(` follows, `response.json<Vec<i64>>()`, as a function's are.
+  And what is expected of a value says them through `?` and through a
+  method called on it: `val numbers: Vec<i64> = response.json()?` and
+  `val numbers: Vec<i64> = json::decode(text).unwrap()` compile, where
+  they asked for the type to be written. **Breaking:** `f(a.x < b, c >
+  (d))`, comparisons after a field in an argument list, reads as type
+  arguments, and is refused with a fix that adds the parentheses.
+
+**The library**
+
+- **`std::http`:** an HTTP/1.1 client, in Wip over `std::net`.
+  `http::get(url)`, and a `Client` that sends any `Request`, keeps its
+  connections, follows redirects and stops waiting after its timeout;
+  `https` through the system's TLS; gzip asked for and undone; a body
+  read as it comes, `client.open(request)`, so that one larger than
+  memory is never held whole, and sent from a file or from any
+  `io::Read`, `client.upload(request, &var source)`; JSON both ways; a
+  Unix-domain socket.
+- **`std::tls`:** `TlsStream`, a TLS connection whose server's
+  certificate the system checks: OpenSSL 3 on Linux, Network.framework
+  on a Mac and iOS, its blocks laid out in Wip.
+- **`std::compress`:** gzip, zlib and raw deflate, at once or in pieces
+  through an `Inflater` and a `Deflater`, over the system's zlib.
+- **`io::Read` and `io::Write`,** what bytes are read from and written
+  to: a `File`, standard input, a connection, a program's input, a
+  response's body; `io::copy(&var from, &var to)`; `io::stdout()` and
+  `io::stderr()`, in order with `print`. **Breaking:** `File.writeBytes`
+  is `writeAll`; a `net::Stream` is read, and it and a
+  `process::Connected` written, through `var`; `IoError` has
+  `InvalidData` and `TimedOut`, and `EPERM` is `.Denied`.
+- **`std::base64`, `std::hex` and `std::url`:** bytes as text, each an
+  `encode` and a `decode` that says where text is wrong: base64 in both
+  alphabets, padded or not; two hexadecimal digits a byte; and
+  percent-encoding for any part of a URL.
+- **`digest::crc32` and `digest::adler32`,** and `Crc32` and `Adler32`
+  for bytes in pieces.
+- **What a server asks of the system:** `std::users`, a user or a group
+  by name or number; a file's owner, `fs::setOwner` and `fs::setMode`;
+  `process::fork`, `newGroup`, `sendToGroup`, `becomeUser`,
+  `changeRoot`, `setCurrentDir`, `limit` and `setLimit`.
+- **`net::Stream::tcpWithin`,** a connection that gives up after a time.
+- **`future::both`.** **Breaking:** it was `future::together`.
+
+**Fixed**
+
+- A binding of an `is` whose test failed, followed by a `return`, could
+  drop what it never held: a variable's drop flag is false from the start.
+- A `&var dyn` parameter lent on to another call, `inner(&var source)`.
+- A release build in parts, where a type's interface table named a
+  small function another part had.
+- On a Mac, a write to a program that had ended ended this one where
+  another thread was running; on Linux, a TLS write to a server that had
+  gone could too.
+
 ## 0.9.0 — 2026-10-18
 
 Programs written for 0.8 compile as they did, but where marked

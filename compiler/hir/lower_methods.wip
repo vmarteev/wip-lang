@@ -13,7 +13,8 @@ import syntax::{
 	Receiver,
 	SELF_OUTSIDE_METHOD,
 	Span,
-	Symbol
+	Symbol,
+	TYPE_ARGUMENT_COUNT
 }
 
 /// How many interfaces offer a call's method.
@@ -278,9 +279,14 @@ extend Lowerer {
 		// arguments say it.
 		if self.waitingLocal(base) is .Some(local) then
 			self.decideByMethod(local, base, name, &item)
+		// What the method's result is expected to be may say what the
+		// receiver is, where it is a call its own arguments do not settle.
+		if item.hint is .Some(h) && h != UNIT && !self.isPoisoned(h) then
+			self.state.wanted.put(base, Wanted::Through(method: name.sym, ty: h))
 		// A receiver is lent where it is written, so a range of elements may
 		// be one: `window[at..at + n].copyFrom(&block)`.
 		val receiver = self.inferBorrowed(base, .None)
+		self.state.wanted.remove(&base)
 		val ty = self.tyOf(receiver)
 		// The receiver is already broken, and looking for a field of this name
 		// would lower it a second time and report it twice.
@@ -455,6 +461,32 @@ extend Lowerer {
 		return .Some(self.call(id, used))
 	}
 
+	/// A field followed by what reads as type arguments: `a.x < b, c > (d)`
+	/// in an argument list is `a.x<b, c>(d)`. Says so, with a fix that makes
+	/// the first comparison one.
+	fn fieldWithTypeArgs(
+		receiver: ExprId,
+		name: ast::Name,
+		typeArgs: &ast::TypeArgs,
+	): Diagnostic = {
+		var diagnostic = Diagnostic::error(
+			TYPE_ARGUMENT_COUNT,
+			"`\(self.text(name.sym))` is a field, and takes no type arguments",
+			typeArgs.span,
+			"read as type arguments",
+		).withNote(
+			"after a method's name, `<` starts type arguments when `(` follows the matching `>`",
+		)
+		if !typeArgs.args.isEmpty() {
+			val end = self.ast.types[typeArgs.args[0]].span.hi
+			diagnostic = diagnostic.withFix("to compare, put the comparison in parentheses", [
+				Edit::insert(self.state.body.exprs[receiver].span.lo, "("),
+				Edit::insert(end, ")"),
+			])
+		}
+		return diagnostic
+	}
+
 	/// A call of a name the type has no method of: an extension whose
 	/// condition is not met, a field of function type, or a name that is
 	/// not there.
@@ -473,7 +505,14 @@ extend Lowerer {
 		}
 		// A field of function type can be called; any other name is a method
 		// that does not exist.
-		if self.fieldNamed(owner, name.sym) then return .None
+		if self.fieldNamed(owner, name.sym) {
+			// `a.x < b, c > (d)` in an argument list reads as `a.x<b, c>(d)`.
+			if item.methodTypeArgs && item.typeArgs is .Some(written) {
+				self.report(self.fieldWithTypeArgs(receiver, name, written))
+				return .Some(self.giveUpItem(item))
+			}
+			return .None
+		}
 		// An interpolated literal appends each of its values through `Text`,
 		// so a type that does not implement it is reported here.
 		if name.sym == Symbol::appendTo() {

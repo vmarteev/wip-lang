@@ -1,0 +1,176 @@
+// The system's users and groups, found by name or by number: who a file
+// belongs to, and whom a server that starts as root goes on as. Each is
+// looked up afresh with the C library's `getpwnam_r` and its kin, which
+// read the system's own records — `/etc/passwd`, a directory service —
+// and write into room this module gives them, so a lookup on one thread
+// leaves another's alone.
+
+import std::libc
+
+/// A user of the system.
+@derive(Eq, Clone)
+pub struct User {
+	/// Its number, as a file's owner and `process::becomeUser` take it.
+	pub id: u32
+	/// The number of its group.
+	pub group: u32
+	/// Its name: `root`, `www`.
+	pub name: String
+	/// Its home directory.
+	pub home: String
+	/// The shell it logs in with.
+	pub shell: String
+}
+
+/// A group of the system's users.
+@derive(Eq, Clone)
+pub struct Group {
+	/// Its number, as a file's group and `process::becomeUser` take it.
+	pub id: u32
+	/// Its name: `wheel`, `www`.
+	pub name: String
+	/// The names of the users it holds beyond those whose own group it is.
+	pub members: Vec<String>
+}
+
+extend User {
+	/// The user named `name`, or nothing where there is none.
+	pub static fn named(name: str): Option<User> = {
+		var text = String::of(name)
+		val wanted = text.toCstring()
+		return userOf((into, room, size, found) => libc::getpwnam_r(
+			wanted,
+			into,
+			room,
+			size,
+			&var found,
+		))
+	}
+
+	/// The user numbered `id`, or nothing where there is none.
+	pub static fn withId(id: u32): Option<User> = userOf((
+		into,
+		room,
+		size,
+		found,
+	) => libc::getpwuid_r(id, into, room, size, &var found))
+}
+
+extend Group {
+	/// The group named `name`, or nothing where there is none.
+	pub static fn named(name: str): Option<Group> = {
+		var text = String::of(name)
+		val wanted = text.toCstring()
+		return groupOf((into, room, size, found) => libc::getgrnam_r(
+			wanted,
+			into,
+			room,
+			size,
+			&var found,
+		))
+	}
+
+	/// The group numbered `id`, or nothing where there is none.
+	pub static fn withId(id: u32): Option<Group> = groupOf((
+		into,
+		room,
+		size,
+		found,
+	) => libc::getgrgid_r(id, into, room, size, &var found))
+}
+
+/// What a lookup is asked with: the struct to fill, the room for its
+/// strings and its size, and where it says what it found.
+type Lookup = &(into: ptr<u8>, room: ptr<u8>, size: size_t, found: &var ptr<u8>) => c_int
+
+// `struct passwd` and `struct group`, as far as the fields read, at the
+// offsets each system has them. What they are filled into is room enough
+// for the whole, which is less than 128 bytes on either.
+val STRUCT_ROOM: i64 = 128
+
+// A Mac's `struct passwd` has its password's change time and its class
+// between the group and the rest.
+@target(vendor = "apple")
+extern struct Passwd {
+	name: cstring
+	password: cstring
+	id: u32
+	group: u32
+	changed: i64
+	class: cstring
+	gecos: cstring
+	home: cstring
+	shell: cstring
+}
+
+@target(os = "linux")
+extern struct Passwd {
+	name: cstring
+	password: cstring
+	id: u32
+	group: u32
+	gecos: cstring
+	home: cstring
+	shell: cstring
+}
+
+extern struct GroupEntry {
+	name: cstring
+	password: cstring
+	id: u32
+	/// The members' names, ended by a null.
+	members: ptr<cstring>
+}
+
+fn userOf(lookup: Lookup): Option<User> = found(lookup, (entry) => {
+	val passwd = entry as ptr<Passwd>
+	return User(
+		id: passwd.id,
+		group: passwd.group,
+		name: textOf(passwd.name),
+		home: textOf(passwd.home),
+		shell: textOf(passwd.shell),
+	)
+})
+
+fn groupOf(lookup: Lookup): Option<Group> = found(lookup, (entry) => {
+	val group = entry as ptr<GroupEntry>
+	var members: Vec<String> = Vec()
+	if !group.members.isNull {
+		var at = 0
+		while !group.members[at].isNull {
+			members.push(textOf(group.members[at]))
+			at += 1
+		}
+	}
+	return Group(id: group.id, name: textOf(group.name), members: members)
+})
+
+/// What `lookup` found, read by `read` while its room is there: room for
+/// the strings is doubled from a kilobyte for as long as the C library
+/// says it is too small, as the C library asks of a caller.
+fn found<T>(lookup: Lookup, read: &(entry: ptr<u8>) => T): Option<T> = {
+	val entry = libc::calloc(1, STRUCT_ROOM as size_t)
+	if entry.isNull then return .None
+	var size: i64 = 1024
+	var answer: Option<T> = .None
+	while true {
+		val room = libc::malloc(size as size_t)
+		if room.isNull then break
+		var result: ptr<u8> = null
+		val code = lookup(entry, room, size as size_t, &var result)
+		if code == libc::ERANGE && size < 1 << 20 {
+			libc::free(room)
+			size *= 2
+			continue
+		}
+		if code == 0 && !result.isNull then answer = .Some(read(entry))
+		libc::free(room)
+		break
+	}
+	libc::free(entry)
+	return answer
+}
+
+/// A C string's text, copied; an empty one where it is null.
+fn textOf(text: cstring): String = if text.isNull then String() else String::of(text.toStr())

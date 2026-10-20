@@ -1,0 +1,270 @@
+// What goes over a connection: the request written, and the answer read —
+// its status line and headers, then its body framed as its headers say.
+// A connection is read through a buffer of its own, from which the head is
+// taken a line at a time and the body as it is asked for.
+
+import std::io
+import std::libc
+import std::net::{Stream}
+import std::tls::{TlsStream}
+
+/// The longest a line of the head may be, and the most headers: past either
+/// the answer is not taken to be HTTP.
+val LINE_MOST: i64 = 65536
+val HEADERS_MOST: i64 = 256
+
+/// What a connection is: TCP, or TLS over it.
+enum Link {
+	Plain(stream: Stream)
+	Secure(stream: TlsStream)
+}
+
+extend Link {
+	var fn read(into: &var [u8]): Result<i64, io::IoError> = match self {
+		.Plain(stream) => stream.read(&var into)
+		.Secure(stream) => stream.read(&var into)
+	}
+
+	var fn writeAll(bytes: &[u8]): Result<void, io::IoError> = match self {
+		.Plain(stream) => stream.writeAll(bytes)
+		.Secure(stream) => stream.writeAll(bytes)
+	}
+}
+
+/// A connection to a server, and what has been read of it and not taken.
+struct Wire {
+	link: Link
+	held: Vec<u8> = Vec()
+	given: i64 = 0
+	/// How many milliseconds a read waits; -1 waits as long as it takes.
+	timeout: i64 = -1
+	/// Whether the server has closed its end.
+	ended: bool = false
+}
+
+extend Wire {
+	/// More bytes into the buffer, waiting at most the timeout: `false` at
+	/// the end.
+	var fn fill(): Result<bool, io::IoError> = {
+		if self.given > 0 {
+			var kept: Vec<u8> = Vec()
+			kept.pushAll(&self.held.items()[self.given..])
+			self.held = kept
+			self.given = 0
+		}
+		self.waitReadable()?
+		var room = [0 as u8; 16384]
+		val got = self.link.read(&var room)?
+		if got == 0 {
+			self.ended = true
+			return .Ok(false)
+		}
+		self.held.pushAll(&room[0..got])
+		return .Ok(true)
+	}
+
+	/// Waits for something to read, as long as the timeout says. A TLS
+	/// stream waits in its own reads, as its timeout says, since what it has
+	/// read of the socket may hold what comes next.
+	fn waitReadable(): Result<void, io::IoError> = {
+		if self.timeout < 0 then return .Ok()
+		val .Plain(stream) = self.link else return .Ok()
+		var fds = [libc::PollFd(fd: stream.descriptor(), events: libc::POLLIN, answered: 0)]
+		while true {
+			val ready = libc::poll(&var fds, self.timeout as c_int)
+			if ready > 0 then return .Ok()
+			if ready == 0 then return .Err(.TimedOut)
+			if io::lastError() != .Interrupted then return .Err(io::lastError())
+		}
+		return .Ok()
+	}
+
+	/// The next line, without its line break, or nothing where the
+	/// connection ended before one came.
+	var fn line(): Result<Option<String>, io::IoError> = {
+		while true {
+			val start = self.given
+			val newline = '\n' as u8
+			if self.held.items()[start..].indexOf(&newline) is .Some(at) {
+				val breakAt = start + at
+				val end =
+					if at > 0 && self.held[breakAt - 1] == '\r' as u8 then breakAt - 1 else breakAt
+				val text = String::of(str::fromBytes(&self.held.items()[start..end]))
+				self.given = breakAt + 1
+				return .Ok(.Some(text))
+			}
+			if self.held.len() - start > LINE_MOST then return .Err(.InvalidData)
+			if !self.fill()? then return .Ok(.None)
+		}
+		return .Ok(.None)
+	}
+
+	/// What comes next, into `into`: what is held first, then from the
+	/// connection. 0 at its end.
+	var fn readSome(into: &var [u8]): Result<i64, io::IoError> = {
+		if into.isEmpty() then return .Ok(0)
+		if self.given == self.held.len() {
+			if self.ended then return .Ok(0)
+			self.held.clear()
+			self.given = 0
+			self.waitReadable()?
+			val got = self.link.read(&var into)?
+			if got == 0 then self.ended = true
+			return .Ok(got)
+		}
+		val count = (self.held.len() - self.given).min(into.len())
+		into[0..count].copyFrom(&self.held.items()[self.given..self.given + count])
+		self.given += count
+		return .Ok(count)
+	}
+
+	var fn writeAll(bytes: &[u8]): Result<void, io::IoError> = self.link.writeAll(bytes)
+}
+
+/// How an answer's body comes, and how much of it is left.
+enum Framing {
+	/// No body: the answer to a `HEAD`, a 204, a 304.
+	Nothing
+	/// As many bytes as `Content-Length` said.
+	Length(left: i64)
+	/// In chunks, each its size in hexadecimal on a line of its own, the
+	/// last of size 0: `left` of the one being read, and whether the last
+	/// has come.
+	Chunked(left: i64, done: bool)
+	/// Until the server closes the connection.
+	UntilClosed
+}
+
+extend Framing {
+	/// What comes next of the body, into `into`: 0 at its end.
+	var fn read(wire: &var Wire, into: &var [u8]): Result<i64, io::IoError> = match self {
+		.Nothing => .Ok(0)
+		.Length(left) => {
+			if left == 0 || into.isEmpty() then return .Ok(0)
+			val wanted = left.min(into.len())
+			val got = wire.readSome(&var into[0..wanted])?
+			if got == 0 then return .Err(.InvalidData)
+			left -= got
+			return .Ok(got)
+		}
+		.Chunked(left, done) => {
+			if done || into.isEmpty() then return .Ok(0)
+			if left == 0 {
+				val size = chunkSize(&var wire)?
+				if size == 0 {
+					// Trailers, which are not kept, and the blank line.
+					while true {
+						val .Some(line) = wire.line()? else return .Err(.InvalidData)
+						if line.isEmpty() then break
+					}
+					done = true
+					return .Ok(0)
+				}
+				left = size
+			}
+			val wanted = left.min(into.len())
+			val got = wire.readSome(&var into[0..wanted])?
+			if got == 0 then return .Err(.InvalidData)
+			left -= got
+			if left == 0 {
+				val .Some(end) = wire.line()? else return .Err(.InvalidData)
+				if !end.isEmpty() then return .Err(.InvalidData)
+			}
+			return .Ok(got)
+		}
+		.UntilClosed => wire.readSome(&var into)
+	}
+}
+
+/// The size of the next chunk, from its line: hexadecimal, before any `;`.
+fn chunkSize(wire: &var Wire): Result<i64, io::IoError> = {
+	val .Some(line) = wire.line()? else return .Err(.InvalidData)
+	val digits = match line.indexOf(";") {
+		.Some(at) => line.toStr()[0..at].trim()
+		.None => line.trim()
+	}
+	val .Ok(size) = digits.toInt(radix: 16) else return .Err(.InvalidData)
+	if size < 0 || digits.startsWith("-") || digits.startsWith("+") then return .Err(.InvalidData)
+	return .Ok(size)
+}
+
+/// An answer's status line and headers.
+struct Head {
+	status: i64
+	/// Whether it is HTTP/1.1, which keeps a connection unless it says not
+	/// to; HTTP/1.0 closes one unless it says to keep it.
+	later: bool
+	headers: Vec<Header>
+}
+
+/// The head of the next answer, past any that say only to go on (1xx); or
+/// nothing where the connection ended before an answer began.
+fn readHead(wire: &var Wire): Result<Option<Head>, HttpError> = {
+	while true {
+		val .Some(statusLine) = wire.line().mapErr(failed)? else return .Ok(.None)
+		val (later, status) = statusOf(statusLine)?
+		var headers: Vec<Header> = Vec()
+		while true {
+			val .Some(line) = wire.line().mapErr(failed)? else {
+				return .Err(.Malformed("the connection ended within the headers"))
+			}
+			if line.isEmpty() then break
+			if headers.len() == HEADERS_MOST then return .Err(.Malformed("too many headers"))
+			val .Some(colon) = line.indexOf(":") else {
+				return .Err(.Malformed("a header with no `:`: `\(line)`"))
+			}
+			if line.startsWith(" ") || line.startsWith("\t") then
+				return .Err(.Malformed("a header folded onto a second line"))
+			headers.push(Header(
+				name: String::of(line.toStr()[0..colon].trim()),
+				value: String::of(line.toStr()[colon + 1..].trim()),
+			))
+		}
+		if status >= 100 && status < 200 && status != 101 then continue
+		return .Ok(.Some(Head(status: status, later: later, headers: headers)))
+	}
+	return .Ok(.None)
+}
+
+/// `HTTP/1.1 200 OK` taken apart: whether it is 1.1, and the status.
+fn statusOf(line: str): Result<(bool, i64), HttpError> = {
+	val later =
+		if line.startsWith("HTTP/1.1 ") then true
+		else if line.startsWith("HTTP/1.0 ") then false
+		else return .Err(.Malformed("a status line that is not HTTP/1: `\(line)`"))
+	val code = line[9..].trim()
+	val digits = if code.len() >= 3 then code[0..3] else code
+	val .Ok(status) = digits.toInt() else {
+		return .Err(.Malformed("a status that is not a number: `\(line)`"))
+	}
+	if digits.len() != 3 || status < 100 then return .Err(.Malformed("status `\(digits)`"))
+	return .Ok((later, status))
+}
+
+/// How the body of an answer to `method` with `head` comes.
+fn framingOf(method: Method, head: &Head): Result<Framing, HttpError> = {
+	if method == .Head || head.status == 204 || head.status == 304 then return .Ok(.Nothing)
+	if headerOf(&head.headers, "Transfer-Encoding") is .Some(codings) {
+		if codings.toAsciiLower().trim().endsWith("chunked") then
+			return .Ok(.Chunked(left: 0, done: false))
+		return .Ok(.UntilClosed)
+	}
+	if headerOf(&head.headers, "Content-Length") is .Some(text) {
+		val .Ok(length) = text.trim().toInt() else {
+			return .Err(.Malformed("a `Content-Length` that is not a number: `\(text)`"))
+		}
+		if length < 0 then return .Err(.Malformed("a negative `Content-Length`"))
+		return .Ok(.Length(left: length))
+	}
+	return .Ok(.UntilClosed)
+}
+
+/// Whether the connection may carry another request after this answer.
+fn keepsOf(head: &Head, framing: &Framing): bool = {
+	if framing is .UntilClosed then return false
+	val said = match headerOf(&head.headers, "Connection") {
+		.Some(value) => value.toAsciiLower()
+		.None => String()
+	}
+	return if head.later then !said.contains("close") else said.contains("keep-alive")
+}

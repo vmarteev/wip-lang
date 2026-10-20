@@ -1,0 +1,349 @@
+// A client: what sends requests, keeps the connections a server leaves
+// open for the next, follows redirects, and stops waiting when told. It is
+// a value a program keeps; nothing of it is shared between threads or
+// held anywhere else.
+
+import std::fs
+import std::io
+import std::net::{Stream}
+import std::time::{Duration}
+import std::tls::{TlsStream}
+
+/// Sends requests, and keeps what it may of their connections.
+pub struct Client {
+	/// How long connecting, and each read of an answer, may wait. Nothing
+	/// waits as long as it takes.
+	pub var timeout: Option<Duration> = .None
+	/// How many redirects a request follows before it answers
+	/// `TooManyRedirects`; 0 follows none, and answers each as it came.
+	pub var redirects: i64 = 10
+	/// The Unix-domain socket every request goes over, where there is one.
+	socket: Option<String> = .None
+	/// Connections a server left open, each by where it leads.
+	idle: Vec<Idle> = Vec()
+}
+
+/// A connection kept for the next request to its host.
+struct Idle {
+	key: String
+	wire: Wire
+}
+
+/// A body read from nothing, for a request that has its body in hand.
+struct NoSource
+
+extend NoSource: io::Read {
+	var fn read(into: &var [u8]): Result<i64, io::IoError> = .Ok(0)
+}
+
+extend Client {
+	/// A client that sends every request over the Unix-domain socket at
+	/// `path`, whatever host its URL names, as a container's API is reached:
+	/// `Client::overUnix("/var/run/docker.sock").get("http://localhost/info")`.
+	pub static fn overUnix(path: str): Client = Client(socket: .Some(String::of(path)))
+
+	/// A `GET` of `url`, its body read whole.
+	pub var fn get(url: str): Result<Response, HttpError> = self.send(Request::get(url))
+
+	/// Sends `request`, and reads the whole answer.
+	pub var fn send(request: Request): Result<Response, HttpError> = {
+		var none = NoSource()
+		val incoming = self.followed(request, &var none, false)?
+		val key = incoming.key.clone()
+		val (response, kept) = incoming.drained()?
+		match move kept {
+			.Some(wire) => self.keep(key, wire)
+			.None => {}
+		}
+		return .Ok(response)
+	}
+
+	/// Sends `request`, and answers once the status and the headers have
+	/// come, its body to be read as it comes.
+	pub var fn open(request: Request): Result<Incoming, HttpError> = {
+		var none = NoSource()
+		return self.followed(request, &var none, false)
+	}
+
+	/// Sends `request` with its body read from `source` as it is sent, and
+	/// reads the whole answer: in chunks, or as many bytes as the request's
+	/// `length` says. The source is read once, so the request goes on a
+	/// connection of its own, and a redirect that would send it again is
+	/// answered as it came.
+	pub var fn upload(request: Request, source: &var dyn io::Read): Result<Response, HttpError> = {
+		val incoming = self.followed(request, &var source, true)?
+		return incoming.readAll()
+	}
+
+	/// The same, answering once the status and the headers have come.
+	pub var fn openUpload(
+		request: Request,
+		source: &var dyn io::Read,
+	): Result<Incoming, HttpError> = self.followed(request, &var source, true)
+
+	/// `request` sent, and the redirects it is answered with followed, as
+	/// far as the client follows them.
+	var fn followed(
+		request: Request,
+		source: &var dyn io::Read,
+		streamed: bool,
+	): Result<Incoming, HttpError> = {
+		checkHeaders(&request)?
+		var current = request
+		var url = parseUrl(&current.url)?
+		var hops = 0
+		while true {
+			val incoming = self.once(&current, &url, &var source, streamed)?
+			val .Some(location) = incoming.header("Location") else return .Ok(incoming)
+			val status = incoming.status
+			if !(status == 301 ||
+				status == 302 ||
+				status == 303 ||
+				status == 307 ||
+				status == 308) {
+				return .Ok(incoming)
+			}
+			if self.redirects == 0 then return .Ok(incoming)
+			// A redirect that keeps the method sends the body again, which a
+			// source read once cannot.
+			val asGet =
+				status == 303 || ((status == 301 || status == 302) && current.method == .Post)
+			if streamed && !asGet then return .Ok(incoming)
+			if hops == self.redirects then return .Err(.TooManyRedirects)
+			hops += 1
+			val next = resolve(&url, location)?
+			if asGet && current.method != .Head {
+				current.method = .Get
+				current.body = .Empty
+				current.length = .None
+				current.headers.retain((header) =>
+					!sameName(header.name, "Content-Type") &&
+						!sameName(header.name, "Content-Length"))
+			}
+			if next.key() != url.key() then
+				current.headers.retain((header) => !sameName(header.name, "Authorization"))
+			url = next
+			// The answer that redirected is not read, and its connection ends.
+			destroy(incoming)
+		}
+		return .Err(.TooManyRedirects)
+	}
+
+	/// `request` sent to `url` once, on a kept connection where there is
+	/// one, and the head of its answer read. A kept connection the server
+	/// had closed meanwhile is given up, and a new one tried, where the body
+	/// can be sent again.
+	var fn once(
+		request: &Request,
+		url: &Url,
+		source: &var dyn io::Read,
+		streamed: bool,
+	): Result<Incoming, HttpError> = {
+		if url.secure && self.socket.isSome() then
+			return .Err(.InvalidUrl("https is not sent over a Unix-domain socket"))
+		val key = self.keyOf(&url)
+		if !streamed {
+			if self.taken(&key) is .Some(kept) {
+				var wire = kept
+				if self.exchange(&var wire, &request, &url, &var source, false) is .Ok(
+					.Some(head),
+				) {
+					return answered(request.method, head, wire, key)
+				}
+			}
+		}
+		var wire = self.connect(&url)?
+		val .Some(head) = self.exchange(&var wire, &request, &url, &var source, streamed)? else {
+			return .Err(.Malformed("the connection ended before an answer came"))
+		}
+		return answered(request.method, head, wire, key)
+	}
+
+	/// The request written on `wire`, and the head of its answer; nothing
+	/// where the connection ended first.
+	fn exchange(
+		wire: &var Wire,
+		request: &Request,
+		url: &Url,
+		source: &var dyn io::Read,
+		streamed: bool,
+	): Result<Option<Head>, HttpError> = {
+		writeRequest(&var wire, &request, &url, &var source, streamed)?
+		return readHead(&var wire)
+	}
+
+	/// A new connection to where `url` leads: TLS over TCP for `https`.
+	fn connect(url: &Url): Result<Wire, HttpError> = {
+		if url.secure {
+			val made = match self.timeout {
+				.Some(within) => TlsStream::connectWithin(&url.host, url.port, within)
+				.None => TlsStream::connect(&url.host, url.port)
+			}
+			return match move made {
+				.Ok(stream) => {
+					var secure = stream
+					secure.setTimeout(self.timeout)
+					Result::Ok(Wire(link: .Secure(secure), timeout: self.waitMillis()))
+				}
+				.Err(.Io(error)) => .Err(failed(error))
+				.Err(error) => .Err(.Tls(error))
+			}
+		}
+		val stream = match self.socket {
+			.Some(path) => Stream::unix(path)
+			.None => match self.timeout {
+				.Some(within) => Stream::tcpWithin(&url.host, url.port, within)
+				.None => Stream::tcp(&url.host, url.port)
+			}
+		}
+		return match move stream {
+			.Ok(stream) => .Ok(Wire(link: .Plain(stream), timeout: self.waitMillis()))
+			.Err(error) => .Err(failed(error))
+		}
+	}
+
+	/// Which kept connections may carry a request to `url`.
+	fn keyOf(url: &Url): String = match self.socket {
+		.Some(path) => "unix:\(path)"
+		.None => url.key()
+	}
+
+	fn waitMillis(): i64 = match self.timeout {
+		.Some(within) => within.asMillis().max(0)
+		.None => -1
+	}
+
+	/// A kept connection to `key`, taken out of those kept.
+	var fn taken(key: str): Option<Wire> = {
+		for (at, idle) in self.idle.forwards().enumerate() {
+			if idle.key == key {
+				val found = self.idle.remove(at)
+				return .Some(found.wire)
+			}
+		}
+		return .None
+	}
+
+	/// `wire` kept for the next request to `key`.
+	var fn keep(key: String, wire: Wire) = self.idle.push(Idle(key: key, wire: wire))
+}
+
+/// An answer whose head has come, its body framed as the head says.
+fn answered(method: Method, head: Head, wire: Wire, key: String): Result<Incoming, HttpError> = {
+	val framing = framingOf(method, &head)?
+	val keeps = keepsOf(&head, &framing)
+	val decoder = decoderOf(&head, &framing)?
+	return .Ok(Incoming(
+		status: head.status,
+		headers: head.headers,
+		wire: wire,
+		framing: framing,
+		keeps: keeps,
+		key: key,
+		decoder: decoder,
+	))
+}
+
+/// The request's line, its headers and its body, written on `wire`.
+fn writeRequest(
+	wire: &var Wire,
+	request: &Request,
+	url: &Url,
+	source: &var dyn io::Read,
+	streamed: bool,
+): Result<void, HttpError> = {
+	var head = String()
+	head.push("\(request.method.name()) \(url.target) HTTP/1.1\r\n")
+	if !request.has("Host") then head.push("Host: \(url.hostHeader())\r\n")
+	if !request.has("User-Agent") then head.push("User-Agent: wip\r\n")
+	if !request.has("Accept-Encoding") then head.push("Accept-Encoding: gzip, deflate\r\n")
+	// What the body is, and how long.
+	var file: Option<fs::File> = .None
+	val length: Option<i64> =
+		if streamed then request.length
+		else match request.body {
+			.Empty => if request.method == .Get || request.method == .Head then .None else .Some(0)
+			.Bytes(bytes) => .Some(bytes.len())
+			.File(path) => {
+				val opened = fs::File::open(path).mapErr((error) => HttpError::Io(error))?
+				val size = opened.size().mapErr((error) => HttpError::Io(error))?
+				file = .Some(opened)
+				Option::Some(size)
+			}
+		}
+	match length {
+		.Some(count) => head.push("Content-Length: \(count)\r\n")
+		.None => if streamed then head.push("Transfer-Encoding: chunked\r\n")
+	}
+	for header in request.headers {
+		head.push("\(header.name): \(header.value)\r\n")
+	}
+	head.push("\r\n")
+	wire.writeAll(&head).mapErr(failed)?
+	if streamed then return sendStreamed(&var wire, &var source, request.length)
+	match request.body {
+		.Bytes(bytes) => wire.writeAll(&bytes).mapErr(failed)?
+		.File(..) => match move file {
+			.Some(opened) => {
+				var reading = opened
+				sendStreamed(&var wire, &var reading, length)?
+			}
+			.None => {}
+		}
+		.Empty => {}
+	}
+	return .Ok()
+}
+
+/// What `source` reads, sent as it comes: as many bytes as `length` says,
+/// or in chunks where it says nothing.
+fn sendStreamed(
+	wire: &var Wire,
+	source: &var dyn io::Read,
+	length: Option<i64>,
+): Result<void, HttpError> = {
+	var room = [0 as u8; 65536]
+	var sent = 0
+	while true {
+		val got = source.read(&var room).mapErr((error) => HttpError::Io(error))?
+		if got == 0 then break
+		sent += got
+		match length {
+			.Some(count) => {
+				if sent > count then return .Err(.Io(.InvalidData))
+				wire.writeAll(&room[0..got]).mapErr(failed)?
+			}
+			.None => {
+				var size = "\(got, radix: 16)\r\n"
+				wire.writeAll(&size).mapErr(failed)?
+				wire.writeAll(&room[0..got]).mapErr(failed)?
+				var end = "\r\n"
+				wire.writeAll(&end).mapErr(failed)?
+			}
+		}
+	}
+	match length {
+		.Some(count) => if sent != count then return .Err(.Io(.InvalidData))
+		.None => {
+			var last = "0\r\n\r\n"
+			wire.writeAll(&last).mapErr(failed)?
+		}
+	}
+	return .Ok()
+}
+
+/// Each header given, refused where it would break the request: no name, a
+/// line break in either, or a `:` in the name.
+fn checkHeaders(request: &Request): Result<void, HttpError> = {
+	for header in request.headers {
+		if header.name.isEmpty() ||
+			header.name.contains("\n") ||
+			header.name.contains("\r") ||
+			header.name.contains(":") ||
+			header.value.contains("\n") ||
+			header.value.contains("\r") {
+			return .Err(.InvalidHeader(header.name.clone()))
+		}
+	}
+	return .Ok()
+}

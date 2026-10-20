@@ -60,7 +60,7 @@ What it does not have yet:
 - **Packages fetched from anywhere:** a program depends on another by its
   path, and nothing is downloaded.
 - **Asynchronous input and output:** threads and futures are there, an
-  event loop is not; nor UDP or TLS.
+  event loop is not; nor UDP.
 
 ## Installing
 
@@ -71,6 +71,10 @@ as `clang`, or as `WIP_CLANG` names it, and is linked by the system's C
 compiler, `cc`. On a Mac, the Command Line Tools have both
 (`xcode-select --install`); Debian 12's own `clang` is 14, so install
 `clang-15` or newer there and set `WIP_CLANG=clang-15`.
+On Linux, a program that imports `std::tls`, `std::http` or
+`std::compress` links the system's OpenSSL 3 and zlib, which the linker
+finds on Debian once `libssl-dev` and `zlib1g-dev` are installed; a Mac
+has both.
 
 `wip` is a directory: `bin/wip`, and beside it the standard library,
 `std/`, and the tools, `tools/`, which it finds from where `bin/wip` is.

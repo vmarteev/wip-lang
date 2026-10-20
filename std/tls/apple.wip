@@ -1,0 +1,410 @@
+// A Mac and iOS: TLS through Network.framework. A connection is made with
+// TLS's default options — the system's roots, the host's name checked and
+// told — and run on a dispatch queue of its own. Network.framework says
+// what happens by calling blocks, which Wip lays out as Clang does: a
+// class, flags, the function called, a descriptor, and after them what the
+// function needs. Each is of the global class, which the system neither
+// copies nor frees, and lives as long as the connection. The function is a
+// Wip function the queue calls; a call of this module's that waits, waits
+// on a semaphore that function signals.
+
+import std::c
+import std::io
+import std::libc
+import std::time::{Duration}
+
+@target(vendor = "apple")
+pub struct TlsStream {
+	connection: ptr<u8>
+	/// What the blocks and the calls share.
+	link: ptr<Link>
+	/// What was received and not yet read.
+	held: Vec<u8> = Vec()
+	given: i64 = 0
+	/// How many milliseconds a read waits; -1 waits as long as it takes.
+	timeout: i64 = -1
+	/// Whether a read gave up waiting, which leaves a receive outstanding
+	/// that no other may follow.
+	broken: bool = false
+}
+
+@target(vendor = "apple")
+@framework("Network")
+extern "C" {
+	fn nw_endpoint_create_host(host: cstring, port: cstring): ptr<u8>
+	fn nw_parameters_create_secure_tcp(configureTls: ptr<u8>, configureTcp: ptr<u8>): ptr<u8>
+	fn nw_connection_create(endpoint: ptr<u8>, parameters: ptr<u8>): ptr<u8>
+	fn nw_connection_set_queue(connection: ptr<u8>, queue: ptr<u8>)
+	fn nw_connection_set_state_changed_handler(connection: ptr<u8>, handler: ptr<StateBlock>)
+	fn nw_connection_start(connection: ptr<u8>)
+	fn nw_connection_receive(
+		connection: ptr<u8>,
+		minimum: u32,
+		maximum: u32,
+		completion: ptr<ReceiveBlock>,
+	)
+	fn nw_connection_send(
+		connection: ptr<u8>,
+		content: ptr<u8>,
+		context: ptr<u8>,
+		complete: bool,
+		completion: ptr<SendBlock>,
+	)
+	fn nw_connection_cancel(connection: ptr<u8>)
+	fn nw_release(object: ptr<u8>)
+	fn nw_error_get_error_domain(error: ptr<u8>): c_int
+	fn nw_error_get_error_code(error: ptr<u8>): c_int
+	/// TLS's and TCP's options as the system chooses them.
+	val _nw_parameters_configure_protocol_default_configuration: ptr<u8>
+	/// The context of a send that is no message of its own.
+	val _nw_content_context_default_message: ptr<u8>
+}
+
+@target(vendor = "apple")
+extern "C" {
+	fn dispatch_queue_create(label: cstring, attributes: ptr<u8>): ptr<u8>
+	fn dispatch_semaphore_create(value: i64): ptr<u8>
+	fn dispatch_semaphore_signal(semaphore: ptr<u8>): i64
+	fn dispatch_semaphore_wait(semaphore: ptr<u8>, until: u64): i64
+	fn dispatch_time(from: u64, nanos: i64): u64
+	fn dispatch_data_create(
+		bytes: ptr<u8>,
+		size: size_t,
+		queue: ptr<u8>,
+		destructor: ptr<u8>,
+	): ptr<u8>
+	fn dispatch_data_create_map(data: ptr<u8>, bytes: &var ptr<u8>, size: &var size_t): ptr<u8>
+	fn dispatch_release(object: ptr<u8>)
+	fn dlsym(handle: ptr<u8>, name: cstring): ptr<u8>
+}
+
+/// A connection's states, as Network.framework numbers them.
+@target(vendor = "apple")
+val WAITING: u32 = 1
+@target(vendor = "apple")
+val READY: u32 = 3
+@target(vendor = "apple")
+val FAILED: u32 = 4
+@target(vendor = "apple")
+val CANCELLED: u32 = 5
+
+/// Where an error comes from: the system's calls, a host's name, TLS.
+@target(vendor = "apple")
+val DOMAIN_POSIX: c_int = 1
+@target(vendor = "apple")
+val DOMAIN_DNS: c_int = 2
+@target(vendor = "apple")
+val DOMAIN_TLS: c_int = 3
+
+/// The most a receive takes at once.
+@target(vendor = "apple")
+val RECEIVE_MOST: i64 = 65536
+
+/// What the blocks and the calls share: two semaphores, one for the
+/// connection's state and one for each receive or send, and what each
+/// handler last said. The handlers write before they signal, and the calls
+/// read after they wait.
+@target(vendor = "apple")
+extern struct Link {
+	stateSignal: ptr<u8>
+	ioSignal: ptr<u8>
+	state: u32
+	errorDomain: c_int
+	errorCode: c_int
+	/// Room for what a receive brings, and how much it brought.
+	room: ptr<u8>
+	received: i64
+	/// Whether the receive found the end, and whether it or a send failed.
+	ended: bool
+	failed: bool
+	stateBlock: ptr<StateBlock>
+	receiveBlock: ptr<ReceiveBlock>
+	sendBlock: ptr<SendBlock>
+	descriptor: ptr<Descriptor>
+}
+
+/// What every block says of itself: nothing reserved, and its size.
+@target(vendor = "apple")
+extern struct Descriptor {
+	reserved: u64
+	size: u64
+}
+
+/// A block the connection's state is told to: `(state, error)`.
+@target(vendor = "apple")
+extern struct StateBlock {
+	isa: ptr<u8>
+	flags: i32
+	reserved: i32
+	invoke: Option<(block: ptr<StateBlock>, state: u32, error: ptr<u8>) => void>
+	descriptor: ptr<Descriptor>
+	link: ptr<Link>
+}
+
+/// A block a receive answers: `(content, context, complete, error)`.
+@target(vendor = "apple")
+extern struct ReceiveBlock {
+	isa: ptr<u8>
+	flags: i32
+	reserved: i32
+	invoke: Option<(block: ptr<ReceiveBlock>, content: ptr<u8>, context: ptr<u8>, complete: bool, error: ptr<u8>) => void>
+	descriptor: ptr<Descriptor>
+	link: ptr<Link>
+}
+
+/// A block a send answers: `(error)`.
+@target(vendor = "apple")
+extern struct SendBlock {
+	isa: ptr<u8>
+	flags: i32
+	reserved: i32
+	invoke: Option<(block: ptr<SendBlock>, error: ptr<u8>) => void>
+	descriptor: ptr<Descriptor>
+	link: ptr<Link>
+}
+
+/// The flag of a block of the global class, which is neither copied nor
+/// freed.
+@target(vendor = "apple")
+val BLOCK_IS_GLOBAL: i32 = 1 << 28
+
+/// The size of each block, which its descriptor says.
+@target(vendor = "apple")
+val BLOCK_SIZE: u64 = 40
+
+@target(vendor = "apple")
+fn toldState(block: ptr<StateBlock>, state: u32, error: ptr<u8>) = {
+	val link = block.link
+	link.state = state
+	if !error.isNull {
+		link.errorDomain = nw_error_get_error_domain(error)
+		link.errorCode = nw_error_get_error_code(error)
+	}
+	if state == WAITING || state == READY || state == FAILED || state == CANCELLED then
+		dispatch_semaphore_signal(link.stateSignal)
+}
+
+@target(vendor = "apple")
+fn toldReceived(
+	block: ptr<ReceiveBlock>,
+	content: ptr<u8>,
+	context: ptr<u8>,
+	complete: bool,
+	error: ptr<u8>,
+) = {
+	val link = block.link
+	link.received = 0
+	if !content.isNull {
+		var bytes: ptr<u8> = null
+		var size: size_t = 0
+		val map = dispatch_data_create_map(content, &var bytes, &var size)
+		val count = (size as i64).min(RECEIVE_MOST)
+		libc::memmove(link.room, bytes, count as size_t)
+		link.received = count
+		dispatch_release(map)
+	}
+	if complete && link.received == 0 then link.ended = true
+	if !error.isNull {
+		link.failed = true
+		link.errorDomain = nw_error_get_error_domain(error)
+		link.errorCode = nw_error_get_error_code(error)
+	}
+	dispatch_semaphore_signal(link.ioSignal)
+}
+
+@target(vendor = "apple")
+fn toldSent(block: ptr<SendBlock>, error: ptr<u8>) = {
+	val link = block.link
+	if !error.isNull {
+		link.failed = true
+		link.errorDomain = nw_error_get_error_domain(error)
+		link.errorCode = nw_error_get_error_code(error)
+	}
+	dispatch_semaphore_signal(link.ioSignal)
+}
+
+/// The class every global block is of.
+@target(vendor = "apple")
+fn globalBlockClass(): ptr<u8> = {
+	var name = String::of("_NSConcreteGlobalBlock")
+	// RTLD_DEFAULT: every image the program has loaded.
+	return dlsym((-2 as i64) as ptr<u8>, name.toCstring())
+}
+
+/// A link and its blocks, each block's function this module's.
+@target(vendor = "apple")
+fn newLink(): ptr<Link> = {
+	val link = libc::calloc(1, 128) as ptr<Link>
+	link.stateSignal = dispatch_semaphore_create(0)
+	link.ioSignal = dispatch_semaphore_create(0)
+	link.room = libc::malloc(RECEIVE_MOST as size_t)
+	link.descriptor = libc::calloc(1, 16) as ptr<Descriptor>
+	link.descriptor.size = BLOCK_SIZE
+	val class = globalBlockClass()
+	link.stateBlock = libc::calloc(1, BLOCK_SIZE as size_t) as ptr<StateBlock>
+	link.stateBlock.isa = class
+	link.stateBlock.flags = BLOCK_IS_GLOBAL
+	link.stateBlock.invoke = .Some(toldState)
+	link.stateBlock.descriptor = link.descriptor
+	link.stateBlock.link = link
+	link.receiveBlock = libc::calloc(1, BLOCK_SIZE as size_t) as ptr<ReceiveBlock>
+	link.receiveBlock.isa = class
+	link.receiveBlock.flags = BLOCK_IS_GLOBAL
+	link.receiveBlock.invoke = .Some(toldReceived)
+	link.receiveBlock.descriptor = link.descriptor
+	link.receiveBlock.link = link
+	link.sendBlock = libc::calloc(1, BLOCK_SIZE as size_t) as ptr<SendBlock>
+	link.sendBlock.isa = class
+	link.sendBlock.flags = BLOCK_IS_GLOBAL
+	link.sendBlock.invoke = .Some(toldSent)
+	link.sendBlock.descriptor = link.descriptor
+	link.sendBlock.link = link
+	return link
+}
+
+/// The link, its blocks and its room given back, once nothing more can call
+/// them: the connection has said it is cancelled.
+@target(vendor = "apple")
+fn freeLink(link: ptr<Link>) = {
+	dispatch_release(link.stateSignal)
+	dispatch_release(link.ioSignal)
+	libc::free(link.room)
+	libc::free(link.stateBlock as ptr<u8>)
+	libc::free(link.receiveBlock as ptr<u8>)
+	libc::free(link.sendBlock as ptr<u8>)
+	libc::free(link.descriptor as ptr<u8>)
+	libc::free(link as ptr<u8>)
+}
+
+/// When a wait of `millis` ends, as dispatch says it: never, for -1.
+@target(vendor = "apple")
+fn deadline(millis: i64): u64 =
+	if millis < 0 then 0xFFFFFFFFFFFFFFFF else dispatch_time(0, millis * 1000000)
+
+@target(vendor = "apple")
+fn connected(host: str, port: u16, within: Option<Duration>): Result<TlsStream, TlsError> = {
+	var named = String::of(host)
+	var service = port.toString()
+	val endpoint = nw_endpoint_create_host(named.toCstring(), service.toCstring())
+	val parameters = nw_parameters_create_secure_tcp(
+		_nw_parameters_configure_protocol_default_configuration,
+		_nw_parameters_configure_protocol_default_configuration,
+	)
+	val connection = nw_connection_create(endpoint, parameters)
+	nw_release(endpoint)
+	nw_release(parameters)
+	val link = newLink()
+	var label = String::of("std.tls")
+	val queue = dispatch_queue_create(label.toCstring(), null)
+	nw_connection_set_queue(connection, queue)
+	dispatch_release(queue)
+	nw_connection_set_state_changed_handler(connection, link.stateBlock)
+	nw_connection_start(connection)
+	val millis = millisOf(within)
+	val timedOut = dispatch_semaphore_wait(link.stateSignal, deadline(millis)) != 0
+	val state = link.state
+	var stream = TlsStream(connection: connection, link: link, timeout: millis)
+	if !timedOut && state == READY then return .Ok(stream)
+	val failed: TlsError =
+		if timedOut then .Io(.TimedOut)
+		else if link.errorDomain == DOMAIN_TLS then tlsErrorOf(link.errorCode)
+		else .Io(ioErrorOf(link.errorDomain, link.errorCode))
+	// The stream ends here, which cancels the connection and waits for it to
+	// say so.
+	destroy(stream)
+	return .Err(failed)
+}
+
+/// A TLS error by its `OSStatus`: those that say the certificate is not to
+/// be trusted, and the rest.
+@target(vendor = "apple")
+fn tlsErrorOf(code: c_int): TlsError = match code {
+	-9807 => .Certificate(String::of("its chain is not valid"))
+	-9808 => .Certificate(String::of("it is not a valid certificate"))
+	-9812 => .Certificate(String::of("its root is not known"))
+	-9813 => .Certificate(String::of("it has no root the system trusts"))
+	-9814 => .Certificate(String::of("it has expired"))
+	-9815 => .Certificate(String::of("it is not valid yet"))
+	-9843 => .Certificate(String::of("it is not for this host"))
+	-67843 | -67901 | -67818 => .Certificate(String::of("the system does not trust it"))
+	_ => .Handshake("TLS error \(code)")
+}
+
+/// An error of the system's calls, or of finding a host, as `std::io`
+/// says it.
+@target(vendor = "apple")
+fn ioErrorOf(domain: c_int, code: c_int): io::IoError = {
+	if domain == DOMAIN_DNS then return .NotFound
+	if domain == DOMAIN_POSIX {
+		libc::errnoAt()[0] = code
+		return io::lastError()
+	}
+	return .Other(code)
+}
+
+@target(vendor = "apple")
+extend TlsStream: io::Read {
+	var fn read(into: &var [u8]): Result<i64, io::IoError> = {
+		if into.isEmpty() then return .Ok(0)
+		if self.given == self.held.len() {
+			if self.broken then return .Err(.TimedOut)
+			if self.link.ended then return .Ok(0)
+			self.held.clear()
+			self.given = 0
+			nw_connection_receive(self.connection, 1, RECEIVE_MOST as u32, self.link.receiveBlock)
+			if dispatch_semaphore_wait(self.link.ioSignal, deadline(self.timeout)) != 0 {
+				self.broken = true
+				return .Err(.TimedOut)
+			}
+			if self.link.received == 0 {
+				if self.link.failed then return .Err(.ConnectionReset)
+				return .Ok(0)
+			}
+			self.held.pushAll(&self.link.room[0..self.link.received])
+		}
+		val count = (self.held.len() - self.given).min(into.len())
+		into[0..count].copyFrom(&self.held.items()[self.given..self.given + count])
+		self.given += count
+		return .Ok(count)
+	}
+}
+
+@target(vendor = "apple")
+extend TlsStream: io::Write {
+	var fn writeAll(bytes: &[u8]): Result<void, io::IoError> = {
+		if bytes.isEmpty() then return .Ok()
+		if self.broken then return .Err(.BrokenPipe)
+		// Copied by dispatch, which no destructor given says.
+		val content = dispatch_data_create(
+			c::pointerTo<u8>(bytes) as ptr<u8>,
+			bytes.len() as size_t,
+			null,
+			null,
+		)
+		nw_connection_send(
+			self.connection,
+			content,
+			_nw_content_context_default_message,
+			false,
+			self.link.sendBlock,
+		)
+		dispatch_release(content)
+		dispatch_semaphore_wait(self.link.ioSignal, deadline(-1))
+		if self.link.failed then return .Err(.BrokenPipe)
+		return .Ok()
+	}
+}
+
+@target(vendor = "apple")
+extend TlsStream: Destroy {
+	var fn destroy() = {
+		nw_connection_cancel(self.connection)
+		// Once it says it is cancelled, no handler is called again, and its
+		// blocks may go; a receive left waiting is answered first.
+		while self.link.state != CANCELLED {
+			dispatch_semaphore_wait(self.link.stateSignal, deadline(-1))
+		}
+		nw_release(self.connection)
+		freeLink(self.link)
+	}
+}

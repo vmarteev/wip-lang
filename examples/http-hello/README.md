@@ -21,5 +21,5 @@ What it shows:
   a lock.
 - **A text block with values in it** for the response, `\r` written where
   HTTP wants it.
-- **A test that is a client:** `future::together` runs the server for one
+- **A test that is a client:** `future::both` runs the server for one
   request beside a client that sends it, on a port the system chooses.

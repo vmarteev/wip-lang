@@ -1,0 +1,138 @@
+// What a server asks of the system: users and groups found by name and by
+// number, a file's owner and mode, this program copied, its group, the
+// user it acts as, its root and its limits. What changes the whole program
+// is done in a copy of it, which ends with an exit code saying whether it
+// held, so that the run goes on as it was; what only root may do is
+// checked to be refused, or done, as the run is or is not root.
+
+import std::fs
+import std::libc
+import std::process
+import std::process::{Exit, Forked, Limit, Resource, Signal}
+import std::users::{Group, User}
+
+/// Whether `check` holds in a copy of this program, which ends at once
+/// with what it answered.
+fn inCopy(check: &() => bool): bool = match process::fork().unwrap() {
+	.Parent(child) => child.wait() == Exit::Code(0)
+	.Child => libc::exitAtOnce(if check() then 0 else 1)
+}
+
+@test
+fn usersAreFoundByNameAndByNumber() = {
+	val root = User::named("root").unwrap()
+	assert(root.id == 0 && User::withId(0).unwrap().name == "root")
+	assert(User::named("no user is named this").isNone())
+	assert(User::withId(4_000_000_000).isNone())
+}
+
+@test
+fn groupsAreFoundByNameAndByNumber() = {
+	val zero = Group::withId(0).unwrap()
+	assert(Group::named(&zero.name).unwrap().id == 0)
+	assert(Group::named("no group is named this").isNone())
+}
+
+/// The program's own user and group, which an app on iOS runs as without
+/// either being among the system's.
+@target(os = "macos")
+@target(os = "linux")
+@test
+fn theProgramsUserAndGroupAreFound() = {
+	val me = User::withId(process::userId()).unwrap()
+	assert(User::named(&me.name).unwrap().id == me.id && !me.home.isEmpty())
+	val mine = Group::withId(me.group).unwrap()
+	assert(Group::named(&mine.name).unwrap() == mine)
+}
+
+@test
+fn aFileSaysItsOwnerAndTakesAMode() = {
+	val dir = fs::TempDir::new().unwrap()
+	val file = dir.join("owned")
+	fs::writeFile(&file, "x").unwrap()
+	val made = fs::meta(&file).unwrap()
+	assert(made.user == process::userId())
+	assert(fs::setMode(&file, 0o640).isOk() && fs::meta(&file).unwrap().mode == 0o640)
+	assert(fs::setOwner(&file, made.user, made.group).isOk(), "its owner gives it to itself")
+	if process::userId() != 0 then
+		assert(fs::setOwner(&file, 0, made.group) == .Err(.Denied), "only root gives a file away")
+	assert(fs::setMode(dir.join("not there"), 0o600) == .Err(.NotFound))
+}
+
+/// It copies the program, which iOS does not.
+@target(os = "macos")
+@target(os = "linux")
+@test
+fn aCopyEndsAsItSays() = {
+	match process::fork().unwrap() {
+		.Parent(child) => assert(child.wait() == .Code(7))
+		.Child => libc::exitAtOnce(7)
+	}
+	assert(inCopy(() => true) && !inCopy(() => false))
+}
+
+/// It copies the program, which iOS does not.
+@target(os = "macos")
+@target(os = "linux")
+@test
+fn aCopyMakesAGroupOfItsOwnAndSignalsIt() = {
+	// A child's end is a signal that ends nothing, sent here to a group of
+	// the copy alone.
+	assert(inCopy(() => process::newGroup().isOk() && process::sendToGroup(Signal::Child).isOk()))
+}
+
+/// It copies the program, which iOS does not.
+@target(os = "macos")
+@target(os = "linux")
+@test
+fn aLimitIsReadLoweredAndRaisedBack() = {
+	val files = process::limit(Resource::OpenFiles).unwrap()
+	assert(files.current.isSome())
+	assert(process::setLimit(Resource::OpenFiles, files.clone()).isOk())
+	assert(process::limit(Resource::OpenFiles).unwrap() == files)
+	assert(
+		inCopy(() => {
+			val lowered = Limit(current: .Some(64), most: files.most)
+			return process::setLimit(Resource::OpenFiles, lowered).isOk() &&
+				process::limit(Resource::OpenFiles).unwrap().current == .Some(64)
+		}),
+	)
+	assert(process::limit(Resource::Stack).isOk() && process::limit(Resource::CoreFile).isOk())
+	assert(process::limit(Resource::Processes).isOk())
+}
+
+/// It copies the program, which iOS does not.
+@target(os = "macos")
+@target(os = "linux")
+@test
+fn onlyRootBecomesAnotherUserOrChangesItsRoot() = {
+	val root = process::userId() == 0
+	val user = process::userId()
+	val group = process::groupId()
+	assert(inCopy(() => process::becomeUser(user, group).isOk() == root))
+	val dir = fs::TempDir::new().unwrap()
+	fs::writeFile(dir.join("marker"), "here").unwrap()
+	val path = fs::realPath(&dir.path).unwrap()
+	assert(
+		inCopy(() => {
+			val changed = process::changeRoot(&path)
+			return if root then changed.isOk() && fs::exists("/marker")
+			else changed == .Err(.Denied)
+		}),
+	)
+}
+
+/// It copies the program, which iOS does not.
+@target(os = "macos")
+@target(os = "linux")
+@test
+fn aCopyMovesIntoADirectory() = {
+	val dir = fs::TempDir::new().unwrap()
+	val path = fs::realPath(&dir.path).unwrap()
+	assert(
+		inCopy(() =>
+			process::setCurrentDir(&path).isOk() &&
+				process::currentDir().unwrap() == path &&
+				fs::exists("marker") == false),
+	)
+}

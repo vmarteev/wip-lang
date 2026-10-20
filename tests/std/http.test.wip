@@ -1,0 +1,522 @@
+// `std::http` against a server each test starts on a thread of its own:
+// what the client sends, read back as the server saw it, and what the
+// server answers, sent by hand — a body of a length, in chunks, or to the
+// connection's end; redirects; a connection kept and one closed; a body
+// read as it comes, and one sent from a file or any reader.
+
+import std::compress
+import std::fs
+import std::future
+import std::http
+import std::http::{Client, HttpError, Request}
+import std::io
+import std::net::{Listener, Stream}
+import std::time::{Duration}
+
+/// A listener on the loopback, and its port.
+fn listening(): (Listener, u16) = {
+	val listener = Listener::tcp(.Some("127.0.0.1"), 0).unwrap()
+	val .Ok(.V4(port: port, ..)) = listener.localAddress() else panic("an IPv4 address")
+	return (listener, port)
+}
+
+/// One request read off `stream`: its head, and its body as its head says
+/// — a length, or chunks undone — appended to `seen`; nothing where the
+/// client closed the connection first.
+fn received(stream: &var Stream, held: &var Vec<u8>): Option<String> = {
+	var head = String()
+	while true {
+		if indexOfText(&held, "\r\n\r\n") is .Some(end) {
+			head.pushBytes(&held[0..end + 4])
+			dropFront(&var held, end + 4)
+			break
+		}
+		if !more(&var stream, &var held) then return .None
+	}
+	var seen = head.clone()
+	val lower = head.toAsciiLower()
+	if lower.indexOf("content-length: ") is .Some(at) {
+		val digits = lower.toStr()[at + 16..]
+		val count = digits[0..digits.indexOf("\r").unwrap()].toInt().unwrap()
+		while held.len() < count {
+			more(&var stream, &var held)
+		}
+		seen.pushBytes(&held[0..count])
+		dropFront(&var held, count)
+	} else if lower.contains("transfer-encoding: chunked") {
+		while true {
+			while indexOfText(&held, "\r\n").isNone() {
+				more(&var stream, &var held)
+			}
+			val line = indexOfText(&held, "\r\n").unwrap()
+			val size = str::fromBytes(&held[0..line]).toInt(radix: 16).unwrap()
+			dropFront(&var held, line + 2)
+			while held.len() < size + 2 {
+				more(&var stream, &var held)
+			}
+			seen.pushBytes(&held[0..size])
+			dropFront(&var held, size + 2)
+			if size == 0 then break
+		}
+	}
+	return .Some(seen)
+}
+
+fn more(stream: &var Stream, held: &var Vec<u8>): bool = {
+	var room = [0 as u8; 4096]
+	val got = stream.read(&var room).unwrap()
+	held.pushAll(&room[0..got])
+	return got > 0
+}
+
+fn indexOfText(bytes: &[u8], text: str): Option<i64> = str::fromBytes(bytes).indexOf(text)
+
+/// `held` without its first `count` bytes.
+fn dropFront(held: &var Vec<u8>, count: i64) = {
+	val rest = held.splitOff(count)
+	held = rest
+}
+
+/// Answers each request with the next of `answers`, on one connection
+/// until an answer closes it, then on the next accepted; and what each
+/// request was, as the server read it.
+fn serve(listener: &Listener, answers: &[str]): Vec<String> = {
+	var seen: Vec<String> = Vec()
+	var open: Option<Stream> = .None
+	var held: Vec<u8> = Vec()
+	for answer in answers {
+		if open.isNone() {
+			val (stream, _) = listener.accept().unwrap()
+			open = .Some(stream)
+			held.clear()
+		}
+		match received(&var open.get(), &var held) {
+			.Some(request) => seen.push(request)
+			.None => {
+				// The client closed it: the answer goes on the next.
+				val (stream, _) = listener.accept().unwrap()
+				open = .Some(stream)
+				held.clear()
+				seen.push(received(&var open.get(), &var held).unwrap())
+			}
+		}
+		open.get().writeText(answer).unwrap()
+		if answer.contains("Connection: close") then open = .None
+	}
+	return seen
+}
+
+/// `answers` served while `client` runs, and what the server saw.
+fn against<R>(answers: &[str], client: &(port: u16) => R): (Vec<String>, R) = {
+	val (listener, port) = listening()
+	return future::both(() => serve(&listener, &answers), () => client(port))
+}
+
+val OK = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello"
+
+/// The same, closing the connection: the next request comes on another,
+/// as an upload's does.
+val CLOSING = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello"
+
+@test
+fn aGetIsSentAndItsAnswerRead() = {
+	val answers = [OK]
+	val (seen, response) = against(&answers, (
+		port,
+	) => http::get("http://127.0.0.1:\(port)/a?b=1").unwrap())
+	assert(response.status == 200 && response.isSuccess() && response.text().unwrap() == "hello")
+	assert(response.header("content-length") == .Some("5"), "a header in any case")
+	assert(seen[0].startsWith("GET /a?b=1 HTTP/1.1\r\n"), seen[0].toStr())
+	assert(seen[0].contains("Host: 127.0.0.1:"), seen[0].toStr())
+	assert(seen[0].contains("User-Agent: wip\r\n"), seen[0].toStr())
+}
+
+@test
+fn eachMethodAndBodyIsSentAsItSays() = {
+	val answers = [OK, OK, OK, OK, OK]
+	val (seen, _) = against(&answers, (port) => {
+		var client = Client()
+		val url = "http://127.0.0.1:\(port)/items"
+		val pair = [1, 2]
+		client.send(Request::post(url).text("a text")).unwrap()
+		client.send(Request::put(url).body([1 as u8, 2, 3])).unwrap()
+		client.send(Request::patch(url).header("X-Kind", "one").json(&pair)).unwrap()
+		client.send(Request::delete(url)).unwrap()
+		client.send(Request::head(url)).unwrap()
+	})
+	assert(
+		seen[0].startsWith("POST /items ") && seen[0].endsWith("\r\n\r\na text"),
+		seen[0].toStr(),
+	)
+	assert(seen[0].contains("Content-Type: text/plain; charset=utf-8"), seen[0].toStr())
+	assert(seen[1].startsWith("PUT ") && seen[1].contains("Content-Length: 3"), seen[1].toStr())
+	assert(seen[2].contains("X-Kind: one") && seen[2].endsWith("[1,2]"), seen[2].toStr())
+	assert(seen[2].contains("Content-Type: application/json"), seen[2].toStr())
+	assert(seen[3].startsWith("DELETE ") && seen[4].startsWith("HEAD "))
+}
+
+@test
+fn aStatusIsAnAnswerNotAnError() = {
+	val missing = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n"
+	val answers = [missing]
+	val (_, response) = against(&answers, (port) => http::get("http://127.0.0.1:\(port)/").unwrap())
+	assert(response.status == 404 && !response.isSuccess() && response.body.isEmpty())
+}
+
+@test
+fn aBodyInChunksOrToTheEndIsRead() = {
+	val chunked =
+		"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nwip \r\n6;x=y\r\nchunks\r\n0\r\nTrailer: t\r\n\r\n"
+	val closed = "HTTP/1.0 200 OK\r\nConnection: close\r\n\r\nto the end"
+	val answers = [chunked, closed]
+	val (_, (first, second)) = against(&answers, (port) => {
+		var client = Client()
+		val url = "http://127.0.0.1:\(port)/"
+		return (client.get(url).unwrap(), client.get(url).unwrap())
+	})
+	assert(first.text().unwrap() == "wip chunks" && second.text().unwrap() == "to the end")
+}
+
+@test
+fn aConnectionIsKeptForTheNextRequest() = {
+	val (listener, port) = listening()
+	val (accepted, _) = future::both(
+		() => {
+			// One connection, two requests on it.
+			var (stream, _) = listener.accept().unwrap()
+			var held: Vec<u8> = Vec()
+			received(&var stream, &var held).unwrap()
+			stream.writeText(OK).unwrap()
+			received(&var stream, &var held).unwrap()
+			stream.writeText(OK).unwrap()
+			return 1
+		},
+		() => {
+			var client = Client()
+			client.get("http://127.0.0.1:\(port)/one").unwrap()
+			client.get("http://127.0.0.1:\(port)/two").unwrap()
+		},
+	)
+	assert(accepted == 1)
+}
+
+@test
+fn aConnectionTheServerClosedIsGivenUp() = {
+	val closing = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello"
+	val answers = [closing, OK]
+	val (seen, _) = against(&answers, (port) => {
+		var client = Client()
+		client.get("http://127.0.0.1:\(port)/").unwrap()
+		client.get("http://127.0.0.1:\(port)/").unwrap()
+	})
+	assert(seen.len() == 2)
+}
+
+@test
+fn redirectsAreFollowedAsTheirStatusSays() = {
+	val see = "HTTP/1.1 303 See Other\r\nLocation: /done\r\nContent-Length: 0\r\n\r\n"
+	val keep =
+		"HTTP/1.1 307 Temporary Redirect\r\nLocation: http://127.0.0.1:{PORT}/kept\r\nContent-Length: 0\r\n\r\n"
+	val (listener, port) = listening()
+	val kept = keep.replace("{PORT}", "\(port)")
+	val answers = [see, OK, kept.toStr(), OK]
+	val (seen, _) = future::both(
+		() => serve(&listener, &answers),
+		() => {
+			var client = Client()
+			val url = "http://127.0.0.1:\(port)/start"
+			assert(client.send(Request::post(url).text("x")).unwrap().text().unwrap() == "hello")
+			assert(client.send(Request::put(url).text("y")).unwrap().status == 200)
+		},
+	)
+	assert(seen[1].startsWith("GET /done ") && !seen[1].contains("Content-Length"), seen[1].toStr())
+	assert(seen[3].startsWith("PUT /kept ") && seen[3].endsWith("y"), seen[3].toStr())
+}
+
+@test
+fn tooManyRedirectsIsAnError() = {
+	val loop = "HTTP/1.1 302 Found\r\nLocation: /again\r\nContent-Length: 0\r\n\r\n"
+	val answers = [loop, loop, loop]
+	val (_, answer) = against(&answers, (port) => {
+		var client = Client()
+		client.redirects = 2
+		return client.get("http://127.0.0.1:\(port)/")
+	})
+	assert(answer is .Err(.TooManyRedirects))
+}
+
+@test
+fn aBodyIsReadAsItComes() = {
+	var big = String()
+	for i in 0..100000 {
+		big.push("\(i % 10)")
+	}
+	val answer = "HTTP/1.1 200 OK\r\nContent-Length: 100000\r\n\r\n\(big)"
+	val answers = [answer.toStr()]
+	val (_, counted) = against(&answers, (port) => {
+		var client = Client()
+		var incoming = client.open(Request::get("http://127.0.0.1:\(port)/")).unwrap()
+		assert(incoming.status == 200)
+		var room = [0 as u8; 777]
+		var total = 0
+		while true {
+			val got = incoming.read(&var room).unwrap()
+			if got == 0 then break
+			total += got
+		}
+		return total
+	})
+	assert(counted == 100000)
+}
+
+@test
+fn aBodyIsSentFromAFileOrAnyReader() = {
+	val dir = fs::TempDir::new().unwrap()
+	assert(fs::writeFile(dir.join("sent"), "from a file").isOk())
+	val path = dir.join("sent")
+	val answers = [CLOSING, CLOSING, CLOSING]
+	val (seen, _) = against(&answers, (port) => {
+		var client = Client()
+		val url = "http://127.0.0.1:\(port)/up"
+		client.send(Request::put(url).file(&path)).unwrap()
+		var reading = fs::File::open(&path).unwrap()
+		client.upload(Request::put(url), &var reading).unwrap()
+		var again = fs::File::open(&path).unwrap()
+		client.upload(Request::put(url).length(11), &var again).unwrap()
+	})
+	assert(
+		seen[0].contains("Content-Length: 11") && seen[0].endsWith("from a file"),
+		seen[0].toStr(),
+	)
+	assert(seen[1].contains("Transfer-Encoding: chunked") && seen[1].endsWith("from a file"))
+	assert(seen[2].contains("Content-Length: 11") && seen[2].endsWith("from a file"))
+}
+
+@test
+fn anUploadOfTheWrongLengthIsAnError() = {
+	val dir = fs::TempDir::new().unwrap()
+	assert(fs::writeFile(dir.join("short"), "short").isOk())
+	val path = dir.join("short")
+	val (listener, port) = listening()
+	val (_, answer) = future::both(
+		() => {
+			val (stream, _) = listener.accept().unwrap()
+			return stream
+		},
+		() => {
+			var client = Client()
+			var reading = fs::File::open(&path).unwrap()
+			return client.upload(
+				Request::put("http://127.0.0.1:\(port)/").length(100),
+				&var reading,
+			)
+		},
+	)
+	assert(answer is .Err(.Io(.InvalidData)))
+}
+
+@test
+fn anUploadIsNotSentAgainByARedirect() = {
+	val keep =
+		"HTTP/1.1 307 Temporary Redirect\r\nLocation: /elsewhere\r\nContent-Length: 0\r\n\r\n"
+	val dir = fs::TempDir::new().unwrap()
+	assert(fs::writeFile(dir.join("once"), "once").isOk())
+	val path = dir.join("once")
+	val answers = [keep]
+	val (_, answer) = against(&answers, (port) => {
+		var client = Client()
+		var reading = fs::File::open(&path).unwrap()
+		return client.upload(Request::put("http://127.0.0.1:\(port)/"), &var reading).unwrap()
+	})
+	assert(answer.status == 307 && answer.header("Location") == .Some("/elsewhere"))
+}
+
+@test
+fn aServerThatSaysNothingTimesOut() = {
+	val (listener, port) = listening()
+	val (_, answer) = future::both(
+		() => {
+			val (stream, _) = listener.accept().unwrap()
+			std::time::sleep(Duration::millis(500))
+			return stream
+		},
+		() => {
+			var client = Client()
+			client.timeout = .Some(Duration::millis(100))
+			return client.get("http://127.0.0.1:\(port)/")
+		},
+	)
+	assert(answer is .Err(.Timeout))
+}
+
+@test
+fn whatIsNotHttpIsMalformed() = {
+	val answers = ["SMTP ready\r\n\r\n"]
+	val (_, answer) = against(&answers, (port) => http::get("http://127.0.0.1:\(port)/"))
+	assert(answer is .Err(.Malformed(..)))
+	val (_, cut) = against(
+		["HTTP/1.1 200 OK\r\nContent-Length: 10\r\nConnection: close\r\n\r\nshort"],
+		(port) => http::get("http://127.0.0.1:\(port)/"),
+	)
+	assert(cut is .Err(.Malformed(..)), "a body cut short")
+}
+
+@test
+fn jsonIsReadAsWhatItWasAskedFor() = {
+	val answer = "HTTP/1.1 200 OK\r\nContent-Length: 7\r\n\r\n[1,2,3]"
+	val answers = [answer]
+	val (_, response) = against(&answers, (port) => http::get("http://127.0.0.1:\(port)/").unwrap())
+	val numbers: Result<Vec<i64>, HttpError> = response.json()
+	assert(numbers.unwrap() == [1, 2, 3])
+	val asText: Result<String, HttpError> = response.json()
+	assert(asText is .Err(.Json(..)))
+}
+
+@test
+fn urlsAndHeadersThatCannotBeSentAreRefused() = {
+	assert(http::get("ftp://example.com/") is .Err(.InvalidUrl(..)))
+	assert(http::get("http://user:pass@example.com/") is .Err(.InvalidUrl(..)))
+	assert(http::get("http:///nohost") is .Err(.InvalidUrl(..)))
+	assert(http::get("http://example.com:99999/") is .Err(.InvalidUrl(..)))
+	var client = Client()
+	val sent = client.send(
+		Request::get("http://127.0.0.1:9/").header("X-Bad", "a\r\nInjected: yes"),
+	)
+	assert(sent is .Err(.InvalidHeader(..)))
+}
+
+@test
+fn aUnixSocketCarriesEveryRequest() = {
+	val (listener, path) = freshSocket()
+	val (seen, response) = future::both(
+		() => serve(&listener, [OK]),
+		() => {
+			var client = Client::overUnix(&path)
+			return client.get("http://localhost/info").unwrap()
+		},
+	)
+	assert(response.text().unwrap() == "hello" && seen[0].contains("Host: localhost\r\n"))
+	assert(fs::removeFile(&path).isOk())
+}
+
+@test
+fn aKeptConnectionTheServerDroppedIsTriedAgain() = {
+	val (listener, port) = listening()
+	val (served, _) = future::both(
+		() => {
+			// It answers as one that keeps the connection, then drops it.
+			var held: Vec<u8> = Vec()
+			var (first, _) = listener.accept().unwrap()
+			received(&var first, &var held).unwrap()
+			first.writeText(OK).unwrap()
+			destroy(first)
+			held.clear()
+			var (second, _) = listener.accept().unwrap()
+			received(&var second, &var held).unwrap()
+			second.writeText(OK).unwrap()
+			return 2
+		},
+		() => {
+			var client = Client()
+			client.get("http://127.0.0.1:\(port)/").unwrap()
+			client.get("http://127.0.0.1:\(port)/").unwrap()
+		},
+	)
+	assert(served == 2)
+}
+
+/// An answer of `head`'s status line and headers, then `body` with its
+/// length, or in two chunks where `chunked`.
+fn answerOf(head: str, body: &[u8], chunked: bool): String = {
+	var out = String::of(head)
+	if chunked {
+		val half = body.len() / 2
+		out.push("Transfer-Encoding: chunked\r\n\r\n")
+		out.push("\(half, radix: 16)\r\n")
+		out.pushBytes(&body[0..half])
+		out.push("\r\n\(body.len() - half, radix: 16)\r\n")
+		out.pushBytes(&body[half..])
+		out.push("\r\n0\r\n\r\n")
+	} else {
+		out.push("Content-Length: \(body.len())\r\n\r\n")
+		out.pushBytes(body)
+	}
+	return out
+}
+
+@test
+fn aCompressedBodyIsUndoneAsItComes() = {
+	var text = String()
+	for i in 0..5000 {
+		text.push("line \(i % 37)\n")
+	}
+	val gzipped = answerOf(
+		"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\n",
+		compress::gzip(&text),
+		false,
+	)
+	val deflated = answerOf(
+		"HTTP/1.1 200 OK\r\nContent-Encoding: deflate\r\n",
+		compress::zlib(&text),
+		true,
+	)
+	val answers = [gzipped.toStr(), deflated.toStr(), OK]
+	val (seen, (first, second, third)) = against(&answers, (port) => {
+		var client = Client()
+		val url = "http://127.0.0.1:\(port)/"
+		return (client.get(url).unwrap(), client.get(url).unwrap(), client.get(url).unwrap())
+	})
+	assert(seen[0].contains("Accept-Encoding: gzip, deflate\r\n"), seen[0].toStr())
+	assert(first.text().unwrap() == text && first.header("Content-Encoding") == .Some("gzip"))
+	assert(second.text().unwrap() == text, "deflate, in chunks")
+	assert(third.text().unwrap() == "hello", "the connection kept is where the next answer begins")
+}
+
+@test
+fn aCompressedBodyThatIsNotIsMalformed() = {
+	val broken = "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 5\r\n\r\nhello"
+	val unknown = "HTTP/1.1 200 OK\r\nContent-Encoding: br\r\nContent-Length: 5\r\n\r\nhello"
+	val answers = [broken, unknown]
+	val (_, (bad, kept)) = against(&answers, (port) => {
+		val bad = http::get("http://127.0.0.1:\(port)/")
+		val kept = http::get("http://127.0.0.1:\(port)/")
+		return (bad, kept)
+	})
+	assert(bad is .Err(.Malformed(..)))
+	assert(
+		kept.unwrap().text().unwrap() == "hello",
+		"an encoding it cannot undo is left as it came",
+	)
+}
+
+@test
+fn anHttpsUrlIsFetchedWhereTheNetworkIsThere() = {
+	if !reachable("example.com") {
+		io::println("skipped: no network")
+		return
+	}
+	var client = Client()
+	client.timeout = .Some(Duration::seconds(10))
+	val page = client.get("https://example.com/").unwrap()
+	assert(page.status == 200 && page.text().unwrap().contains("Example Domain"))
+	val again = client.get("https://example.com/").unwrap()
+	assert(again.status == 200, "on the connection kept")
+}
+
+/// Its server is a program the test starts, which iOS does not.
+@target(os = "macos")
+@target(os = "linux")
+@test
+fn anHttpsServerTheSystemDoesNotTrustIsRefused() = {
+	val dir = fs::TempDir::new().unwrap()
+	val port = freePort()
+	val server = untrustedServer(&dir, port)
+	var client = Client()
+	client.timeout = .Some(Duration::seconds(10))
+	val answer = client.get("https://localhost:\(port)/")
+	server.kill()
+	assert(answer is .Err(.Tls(.Certificate(..))))
+	var unix = Client::overUnix("/nowhere")
+	val overUnix = unix.get("https://localhost/")
+	assert(overUnix is .Err(.InvalidUrl(..)))
+}

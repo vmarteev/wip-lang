@@ -112,6 +112,10 @@ pub val F_SETFL: c_int = 4
 pub val F_SETFD: c_int = 2
 /// `F_SETFD`'s flag: closed in the program started.
 pub val FD_CLOEXEC: c_int = 1
+/// `fcntl`, on a Mac: whether a write to a pipe no one reads answers
+/// `EPIPE` alone, without raising `SIGPIPE`.
+@target(vendor = "apple")
+pub val F_SETNOSIGPIPE: c_int = 73
 
 /// Marks a descriptor closed in any program this one starts, as every
 /// descriptor the library opens is: a program started is given its
@@ -198,6 +202,8 @@ extern "C" {
 /// This thread's `errno`: what the last call that failed said.
 pub fn errno(): c_int = errnoAt()[0]
 
+/// Not permitted: what only root, or the owner, may do.
+pub val EPERM: c_int = 1
 /// No such file or directory.
 pub val ENOENT: c_int = 2
 /// A call cut short by a signal.
@@ -210,6 +216,8 @@ pub val EACCES: c_int = 13
 pub val EEXIST: c_int = 17
 /// A pipe whose reading end is closed.
 pub val EPIPE: c_int = 32
+/// An answer larger than the room given for it.
+pub val ERANGE: c_int = 34
 
 /// Nothing can be done now without waiting, on a descriptor that does not
 /// wait: each system numbers it its own way.
@@ -236,6 +244,10 @@ pub val ECONNRESET: c_int = 104
 pub val ENOTCONN: c_int = 57
 @target(os = "linux")
 pub val ENOTCONN: c_int = 107
+@target(vendor = "apple")
+pub val ETIMEDOUT: c_int = 60
+@target(os = "linux")
+pub val ETIMEDOUT: c_int = 110
 @target(vendor = "apple")
 pub val ENAMETOOLONG: c_int = 63
 @target(os = "linux")
@@ -372,7 +384,13 @@ extern "C" {
 	pub fn posix_spawn_file_actions_addchdir_np(actions: &var Hidden, path: cstring): c_int
 	pub fn pipe(ends: &var Pipe): c_int
 	pub fn waitpid(pid: c_int, status: &var c_int, options: c_int): c_int
+	/// A signal sent to a process, or with 0 to every process of this
+	/// one's group.
 	pub fn kill(pid: c_int, signal: c_int): c_int
+	/// This process copied: 0 in the copy, the copy's number in this one.
+	pub fn fork(): c_int
+	/// The process's group set; `setpgid(0, 0)` makes it a group of its own.
+	pub fn setpgid(pid: c_int, group: c_int): c_int
 	/// The files, and how many: what a slice crosses as. `nfds_t` is 32
 	/// bits on a Mac and 64 on Linux; a Mac reads the low 32.
 	pub fn poll(watched: &var [PollFd], timeout: c_int): c_int
@@ -524,3 +542,117 @@ pub val SIG_BLOCK: c_int = 0
 /// `pthread_sigmask`: hold back exactly the signals given.
 @target(os = "linux")
 pub val SIG_SETMASK: c_int = 2
+
+/// Holds back `SIGPIPE` on this thread while it writes to a pipe or a
+/// socket no one may read, so that the write answers `EPIPE` rather than
+/// end the program. Linux raises it in the thread that wrote; a Mac raises
+/// it for the whole process, where a descriptor is told not to raise it at
+/// all. Answers the signals held back before, for `releasePipeSignal`.
+pub fn holdPipeSignal(): Hidden = {
+	var pipeSignal = hidden()
+	sigemptyset(&var pipeSignal)
+	sigaddset(&var pipeSignal, SIGPIPE)
+	var before = hidden()
+	pthread_sigmask(SIG_BLOCK, &pipeSignal, &var before)
+	return before
+}
+
+/// Puts back the signals held back `before`, having taken a `SIGPIPE` the
+/// writing raised, so that it is not let through afterwards.
+pub fn releasePipeSignal(before: &Hidden) = {
+	var pending = hidden()
+	sigemptyset(&var pending)
+	sigpending(&var pending)
+	if sigismember(&pending, SIGPIPE) == 1 && sigismember(before, SIGPIPE) != 1 {
+		var pipeSignal = hidden()
+		sigemptyset(&var pipeSignal)
+		sigaddset(&var pipeSignal, SIGPIPE)
+		var taken = 0
+		sigwait(&pipeSignal, &var taken)
+	}
+	var ignored = hidden()
+	pthread_sigmask(SIG_SETMASK, before, &var ignored)
+}
+
+// Users and groups, and what this process may do: whom it acts as, where
+// its root is, and how much it may hold.
+
+extern "C" {
+	/// The user and group this process acts as, for what it may touch.
+	pub fn geteuid(): u32
+	pub fn getegid(): u32
+	pub fn setuid(user: u32): c_int
+	pub fn setgid(group: u32): c_int
+	pub fn chdir(path: cstring): c_int
+	pub fn chroot(path: cstring): c_int
+	/// A path's owner set, each id `0xFFFFFFFF` to leave it as it is.
+	pub fn chown(path: cstring, user: u32, group: u32): c_int
+	/// A user or a group found by name or number, its strings written into
+	/// `room`: 0 where it was looked for, and `found` null where there is
+	/// none, `ERANGE` where the room is too small.
+	pub fn getpwnam_r(
+		name: cstring,
+		into: ptr<u8>,
+		room: ptr<u8>,
+		size: size_t,
+		found: &var ptr<u8>,
+	): c_int
+	pub fn getpwuid_r(
+		id: u32,
+		into: ptr<u8>,
+		room: ptr<u8>,
+		size: size_t,
+		found: &var ptr<u8>,
+	): c_int
+	pub fn getgrnam_r(
+		name: cstring,
+		into: ptr<u8>,
+		room: ptr<u8>,
+		size: size_t,
+		found: &var ptr<u8>,
+	): c_int
+	pub fn getgrgid_r(
+		id: u32,
+		into: ptr<u8>,
+		room: ptr<u8>,
+		size: size_t,
+		found: &var ptr<u8>,
+	): c_int
+	pub fn getrlimit(resource: c_int, limit: &var Rlimit): c_int
+	pub fn setrlimit(resource: c_int, limit: &Rlimit): c_int
+}
+
+/// The groups beyond its own a process belongs to, set: the count is an
+/// `int` on a Mac and a `size_t` on Linux.
+@target(vendor = "apple")
+extern "C" {
+	pub fn setgroups(count: c_int, groups: &[u32]): c_int
+}
+@target(os = "linux")
+extern "C" {
+	pub fn setgroups(count: size_t, groups: &[u32]): c_int
+}
+
+/// How much of a resource a process may hold: what it may hold now, and
+/// the most it may raise that to. Each system says "no limit" its own way.
+pub extern struct Rlimit {
+	pub current: u64 = 0
+	pub most: u64 = 0
+}
+
+@target(vendor = "apple")
+pub val RLIM_INFINITY: u64 = 0x7FFFFFFFFFFFFFFF
+@target(os = "linux")
+pub val RLIM_INFINITY: u64 = 0xFFFFFFFFFFFFFFFF
+
+// The resources a limit is set on, each system numbering its own.
+pub val RLIMIT_STACK: c_int = 3
+pub val RLIMIT_CORE: c_int = 4
+@target(vendor = "apple")
+pub val RLIMIT_NPROC: c_int = 7
+@target(os = "linux")
+pub val RLIMIT_NPROC: c_int = 6
+@target(vendor = "apple")
+pub val RLIMIT_NOFILE: c_int = 8
+@target(os = "linux")
+pub val RLIMIT_NOFILE: c_int = 7

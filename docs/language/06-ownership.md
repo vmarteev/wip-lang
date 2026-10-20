@@ -230,7 +230,7 @@ fn main() = {
 ```
 
 - **A thread has its own:** `using` reaches the allocations of the thread
-  that calls it. A thread its body starts — `future::each`, `together` —
+  that calls it. A thread its body starts — `future::each`, `both` —
   allocates from the heap, since an arena reached from two threads at
   once would need a lock on every allocation.
 - **Calls nest,** and the innermost gives.

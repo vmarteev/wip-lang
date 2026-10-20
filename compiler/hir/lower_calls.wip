@@ -53,12 +53,14 @@ extend Lowerer {
 		names: &[Option<ast::Name>],
 		rest: Option<ast::ExprId>,
 		hint: Option<Ty>,
+		wanted: Option<Wanted>,
 		span: Span,
 	): ExprId = {
 		val file = self.ast
 		val calleeExpr = &file.exprs[callee]
 		var used = ItemUse::plain(.Some(&args), hint, span)
 		used.names = &names
+		used.wanted = wanted
 		// A struct, built as a variant is: by its name, or `Self`, where no
 		// function or variable has that name.
 		if calleeExpr.kind is .Name(sym) && self.namesStruct(sym) {
@@ -81,7 +83,11 @@ extend Lowerer {
 				item.typeArgs = typeArgs.asRef()
 				return self.pathCall(leadingDot, &segments, item, rest)
 			}
-			.Field(base, name) => {
+			.Field(base, name, typeArgs) => {
+				if typeArgs is .Some(written) {
+					used.typeArgs = .Some(&written)
+					used.methodTypeArgs = true
+				}
 				if self.variantWithDot(base, name, used) is .Some(variant) then return variant
 				// A method of the receiver's type; otherwise a field of function
 				// type, checked below.
@@ -423,7 +429,12 @@ extend Lowerer {
 		var typeList = TyList::empty()
 		if !generics.isEmpty() {
 			val sliced = self.arraysAsSlices(&generics, &var inference.tys)
-			val written = "\(name)<\(elided(generics.len()))>(…)"
+			val written =
+				if item.methodTypeArgs || item.receiver.isSome() then
+					".\(name)<\(elided(generics.len() - self.typeParamsBefore(callee)))>(…)"
+				else "\(name)<\(elided(generics.len()))>(…)"
+			if item.wanted is .Some(wanted) then
+				self.settleWanted(self.program.fns[callee].ret, wanted, &var inference.tys)
 			// The prelude's walk of copies is refused for values that own
 			// memory with the walk that lends them.
 			self.state.copiesCalled =
@@ -801,6 +812,14 @@ extend Lowerer {
 		return match file.exprs[e].kind {
 			.Path(segments, typeArgs: .Some(_), ..) =>
 				segments.len() == 1 && self.lookup(segments[0].sym).isSome()
+			// `a.x < b, c > (d)`, where `a` is a variable whose type has a
+			// field `x` and no method of that name.
+			.Field(base, name, typeArgs: .Some(_)) => {
+				val .Name(sym) = file.exprs[base].kind else return false
+				val .Some(local) = self.lookup(sym) else return false
+				val .Some(owner) = self.ownerOf(self.state.body.locals[local].ty) else return false
+				self.fieldNamed(owner, name.sym) && self.methodOf(owner, name.sym).isNone()
+			}
 			_ => false
 		}
 	}
@@ -1082,6 +1101,44 @@ extend Lowerer {
 			self.unify(declared, ownerTy, &var inference.tys)
 	}
 
+	/// How many of a function's type parameters are its type's, or its
+	/// interface's with `Self`, before its own.
+	fn typeParamsBefore(callee: FnId): i64 = {
+		if self.program.fns[callee].interfaceId is .Some(i) then
+			return 1 + self.program.interfaces[i].generics.len()
+		return match self.program.ownerOfFn(callee) {
+			.Some(owner) => self.typeGenerics(owner).len()
+			.None => 0
+		}
+	}
+
+	/// What a call's value is wanted for settles what nothing else about the
+	/// call did. Through a method, `answer.read().unwrap()` with a `Vec<i64>`
+	/// expected: the method's result, read in the type `ret` is, is that type.
+	/// Through `?`: what an `Option` or a `Result` holds. A method with type
+	/// parameters of its own says nothing, since what it answers depends on
+	/// them too.
+	var fn settleWanted(ret: Ty, wanted: Wanted, tys: &var Vec<Option<Ty>>) = match wanted {
+		.Propagated(ty) => {
+			val .Enum(id, args) = self.kind(ret) else return
+			if self.propagatedEnum(id).isNone() then return
+			val list = self.program.types.list(args).toVec()
+			if !list.isEmpty() then self.unify(list[0], ty, &var tys)
+		}
+		.Through(method, ty) => {
+			val (owner, args) = match self.kind(ret) {
+				.Struct(id, args) => (TypeDef::Struct(id), args)
+				.Enum(id, args) => (TypeDef::Enum(id), args)
+				_ => return
+			}
+			val .Some(m) = self.methodOf(owner, method) else return
+			val list = self.program.types.list(args).toVec()
+			if self.program.fns[m].generics.len() != list.len() then return
+			val answered = self.program.types.subst(self.program.fns[m].ret, &list)
+			if self.kind(answered) !is .Ref(..) then self.unify(answered, ty, &var tys)
+		}
+	}
+
 	/// The type arguments a call writes. After a generic type's name, as
 	/// `Pair<i64>::decode(…)`, as many as the type takes are the type's, and
 	/// the method's own are inferred, as they are where none are written.
@@ -1091,9 +1148,18 @@ extend Lowerer {
 		generics: &[GenericParamDef],
 		item: &ItemUse,
 	): Vec<Option<Ty>> = {
-		val ownerCount = match self.program.ownerOfFn(callee) {
-			.Some(owner) => self.typeGenerics(owner).len()
-			.None => 0
+		val ownerCount = self.typeParamsBefore(callee)
+		// After a method's name, `x.m<T>(…)`, they are the method's own, which
+		// come after its type's or its interface's.
+		if item.methodTypeArgs {
+			val first = ownerCount
+			var given: Vec<Option<Ty>> = Vec()
+			for _ in 0..first {
+				given.push(.None)
+			}
+			val written = self.explicitTypeArgs(name, &generics[first..], item.typeArgs, 0)
+			given.pushAll(&written)
+			return given
 		}
 		val writesTheType =
 			item.typeArgs is .Some(written) &&

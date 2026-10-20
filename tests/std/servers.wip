@@ -1,0 +1,76 @@
+// What the tests of the network share: whether the network is there; a
+// server with a certificate no system trusts, which `openssl` makes and
+// serves; and a Unix-domain socket of their own.
+
+import std::fs
+import std::net::{Listener, Stream}
+import std::process::{Child, Command}
+import std::time::{Duration, sleep}
+
+/// Whether `host` answers on 443 within a few seconds.
+pub fn reachable(host: str): bool = Stream::tcpWithin(host, 443, Duration::seconds(5)).isOk()
+
+/// A free port on the loopback, as the system chose it for a listener.
+pub fn freePort(): u16 = {
+	val listener = Listener::tcp(.Some("127.0.0.1"), 0).unwrap()
+	val .Ok(.V4(port: port, ..)) = listener.localAddress() else panic("an IPv4 address")
+	return port
+}
+
+/// `openssl s_server` on `port`, with a certificate made for `localhost`
+/// in `dir`, which no system trusts; and once it listens.
+pub fn untrustedServer(dir: &fs::TempDir, port: u16): Child = {
+	val made = Command::of("openssl").args([
+		"req",
+		"-x509",
+		"-newkey",
+		"rsa:2048",
+		"-nodes",
+		"-days",
+		"1",
+		"-subj",
+		"/CN=localhost",
+	])
+		.arg("-keyout")
+		.arg(dir.join("key.pem"))
+		.arg("-out")
+		.arg(dir.join("cert.pem"))
+		.output()
+		.unwrap()
+	assert(made.exit.success(), made.stderr.toStr())
+	val server = Command::of("openssl").args(["s_server", "-quiet", "-accept"])
+		.arg("\(port)")
+		.arg("-cert")
+		.arg(dir.join("cert.pem"))
+		.arg("-key")
+		.arg(dir.join("key.pem"))
+		.start()
+		.unwrap()
+	for _ in 0..100 {
+		if Stream::tcp("127.0.0.1", port).isOk() then return server
+		sleep(Duration::millis(50))
+	}
+	panic("openssl s_server did not listen")
+}
+
+/// Where the tests make their Unix-domain sockets, made once and kept: a
+/// path short enough for a socket's address, which the system's directory
+/// of temporary files may not be, as in the iOS simulator.
+pub val SOCKETS: str = "target/net-tests"
+
+/// A listener on a socket path nothing had, and the path. The path is
+/// claimed by binding it: the tests run in two processes at once, debug
+/// and release.
+pub fn freshSocket(): (Listener, String) = {
+	if !fs::exists(SOCKETS) then fs::makeDir(SOCKETS)
+	var n = 0
+	while true {
+		val name = "\(SOCKETS)/socket-\(n)"
+		match Listener::unix(name.toStr()) {
+			.Ok(listener) => return (listener, name)
+			.Err(.AddressInUse) => n += 1
+			.Err(error) => panic("the scratch directory takes a socket: \(error)")
+		}
+	}
+	panic("every name is taken")
+}
