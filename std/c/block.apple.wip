@@ -1,0 +1,141 @@
+// A closure given to C as a block, on Apple's systems, where a C function
+// that calls a program back takes one: Grand Central Dispatch,
+// Network.framework, `bsearch_b`, a module's Objective-C. A block is laid
+// out as Clang lays one out — its class, flags, the function C calls, a
+// descriptor — and after those, what holds the closure, and the closure's
+// captures and code, which the function the compiler writes for each type
+// of block reads.
+//
+// A block starts where the program made it. A C function that keeps one
+// copies it, through the block runtime, which calls the copy helper the
+// descriptor names; letting a copy go calls the dispose helper. What holds
+// the closure counts the program's block and every copy, and the closure
+// ends with the last of them.
+
+import std::sync::{Atomic}
+
+/// A closure C calls as a block, of the function type `F`: a C function
+/// that takes `R (^)(A, B)` takes a `&c::Block<(a: A, b: B) => R>`.
+/// `F`'s parameters and result are what C passes in registers.
+pub struct Block<F> {
+	literal: Literal
+}
+
+extend Block<F> {
+	/// A block that calls `work`. The system may call it on another thread,
+	/// more than once, and at once, so `work` reads what it captured, and
+	/// changes what an `Atomic`, a `Mutex` or a channel holds.
+	pub static fn of(work: own<F>): Block<F> = {
+		val captures = ownedClosureCaptures(&work)
+		val code = ownedClosureCode(&work)
+		val held = intoAddress(own Held(
+			count: Atomic::of(1),
+			descriptor: Descriptor(
+				reserved: 0,
+				size: LITERAL_SIZE,
+				copy: .Some(copied<F>),
+				dispose: .Some(disposed<F>),
+			),
+			work: work,
+		))
+		val descriptor =
+			offsetBytes(held, offsetOf<Held<F>>("descriptor") as i64) as ptr<Descriptor>
+		return Block(Literal(
+			isa: stackBlockClass(),
+			flags: BLOCK_HAS_COPY_DISPOSE,
+			reserved: 0,
+			invoke: blockInvoke<F>(),
+			descriptor: descriptor,
+			held: held,
+			captures: captures,
+			code: code,
+		))
+	}
+}
+
+extend Block<F>: Destroy {
+	/// The program's block ends as a copy does: the closure ends once no
+	/// copy C made holds it either.
+	var fn destroy() = disposed<F>(addressOf(&var self.literal) as ptr<Literal>)
+}
+
+/// A block as Clang lays it out, and after its descriptor what the function
+/// the compiler writes reads: what holds the closure, at 32; the closure's
+/// captures, at 40, and its code, at 48.
+extern struct Literal {
+	isa: ptr<u8>
+	flags: i32
+	reserved: i32
+	invoke: ptr<u8>
+	descriptor: ptr<Descriptor>
+	held: ptr<u8>
+	captures: ptr<u8>
+	code: ptr<u8>
+}
+
+/// What every block of the kind says of itself: nothing reserved, its size,
+/// and the helpers the block runtime copies and lets go of it with.
+extern struct Descriptor {
+	reserved: u64
+	size: u64
+	copy: Option<(to: ptr<Literal>, from: ptr<Literal>) => void>
+	dispose: Option<(block: ptr<Literal>) => void>
+}
+
+/// What holds a block's closure, on the heap: how many blocks hold it, the
+/// descriptor they name, and the closure.
+struct Held<F> {
+	count: Atomic<i64>
+	descriptor: Descriptor
+	work: own<F>
+}
+
+/// `BLOCK_HAS_COPY_DISPOSE`: the descriptor names the helpers.
+val BLOCK_HAS_COPY_DISPOSE: i32 = 1 << 25
+
+/// How large a block is, which its descriptor says.
+val LITERAL_SIZE: u64 = 56
+
+/// A copy the block runtime made: one more block holds the closure.
+fn copied<F>(to: ptr<Literal>, from: ptr<Literal>) = {
+	referenceAt<Held<F>>(from[0].held as ptr<void>).count.add(1)
+}
+
+/// A block let go of: one fewer holds the closure, and the last ends it.
+fn disposed<F>(block: ptr<Literal>) = {
+	val held = block[0].held
+	if referenceAt<Held<F>>(held as ptr<void>).count.subtract(1) == 1 then
+		destroy(fromAddress<Held<F>>(held))
+}
+
+/// The class of a block made where the program runs, which the block
+/// runtime copies to the heap.
+fn stackBlockClass(): ptr<u8> = {
+	var name = String::of("_NSConcreteStackBlock")
+	return dlsym(RTLD_DEFAULT, name.toCstring())
+}
+
+/// `dlsym`'s handle for every image the program has loaded.
+val RTLD_DEFAULT: ptr<u8> = (-2 as i64) as ptr<u8>
+
+extern "C" {
+	fn dlsym(handle: ptr<u8>, name: cstring): ptr<u8>
+}
+
+@intrinsic
+fn ownedClosureCode<F>(work: &own<F>): ptr<u8>
+
+@intrinsic
+fn ownedClosureCaptures<F>(work: &own<F>): ptr<u8>
+
+@intrinsic
+fn blockInvoke<F>(): ptr<u8>
+
+@intrinsic
+fn intoAddress<T>(value: own<T>): ptr<u8>
+
+@intrinsic
+fn fromAddress<T>(address: ptr<u8>): own<T>
+
+@intrinsic
+fn offsetBytes(pointer: ptr<u8>, bytes: i64): ptr<u8>

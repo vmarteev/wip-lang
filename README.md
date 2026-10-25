@@ -139,6 +139,7 @@ wip build hello.wip   # write an executable
 wip test hello.wip    # run the program's tests
 wip check hello.wip   # report everything wrong, write nothing
 wip fmt hello.wip     # lay the file out in the one way Wip is written
+wip fix hello.wip     # take out a needless clone() or move, as the warnings say
 ```
 
 The entry file's directory is the program's module, and every directory it

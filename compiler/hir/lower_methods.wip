@@ -4,6 +4,7 @@ import syntax as ast
 import syntax::{
 	ARGUMENT_COUNT,
 	CANNOT_BORROW_VAR,
+	CLONE_OF_PLAIN,
 	DROP_RULES,
 	Diagnostic,
 	Edit,
@@ -331,6 +332,8 @@ extend Lowerer {
 			)
 			return .Some(self.giveUpItem(item))
 		}
+		if self.text(name.sym) == "clone" && noArgs && item.names.isEmpty() then
+			self.cloneOfPlain(base, receiver, ty, name, &item)
 		// Plain data is its own clone, which no method of its type need say.
 		val ownClone = match self.ownerOf(ty) {
 			.Some(owner) => self.methodOf(owner, name.sym).isSome()
@@ -361,6 +364,41 @@ extend Lowerer {
 				return self.dispatch(receiver, array, name, item)
 		}
 		return self.dispatch(receiver, owner, name, item)
+	}
+
+	/// Warns of `clone()` called on a value of plain data, which naming
+	/// copies, where the clone is that copy: its type has no `clone` of its
+	/// own, or one derived or the library's. One the program writes may do
+	/// more; a reference's clone is what it refers to, read through it, and
+	/// a type parameter may own memory.
+	var fn cloneOfPlain(
+		base: ast::ExprId,
+		receiver: ExprId,
+		ty: Ty,
+		name: ast::Name,
+		item: &ItemUse,
+	) = {
+		if self.kind(ty) is .Ref(..) | .Own(..) || self.program.types.isGeneric(ty) then return
+		if self.state.body.exprs[receiver].kind is .Deref(..) then return
+		if self.isPoisoned(ty) || self.owns(ty) then return
+		if self.ownerOf(ty) is .Some(owner) && self.methodOf(owner, name.sym) is .Some(id) {
+			val library = self.prelude == .Some(self.program.fns[id].module as i64)
+			if !library && !self.program.derived.contains(&id) then return
+		}
+		val typeName = self.tyName(ty)
+		val end = self.ast.exprs[base].span.hi
+		self.report(
+			Diagnostic::warning(
+				CLONE_OF_PLAIN,
+				"\(typeName) is plain data, which naming copies",
+				Span::new(name.span.lo, item.span.hi),
+				"a copy of a copy",
+			).withFix("remove `.clone()`", [
+				Edit::replace(Span::new(end, item.span.hi), ""),
+			]).withNote(
+				"plain data owns no memory — no `own`, no `String`, no `Vec`, nothing with a `destroy` — and is copied wherever it is named",
+			),
+		)
 	}
 
 	/// The receiver, read as the text it holds, when it is a `String` and
@@ -394,7 +432,7 @@ extend Lowerer {
 				self.ambiguousMethod(&offered, &subject, name)
 				return .Some(self.giveUpItem(item))
 			}
-			if !missed.isEmpty() then unmet = .Some(missed[0].clone())
+			if !missed.isEmpty() then unmet = .Some(missed[0])
 			if found.isNone() && !offered.isEmpty() then found = .Some(offered[0].method)
 		}
 		val .Some(id) = found else return self.noMethod(receiver, owner, name, item, unmet)
@@ -814,7 +852,7 @@ extend Lowerer {
 			if constraints.isEmpty() then return .None
 			if !missed.isEmpty() {
 				val paramName = String::of(self.text(param.name))
-				self.unmetExtension(missed[0].clone(), &paramName, name)
+				self.unmetExtension(missed[0], &paramName, name)
 				return .Some(self.giveUpItem(item))
 			}
 			var names: Vec<String> = Vec()
@@ -833,7 +871,7 @@ extend Lowerer {
 			)
 			return .Some(self.giveUpItem(item))
 		}
-		val found = offered[0].clone()
+		val found = offered[0]
 		val kind = self.program.fns[found.method].receiver.unwrap()
 		val .Some(lent) = self.receiverExpr(receiver, kind, name, false) else {
 			return .Some(self.giveUpItem(item))

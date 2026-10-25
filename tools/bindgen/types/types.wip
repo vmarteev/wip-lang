@@ -31,6 +31,9 @@ pub enum Ty {
 	/// A function pointer that may be null, where C keeps one: `.None` is
 	/// the null.
 	Nullable(target: own<Ty>)
+	/// A block a function takes, `void (^)(int)`, on Apple's systems: a
+	/// `c::Block` of the function it calls, lent.
+	Block(params: Vec<Ty>, result: own<Ty>)
 	Void
 }
 
@@ -51,6 +54,13 @@ extend Ty {
 			"(\(written.join(", "))) => \(result.text())"
 		}
 		.Nullable(target) => "Option<\(target.text())>"
+		.Block(params, result) => {
+			var written: Vec<String> = Vec()
+			for i in 0..params.len() {
+				written.push("a\(i): \(params[i].text())")
+			}
+			"&c::Block<(\(written.join(", "))) => \(result.text())>"
+		}
 		.Void => "void"
 	}
 }
@@ -213,6 +223,7 @@ fn atDepth(text: str, position: Where, known: &Known, depth: i64): Option<Ty> = 
 	val (written, mayBeNull) = unqualifiedPointer(text)
 	// A function pointer is a Wip function type; anything
 	// else with a parenthesis in it is not a type the tool writes.
+	if written.contains("(^") then return blockPointer(written, position, known, depth)
 	if written.contains("(") then return functionPointer(written, known, depth)
 
 	// `char name[8]`, as a field's type is written; `float m[3][4]` is three
@@ -239,22 +250,22 @@ fn atDepth(text: str, position: Where, known: &Known, depth: i64): Option<Ty> = 
 		// hold a reference, which nothing may.
 		val .Some(inner) = atDepth(pointee.trim(), .Field, known, depth) else return .None
 
-		// A `const` pointer to a struct the header defines, which it does
-		// not say may be null, is one struct C reads: a reference, which a
-		// call lends a value to. Anything else — a struct C writes, a
-		// handle, a scalar, `void` — stays a pointer, since it may be null,
-		// an array, or something C keeps; a call lends `&var x` to one all
-		// the same.
+		// A `const` pointer to a struct the header defines is one struct C
+		// reads: a reference, which a call lends a value to, or an `Option`
+		// of one where the header says it may be null. Anything else — a
+		// struct C writes, a handle, a scalar, `void` — stays a pointer,
+		// since it may be an array, or something C keeps; a call lends
+		// `&var x` to one all the same.
 		val lendable =
 			position is .Parameter &&
 			reads &&
-			!mayBeNull &&
 			match inner {
 				.Tag(name) => known.records.contains(&name)
 				.Mapped(..) => true
 				_ => false
 			}
 
+		if lendable && mayBeNull then return .Some(.Nullable(own .Ref(target: own (inner))))
 		if lendable then return .Some(.Ref(target: own (inner)))
 
 		return .Some(.Pointer(own (inner)))
@@ -330,6 +341,27 @@ fn functionPointer(written: str, known: &Known, depth: i64): Option<Ty> = {
 	if byValue(&returned, known) || params.any((param) => byValue(param, &known)) then return .None
 
 	return .Some(.Function(params: params, result: own (returned)))
+}
+
+/// `void (^)(int)`, as clang spells a block: a parameter's, read as a
+/// function pointer's parts are. A block a struct holds, or one a function
+/// answers, is not written.
+fn blockPointer(written: str, position: Where, known: &Known, depth: i64): Option<Ty> = {
+	if position !is .Parameter then return .None
+	val (result, rest) = written.splitOnce("(^")?
+	// What clang writes of the block's nullability, inside the parentheses:
+	// one that may be null is an `Option` of it.
+	val (said, list) = rest.splitOnce(")")?
+	val mayBeNull = said.contains("_Nullable") || said.contains("__nullable")
+	val .Some(.Function(params, result: returned)) = functionPointer(
+		"\(result)(*)\(list)",
+		known,
+		depth,
+	) else {
+		return .None
+	}
+	val block = Ty::Block(params: params, result: returned)
+	return .Some(if mayBeNull then .Nullable(own block) else block)
 }
 
 /// Whether `ty` is a struct or a union the header defines, by value.

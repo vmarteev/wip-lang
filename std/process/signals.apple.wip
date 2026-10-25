@@ -1,0 +1,87 @@
+// A Mac and iOS: a kqueue, each signal a filter of its own, and the
+// signal ignored, which the filter sees all the same.
+
+import std::io
+import std::libc
+
+extern "C" {
+	fn kqueue(): c_int
+	@symbol("kevent")
+	fn keventOf(
+		queue: c_int,
+		changes: &[SignalEvent],
+		events: &var [SignalEvent],
+		timeout: ptr<u8>,
+	): c_int
+	@symbol("kevent")
+	fn keventWithin(
+		queue: c_int,
+		changes: &[SignalEvent],
+		events: &var [SignalEvent],
+		timeout: &Moment,
+	): c_int
+}
+
+extern struct SignalEvent {
+	ident: u64 = 0
+	filter: i16 = 0
+	flags: u16 = 0
+	fflags: u32 = 0
+	data: i64 = 0
+	udata: u64 = 0
+}
+
+extern struct Moment {
+	seconds: i64
+	nanos: i64
+}
+
+/// kqueue's filter for a signal, and what adds one.
+val EVFILT_SIGNAL: i16 = -6
+val EV_ADD: u16 = 0x1
+
+fn caughtBy(signals: &[Signal]): Result<c_int, io::IoError> = {
+	val queue = kqueue()
+	if queue < 0 then return .Err(io::lastError())
+	var changes: Vec<SignalEvent> = Vec()
+	for signal in signals {
+		// A child's end ends nothing already, and ignored, the system would
+		// wait for no child: what it was would be lost.
+		if signal != Signal::Child then libc::signal(signal.number(), libc::SIG_IGN)
+		changes.push(SignalEvent(
+			ident: signal.number() as u64,
+			filter: EVFILT_SIGNAL,
+			flags: EV_ADD,
+		))
+	}
+	var none: Vec<SignalEvent> = Vec()
+	if keventOf(queue, &changes.items(), &var none.items(), null) < 0 {
+		val why = io::lastError()
+		released(queue, &signals)
+		return .Err(why)
+	}
+	return .Ok(queue)
+}
+
+fn taken(queue: c_int, waiting: bool): Vec<Signal> = {
+	var room: Vec<SignalEvent> = Vec()
+	for _ in 0..8 {
+		room.push(SignalEvent())
+	}
+	var none: Vec<SignalEvent> = Vec()
+	val count =
+		if waiting then keventOf(queue, &none.items(), &var room.items(), null)
+		else keventWithin(queue, &none.items(), &var room.items(), Moment(seconds: 0, nanos: 0))
+	var came: Vec<Signal> = Vec()
+	for i in 0..(count as i64).max(0) {
+		if Signal::numbered(room[i].ident as i64) is .Some(signal) then came.push(signal)
+	}
+	return came
+}
+
+fn released(queue: c_int, signals: &[Signal]) = {
+	for signal in signals {
+		if signal != Signal::Child then libc::signal(signal.number(), libc::SIG_DFL)
+	}
+	libc::close(queue)
+}

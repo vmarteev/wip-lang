@@ -1,0 +1,85 @@
+// A Mac and iOS: how a program is started with only the descriptors it is
+// given, and how this one finds its own file.
+
+import std::io
+import std::libc
+
+import std::libc::{Hidden, Pipe, closeOnExec, fcntl, malloc, pipe}
+
+/// A pipe, both ends marked closed in a program started. A Mac has no
+/// `pipe2`, so they are marked once made; what it starts is started with
+/// every descriptor closed but those its file actions name, so no program
+/// another thread starts in between is given them.
+fn openedPipe(ends: &var Pipe): c_int = {
+	val made = pipe(&var ends)
+	if made == 0 {
+		closeOnExec(ends.reading)
+		closeOnExec(ends.writing)
+	}
+	return made
+}
+
+/// The writing end of the pipe to a program's input, made to answer
+/// `EPIPE` once the program stops reading rather than raise `SIGPIPE`,
+/// which would end this program. A Mac raises it for the whole process,
+/// where any thread that does not hold it back takes it, so the descriptor
+/// itself is told.
+fn quietEnd(writing: c_int) = {
+	fcntl(writing, libc::F_SETNOSIGPIPE, 1)
+}
+
+/// Starts the program: on a Mac with every descriptor closed but those its
+/// file actions give it and the standard streams `kept`, which it shares
+/// with this program.
+fn started(
+	child: &var c_int,
+	program: cstring,
+	actions: &var Hidden,
+	kept: &[c_int],
+	arguments: ptr<cstring>,
+	environment: ptr<cstring>,
+): c_int = {
+	for fd in kept {
+		libc::posix_spawn_file_actions_addinherit_np(&var actions, fd)
+	}
+	var attributes = libc::spawnAttributes()
+	libc::posix_spawnattr_init(&var attributes)
+	libc::posix_spawnattr_setflags(
+		&var attributes,
+		libc::POSIX_SPAWN_CLOEXEC_DEFAULT |
+			libc::POSIX_SPAWN_SETSIGMASK |
+			libc::POSIX_SPAWN_SETSIGDEF,
+	)
+	freshSignals(&var attributes)
+	val failed = libc::posix_spawnpWith(
+		&var child,
+		program,
+		&actions,
+		&attributes,
+		arguments,
+		environment,
+	)
+	libc::posix_spawnattr_destroy(&var attributes)
+	return failed
+}
+
+// This program: where it runs, which file it is, and its number.
+
+/// The path the system has for this program's file, which may go through
+/// a link: a Mac's loader says it.
+fn executableName(): Result<String, io::IoError> = {
+	var size = 0
+	_NSGetExecutablePath(null, &var size)
+	val room = malloc(size)
+	if room.isNull then return .Err(io::lastError())
+	val written = _NSGetExecutablePath(room, &var size)
+	val path = takenFrom(room)
+	if written != 0 then return .Err(.Other(code: 0))
+	return .Ok(path)
+}
+
+extern "C" {
+	/// Writes the path into `into`, where `size` says there is room; where
+	/// there is not, answers -1 and sets `size` to the room it needs.
+	fn _NSGetExecutablePath(into: ptr<u8>, size: &var u32): c_int
+}

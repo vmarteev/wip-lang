@@ -1,26 +1,30 @@
-// A generator's frame: the locals of its `next` live in the generator, after
-// its declared fields, so that each call finds them where the last one left
-// them.
+// A generator's frame: the locals of its `next` that one call leaves for the
+// next live in the generator, after its declared fields, so that each call
+// finds them where the last one left them.
 //
-// Every local but the generator itself and the result is kept there, and
-// every place of the body that names one is rewritten to reach it through the
-// generator: `_3.1` becomes `(*_0).4.1`. An index names a local, not a place,
-// so a kept index is copied into a local of its own just before the statement
-// that reads it.
+// A local is kept there where it is live where the generator starts again —
+// on from a `yield`, or dropped while it waits there — or where its address
+// is taken; the rest are each call's own, as any function's locals are, and
+// stay where the machine keeps them fastest. Every place of the body that
+// names a kept local is rewritten to reach it through the generator: `_3.1`
+// becomes `(*_0).4.1`. An index names a local, not a place, so a kept index
+// is copied into a local of its own just before the statement that reads it.
 
-import std::collections::{Map}
+import std::collections::{Map, Set}
 import std::mem
-import hir::{Ty}
+import hir::{Program, Ty, TyKind}
 
 /// Which field of the generator each local of `body` is kept in, counted from
 /// `base`, its first field after the declared ones: `None` for the generator
-/// itself and the result, which stay where they are.
-fn fields(body: &Body, base: u32): Vec<Option<u32>> = {
+/// itself, the result, and what one call does not leave for the next, which
+/// stay where they are.
+fn fields(program: &Program, body: &Body, base: u32): Vec<Option<u32>> = {
+	val kept = keptLocals(&program, &body)
 	var next = base
 	var fields: Vec<Option<u32>> = Vec()
 	for i in 0..(body.locals.len() as u32) {
 		val local = Local(i)
-		if body.params.contains(&local) || body.ret == Option::Some(local) {
+		if body.params.contains(&local) || body.ret == Option::Some(local) || !kept[i as i64] {
 			fields.push(.None)
 			continue
 		}
@@ -30,11 +34,176 @@ fn fields(body: &Body, base: u32): Vec<Option<u32>> = {
 	return fields
 }
 
+/// Which locals of a generator's `next` its frame keeps: those live where a
+/// call begins — each block the entry goes to: the start, on from each
+/// `yield`, and what drops what is in scope at each — and those whose address
+/// is taken. Live is worked out backwards over the blocks until nothing
+/// changes: a local is live where some way on from there reads it before it
+/// is written whole.
+fn keptLocals(program: &Program, body: &Body): Vec<bool> = {
+	val count = body.locals.len()
+	var addressed: Vec<bool> = Vec::filled(count, false)
+	var uses: Vec<Vec<bool>> = Vec()
+	var defs: Vec<Vec<bool>> = Vec()
+	for block in body.blocks {
+		var used: Vec<bool> = Vec::filled(count, false)
+		var written: Vec<bool> = Vec::filled(count, false)
+		// The fields of each local written so far in the block, one by one: a
+		// local each of whose fields is, is written whole, as a value built
+		// field by field is.
+		var parts: Map<Local, Set<u32>> = Map()
+		for statement in block.statements {
+			val (reads, whole, fieldsWritten) = touched(&statement, &var addressed)
+			for local in reads {
+				if !written[local.index as i64] then used[local.index as i64] = true
+			}
+			for local in whole {
+				written[local.index as i64] = true
+			}
+			for (local, field) in fieldsWritten {
+				if written[local.index as i64] then continue
+				if !parts.contains(&local) then parts.put(local, Set())
+				var .Some(seen) = parts.get(&local) else continue
+				var grown = seen.clone()
+				grown.add(field)
+				val all = fieldCount(&program, body.locals[local.index as i64].ty)
+				if all > 0 && grown.len() == all then written[local.index as i64] = true
+				parts.put(local, grown)
+			}
+		}
+		var reading = Touched(reads: Vec(), writes: Vec())
+		rewriteTerminator(block.terminator.clone(), &var reading)
+		for local in reading.reads {
+			if !written[local.index as i64] then used[local.index as i64] = true
+		}
+		uses.push(used)
+		defs.push(written)
+	}
+	var liveIn: Vec<Vec<bool>> = Vec()
+	for _ in 0..body.blocks.len() {
+		liveIn.push(Vec::filled(count, false))
+	}
+	var changed = true
+	while changed {
+		changed = false
+		// Backwards, as live flows: a block's own reads, and what is live on
+		// where it goes and it does not write.
+		var b = body.blocks.len()
+		while b > 0 {
+			b -= 1
+			var live = uses[b].clone()
+			for next in successors(&body.blocks[b].terminator) {
+				for i in 0..count {
+					if liveIn[next.index as i64][i] && !defs[b][i] then live[i] = true
+				}
+			}
+			if live != liveIn[b] {
+				liveIn[b] = live
+				changed = true
+			}
+		}
+	}
+	var kept = addressed
+	for start in successors(&body.blocks[0].terminator) {
+		for i in 0..count {
+			if liveIn[start.index as i64][i] then kept[i] = true
+		}
+	}
+	return kept
+}
+
+/// The locals a statement reads, and those it writes whole, which it reads
+/// nothing of; a local whose address it takes is noted in `addressed`.
+fn touched(
+	statement: &Statement,
+	addressed: &var Vec<bool>,
+): (Vec<Local>, Vec<Local>, Vec<(Local, u32)>) = {
+	if statement is .Assign(rvalue: .AddressOf(place), ..) &&
+		!(place.projections.first() is .Some(.Deref)) {
+		addressed[place.local.index as i64] = true
+	}
+	var touching = Touched(reads: Vec(), writes: Vec())
+	rewriteStatement(statement.clone(), &var touching)
+	// What a statement assigns, or a call answers into, is written whole
+	// where it is a local and no part of one, and a part of it written reads
+	// nothing of it, unless it is reached through the local, a reference;
+	// what anything else writes — a variant, what a drop reads — is read.
+	val assigns =
+		statement is .Assign(..) | .Call(..) | .Alloc(..) | .AllocBuffer(..) | .Arith(..)
+		| .Atomic(..)
+	var reads = touching.reads
+	var whole: Vec<Local> = Vec()
+	var fieldsWritten: Vec<(Local, u32)> = Vec()
+	for place in touching.writes {
+		if assigns && place.projections.isEmpty() {
+			whole.push(place.local)
+			continue
+		}
+		val through = place.projections.items().any((projection) => projection is .Deref)
+		if !assigns || through then reads.push(place.local)
+		if assigns && place.projections.len() == 1 && place.projections[0] is .Field(index) then
+			fieldsWritten.push((place.local, index))
+		for projection in place.projections {
+			if projection is .Index(index) then reads.push(index)
+		}
+	}
+	return (reads, whole, fieldsWritten)
+}
+
+/// How many fields a value of `ty` has, as places name them: a `str`'s, a
+/// slice reference's and a buffer's two, a struct's own; 0 where a value is
+/// not taken apart so.
+fn fieldCount(program: &Program, ty: Ty): i64 = match program.types.kind(ty) {
+	.Str => 2
+	.Ref(inner, ..) | .Own(inner) => if program.types.kind(inner) is .Slice(..) then 2 else 0
+	.Struct(id, ..) => program.structs[id].fields.len()
+	_ => 0
+}
+
+/// Where a terminator may go next.
+fn successors(terminator: &Terminator): Vec<BlockId> = match terminator {
+	.Goto(target) => [target]
+	.Branch(thenBlock, otherwise, ..) => [thenBlock, otherwise]
+	.Switch(cases, otherwise, ..) => {
+		var targets: Vec<BlockId> = Vec()
+		for (_, target) in cases {
+			targets.push(target)
+		}
+		targets.push(otherwise)
+		targets
+	}
+	_ => Vec()
+}
+
+/// The places a statement or a terminator names, as it reads and writes
+/// them, changing nothing.
+struct Touched {
+	reads: Vec<Local>
+	writes: Vec<Place>
+}
+
+extend Touched: Rewrite {
+	var fn read(place: Place): Place = {
+		self.reads.push(place.local)
+		for projection in place.projections {
+			if projection is .Index(index) then self.reads.push(index)
+		}
+		return place
+	}
+
+	var fn written(place: Place): Place = {
+		self.writes.push(place.clone())
+		return place
+	}
+
+	fn rewritesCallee(): bool = true
+}
+
 /// The types of what a generator keeps between calls: its frame, in the order
 /// of its fields.
-pub fn frameTys(body: &Body): Vec<Ty> = {
+pub fn frameTys(program: &Program, body: &Body): Vec<Ty> = {
 	var tys: Vec<Ty> = Vec()
-	val kept = fields(&body, 0)
+	val kept = fields(&program, &body, 0)
 	for (i, field) in kept.forwards().enumerate() {
 		if field.isSome() then tys.push(body.locals[i].ty)
 	}
@@ -43,10 +212,10 @@ pub fn frameTys(body: &Body): Vec<Ty> = {
 
 /// Moves the locals of a generator's `next` into the generator, whose declared
 /// fields are the first `base`.
-pub fn keepInFrame(body: &var Body, base: u32) = {
+pub fn keepInFrame(program: &Program, body: &var Body, base: u32) = {
 	var rewrite = Keeper(
 		this: body.params[0],
-		fields: fields(&body, base),
+		fields: fields(&program, &body, base),
 		shadows: Map(),
 		locals: mem::replace(&var body.locals, Vec()),
 		copies: Vec(),

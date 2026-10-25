@@ -82,6 +82,7 @@ says which others it uses.
 | `wip test file.wip [filter]` | compiles the program with its `.test.wip` files and runs the `@test` functions; given a package, only that package's |
 | `wip check file.wip` | reports everything wrong, and writes nothing; given a package, every module of it, imported or not; `--target` checks as another target compiles the program; `--dump-diagnostics` writes them plainly, [for a tool](#diagnostics); `--dump-hir` writes what the checker made of the program, [for a tool](#the-checked-program), and with `--library` the standard library's items too |
 | `wip fmt [paths]` | lays `.wip` files out in one way; `--check` writes nothing and fails if any would change; `-` formats standard input |
+| `wip fix [programs]` | applies the fixes that change no meaning to programs and their tests ([below](#fixes)); `--check` writes nothing and fails if any would change |
 | `wip doc [program]` | writes the program's documentation as pages, into `doc` unless `-o` says otherwise, with its packages' and the standard library's; `--std` the standard library's alone |
 | `wip doc path::to::item` | prints one item's documentation: `std::collections::Map`, `str::lastIndexOf` |
 | `wip debug program [args]` | starts lldb on a Mac, gdb elsewhere, or the one `--debugger` names, on a program `wip build` wrote, with the scripts that show Wip's values; `--scripts` prints where the scripts are |
@@ -575,6 +576,28 @@ error E0010 digits are separated by one `_`
   fix keep one `_`
   edit main.wip:6:13-6:15 _
 ```
+
+### Fixes
+
+Some warnings say that code is longer than what it means — a `move` the
+compiler would make (E0451), a copy where a move would do (E0448), a
+`clone()` of plain data (E0464) — and their fixes change nothing a program
+does. `wip fix` applies those. Each program it is given, a file or a
+package's directory as `wip check` takes it, or the current directory's,
+is checked with its tests; where it has no errors, each such fix is made
+in the files under the directory the command is typed in, and the program
+is checked again, since a copy taken away can make another value's use its
+last, until none is left. What it changed is laid out as `wip fmt` lays
+it out, and each file is listed with the codes it was fixed for:
+
+```
+main.wip: E0448 ×2, E0464
+```
+
+A program with errors is left as it is; the fixes of errors, and of the
+warnings whose fix changes what a program does, are offered in an editor
+and made by hand. `--check` writes nothing, and fails where something
+would change.
 
 ### The checked program
 

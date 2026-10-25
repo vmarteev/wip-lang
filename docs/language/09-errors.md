@@ -224,8 +224,9 @@ fn checkAge(age: i64): i64 =
 ```
 
 A panic is for what must not happen: an index outside a container, a
-division by zero, `unwrap` on nothing, arithmetic that overflows. Those all
-panic with a message of their own, naming the place.
+division by zero, `unwrap` on nothing, arithmetic that overflows, a number
+made a type that cannot hold it. Those all panic with a message of their
+own, naming the place.
 
 After the place come the calls, innermost first, each with its function
 and line, in a debug build and a release build alike:
@@ -310,7 +311,10 @@ fn main() = {
 ```
 
 An assert inside a function is checked when it runs, in every build, even
-where its condition could be worked out ahead.
+where its condition could be worked out ahead. One in a generic
+function's signature is checked while the program is compiled, for each
+set of type arguments a call gives
+([page 3](03-functions.md#generic-functions)).
 
 ## `never`
 

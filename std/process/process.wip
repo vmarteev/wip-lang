@@ -17,7 +17,6 @@ import std::libc::{
 	ENOMEM,
 	EINTR,
 	F_SETFL,
-	Hidden,
 	O_NONBLOCK,
 	O_RDONLY,
 	O_WRONLY,
@@ -29,7 +28,6 @@ import std::libc::{
 	WNOHANG,
 	calloc,
 	close,
-	closeOnExec,
 	environ,
 	errno,
 	errnoAt,
@@ -41,7 +39,6 @@ import std::libc::{
 	holdPipeSignal,
 	kill,
 	malloc,
-	pipe,
 	poll,
 	posix_spawn_file_actions_addchdir_np,
 	posix_spawn_file_actions_addclose,
@@ -49,7 +46,6 @@ import std::libc::{
 	posix_spawn_file_actions_addopen,
 	posix_spawn_file_actions_destroy,
 	posix_spawn_file_actions_init,
-	posix_spawnp,
 	pthread_create,
 	pthread_detach,
 	read,
@@ -438,104 +434,6 @@ fn closeEnd(end: c_int) = {
 	if end >= 0 then close(end)
 }
 
-/// A pipe, both ends closed in every program started unless a file action
-/// gives it one: Linux makes it so marked.
-@target(os = "linux")
-fn openedPipe(ends: &var Pipe): c_int = libc::pipe2(&var ends, libc::O_CLOEXEC)
-
-/// A pipe, both ends marked closed in a program started. A Mac has no
-/// `pipe2`, so they are marked once made; what it starts is started with
-/// every descriptor closed but those its file actions name, so no program
-/// another thread starts in between is given them.
-@target(vendor = "apple")
-fn openedPipe(ends: &var Pipe): c_int = {
-	val made = pipe(&var ends)
-	if made == 0 {
-		closeOnExec(ends.reading)
-		closeOnExec(ends.writing)
-	}
-	return made
-}
-
-/// The writing end of the pipe to a program's input, made to answer
-/// `EPIPE` once the program stops reading rather than raise `SIGPIPE`,
-/// which would end this program. A Mac raises it for the whole process,
-/// where any thread that does not hold it back takes it, so the descriptor
-/// itself is told; Linux raises it in the thread that wrote, which holds it
-/// back while it writes.
-@target(vendor = "apple")
-fn quietEnd(writing: c_int) = {
-	fcntl(writing, libc::F_SETNOSIGPIPE, 1)
-}
-@target(os = "linux")
-fn quietEnd(writing: c_int) = {}
-
-/// Starts the program: on Linux, as `posix_spawnp` does, each descriptor
-/// this program opened marked to be closed in it.
-@target(os = "linux")
-fn started(
-	child: &var c_int,
-	program: cstring,
-	actions: &var Hidden,
-	kept: &[c_int],
-	arguments: ptr<cstring>,
-	environment: ptr<cstring>,
-): c_int = {
-	var attributes = libc::spawnAttributes()
-	libc::posix_spawnattr_init(&var attributes)
-	libc::posix_spawnattr_setflags(
-		&var attributes,
-		libc::POSIX_SPAWN_SETSIGMASK | libc::POSIX_SPAWN_SETSIGDEF,
-	)
-	freshSignals(&var attributes)
-	val failed = libc::posix_spawnpWith(
-		&var child,
-		program,
-		&actions,
-		&attributes,
-		arguments,
-		environment,
-	)
-	libc::posix_spawnattr_destroy(&var attributes)
-	return failed
-}
-
-/// Starts the program: on a Mac with every descriptor closed but those its
-/// file actions give it and the standard streams `kept`, which it shares
-/// with this program.
-@target(vendor = "apple")
-fn started(
-	child: &var c_int,
-	program: cstring,
-	actions: &var Hidden,
-	kept: &[c_int],
-	arguments: ptr<cstring>,
-	environment: ptr<cstring>,
-): c_int = {
-	for fd in kept {
-		libc::posix_spawn_file_actions_addinherit_np(&var actions, fd)
-	}
-	var attributes = libc::spawnAttributes()
-	libc::posix_spawnattr_init(&var attributes)
-	libc::posix_spawnattr_setflags(
-		&var attributes,
-		libc::POSIX_SPAWN_CLOEXEC_DEFAULT |
-			libc::POSIX_SPAWN_SETSIGMASK |
-			libc::POSIX_SPAWN_SETSIGDEF,
-	)
-	freshSignals(&var attributes)
-	val failed = libc::posix_spawnpWith(
-		&var child,
-		program,
-		&actions,
-		&attributes,
-		arguments,
-		environment,
-	)
-	libc::posix_spawnattr_destroy(&var attributes)
-	return failed
-}
-
 /// A program started holds back no signal, and handles those a program
 /// catches with `Signals` as it would had nothing said otherwise: what this
 /// program holds back, or has the system ignore so as to catch it, is its
@@ -823,28 +721,3 @@ pub fn besideProgram(path: str): String = match executable() {
 
 /// This program's number, which the system gives each process.
 pub fn id(): i64 = getpid() as i64
-
-/// The path the system has for this program's file, which may go through
-/// a link: a Mac's loader says it.
-@target(vendor = "apple")
-fn executableName(): Result<String, io::IoError> = {
-	var size = 0
-	_NSGetExecutablePath(null, &var size)
-	val room = malloc(size)
-	if room.isNull then return .Err(io::lastError())
-	val written = _NSGetExecutablePath(room, &var size)
-	val path = takenFrom(room)
-	if written != 0 then return .Err(.Other(code: 0))
-	return .Ok(path)
-}
-
-/// The path the system has for this program's file: Linux's link to it.
-@target(os = "linux")
-fn executableName(): Result<String, io::IoError> = .Ok("/proc/self/exe")
-
-@target(vendor = "apple")
-extern "C" {
-	/// Writes the path into `into`, where `size` says there is room; where
-	/// there is not, answers -1 and sets `size` to the room it needs.
-	fn _NSGetExecutablePath(into: ptr<u8>, size: &var u32): c_int
-}

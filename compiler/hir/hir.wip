@@ -38,6 +38,9 @@ pub struct Program {
 	/// Each top-level `assert`, as the function the compiler runs to check
 	/// it.
 	pub var asserts: Vec<FnId>
+	/// Each instance of a generic's signature `assert`, with the call it is
+	/// checked for.
+	pub var instanceAsserts: Vec<InstanceAssert> = Vec()
 	/// Every module's path, `a::b::c`, with the root module first and empty.
 	pub var modules: Vec<String>
 	pub var structs: Arena<StructDef>
@@ -294,8 +297,8 @@ extend Program {
 				return "(\(written.join(", ")))"
 			}
 			// A generator has no name a program could write, so it is called
-			// by what it is.
-			if def.generator is .Some(generator) {
+			// by what it is, unless its function named it.
+			if def.generator is .Some(generator) && def.name == Symbol::generator() {
 				if symbol then return self.argsOf("generator\(id.index())", args, &interner, symbol)
 				val elem = self.types.substFind(generator.elem, &self.types.list(args))
 				return "Iterator<\(self.nameOf(elem, &interner, symbol))>"
@@ -572,6 +575,19 @@ extend Program {
 		val .Enum(id, args) = self.types.kind(ty) else return false
 		return self.preludeItems.enumeration(.Option) == .Some(id) &&
 			self.types.kind(self.types.list(args)[0]) is .Fn(..)
+	}
+
+	/// Whether `ty` is an `Option` of what C passes as one pointer, laid out
+	/// as that pointer with `.None` as null: a function, or a reference to
+	/// one value — not a slice, a `&dyn` or a closure, which are two words.
+	pub fn nullablePointer(ty: Ty): bool = {
+		val .Enum(id, args) = self.types.kind(ty) else return false
+		if self.preludeItems.enumeration(.Option) != .Some(id) then return false
+		return match self.types.kind(self.types.list(args)[0]) {
+			.Fn(..) => true
+			.Ref(inner, ..) => self.types.kind(inner) !is .Slice(..) | .Dyn(..) | .Fn(..)
+			_ => false
+		}
 	}
 
 	/// Whether `interfaceId` is the prelude's `Clone`, which plain data
@@ -1237,11 +1253,28 @@ pub struct FnDef {
 	/// not compile it: the initializer of a `@comptime` constant, or a
 	/// top-level `assert`.
 	pub var compileTime: bool
+	/// The `assert`s of a generic's signature, each a compile-time function
+	/// with the generic's type parameters and no value parameters, made for
+	/// each instance a call makes.
+	pub asserts: Vec<FnId> = Vec()
+	/// For such an assert, the generic whose signature it is in.
+	pub assertOf: Option<FnId> = .None
 	/// The module that declares it, and whether it is exported.
 	pub module: u32
 	pub isPub: bool
 	/// The signature.
 	pub span: Span
+}
+
+/// A generic's signature `assert`, made for the type arguments of an
+/// instance: the function that checks it, the call the program wrote that
+/// made the instance, and the call of the generic itself where that was in
+/// another generic's instance.
+@derive(Clone)
+pub struct InstanceAssert {
+	pub assertion: FnId
+	pub call: Span
+	pub through: Option<Span>
 }
 
 /// What a test expects of its run.
@@ -1416,6 +1449,15 @@ pub enum Intrinsic {
 	/// `offsetBytes(pointer, bytes)`: the address that many bytes on from a C
 	/// pointer, which C writes `p + n`.
 	OffsetBytes
+	/// `ownedClosureCode(work)` and `ownedClosureCaptures(work)`: an owned
+	/// closure's code and what it captured, read through a `&`, which a
+	/// `c::Block` calls the closure with.
+	OwnedClosureCode
+	OwnedClosureCaptures
+	/// `blockInvoke<F>()`: the address of the function a `c::Block<F>` is
+	/// called through, in C's convention, which the compiler writes for each
+	/// `F`: it reads the closure from the block and calls it.
+	BlockInvoke
 	/// `frameTables()`: the program's tables of functions and lines, one for
 	/// each module, listed in the prelude's object.
 	FrameTables
@@ -1897,8 +1939,10 @@ pub enum ExprKind {
 	/// `+%`, `-%` and `*%`: the answer wraps rather than the program
 	/// panicking.
 	Binary(op: BinaryOp, lhs: ExprId, rhs: ExprId, wrapping: bool)
-	/// A numeric conversion to the expression's type.
-	Cast(inner: ExprId)
+	/// A numeric conversion to the expression's type. An integer made a
+	/// narrower one, or one of the other sign, panics where the value does
+	/// not fit, unless it `wraps`: then it keeps the low bits, as `as%` does.
+	Cast(inner: ExprId, wraps: bool)
 	/// `colour as i64`: which variant an enum that carries nothing holds, as
 	/// the expression's integer type.
 	VariantIndex(inner: ExprId)
@@ -2028,7 +2072,7 @@ extend ExprKind {
 			.Some(e) => [e]
 			.None => Vec()
 		}
-		.Lend(e) | .Unary(operand: e, ..) | .Cast(e) | .VariantIndex(e) | .Len(e)
+		.Lend(e) | .Unary(operand: e, ..) | .Cast(inner: e, ..) | .VariantIndex(e) | .Len(e)
 		| .Field(base: e, ..) | .Deref(e) | .Ref(e) | .Undropped(e) | .Move(e) | .Own(e)
 		| .ArrayRepeat(elem: e, ..) | .Unsize(e) | .IsNull(e) | .CstrToStr(e)
 		| .DynRef(value: e, ..) | .Closure(env: e, ..) | .LendClosure(e) | .Is(scrutinee: e, ..)

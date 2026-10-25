@@ -1,0 +1,106 @@
+// The function a `c::Block` is called through. A block is laid out as Clang
+// lays one out — its class, flags, this function and a descriptor — and
+// then, at fixed places, what holds the closure, the closure's captures and
+// its code. C calls this function with the block first, as it calls any
+// block; it reads the closure from the block and calls it as Wip calls a
+// closure, its captures first. A block's types are what C passes in
+// registers, so the arguments go on as they came.
+
+import hir::{PTR_U8, Ty}
+
+/// Where a block holds its closure's captures and its code.
+val CAPTURES_AT: u64 = 40
+val CODE_AT: u64 = 48
+
+extend Llvm {
+	/// The function blocks of the function type `f` are called through,
+	/// written once the queue reaches it.
+	var fn blockInvoke(f: Ty): u32 = {
+		if self.blocks.get(&f) is .Some(name) then return name
+		val symbol = "wip.block_invoke.\(self.blocks.len())"
+		val name = self.global(globalName(symbol))
+		self.blocks.put(f, name)
+		self.pendingBlocks.push((f, name))
+		return name
+	}
+
+	/// The function blocks of `f` are called through, named `name`.
+	var fn defineBlockInvoke(f: Ty, name: u32) = {
+		val .Fn(params, ret) = self.program.types.kind(f) else {
+			panic("a block's type is a function's")
+		}
+		var all: Vec<Ty> = [PTR_U8].toVec()
+		all.pushAll(&self.program.types.list(params))
+		val cSig = self.signatureWith(&all, ret, true, false)
+		val wipSig = self.indirectSignature(&all, ret, false)
+		val subprogram = self.debug.subprogram(
+			"block of \(self.program.tyName(f, self.interner))",
+			.None,
+		)
+		val place = self.debug.noLine(subprogram)
+		var code: Vec<Instruction> = Vec()
+		val at = (result: Option<Value>, op: Op) => Instruction(
+			result: result,
+			op: op,
+			at: .Some(place),
+		)
+		val block = Value::Param(0)
+		code.push(at(.Some(.Wrapper(1)), .Offset(base: block.clone(), offset: .Int(CAPTURES_AT))))
+		code.push(
+			at(
+				.Some(.Wrapper(2)),
+				.Load(t: .Ptr, address: .Wrapper(1), align: 8, assumes: .Nothing),
+			),
+		)
+		code.push(at(.Some(.Wrapper(3)), .Offset(base: block, offset: .Int(CODE_AT))))
+		code.push(
+			at(
+				.Some(.Wrapper(4)),
+				.Load(t: .Ptr, address: .Wrapper(3), align: 8, assumes: .Nothing),
+			),
+		)
+		// The captures first, where the block was; then what C passed.
+		var args: Vec<Arg> = Vec()
+		for (i, slot) in wipSig.params.forwards().enumerate() {
+			val value = if i == 0 then Value::Wrapper(2) else Value::Param(i as u32)
+			args.push(Arg(value: Val::of(value, slot.t.clone()), attrs: slot.attrs.clone()))
+		}
+		val call = Call(
+			ret: wipSig.retType(),
+			retAttrs: wipSig.retAttrs(),
+			variadic: .None,
+			callee: .Wrapper(4),
+			args: args,
+			tail: false,
+		)
+		match wipSig.ret {
+			.Some(slot) => {
+				code.push(at(.Some(.Wrapper(5)), .Call(own call)))
+				code.push(at(.None, .Ret(.Some(Val::of(.Wrapper(5), slot.t.clone())))))
+			}
+			.None => {
+				code.push(at(.None, .Call(own call)))
+				code.push(at(.None, .Ret(.None)))
+			}
+		}
+		var cParams: Vec<Param> = Vec()
+		for (i, slot) in cSig.params.forwards().enumerate() {
+			cParams.push(Param(
+				t: slot.t.clone(),
+				attrs: slot.attrs.clone(),
+				name: .Some(.Param(i as u32)),
+			))
+		}
+		val function = Function(
+			symbol: name,
+			linkage: .Hidden,
+			ret: cSig.retType(),
+			retAttrs: cSig.retAttrs(),
+			params: cParams,
+			returns: true,
+			subprogram: subprogram.node,
+			blocks: [Block(label: .Start, instructions: code)],
+		)
+		self.define(String(), function)
+	}
+}

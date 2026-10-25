@@ -14,6 +14,7 @@ import syntax::{
 	INVALID_OPERANDS,
 	MOVE_INFERRED,
 	MOVE_NOT_A_PLACE,
+	NOTHING_TO_WRAP,
 	NOT_A_VALUE,
 	NULL_WITHOUT_TYPE,
 	REF_NOT_A_PLACE,
@@ -79,7 +80,7 @@ extend Lowerer {
 			.Try(value) => self.tryExpr(value, hint, span)
 			.Assert(cond, note, message) => self.assertion(cond, note, message, span)
 			.Lambda(..) => self.lambda(id, hint, false, span)
-			.Cast(expr: inner, ty) => self.cast(inner, ty, span)
+			.Cast(expr: inner, ty, op, wrapping) => self.cast(inner, ty, op, wrapping, span)
 			// Literals take the type expected of them.
 			.Float(v) => self.alloc(.Float(v), if hint == .Some(F32) then F32 else F64, span)
 			.Str(s) => self.alloc(.Str(s), if hint == .Some(CSTRING) then CSTRING else STR, span)
@@ -317,7 +318,9 @@ extend Lowerer {
 		val integers = self.kind(st) is .Int(..) && self.kind(at) is .Int(..)
 		if op !is .Shl | .Shr || st == at || !integers then return amount
 		val span = self.state.body.exprs[amount].span
-		return self.alloc(.Cast(amount), st, span)
+		// A shift takes its amount modulo the width, so the low bits are
+		// all it reads.
+		return self.alloc(.Cast(inner: amount, wraps: true), st, span)
 	}
 
 	/// An operand of `op`. A comparison reads its operands, as a method reads
@@ -527,17 +530,18 @@ extend Lowerer {
 	}
 
 	fn unknownName(sym: Symbol, span: Span): Diagnostic = {
+		if self.valueInSignatureAssert(sym, span) is .Some(diagnostic) then return diagnostic
 		val text = self.text(sym)
 		var candidates: Vec<str> = Vec()
 		for scope in self.state.scopes {
 			for i in 0..scope.len() {
-				candidates.push(self.text(scope.keyAt(i).clone()))
+				candidates.push(self.text(scope.keyAt(i)))
 			}
 		}
 		for scope in self.here() {
 			val fns = &self.modules[scope].fns
 			for i in 0..fns.len() {
-				candidates.push(self.text(fns.keyAt(i).clone()))
+				candidates.push(self.text(fns.keyAt(i)))
 			}
 		}
 		val diagnostic = Diagnostic::error(
@@ -1718,7 +1722,15 @@ extend Lowerer {
 
 	/// `expr as T`: a conversion between numbers, between a character and a
 	/// number, between C pointers, and between a pointer and an address.
-	var fn cast(expr: ast::ExprId, ty: ast::TypeId, span: Span): ExprId = {
+	/// `expr as% T`, with `wrapping`: an integer or a character as an
+	/// integer type, its low bits kept.
+	var fn cast(
+		expr: ast::ExprId,
+		ty: ast::TypeId,
+		op: Span,
+		wrapping: bool,
+		span: Span,
+	): ExprId = {
 		val target = self.resolveTy(ty)
 		// `null as ptr<T>` is a pointer of the type it is cast to.
 		val hint: Option<Ty> =
@@ -1728,13 +1740,17 @@ extend Lowerer {
 		val e = self.operand(expr, hint)
 		val from = self.tyOf(e)
 		if self.isPoisoned(from) || self.hasError(target) then return self.errorExpr(span)
+		if wrapping then return self.wrappingCast(e, from, target, op, span)
+		if self.program.types.isInteger(target) then self.constantNarrowed(e, target, op, span)
 		val types = &self.program.types
 		if types.isNumeric(from) && types.isNumeric(target) then
-			return self.alloc(.Cast(e), target, span)
+			return self.alloc(.Cast(inner: e, wraps: false), target, span)
 		// A character is its number, cut to the integer type's width as any
 		// number is; of the numbers, only a byte is always a character.
-		if from == CHAR && types.isInteger(target) then return self.alloc(.Cast(e), target, span)
-		if target == CHAR && from == U8 then return self.alloc(.Cast(e), target, span)
+		if from == CHAR && types.isInteger(target) then
+			return self.alloc(.Cast(inner: e, wraps: false), target, span)
+		if target == CHAR && from == U8 then
+			return self.alloc(.Cast(inner: e, wraps: false), target, span)
 		if target == CHAR && types.isInteger(from) {
 			self.report(
 				Diagnostic::error(
@@ -1753,7 +1769,10 @@ extend Lowerer {
 		// An enum whose variants carry nothing is a number: which variant it
 		// holds.
 		if self.kind(from) is .Enum(id, ..) && types.isInteger(target) {
-			if self.namesAlone(id) then return self.alloc(.VariantIndex(e), target, span)
+			if self.namesAlone(id) {
+				self.variantsFit(id, target, span)
+				return self.alloc(.VariantIndex(e), target, span)
+			}
 			val name = self.tyName(from)
 			self.report(
 				Diagnostic::error(
@@ -1771,14 +1790,15 @@ extend Lowerer {
 		// The bits are the same, so nothing is converted.
 		val fromPointer = self.kind(from) is .Ptr(..)
 		val toPointer = self.kind(target) is .Ptr(..)
-		if fromPointer && toPointer then return self.alloc(.Cast(e), target, span)
+		if fromPointer && toPointer then
+			return self.alloc(.Cast(inner: e, wraps: false), target, span)
 		// A pointer as the integer that is its address, and back: what C's
 		// handles are passed as, and compared or hashed by. Only an integer as
 		// wide as a pointer holds one.
 		val fromAddress = from == USIZE || from == ISIZE || from == U64 || from == I64
 		val toAddress = target == USIZE || target == ISIZE || target == U64 || target == I64
 		if (fromPointer && toAddress) || (fromAddress && toPointer) then
-			return self.alloc(.Cast(e), target, span)
+			return self.alloc(.Cast(inner: e, wraps: false), target, span)
 		var diagnostic = Diagnostic::error(
 			INVALID_CAST,
 			"cannot convert \(self.tyName(from)) to \(self.tyName(target))",
@@ -1797,6 +1817,122 @@ extend Lowerer {
 		}
 		self.report(diagnostic)
 		return self.errorExpr(span)
+	}
+
+	/// `e as% target`: an integer, or a character, as an integer type,
+	/// keeping the low bits and reading them in that type. Where the type
+	/// holds every value of `e`'s, or `e` is a constant it holds, nothing is
+	/// cut, and `as` says so.
+	var fn wrappingCast(e: ExprId, from: Ty, target: Ty, op: Span, span: Span): ExprId = {
+		val types = &self.program.types
+		val integral = types.isInteger(from) || from == CHAR
+		if !integral || !types.isInteger(target) {
+			val fromName = self.tyName(from)
+			val note =
+				if types.isNumeric(from) && types.isNumeric(target) then
+					"a float made an integer stops at the type's least or greatest value, and an integer made a float rounds; neither has bits to cut"
+				else "`as%` keeps the low bits of an integer or a character, read as another integer type"
+			var diagnostic = Diagnostic::error(
+				INVALID_CAST,
+				"`as%` cannot convert \(fromName) to \(self.tyName(target))",
+				span,
+				"no bits to cut",
+			).withNote(note)
+			if types.isNumeric(from) && types.isNumeric(target) then
+				diagnostic = diagnostic.withFix("write `as`", [Edit::replace(op, "as")])
+			self.report(diagnostic)
+			return self.errorExpr(span)
+		}
+		// A byte made a byte is never said to cut nothing: C's `char` is one
+		// on one system and the other on another, so the same line cuts on
+		// one and not on the other.
+		val bytes = (from == U8 || from == I8) && (target == U8 || target == I8)
+		val holds = from == target || types.widens(from, target) || self.constantHeld(e, target)
+		if holds && !bytes then
+			self.report(
+				Diagnostic::warning(
+					NOTHING_TO_WRAP,
+					"nothing is cut: \(self.tyName(target)) holds this value",
+					op,
+					"`as%` where `as` loses nothing",
+				).withFix("write `as`", [Edit::replace(op, "as")]).withNote(
+					"`as%` says that bits are cut, so where none can be, `as` says what happens",
+				),
+			)
+		return self.alloc(.Cast(inner: e, wraps: true), target, span)
+	}
+
+	/// Whether `e` is an integer constant that the integer type `target`
+	/// holds, where its value is known while types are checked.
+	var fn constantHeld(e: ExprId, target: Ty): bool = {
+		val .Int(int: wide) = self.kind(target) else return false
+		val .Some((negative, magnitude)) = self.constantValue(e) else return false
+		return holdsValue(wide, negative, magnitude)
+	}
+
+	/// The value of `e`, where it is an integer or a character constant known
+	/// while types are checked: whether it is negative, and its magnitude.
+	var fn constantValue(e: ExprId): Option<(bool, u128)> = {
+		if !self.writtenNumber(e) then return .None
+		// A character is its number, which 32 bits hold.
+		val narrow: IntTy = match self.kind(self.tyOf(e)) {
+			.Int(int) => int
+			.Char => .U32
+			_ => return .None
+		}
+		val .Ok(.Int(bits)) = self.fold(e) else return .None
+		val value = bits & narrow.mask()
+		val negative = narrow.signed() && (value >> (narrow.bits() - 1) as u128) == 1
+		return .Some(if negative then (true, (narrow.mask() ^ value) + 1) else (false, value))
+	}
+
+	/// Whether `e` is a number written as one: a literal, negated, or made
+	/// another integer type, which folding works out where it is written.
+	fn writtenNumber(e: ExprId): bool = match self.state.body.exprs[e].kind {
+		.Int(..) => true
+		.Unary(operand, ..) | .Cast(inner: operand, ..) => self.writtenNumber(operand)
+		_ => false
+	}
+
+	/// Refuses `e as target` of a constant that `target` does not hold: what
+	/// the conversion would do when the program runs is panic, and that is
+	/// known now. `as%` keeps the low bits, where that is what is meant.
+	var fn constantNarrowed(e: ExprId, target: Ty, op: Span, span: Span) = {
+		val .Some(to) = self.program.types.intTy(target) else return
+		val .Some((negative, magnitude)) = self.constantValue(e) else return
+		if holdsValue(to, negative, magnitude) then return
+		val text = if negative then "-\(magnitude)" else "\(magnitude)"
+		val name = to.name()
+		val note =
+			if negative && !to.signed() then "`\(name)` is unsigned, so it has no negative values"
+			else if to.signed() then "`\(name)` holds -\(to.minMagnitude()) to \(to.max())"
+			else "`\(name)` holds 0 to \(to.max())"
+		self.report(
+			Diagnostic::error(
+				INTEGER_OUT_OF_RANGE,
+				"this constant is \(text), which does not fit in `\(name)`",
+				span,
+				"does not fit in `\(name)`",
+			).withNote(note).withFix("keep its low bits", [Edit::replace(op, "as%")]),
+		)
+	}
+
+	/// Refuses an enum of names made an integer type that does not hold the
+	/// number of its last variant, which `as` would cut; every other holds
+	/// all of them, and needs no check where it runs.
+	var fn variantsFit(id: EnumId, target: Ty, span: Span) = {
+		val .Some(to) = self.program.types.intTy(target) else return
+		val count = self.program.enums[id].variants.len()
+		if count == 0 || (count - 1) as u128 <= to.max() then return
+		val name = self.typeName(.Enum(id))
+		self.report(
+			Diagnostic::error(
+				INTEGER_OUT_OF_RANGE,
+				"`\(name)` has \(count) variants, more than `\(to.name())` numbers",
+				span,
+				"its last variant does not fit in `\(to.name())`",
+			).withNote("`\(to.name())` holds up to \(to.max())"),
+		)
 	}
 
 	/// Whether no variant of an enum carries anything.
@@ -1856,3 +1992,7 @@ extend Lowerer {
 		)
 	}
 }
+
+/// Whether the integer type `t` holds the value of that sign and magnitude.
+fn holdsValue(t: IntTy, negative: bool, magnitude: u128): bool =
+	if negative then magnitude <= t.minMagnitude() else magnitude <= t.max()

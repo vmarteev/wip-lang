@@ -1,0 +1,98 @@
+// Linux: inotify, one descriptor, which is the watcher's, and a watch of
+// each directory, which a directory and the files in it watched share.
+
+import std::bytes
+import std::io
+import std::libc
+
+extern "C" {
+	fn inotify_init1(flags: c_int): c_int
+	fn inotify_add_watch(fd: c_int, path: cstring, mask: u32): c_int
+	fn inotify_rm_watch(fd: c_int, wd: c_int): c_int
+}
+
+val IN_NONBLOCK: c_int = 0o4000
+val IN_CLOEXEC: c_int = 0o2000000
+/// What changes a directory's entries: one written, its mode or times
+/// changed, closed after writing, renamed out or in, made or removed; and
+/// the directory itself removed or renamed.
+val WATCHED: u32 = 0x2 | 0x4 | 0x8 | 0x40 | 0x80 | 0x100 | 0x200 | 0x400 | 0x800
+/// The directory itself removed, renamed, or no longer watched.
+val ITSELF: u32 = 0x400 | 0x800 | 0x8000
+/// Only a directory is watched.
+val IN_ONLYDIR: u32 = 0x01000000
+/// More happened than the kernel kept: anything may have changed.
+val IN_Q_OVERFLOW: u32 = 0x4000
+
+struct Source {
+	fd: c_int
+}
+
+struct Handle {
+	wd: c_int
+}
+
+fn opened(): Result<Source, io::IoError> = {
+	val fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC)
+	if fd < 0 then return .Err(io::lastError())
+	return .Ok(Source(fd: fd))
+}
+
+fn closed(source: &var Source) = {
+	libc::close(source.fd)
+}
+
+fn descriptorOf(source: &Source): i32 = source.fd
+
+fn started(
+	source: &var Source,
+	directory: str,
+	name: &Option<String>,
+): Result<Handle, io::IoError> = {
+	var text = String::of(directory)
+	val wd = inotify_add_watch(source.fd, text.toCstring(), WATCHED | IN_ONLYDIR)
+	if wd < 0 then return .Err(io::lastError())
+	return .Ok(Handle(wd: wd))
+}
+
+/// The directory's watch let go, where nothing else watched shares it.
+fn stopped(source: &var Source, handle: Handle, others: &[Watched]) = {
+	if !others.any((one) => one.handle.wd == handle.wd) then inotify_rm_watch(source.fd, handle.wd)
+}
+
+/// Every event waiting read, and each watched path it is about marked.
+fn gathered(source: &var Source, watched: &var [Watched]) = {
+	var buffer = own [0 as u8; 4096]
+	while true {
+		val got = libc::read(source.fd, &var buffer) as i64
+		if got <= 0 then break
+		// Each event: its watch, its mask, a cookie, the length of the
+		// name after it, and the name, ended by a NUL.
+		var at = 0
+		while at + 16 <= got {
+			val wd = bytes::i32le(&buffer, at) as c_int
+			val mask = bytes::u32le(&buffer, at + 4)
+			val length = bytes::u32le(&buffer, at + 12) as i64
+			var end = at + 16
+			while end < at + 16 + length && buffer[end] != 0 {
+				end += 1
+			}
+			val item = str::fromBytes(&buffer[at + 16..end])
+			for i in 0..watched.len() {
+				val about =
+					(mask & IN_Q_OVERFLOW) != 0 ||
+					watched[i].handle.wd == wd &&
+						(mask & ITSELF != 0 ||
+							watched[i].name is .None ||
+							watched[i].name is .Some(name) && name == item)
+				if about then watched[i].fired = true
+			}
+			at += 16 + length
+		}
+	}
+}
+
+fn waiting(source: &Source, watched: &[Watched]): bool = {
+	var fds = [libc::PollFd(fd: source.fd, events: libc::POLLIN, answered: 0)]
+	return libc::poll(&var fds, 0) > 0
+}

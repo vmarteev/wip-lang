@@ -8,10 +8,12 @@ and an enum as the variant it holds.
 
 A type is known by its name and by the members read from it, so a program's
 own type of the same name is left alone; an enum by its shape, as the
-compiler describes one: a structure whose members are its variants, each a
-structure named `Enum::Variant`, and first its tag, `variant`, unless the
-enum is a niche, where the variant that carries nothing is an empty
-structure where the null would be.
+compiler describes one: a structure whose first member is its tag,
+`variant`, an enumeration of the variants' names, and whose others are the
+variants that carry something, each a structure named `Enum::Variant`. An
+enum that keeps its variants that carry nothing in values the one that
+carries cannot have names those values alone, over the bytes that hold
+them: any other value there is the variant that carries.
 
 A release build keeps a variable where it can, and may keep only part of
 it: a `String`'s length but not where its bytes are. A value with a part
@@ -41,7 +43,7 @@ def _fields(gdbtype):
 
 def kind_of(gdbtype):
     """What Wip value a type is: 'char', 'str', 'String', 'slice', 'Vec',
-    'Set', 'Map', 'Deque', 'enum', 'niche', or None."""
+    'Set', 'Map', 'Deque', 'enum', or None."""
     gdbtype = _plain(gdbtype)
     name = _name(gdbtype)
     # A Unicode scalar value, in 32 bits.
@@ -69,20 +71,12 @@ def _enum_kind(gdbtype, name):
     fields = _fields(gdbtype)
     if not fields or not name:
         return None
-    variants = fields
-    tagged = fields[0].name == "variant"
-    if tagged:
-        if _plain(fields[0].type).code != gdb.TYPE_CODE_ENUM:
-            return None
-        variants = fields[1:]
-    for field in variants:
+    if fields[0].name != "variant" or _plain(fields[0].type).code != gdb.TYPE_CODE_ENUM:
+        return None
+    for field in fields[1:]:
         if _name(_plain(field.type)) != name + "::" + field.name:
             return None
-    if tagged:
-        return "enum"
-    if len(variants) == 2 and _plain(variants[1].type).sizeof == 0:
-        return "niche"
-    return None
+    return "enum"
 
 
 # ---------------------------------------------------------------------------
@@ -103,24 +97,21 @@ def _text(pointer, length):
 def _variant(value):
     """The name of the variant an enum holds, and its member, or None where
     it carries nothing."""
-    gdbtype = _plain(value.type)
-    fields = gdbtype.fields()
-    if kind_of(gdbtype) == "enum":
-        tag = str(value["variant"])
-        # A C enumerator may print qualified by its type.
-        tag = tag.rsplit("::", 1)[-1]
-        for field in fields[1:]:
-            if field.name == tag:
-                return tag, value[field.name]
-        return tag, None
-    empty = fields[1]
-    address = value.address
-    if address is not None:
-        start = int(address) + empty.bitpos // 8
-        word = gdb.selected_inferior().read_memory(start, 8).tobytes()
-        if int.from_bytes(word, "little") == 0:
-            return empty.name, None
-    return fields[0].name, value[fields[0].name]
+    fields = _plain(value.type).fields()
+    tag = value["variant"]
+    held = int(tag.cast(gdb.lookup_type("unsigned long long")))
+    # A C enumerator may be named qualified by its type.
+    names = [(e.name.rsplit("::", 1)[-1], e.enumval) for e in _plain(tag.type).fields()]
+    for name, number in names:
+        if number == held:
+            for field in fields[1:]:
+                if field.name == name:
+                    return name, value[field.name]
+            return name, None
+    # A value no variant that carries nothing has is the one that carries.
+    if len(fields) == 2 and fields[1].name not in [name for name, _ in names]:
+        return fields[1].name, value[fields[1].name]
+    return "?", None
 
 
 # ---------------------------------------------------------------------------

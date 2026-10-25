@@ -69,49 +69,53 @@ extend Lowerer {
 		var generators: Map<ast::ExprId, StructId> = Map()
 		for entry in file.exprs {
 			if entry.value.kind !is .ForElement(..) || inLists.contains(&entry.handle) then continue
-			val id = self.declareGenerator(entry.value.span)
+			val id = self.declareGenerator(entry.value.span, Symbol::generator(), false)
 			generators.put(entry.handle, id)
 		}
 		return generators
 	}
 
 	/// A generator's struct, and its `next`, empty.
-	var fn declareGenerator(span: Span): StructId = {
-		val next = self.program.fns.add(FnDef(
-			name: Symbol::next(),
-			nameSpan: span,
-			symbol: .None,
-			receiver: .Some(.Var),
-			owner: .None,
-			interfaceId: .None,
-			generics: Vec(),
-			instanceOf: .None,
-			params: Vec(),
-			ret: ERROR,
-			retSpan: .None,
-			isExtern: false,
-			exportsC: false,
-			header: .None,
-			accesses: .None,
-			isVariadic: false,
-			variadicOf: .None,
-			lendsFrom: .None,
-			keeps: Vec(),
-			keepsAt: .None,
-			isLambda: false,
-			generator: .None,
-			isTailrec: false,
-			test: .None,
-			isInline: false,
-			generated: .None,
-			intrinsic: .None,
-			body: .None,
-			projects: .None,
-			compileTime: false,
-			module: self.current as u32,
-			isPub: false,
-			span: span,
-		))
+	var fn declareGenerator(span: Span, name: Symbol, isPub: bool): StructId = {
+		val next = self.program.fns.add(
+			FnDef(
+				name: Symbol::next(),
+				nameSpan: span,
+				symbol: .None,
+				receiver: .Some(.Var),
+				owner: .None,
+				interfaceId: .None,
+				generics: Vec(),
+				instanceOf: .None,
+				params: Vec(),
+				ret: ERROR,
+				retSpan: .None,
+				isExtern: false,
+				exportsC: false,
+				header: .None,
+				accesses: .None,
+				isVariadic: false,
+				variadicOf: .None,
+				lendsFrom: .None,
+				keeps: Vec(),
+				keepsAt: .None,
+				isLambda: false,
+				generator: .None,
+				isTailrec: false,
+				test: .None,
+				isInline: false,
+				generated: .None,
+				intrinsic: .None,
+				body: .None,
+				projects: .None,
+				compileTime: false,
+				module: self.current as u32,
+				// The method of `Iterator` every iterator answers, wherever it is
+				// walked.
+				isPub: true,
+				span: span,
+			),
+		)
 		val id = self.program.structs.add(StructDef(
 			isExtern: false,
 			isUnion: false,
@@ -119,7 +123,7 @@ extend Lowerer {
 			isIntrinsic: false,
 			header: .None,
 			accessors: Vec(),
-			name: Symbol::generator(),
+			name: name,
 			generics: Vec(),
 			fields: Vec(),
 			methods: [next],
@@ -128,7 +132,7 @@ extend Lowerer {
 			isEnv: false,
 			isView: false,
 			module: self.current as u32,
-			isPub: false,
+			isPub: isPub,
 			span: span,
 		))
 		self.program.fns[next].owner = .Some(.Struct(id))
@@ -149,7 +153,7 @@ extend Lowerer {
 		val .Some(interfaceId) = self.program.preludeItems.interfaceOf(.Iterator) else return
 		var generators: Vec<StructId> = Vec()
 		for i in 0..self.generators.len() {
-			generators.push(self.generators.valueAt(i).clone())
+			generators.push(self.generators.valueAt(i))
 		}
 		generators.sortByKey((id) => id.index())
 		val wanted = self.program.interfaces[interfaceId].methods.clone()
@@ -184,7 +188,7 @@ extend Lowerer {
 		span: Span,
 	): ExprId = {
 		val id = match self.generators.get(&expr) {
-			.Some(found) => found.clone()
+			.Some(found) => found
 			// Among a list's elements, which the list collects; reported where
 			// the list is.
 			.None => return self.errorExpr(span)
@@ -299,7 +303,7 @@ extend Lowerer {
 				if self.program.impls[at].ty == owner &&
 					self.program.impls[at].interfaceId == interfaceId {
 					self.program.impls[at].args = elemList
-					self.program.impls[at].conditions = generics.clone()
+					self.program.impls[at].conditions = generics
 					break
 				}
 			}
@@ -419,7 +423,12 @@ extend Lowerer {
 				),
 			)
 		}
-		val genId = self.declareGenerator(span)
+		// A generator its function names was declared with the types, so a
+		// field may hold one.
+		val genId = match self.namedGenerators.get(&span.lo) {
+			.Some(named) => named
+			.None => self.declareGenerator(span, Symbol::generator(), false)
+		}
 		val next = self.generatorNext(genId)
 		val genTy = self.intern(.Struct(id: genId, args: args))
 		val thisTy = self.intern(.Ref(inner: genTy, kind: .Var))
@@ -512,7 +521,7 @@ extend Lowerer {
 	/// starts. The function's own body makes the generator from what it was
 	/// given.
 	var fn checkGeneratorFn(body: ast::ExprId, id: FnId, genId: StructId) = {
-		val generator = self.program.structs[genId].generator.clone().unwrap()
+		val generator = self.program.structs[genId].generator.unwrap()
 		val next = generator.next
 		val genTy = self.program.fns[id].ret
 		val thisTy = self.program.fns[next].params[0].ty
@@ -750,5 +759,50 @@ extend Lowerer {
 				).withFix("put the inner one on the heap", [Edit::insert(span.lo, "own ")]),
 			)
 		}
+	}
+}
+
+extend Lowerer {
+	/// The fields of the generator a function names, read with the types'
+	/// bodies so a type that holds one knows what it holds: where it stopped,
+	/// then what the function is given. It is a view where any of that
+	/// borrows. The function, once declared, gives it the rest.
+	var fn namedGeneratorBody(f: &ast::FnDecl, id: StructId) = {
+		val span = f.sig.name.span
+		var fields = Vec::of([
+			FieldDef(
+				isPub: false,
+				isVar: true,
+				name: Symbol::state(),
+				ty: I32,
+				span: span,
+				default: .None,
+			),
+		])
+		var isView = false
+		for param in f.sig.params {
+			val ty = self.resolveTy(param.ty)
+			fields.push(FieldDef(
+				isPub: false,
+				isVar: false,
+				name: param.name.sym,
+				ty: ty,
+				span: param.span,
+				default: .None,
+			))
+			if self.program.holdsView(ty) then isView = true
+		}
+		self.program.structs[id].fields = fields
+		self.program.structs[id].isView = isView
+	}
+
+	/// Where a struct is a generator its function names, the function's
+	/// name.
+	fn namedGeneratorOf(id: StructId): Option<String> = {
+		val def = &self.program.structs[id]
+		if def.name == Symbol::generator() then return .None
+		val .Some(generator) = def.generator else return .None
+		val .Some(function) = generator.of else return .Some(String::of("its function"))
+		return .Some(String::of(self.text(self.program.fns[function].name)))
 	}
 }

@@ -21,6 +21,7 @@ pub fn inline(program: &Program, interner: &Interner, body: &var Body) = {
 		done: Map(),
 		lambdas: Set(),
 		open: Vec(),
+		recursive: Set(),
 	)
 	bodies.spliceAll(&var body)
 }
@@ -37,6 +38,10 @@ view struct Bodies {
 	lambdas: Set<FnId>
 	/// What is being spliced, so that a body never splices itself.
 	open: Vec<FnId>
+	/// What reaches itself, whose body still calls it once spliced through:
+	/// a generator that walks its own kind, as a walk of a tree does. Such a
+	/// call is never spliced, anywhere, or splicing it would never end.
+	recursive: Set<FnId>
 }
 
 extend Bodies {
@@ -49,6 +54,7 @@ extend Bodies {
 			self.open.push(id)
 			self.spliceAll(&var body)
 			self.open.pop()
+			if callsItself(&body, id) then self.recursive.add(id)
 			self.done.put(id, body)
 		}
 		return match self.done.get(&id) {
@@ -68,12 +74,20 @@ extend Bodies {
 					statement += 1
 					continue
 				}
-				val wanted = self.program.fns[id].isInline || self.lambdas.contains(&id)
-				if !wanted || self.open.contains(&id) {
+				// A generator's `next` too, which a loop over it calls once a
+				// value: spliced where it is walked, what it keeps between
+				// calls is the caller's own, as a loop's locals are.
+				val def = &self.program.fns[id]
+				val wanted = def.isInline || self.lambdas.contains(&id) || def.generator.isSome()
+				if !wanted || self.open.contains(&id) || self.recursive.contains(&id) {
 					statement += 1
 					continue
 				}
 				val .Some(callee) = self.of(id) else {
+					statement += 1
+					continue
+				}
+				if self.recursive.contains(&id) {
 					statement += 1
 					continue
 				}
@@ -195,7 +209,7 @@ fn splice(
 					_ => Place::of(freshLocal(&var body, decl.ty, .Temp))
 				}
 			}
-			else => Place::of(freshLocal(&var body, decl.ty, decl.kind.clone()))
+			else => Place::of(freshLocal(&var body, decl.ty, decl.kind))
 		}
 		places.push(place)
 	}
@@ -448,4 +462,14 @@ fn mapTerminator(
 		.Return => .Goto(after)
 		other => other
 	}
+}
+
+/// Whether `body` calls `id`.
+fn callsItself(body: &Body, id: FnId): bool = {
+	for block in body.blocks {
+		for statement in block.statements {
+			if statement is .Call(callee: .Fn(called), ..) && called == id then return true
+		}
+	}
+	return false
 }

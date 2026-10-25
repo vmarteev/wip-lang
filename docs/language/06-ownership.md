@@ -58,6 +58,15 @@ else, on a place that owns memory, it says what happens anyway, and is a
 warning (E0451) whose fix removes it. A temporary — the result of a call, a
 literal — is moved where it is used, as a place is.
 
+A copy that says nothing is a warning too. `clone()` of plain data copies
+what naming it copies (E0464); `clone()` of a value the function owns, or
+of a field of one, that nothing reads again copies what giving it would
+move (E0448), as text copied from a `String` the function is done with
+is. Each fix takes the call away, and `wip fix` makes them all
+([page 12](12-tools.md#fixes)). A copy of something used again, of a
+field of `self`, of what a reference refers to, or of a type parameter's
+value is what it says, and is not warned of.
+
 ## `own<T>`
 
 `own<T>` is a value on the heap that this value owns. It is written with

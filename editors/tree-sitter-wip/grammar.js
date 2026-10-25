@@ -66,6 +66,10 @@ module.exports = grammar({
   supertypes: $ => [$._expression, $._type, $._pattern, $._statement],
 
   conflicts: $ => [
+    // A line break after a signature: the end of a declaration with no
+    // body, or the line before the signature's `assert`, which the next
+    // token decides.
+    [$.function_declaration],
     // `f<i64>(x)`, or `i < n` (R7).
     [$._expression, $.generic_expression],
     // `(x) => …` or `(x)`: a lambda's parameter, or an expression.
@@ -184,11 +188,17 @@ module.exports = grammar({
       optional(seq(
         ':',
         field('return_type', $._type),
+        // `as Split`: the name of the generator a function that yields
+        // answers.
+        optional(seq('as', field('generator', $._type_identifier))),
         optional(field('lends_from', $.lends_from)),
       )),
       optional(field('keeps', $.keeps)),
       // A call leaves the receiver holding no view. A word only here.
       optional('empties'),
+      // What a generic asserts of its type arguments, checked for each
+      // instance a call makes: each may begin a line of its own.
+      repeat(seq(optional($._terminator), field('assert', $.assert_expression))),
       optional(seq('=', field('body', $._expression))),
     ),
 
@@ -684,9 +694,10 @@ module.exports = grammar({
       field('end', $._expression),
     )),
 
+    // `as%` keeps the low bits.
     cast_expression: $ => prec.left(PREC.cast, seq(
       field('value', $._expression),
-      'as',
+      choice('as', 'as%'),
       field('type', $._cast_type),
     )),
 

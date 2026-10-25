@@ -29,10 +29,52 @@ pub struct Layouts {
 pub enum Tag {
 	/// The variant's index, in the first `size` bytes.
 	Byte(size: u32)
-	/// No tag: the variant `payload` holds an `own` at `offset`, and a null
-	/// pointer there means the variant `empty` instead. Nothing else in
-	/// `payload` owns memory, since taking the `own` out leaves a null.
-	Niche(payload: u32, empty: u32, offset: u32)
+	/// No tag: the variant `payload` holds, in the `size` bytes at `offset`,
+	/// `count` values it never holds from `first` on — a null pointer, a
+	/// `bool` past 1, a `char` past the last, an enum's tag past its last
+	/// variant — and the variants `empties`, which hold nothing, are the
+	/// first of them, in order.
+	Niche(payload: u32, offset: u32, size: u32, first: u64, count: u64, empties: Vec<u32>)
+}
+
+extend Tag {
+	/// The value the niche holds for `variant`, where it is one of those
+	/// the niche stands for.
+	pub fn nicheValue(variant: u32): Option<u64> = match self {
+		.Niche(first, empties, ..) => match empties.indexOf(&variant) {
+			.Some(k) => .Some(first + k as u64)
+			.None => .None
+		}
+		.Byte(..) => .None
+	}
+}
+
+/// Values a type never holds: `count` of them from `first`, in the `size`
+/// bytes at `offset` of a value of it.
+@derive(Clone)
+struct NicheBytes {
+	offset: u32
+	size: u32
+	first: u64
+	count: u64
+}
+
+extend NicheBytes {
+	/// A pointer's null, at `offset`.
+	static fn pointer(offset: u32): NicheBytes = NicheBytes(
+		offset: offset,
+		size: 8,
+		first: 0,
+		count: 1,
+	)
+
+	/// The same bytes, `by` further into what holds them.
+	fn at(by: u32): NicheBytes = NicheBytes(
+		offset: self.offset + by,
+		size: self.size,
+		first: self.first,
+		count: self.count,
+	)
 }
 
 /// An enum's layout: its tag, and the offsets of each variant's fields from
@@ -52,7 +94,7 @@ extend Layouts {
 	pub static fn new(): Layouts = Layouts()
 
 	pub var fn structLayout(program: &Program, ty: Ty): Layout = {
-		if self.structs.get(&ty) is .Some(s) then return s.layout.clone()
+		if self.structs.get(&ty) is .Some(s) then return s.layout
 		// A union's fields are all at 0, over the same bytes, and it is as
 		// large as the largest of them. `@packed` puts each field right after
 		// the one before, and `@align` raises the alignment of a field or of
@@ -91,7 +133,7 @@ extend Layouts {
 		}
 		align = align.max(raised)
 		val layout = Layout(size: nextMultiple(size, align), align: align)
-		self.structs.put(ty, StructLayout(layout: layout.clone(), offsets: offsets))
+		self.structs.put(ty, StructLayout(layout: layout, offsets: offsets))
 		return layout
 	}
 
@@ -154,30 +196,40 @@ extend Layouts {
 	}
 
 	/// An enum's layout: a tag and then each variant's fields over the same
-	/// bytes, or no tag at all when a null `own`, or a null function, can
-	/// stand for the only variant without fields.
+	/// bytes, or no tag at all where values the one variant with fields
+	/// never holds can stand for the others.
 	pub var fn enumLayout(program: &Program, ty: Ty): Layout = {
-		if self.enums.get(&ty) is .Some(e) then return e.layout.clone()
+		if self.enums.get(&ty) is .Some(e) then return e.layout
 		val variants = program.variantFieldTys(ty)
 		var fields: Vec<Vec<Layout>> = Vec()
 		for variant in variants {
 			val layouts: Vec<Layout> = variant.map((f) => self.of(&program, f))
 			fields.push(layouts)
 		}
-		val niche = if variants.len() == 2 then nicheOf(&program, &variants) else Option::None
+		val niche = self.nicheOf(&program, &variants)
 		val enumLayout = match niche {
-			.Some((payload, empty, field)) => {
+			.Some((payload, bytes)) => {
 				val (offsets, end) = sequential(&fields[payload], 0)
 				var align: u32 = 1
 				for f in fields[payload] {
 					align = align.max(f.align)
 				}
-				val offset = offsets[field]
-				var all: Vec<Vec<u32>> = [Vec(), Vec()]
-				all[payload] = offsets
+				var empties: Vec<u32> = Vec()
+				var all: Vec<Vec<u32>> = Vec()
+				for i in 0..variants.len() {
+					if i != payload then empties.push(i as u32)
+					all.push(if i == payload then offsets.clone() else Vec())
+				}
 				EnumLayout(
 					layout: Layout(size: nextMultiple(end, align), align: align),
-					tag: .Niche(payload: payload as u32, empty: empty as u32, offset: offset),
+					tag: .Niche(
+						payload: payload as u32,
+						offset: bytes.offset,
+						size: bytes.size,
+						first: bytes.first,
+						count: bytes.count,
+						empties: empties,
+					),
 					offsets: all,
 				)
 			}
@@ -205,9 +257,142 @@ extend Layouts {
 				)
 			}
 		}
-		val layout = enumLayout.layout.clone()
+		val layout = enumLayout.layout
 		self.enums.put(ty, enumLayout)
 		return layout
+	}
+
+	/// Of an enum whose one variant carries fields and the rest nothing, the
+	/// variant, and values its fields never hold, enough for the rest. A
+	/// variant that owns memory takes only an `own`'s null, where nothing
+	/// else in it owns memory: a move out of it leaves zeros, which must
+	/// read as an empty variant, and a type with a `destroy` of its own is
+	/// poisoned rather than zeroed where moves are checked, so the way to
+	/// the `own` passes through none.
+	var fn nicheOf(program: &Program, variants: &[Vec<Ty>]): Option<(i64, NicheBytes)> = {
+		if variants.len() < 2 then return .None
+		var payload: Option<i64> = .None
+		for (i, fields) in variants.forwards().enumerate() {
+			if fields.isEmpty() then continue
+			if payload.isSome() then return .None
+			payload = .Some(i)
+		}
+		val .Some(carrier) = payload else return .None
+		val fields = &variants[carrier]
+		var widths: Vec<Layout> = Vec()
+		for f in fields {
+			widths.push(self.of(&program, f))
+		}
+		val (offsets, _) = sequential(&widths, 0)
+		val empties = (variants.len() - 1) as u64
+		var owning: Vec<i64> = Vec()
+		for (i, f) in fields.forwards().enumerate() {
+			if program.ownsMemory(f) then owning.push(i)
+		}
+		var best: Option<NicheBytes> = .None
+		if owning.isEmpty() {
+			for (i, f) in fields.forwards().enumerate() {
+				val .Some(bytes) = self.nicheIn(&program, f) else continue
+				if best is .Some(known) && known.count >= bytes.count then continue
+				best = .Some(bytes.at(offsets[i]))
+			}
+		} else if owning.len() == 1 && empties == 1 {
+			val i = owning[0]
+			if self.ownedNicheIn(&program, fields[i]) is .Some(bytes) then
+				best = .Some(bytes.at(offsets[i]))
+		}
+		val .Some(bytes) = best else return .None
+		if bytes.count < empties then return .None
+		return .Some((carrier, bytes))
+	}
+
+	/// The values a value of `ty` never holds, where it has some: a null
+	/// pointer — an `own`, a reference, a function, a closure's code, a
+	/// `&dyn`'s table — a `bool` past 1, a `char` past the last, an enum's
+	/// tag past its last variant or what its own niche leaves, a struct's
+	/// field's with the most, an array's first element's. Integers, floats
+	/// and `ptr<T>` hold every value; a `str`, a slice and a buffer are made
+	/// from C's pointers too, which nothing checks; and what C lays out, an
+	/// `extern struct` or a union, keeps none of Wip's rules.
+	var fn nicheIn(program: &Program, ty: Ty): Option<NicheBytes> = match program.types.kind(ty) {
+		.Bool => .Some(NicheBytes(offset: 0, size: 1, first: 2, count: 254))
+		.Char => .Some(NicheBytes(
+			offset: 0,
+			size: 4,
+			first: 0x110000,
+			count: 0x1_0000_0000 - 0x110000,
+		))
+		.Fn(..) => .Some(NicheBytes::pointer(0))
+		.Own(inner) | .Ref(inner, ..) => match program.types.kind(inner) {
+			.Slice(..) => .None
+			// A closure's code, and a `&dyn`'s table of methods, are never
+			// null.
+			.Fn(..) | .Dyn(..) => .Some(NicheBytes::pointer(8))
+			_ => .Some(NicheBytes::pointer(0))
+		}
+		.Struct(id, ..) => {
+			val def = &program.structs[id]
+			if def.isExtern || def.isUnion || def.isOpaque || def.isIntrinsic then return .None
+			var best: Option<NicheBytes> = .None
+			for (i, f) in program.fieldTys(ty).forwards().enumerate() {
+				val .Some(bytes) = self.nicheIn(&program, f) else continue
+				if best is .Some(known) && known.count >= bytes.count then continue
+				best = .Some(bytes.at(self.fieldOffset(&program, ty, i as u32)))
+			}
+			best
+		}
+		.Enum(..) => match self.enumTag(&program, ty) {
+			.Byte(size) => {
+				val variants = program.variantFieldTys(ty).len() as u64
+				val all: u64 = if size == 1 then 256 else 0x1_0000_0000
+				if variants >= all then return .None
+				Option::Some(NicheBytes(
+					offset: 0,
+					size: size,
+					first: variants,
+					count: all - variants,
+				))
+			}
+			.Niche(offset, size, first, count, empties, ..) => {
+				val used = empties.len() as u64
+				if count <= used then return .None
+				Option::Some(NicheBytes(
+					offset: offset,
+					size: size,
+					first: first + used,
+					count: count - used,
+				))
+			}
+		}
+		.Array(elem, len) if len > 0 => self.nicheIn(&program, elem)
+		_ => .None
+	}
+
+	/// In a value of `ty` that owns memory, the `own` whose null may stand
+	/// for an empty variant: one that is not a buffer, alone or the one
+	/// thing that owns memory in a struct with no `destroy` of its own.
+	var fn ownedNicheIn(program: &Program, ty: Ty): Option<NicheBytes> = match program.types.kind(
+		ty,
+	) {
+		.Own(inner) => match program.types.kind(inner) {
+			.Slice(..) | .Dyn(..) => .None
+			_ => .Some(NicheBytes::pointer(0))
+		}
+		.Struct(id, ..) => {
+			val def = &program.structs[id]
+			if def.isExtern || def.isUnion || def.isIntrinsic || program.dropFns.contains(&ty) then
+				return .None
+			var found: Option<NicheBytes> = .None
+			var owners = 0
+			for (i, f) in program.fieldTys(ty).forwards().enumerate() {
+				if !program.ownsMemory(f) then continue
+				owners += 1
+				if self.ownedNicheIn(&program, f) is .Some(bytes) then
+					found = .Some(bytes.at(self.fieldOffset(&program, ty, i as u32)))
+			}
+			if owners == 1 then found else .None
+		}
+		_ => .None
 	}
 
 	pub var fn enumTag(program: &Program, ty: Ty): Tag = {
@@ -225,29 +410,6 @@ extend Layouts {
 			.None => panic("laid out above")
 		}
 	}
-}
-
-/// Of an enum of two variants, the one whose `own` or function can be null
-/// for the other, which has no fields: the variant, the empty one, and the
-/// field. Taking the `own` out leaves a null, which reads as the empty
-/// variant, so nothing else in the variant may still need dropping then.
-fn nicheOf(program: &Program, variants: &[Vec<Ty>]): Option<(i64, i64, i64)> = {
-	val empty =
-		if variants[0].isEmpty() then 0 else if variants[1].isEmpty() then 1 else return .None
-	val payload = 1 - empty
-	val fields = &variants[payload]
-	var found: Option<i64> = .None
-	for (i, f) in fields.forwards().enumerate() {
-		if program.types.kind(f) is .Own(..) | .Fn(..) {
-			found = .Some(i)
-			break
-		}
-	}
-	val .Some(field) = found else return .None
-	for (i, f) in fields.forwards().enumerate() {
-		if i != field && program.ownsMemory(f) then return .None
-	}
-	return .Some((payload, empty, field))
 }
 
 /// Offsets for fields laid out one after another from `start`, each at the

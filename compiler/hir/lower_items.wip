@@ -5,6 +5,7 @@ import std::collections::{Map}
 import std::mem
 import syntax as ast
 import syntax::{
+	GENERATOR_NAME,
 	ALIAS,
 	ANNOTATION,
 	BUILTIN_REDEFINED,
@@ -58,6 +59,15 @@ extend Declared {
 			.Struct(s) => .Some(&s)
 			_ => .None
 		}
+	}
+
+	/// The function that names the generator it declares, where it is one.
+	fn generatorDecl(): Option<&ast::FnDecl> from self = match self {
+		.Item(item) => match item {
+			.Fn(f) if f.sig.named.isSome() => .Some(&f)
+			_ => .None
+		}
+		_ => .None
 	}
 
 	/// The enum it declares, where it declares one.
@@ -138,6 +148,17 @@ extend Lowerer {
 				.Struct(s) => match self.collectStruct(&s, .None) {
 					.Some(pair) => pair
 					.None => continue
+				}
+				// A function that names the generator it answers declares that
+				// generator's type with the types, so a field may hold one; its
+				// fields are the function's parameters, read with the types'
+				// bodies, and the function fills in the rest.
+				.Fn(f) if f.sig.named.isSome() => {
+					val name = f.sig.named.unwrap()
+					val id = self.declareGenerator(name.span, name.sym, f.isPub)
+					self.program.structs[id].generics = self.typeGenericParams(&f.sig.generics)
+					self.namedGenerators.put(f.sig.name.span.lo, id)
+					(name, .Struct(id))
 				}
 				.Enum(e) => {
 					self.annotations(&e.annotations, .Enum)
@@ -512,7 +533,7 @@ extend Lowerer {
 		val hereAst = self.ast
 		val hereModule = self.current
 		val hereImports = self.imports.clone()
-		val typeParams = mem::replace(&var self.typeParams, alias.generics.clone())
+		val typeParams = mem::replace(&var self.typeParams, alias.generics)
 		val selfTy = mem::replace(&var self.selfTy, .None)
 		self.aliasStack.push((module, sym))
 		self.enter(self.moduleOf(module), source.ast, source.imports.clone())
@@ -596,7 +617,10 @@ extend Lowerer {
 			val params: Vec<ast::GenericParam> = match (item.structDecl(), item.enumDecl()) {
 				(.Some(s), _) => s.generics.clone()
 				(_, .Some(e)) => e.generics.clone()
-				_ => continue
+				_ => match item.generatorDecl() {
+					.Some(f) => f.sig.generics.clone()
+					.None => continue
+				}
 			}
 			var defs = self.typeGenerics(def)
 			self.constrain(&params, &var defs)
@@ -694,6 +718,10 @@ extend Lowerer {
 	var fn resolveTypeBodies(types: &[(Declared, TypeDef)]) = {
 		for (item, def) in types {
 			self.typeParams = self.typeGenerics(def)
+			if item.generatorDecl() is .Some(f) && def is .Struct(id) {
+				self.namedGeneratorBody(&f, id)
+				continue
+			}
 			match def {
 				.Struct(id) if item.structDecl().isSome() => {
 					val .Some(s) = item.structDecl() else panic("just asked")
@@ -1081,7 +1109,7 @@ extend Lowerer {
 		// A C type another module declared, which is only ever seen through
 		// `ptr`.
 		val opaque: Option<OpaqueId> = match self.modules[module].opaques.get(&name.sym) {
-			.Some(found) => .Some(found.clone())
+			.Some(found) => .Some(found)
 			.None => .None
 		}
 		if opaque is .Some(id) {
@@ -1106,11 +1134,11 @@ extend Lowerer {
 		var candidates: Vec<str> = Vec()
 		val types = &self.modules[module].types
 		for i in 0..types.len() {
-			candidates.push(self.text(types.keyAt(i).clone()))
+			candidates.push(self.text(types.keyAt(i)))
 		}
 		val opaques = &self.modules[module].opaques
 		for i in 0..opaques.len() {
-			candidates.push(self.text(opaques.keyAt(i).clone()))
+			candidates.push(self.text(opaques.keyAt(i)))
 		}
 		var diagnostic = Diagnostic::error(
 			UNKNOWN_TYPE,
@@ -1140,6 +1168,7 @@ extend Lowerer {
 					// it.
 					if f.body is .Some(body) then
 						bodies.push(BodyWork(body: body, id: id, span: f.span))
+					self.declareSignatureAsserts(&f.sig, id, &var bodies)
 				}
 				.Extern(e) => {
 					// `@link("sqlite3", …)` names the libraries its declarations
@@ -1201,7 +1230,7 @@ extend Lowerer {
 						val entry = (
 							self.current,
 							path,
-							annotations.sourceLanguage.clone(),
+							annotations.sourceLanguage,
 							annotations.sourceStandard.clone(),
 						)
 						if !self.program.cSources.contains(&entry) then
@@ -1235,6 +1264,7 @@ extend Lowerer {
 							declared.isPub,
 							.None,
 						)
+						self.noSignatureAsserts(&declared.sig, "a C function's")
 					}
 				}
 				// A type's methods belong to it, not to the module.
@@ -1261,6 +1291,21 @@ extend Lowerer {
 					}
 					self.derived = block.derived.isSome()
 					if self.implTarget(&block) is .Some((owner, typeParams)) {
+						// A generator its function names has the methods every
+						// iterator has, and no others: what it holds between
+						// calls is its loop's.
+						if owner is .Struct(id) && self.namedGeneratorOf(id) is .Some(function) {
+							self.report(
+								Diagnostic::error(
+									GENERATOR_NAME,
+									"`\(self.text(self.program.structs[id].name))` is a generator, and cannot be extended",
+									block.span,
+									"a generator's methods are an iterator's",
+								).withNote("what `\(function)` holds between values is where its loop stopped, which no method could name; a type that needs more is a struct with a `next` of its own"),
+							)
+							self.derived = false
+							continue
+						}
 						match block.interfaceName {
 							.None => self.declareMethods(
 								owner,
@@ -1368,6 +1413,10 @@ extend Lowerer {
 				if receiver == .Lend && half == .Var then self.program.lentHalves.add(id)
 				if method.body is .Some(body) then
 					bodies.push(BodyWork(body: body, id: id, span: method.span))
+				// The writing half of a lending pair asks what the reading
+				// half does, of the same type arguments.
+				if half != ast::Receiver::Var || receiver != .Lend then
+					self.declareSignatureAsserts(&method.sig, id, &var bodies)
 				if !both then break
 			}
 		}
@@ -1693,7 +1742,7 @@ extend Lowerer {
 					[owner.clone()],
 					field.ty,
 					header,
-					access.clone(),
+					access,
 					isPub,
 					field.span,
 				),
@@ -1940,7 +1989,7 @@ extend Lowerer {
 			isLambda: false,
 			generator: .None,
 			isTailrec: annotations.tailrec,
-			test: if annotations.test is .Some((test, _)) then .Some(test.clone()) else .None,
+			test: if annotations.test is .Some((test, _)) then .Some(test) else .None,
 			isInline: annotations.inline.isSome(),
 			generated: .None,
 			intrinsic: intrinsic,
@@ -1958,6 +2007,24 @@ extend Lowerer {
 		self.checkTestShape(id, if annotations.test is .Some((_, at)) then .Some(at) else .None)
 		for (index, value) in deferred {
 			self.paramDefaults.push((id, index, value))
+		}
+		// `as Split` names the generator a function of the module answers; a
+		// method's would belong to its type, and a function that answers no
+		// `Iterator` makes no generator.
+		if sig.named is .Some(name) && (member.isSome() || isExtern || yields.isNone()) {
+			val why =
+				if member.isSome() then
+					"a method answers a generator its function of the module names: call one that does"
+				else if isExtern then "a C function makes no generator"
+				else "only a function whose result is `Iterator<T>`, and that yields, answers a generator"
+			self.report(
+				Diagnostic::error(
+					GENERATOR_NAME,
+					"`\(self.text(name.sym))` names no generator here",
+					name.span,
+					"nothing for it to name",
+				).withNote(why),
+			)
 		}
 		if yields is .Some(elem) {
 			val receiver: Option<ast::Receiver> = match member {
@@ -2295,10 +2362,10 @@ extend Lowerer {
 					"a call that passes nothing fills an implicit from its caller; a default would give a value nothing shows",
 				),
 			)
-			self.program.types.isGeneric(ty) => .Some(
+			self.kind(ty) !is .Ref(..) && self.kind(ty) is .Param(..) && self.owns(ty) => .Some(
 				(
-					"`\(name)` is implicit and its type names a type parameter",
-					"a call fills it from the implicit of its name, which has one type; a type parameter would be decided by what is found",
+					"`\(name)` is implicit and may own what it holds",
+					"an implicit is lent, `&` or `&var`, or copied; a type parameter is copied only where it is `copy`, and may otherwise own memory, which would be moved out of the caller at every call",
 				),
 			)
 			self.kind(ty) !is .Ref(..) && self.owns(ty) => .Some(
@@ -2464,6 +2531,10 @@ extend Lowerer {
 				"atomicCompareSwap" => .Some(.AtomicCompareSwap)
 				"atomicFence" => .Some(.AtomicFence)
 				"offsetBytes" => .Some(.OffsetBytes)
+				// What a block a C function is given is made of.
+				"ownedClosureCode" if path == "std::c" => .Some(.OwnedClosureCode)
+				"ownedClosureCaptures" if path == "std::c" => .Some(.OwnedClosureCaptures)
+				"blockInvoke" if path == "std::c" => .Some(.BlockInvoke)
 				"runtimeWords" => .Some(.RuntimeWords)
 				"threadWords" => .Some(.ThreadWords)
 				"debugBuild" => .Some(.DebugBuild)
@@ -2913,8 +2984,9 @@ extend Lowerer {
 		// travel, and Wip never has to. Any other struct is Wip's own layout.
 		.Struct(id, ..) => self.program.structs[id].isExtern
 		.Ref(inner, ..) if !isResult => match self.kind(inner) {
-			// A pointer to a C layout is a C pointer.
+			// A pointer to a C layout is a C pointer, and so is a block's.
 			.Struct(id, ..) if self.program.structs[id].isExtern => true
+			.Struct(..) if self.isBlock(inner) => true
 			// A slice goes to C as a pointer and a length, two arguments, as a
 			// `str` does.
 			.Slice(elem) => self.cCompatible(elem, false)
@@ -2942,19 +3014,73 @@ extend Lowerer {
 			ret == UNIT || (!self.passedByValue(ret) && self.cCompatible(ret, true))
 		}
 		.Float(..) | .Bool | .Cstring | .Error => true
-		// A C function pointer that may be null: the pointer, with `.None` as
-		// null.
-		.Enum(args, ..) if self.program.nullableFunction(ty) => self.cCompatible(
-			self.program.types.list(args)[0],
-			false,
-		)
+		// A pointer that may be null, with `.None` as null: a C function
+		// pointer, which may be answered too; or a reference to one value,
+		// which crosses where a reference does, as a parameter.
+		.Enum(args, ..) if self.program.nullablePointer(ty) => {
+			val inner = self.program.types.list(args)[0]
+			self.cCompatible(inner, if self.kind(inner) is .Fn(..) then false else isResult)
+		}
 		_ => false
 	}
 
-	/// A struct, or a function that may be null, which a C function pointer
+	/// Whether `ty` is `std::c`'s `Block<F>`, which C is given the address of
+	/// as it is given a block.
+	fn isBlock(ty: Ty): bool = {
+		val .Struct(id, ..) = self.kind(ty) else return false
+		val def = &self.program.structs[id]
+		return self.program.modules[def.module] == "std::c" && self.text(def.name) == "Block"
+	}
+
+	/// What a `c::Block<F>` calls is `F`, as C calls a function: its
+	/// parameters and its result are what C passes in registers. A struct, a
+	/// `str`, a slice and a closure are passed by Wip at their address, and
+	/// a struct is answered there, which a block's caller does not do.
+	fn blockCallable(f: Ty): bool = {
+		val .Fn(params, ret) = self.kind(f) else return false
+		val inRegister = (t: Ty, isResult: bool) =>
+			self.cCompatible(t, isResult) &&
+				!self.passedByValue(t) &&
+				self.kind(t) !is .Str | .Slots(..) &&
+				!(self.kind(t) is .Ref(inner, ..) | .Own(inner) &&
+					self.kind(inner) is .Fn(..) | .Slice(..))
+		for p in self.program.types.list(params).toVec() {
+			if !inRegister(p, false) then return false
+		}
+		return ret == UNIT || inRegister(ret, true)
+	}
+
+	/// Refuses a `c::Block<F>` whose `F` is not a function C can call.
+	var fn checkBlockFunction(f: Ty, span: Span) = {
+		if self.program.types.isGeneric(f) || self.isPoisoned(f) || self.blockCallable(f) then
+			return
+		if self.kind(f) !is .Fn(..) {
+			self.report(
+				Diagnostic::error(
+					NOT_C_COMPATIBLE,
+					"a block is called, and \(self.tyName(f)) is not a function type",
+					span,
+					"not a function type",
+				).withHelp("write the function C calls: `c::Block<(n: i32) => void>`"),
+			)
+			return
+		}
+		self.report(
+			Diagnostic::error(
+				NOT_C_COMPATIBLE,
+				"C calls a block as it calls a function, and cannot call \(self.tyName(f))",
+				span,
+				"not a function C can call",
+			).withNote(
+				"a block's parameters and result are what C passes in registers: numbers, `bool`, pointers, a `&` to an `extern struct`, a plain function",
+			).withHelp("pass a struct, a `str` or a slice as a `ptr<T>`"),
+		)
+	}
+
+	/// A struct, or a pointer that may be null, which a C function pointer
 	/// cannot take or answer by value.
 	fn passedByValue(ty: Ty): bool =
-		self.kind(ty) is .Struct(..) || self.program.nullableFunction(ty)
+		self.kind(ty) is .Struct(..) || self.program.nullablePointer(ty)
 
 	/// What C can hold as the elements of an array it is lent: what crosses
 	/// by itself, an `extern struct`, or an array of those.
@@ -2998,7 +3124,7 @@ extend Lowerer {
 			span,
 			"not a C-compatible type",
 		).withNote(
-			"extern functions can take and return only integers of up to 64 bits, `f32`, `f64`, `bool`, `cstring`, `ptr<T>` and C's structs; a parameter may also be a `str` or a `&[T]`, which pass as a pointer and a length, an array by reference, which passes as a pointer to its first element, or a function that takes and answers no struct by value, and no function that may be null, and whose own types cross, which passes as a C function pointer; a result may be `never`, for a C function that does not return",
+			"extern functions can take and return only integers of up to 64 bits, `f32`, `f64`, `bool`, `cstring`, `ptr<T>` and C's structs; a parameter may also be a `&T`, or an `Option<&T>`, which pass as a pointer, null for `.None`, a `str` or a `&[T]`, which pass as a pointer and a length, an array by reference, which passes as a pointer to its first element, or a function that takes and answers no struct by value, and no function that may be null, and whose own types cross, which passes as a C function pointer; a result may be `never`, for a C function that does not return",
 		)
 		// An `extern struct` is C's layout; what it cannot do yet is cross by
 		// value.
@@ -3006,11 +3132,15 @@ extend Lowerer {
 			diagnostic = diagnostic.withHelp(
 				"C takes strings as `cstring`; a string literal can be passed as either",
 			)
-		// A reference C may be given a null for is C's own pointer.
+		// A pointer C answers that may be null, and a slice that may be
+		// absent, are C's own pointer.
 		if self.kind(ty) is .Enum(id, args) &&
 			self.program.preludeItems.enumeration(.Option) == .Some(id) &&
 			self.kind(self.program.types.list(args)[0]) is .Ref(inner, ..) {
-			diagnostic = diagnostic.withHelp("a pointer that may be null is `ptr<\(self.program.tyName(inner, self.interner))>` in C's declarations; a call passes `null` to it, or lends `&x` or `&var x`")
+			if self.kind(inner) is .Slice(elem) then
+				diagnostic = diagnostic.withHelp("a slice that may be absent is a `ptr<\(self.program.tyName(elem, self.interner))>` and a count, `null` for none")
+			else if isResult then
+				diagnostic = diagnostic.withHelp("what C answers is a pointer: `ptr<\(self.program.tyName(inner, self.interner))>`, which may be null")
 		}
 		// C's pointer-sized integers are built in under C's names.
 		if self.kind(ty) is .Int(int: .Isize | .Usize) then

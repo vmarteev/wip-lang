@@ -1,0 +1,122 @@
+// A Mac and iOS: a kqueue, each descriptor with a filter for reading
+// and one for writing, the one not waited for disabled.
+
+import std::time::{Duration}
+
+extern "C" {
+	fn kqueue(): c_int
+	/// The changes, and the room for events: what two slices cross as.
+	@symbol("kevent")
+	fn keventChange(
+		queue: c_int,
+		changes: &[RawEvent],
+		events: &var [RawEvent],
+		timeout: ptr<u8>,
+	): c_int
+	@symbol("kevent")
+	fn keventWait(
+		queue: c_int,
+		changes: &[RawEvent],
+		events: &var [RawEvent],
+		timeout: &Timespec,
+	): c_int
+}
+
+extern struct RawEvent {
+	ident: u64 = 0
+	filter: i16 = 0
+	flags: u16 = 0
+	fflags: u32 = 0
+	data: i64 = 0
+	udata: u64 = 0
+}
+
+extern struct Timespec {
+	seconds: i64
+	nanos: i64
+}
+
+val EVFILT_READ: i16 = -1
+val EVFILT_WRITE: i16 = -2
+val EV_ADD: u16 = 0x1
+val EV_DELETE: u16 = 0x2
+val EV_ENABLE: u16 = 0x4
+val EV_ERROR: u16 = 0x4000
+val EV_EOF: u16 = 0x8000
+
+fn blank(): RawEvent = RawEvent()
+
+/// A kqueue, which no program this one starts is given: a child never has
+/// its parent's.
+fn created(): c_int = kqueue()
+
+/// The changes that take what a descriptor is waited for from `was` to
+/// `now`: a filter added for each it waits for now, and one taken away for
+/// each it waited for and waits for no longer. Only what is waited for has
+/// a filter, since some descriptors — a kqueue's own — take no other.
+fn filters(fd: i32, was: Option<Interest>, now: Option<Interest>, token: u64): Vec<RawEvent> = {
+	var changes: Vec<RawEvent> = Vec()
+	for (filter, reading) in [(EVFILT_READ, true), (EVFILT_WRITE, false)] {
+		val wanted = match now {
+			.Some(interest) => if reading then interest.reads() else interest.writes()
+			.None => false
+		}
+		val had = match was {
+			.Some(interest) => if reading then interest.reads() else interest.writes()
+			.None => false
+		}
+		if wanted then
+			changes.push(RawEvent(
+				ident: fd as u64,
+				filter: filter,
+				flags: EV_ADD | EV_ENABLE,
+				udata: token,
+			))
+		else if had then changes.push(RawEvent(ident: fd as u64, filter: filter, flags: EV_DELETE))
+	}
+	return changes
+}
+
+fn applied(queue: c_int, changes: &[RawEvent]): Result<void, IoError> = {
+	var none: Vec<RawEvent> = Vec()
+	if keventChange(queue, &changes, &var none.items(), null) < 0 then return .Err(lastError())
+	return .Ok()
+}
+
+fn added(queue: c_int, fd: i32, interest: Interest, token: u64): Result<void, IoError> = applied(
+	queue,
+	&filters(fd, .None, .Some(interest), token).items(),
+)
+
+fn changed(
+	queue: c_int,
+	fd: i32,
+	was: Interest,
+	now: Interest,
+	token: u64,
+): Result<void, IoError> = applied(queue, &filters(fd, .Some(was), .Some(now), token).items())
+
+fn removed(queue: c_int, fd: i32, was: Interest): Result<void, IoError> = applied(
+	queue,
+	&filters(fd, .Some(was), .None, 0).items(),
+)
+
+fn waited(queue: c_int, room: &var [RawEvent], timeout: Option<Duration>): i64 = {
+	var none: Vec<RawEvent> = Vec()
+	val count = match timeout {
+		.Some(length) => {
+			val nanos = length.asNanos().max(0)
+			val until = Timespec(seconds: nanos / 1000000000, nanos: nanos % 1000000000)
+			keventWait(queue, &none, &var room, &until)
+		}
+		.None => keventChange(queue, &none, &var room, null)
+	}
+	return count as i64
+}
+
+fn eventOf(raw: &RawEvent): Event = Event(
+	token: raw.udata,
+	readable: raw.filter == EVFILT_READ,
+	writable: raw.filter == EVFILT_WRITE,
+	closed: (raw.flags & (EV_EOF | EV_ERROR)) != 0,
+)

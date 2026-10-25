@@ -79,7 +79,8 @@ pub fn evaluateWithin(
 		val def = &program.consts[id]
 		if def.code.isSome() && def.value.isNone() then ids.push(id)
 	}
-	if ids.isEmpty() && program.asserts.isEmpty() then return Vec()
+	if ids.isEmpty() && program.asserts.isEmpty() && program.instanceAsserts.isEmpty() then
+		return Vec()
 	var diagnostics: Vec<Diagnostic> = Vec()
 	var values: Vec<(ConstId, Built)> = Vec()
 	{
@@ -113,6 +114,17 @@ pub fn evaluateWithin(
 				val failure = Failure(stop: stop.clone(), calls: machine.stack())
 				machine.calls.clear()
 				if machine.report(.Assert(id), failure, locate) is .Some(d) then
+					diagnostics.push(d.clone())
+			}
+		}
+		// What each instance's signature asserts, for the call that made it.
+		for index in 0..program.instanceAsserts.len() {
+			machine.steps = 0
+			val id = program.instanceAsserts[index].assertion
+			if machine.call(.Fn(id), Vec(), .None) is .Err(stop) {
+				val failure = Failure(stop: stop.clone(), calls: machine.stack())
+				machine.calls.clear()
+				if machine.report(.InstanceAssert(index), failure, locate) is .Some(d) then
 					diagnostics.push(d.clone())
 			}
 		}
@@ -165,6 +177,9 @@ enum Subject {
 	Constant(id: ConstId)
 	/// A top-level `assert`'s function.
 	Assert(id: FnId)
+	/// A generic's signature `assert`, made for an instance: which of the
+	/// program's.
+	InstanceAssert(index: i64)
 }
 
 /// Why running stopped.
@@ -373,6 +388,18 @@ extend Machine {
 				"checking this assert",
 				"this assert cannot be checked while the program is compiled",
 			)
+			.InstanceAssert(index) => {
+				val name = self.assertingName(index)
+				(
+					self.program.instanceAsserts[index].call,
+					"checking what `\(name)` asserts",
+					"what `\(name)` asserts cannot be checked while the program is compiled",
+				)
+			}
+		}
+		val instance: Option<i64> = match subject {
+			.InstanceAssert(index) => .Some(index)
+			_ => .None
 		}
 		val diagnostic = match failure.stop {
 			.Quiet => return .None
@@ -388,6 +415,11 @@ extend Machine {
 				).withNote(
 					"a top-level assert is checked while the program is compiled, for the target it is compiled for",
 				),
+			)
+			// A generic's signature `assert`, at the call whose type arguments
+			// it does not hold for.
+			.Panic(message, ..) if instance.isSome() && failure.calls.len() == 1 => return .Some(
+				self.instanceAssertFailed(instance.unwrap(), &message),
 			)
 			.Panic(message, at) => {
 				val (file, line, column) = locate(at)
@@ -419,6 +451,44 @@ extend Machine {
 			noted = noted.withNote("in \(function) (\(file):\(line))")
 		}
 		return .Some(noted)
+	}
+
+	/// The generic whose signature asserts what the `index`th instance assert
+	/// checks, by name.
+	fn assertingName(index: i64): String = {
+		val assertion = self.program.instanceAsserts[index].assertion
+		val .Some((generic, _)) = self.program.fns[assertion].instanceOf else return "a generic"
+		val .Some(function) = self.program.fns[generic].assertOf else return "a generic"
+		return self.program.fnName(function, self.interner)
+	}
+
+	/// The error where the `index`th instance assert does not hold: at the
+	/// call, with its type arguments, the `assert` as where it is asked, and
+	/// the call of the generic where that was inside another's instance.
+	fn instanceAssertFailed(index: i64, message: &String): Diagnostic = {
+		val checked = &self.program.instanceAsserts[index]
+		val name = self.assertingName(index)
+		var given: Vec<String> = Vec()
+		if self.program.fns[checked.assertion].instanceOf is .Some((generic, args)) {
+			val params = &self.program.fns[generic].generics
+			val tys = self.program.types.list(args)
+			for i in 0..params.len().min(tys.len()) {
+				val param = self.interner.resolve(params[i].name)
+				given.push("`\(param)` as `\(self.program.tyName(tys[i], self.interner))`")
+			}
+		}
+		val forArgs = if given.isEmpty() then String() else ", for \(given.join(", "))"
+		var diagnostic = Diagnostic::error(
+			ASSERTION_FAILED,
+			"\(message)\(forArgs)",
+			checked.call,
+			"does not hold for this call",
+		).withNote("`\(name)` asserts this of its type arguments, while the program is compiled, for each instance a call makes")
+		if self.program.fns[checked.assertion].instanceOf is .Some((generic, _)) then
+			diagnostic = diagnostic.withSecondary(self.program.fns[generic].span, "asserted here")
+		if checked.through is .Some(through) then
+			diagnostic = diagnostic.withSecondary(through, "called here, in a generic's instance")
+		return diagnostic
 	}
 
 	/// The calls being run, innermost first.
@@ -501,7 +571,7 @@ extend Machine {
 			.DropInPlace(ty) => lowerDropInPlaceFn(self.program, self.interner, ty)
 		}
 		val shared = Shared::of(body)
-		self.bodies.put(callable.clone(), shared.share())
+		self.bodies.put(callable, shared.share())
 		return .Ok(shared)
 	}
 
@@ -525,7 +595,7 @@ extend Machine {
 				if def.isExtern || def.accesses.isSome() || def.variadicOf.isSome() then
 					return self.cCall(id, &given)
 			}
-			val body = self.body(calling.clone())?
+			val body = self.body(calling)?
 			val name = self.nameOf(&calling)
 			val at = match calling {
 				.Fn(id) => self.program.fns[id].span
@@ -675,11 +745,15 @@ extend Machine {
 			.SetVariant(place, variant) => {
 				val ty = placeTy(program, &body, &place)
 				val address = self.place(&frame, &place)?
-				match self.layouts.enumTag(program, ty) {
+				val tag = self.layouts.enumTag(program, ty)
+				match tag {
 					.Byte(size) => self.writeInt(address, size, variant)?
-					.Niche(empty, offset, ..) if variant == empty =>
-						self.writeWord(address + offset, 0)?
-					.Niche(..) => {}
+					.Niche(offset, size, ..) => {
+						// An empty variant is its value in the niche; the one
+						// that carries is its fields, written apart.
+						if tag.nicheValue(variant) is .Some(value) then
+							self.writeInt(address + offset as u64, size as u64, value as u128)?
+					}
 				}
 			}
 			.Zero(place) => {
@@ -699,7 +773,7 @@ extend Machine {
 					self.writeWord(address + offset, POISON)?
 					offset += 8
 				}
-				self.fill(address + offset, size - offset, POISON as u8)?
+				self.fill(address + offset, size - offset, POISON as% u8)?
 			}
 			.CheckMoved(place, at) => {
 				val ty = placeTy(program, &body, &place)
@@ -754,7 +828,7 @@ extend Machine {
 				self.writeWord(address, pointer)?
 			}
 			.AllocBuffer(dest, elem, count) => {
-				val n = self.scalar(&frame, &count)? as u64 as i64
+				val n = self.scalar(&frame, &count)? as u64 as% i64
 				val stride = self.layouts.of(program, elem).stride() as i64
 				val .Some(size) = n.checkedMul(stride) else return .Err(.Budget("much memory"))
 				val pointer = self.alloc((size as u64).max(1))?
@@ -824,17 +898,21 @@ extend Machine {
 				if self.scalar(&frame, &fails)? == 0 then return .Ok()
 				val message: String = match kind {
 					.Bounds(index, length) => {
-						val i = self.scalar(&frame, &index)? as u64 as i64
-						val n = self.scalar(&frame, &length)? as u64 as i64
+						val i = self.scalar(&frame, &index)? as u64 as% i64
+						val n = self.scalar(&frame, &length)? as u64 as% i64
 						"index \(i) is out of bounds for length \(n)"
 					}
 					.Length(length) => {
-						val n = self.scalar(&frame, &length)? as u64 as i64
+						val n = self.scalar(&frame, &length)? as u64 as% i64
 						"a buffer cannot have length \(n)"
 					}
 					.Division => "divided by zero"
 					.NullText => "a null C string read as text"
 					.Overflow(op) => overflowMessage(op)
+					.Narrowing(value, from, to) => {
+						val bits = self.scalar(&frame, &value)?
+						self.narrowingMessage(bits, from, to)
+					}
 				}
 				return .Err(.Panic(message: message, at: at))
 			}
@@ -875,7 +953,7 @@ extend Machine {
 				word(&args, 0)
 			}
 			"memset" => {
-				self.fill(word(&args, 0), word(&args, 2), word(&args, 1) as u8)?
+				self.fill(word(&args, 0), word(&args, 2), word(&args, 1) as% u8)?
 				word(&args, 0) as u128
 			}
 			"memcmp" => {
@@ -884,12 +962,12 @@ extend Machine {
 				val b = self.readBytes(word(&args, 1), count)?
 				val order = a.items().compare(&b.items())
 				val signed: i32 = if order.isLess() then -1 else if order.isSame() then 0 else 1
-				signed as u32
+				signed as% u32
 			}
 			"memchr" => {
 				val start = word(&args, 0)
 				val bytes = self.readBytes(start, word(&args, 2))?
-				match bytes.items().indexOf(word(&args, 1) as u8) {
+				match bytes.items().indexOf(word(&args, 1) as% u8) {
 					.Some(at) => (start + at as u64) as u128
 					.None => 0
 				}
@@ -930,7 +1008,7 @@ extend Machine {
 		val b = self.readBytes(word(&args, 2), word(&args, 3))?
 		val order = a.items().compare(&b.items())
 		val signed = if order.isLess() then -1 else if order.isSame() then 0 else 1
-		return .Ok(signed as u64)
+		return .Ok(signed as% u64)
 	}
 
 	/// The runtime's test of whether two strings hold the same bytes.
@@ -979,10 +1057,10 @@ extend Machine {
 						.ConstIndex(index) => index
 						_ => panic("an index")
 					}
-					(first +% index *% stride) as u64
+					(first +% index *% stride) as% u64
 				}
 			}
-			ty = projectTy(program, ty, projection.clone())
+			ty = projectTy(program, ty, projection)
 		}
 		return .Ok(address)
 	}
@@ -1027,6 +1105,9 @@ extend Machine {
 			.SizeOf(of, ..) => self.layouts.of(self.program, of).stride()
 			.AlignOf(of, ..) => self.layouts.of(self.program, of).align
 			.OffsetOf(of, index, ..) => self.layouts.fieldOffset(self.program, of, index)
+			.BlockInvoke(..) => return .Err(
+				.Cannot("makes a block, which C calls once the program runs"),
+			)
 		},
 	)
 
@@ -1135,7 +1216,7 @@ extend Machine {
 					val (bits, _) = intOf(program, ty)
 					val v = self.scalar(&frame, &value)? & mask(bits)
 					// Modulo the width, as a shift's amount is.
-					val turned = (self.scalar(&frame, &amount)? as u32) % bits
+					val turned = (self.scalar(&frame, &amount)? as% u32) % bits
 					val left = match turn {
 						.Left => turned
 						.Right => (bits - turned) % bits
@@ -1161,8 +1242,11 @@ extend Machine {
 	var fn variant(address: u64, ty: Ty): Result<u32, Stop> = .Ok(
 		match self.layouts.enumTag(self.program, ty) {
 			.Byte(size) => self.readInt(address, size)? as u32
-			.Niche(payload, empty, offset) =>
-				if self.readWord(address + offset as u64)? == 0 then empty else payload
+			.Niche(payload, offset, size, first, empties, ..) => {
+				val held = self.readInt(address + offset as u64, size as u64)? as u64
+				val k = held -% first
+				if k < empties.len() as u64 then empties[k as i64] else payload
+			}
 		},
 	)
 
@@ -1171,7 +1255,7 @@ extend Machine {
 	var fn codeAddress(callable: Callable): u64 = {
 		if self.codeOf.get(&callable) is .Some(address) then return address
 		val address = CODE + self.code.len() as u64 * 16
-		self.code.push(callable.clone())
+		self.code.push(callable)
 		self.codeOf.put(move callable, address)
 		return address
 	}
@@ -1179,7 +1263,7 @@ extend Machine {
 	fn callable(address: u64): Result<Callable, Stop> = {
 		val index = (address -% CODE) / 16
 		if address >= CODE && (address -% CODE) % 16 == 0 && index < self.code.len() as u64 then
-			return .Ok(self.code[index as i64].clone())
+			return .Ok(self.code[index as i64])
 		return .Err(.Cannot("calls through an address that is no function's"))
 	}
 
@@ -1308,7 +1392,7 @@ extend Machine {
 		val (start, end) = self.range(address, size)?
 		var rest = bits
 		for i in start..end {
-			self.memory[i] = rest as u8
+			self.memory[i] = rest as% u8
 			rest = rest >> 8
 		}
 		return .Ok()
@@ -1352,7 +1436,7 @@ extend Machine {
 fn word(args: &[Arg], i: i64): u64 = {
 	if i >= args.len() then return 0
 	return match args[i] {
-		.Scalar(bits) => bits as u64
+		.Scalar(bits) => bits as% u64
 		.Address(address) => address
 	}
 }
@@ -1443,9 +1527,9 @@ fn intOf(program: &Program, ty: Ty): (u32, bool) = match program.types.kind(ty) 
 /// The bits of a value of type `ty`, as the signed number they are.
 fn signed(program: &Program, ty: Ty, bits: u128): i128 = {
 	val (width, isSigned) = intOf(program, ty)
-	if !isSigned || width >= 128 then return bits as i128
+	if !isSigned || width >= 128 then return bits as% i128
 	val shift = 128 - width
-	return ((bits << shift) as i128) >> shift
+	return ((bits << shift) as% i128) >> shift
 }
 
 /// What an atomic add or subtract leaves: integers wrap, and floats are
@@ -1469,6 +1553,30 @@ fn atomicSum(
 	}
 	_ => (if adds then before +% amount else before -% amount) & mask(intOf(program, ty).0)
 }
+
+extend Machine {
+	/// What a failed narrowing says: the value, and the type that does not
+	/// hold it.
+	fn narrowingMessage(bits: u128, from: Ty, to: Ty): String = {
+		val name = self.program.tyName(to, self.interner)
+		val value: String = match self.program.types.kind(from) {
+			.Int(int) => {
+				val held = bits & int.mask()
+				val negative = int.signed() && (held >> (int.bits() - 1) as u128) & 1 == 1
+				if negative then "-\((int.mask() ^ held) + 1)" else "\(held)"
+			}
+			_ => match char::fromInt(bits as% i64) {
+				.Some(c) => "the character `\(c)`"
+				.None => "\(bits)"
+			}
+		}
+		return "\(value) does not fit in \(integerArticle(&name)) \(name)"
+	}
+}
+
+/// "an" before a name read with a vowel first, `i8` and `isize`, and "a"
+/// before the rest.
+fn integerArticle(name: &String): str = if name.startsWith("i") then "an" else "a"
 
 fn overflowMessage(op: BinaryOp): str = match op {
 	.Add => "the sum does not fit"
@@ -1496,7 +1604,7 @@ fn checked(program: &Program, ty: Ty, op: BinaryOp, l: u128, r: u128): Option<u1
 			val high = ((1 as i128) << (bits - 1)) - 1
 			if answer < low || answer > high then return .None
 		}
-		return .Some(answer as u128 & mask(bits))
+		return .Some(answer as% u128 & mask(bits))
 	}
 	val .Some(answer) = match op {
 		.Add => l.checkedAdd(r)
@@ -1566,12 +1674,12 @@ fn binary(program: &Program, operand: Ty, op: BinaryOp, l: u128, r: u128): Optio
 			.Mul => (l *% r) & m
 			.Div | .Rem if r & m == 0 => return .None
 			.Div if isSigned => match a.checkedDiv(b) {
-				.Some(q) => q as u128 & m
+				.Some(q) => q as% u128 & m
 				.None => return .None
 			}
 			.Div => (l & m) / (r & m)
 			.Rem if isSigned => match a.checkedRem(b) {
-				.Some(q) => q as u128 & m
+				.Some(q) => q as% u128 & m
 				.None => return .None
 			}
 			.Rem => (l & m) % (r & m)
@@ -1579,9 +1687,9 @@ fn binary(program: &Program, operand: Ty, op: BinaryOp, l: u128, r: u128): Optio
 			.BitOr => (l | r) & m
 			.BitXor => (l ^ r) & m
 			// The amount is taken modulo the width.
-			.Shl => (l << ((r as u32) % bits)) & m
-			.Shr if isSigned => (a >> ((r as u32) % bits)) as u128 & m
-			.Shr => (l & m) >> ((r as u32) % bits)
+			.Shl => (l << ((r as% u32) % bits)) & m
+			.Shr if isSigned => (a >> ((r as% u32) % bits)) as% u128 & m
+			.Shr => (l & m) >> ((r as% u32) % bits)
 			.Eq => boolBits(l & m == r & m)
 			.Ne => boolBits(l & m != r & m)
 			.Lt | .Le | .Gt | .Ge => {
@@ -1611,7 +1719,7 @@ fn saturated(v: f64, bits: u32, isSigned: bool): u128 = {
 		if v >= limit then return (((1 as u128) << (bits - 1)) - 1) & mask(bits)
 		if v < -limit then return ((1 as u128) << (bits - 1)) & mask(bits)
 		val whole = if bits <= 64 then v as i64 as i128 else v as i128
-		return whole as u128 & mask(bits)
+		return whole as% u128 & mask(bits)
 	}
 	if v <= -1.0 then return 0
 	val limit =
@@ -1646,5 +1754,5 @@ fn cast(program: &Program, value: u128, from: Ty, to: Ty): u128 = {
 		}
 	}
 	val (toBits, _) = intOf(program, to)
-	return signed(program, from, value) as u128 & mask(toBits)
+	return signed(program, from, value) as% u128 & mask(toBits)
 }

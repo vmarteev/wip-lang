@@ -116,8 +116,15 @@ fn main() = {
   (E0455), with the two ways to declare one.
 - **Implicit parameters come after the others,** and are a reference, `&`
   or `&var`, or plain data, copied; a value that owns memory would be
-  moved out of the caller at every call. Their type names none of the
-  function's type parameters, and they have no default (E0454).
+  moved out of the caller at every call, and so a type parameter taken by
+  value is one that is `copy`. They have no default (E0454).
+- **In generic code, filled as if written.** An implicit's type may name
+  type parameters, the function's and those of the type a method extends.
+  A call fills it after the arguments that say their own type, so the
+  call's type arguments are inferred from the implicit found as from any
+  argument; where the receiver or another argument decides them already,
+  the implicit must be of the type they say. An argument told its type,
+  as a number literal is, is told it by the implicit too.
 - **A lambda sees the implicits where it is written,** as it captures
   anything around it, and declares none of its own. A function with
   implicit parameters is not a value (E0456): it would be called somewhere
@@ -128,6 +135,40 @@ fn main() = {
   `&dyn` fills what the interface says.
 - **`implicit` is a word only there,** before a parameter and before
   `val` or `var`. Elsewhere it is a name.
+
+```wip,run
+struct Draw<G> {
+    width: i64
+}
+
+struct Writer<G> {
+    scale: i64
+}
+
+extend Writer<G> {
+    // `G` is the receiver's, and `draws` is checked against it.
+    fn drawn(text: str, implicit draws: &var Vec<Draw<G>>) = {
+        draws.push(Draw(width: text.len() * self.scale))
+    }
+}
+
+// `G` is decided by the implicit alone.
+fn line<G>(text: str, implicit draws: &var Vec<Draw<G>>) = {
+    draws.push(Draw(width: text.len()))
+}
+
+fn page<G>(writer: &Writer<G>, implicit draws: &var Vec<Draw<G>>) = {
+    line("title")
+    writer.drawn("body")
+}
+
+fn main() = {
+    implicit var draws: Vec<Draw<bool>> = Vec()
+    val writer: Writer<bool> = Writer(scale: 2)
+    page(&writer)
+    assert(draws.len() == 2 && draws[0].width + draws[1].width == 13)
+}
+```
 
 ```wip,error=E0455
 struct Log {
@@ -212,6 +253,47 @@ A function that answers `Iterator<T>` and hands its values over with
 `yield` is a generator: calling it runs nothing, and each value is made
 as it is asked for. [Page 4](04-expressions.md#generators)
 has how it works.
+
+Its type has no name, so it is walked or handed on where it is made. A
+function of a module may name it, `as Name` after the result, and the
+name is then a type as a struct's is: a field, a result or an argument
+may be one, and another module imports it. Its type parameters are the
+function's, in order; it is made only by calling the function, and is a
+view where what it holds borrows, a `str` or a reference, so a struct
+that keeps one is a `view struct` (E0466 where a name names nothing):
+
+```wip,run
+fn pieces(text: str, separator: str): Iterator<str> as Pieces = {
+    var at = 0
+    while true {
+        val rest = text[at..text.len()]
+        val .Some(offset) = rest.indexOf(separator) else {
+            yield rest
+            return
+        }
+        at += offset + separator.len()
+        yield rest[0..offset]
+    }
+}
+
+view struct Fields {
+    parts: Pieces
+    read: i64
+}
+
+extend Fields {
+    var fn next(): Option<str> = {
+        self.read += 1
+        return self.parts.next()
+    }
+}
+
+fn main() = {
+    var fields = Fields(parts: pieces("a,b", ","), read: 0)
+    assert(fields.next() == .Some("a") && fields.next() == .Some("b"))
+    assert(fields.next().isNone() && fields.read == 3)
+}
+```
 
 ## Functions as values
 
@@ -532,6 +614,33 @@ fn main() = {
 }
 ```
 
+An argument whose type is said by what is expected of it — a number
+literal, a `.Variant`, a generic struct built without its type arguments
+— is checked after the arguments that say their own, and is told the type
+they decide. `Writer(scale: 10)` says nothing of its `G`; the draw beside
+it does:
+
+```wip,run
+struct Metal {
+    n: i64
+}
+
+struct Draw<G> {
+    width: i64
+}
+
+struct Writer<G> {
+    scale: i64
+}
+
+fn drawn<G>(writer: &Writer<G>, draw: Draw<G>): i64 = writer.scale * draw.width
+
+fn main() = {
+    val draw: Draw<Metal> = Draw(width: 3)
+    assert(drawn(Writer(scale: 10), draw) == 30)
+}
+```
+
 What the call's value is expected to be says them too, as a `val`'s type
 does: `val numbers: Vec<i64> = json::decode(text)?`. The type expected
 passes through `?` to what the `Option` or the `Result` holds, and through
@@ -564,6 +673,55 @@ fn main() = {
     assert(numbers.len() == 3)
     val words = answer.read<Vec<String>>()
     assert(words.isErr())
+}
+```
+
+A generic function's signature may end with `assert(…)`: a fact about its
+type and length parameters that its calls must meet, such as that a type
+fits the room a buffer has for it. The fact reads what is known while the
+program compiles — the type and length parameters, the function's and its
+type's, constants, `c::sizeOf` and what else runs then — and never a
+value parameter, which is known only when the call runs. It is checked
+while the program compiles, once for each set of type arguments a call
+gives, and a fact that does not hold is an error at that call (E0445),
+naming the type arguments; through another generic, the error is at the
+call that made its instance, and the generic's call is shown as the way
+there. The body is still checked once, and assumes nothing of the fact.
+An `assert` in a body is checked when it runs, and one at the top level
+once ([page 9](09-errors.md#assert)):
+
+```wip,run
+import std::c
+
+val ROOM: u64 = 16
+
+fn stored<C: copy>(value: &C): u64
+    assert(c::sizeOf<C>() <= ROOM, "a value fits the room") = c::sizeOf<C>()
+
+struct Ring<val N> {
+    length: i64
+}
+
+extend Ring<val N> {
+    static fn new(): Ring<N>
+        assert(N > 0 && (N & (N - 1)) == 0, "a power of two") = Ring(length: N)
+}
+
+fn main() = {
+    assert(stored(42) == 8)
+    val ring: Ring<8> = Ring::new()
+    assert(ring.length == 8)
+}
+```
+
+```wip,error=E0445
+import std::c
+
+fn stored<C: copy>(value: &C): u64
+    assert(c::sizeOf<C>() <= 16, "a value fits the room") = c::sizeOf<C>()
+
+fn main() = {
+    val wide = stored((1, 2, 3))
 }
 ```
 

@@ -466,6 +466,11 @@ extend Lowerer {
 			if self.hasError(t) then return ERROR
 		}
 		val list = self.program.types.internList(&tys)
+		// A block's function is one C calls.
+		if def is .Struct(id) && !tys.isEmpty() {
+			val probe = self.intern(.Struct(id: id, args: list))
+			if self.isBlock(probe) then self.checkBlockFunction(tys[0], span)
+		}
 		return match def {
 			.Struct(id) => self.intern(.Struct(id: id, args: list))
 			.Enum(id) => self.intern(.Enum(id: id, args: list))
@@ -911,8 +916,9 @@ extend Lowerer {
 	}
 
 	/// Whether an expression's type is decided by what is expected of it: a
-	/// literal number, a `.Variant`, or an array of them. Such operands are
-	/// checked after the others, which may decide the type arguments.
+	/// literal number, a `.Variant`, a generic struct built without its type
+	/// arguments, or an array of them. Such operands are checked after the
+	/// others, which may decide the type arguments.
 	fn takesExpectedType(e: ast::ExprId): bool = {
 		val file = self.ast
 		return match file.exprs[e].kind {
@@ -921,7 +927,9 @@ extend Lowerer {
 				operand,
 			)
 			.Path(leadingDot, ..) => leadingDot
-			.Call(callee, ..) => file.exprs[callee].kind is .Path(leadingDot: true, ..)
+			.Call(callee, ..) =>
+				file.exprs[callee].kind is .Path(leadingDot: true, ..) ||
+					self.buildsGenericStruct(callee)
 			.Array(elems) => {
 				for elem in elems {
 					if !self.takesExpectedType(elem) then return false
@@ -995,9 +1003,13 @@ extend Lowerer {
 	/// Checks the operands of a use of a generic item, learning its type
 	/// arguments from them. Operands whose declared type is already known are
 	/// checked against it; the others are inferred first, and converted once
-	/// the type arguments are known. Returns the operands in order.
+	/// the type arguments are known. `implied` pairs a declared type with the
+	/// type of what fills it unwritten, an implicit's binding: learnt from
+	/// after the operands that say their own type, and before those that wait
+	/// to be told. Returns the operands in order.
 	var fn genericOperands(
 		operands: &[GenericOperand],
+		implied: &[(Ty, Ty)],
 		solution: &var Vec<Option<Ty>>,
 	): Vec<ExprId> = {
 		var done: Vec<Option<ExprId>> = Vec()
@@ -1064,6 +1076,11 @@ extend Lowerer {
 					kept
 				}
 				done[i] = .Some(id)
+			}
+			if pass == 0 {
+				for (declared, held) in implied {
+					self.unify(declared, held, &var solution)
+				}
 			}
 		}
 		val args = solved(&solution)
@@ -1327,14 +1344,19 @@ extend Lowerer {
 	}
 
 	/// The type arguments a generic struct or enum takes from the type
-	/// expected where it is written.
+	/// expected where it is written: a value where a `&` of it is expected
+	/// is lent, so the reference says them too.
 	fn expectedArgs(def: TypeDef, expected: Option<Ty>): Vec<Option<Ty>> = {
 		val count = self.typeGenerics(def).len()
 		var unknown: Vec<Option<Ty>> = Vec()
 		for _ in 0..count {
 			unknown.push(.None)
 		}
-		val .Some(expected) = expected else return unknown
+		val .Some(written) = expected else return unknown
+		val expected = match self.kind(written) {
+			.Ref(inner, kind: .Shared) => inner
+			_ => written
+		}
 		val list: TyList = match (def, self.kind(expected)) {
 			(.Struct(a), .Struct(id: b, args)) if a == b => args
 			(.Enum(a), .Enum(id: b, args)) if a == b => args

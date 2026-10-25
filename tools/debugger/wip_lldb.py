@@ -8,10 +8,12 @@ their elements, and an enum as the variant it holds.
 
 A type is known by its name and by the members read from it, so a program's
 own type of the same name is left alone; an enum by its shape, as the
-compiler describes one: a structure whose members are its variants, each a
-structure named `Enum::Variant`, and first its tag, `variant`, unless the
-enum is a niche, where the variant that carries nothing is an empty
-structure where the null would be.
+compiler describes one: a structure whose first member is its tag,
+`variant`, an enumeration of the variants' names, and whose others are the
+variants that carry something, each a structure named `Enum::Variant`. An
+enum that keeps its variants that carry nothing in values the one that
+carries cannot have names those values alone, over the bytes that hold
+them: any other value there is the variant that carries.
 
 A release build keeps a variable where it can, and may keep only part of
 it: a `String`'s length but not where its bytes are. A value with a part
@@ -39,7 +41,7 @@ def _plain(sbtype):
 
 def kind_of(sbtype):
     """What Wip value a type is: 'char', 'str', 'String', 'slice', 'Vec',
-    'Set', 'Map', 'Deque', 'enum', 'niche', or None."""
+    'Set', 'Map', 'Deque', 'enum', or None."""
     sbtype = _plain(sbtype)
     # A Unicode scalar value, in 32 bits.
     if sbtype.GetBasicType() == lldb.eBasicTypeChar32:
@@ -67,20 +69,14 @@ def _enum_kind(sbtype, name):
     fields = _fields(sbtype)
     if not fields or not name:
         return None
-    variants = fields
-    tagged = fields[0].GetName() == "variant"
-    if tagged:
-        if fields[0].GetType().GetTypeClass() != lldb.eTypeClassEnumeration:
-            return None
-        variants = fields[1:]
-    for field in variants:
+    if fields[0].GetName() != "variant":
+        return None
+    if fields[0].GetType().GetTypeClass() != lldb.eTypeClassEnumeration:
+        return None
+    for field in fields[1:]:
         if field.GetType().GetName() != name + "::" + field.GetName():
             return None
-    if tagged:
-        return "enum"
-    if len(variants) == 2 and variants[1].GetType().GetByteSize() == 0:
-        return "niche"
-    return None
+    return "enum"
 
 
 def _recognizer(kind):
@@ -100,8 +96,7 @@ is_map = _recognizer("Map")
 is_deque = _recognizer("Deque")
 
 
-def is_enum(sbtype, _internal_dict):
-    return kind_of(sbtype) in ("enum", "niche")
+is_enum = _recognizer("enum")
 
 
 # ---------------------------------------------------------------------------
@@ -156,20 +151,21 @@ def _element(pointer, index, name):
 def _variant(value):
     """The member of the variant an enum holds, or its name alone where it
     carries nothing: (name, member or None)."""
-    kind = kind_of(value.GetType())
     plain = value.GetNonSyntheticValue()
-    if kind == "enum":
-        name = plain.GetChildAtIndex(0).GetValue() or "?"
-        return name, plain.GetChildMemberWithName(name) or None
+    tag = plain.GetChildAtIndex(0)
+    held = tag.GetValueAsUnsigned(0)
+    named = tag.GetType().GetEnumMembers()
+    names = [named.GetTypeEnumMemberAtIndex(i) for i in range(named.GetSize())]
+    for member in names:
+        if member.GetValueAsUnsigned() == held:
+            name = member.GetName()
+            return name, plain.GetChildMemberWithName(name) or None
+    # A value no variant that carries nothing has is the one that carries.
     fields = _fields(_plain(value.GetType()))
-    empty = fields[1]
-    offset = empty.GetOffsetInBytes()
-    error = lldb.SBError()
-    word = plain.GetData().GetUnsignedInt64(error, offset)
-    if error.Success() and word == 0:
-        return empty.GetName(), None
-    carried = fields[0].GetName()
-    return carried, plain.GetChildMemberWithName(carried)
+    if len(fields) == 2 and fields[1].GetName() not in [m.GetName() for m in names]:
+        carried = fields[1].GetName()
+        return carried, plain.GetChildMemberWithName(carried)
+    return "?", None
 
 
 def _summary_of(value):

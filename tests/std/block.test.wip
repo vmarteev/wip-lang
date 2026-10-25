@@ -1,0 +1,147 @@
+// `c::Block` on Apple's systems: a block Grand Central Dispatch calls on
+// another thread, and one it calls at once on many; one the C library calls
+// for a value; one a C function may be given or not, as an `Option`; and
+// what a block's closure captured, which ends once, when the program's
+// block and every copy the system made of it are gone.
+
+import std::c
+import std::shared::{Shared}
+import std::sync::{Atomic}
+import std::time::{Duration, Instant, sleep}
+
+@target(vendor = "apple")
+extern "C" {
+	fn dispatch_get_global_queue(priority: i64, flags: u64): ptr<u8>
+	fn dispatch_async(queue: ptr<u8>, work: &c::Block<() => void>)
+	fn dispatch_apply(count: u64, queue: ptr<u8>, work: &c::Block<(index: u64) => void>)
+	fn dispatch_semaphore_create(value: i64): ptr<u8>
+	fn dispatch_semaphore_signal(semaphore: ptr<u8>): i64
+	fn dispatch_semaphore_wait(semaphore: ptr<u8>, until: u64): i64
+	fn dispatch_release(object: ptr<u8>)
+	fn dispatch_data_create(
+		bytes: ptr<u8>,
+		size: u64,
+		queue: ptr<u8>,
+		destructor: Option<&c::Block<() => void>>,
+	): ptr<u8>
+	fn dispatch_data_get_size(data: ptr<u8>): u64
+	fn bsearch_b(
+		key: ptr<u8>,
+		base: ptr<u8>,
+		count: u64,
+		size: u64,
+		compare: &c::Block<(a: ptr<u8>, b: ptr<u8>) => i32>,
+	): ptr<u8>
+}
+
+/// Counts its ends into what the test holds.
+@target(vendor = "apple")
+struct Counted {
+	ends: Shared<Atomic<i64>>
+}
+
+@target(vendor = "apple")
+extend Counted: Destroy {
+	var fn destroy() = {
+		self.ends.value().add(1)
+	}
+}
+
+/// Whether `count` reaches `wanted` within a few seconds: what the system
+/// lets go of, it lets go of on its own thread, after the block returns.
+@target(vendor = "apple")
+fn reaches(count: &Atomic<i64>, wanted: i64): bool = {
+	val started = Instant::now()
+	while count.load() != wanted && started.elapsed().asMillis() < 5000 {
+		sleep(Duration::millis(1))
+	}
+	return count.load() == wanted
+}
+
+@target(vendor = "apple")
+@test
+fn aBlockIsCalledOnAnotherThreadAndEndsWhenTheSystemLetsGo() = {
+	val ends = Shared::of(Atomic::of(0 as i64))
+	val ran = Shared::of(Atomic::of(false))
+	val done = dispatch_semaphore_create(0)
+	val counted = Counted(ends: ends.share())
+	val told = ran.share()
+	dispatch_async(
+		dispatch_get_global_queue(0, 0),
+		c::Block::of(own () => {
+			told.value().store(counted.ends.owners() == 2)
+			dispatch_semaphore_signal(done)
+		}),
+	)
+	assert(dispatch_semaphore_wait(done, 0xFFFFFFFFFFFFFFFF) == 0)
+	assert(ran.value().load(), "it ran, holding what it captured")
+	assert(reaches(&ends.value(), 1), "what it captured ends once, when the system lets go")
+	dispatch_release(done)
+}
+
+@target(vendor = "apple")
+@test
+fn aBlockIsCalledAtOnceOnManyThreads() = {
+	val total = Shared::of(Atomic::of(0 as i64))
+	val adding = total.share()
+	dispatch_apply(
+		1000,
+		dispatch_get_global_queue(0, 0),
+		c::Block::of(own (index) => { adding.value().add(index as i64) }),
+	)
+	assert(total.value().load() == 499500)
+	assert(total.owners() == 1, "the block's closure ended with the call")
+}
+
+@target(vendor = "apple")
+@test
+fn aBlockAnswersAValue() = {
+	val numbers = [2 as i32, 3, 5, 7, 11, 13]
+	val wanted = [11 as i32]
+	val found = bsearch_b(
+		c::pointerTo(&wanted) as ptr<u8>,
+		c::pointerTo(&numbers) as ptr<u8>,
+		6,
+		4,
+		c::Block::of(own (a, b) => {
+			val x = (a as ptr<i32>)[0]
+			val y = (b as ptr<i32>)[0]
+			return if x < y then -1 else if x > y then 1 else 0
+		}),
+	)
+	assert(!found.isNull && (found as ptr<i32>)[0] == 11)
+}
+
+@target(vendor = "apple")
+@test
+fn aBlockMayBeGivenOrNot() = {
+	val bytes: [u8; 4] = [1, 2, 3, 4]
+	// None: dispatch copies the bytes, as C's null says.
+	val copied = dispatch_data_create(c::pointerTo<u8>(&bytes) as ptr<u8>, 4, null, .None)
+	assert(dispatch_data_get_size(copied) == 4)
+	dispatch_release(copied)
+	// A block: dispatch keeps the bytes where they are, and calls it once
+	// it is done with them.
+	val freed = Shared::of(Atomic::of(0 as i64))
+	val told = freed.share()
+	val kept = dispatch_data_create(
+		c::pointerTo<u8>(&bytes) as ptr<u8>,
+		4,
+		null,
+		.Some(&c::Block::of(own () => { told.value().add(1) })),
+	)
+	assert(dispatch_data_get_size(kept) == 4)
+	dispatch_release(kept)
+	assert(reaches(&freed.value(), 1), "the destructor was called")
+}
+
+@target(vendor = "apple")
+@test
+fn aBlockNoOneCopiedEndsWithTheProgramsBlock() = {
+	val ends = Shared::of(Atomic::of(0 as i64))
+	val counted = Counted(ends: ends.share())
+	val block = c::Block::of(own () => { counted.ends.value().add(0) })
+	assert(ends.value().load() == 0, "not while the block is there")
+	destroy(block)
+	assert(ends.value().load() == 1, "once, when it ends")
+}

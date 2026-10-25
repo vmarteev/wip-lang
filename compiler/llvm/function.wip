@@ -90,12 +90,12 @@ fn defineFn(
 	// The code before the first statement is at the declaration's line; the
 	// compiler's own at none.
 	val located: Option<i64> = match at {
-		.Some(span) => m.debug.location(subprogram.clone(), span, .None)
+		.Some(span) => m.debug.location(subprogram, span, .None)
 		.None => .None
 	}
 	val first = match located {
 		.Some(node) => node
-		.None => m.debug.noLine(subprogram.clone())
+		.None => m.debug.noLine(subprogram)
 	}
 	var addressSlots: Vec<Option<Value>> = Vec()
 	for _ in 0..body.locals.len() {
@@ -108,7 +108,7 @@ fn defineFn(
 		next: 0,
 		storage: Vec(),
 		addressSlots: addressSlots,
-		subprogram: subprogram.clone(),
+		subprogram: subprogram,
 		place: .Some(first),
 		blocks: Vec(),
 	)
@@ -185,7 +185,7 @@ extend FnGen {
 					break
 				}
 			}
-			variables.push((local, source.clone(), param))
+			variables.push((local, source, param))
 		}
 		variables.sortBy((a, b) => declaredBefore(&a, &b))
 		var open: Vec<(u32, i64)> = Vec()
@@ -334,7 +334,7 @@ extend FnGen {
 				.Field(..) => if m.layouts.packedAt(m.program, container) then packed = true
 				_ => {}
 			}
-			container = projectTy(m.program, container, projection.clone())
+			container = projectTy(m.program, container, projection)
 		}
 		return if packed then 1 else self.align(&var m, ty)
 	}
@@ -466,7 +466,7 @@ extend FnGen {
 		if count == 0 || !(place.projections[count - 1] is .Field(index: 1)) then return false
 		var container = self.body.local(place.local).ty
 		for projection in place.projections[0..count - 1] {
-			container = projectTy(m.program, container, projection.clone())
+			container = projectTy(m.program, container, projection)
 		}
 		return m.kind(container) is .Str | .Slice(..) || isSlicePointer(m.program, container)
 	}
@@ -496,7 +496,7 @@ extend FnGen {
 		var ty = self.body.local(place.local).ty
 		for projection in place.projections {
 			addr = self.project(&var m, addr, ty, &projection)
-			ty = projectTy(m.program, ty, projection.clone())
+			ty = projectTy(m.program, ty, projection)
 		}
 		return addr
 	}
@@ -621,7 +621,7 @@ extend FnGen {
 		.Int(bits, ty) => match m.lt(ty) {
 			.Some(.Ptr) =>
 				if bits == 0 then Val::of(.Zero, .Ptr)
-				else Val::of(.Address(bits as u64 as i64), .Ptr)
+				else Val::of(.Address(bits as u64 as% i64), .Ptr)
 			.Some(.I(width)) => Val::of(Value::int(signed(bits, width)), .I(width))
 			_ => panic("an integer constant of another type")
 		}
@@ -650,6 +650,7 @@ extend FnGen {
 		.ThreadWords => Val::of(.Global(THREAD_WORDS), .Ptr)
 		.DebugBuild => Val::of(.Int(if m.optimize then 0 else 1), .I(8))
 		.DropFn(ty) => Val::of(.Global(m.dropFn(ty, false)), .Ptr)
+		.BlockInvoke(of) => Val::of(.Global(m.blockInvoke(of)), .Ptr)
 	}
 
 	/// Stores a scalar in a local's own slot, as its type.
@@ -688,7 +689,7 @@ extend FnGen {
 		if size == 0 then return
 		self.intrinsicVoid(&var m, "@llvm.memset.p0.i64", [
 			Val::of(addr, .Ptr),
-			Val::of(.Int((byte as i8) as i64), .I(8)),
+			Val::of(.Int((byte as% i8) as i64), .I(8)),
 			Val::of(.Int(size as i64), .I(64)),
 			Val::of(.Int(0), .I(1)),
 		])
@@ -712,7 +713,7 @@ extend FnGen {
 		// passes over it.
 		.At(span) => {
 			val block = self.blockAt(span.lo)
-			if m.debug.location(self.subprogram.clone(), span, block) is .Some(place) then
+			if m.debug.location(self.subprogram, span, block) is .Some(place) then
 				self.place = .Some(place)
 		}
 		.Assign(place, rvalue) => self.assign(&var m, &place, &rvalue)
@@ -727,7 +728,7 @@ extend FnGen {
 			val ty = self.placeTy(&m, &place)
 			val size = m.layout(ty).size
 			val addr = self.placeAddr(&var m, &place)
-			self.memset(&var m, addr, POISON as u8, size)
+			self.memset(&var m, addr, POISON as% u8, size)
 		}
 		.CheckMoved(place, at) => self.checkMoved(&var m, &place, at)
 		.ErrorStep(made, function, at) => self.errorStep(&var m, made, function, at)
@@ -867,7 +868,7 @@ extend FnGen {
 							align: align,
 							order: ordering,
 						),
-						bits.clone(),
+						bits,
 					)
 					Option::Some(self.fromBits(swapped, &lt))
 				}
@@ -888,7 +889,7 @@ extend FnGen {
 							align: align,
 							order: ordering,
 						)),
-						withFlag(bits.clone()),
+						withFlag(bits),
 					)
 					Option::Some(self.value(.ExtractValue(aggregate: both, index: 1), .I(1)))
 				}
@@ -946,12 +947,7 @@ extend FnGen {
 		val failed = Label::Failed(self.number())
 		val fine = Label::Fine(self.number())
 		val unlikely = m.debug.unlikely()
-		self.emit(.CondBr(
-			condition: flag,
-			ifTrue: failed.clone(),
-			ifFalse: fine.clone(),
-			weights: .Some(unlikely),
-		))
+		self.emit(.CondBr(condition: flag, ifTrue: failed, ifFalse: fine, weights: .Some(unlikely)))
 		self.startBlock(failed)
 		self.panics(&var m, panics)
 		self.emit(.Unreachable)
@@ -974,6 +970,19 @@ extend FnGen {
 				}
 				.Division => ("wip_panic_division", Vec())
 				.NullText => ("wip_panic_null_text", Vec())
+				// The value as 64 bits, as its type extends it, and what the
+				// types are, for the message.
+				.Narrowing(value, from, to) => {
+					val v = self.cast(&var m, &value, I64)
+					(
+						"wip_panic_narrowing",
+						[
+							v,
+							Val::of(.Int(integerCode(m.kind(from))), .I(64)),
+							Val::of(.Int(integerCode(m.kind(to))), .I(64)),
+						],
+					)
+				}
 				.Overflow(op) => (
 					"wip_panic_overflow",
 					[Val::of(.Int(overflowCode(op) as i64), .I(64))],
@@ -1071,13 +1080,17 @@ extend FnGen {
 				val stored = Val::of(.Int(variant as i64), lt)
 				self.store(&stored, addr, size.min(4))
 			}
-			.Niche(empty, offset, ..) if variant == empty => {
-				val addr = self.placeAddr(&var m, &place)
-				val at = self.gep(addr, offset as i64)
-				val stored = Val::of(.Zero, .Ptr)
-				self.store(&stored, at, 8)
+			// An empty variant is its value in the niche; the one that carries
+			// is its fields, assigned apart.
+			.Niche(offset, size, ..) => {
+				val tag = m.layouts.enumTag(m.program, ty)
+				if tag.nicheValue(variant) is .Some(value) {
+					val addr = self.placeAddr(&var m, &place)
+					val at = self.gep(addr, offset as i64)
+					val stored = Val::of(.Int(value as% i64), .I(size * 8))
+					self.store(&stored, at, size)
+				}
 			}
-			.Niche(..) => {}
 		}
 	}
 
@@ -1090,18 +1103,28 @@ extend FnGen {
 			self.value(.Cast(cast: .ZExt, value: tag, to: .I(32)), .I(32))
 		}
 		.Byte(..) => self.load(addr, .I(32), 4)
-		.Niche(payload, empty, offset) => {
+		// The variant whose value the niche holds, each empty one's in turn;
+		// any other is the one that carries.
+		.Niche(payload, offset, size, first, empties, ..) => {
 			val at = self.gep(addr, offset as i64)
-			val ptr = self.load(at, .Ptr, 8)
-			val isNull = self.value(.IntCompare(cond: .Eq, left: ptr, right: .Zero), .I(1))
-			self.value(
-				.Select(own Select(
-					condition: isNull.v,
-					ifTrue: Val::of(.Int(empty as i64), .I(32)),
-					ifFalse: Val::of(.Int(payload), .I(32)),
-				)),
-				.I(32),
-			)
+			val held = self.load(at, .I(size * 8), size)
+			var variant = Val::of(.Int(payload as i64), .I(32))
+			for (k, empty) in empties.forwards().enumerate() {
+				val value = (first + k as u64) as i64
+				val isIt = self.value(
+					.IntCompare(cond: .Eq, left: held.clone(), right: .Int(value)),
+					.I(1),
+				)
+				variant = self.value(
+					.Select(own Select(
+						condition: isIt.v,
+						ifTrue: Val::of(.Int(empty as i64), .I(32)),
+						ifFalse: variant,
+					)),
+					.I(32),
+				)
+			}
+			variant
 		}
 	}
 
@@ -1136,7 +1159,7 @@ extend FnGen {
 			val left = self.operand(&var m, &lhs)
 			val given = self.operand(&var m, &rhs)
 			val lt = left.t.clone()
-			val right = Val(v: self.coerce(&given, lt.clone()), t: lt.clone())
+			val right = Val(v: self.coerce(&given, lt.clone()), t: lt)
 			val over = self.overflows(&var m, op, signed, &left, &right)
 			self.value(.Cast(cast: .ZExt, value: over, to: .I(8)), .I(8))
 		}
@@ -1541,7 +1564,7 @@ extend FnGen {
 					self.memmove(&var m, scratch.clone(), src, size)
 					for part in parts {
 						val at = self.gep(scratch.clone(), part.offset)
-						values.push(self.load(at, regType(part.reg.clone()), 1))
+						values.push(self.load(at, regType(part.reg), 1))
 					}
 				}
 				.Copy => {
@@ -1593,7 +1616,7 @@ extend FnGen {
 				val both = self.value(.Call(own call), ty)
 				val scratch = self.scratch(&var m, defRet, &parts)
 				for (i, part) in parts.forwards().enumerate() {
-					val t = regType(part.reg.clone())
+					val t = regType(part.reg)
 					val piece = self.value(
 						.ExtractValue(aggregate: both.clone(), index: i as u32),
 						t,
@@ -1769,7 +1792,7 @@ extend FnGen {
 			val word = self.coerce(&given, .I(32))
 			var written: Vec<(i64, Label)> = Vec()
 			for (case, target) in cases {
-				written.push(((case as i32), .Block(target.index)))
+				written.push(((case as% i32), .Block(target.index)))
 			}
 			self.emit(.Switch(
 				value: Val::of(word, .I(32)),
@@ -1891,9 +1914,9 @@ fn overflowIntrinsic(op: BinaryOp, signed: bool): str = match op {
 
 /// Bits as the signed number they are, which LLVM takes for every width.
 fn signed(bits: u128, width: u32): i128 = {
-	if width >= 128 then return bits as i128
+	if width >= 128 then return bits as% i128
 	val shift = 128 - width
-	return ((bits << shift) as i128) >> shift
+	return ((bits << shift) as% i128) >> shift
 }
 
 /// The struct an intrinsic answers a value of type `t` in, with a flag: an
@@ -1913,6 +1936,27 @@ fn orderingOf(order: &AtomicOrder): AtomicOrdering = match order {
 fn floatNames(t: Type): (str, str) = if t is .F32 then ("float", "f32") else ("double", "f64")
 
 /// Which arithmetic a panic is about, as the runtime's message names it.
+/// Which integer type a narrowing's message names, as the runtime numbers
+/// them: `i8` to `i128` 0 to 4, `isize` 5, `u8` to `u128` 6 to 10, `usize`
+/// 11, and a character 12.
+fn integerCode(kind: TyKind): i64 = match kind {
+	.Int(int) => match int {
+		.I8 => 0
+		.I16 => 1
+		.I32 => 2
+		.I64 => 3
+		.I128 => 4
+		.Isize => 5
+		.U8 => 6
+		.U16 => 7
+		.U32 => 8
+		.U64 => 9
+		.U128 => 10
+		.Usize => 11
+	}
+	_ => 12
+}
+
 fn overflowCode(op: BinaryOp): i64 = match op {
 	.Add => 0
 	.Sub => 1

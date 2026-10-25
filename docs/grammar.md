@@ -336,11 +336,20 @@ method      = annotation* "pub"? ( "var" | "move" | "static" | "lend" )? fnDecl 
                                             method does with its receiver;
                                             `lend` both ways *)
 
-fnDecl      = "fn" IDENT generics? "(" params? ")" ( ":" type lendsFrom? )? keeps?
-              "empties"? "=" expr ;
+fnDecl      = "fn" IDENT generics? "(" params? ")" ( ":" type ( "as" IDENT )? lendsFrom? )? keeps?
+              "empties"? assertExpr* "=" expr ;
                                          (* `empties`: a call leaves the
                                             receiver, a `var fn`'s, holding no
                                             view; a word here alone *)
+                                         (* `as IDENT`: the name of the
+                                            generator a function that yields
+                                            answers, a type of the module *)
+                                         (* `assertExpr`: a generic's fact
+                                            about its type and length
+                                            parameters, checked while the
+                                            program compiles for each
+                                            instance a call makes; it may
+                                            begin a line of its own *)
 lendsFrom   = "from" lendPath ( "," lendPath )* ;
                                          (* what the result borrows, and
                                             nothing else; `from` is a word
@@ -485,7 +494,9 @@ shift       = term ( ( "<<" | ">>" ) term )* ;   (* two adjacent "<" or ">" *)
 term        = factor ( ( "+" | "-" | "+%" | "-%" ) factor )* ;
 factor      = cast ( ( "*" | "/" | "%" | "*%" ) cast )* ;
                                          (* `+%`, `-%` and `*%` wrap *)
-cast        = unary ( "as" type )* ;     (* numeric conversions;
+cast        = unary ( ( "as" | "as%" ) type )* ;
+                                         (* numeric conversions; `as%` keeps
+                                           the low bits, and is one token;
                                            the type takes no typeArgs, see R7 *)
 unary       = ( "-" | "!" | "&" "var"? | "move" | "own" ) unary
             | postfix ;

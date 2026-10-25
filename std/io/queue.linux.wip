@@ -1,0 +1,105 @@
+// Linux: an epoll instance.
+
+import std::time::{Duration}
+
+extern "C" {
+	fn epoll_create1(flags: c_int): c_int
+	fn epoll_ctl(queue: c_int, operation: c_int, fd: c_int, event: &RawEvent): c_int
+	/// The room for events, and how long to wait, in milliseconds, or -1.
+	fn epoll_wait(queue: c_int, events: &var [RawEvent], timeout: c_int): c_int
+}
+
+// `struct epoll_event` is packed on x86-64, where the token starts four
+// bytes in, and laid out as usual on arm64, where it starts at eight.
+@target(arch = "x86_64")
+extern struct RawEvent {
+	events: u32 = 0
+	low: u32 = 0
+	high: u32 = 0
+}
+
+@target(arch = "arm64")
+extern struct RawEvent {
+	events: u32 = 0
+	padding: u32 = 0
+	data: u64 = 0
+}
+
+@target(arch = "x86_64")
+fn rawOf(events: u32, token: u64): RawEvent = RawEvent(
+	events: events,
+	low: (token & 0xffffffff) as u32,
+	high: (token >> 32) as u32,
+)
+
+@target(arch = "arm64")
+fn rawOf(events: u32, token: u64): RawEvent = RawEvent(events: events, data: token)
+
+@target(arch = "x86_64")
+fn tokenOf(raw: &RawEvent): u64 = (raw.low as u64) | ((raw.high as u64) << 32)
+
+@target(arch = "arm64")
+fn tokenOf(raw: &RawEvent): u64 = raw.data
+
+val EPOLLIN: u32 = 0x1
+val EPOLLOUT: u32 = 0x4
+val EPOLLERR: u32 = 0x8
+val EPOLLHUP: u32 = 0x10
+/// The other end shut its writing down.
+val EPOLLRDHUP: u32 = 0x2000
+val EPOLL_CLOEXEC: c_int = 0o2000000
+val EPOLL_CTL_ADD: c_int = 1
+val EPOLL_CTL_DEL: c_int = 2
+val EPOLL_CTL_MOD: c_int = 3
+
+fn blank(): RawEvent = rawOf(0, 0)
+
+fn created(): c_int = epoll_create1(EPOLL_CLOEXEC)
+
+fn bitsOf(interest: Interest): u32 =
+	EPOLLRDHUP |
+	(if interest.reads() then EPOLLIN else 0) |
+	(if interest.writes() then EPOLLOUT else 0)
+
+fn controlled(queue: c_int, operation: c_int, fd: i32, event: RawEvent): Result<void, IoError> = {
+	if epoll_ctl(queue, operation, fd, &event) < 0 then return .Err(lastError())
+	return .Ok()
+}
+
+fn added(queue: c_int, fd: i32, interest: Interest, token: u64): Result<void, IoError> = controlled(
+	queue,
+	EPOLL_CTL_ADD,
+	fd,
+	rawOf(bitsOf(interest), token),
+)
+
+fn changed(
+	queue: c_int,
+	fd: i32,
+	was: Interest,
+	now: Interest,
+	token: u64,
+): Result<void, IoError> = controlled(queue, EPOLL_CTL_MOD, fd, rawOf(bitsOf(now), token))
+
+fn removed(queue: c_int, fd: i32, was: Interest): Result<void, IoError> = controlled(
+	queue,
+	EPOLL_CTL_DEL,
+	fd,
+	blank(),
+)
+
+fn waited(queue: c_int, room: &var [RawEvent], timeout: Option<Duration>): i64 = {
+	// Milliseconds, rounded up, so that a wait is never cut short.
+	val millis = match timeout {
+		.Some(length) => ((length.asNanos().max(0) + 999999) / 1000000).min(i32::MAX as i64)
+		.None => -1
+	}
+	return epoll_wait(queue, &var room, millis as c_int) as i64
+}
+
+fn eventOf(raw: &RawEvent): Event = Event(
+	token: tokenOf(&raw),
+	readable: (raw.events & EPOLLIN) != 0,
+	writable: (raw.events & EPOLLOUT) != 0,
+	closed: (raw.events & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) != 0,
+)

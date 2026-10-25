@@ -1,0 +1,215 @@
+// A Mac: FSEvents, a stream for each path watched, of its directory,
+// telling of each item that changed. A stream tells on a dispatch queue's
+// thread, where its callback counts what is the watch's into an atomic and
+// writes a byte to a pipe, whose other end is the watcher's descriptor;
+// `changed` compares each count with the last it saw. Nothing else is
+// shared between the two threads.
+
+import std::c
+import std::fs
+import std::io
+import std::libc
+import std::path
+import std::sync::{Atomic}
+
+@framework("CoreServices")
+extern "C" {
+	fn CFStringCreateWithCString(allocator: ptr<u8>, text: cstring, encoding: u32): ptr<u8>
+	/// The values, and how many: what a slice crosses as.
+	fn CFArrayCreate(allocator: ptr<u8>, values: &[ptr<u8>], callbacks: ptr<u8>): ptr<u8>
+	fn CFRelease(object: ptr<u8>)
+	fn FSEventStreamCreate(
+		allocator: ptr<u8>,
+		callback: (stream: ptr<u8>, info: ptr<u8>, count: size_t, paths: ptr<ptr<u8>>, flags: ptr<u32>, ids: ptr<u64>) => void,
+		context: &StreamContext,
+		directories: ptr<u8>,
+		since: u64,
+		latency: f64,
+		flags: u32,
+	): ptr<u8>
+	fn FSEventStreamSetDispatchQueue(stream: ptr<u8>, queue: ptr<u8>)
+	fn FSEventStreamStart(stream: ptr<u8>): u8
+	fn FSEventStreamStop(stream: ptr<u8>)
+	fn FSEventStreamInvalidate(stream: ptr<u8>)
+	fn FSEventStreamRelease(stream: ptr<u8>)
+	fn dispatch_queue_create(label: cstring, attributes: ptr<u8>): ptr<u8>
+	fn dispatch_sync_f(queue: ptr<u8>, context: ptr<u8>, work: (context: ptr<u8>) => void)
+	fn dispatch_release(object: ptr<u8>)
+}
+
+/// What a stream is made with, and copies.
+extern struct StreamContext {
+	version: i64
+	info: ptr<u8>
+	retain: ptr<u8>
+	release: ptr<u8>
+	describe: ptr<u8>
+}
+
+val kCFStringEncodingUTF8: u32 = 0x08000100
+val kFSEventStreamEventIdSinceNow: u64 = 0xFFFFFFFFFFFFFFFF
+/// The first change after a quiet moment is told at once, and those after
+/// it are held together.
+val kFSEventStreamCreateFlagNoDefer: u32 = 0x2
+/// Each item that changed is told of, not only its directory.
+val kFSEventStreamCreateFlagFileEvents: u32 = 0x10
+/// The stream missed some, and anything may have changed.
+val MISSED: u32 = 0x1 | 0x2 | 0x4
+/// How long, in seconds, changes are held together before they are told.
+val LATENCY: f64 = 0.05
+
+/// The pipe a stream's callback writes to, and the watcher reads from.
+struct Source {
+	reading: c_int
+	writing: c_int
+}
+
+/// What a stream's callback and the watcher share: how many changes were
+/// the watch's; the directory's real path, as FSEvents tells paths, and a
+/// file's name in it; and the pipe's end to wake the watcher with.
+struct Told {
+	count: Atomic<i64>
+	directory: String
+	name: Option<String>
+	writing: c_int
+}
+
+struct Handle {
+	stream: ptr<u8>
+	queue: ptr<u8>
+	told: c::Pinned<Told>
+	directories: ptr<u8>
+	text: ptr<u8>
+	/// The count when the watcher last looked.
+	seen: i64
+}
+
+fn opened(): Result<Source, io::IoError> = {
+	var ends = libc::Pipe(reading: 0, writing: 0)
+	if libc::pipe(&var ends) != 0 then return .Err(io::lastError())
+	for fd in [ends.reading, ends.writing] {
+		libc::closeOnExec(fd)
+		libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK)
+	}
+	return .Ok(Source(reading: ends.reading, writing: ends.writing))
+}
+
+fn closed(source: &var Source) = {
+	libc::close(source.reading)
+	libc::close(source.writing)
+}
+
+fn descriptorOf(source: &Source): i32 = source.reading
+
+fn started(
+	source: &var Source,
+	directory: str,
+	name: &Option<String>,
+): Result<Handle, io::IoError> = {
+	val real = fs::realPath(directory)?
+	val told = c::Pinned::of(Told(
+		count: Atomic::of(0 as i64),
+		directory: real.clone(),
+		name: name.clone(),
+		writing: source.writing,
+	))
+	var label = real
+	val text = CFStringCreateWithCString(null, label.toCstring(), kCFStringEncodingUTF8)
+	val directories = CFArrayCreate(null, [text], null)
+	val context = StreamContext(
+		version: 0,
+		info: told.address() as ptr<u8>,
+		retain: null,
+		release: null,
+		describe: null,
+	)
+	val stream = FSEventStreamCreate(
+		null,
+		toldOf,
+		&context,
+		directories,
+		kFSEventStreamEventIdSinceNow,
+		LATENCY,
+		kFSEventStreamCreateFlagNoDefer | kFSEventStreamCreateFlagFileEvents,
+	)
+	var queueName = String::of("std.watch")
+	val queue = dispatch_queue_create(queueName.toCstring(), null)
+	val handle = Handle(
+		stream: stream,
+		queue: queue,
+		told: told,
+		directories: directories,
+		text: text,
+		seen: 0,
+	)
+	FSEventStreamSetDispatchQueue(stream, queue)
+	if FSEventStreamStart(stream) == 0 {
+		stopped(&var source, handle, [])
+		return .Err(.Other(0))
+	}
+	return .Ok(handle)
+}
+
+/// The stream stopped and let go: what it was telling as it stopped is
+/// waited for, on its queue, before what it tells into is freed.
+fn stopped(source: &var Source, handle: Handle, others: &[Watched]) = {
+	FSEventStreamStop(handle.stream)
+	FSEventStreamInvalidate(handle.stream)
+	dispatch_sync_f(handle.queue, null, drained)
+	FSEventStreamRelease(handle.stream)
+	dispatch_release(handle.queue)
+	CFRelease(handle.directories)
+	CFRelease(handle.text)
+}
+
+/// Nothing: what `dispatch_sync_f` runs once what was queued before it is
+/// done.
+fn drained(context: ptr<u8>) = {}
+
+fn gathered(source: &var Source, watched: &var [Watched]) = {
+	// The pipe emptied: the counts say what changed.
+	var bytes = [0 as u8; 256]
+	while libc::read(source.reading, &var bytes) > 0 {}
+	for i in 0..watched.len() {
+		val count = watched[i].handle.told.value().count.load()
+		if count == watched[i].handle.seen then continue
+		watched[i].handle.seen = count
+		watched[i].fired = true
+	}
+}
+
+fn waiting(source: &Source, watched: &[Watched]): bool = watched.any((one) =>
+	one.handle.told.value().count.load() != one.handle.seen)
+
+/// What a stream tells, on its queue's thread: which items changed. One
+/// that is the watch's — the directory, an entry of it, or the file — is
+/// counted, and the watcher woken.
+fn toldOf(
+	stream: ptr<u8>,
+	info: ptr<u8>,
+	count: size_t,
+	paths: ptr<ptr<u8>>,
+	flags: ptr<u32>,
+	ids: ptr<u64>,
+) = {
+	c::pinnedAt<Told, void>(
+		info as ptr<void>,
+		(told) => {
+			for i in 0..(count as i64) {
+				val item = str::fromBytes(&paths[i][0..libc::strlen(paths[i]) as i64])
+				if (flags[i] & MISSED) != 0 || isTheWatchs(&told, item) {
+					told.count.add(1)
+					libc::write(told.writing, [1 as u8])
+					return
+				}
+			}
+		},
+	)
+}
+
+/// Whether a change to `item` is the watch's: for a directory, the
+/// directory or an entry in it; for a file, the file.
+fn isTheWatchs(told: &Told, item: str): bool = match told.name {
+	.Some(name) => path::parent(item) == told.directory && path::name(item) == name
+	.None => item == told.directory || path::parent(item) == told.directory
+}

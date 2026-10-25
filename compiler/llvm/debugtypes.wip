@@ -6,13 +6,13 @@
 // member for each variant that carries something. Sizes and offsets are in
 // bits, as LLVM counts them.
 
-import hir::{I64, Ty, U32, U8}
+import hir::{I64, Ty, U16, U32, U64, U8}
 
 extend Llvm {
 	/// The node of `ty`, written the first time it is asked for; nothing for
 	/// a type with no value, which C calls `void`.
 	var fn diType(ty: Ty): Option<i64> = {
-		if self.diTypes.get(&ty) is .Some(node) then return node.clone()
+		if self.diTypes.get(&ty) is .Some(node) then return node
 		val name = self.program.tyName(ty, self.interner)
 		val node: Option<i64> = match self.kind(ty) {
 			.Unit | .Never | .Error | .Param(..) | .Assoc(..) | .Count(..) | .ArrayOf(..) => .None
@@ -38,11 +38,11 @@ extend Llvm {
 				Option::Some(self.diPair(name, "ptr", bytes))
 			}
 			// Only a declaration: what is in it is C's to know.
-			.Opaque(..) => .Some(self.debug.add(.Declared(tag: .Structure, name: name.clone())))
+			.Opaque(..) => .Some(self.debug.add(.Declared(tag: .Structure, name: name)))
 			// A function's address, as C's `void *`.
 			.Fn(..) => {
 				val pointer = self.diPointer(.None)
-				Option::Some(self.debug.add(.Typedef(name: name.clone(), base: pointer)))
+				Option::Some(self.debug.add(.Typedef(name: name, base: pointer)))
 			}
 			.Ref(inner, ..) | .Own(inner) | .Ptr(inner) => .Some(self.diPointerTo(ty, inner, name))
 			.Slice(elem) | .Slots(inner: elem) => {
@@ -66,7 +66,7 @@ extend Llvm {
 			.Struct(..) => .Some(self.diStructure(ty, name))
 			.Enum(..) => .Some(self.diEnumeration(ty, name))
 		}
-		self.diTypes.put(ty, node.clone())
+		self.diTypes.put(ty, node)
 		return node
 	}
 
@@ -163,20 +163,38 @@ extend Llvm {
 			names.push(self.interner.resolve(variant.name))
 		}
 		return match tag {
-			// The one variant that carries something, where a null in its
-			// `own` is the one that does not: the variant that carries is a
-			// member, and the other an empty structure where the null would
-			// be, so that both keep their names.
-			.Niche(payload, empty, offset) => {
+			// The one variant that carries something, where the values it
+			// cannot hold are the others: their names over those bytes, as a
+			// tag's are over the tag, and the variant that carries a member.
+			// A debugger shows a value it holds as no name of theirs.
+			.Niche(payload, offset, size: nicheSize, ..) => {
+				var enumerators: Vec<i64> = Vec()
+				for (index, variant) in names.forwards().enumerate() {
+					if tag.nicheValue(index as u32) is .Some(value) then
+						enumerators.push(
+							self.debug.add(.Enumerator(name: variant.clone(), value: value as i64)),
+						)
+				}
+				val enumeratorList = self.diList(&enumerators)
+				val nicheType = match nicheSize {
+					1 => U8
+					2 => U16
+					4 => U32
+					_ => U64
+				}
+				val .Some(base) = self.diType(nicheType) else panic("an integer has a type")
+				val namesOf = self.debug.add(.Enumeration(
+					name: .None,
+					base: base,
+					size: nicheSize * 8,
+					elements: enumeratorList,
+				))
 				val node = self.debug.reserve()
 				self.diTypes.put(ty, .Some(node))
-				val carried = self.diVariant(node, ty, payload, names[payload], &variants[payload])
-				val emptyName = names[empty].toStr()
-				val nothingName = "\(name)::\(emptyName)"
-				val none: Vec<Member> = Vec()
-				val nothing = self.diStruct(nothingName, 0, &none)
-				val other = self.diMember(node, emptyName, nothing, 0, offset * 8)
-				val elements = self.diList([carried, other])
+				val elements = self.diList([
+					self.diMember(node, "variant", namesOf, nicheSize * 8, offset * 8),
+					self.diVariant(node, ty, payload, names[payload], &variants[payload]),
+				])
 				self.debug.fill(node, .Structure(
 					tag: .Structure,
 					name: name,

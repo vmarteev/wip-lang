@@ -377,8 +377,15 @@ extend Lowerer {
 		// receiver, which is what the value is: `Option<i64>`'s `unwrap`
 		// answers an `i64` whatever is expected of it, and a `str` expected
 		// is then a mismatch, not an `unwrap<str>` of an `Option<i64>`.
-		if hint is .Some(h) && h != UNIT && self.kind(ret) !is .Ref(..) then
-			self.unify(ret, h, &var inference.tys)
+		if hint is .Some(h) && h != UNIT && self.kind(ret) !is .Ref(..) {
+			// A struct or an enum where a `&` of one is expected is a temporary
+			// lent where it is used: what it is, is what the `&` is to.
+			val lent = match (self.kind(ret), self.kind(h)) {
+				(.Struct(..) | .Enum(..), .Ref(inner, kind: .Shared)) => inner
+				_ => h
+			}
+			self.unify(ret, lent, &var inference.tys)
+		}
 		var params: Vec<ParamDef> = Vec()
 		val all = &self.program.fns[callee].params
 		for i in taken..all.len() {
@@ -403,7 +410,7 @@ extend Lowerer {
 					toC: self.program.fns[callee].isExtern,
 				))
 			}
-			hirArgs = self.genericOperands(&operands, &var inference.tys)
+			hirArgs = self.genericOperands(&operands, [], &var inference.tys)
 		} else {
 			val (matchedArgs, matchedOrder) = self.matchedCall(
 				callee,
@@ -609,7 +616,23 @@ extend Lowerer {
 				toC: self.program.fns[callee].isExtern,
 			))
 		}
-		val values = self.genericOperands(&operands, &var inference.tys)
+		// An implicit the call leaves out is an argument it does not write,
+		// after those that say their own type: the binding it is filled from
+		// decides the call's type arguments as a written argument's type
+		// would, and a literal or a lambda that waits to be told its type is
+		// told by it.
+		var implied: Vec<(Ty, Ty)> = Vec()
+		for (slot, arg) in matched.slots.forwards().enumerate() {
+			if arg.isSome() || !slots[slot].implicit || slots[slot].default.isSome() then continue
+			val declared = slots[slot].ty
+			if !self.program.types.isGeneric(declared) then continue
+			val .Some(held) = self.implicitTy(slots[slot].name) else continue
+			match self.kind(declared) {
+				.Ref(inner, ..) if self.kind(held) !is .Ref(..) => implied.push((inner, held))
+				_ => implied.push((declared, held))
+			}
+		}
+		val values = self.genericOperands(&operands, &implied, &var inference.tys)
 		var checked: Vec<Option<ExprId>> = Vec()
 		for _ in 0..args.len() {
 			checked.push(.None)
@@ -619,6 +642,16 @@ extend Lowerer {
 		}
 		for arg in matched.unmatched {
 			self.inferArgument(args[arg], .None)
+		}
+		// It is filled as the type the call's arguments say it is. Where they
+		// leave a type argument in it undecided, it is not one the binding
+		// found can be, which `implicitArgument` says, and that is why the
+		// type argument is not known.
+		val known = solved(&inference.tys)
+		for slot in 0..slots.len() {
+			if !slots[slot].implicit then continue
+			val filled = self.program.types.subst(slots[slot].ty, &known)
+			if self.isPoisoned(filled) then inference.explained = true else slots[slot].ty = filled
 		}
 		return self.arrangeArguments(&slots, &matched, &checked, item.span, name)
 	}
@@ -687,6 +720,41 @@ extend Lowerer {
 					self.aliasScope(sym).isSome() ||
 					self.preludeModule(sym).isSome()
 		}
+	}
+
+	/// Whether a call of `callee` builds a generic struct without writing its
+	/// type arguments: `Writer(scale: 10)`, whose `G` its fields may not say,
+	/// and the type expected of it does.
+	fn buildsGenericStruct(callee: ast::ExprId): bool = {
+		val found: Option<TypeDef> = match self.ast.exprs[callee].kind {
+			.Name(sym) => {
+				if !self.namesStruct(sym) then return false
+				val name = ast::Name(sym: sym, span: Span::new(0, 0))
+				match self.imported(name) {
+					.Some(.Item(module, name: item)) => self.modules[module].types.get(
+						&item.sym,
+					).map((f) => f.0)
+					_ => match self.typeHere(sym) {
+						.Some(here) => .Some(here.0)
+						.None => match self.preludeModule(sym) {
+							.Some(prelude) => self.modules[prelude].types.get(&sym).map((f) => f.0)
+							.None => .None
+						}
+					}
+				}
+			}
+			.Path(leadingDot: false, segments, typeArgs: .None) => match self.resolvePathQuietly(
+				&segments,
+			) {
+				.Item(module, name) if self.moduleTypesContain(
+					module,
+					name.sym,
+				) => self.modules[module].types.get(&name.sym).map((f) => f.0)
+				_ => .None
+			}
+			_ => .None
+		}
+		return found is .Some(.Struct(id)) && !self.program.structs[id].generics.isEmpty()
 	}
 
 	/// `..base` in a call that builds no struct.
@@ -900,7 +968,7 @@ extend Lowerer {
 				candidates.push(self.text(self.program.fns[id].name))
 		}
 		for i in 0..self.program.typeConsts.len() {
-			val (of, constant) = self.program.typeConsts.keyAt(i).clone()
+			val (of, constant) = self.program.typeConsts.keyAt(i)
 			if of == owner then candidates.push(self.text(constant))
 		}
 		var diagnostic = Diagnostic::error(
@@ -997,11 +1065,11 @@ extend Lowerer {
 			var candidates: Vec<str> = Vec()
 			val fns = &self.modules[module].fns
 			for i in 0..fns.len() {
-				candidates.push(self.text(fns.keyAt(i).clone()))
+				candidates.push(self.text(fns.keyAt(i)))
 			}
 			val consts = &self.modules[module].consts
 			for i in 0..consts.len() {
-				candidates.push(self.text(consts.keyAt(i).clone()))
+				candidates.push(self.text(consts.keyAt(i)))
 			}
 			// A path that names no module is a name of this one: said as an
 			// unknown name is, with what left the prelude.

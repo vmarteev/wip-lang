@@ -17,7 +17,7 @@ val name = "wip" // a `str`; it becomes a `String` where one is expected
 val point = (3, 4) // a tuple
 val primes = [2, 3, 5, 7] // an array, `[i64; 4]`
 val total: i64 = count // a `u8` widens to a type that holds it
-val small = 300 as u8 // `as` may lose something: 44
+val small = 300 as% u8 // `as%` keeps the low bits: 44
 assert(answer == 42 && count == 4 && primes[1] == 3 && point.1 == 4)
 assert(total + count == 8 && small == 44)
 assert(ratio > 1.0 && ok && letter != 'x' && name.len() == 3)
@@ -422,6 +422,7 @@ A directory is a module, and `pub` is what it exports. [Page 2](02-modules.md)
 | `wip test .` | runs the `@test` functions of `*.test.wip` files |
 | `wip check main.wip` | checks without building |
 | `wip fmt .` | lays the code out |
+| `wip fix .` | makes the fixes that change no meaning: a needless `clone()` or `move` |
 | `wip doc .` | writes the documentation of what a module exports |
 | `wip bindgen header.h` | writes a module that calls a C library |
 

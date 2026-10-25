@@ -158,18 +158,42 @@ assert(count.saturatingAdd(100) == 255 && (3 as u8).saturatingSub(5) == 0)
 assert((7 as i64).checkedDiv(0) == .None)
 ```
 
-`as` converts between number types. An integer keeps its low bits where
-the type is narrower and its bits where only the sign differs, a float
-rounds to the nearest the type holds, and a float made an integer drops
-its fraction and stops at the type's least or greatest value, `NaN` at 0:
+`as` converts between number types. An integer made another integer
+type is the same number: where the type cannot hold it — a narrower type
+too small for it, or the other sign — the program panics with the value,
+as arithmetic that does not fit does, and a constant that does not fit is
+refused where it is written (E0310). A float rounds to the nearest the
+type holds, and a float made an integer drops its fraction and stops at
+the type's least or greatest value, `NaN` at 0:
+
+```wip,run
+val n = 200
+assert(n as u8 == 200)
+assert(65 as u8 as char == 'A')
+assert(3.7 as i64 == 3)
+assert(1e20 as i64 == 9223372036854775807)
+```
+
+```wip,error=E0310
+val small = 300 as u8
+```
+
+`as%` makes an integer, or a character, another integer type by keeping
+its low bits and reading them in that type: the value modulo 2 to the
+type's width. It is for a cut that is meant — a byte taken out of a word,
+the same bits read with the other sign — and says so where it is written,
+as `+%` does for arithmetic. Where nothing can be cut — a type that holds
+every value, or a constant that fits — it is a warning (E0371), whose fix
+writes `as`; a float has no bits to cut, so `as%` of one is refused.
 
 ```wip,run
 val n = 300
-assert(n as u8 == 44)
-assert(-1 as u64 == 18446744073709551615)
-assert(3.7 as i64 == 3)
-assert(1e20 as i64 == 9223372036854775807)
-assert(65 as u8 as char == 'A')
+assert(n as% u8 == 44)
+val word: u32 = 0xABCD
+assert((word >> 8) as% u8 == 0xAB)
+assert(-1 as% u64 == 18446744073709551615)
+val all: u64 = 0xFFFF_FFFF_FFFF_FFFF
+assert(all as% i64 == -1)
 ```
 
 A float's bits are an unsigned integer of its width, and back:
@@ -404,6 +428,20 @@ val list: Vec<i64> = [1, 2, 3, 4]
 assert(list == [1, 2, 3, 4] && list.items()[1..3] == [2, 3])
 val names: Vec<String> = ["ann", "bob"]
 assert(names == ["ann", "bob"])
+```
+
+An array of one value repeated is `[value; count]`, the value copied
+into each element, so it is plain data. One whose elements differ, or
+own memory, is made by a function of each index, `madeBy((i) => …)`,
+called for each index in order, its length and element type those of the
+type expected:
+
+```wip,run
+val squares: [i64; 4] = madeBy((i) => i * i)
+assert(squares == [0, 1, 4, 9])
+var lists: [Vec<String>; 3] = madeBy((_) => Vec())
+lists[1].push(String::of("one"))
+assert(lists[0].isEmpty() && lists[1].len() == 1)
 ```
 
 A block of values whose size is known only when the program runs is written
@@ -829,6 +867,34 @@ fn main() = {
     assert(Colour::fromIndex(1) == .Some(.Green))
     assert(Colour::fromIndex(9).isNone())
     assert(Colour::all() == [Colour::Red, Colour::Green, Colour::Blue])
+}
+```
+
+An enum is its tag and room for its largest variant. One where a single
+variant carries a value and the others carry none, as `Option` is, keeps
+the others in values that one cannot have, and needs no tag: a
+reference's, an `own`'s or a function's null, a `bool`'s bytes past 1, a
+`char`'s numbers past the last, the tags an enum does not use, and the
+field of a struct or a tuple that has the most of them. So an
+`Option<&T>` is one pointer, with `.None` its null, and an `Option<bool>`
+one byte. A value whose type ends by `Destroy`, or holds one that does —
+a `String`, a `Vec` — keeps its tag beside it, since a program that
+checks its moves ([page 12](12-tools.md)) writes over such a value where
+it was moved from:
+
+```wip,run
+import std::c
+
+struct Reading {
+    at: i64
+    taken: bool
+}
+
+fn main() = {
+    assert(c::sizeOf<Option<&i64>>() == c::sizeOf<&i64>())
+    assert(c::sizeOf<Option<bool>>() == 1 && c::sizeOf<Option<char>>() == 4)
+    assert(c::sizeOf<Option<Reading>>() == c::sizeOf<Reading>())
+    assert(c::sizeOf<Option<String>>() > c::sizeOf<String>())
 }
 ```
 

@@ -1,6 +1,6 @@
 // Expressions that produce scalars, operators and calls.
 
-import hir::{BOOL, ExprId, FnId, I32, I64, Intrinsic, PTR_U8, Ty, TyKind, evaluationOrder}
+import hir::{BOOL, ExprId, FnId, I32, I64, IntTy, Intrinsic, PTR_U8, Ty, TyKind, evaluationOrder}
 import syntax::{BinaryOp, Span}
 
 /// Every bit of a `u128` set.
@@ -222,13 +222,21 @@ extend Builder {
 				expr.ty,
 				.None,
 			)
-			.Cast(inner) => {
+			.Cast(inner, wraps) => {
 				val operand = self.scalar(inner)
+				val from = self.hir.exprs[inner].ty
+				val checked = !wraps && self.narrows(from, expr.ty)
 				// A constant integer or character made another integer type is
 				// the constant it becomes: `'-' as u8` is `45_u8`, which is how
-				// the standard library writes a byte.
-				if self.foldedCast(&operand, expr.ty) is .Some(folded) then return .Scalar(folded)
-				Value::Scalar(self.value(expr.ty, .Cast(operand: operand, ty: expr.ty)))
+				// the standard library writes a byte. One that does not fit is
+				// left to the check, which panics.
+				if self.foldedCast(&operand, expr.ty) is .Some(folded) {
+					if !checked || self.foldedFits(&operand, &folded, from) then
+						return .Scalar(folded)
+				}
+				val cast = self.value(expr.ty, .Cast(operand: operand.clone(), ty: expr.ty))
+				if checked then self.narrowingCheck(&operand, from, &cast, expr.ty, expr.span)
+				Value::Scalar(cast)
 			}
 			// `colour as i64`: the tag, read where the value lies, and widened to
 			// the type that was asked for.
@@ -364,6 +372,59 @@ extend Builder {
 
 	/// Whether an answer of this type is checked: the integers, up to the
 	/// widest the backend has an instruction for.
+	/// Whether `from as to` can lose something: an integer, or a character,
+	/// made an integer type that does not hold every value of it.
+	fn narrows(from: Ty, to: Ty): bool = {
+		val .Int(target) = self.kind(to) else return false
+		return match self.kind(from) {
+			.Int(source) => from != to && !target.holds(source) && !sameWord(source, target)
+			.Char => target.bits() < 32
+			_ => false
+		}
+	}
+
+	/// Whether the constant `folded`, what `operand` of type `from` became,
+	/// is the same number: it comes back the same, and has the same sign.
+	fn foldedFits(operand: &Operand, folded: &Operand, from: Ty): bool = {
+		if self.foldedCast(folded, from) != .Some(operand.clone()) then return false
+		return self.negative(operand) == self.negative(folded)
+	}
+
+	/// Whether a constant integer reads as negative in its type.
+	fn negative(operand: &Operand): bool = {
+		val .Const(.Int(bits, ty)) = operand else return false
+		val .Int(int) = self.kind(ty) else return false
+		return int.signed() && (bits >> (int.bits() - 1) as u128) & 1 == 1
+	}
+
+	/// The check after `cast`, `operand as to` of a `from` that `to` does not
+	/// hold: that the value comes back the same from the narrower type, and
+	/// keeps its sign where the signs differ. It panics with the value.
+	var fn narrowingCheck(operand: &Operand, from: Ty, cast: &Operand, to: Ty, at: Span) = {
+		val back = self.value(from, .Cast(operand: cast.clone(), ty: from))
+		var fails = self.value(BOOL, .Binary(op: .Ne, lhs: back, rhs: operand.clone()))
+		val fromSigned = self.kind(from) is .Int(int) && int.signed()
+		val toSigned = self.kind(to) is .Int(int) && int.signed()
+		if fromSigned != toSigned {
+			// Of a signed value, a negative one; of an unsigned value, one
+			// that reads as negative in the signed type.
+			val negative =
+				if fromSigned then
+					self.value(BOOL, .Binary(
+						op: .Lt,
+						lhs: operand.clone(),
+						rhs: Builder::int(0, from),
+					))
+				else self.value(BOOL, .Binary(op: .Lt, lhs: cast.clone(), rhs: Builder::int(0, to)))
+			fails = self.value(BOOL, .Binary(op: .BitOr, lhs: fails, rhs: negative))
+		}
+		self.push(.Check(
+			fails: fails,
+			kind: .Narrowing(value: operand.clone(), from: from, to: to),
+			at: at,
+		))
+	}
+
 	fn checksOverflow(ty: Ty): bool = match self.kind(ty) {
 		.Int(int) => int.bits() <= 64
 		_ => false
@@ -807,6 +868,21 @@ extend Builder {
 				val field = if which is .ClosureCaptures then 0 else 1
 				self.answer(.Use(.Copy(closure.project(.Field(field)))), ty, dest)
 			}
+			// An owned closure is the same pair, read through the `&` given.
+			.OwnedClosureCode | .OwnedClosureCaptures => {
+				val closure = self.behindReference(args[0])
+				val field = if which is .OwnedClosureCaptures then 0 else 1
+				self.answer(.Use(.Copy(closure.project(.Field(field)))), ty, dest)
+			}
+			// The function a block of `F` is called through, which the code
+			// generator writes for each `F`.
+			.BlockInvoke => {
+				val .Some((_, typeArgs)) = self.program.fns[callee].instanceOf else {
+					panic("`blockInvoke` is generic")
+				}
+				val of = self.program.types.list(typeArgs)[0]
+				self.constantAnswer(.BlockInvoke(of: of), dest)
+			}
 			// `text.items()`: the pointer and the length a `str` already is,
 			// read as a slice.
 			.StrBytes => {
@@ -829,7 +905,7 @@ extend Builder {
 				val second = self.elementPlace(slice, args[2], at)
 				val temp = Place::of(self.temp(elem))
 				self.assign(temp.clone(), .Use(.Copy(first.clone())))
-				self.assign(first.clone(), .Use(.Copy(second.clone())))
+				self.assign(first, .Use(.Copy(second.clone())))
 				self.assign(second, .Use(.Copy(temp)))
 				Value::Unit
 			}
@@ -1159,3 +1235,7 @@ extend Builder {
 		return Place::of(local).project(.Deref)
 	}
 }
+
+/// Whether two integer types are the same width and sign, as `usize` and
+/// `u64` are on the 64-bit systems the compiler targets.
+fn sameWord(a: IntTy, b: IntTy): bool = a.bits() == b.bits() && a.signed() == b.signed()

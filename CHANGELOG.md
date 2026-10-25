@@ -2,6 +2,65 @@
 
 Each version published, newest first.
 
+## 0.11.0 — 2026-10-24
+
+Programs written for 0.10 compile as they did, but where marked
+**breaking**; the compiler's errors say what to write instead.
+
+**The language**
+
+- **A narrowing that does not fit panics.** `as` between integers gives
+  the same number in the new type, or panics with the value and the type,
+  `300 does not fit in a u8`, as arithmetic that does not fit does; a
+  constant that does not fit is refused where it is written. `as%` keeps
+  the low bits, which is what `as` did: for a byte taken out of a word,
+  or the same bits read with the other sign. An `as%` of a value the type
+  holds is a warning whose fix writes `as`. **Breaking:** where a program
+  cuts on purpose, it writes `as%`; a narrowing that cuts by mistake now
+  panics where it happens rather than going on with a wrong number.
+- **An `assert` in a generic's signature**, after its result: a fact
+  about its type and length parameters, `assert(c::sizeOf<C>() <= ROOM)`,
+  checked while the program compiles for each set of type arguments a
+  call gives, and an error at that call where it does not hold.
+- **A generator's type named.** A function that yields may name the type
+  it answers, `fn split(text: str, separator: str): Iterator<str> as
+  Split`, which a field, a result or an argument may then be.
+- **Implicit parameters in generic code:** an implicit's type may name
+  the function's type parameters, and those of the type a method extends.
+- **A generic struct built without its type arguments** is told them by
+  the arguments beside it, `written(Writer(scale: 10), draw)`.
+- **An `Option` in the room of what it holds:** `Option<&T>`,
+  `Option<own<T>>` and an optional function are one pointer, an optional
+  `bool` one byte, an optional `char` four; an `Option<&T>` crosses to C
+  as the pointer, null for nothing.
+- **A closure as a block,** `c::Block::of(own (…) => …)`, for what
+  Apple's systems call back.
+- **Generators run as fast as a loop written out:** a generator keeps
+  between calls only what it needs then, and is spliced where it is
+  walked.
+
+**The tools**
+
+- **`wip fix`** makes the fixes of the warnings that change no meaning —
+  a copy where a move would do, a `move` the compiler infers, a `clone()`
+  of plain data, now a warning of its own — over a tree, round after
+  round; `--check` writes nothing.
+
+**The library**
+
+- **`madeBy((i) => …)`:** an array made by a function of each index, its
+  length and element type the type expected's, of any element type.
+- **`std::text`'s pieces, lines, words and characters** are generators,
+  `text::split(t, ",")` and the rest, which the methods `split`, `lines`
+  and the like answer; `rsplit` is several times faster. **Breaking:**
+  `Split::of(t, ",")` and its kind are `text::split(t, ",")` and the like.
+- **The library's files for one system** are named for it, and read for
+  that system alone.
+
+**Fixed**
+
+- A library module's file named for a system was read for every system.
+
 ## 0.10.0 — 2026-10-19
 
 Programs written for 0.9 compile as they did, but where marked

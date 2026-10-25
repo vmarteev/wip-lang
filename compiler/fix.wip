@@ -1,0 +1,172 @@
+// `wip fix`: the fixes of the warnings whose fix changes no meaning,
+// applied to programs and their tests. Each program is checked with its
+// tests, as `wip test` compiles it; where it has no errors, each such fix
+// is applied to the file it is in, where that file is under the directory
+// the command is typed in, and the program is checked again, since a copy
+// taken away can make another value's use its last. What a round changed
+// is laid out as `wip fmt` lays it out.
+
+import std::fs
+import std::io
+import std::path
+import fmt::{switchedOff}
+import lang::{Sources, Target, Timings, checkLoaded, findHome, loadFor, renderProgram}
+import syntax::{CLONE_OF_PLAIN, COPIED_AT_LAST_USE, Code, Diagnostic, MOVE_INFERRED}
+
+/// The warnings whose fix changes no meaning, which `wip fix` applies: a
+/// copy where a move would do, a `move` the compiler infers, and a
+/// `clone()` of plain data.
+val FIXED: [Code; 3] = [COPIED_AT_LAST_USE, MOVE_INFERRED, CLONE_OF_PLAIN]
+
+/// How many times a program is checked and fixed again, at most: each round
+/// can make another value's use its last.
+val ROUNDS = 8
+
+/// One edit a fix makes in a file: the bytes it replaces, what with, and
+/// the code of the warning it fixes.
+@derive(Clone)
+struct FileEdit {
+	lo: u32
+	hi: u32
+	replacement: String
+	code: Code
+}
+
+/// `wip fix`: each program in `paths`, or the current directory's, fixed;
+/// each file changed listed with how many fixes of each code it took. With
+/// `check`, nothing is written, and it fails where something would change.
+fn fixCommand(paths: &[str], check: bool, layout: &Layout, color: bool, threads: i64): i64 = {
+	val programs: Vec<str> = if paths.isEmpty() then ["."].toVec() else paths.toVec()
+	val here = match fs::realPath(".") {
+		.Ok(here) => here
+		.Err(error) => {
+			io::eprintln("error: cannot tell which directory this is: \(error)")
+			return 2
+		}
+	}
+	val home = findHome().toOption()
+	var changed: Vec<(String, Vec<Code>)> = Vec()
+	var failed = 0
+	for program in programs {
+		for _ in 0..ROUNDS {
+			var timings = Timings()
+			var loaded = match loadFor(program, .Tests, Target::host(), &var timings, threads) {
+				.Ok(loaded) => loaded
+				.Err(message) => {
+					io::eprintln("error: \(message)")
+					failed += 1
+					break
+				}
+			}
+			val checked = checkLoaded(&var loaded, &var timings)
+			if checked.diagnostics.any((d) => d.isError()) {
+				io::eprint(renderProgram(&checked.diagnostics, &loaded.sources, color))
+				io::eprintln("`\(program)` is left as it is: it has errors")
+				failed += 1
+				break
+			}
+			val files = editsOf(&checked.diagnostics, &loaded.sources, here, &home)
+			if files.isEmpty() then break
+			for (file, edits) in files {
+				val at = match changed.indexWhere((c) => c.0 == file) {
+					.Some(at) => at
+					.None => {
+						changed.push((file.clone(), Vec()))
+						changed.len() - 1
+					}
+				}
+				for edit in edits {
+					changed[at].1.push(edit.code)
+				}
+				if !check && written(file, &edits, &layout, color) is .Err(message) {
+					io::eprintln("error: \(message)")
+					failed += 1
+				}
+			}
+			if check then break
+		}
+	}
+	for (file, codes) in changed {
+		io::println("\(file.stripPrefix("\(here)/").unwrapOr(&file)): \(counted(&codes))")
+	}
+	return if failed > 0 then 1 else if check && !changed.isEmpty() then 1 else 0
+}
+
+/// The edits the fixes of `diagnostics` make, file by file: those of the
+/// warnings `FIXED` names, in files under `here`, each once, and none that
+/// overlaps another, which a later round makes if it still applies.
+fn editsOf(
+	diagnostics: &[Diagnostic],
+	sources: &Sources,
+	here: str,
+	home: &Option<String>,
+): Vec<(String, Vec<FileEdit>)> = {
+	var files: Vec<(String, Vec<FileEdit>)> = Vec()
+	for diagnostic in diagnostics {
+		if diagnostic.isError() || !FIXED.contains(&diagnostic.code) then continue
+		val .Some(fix) = diagnostic.fix else continue
+		for edit in fix.edits {
+			val .Some((name, _, base)) = sources.of(edit.span) else continue
+			val .Some(file) = fixable(name, here, &home) else continue
+			val made = FileEdit(
+				lo: edit.span.lo - base,
+				hi: edit.span.hi - base,
+				replacement: edit.replacement.clone(),
+				code: diagnostic.code,
+			)
+			val at = match files.indexWhere((f) => f.0 == file) {
+				.Some(at) => at
+				.None => {
+					files.push((file, Vec()))
+					files.len() - 1
+				}
+			}
+			val clashes = files[at].1.any((e) =>
+				e.lo < made.hi && made.lo < e.hi || e.lo == made.lo && e.hi == made.hi)
+			if !clashes then files[at].1.push(made)
+		}
+	}
+	return files
+}
+
+/// Where the file a diagnostic names is, where `wip fix` may change it:
+/// under `here`. The library's files are named from its home.
+fn fixable(name: str, here: str, home: &Option<String>): Option<String> = {
+	val onDisk: String =
+		if fs::exists(name) then String::of(name)
+		else match home {
+			.Some(dir) if name.startsWith("std/") &&
+				fs::exists(path::join(dir, name)) => path::join(dir, name)
+			_ => return .None
+		}
+	val .Ok(real) = fs::realPath(onDisk) else return .None
+	return if real.startsWith("\(here)/") then .Some(real) else .None
+}
+
+/// `file` with `edits` made, laid out as `wip fmt` lays it out unless it
+/// says not to be, and written.
+fn written(file: str, edits: &[FileEdit], layout: &Layout, color: bool): Result<void, String> = {
+	var text = fs::readFile(file).mapErr((error) => "cannot read `\(file)`: \(error)")?
+	var order = edits.toVec()
+	order.sortBy((a, b) => a.lo > b.lo)
+	for edit in order {
+		text = "\(text[..edit.lo as i64])\(edit.replacement)\(text[edit.hi as i64..])"
+	}
+	if !switchedOff(text) && formatText(file, text, &layout, color) is .Some(formatted) then
+		text = formatted
+	return fs::writeFile(file, text).mapErr((error) => "cannot write `\(file)`: \(error)")
+}
+
+/// How many fixes of each code: `E0448 ×2, E0464`.
+fn counted(codes: &[Code]): String = {
+	var seen: Vec<(Code, i64)> = Vec()
+	for code in codes {
+		match seen.indexWhere((s) => s.0 == code) {
+			.Some(at) => seen[at].1 += 1
+			.None => seen.push((code, 1))
+		}
+	}
+	seen.sortBy((a, b) => a.0.text() < b.0.text())
+	val parts: Vec<String> = seen.map((s) => if s.1 == 1 then "\(s.0)" else "\(s.0) ×\(s.1)")
+	return parts.join(", ")
+}
