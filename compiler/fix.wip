@@ -11,25 +11,44 @@ import std::io
 import std::path
 import fmt::{switchedOff}
 import lang::{Sources, Target, Timings, checkLoaded, findHome, loadFor, renderProgram}
-import syntax::{CLONE_OF_PLAIN, COPIED_AT_LAST_USE, Code, Diagnostic, MOVE_INFERRED}
+import syntax::{
+	BYTE_CAST,
+	CLONE_OF_PLAIN,
+	COPIED_AT_LAST_USE,
+	Code,
+	Diagnostic,
+	MOVE_INFERRED,
+	NEEDLESS_DERIVE,
+	NEEDLESS_WRAPPER
+}
 
 /// The warnings whose fix changes no meaning, which `wip fix` applies: a
-/// copy where a move would do, a `move` the compiler infers, and a
-/// `clone()` of plain data.
-val FIXED: [Code; 3] = [COPIED_AT_LAST_USE, MOVE_INFERRED, CLONE_OF_PLAIN]
+/// copy where a move would do, a `move` the compiler infers, a `clone()` of
+/// plain data, a `@derive` of what the type has without it, a character
+/// cast to a byte, and a `.Some` or an `.Ok` the type expected says.
+val FIXED: [Code; 6] = [
+	COPIED_AT_LAST_USE,
+	MOVE_INFERRED,
+	CLONE_OF_PLAIN,
+	NEEDLESS_DERIVE,
+	BYTE_CAST,
+	NEEDLESS_WRAPPER,
+]
 
 /// How many times a program is checked and fixed again, at most: each round
 /// can make another value's use its last.
 val ROUNDS = 8
 
-/// One edit a fix makes in a file: the bytes it replaces, what with, and
-/// the code of the warning it fixes.
+/// One edit a fix makes in a file: the bytes it replaces, what with, the
+/// code of the warning it fixes, and whether it is the fix's first, which
+/// the fix is counted by.
 @derive(Clone)
 struct FileEdit {
 	lo: u32
 	hi: u32
 	replacement: String
 	code: Code
+	first: bool
 }
 
 /// `wip fix`: each program in `paths`, or the current directory's, fixed;
@@ -76,7 +95,7 @@ fn fixCommand(paths: &[str], check: bool, layout: &Layout, color: bool, threads:
 					}
 				}
 				for edit in edits {
-					changed[at].1.push(edit.code)
+					if edit.first then changed[at].1.push(edit.code)
 				}
 				if !check && written(file, &edits, &layout, color) is .Err(message) {
 					io::eprintln("error: \(message)")
@@ -93,8 +112,10 @@ fn fixCommand(paths: &[str], check: bool, layout: &Layout, color: bool, threads:
 }
 
 /// The edits the fixes of `diagnostics` make, file by file: those of the
-/// warnings `FIXED` names, in files under `here`, each once, and none that
-/// overlaps another, which a later round makes if it still applies.
+/// warnings `FIXED` names, in files under `here`, each once. A fix is made
+/// whole or not at all: one with an edit outside them, or that overlaps an
+/// edit already taken, is left to a later round, which makes it if it
+/// still applies.
 fn editsOf(
 	diagnostics: &[Diagnostic],
 	sources: &Sources,
@@ -105,15 +126,35 @@ fn editsOf(
 	for diagnostic in diagnostics {
 		if diagnostic.isError() || !FIXED.contains(&diagnostic.code) then continue
 		val .Some(fix) = diagnostic.fix else continue
+		var made: Vec<(String, FileEdit)> = Vec()
+		var whole = true
 		for edit in fix.edits {
-			val .Some((name, _, base)) = sources.of(edit.span) else continue
-			val .Some(file) = fixable(name, here, &home) else continue
-			val made = FileEdit(
+			val .Some((name, _, base)) = sources.of(edit.span) else {
+				whole = false
+				break
+			}
+			val .Some(file) = fixable(name, here, &home) else {
+				whole = false
+				break
+			}
+			val one = FileEdit(
 				lo: edit.span.lo - base,
 				hi: edit.span.hi - base,
 				replacement: edit.replacement.clone(),
 				code: diagnostic.code,
+				first: made.isEmpty(),
 			)
+			val clashes =
+				files.any((f) => f.0 == file && f.1.any((e) => overlaps(&e, &one))) ||
+				made.any((m) => m.0 == file && overlaps(&m.1, &one))
+			if clashes {
+				whole = false
+				break
+			}
+			made.push((file, one))
+		}
+		if !whole then continue
+		for (file, one) in move made {
 			val at = match files.indexWhere((f) => f.0 == file) {
 				.Some(at) => at
 				.None => {
@@ -121,13 +162,16 @@ fn editsOf(
 					files.len() - 1
 				}
 			}
-			val clashes = files[at].1.any((e) =>
-				e.lo < made.hi && made.lo < e.hi || e.lo == made.lo && e.hi == made.hi)
-			if !clashes then files[at].1.push(made)
+			files[at].1.push(one)
 		}
 	}
 	return files
 }
+
+/// Whether two edits touch the same bytes, or are both an insertion at
+/// one place, which would leave their order to chance.
+fn overlaps(a: &FileEdit, b: &FileEdit): bool =
+	a.lo < b.hi && b.lo < a.hi || a.lo == b.lo && a.hi == b.hi
 
 /// Where the file a diagnostic names is, where `wip fix` may change it:
 /// under `here`. The library's files are named from its home.
@@ -140,7 +184,7 @@ fn fixable(name: str, here: str, home: &Option<String>): Option<String> = {
 			_ => return .None
 		}
 	val .Ok(real) = fs::realPath(onDisk) else return .None
-	return if real.startsWith("\(here)/") then .Some(real) else .None
+	return if real.startsWith("\(here)/") then real else .None
 }
 
 /// `file` with `edits` made, laid out as `wip fmt` lays it out unless it

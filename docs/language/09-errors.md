@@ -11,9 +11,8 @@ panic is a mistake in the program. There are no exceptions.
 apart the way any enum is ([page 5](05-patterns.md)):
 
 ```wip,run
-// `@derive(Eq)` so that a `Result` holding one can be compared; an error
-// that is only matched on needs no equality.
-@derive(Eq)
+// An enum of names compares without being told, so a `Result` holding
+// one can be compared.
 enum ParseTrouble {
     Empty
     NotANumber
@@ -22,11 +21,11 @@ enum ParseTrouble {
 fn double(text: str): Result<i64, ParseTrouble> = {
     if text.isEmpty() then return .Err(.Empty)
     val .Ok(number) = text.toInt() else return .Err(.NotANumber)
-    return .Ok(number * 2)
+    return number * 2
 }
 
 fn main() = {
-    assert(double("21") == .Ok(42))
+    assert(double("21") == 42)
     assert(double("") == .Err(.Empty))
     assert(double("x").isErr())
 }
@@ -49,10 +48,85 @@ fn numbers(texts: &[str]): Result<Vec<i64>, ParseError> = Result::collect(
 )
 
 fn main() = {
-    assert(numbers(["1", "2"]) == .Ok([1, 2].toVec()))
+    assert(numbers(["1", "2"]) == [1, 2].toVec())
     assert(numbers(["1", "x"]).isErr())
-    val gaps: [Option<i64>; 2] = [.Some(1), .None]
+    val gaps: [Option<i64>; 2] = [1, .None]
     assert(Option::collect(gaps.copies()).isNone())
+}
+```
+
+### A value where one is expected
+
+Where an `Option<T>` is expected and a value of type `T` is given, the value
+is its `.Some`; where a `Result<T, E>` is expected, its `.Ok`. The type
+expected has said what the wrapper is, at a `return`, an argument, a field,
+an element, an annotated `val`, an assignment, a branch beside a typed one,
+and either side of `==` or `!=`. What is absent and what failed are still
+written, `.None` and `.Err(…)`, so the place a function says something went
+wrong is the place that names a variant:
+
+```wip,run
+enum Json {
+    Null
+    Array(items: Vec<i64>)
+}
+
+fn prompt(near: bool, saving: bool): Option<str> = {
+    if near then return "TALK"
+    if saving then return "SAVE"
+    return .None
+}
+
+// `.Array` is not a `Result`'s: it is the `Json` the `Result` holds.
+fn array(items: Vec<i64>): Result<Json, str> = {
+    if items.isEmpty() then return .Err("no items")
+    return .Array(items)
+}
+
+fn main() = {
+    assert(prompt(true, false) == "TALK")
+    assert(prompt(false, false) == .None)
+    assert(array([1, 2].toVec()).isOk())
+    val chosen: Option<i64> = 2
+    val i = 2
+    assert(chosen == i)
+}
+```
+
+A value is wrapped where it is of the success's type exactly, and once: an
+`Option<i64>` where an `Option<Option<i64>>` is expected is its `.Some`, and
+an `i64` there is refused. In generic code the type is matched first, so
+`f(opt)` of an `f<T>(x: Option<T>)` takes `T` from `opt`, and `f(5)` takes
+`T` as `i64` and wraps it. A value of a `Result`'s error type is never its
+`.Err`, even where the two types are one; there a value is the `.Ok`, and a
+failure is said:
+
+```wip,error=E0301
+enum Problem {
+    Empty
+}
+
+fn parse(text: str): Result<i64, Problem> = {
+    if text.isEmpty() then return Problem::Empty
+    return 1
+}
+```
+
+A function that answers `Result<void, E>` succeeds with nothing to say, so
+`return` alone is its `.Ok()`, and so is the end of its body, as it is for a
+function that answers nothing:
+
+```wip,run
+fn check(age: i64): Result<void, str> = {
+    if age < 0 then return .Err("an age is not negative")
+    if age == 0 then return
+    assert(age > 0)
+}
+
+fn main() = {
+    assert(check(30).isOk())
+    assert(check(0).isOk())
+    assert(check(-1) == .Err("an age is not negative"))
 }
 ```
 
@@ -64,7 +138,7 @@ say only half of a `Result`, still need its type:
 fn main() = {
     val wanted = 3
     val found = if wanted > 2 then .Some(wanted) else .None
-    assert(found == .Some(3))
+    assert(found == 3)
 }
 ```
 
@@ -75,24 +149,23 @@ function with the failure where it is not. It stands in a function that
 answers the matching kind:
 
 ```wip,run
-@derive(Eq)
 enum Trouble {
     NotANumber
 }
 
 fn number(text: str): Result<i64, Trouble> = match text.toInt() {
-    .Ok(n) => .Ok(n)
+    .Ok(n) => n
     .Err(..) => .Err(.NotANumber)
 }
 
 fn sum(a: str, b: str): Result<i64, Trouble> = {
     val first = number(a)?
     val second = number(b)?
-    return .Ok(first + second)
+    return first + second
 }
 
 fn main() = {
-    assert(sum("1", "2") == .Ok(3))
+    assert(sum("1", "2") == 3)
     assert(sum("1", "x") == .Err(.NotANumber))
 }
 ```
@@ -119,12 +192,11 @@ fn port(text: str): Result<i64, ConfigError> = {
     if text.isEmpty() then return .Err(.Empty)
     // `toInt` fails with a `ParseError`, which becomes a `ConfigError`
     // on its way out.
-    val number = text.toInt()?
-    return .Ok(number)
+    return text.toInt()?
 }
 
 fn main() = {
-    assert(port("8080") == .Ok(8080))
+    assert(port("8080") == 8080)
     assert(port("").isErr())
     assert(port("http").isErr())
 }
@@ -136,17 +208,17 @@ it — the lambda answers what it first returns, or its body's value, and each
 `?` before that is checked once it is said:
 
 ```wip,run
-fn half(n: i64): Option<i64> = if n % 2 == 0 then .Some(n / 2) else .None
+fn half(n: i64): Option<i64> = if n % 2 == 0 then n / 2 else .None
 
 fn apply<E>(n: i64, f: (n: i64) => Option<E>): Option<E> = f(n)
 
 fn main() = {
-    assert(apply(4, (n) => .Some(half(n)? + 1)) == .Some(3))
+    assert(apply(4, (n) => .Some(half(n)? + 1)) == 3)
     val quarter = (n: i64) => {
         val h = half(n)?
         return half(h)
     }
-    assert(quarter(8) == .Some(2) && quarter(6) == .None)
+    assert(quarter(8) == 2 && quarter(6) == .None)
 }
 ```
 
@@ -154,7 +226,7 @@ A lambda found to answer another kind, or nothing, is refused where the `?`
 is, with what said the lambda's result:
 
 ```wip,error=E0348
-fn half(n: i64): Option<i64> = if n % 2 == 0 then .Some(n / 2) else .None
+fn half(n: i64): Option<i64> = if n % 2 == 0 then n / 2 else .None
 
 fn main() = {
     val plusOne = (n: i64) => {
@@ -174,7 +246,6 @@ exit code is 1:
 fn main(): Result<void, io::IoError> = {
     val text = fs::readFile("config")?
     io::println(text)
-    return .Ok()
 }
 ```
 
@@ -306,7 +377,7 @@ fn isSorted(values: &[i64]): bool = {
 }
 
 fn main() = {
-    assert(KEYS.binarySearch(5) == .Ok(2))
+    assert(KEYS.binarySearch(5) == 2)
 }
 ```
 

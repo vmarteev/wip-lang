@@ -1,17 +1,21 @@
-// What `@derive` asks for, and the numbering an enum whose variants carry
-// nothing gets.
+// What `@derive` asks for, and what an enum whose variants carry nothing
+// gets without asking: its numbering, and `Eq` and `Hash`.
 //
 // What `@derive` writes is code of the module's own, expanded before the
 // module is checked; here what each implementation asks of the type's
 // parameters is worked out from what its fields need, and a field that
-// cannot have the interface is reported where it is written. `count` and `fromIndex` are declared here as
-// methods of the type, with `FnDef::generated` saying which body the code
-// generator is to write.
+// cannot have the interface is reported where it is written. `count`,
+// `fromIndex`, `all`, `name` and `fromName` are declared here as methods of
+// the type, with `FnDef::generated` saying which body the code generator is
+// to write.
 
 import syntax as ast
 import syntax::{
 	Code,
 	Diagnostic,
+	Edit,
+	NEEDLESS_DERIVE,
+	Receiver,
 	NOT_CLONEABLE,
 	NOT_COMPARABLE,
 	NOT_DECODABLE,
@@ -48,8 +52,7 @@ extend Lowerer {
 		for a in written {
 			if self.text(a.name.sym) != "derive" then continue
 			for arg in a.args {
-				if arg.value is .Name(sym) && self.text(sym) == wanted.name() then
-					return .Some(arg.span)
+				if arg.value is .Name(sym) && self.text(sym) == wanted.name() then return arg.span
 			}
 		}
 		return .None
@@ -66,6 +69,75 @@ extend Lowerer {
 					self.deriveOwners.put(arg.span, def)
 				}
 			}
+			// What an enum of names is given without asking is placed at its
+			// name.
+			if item is .Item(.Enum(e)) && ast::namesOnly(&e) then
+				self.deriveOwners.put(e.name.span, def)
+		}
+	}
+
+	/// Warns of what a `@derive` names that `owner` has without it: `Eq` and
+	/// `Hash` on an enum of names, and `Clone` on plain data, which is its
+	/// own clone. One warning for each `@derive`, whose fix takes the names
+	/// away, and the `@derive` where nothing else is left in it.
+	var fn needlessDerives(annotations: &[ast::Annotation], owner: TypeDef, names: bool) = {
+		// Plain data for every argument the type may take: a parameter that
+		// may own memory is taken to.
+		var plain = !self.owns(self.ownSelfTy(owner))
+		for (_, ty, _) in self.fieldsOf(owner) {
+			if self.hasError(ty) then plain = false
+		}
+		if !names && !plain then return
+		val typeName = self.typeName(owner)
+		for annotation in annotations {
+			if self.text(annotation.name.sym) != "derive" then continue
+			var needless: Vec<(String, Span)> = Vec()
+			var kept: Vec<String> = Vec()
+			var compares = false
+			var clones = false
+			for arg in annotation.args {
+				val .Name(sym) = arg.value else continue
+				val text = String::of(self.text(sym))
+				if names && text.toStr() is "Eq" | "Hash" {
+					compares = true
+					needless.push((text, arg.span))
+				} else if plain && text == "Clone" {
+					clones = true
+					needless.push((text, arg.span))
+				} else kept.push(text)
+			}
+			if needless.isEmpty() then continue
+			var quoted: Vec<String> = Vec()
+			for (text, _) in needless {
+				quoted.push("`\(text)`")
+			}
+			val (fixed, edit) =
+				if kept.isEmpty() then
+					(String::of("remove `@derive`"), Edit::replace(annotation.removal, ""))
+				else (
+					"remove \(allOf(&quoted))",
+					Edit::replace(annotation.parens.unwrap(), "(\(kept.join(", ")))"),
+				)
+			val message =
+				if compares && clones then
+					"`\(typeName)` compares, hashes and clones without being told"
+				else if compares then
+					String::of("an enum of names compares and hashes without being told")
+				else "`\(typeName)` is plain data, its own clone without being told"
+			var diagnostic = Diagnostic::warning(NEEDLESS_DERIVE, message, needless[0].1, "`\(needless[0].0)` says nothing here")
+			for (text, span) in needless[1..] {
+				diagnostic = diagnostic.withSecondary(span, "nor does `\(text)`")
+			}
+			diagnostic = diagnostic.withFix(fixed, [edit])
+			if compares then
+				diagnostic = diagnostic.withNote(
+					"an enum whose variants carry nothing implements `Eq` and `Hash` by which name it is",
+				)
+			if clones then
+				diagnostic = diagnostic.withNote(
+					"plain data owns no memory — no `own`, no `String`, no `Vec`, nothing with a `destroy` — and its clone is a copy, taken wherever `Clone` is asked for",
+				)
+			self.report(diagnostic)
 		}
 	}
 
@@ -152,7 +224,7 @@ extend Lowerer {
 	/// what `@derive` wrote as the implementation at `at`.
 	fn firstAsk(at: i64, param: i64): Option<Span> = {
 		for ask in self.program.derivedAsks {
-			if ask.at == at && ask.param == param then return .Some(ask.span)
+			if ask.at == at && ask.param == param then return ask.span
 		}
 		return .None
 	}
@@ -168,7 +240,7 @@ extend Lowerer {
 				if ask.at == first.at &&
 					ask.param == first.param &&
 					ask.constraint.interfaceId == interfaceId {
-					return .Some(&ask)
+					return &ask
 				}
 			}
 		}
@@ -192,7 +264,7 @@ extend Lowerer {
 					ask.param < args.len() &&
 					args[ask.param] == inside &&
 					ask.constraint.interfaceId == condition.interfaceId {
-					return .Some(self.askedField(&ask))
+					return self.askedField(&ask)
 				}
 			}
 			return .None
@@ -207,33 +279,32 @@ extend Lowerer {
 
 	/// What one field needs of the type's parameters for what `@derive`
 	/// writes of `wanted`; `None` where it cannot have it, which the field
-	/// is reported for. What an `own<T>` or a reference points at may have
-	/// it, which a call looks through to; the field itself does not. A clone
-	/// is asked of the field's own type, whose `clone` a `&T` has; so is
-	/// decoding, which a reference cannot be read into.
+	/// is reported for. An `own<T>` has what the prelude implements for it,
+	/// as what it holds has. What a reference points at may have it, which
+	/// a call looks through to; the field itself does not. A clone is asked
+	/// of the field's own type, whose `clone` a `&T` has; so is decoding,
+	/// which a reference cannot be read into.
 	var fn fieldNeeds(wanted: Derived, interfaceId: InterfaceId, ty: Ty): Option<Vec<Need>> = {
 		val kind = self.kind(ty)
 		val none: Vec<Need> = Vec()
 		val nothing: [Ty; 0] = []
 		// Whether it is plain data is read from its fields' types.
 		completeType(&var self.program, ty)
-		if self.isPoisoned(ty) then return .Some(none)
+		if self.isPoisoned(ty) then return none
 		// Two pointers compare by where they point.
-		if wanted == .Eq && kind is .Ptr(..) then return .Some(none)
+		if wanted == .Eq && kind is .Ptr(..) then return none
 		return match wanted {
 			// A format is given an `own<T>` as the prelude's implementation for
 			// it says, and a reference as what it refers to.
 			.Encode => match self.conditionsFor(ty, interfaceId, &nothing) {
-				.Some(asked) => .Some(asked)
+				.Some(asked) => asked
 				.None => match kind {
 					.Ref(inner, ..) => self.conditionsFor(inner, interfaceId, &nothing)
 					_ => .None
 				}
 			}
 			.Decode | .Clone => self.conditionsFor(ty, interfaceId, &nothing)
-			_ =>
-				if kind is .Own(..) | .Ref(..) then .None
-				else self.conditionsFor(ty, interfaceId, &nothing)
+			_ => if kind is .Ref(..) then .None else self.conditionsFor(ty, interfaceId, &nothing)
 		}
 	}
 
@@ -260,9 +331,17 @@ extend Lowerer {
 				continue
 			}
 			self.typeParams = self.typeGenerics(def)
+			val names = item is .Item(.Enum(e)) && ast::namesOnly(&e)
+			self.needlessDerives(&annotations, def, names)
+			// An enum of names has the equality the compiler writes without
+			// being asked, unless the program writes its own.
+			val fieldsEqual =
+				eq.isSome() ||
+				(self.program.preludeItems.interfaceOf(.Eq) is .Some(eqId) &&
+					self.derivedImpl(def, eqId).isSome())
 			if eq is .Some(at) then self.checkDerivedFields(def, at, .Eq)
-			if ord is .Some(at) then self.checkOrderable(def, at, eq.isSome())
-			if hash is .Some(at) then self.checkHashable(def, at, eq.isSome())
+			if ord is .Some(at) then self.checkOrderable(def, at, fieldsEqual)
+			if hash is .Some(at) then self.checkHashable(def, at, fieldsEqual)
 			if text is .Some(at) then self.checkDerivedFields(def, at, .Text)
 			if clone is .Some(at) then self.checkDerivedFields(def, at, .Clone)
 			if encode is .Some(at) then self.checkDerivedFields(def, at, .Encode)
@@ -434,7 +513,7 @@ extend Lowerer {
 		for m in i.methods {
 			if !derived.contains(&m) then methods.push(m)
 		}
-		return .Some(methods)
+		return methods
 	}
 
 	/// Where among the program's implementations is `owner`'s of
@@ -447,15 +526,15 @@ extend Lowerer {
 		for (at, i) in self.program.impls.forwards().enumerate() {
 			if i.ty != owner || i.interfaceId != interfaceId then continue
 			for m in i.methods {
-				if derived.contains(&m) then return .Some(at)
+				if derived.contains(&m) then return at
 			}
 		}
 		return .None
 	}
 
-	/// An enum whose variants carry nothing gets `count` and `fromIndex`,
-	/// whose bodies the compiler writes, and `all`. A program that declares
-	/// a method of one of those names keeps its own.
+	/// An enum whose variants carry nothing gets `count`, `fromIndex`, `all`,
+	/// `name` and `fromName`, whose bodies the compiler writes. A program
+	/// that declares a method of one of those names keeps its own.
 	var fn declareEnumNumbers(types: &[(Declared, TypeDef)]) = {
 		for (item, def) in types {
 			val .Some(e) = item.enumDecl() else continue
@@ -469,16 +548,17 @@ extend Lowerer {
 			val at = e.name.span
 			if !self.enumDeclares(id, "count") {
 				val none: Vec<(Symbol, Ty)> = Vec()
-				self.generatedStatic(def, Symbol::count(), none, I64, .VariantCount, at)
+				self.generatedFn(def, Symbol::count(), .Static, none, I64, .VariantCount, at)
 			}
 			if !self.enumDeclares(id, "fromIndex") &&
 				self.program.preludeItems.enumeration(.Option) is .Some(option) {
 				val selfTy = self.ownSelfTy(def)
 				val args = self.program.types.internList([selfTy])
 				val ret = self.intern(.Enum(id: option, args: args))
-				self.generatedStatic(
+				self.generatedFn(
 					def,
 					Symbol::fromIndex(),
+					.Static,
 					[(Symbol::indexParam(), I64)],
 					ret,
 					.FromIndex,
@@ -490,10 +570,43 @@ extend Lowerer {
 				val count = self.program.enums[id].variants.len() as u64
 				val ret = self.intern(.Array(elem: selfTy, len: count))
 				val none: Vec<(Symbol, Ty)> = Vec()
-				self.generatedStatic(def, Symbol::all(), none, ret, .AllVariants, at)
+				self.generatedFn(def, Symbol::all(), .Static, none, ret, .AllVariants, at)
+			}
+			if !self.enumDeclares(id, "name") {
+				val none: Vec<(Symbol, Ty)> = Vec()
+				self.generatedFn(def, Symbol::variantName(), .Read, none, STR, .VariantName, at)
+			}
+			if !self.enumDeclares(id, "fromName") &&
+				self.program.preludeItems.enumeration(.Option) is .Some(option) {
+				val selfTy = self.ownSelfTy(def)
+				val args = self.program.types.internList([selfTy])
+				val ret = self.intern(.Enum(id: option, args: args))
+				self.generatedFn(
+					def,
+					Symbol::fromName(),
+					.Static,
+					[(Symbol::textParam(), STR)],
+					ret,
+					.FromName,
+					at,
+				)
 			}
 			self.typeParams.clear()
 		}
+	}
+
+	/// Why an enum whose variants carry values has no `count`, `fromIndex`,
+	/// `all`, `name` or `fromName`, where one of them is asked of it.
+	fn carriesValuesNote(owner: TypeDef, asked: str): Option<String> = {
+		val .Enum(id) = owner else return .None
+		if !["count", "fromIndex", "all", "name", "fromName"].contains(&asked) then return .None
+		var carries = false
+		for v in self.program.enums[id].variants {
+			if !v.fields.isEmpty() then carries = true
+		}
+		if !carries then return .None
+		val typeName = self.text(self.program.enums[id].name)
+		return .Some("an enum whose variants carry nothing has `count`, `fromIndex`, `all`, `name` and `fromName`, since a number or a name says all of such a value; `\(typeName)`'s variants carry values")
 	}
 
 	/// Whether an enum declares a method of this name.
@@ -504,10 +617,12 @@ extend Lowerer {
 		return false
 	}
 
-	/// A static function whose body the compiler writes.
-	var fn generatedStatic(
+	/// A function whose body the compiler writes: a static one, or a method
+	/// that reads its receiver, `self`, which comes before `params`.
+	var fn generatedFn(
 		owner: TypeDef,
 		name: Symbol,
+		receiver: Receiver,
 		params: Vec<(Symbol, Ty)>,
 		ret: Ty,
 		generated: Generated,
@@ -515,44 +630,58 @@ extend Lowerer {
 	): FnId = {
 		val generics = self.typeGenerics(owner)
 		var defs: Vec<ParamDef> = Vec()
+		if receiver is .Read {
+			val selfTy = self.intern(.Ref(inner: self.ownSelfTy(owner), kind: .Shared))
+			defs.push(ParamDef(
+				name: Symbol::receiver(),
+				nameSpan: at,
+				ty: selfTy,
+				span: at,
+				default: .None,
+			))
+		}
 		for (paramName, ty) in params {
 			defs.push(ParamDef(name: paramName, nameSpan: at, ty: ty, span: at, default: .None))
 		}
-		val id = self.program.fns.add(FnDef(
-			name: name,
-			nameSpan: at,
-			symbol: .None,
-			receiver: .Some(.Static),
-			owner: .Some(owner),
-			interfaceId: .None,
-			generics: generics,
-			instanceOf: .None,
-			params: defs,
-			ret: ret,
-			retSpan: .None,
-			isExtern: false,
-			exportsC: false,
-			header: .None,
-			accesses: .None,
-			isVariadic: false,
-			variadicOf: .None,
-			lendsFrom: .None,
-			keeps: Vec(),
-			keepsAt: .None,
-			isLambda: false,
-			generator: .None,
-			isTailrec: false,
-			test: .None,
-			isInline: false,
-			generated: .Some(generated),
-			intrinsic: .None,
-			body: .None,
-			projects: .None,
-			compileTime: false,
-			module: self.current as u32,
-			isPub: true,
-			span: at,
-		))
+		val id = self.program.fns.add(
+			FnDef(
+				name: name,
+				nameSpan: at,
+				symbol: .None,
+				receiver: receiver,
+				owner: owner,
+				interfaceId: .None,
+				generics: generics,
+				instanceOf: .None,
+				params: defs,
+				ret: ret,
+				retSpan: .None,
+				isExtern: false,
+				exportsC: false,
+				header: .None,
+				accesses: .None,
+				isVariadic: false,
+				variadicOf: .None,
+				// What a method of these answers, a variant's name, is text the
+				// program keeps, and borrows nothing of `self`.
+				lendsFrom: if receiver is .Static then .None else .Some(Vec()),
+				keeps: Vec(),
+				keepsAt: .None,
+				isLambda: false,
+				generator: .None,
+				isTailrec: false,
+				test: .None,
+				isInline: false,
+				generated: generated,
+				intrinsic: .None,
+				body: .None,
+				projects: .None,
+				compileTime: false,
+				module: self.current as u32,
+				isPub: true,
+				span: at,
+			),
+		)
 		match owner {
 			.Struct(s) => self.program.structs[s].methods.push(id)
 			.Enum(e) => self.program.enums[e].methods.push(id)

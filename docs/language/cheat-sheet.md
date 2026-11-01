@@ -11,6 +11,7 @@ val answer = 42 // an `i64`: a whole number is one unless something says
 var count: u8 = 3 // `var` may be assigned again
 count += 1
 val ratio = 1.5 // an `f64`
+val scale: f32 = 2 // a whole number where a float is expected is one
 val ok = true
 val letter = 'w'
 val name = "wip" // a `str`; it becomes a `String` where one is expected
@@ -20,7 +21,7 @@ val total: i64 = count // a `u8` widens to a type that holds it
 val small = 300 as% u8 // `as%` keeps the low bits: 44
 assert(answer == 42 && count == 4 && primes[1] == 3 && point.1 == 4)
 assert(total + count == 8 && small == 44)
-assert(ratio > 1.0 && ok && letter != 'x' && name.len() == 3)
+assert(ratio > 1.0 && scale == 2.0 && ok && letter != 'x' && name.len() == 3)
 assert("\(name) has \(name.len()) letters" == "wip has 3 letters")
 ```
 
@@ -151,6 +152,8 @@ fn main() = {
     counter.bump()
     assert(counter.current() == 6)
     assert(counter.finish() == 6)
+    val again: Counter = .starting(1) // a type's function, where the type is expected
+    assert(again.current() == 1)
 }
 ```
 
@@ -280,24 +283,30 @@ fn main() = {
 fn parse(text: str): Result<i64, str> = {
     val n = text.toInt().mapErr((_) => "not a number")?
     if n < 0 then return .Err("negative")
-    return .Ok(n)
+    return n // .Ok(n)
 }
 
 fn firstWord(text: str): Option<str> = {
     val .Some(word) = text.split(" ").next() else return .None
-    return .Some(word)
+    return word // .Some(word)
 }
 
+fn save(text: str): Result<void, str> = {
+    if text.isEmpty() then return .Err("nothing to save")
+} // .Ok() at the end, as `return` alone is
+
 fn main() = {
-    assert(parse("12") == .Ok(12) && parse("x") == .Err("not a number"))
-    assert(firstWord("a b") == .Some("a"))
+    assert(parse("12") == 12 && parse("x") == .Err("not a number"))
+    assert(firstWord("a b") == "a")
+    assert(save("a").isOk())
     val sure = parse("3").unwrap() // a panic where it holds an error
     assert(sure == 3)
 }
 ```
 
-`?` passes an error up; `panic` and `assert` stop the program, for what
-must not happen. [Page 9](09-errors.md)
+A value where an `Option` or a `Result` is expected is its `.Some` or its
+`.Ok`; `.None` and `.Err(…)` are written. `?` passes an error up; `panic`
+and `assert` stop the program, for what must not happen. [Page 9](09-errors.md)
 
 ## Interfaces and generics
 

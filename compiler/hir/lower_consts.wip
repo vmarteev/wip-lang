@@ -146,14 +146,13 @@ extend Lowerer {
 		if block.derived.isSome() || block.path.len() != 1 then return .None
 		val name = block.path[0]
 		if refused && (block.sliceOf.isSome() || block.boxed.isSome()) then
-			return .Some(.Builtin(if block.sliceOf.isSome() then .Slice else .Own))
+			return .Builtin(if block.sliceOf.isSome() then .Slice else .Own)
 		if self.builtin(name.sym) is .Some(ty) &&
 			BuiltinOwner::of(self.kind(ty)) is .Some(builtin) {
-			return if self.prelude == .Some(self.current) || refused then .Some(.Builtin(builtin))
-			else .None
+			return if self.prelude == self.current || refused then .Builtin(builtin) else .None
 		}
 		val (owner, _) = self.typeHere(name.sym)?
-		return .Some(owner)
+		return owner
 	}
 
 	/// Whether an `extend` block's type is an interface, whose implementers
@@ -209,7 +208,7 @@ extend Lowerer {
 			module: self.current as u32,
 			isPub: decl.isPub,
 			span: decl.name.span,
-			owner: .Some(owner),
+			owner: owner,
 		))
 		val key = (owner, decl.name.sym)
 		match self.program.typeConsts.get(&key) {
@@ -297,28 +296,28 @@ extend Lowerer {
 		val name = self.definedName(id)
 		val value: Option<ConstValue> = match self.kind(ty) {
 			.Bool =>
-				if text == "true" then .Some(.Bool(true))
-				else if text == "false" then .Some(.Bool(false))
+				if text == "true" then .Bool(true)
+				else if text == "false" then .Bool(false)
 				else .None
 			.Int(int: t) => {
 				val negative = text.startsWith("-")
 				val digits = if negative then text[1..] else text
 				match digits.toU128() {
 					.Ok(magnitude) if (if negative then magnitude <= t.minMagnitude()
-					else magnitude <= t.max()) => .Some(
-						.Int((if negative then 0 -% magnitude else magnitude) & t.mask()),
+					else magnitude <= t.max()) => .Int(
+						(if negative then 0 -% magnitude else magnitude) & t.mask(),
 					)
 					_ => .None
 				}
 			}
 			.Float(..) => match text.toFloat() {
-				.Ok(f) => .Some(.Float(f))
+				.Ok(f) => .Float(f)
 				.Err(..) => .None
 			}
-			.Str => .Some(.Str(define.text))
+			.Str => .Str(define.text)
 			_ => .None
 		}
-		if value is .Some(v) then return .Some(.Ok(v.clone()))
+		if value is .Some(v) then return .Some(v.clone())
 		self.report(
 			Diagnostic::error(
 				DEFINE,
@@ -345,17 +344,24 @@ extend Lowerer {
 				ids.push(consts.valueAt(i))
 			}
 		}
-		// And its types' constants, each of which may share no name with a
-		// variant of its type, which is not declared when they are.
+		// And its types' constants.
 		for i in 0..self.program.typeConsts.len() {
 			val id = self.program.typeConsts.valueAt(i)
 			if self.program.consts[id].module != self.current as u32 then continue
 			ids.push(id)
-			self.checkTypeConstName(id)
 		}
 		ids.sortBy((a, b) => a.index() < b.index())
 		for id in ids {
 			self.constValue(id)
+		}
+	}
+
+	/// Reports each type's constant that shares its name with a variant of
+	/// its type, once every variant is declared: once for the program, where
+	/// what works out the constants runs once for each file of a module.
+	var fn checkTypeConstNames() = {
+		for i in 0..self.program.typeConsts.len() {
+			self.checkTypeConstName(self.program.typeConsts.valueAt(i))
 		}
 	}
 
@@ -421,7 +427,7 @@ extend Lowerer {
 					ty = ERROR
 				}
 				val context = (self.ast.types[t].span, "expected because of this type")
-				(self.checkIn(decl.value, ty, .Some(context)), ty)
+				(self.checkIn(decl.value, ty, context), ty)
 			}
 			.None => {
 				val value = self.infer(decl.value, .None)
@@ -493,8 +499,8 @@ extend Lowerer {
 		var code: Option<FnId> = .None
 		if folded is .Err(.Runs) {
 			var body = mem::replace(&var self.state.body, Body())
-			body.value = .Some(value)
-			code = .Some(self.constantCode(&decl, ty, body))
+			body.value = value
+			code = self.constantCode(&decl, ty, body)
 		}
 		self.state = self.outer.pop().unwrap()
 		self.enter(hereModule, hereAst, hereImports)
@@ -504,7 +510,7 @@ extend Lowerer {
 		self.constStack.pop()
 		self.program.consts[id].ty = ty
 		self.program.consts[id].value = match move folded {
-			.Ok(v) => .Some(v)
+			.Ok(v) => v
 			.Err(_) => .None
 		}
 		self.program.consts[id].code = code
@@ -517,16 +523,16 @@ extend Lowerer {
 		val ty = self.state.body.exprs[id].ty
 		val span = self.state.body.exprs[id].span
 		return match kind {
-			.Int(value) => .Ok(.Int(value))
-			.Float(value) => .Ok(.Float(value))
-			.Bool(value) => .Ok(.Bool(value))
-			.Str(symbol) => .Ok(.Str(symbol))
+			.Int(value) => .Int(value)
+			.Float(value) => .Float(value)
+			.Bool(value) => .Bool(value)
+			.Str(symbol) => .Str(symbol)
 			.Error => .Err(.Failed)
 			// A table's value, where it is known and holds what a slice points
 			// at, which is read where it is kept rather than made again.
 			.Deref(address) => match self.state.body.exprs[address].kind {
 				.Table(table) => match self.program.consts[table].value {
-					.Some(value) if value.holdsKept() => .Ok(value.clone())
+					.Some(value) if value.holdsKept() => value.clone()
 					_ => .Err(.Runs)
 				}
 				// What a reference to a value refers to: the value.
@@ -537,26 +543,23 @@ extend Lowerer {
 			// it, which the slice points at where the program keeps it.
 			.Ref(inner) => match self.state.body.exprs[inner].kind {
 				.SubSlice(base, lo: .None, hi: .None) => match self.fold(base)? {
-					.Array(values) => .Ok(.List(values))
+					.Array(values) => .List(values)
 					_ => .Err(.Runs)
 				}
 				_ => .Err(.Runs)
 			}
 			// A table: an array, a struct or tuple, or a variant, of constants.
-			.Array(elems) => .Ok(.Array(self.foldAll(&elems)?))
+			.Array(elems) => .Array(self.foldAll(&elems)?)
 			.ArrayRepeat(elem, count) => {
 				val value = self.fold(elem)?
 				var values: Vec<ConstValue> = Vec()
 				for _ in 0..count as i64 {
 					values.push(value.clone())
 				}
-				.Ok(.Array(values))
+				.Array(values)
 			}
-			.Struct(fields, ..) => .Ok(.Struct(self.foldAll(&fields)?))
-			.Variant(variant, args, ..) => .Ok(.Variant(
-				variant: variant,
-				fields: self.foldAll(&args)?,
-			))
+			.Struct(fields, ..) => .Struct(self.foldAll(&fields)?)
+			.Variant(variant, args, ..) => .Variant(variant: variant, fields: self.foldAll(&args)?)
 			.Unary(op, operand) => {
 				val value = self.fold(operand)?
 				self.foldUnary(op, value, ty)
@@ -571,7 +574,7 @@ extend Lowerer {
 			// that a constant built of a target and a define is one, and
 			// decides a branch as they do.
 			.StrEq(lhs, rhs) => match (self.fold(lhs)?, self.fold(rhs)?) {
-				(.Str(a), .Str(b)) => .Ok(.Bool(self.text(a) == self.text(b)))
+				(.Str(a), .Str(b)) => .Bool(self.text(a) == self.text(b))
 				_ => .Err(.Runs)
 			}
 			// `as` between numbers: the checker has already agreed to it.
@@ -591,18 +594,18 @@ extend Lowerer {
 		for part in parts {
 			values.push(self.fold(part)?)
 		}
-		return .Ok(values)
+		return values
 	}
 
 	fn foldUnary(op: UnaryOp, value: ConstValue, ty: Ty): Result<ConstValue, Unfolded> = match op {
 		.Neg => match value {
-			.Int(v) => .Ok(.Int(truncate(0 -% v, self.intBits(ty))))
-			.Float(v) => .Ok(.Float(-v))
+			.Int(v) => .Int(truncate(0 -% v, self.intBits(ty)))
+			.Float(v) => .Float(-v)
 			_ => .Err(.Runs)
 		}
 		.Not => match value {
-			.Bool(v) => .Ok(.Bool(!v))
-			.Int(v) => .Ok(.Int(truncate(!v, self.intBits(ty))))
+			.Bool(v) => .Bool(!v)
+			.Int(v) => .Int(truncate(!v, self.intBits(ty)))
 			_ => .Err(.Runs)
 		}
 	}
@@ -669,7 +672,7 @@ extend Lowerer {
 				}
 				.And | .Or => return .Err(.Runs)
 			}
-			return .Ok(value)
+			return value
 		}
 		if lhs is .Float(a) && rhs is .Float(b) then
 			return .Ok(
@@ -751,7 +754,7 @@ extend Lowerer {
 		isInline: false,
 		generated: .None,
 		intrinsic: .None,
-		body: .Some(body),
+		body: body,
 		projects: .None,
 		compileTime: true,
 		module: self.current as u32,
@@ -805,14 +808,14 @@ extend Lowerer {
 	var fn ownedInList(ty: Ty): Option<Ty> = match self.kind(ty) {
 		_ if !self.containsRef(ty) => .None
 		.Ref(inner, ..) => match self.kind(inner) {
-			.Slice(elem) if self.owns(elem) => .Some(elem)
+			.Slice(elem) if self.owns(elem) => elem
 			.Slice(elem) => self.ownedInList(elem)
 			_ => .None
 		}
 		.Array(elem, ..) | .ArrayOf(elem, ..) => self.ownedInList(elem)
 		.Struct(args, ..) | .Enum(args, ..) => {
 			for arg in self.program.types.list(args).toVec() {
-				if self.ownedInList(arg) is .Some(elem) then return .Some(elem)
+				if self.ownedInList(arg) is .Some(elem) then return elem
 			}
 			.None
 		}
@@ -868,7 +871,7 @@ extend Lowerer {
 		if !self.derived then self.program.names.push((span, .Const(id)))
 		var at: Option<i64> = .None
 		for (i, on) in self.constStack.forwards().enumerate() {
-			if at.isNone() && on == id then at = .Some(i)
+			if at.isNone() && on == id then at = i
 		}
 		if at is .Some(at) {
 			var cycle: Vec<String> = Vec()
@@ -1010,7 +1013,6 @@ fn saturatingI128(v: f64): i128 = {
 }
 
 /// Why folding did not work a constant out.
-@derive(Eq, Clone)
 enum Unfolded {
 	/// It is to be run, once the program is checked.
 	Runs

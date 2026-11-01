@@ -2,6 +2,60 @@
 
 Each version published, newest first.
 
+## 0.12.0 — 2026-10-31
+
+Programs written for 0.11 compile as they did, but where marked
+**breaking**; the compiler's errors say what to write instead.
+
+**The language**
+
+- **A value where an `Option` or a `Result` is expected is its `.Some`
+  or its `.Ok`:** `return found` from a function answering `Option<T>`,
+  `val limit: Option<i64> = 10`; a function answering `Result<void, E>`
+  ends with nothing, or `return`. `.None` and `.Err(…)`
+  are still written. A `.Some(…)` or `.Ok(…)` the type expected says is a
+  warning, and `wip fix` takes them away.
+- **An integer literal where a float is expected is that float:**
+  `Color(r: 255, g: 140, b: 0, a: 255)`, `width / 2`, `if held then 1
+  else 0` of an `f32`, and `[0, 0.5, 1]`. A literal the float cannot
+  hold exactly, as `16_777_217` is for an `f32`, is refused.
+- **A type's function named from the type expected,** `.name(…)`, as a
+  variant is: `Sizing(width: .grow(), height: .fixed(60.0))`,
+  `Mat4::lookAt(eye, look, .unitY())`, `val every: Duration =
+  .millis(500)`.
+- **An enum whose variants carry nothing compares and hashes** without
+  `@derive(Eq, Hash)`, and is a map's key as it is; a `@derive` that says
+  so is a warning `wip fix` takes away. It also answers **`name()`**, the
+  name its variant is written with, and **`fromName(text)`**, the variant
+  of that name or nothing.
+- **A box compares, orders, hashes and is written as what it holds,** so
+  a recursive type whose children are `own` derives `Eq`, `Ord`, `Hash`
+  and `Text`.
+- **A line that starts with `-`** and whose value nothing uses is
+  refused as a line cut short, with the fix that joins it to the line
+  above: `total = a` then `- b` on the next line computed `a`.
+  **Breaking:** such a statement compiled, and did not subtract.
+- **`own f` of a function's name** is refused, as `&f` is, with the fix
+  that takes the `own` away; it crashed the compiler.
+
+**The tools**
+
+- **`wip fix`** makes three more fixes: a byte written as a character
+  cast, `'[' as u8`, becomes `b'['`; a `@derive(Clone)` on plain data,
+  which clones without it, goes; and so do the wrappers and the
+  `@derive`s above.
+
+**The library**
+
+- **`std::text::Scanner`:** text read from the front by position — the
+  next byte or character looked at, taken, taken where it is the one
+  expected, skipped or taken while a test holds, what was read cut out,
+  and a line and a column worked out where an error needs one.
+  `std::json` reads with it.
+- **A vector of plain data is emptied in one step:** `clear`,
+  `truncate` and its drop set its length, where they touched every
+  element.
+
 ## 0.11.0 — 2026-10-24
 
 Programs written for 0.10 compile as they did, but where marked

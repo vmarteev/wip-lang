@@ -11,9 +11,11 @@ import syntax::{
 	INVALID_OPERANDS,
 	INVALID_PATTERN,
 	JUMP_IN_DEFER,
+	LEADING_OPERATOR,
 	LOOP_JUMP_OUTSIDE,
 	MISMATCHED_TYPES,
 	MISSING_RETURN,
+	NEEDLESS_WRAPPER,
 	NOT_ITERABLE,
 	NO_VALUE,
 	REF_OUTSIDE_ARGUMENT,
@@ -40,13 +42,23 @@ fn leadingNeg(file: &ast::Ast, stmt: ast::StmtId): Option<Span> = {
 	var .Expr(e) = file.stmts[stmt].kind else return .None
 	while true {
 		match file.exprs[e].kind {
-			.Unary(op: .Neg, opSpan, ..) => return .Some(opSpan)
+			.Unary(op: .Neg, opSpan, ..) => return opSpan
 			.Binary(lhs, ..) => e = lhs
 			.Cast(expr, ..) => e = expr
 			_ => return .None
 		}
 	}
 	return .None
+}
+
+/// Whether a binary operator written after statement `stmt` would continue
+/// it: it ends in an expression that is not a block, which joining the
+/// lines would make its left operand.
+fn continues(file: &ast::Ast, stmt: ast::StmtId): bool = match file.stmts[stmt].kind {
+	.Let(..) | .Guard(elseBlock: .None, ..) | .Defer(..) | .Return(value: .Some(_)) | .Yield(..) =>
+		true
+	.Expr(e) => !(file.exprs[e].kind is .Block(..) | .If(..) | .Match(..))
+	_ => false
 }
 
 /// What a `for` found to walk.
@@ -128,11 +140,13 @@ extend Lowerer {
 		self.selfTy = owner.map((owner) => self.ownSelfTy(owner))
 		self.state.body = Body()
 		self.state.byteLiterals = Set()
+		self.state.writtenSuccesses = Set()
+		self.state.converted = Set()
 		self.state.scopes = [Map()]
 		self.state.pendingLocals = Map()
 		self.state.keptOwn = Map()
 		self.state.taking = Set()
-		self.state.function = .Some(id)
+		self.state.function = id
 		self.state.lends = 0
 		self.state.lentParam = .None
 		self.state.lentTable = false
@@ -143,7 +157,7 @@ extend Lowerer {
 		}
 		val value =
 			if self.state.ret == UNIT then self.unitBody(body, id) else self.valueBody(body, id)
-		self.state.body.value = .Some(value)
+		self.state.body.value = value
 		if self.kind(self.state.ret) is .Ref(..) then self.checkProjection(id, value)
 		// `@tailrec`: its calls to itself must be tail calls.
 		if self.program.fns[id].isTailrec then self.checkTailrec(id, value)
@@ -156,7 +170,7 @@ extend Lowerer {
 	/// The body of a function that returns nothing. Its value, if it has one,
 	/// is discarded.
 	var fn unitBody(body: ast::ExprId, id: FnId): ExprId = {
-		val value = self.infer(body, .Some(UNIT))
+		val value = self.infer(body, UNIT)
 		val ty = self.tyOf(value)
 		if ty == UNIT || self.isPoisoned(ty) then return value
 		if !self.hasEffect(value) {
@@ -182,12 +196,19 @@ extend Lowerer {
 	/// The body of a function that returns a value: its value is the result.
 	var fn valueBody(body: ast::ExprId, id: FnId): ExprId = {
 		val ret = self.state.ret
-		val value = self.infer(body, .Some(ret))
+		val ending: Option<(Span, ast::ExprId)> =
+			if self.inDerived() then .None else self.endingOk(body)
+		self.state.endingOk = ending.map((e) => e.0)
+		val value = self.infer(body, ret)
+		if ending is .Some((span, ok)) then self.needlessOk(ok, span, self.endsBare(body, value))
 		// A block that ends with a statement instead of a value.
 		val openEnd: Option<u32> = match self.state.body.exprs[value].kind {
-			.Block(block) if block.value.isNone() => .Some(block.span.hi)
+			.Block(block) if block.value.isNone() => block.span.hi
 			_ => .None
 		}
+		// A function that answers `Result<void, E>` ends with its `.Ok()`.
+		if openEnd.isSome() && self.state.body.exprs[value].ty == UNIT && self.voidSuccess(ret) then
+			return self.endedOk(value, ret)
 		if openEnd is .Some(hi) && self.state.body.exprs[value].ty == UNIT {
 			if !self.hasError(ret) {
 				val end = Span::new(if hi > 0 then hi - 1 else 0, hi)
@@ -204,10 +225,76 @@ extend Lowerer {
 			return value
 		}
 		val context: Option<(Span, str)> = match self.state.retSpan {
-			.Some(s) => .Some((s, "return type declared here"))
+			.Some(s) => (s, "return type declared here")
 			.None => .None
 		}
 		return self.coerce(value, ret, context)
+	}
+
+	/// Whether the body being checked is one `@derive` wrote, which no
+	/// warning of how it is written is for.
+	fn inDerived(): bool = match self.state.function {
+		.Some(f) => self.program.derived.contains(&f)
+		.None => false
+	}
+
+	/// Whether `ret` is a `Result<void, E>`, whose success holds nothing and
+	/// may be left unsaid.
+	fn voidSuccess(ret: Ty): bool = match self.success(ret) {
+		.Some((enumId, inner)) =>
+			self.program.preludeItems.enumeration(.Result) == enumId && inner == UNIT
+		.None => false
+	}
+
+	/// The block `value`, which ends with a statement, answering `.Ok()` at its
+	/// end, as `ret`.
+	var fn endedOk(value: ExprId, ret: Ty): ExprId = {
+		val .Block(block) = self.state.body.exprs[value].kind.clone() else return value
+		val end = Span::new(if block.span.hi > 0 then block.span.hi - 1 else 0, block.span.hi)
+		val ok = self.wrapped(self.nothing(end), ret).unwrap()
+		var ended = block
+		ended.value = ok
+		self.state.body.exprs[value] = Expr(
+			kind: .Block(ended),
+			ty: ret,
+			span: self.state.body.exprs[value].span,
+		)
+		return value
+	}
+
+	/// The `return .Ok()` a function's body ends with, where it does, and its
+	/// `.Ok()`.
+	fn endingOk(body: ast::ExprId): Option<(Span, ast::ExprId)> = {
+		val .Block(block) = self.ast.exprs[body].kind else return .None
+		if block.stmts.isEmpty() then return .None
+		val last = &self.ast.stmts[block.stmts[block.stmts.len() - 1]]
+		val .Return(value: .Some(v)) = last.kind else return .None
+		return if self.writtenOk(v) then (last.span, v) else .None
+	}
+
+	/// Whether the body `value`, checked from `body`, could end without its
+	/// last statement, a `return .Ok()`: the statement before it is no value
+	/// that would become the body's. An `if`, a `match` or a block before it
+	/// would be checked as that value, and is not looked into.
+	fn endsBare(body: ast::ExprId, value: ExprId): bool = {
+		val .Block(written) = self.ast.exprs[body].kind else return false
+		val .Block(block) = self.state.body.exprs[value].kind else return false
+		val count = written.stmts.len()
+		if count < 2 || block.stmts.len() != count then return count == 1
+		val .Expr(e) = self.ast.stmts[written.stmts[count - 2]].kind else return true
+		if self.ast.exprs[e].kind is .If(..) | .Match(..) | .Block(..) then return false
+		val .Expr(checked) = self.state.body.stmts[block.stmts[count - 2]].kind else return false
+		return self.tyOf(checked) == UNIT || self.tyOf(checked) == NEVER
+	}
+
+	/// Whether `e` is `.Ok()`, written with nothing in it.
+	fn writtenOk(e: ast::ExprId): bool = {
+		val .Call(callee, args, ..) = self.ast.exprs[e].kind else return false
+		if !args.isEmpty() then return false
+		val .Path(leadingDot: true, segments, typeArgs: .None) = self.ast.exprs[callee].kind else {
+			return false
+		}
+		return segments.len() == 1 && self.text(segments[0].sym) == "Ok"
 	}
 
 	var fn declare(name: Symbol, ty: Ty, kind: LocalKind, span: Span): LocalId = {
@@ -221,7 +308,7 @@ extend Lowerer {
 		var i = self.state.scopes.len()
 		while i > 0 {
 			i -= 1
-			if self.state.scopes[i].get(&name) is .Some(id) then return .Some(id)
+			if self.state.scopes[i].get(&name) is .Some(id) then return id
 		}
 		return .None
 	}
@@ -260,33 +347,37 @@ extend Lowerer {
 			.Some(t) => self.variantTail(&block, t)
 			.None => false
 		}
+		// An `if` without `else` has no value: where one is expected, it is a
+		// statement and the block falls off its end.
+		val lastIsValue =
+			count > 0 &&
+			!variantTail &&
+			expected != UNIT &&
+			file.stmts[block.stmts[count - 1]].kind is .Expr(e) &&
+			!(expected.isSome() && lacksElse(&file, e))
 		for (i, stmt) in block.stmts.forwards().enumerate() {
-			// An `if` without `else` has no value: where one is expected, it is
-			// a statement and the block falls off its end.
-			if i + 1 == count &&
-				!variantTail &&
-				expected != .Some(UNIT) &&
-				file.stmts[stmt].kind is .Expr(e) &&
-				!(expected.isSome() && lacksElse(&file, e)) {
+			if i + 1 == count && lastIsValue {
+				var .Expr(e) = file.stmts[stmt].kind else break
 				val v = match expected {
 					// A block that is an argument answers its value as it is:
 					// what the argument is lent as is the call's to say, of the
 					// value the block answers, which has left the block.
-					.Some(t) if argument => self.infer(e, .Some(t))
+					.Some(t) if argument => self.infer(e, t)
 					.Some(t) => self.check(e, t)
 					.None => self.infer(e, .None)
 				}
 				if self.tyOf(v) == NEVER then diverges = true
-				value = .Some(v)
+				value = v
 				break
 			}
-			// A statement that starts with `-` may be meant to continue the
-			// expression above it, which the warning says.
+			// A block's value that starts with `-` may be meant to continue the
+			// expression above it, which the warning for that one says.
 			val nextNeg =
-				if file.stmts[stmt].kind is .Expr(..) && i + 1 < count then
+				if file.stmts[stmt].kind is .Expr(..) && i + 2 == count && lastIsValue then
 					leadingNeg(&file, block.stmts[i + 1])
 				else .None
-			val (id, d) = self.stmt(stmt, nextNeg)
+			val prev = if i > 0 then .Some(block.stmts[i - 1]) else .None
+			val (id, d) = self.stmt(stmt, prev, nextNeg)
 			stmts.push(id)
 			if d then diverges = true
 		}
@@ -345,8 +436,8 @@ extend Lowerer {
 	fn lastDot(e: ast::ExprId): Option<ast::ExprId> = {
 		val file = self.ast
 		return match file.exprs[e].kind {
-			.Field(..) if file.lineDots.contains(&e) => .Some(e)
-			.Call(callee, ..) if file.lineDots.contains(&callee) => .Some(callee)
+			.Field(..) if file.lineDots.contains(&e) => e
+			.Call(callee, ..) if file.lineDots.contains(&callee) => callee
 			.Assign(value, ..) => self.lastDot(value)
 			.Binary(rhs, ..) => self.lastDot(rhs)
 			.Unary(operand, ..) => self.lastDot(operand)
@@ -365,7 +456,7 @@ extend Lowerer {
 	/// with `-`, which the warning for a pointless value mentions.
 	var fn discarded(e: ast::ExprId, nextNeg: Option<Span>): ExprId = {
 		val blockLike = self.ast.exprs[e].kind is .Block(..) | .If(..) | .Match(..)
-		val id = self.infer(e, if blockLike then .Some(UNIT) else .None)
+		val id = self.infer(e, if blockLike then UNIT else .None)
 		self.warnIfPointless(id, nextNeg)
 		return id
 	}
@@ -394,7 +485,6 @@ extend Lowerer {
 		val ty = self.tyOf(id)
 		if ty == UNIT || self.isPoisoned(ty) || self.hasEffect(id) then return
 		val span = self.state.body.exprs[id].span
-		val negated = self.state.body.exprs[id].kind is .Unary(op: .Neg, ..)
 		var diagnostic = Diagnostic::warning(DISCARDED_VALUE, "this value is computed and never used", span, "a value of type \(self.tyName(ty))")
 		if nextNeg is .Some(neg) then
 			diagnostic = diagnostic.withSecondary(neg, "this `-` starts a new statement")
@@ -402,11 +492,37 @@ extend Lowerer {
 					"a line break ends a complete expression, so a line that starts with `-` is a new statement",
 				)
 				.withHelp("to subtract, move `-` to the end of the previous line")
-		else if negated then
-			diagnostic = diagnostic.withNote(
-				"a line break ends a complete expression, so a line that starts with `-` is a new statement",
-			).withHelp("to continue the previous line, move `-` to its end")
 		self.report(diagnostic)
+	}
+
+	/// The error for statement `id`, which starts with the `-` at `neg` and
+	/// whose value is dropped: what it negates is never used, so it is a line
+	/// cut short, meant to continue `prev`, the statement above it.
+	fn droppedNegation(id: ast::StmtId, neg: Span, prev: Option<ast::StmtId>): Diagnostic = {
+		val file = self.ast
+		val .Some(line) = file.negLines.get(&id) else {
+			return Diagnostic::error(
+				LEADING_OPERATOR,
+				"a negation whose value is never used",
+				neg,
+				"this statement negates a value and drops it",
+			)
+		}
+		var diagnostic = Diagnostic::error(
+			LEADING_OPERATOR,
+			"a line cannot start with `-`",
+			neg,
+			"this line starts a statement that negates a value and drops it",
+		).withNote(
+			"a line break ends an expression that is complete, so `-` at the start of the next line begins a new one",
+		)
+		if !(prev is .Some(above) && continues(&file, above)) then return diagnostic
+		// Joining the lines would delete a comment at the end of the line.
+		if line.comment then
+			return diagnostic.withHelp("to subtract, move `-` to the end of the previous line")
+		return diagnostic.withFix("move `-` to the end of the previous line", [
+			Edit::replace(line.gap, " "),
+		])
 	}
 
 	/// Whether evaluating `id` does anything besides producing its value: a
@@ -430,9 +546,15 @@ extend Lowerer {
 		return false
 	}
 
-	/// A statement, and whether it never finishes. `nextNeg` is what an
-	/// expression statement passes to `discarded`.
-	var fn stmt(id: ast::StmtId, nextNeg: Option<Span>): (StmtId, bool) = {
+	/// A statement, and whether it never finishes. `prev` is the statement
+	/// above it in its block, which one that starts with `-` may be meant to
+	/// continue; `nextNeg` is what an expression statement passes to
+	/// `discarded`.
+	var fn stmt(
+		id: ast::StmtId,
+		prev: Option<ast::StmtId>,
+		nextNeg: Option<Span>,
+	): (StmtId, bool) = {
 		val file = self.ast
 		val stmt = &file.stmts[id]
 		// The local declared here, where it waits for its type.
@@ -486,7 +608,7 @@ extend Lowerer {
 						mutable: mutable,
 						literal: literal,
 					))
-					waiting = .Some(local)
+					waiting = local
 				}
 				(.Let(local: local, init: kept), ty == NEVER)
 			}
@@ -530,7 +652,7 @@ extend Lowerer {
 						),
 					)
 				}
-				(.Return(.Some(self.becomeCall(call, stmt.span))), true)
+				(.Return(self.becomeCall(call, stmt.span)), true)
 			}
 			.Guard(mutable, pattern, value, elseBlock) => (
 				self.guard(mutable, &pattern, value, elseBlock.asRef()),
@@ -541,7 +663,7 @@ extend Lowerer {
 				self.state.scopes.push(Map())
 				val checkedCond = self.bindingCondition(cond)
 				self.pushLoop(label.asRef())
-				val (checkedBody, _) = self.checkBlock(&body, .Some(UNIT))
+				val (checkedBody, _) = self.checkBlock(&body, UNIT)
 				val (_, breaks) = self.state.loops.pop().unwrap()
 				self.endScope()
 				// `while true` with no `break` never finishes normally.
@@ -554,12 +676,20 @@ extend Lowerer {
 			.Break(label) => (self.loopJump(label, true, stmt.span), true)
 			.Continue(label) => (self.loopJump(label, false, stmt.span), true)
 			.Expr(e) => {
-				val checked = self.discarded(e, nextNeg)
+				val checked = match leadingNeg(&file, id) {
+					// A negation is never a block, so it is checked as itself.
+					.Some(neg) => {
+						val checked = self.infer(e, .None)
+						self.report(self.droppedNegation(id, neg, prev))
+						checked
+					}
+					.None => self.discarded(e, nextNeg)
+				}
 				(.Expr(checked), self.state.body.exprs[checked].ty == NEVER)
 			}
 		}
 		val added = self.state.body.stmts.add(Stmt(kind: kind, span: stmt.span))
-		if waiting is .Some(local) then self.state.pendingLocals.at(&local).stmt = .Some(added)
+		if waiting is .Some(local) then self.state.pendingLocals.at(&local).stmt = added
 		return (added, diverges)
 	}
 
@@ -587,7 +717,7 @@ extend Lowerer {
 				ty = ERROR
 			}
 			val context = (file.types[t].span, "expected because of this type")
-			return (self.checkIn(init, ty, .Some(context)), ty)
+			return (self.checkIn(init, ty, context), ty)
 		}
 		// `val f = (x) => …` may keep what it captures.
 		self.state.keepingClosure = !mutable && file.exprs[init].kind is .Lambda(..)
@@ -635,7 +765,7 @@ extend Lowerer {
 		val depth: Option<u32> = match label {
 			.Some(label) if !self.state.loops.isEmpty() => self.loopNamed(label, word)
 			.Some(_) => .None
-			.None => .Some(0)
+			.None => 0
 		}
 		val skip = 1 + depth.unwrapOr(0) as i64
 		val target = if self.state.loops.len() > skip then self.state.loops.len() - skip else 0
@@ -681,7 +811,7 @@ extend Lowerer {
 			for c in self.typeParams[param.index].interfaces {
 				if c.interfaceId == interfaceId {
 					val args = self.program.types.list(c.args)
-					return if args.isEmpty() then .None else .Some(args[0])
+					return if args.isEmpty() then .None else args[0]
 				}
 			}
 			return .None
@@ -691,7 +821,7 @@ extend Lowerer {
 		for i in self.program.impls {
 			if i.interfaceId == interfaceId && i.ty == owner {
 				if i.methods.isEmpty() then return .None
-				found = .Some(i.methods[0])
+				found = i.methods[0]
 				break
 			}
 		}
@@ -725,7 +855,7 @@ extend Lowerer {
 					if found.isNone() && c.interfaceId == interfaceId {
 						val list = self.program.types.list(c.args)
 						if list.isEmpty() then break
-						found = .Some(list[0])
+						found = list[0]
 					}
 				}
 			}
@@ -737,7 +867,7 @@ extend Lowerer {
 			var method: Option<FnId> = .None
 			for i in self.program.impls {
 				if i.interfaceId == interfaceId && i.ty == owner {
-					if !i.methods.isEmpty() then method = .Some(i.methods[0])
+					if !i.methods.isEmpty() then method = i.methods[0]
 					break
 				}
 			}
@@ -857,7 +987,7 @@ extend Lowerer {
 			return self.walkIterator(label, &binding, taken, next, &body)
 		var elem: Option<Ty> = .None
 		match self.kind(ty) {
-			.Array(elem: t, ..) | .ArrayOf(elem: t, ..) | .Slice(elem: t) => elem = .Some(t)
+			.Array(elem: t, ..) | .ArrayOf(elem: t, ..) | .Slice(elem: t) => elem = t
 			_ if self.isPoisoned(ty) => {}
 			// A container is walked through the elements it lends.
 			_ => match self.itemsOf(e, ty) {
@@ -873,7 +1003,7 @@ extend Lowerer {
 							self.state.body.exprs[items].ty = slice
 					}
 					e = items
-					elem = .Some(t)
+					elem = t
 				}
 				.No => {
 					// What lends no slice may lend its elements one place at a
@@ -906,7 +1036,7 @@ extend Lowerer {
 			.Some(t) => self.intern(.Ref(inner: t, kind: kind))
 			.None => ERROR
 		}
-		val pattern = self.elementPattern(&binding, elementTy, elem, kind, .Some(e))
+		val pattern = self.elementPattern(&binding, elementTy, elem, kind, e)
 		val checkedBody = self.loopBody(label, &body)
 		self.state.scopes.pop()
 		return .ForElements(binding: pattern, elements: e, body: checkedBody)
@@ -925,10 +1055,10 @@ extend Lowerer {
 		// does.
 		val (low, high) = if self.numberLiteral(lo) {
 			val h = self.operand(hi, .None)
-			(self.operand(lo, .Some(self.tyOf(h))), h)
+			(self.operand(lo, self.tyOf(h)), h)
 		} else {
 			val l = self.operand(lo, .None)
-			(l, self.operand(hi, .Some(self.tyOf(l))))
+			(l, self.operand(hi, self.tyOf(l)))
 		}
 		val loTy = self.tyOf(low)
 		val hiTy = self.tyOf(high)
@@ -945,8 +1075,11 @@ extend Lowerer {
 		}
 		self.state.scopes.push(Map())
 		val local: Option<LocalId> = match binding.kind {
-			.Binding(symbol, isVar) => .Some(
-				self.declare(symbol, ty, if isVar then .Var else .Binding, binding.span),
+			.Binding(symbol, isVar) => self.declare(
+				symbol,
+				ty,
+				if isVar then .Var else .Binding,
+				binding.span,
 			)
 			.Wildcard | .Error => .None
 			_ => {
@@ -996,10 +1129,10 @@ extend Lowerer {
 		}
 		val (low, high) = if self.numberLiteral(lo) {
 			val h = self.operand(hi, if self.numberLiteral(hi) then counted else .None)
-			(self.operand(lo, .Some(self.tyOf(h))), h)
+			(self.operand(lo, self.tyOf(h)), h)
 		} else {
 			val l = self.operand(lo, .None)
-			(l, self.operand(hi, .Some(self.tyOf(l))))
+			(l, self.operand(hi, self.tyOf(l)))
 		}
 		val loTy = self.tyOf(low)
 		val hiTy = self.tyOf(high)
@@ -1031,7 +1164,7 @@ extend Lowerer {
 	/// arm that leaves leaves nothing for what follows the `match`.
 	var fn typedLoopBody(label: Option<&ast::Name>, body: &ast::Block): (Block, Ty) = {
 		self.pushLoop(label)
-		val checked = self.checkBlock(&body, .Some(UNIT))
+		val checked = self.checkBlock(&body, UNIT)
 		self.state.loops.pop()
 		return checked
 	}
@@ -1043,7 +1176,7 @@ extend Lowerer {
 		if label is .Some(label) {
 			var taken = false
 			for (name, _) in self.state.loops {
-				if name == .Some(label.sym) then taken = true
+				if name == label.sym then taken = true
 			}
 			if taken {
 				val text = String::of(self.text(label.sym))
@@ -1060,7 +1193,7 @@ extend Lowerer {
 			}
 		}
 		val name: Option<Symbol> = match label {
-			.Some(l) => .Some(l.sym)
+			.Some(l) => l.sym
 			.None => .None
 		}
 		self.state.loops.push((name, false))
@@ -1073,7 +1206,7 @@ extend Lowerer {
 		var i = self.state.loops.len()
 		while i > 0 {
 			i -= 1
-			if self.state.loops[i].0 == .Some(label.sym) then return .Some(depth as u32)
+			if self.state.loops[i].0 == label.sym then return depth as u32
 			depth += 1
 		}
 		val text = String::of(self.text(label.sym))
@@ -1100,14 +1233,14 @@ extend Lowerer {
 			self.state.inferringRet = false
 			val .Some(v) = value else {
 				self.state.ret = UNIT
-				self.settlePendingTries(.Some(span))
+				self.settlePendingTries(span)
 				return .None
 			}
 			val e = self.infer(v, .None)
 			val ty = self.tyOf(e)
 			self.state.ret = if ty == NEVER then UNIT else ty
-			self.settlePendingTries(.Some(self.state.body.exprs[e].span))
-			return .Some(e)
+			self.settlePendingTries(self.state.body.exprs[e].span)
+			return e
 		}
 		val ret = self.state.ret
 		return match value {
@@ -1121,12 +1254,23 @@ extend Lowerer {
 				Option::Some(e)
 			}
 			.Some(v) => {
+				if self.voidSuccess(ret) &&
+					self.writtenOk(v) &&
+					self.state.endingOk != span &&
+					!self.inDerived() {
+					self.needlessOk(v, span, false)
+				}
 				val context: Option<(Span, str)> = match self.state.retSpan {
-					.Some(s) => .Some((s, "return type declared here"))
+					.Some(s) => (s, "return type declared here")
 					.None => .None
 				}
 				Option::Some(self.checkIn(v, ret, context))
 			}
+			// `return` alone, where the result is a `Result<void, E>`, is its
+			// `.Ok()`.
+			.None if self.voidSuccess(ret) => Option::Some(
+				self.wrapped(self.nothing(span), ret).unwrap(),
+			)
 			.None => {
 				if ret != UNIT && !self.hasError(ret) {
 					var diagnostic = Diagnostic::error(MISMATCHED_TYPES, "missing return value", span, "expected a value of type \(self.tyName(ret))")
@@ -1137,6 +1281,20 @@ extend Lowerer {
 				Option::None
 			}
 		}
+	}
+
+	/// E0469: `return .Ok()` where the result is a `Result<void, E>`, which
+	/// `return` says, as the end of the body does.
+	/// Where it ends the body, and `bare`, the fix takes the whole statement
+	/// away.
+	var fn needlessOk(ok: ast::ExprId, span: Span, bare: bool) = {
+		val fix = if bare then "end the body without it" else "write `return` alone"
+		val removed = if bare then span else Span::new(span.lo + 6, self.ast.exprs[ok].span.hi)
+		self.report(
+			Diagnostic::warning(NEEDLESS_WRAPPER, "`.Ok()` is said by the result type", self.ast.exprs[ok].span, "the result is \(self.tyName(self.state.ret))").withNote(
+				"where a function answers `Result<void, E>`, `return` alone is `return .Ok()`, and so is the end of its body",
+			).withFix(fix, [Edit::replace(removed, "")]),
+		)
 	}
 
 	/// `assert(condition)` and `assert(condition, note)`: the condition
@@ -1157,12 +1315,12 @@ extend Lowerer {
 		var built: Option<ExprId> = .None
 		if note is .Some(n) &&
 			self.messageText(n, ASSERT_NOTE, "an assert's note") is .Some(value) {
-			if self.state.body.exprs[value].kind !is .Str(..) then built = .Some(value)
+			if self.state.body.exprs[value].kind !is .Str(..) then built = value
 		}
 		val .Some(text) = message else return self.errorExpr(span)
 		val negated = self.alloc(.Unary(op: .Not, operand: condition), BOOL, span)
-		val panicked = self.alloc(.Panic(note: built, message: .Some(text)), NEVER, span)
-		val thenBlock = Block(stmts: Vec(), value: .Some(panicked), span: span)
+		val panicked = self.alloc(.Panic(note: built, message: text), NEVER, span)
+		val thenBlock = Block(stmts: Vec(), value: panicked, span: span)
 		return self.alloc(.If(cond: negated, thenBlock: thenBlock, elseBlock: .None), UNIT, span)
 	}
 
@@ -1182,8 +1340,8 @@ extend Lowerer {
 			// Where a value is expected, the branch is checked against its type
 			// instead, so that the missing `else` is the only error.
 			val wanted: Option<Ty> = match hint {
-				.Some(t) if t != UNIT && !self.isPoisoned(t) => .Some(t)
-				_ => .Some(UNIT)
+				.Some(t) if t != UNIT && !self.isPoisoned(t) => t
+				_ => UNIT
 			}
 			val (checked, _) = self.checkBlock(&thenBlock, wanted)
 			self.endScope()
@@ -1199,14 +1357,14 @@ extend Lowerer {
 		// one error where a value is asked of it (E0354), as for an `if`.
 		if lacksElse(self.ast, elseAt) {
 			val wanted: Option<Ty> = match hint {
-				.Some(t) if t != UNIT && !self.isPoisoned(t) => .Some(t)
-				_ => .Some(UNIT)
+				.Some(t) if t != UNIT && !self.isPoisoned(t) => t
+				_ => UNIT
 			}
 			val (checkedThen, _) = self.checkBlock(&thenBlock, wanted)
 			self.endScope()
 			val (checkedElse, _) = self.elseBlock(elseAt, wanted)
 			return self.alloc(
-				.If(cond: condition, thenBlock: checkedThen, elseBlock: .Some(checkedElse)),
+				.If(cond: condition, thenBlock: checkedThen, elseBlock: checkedElse),
 				UNIT,
 				span,
 			)
@@ -1220,7 +1378,7 @@ extend Lowerer {
 			val (checkedElse, elseTy) = self.elseBlock(elseAt, .None)
 			self.state.scopes.push(bindings)
 			self.state.matched.append(matched)
-			val expected: Option<Ty> = if elseTy != NEVER then .Some(elseTy) else .None
+			val expected: Option<Ty> = if elseTy != NEVER then elseTy else .None
 			val reported = self.errorsReported()
 			val (checkedThen, thenTy) = self.checkBlock(&thenBlock, expected)
 			self.endScope()
@@ -1237,7 +1395,7 @@ extend Lowerer {
 				}
 			}
 			return self.alloc(
-				.If(cond: condition, thenBlock: checkedThen, elseBlock: .Some(checkedElse)),
+				.If(cond: condition, thenBlock: checkedThen, elseBlock: checkedElse),
 				ty,
 				span,
 			)
@@ -1249,8 +1407,8 @@ extend Lowerer {
 		// Without an expected type, the `then` branch sets the type of the
 		// `else` branch.
 		val expected: Option<Ty> = match hint {
-			.Some(t) => .Some(t)
-			.None => if thenTy != NEVER then .Some(thenTy) else .None
+			.Some(t) => t
+			.None => if thenTy != NEVER then thenTy else .None
 		}
 		val (checkedElse, elseTy) = self.elseBlock(elseAt, expected)
 		val ty =
@@ -1260,7 +1418,7 @@ extend Lowerer {
 				.None => elseTy
 			}
 		return self.alloc(
-			.If(cond: condition, thenBlock: checkedThen, elseBlock: .Some(checkedElse)),
+			.If(cond: condition, thenBlock: checkedThen, elseBlock: checkedElse),
 			ty,
 			span,
 		)
@@ -1282,15 +1440,15 @@ extend Lowerer {
 		val (
 			elseBlock,
 			elseTy,
-		) = if expr.kind is .Block(block) then self.blockOf(&block, .Some(thenTy), true) else {
-			val value = self.infer(elseAt, .Some(thenTy))
-			(Block(stmts: Vec(), value: .Some(value), span: expr.span), self.tyOf(value))
+		) = if expr.kind is .Block(block) then self.blockOf(&block, thenTy, true) else {
+			val value = self.infer(elseAt, thenTy)
+			(Block(stmts: Vec(), value: value, span: expr.span), self.tyOf(value))
 		}
 		val ty = if elseTy == NEVER then thenTy else self.partsType(thenTy, elseTy).unwrapOr(thenTy)
 		val checkedThen = self.blockAs(thenBlock, thenTy, ty)
 		val checkedElse = self.blockAs(elseBlock, elseTy, ty)
 		return self.alloc(
-			.If(cond: condition, thenBlock: checkedThen, elseBlock: .Some(checkedElse)),
+			.If(cond: condition, thenBlock: checkedThen, elseBlock: checkedElse),
 			ty,
 			span,
 		)
@@ -1302,7 +1460,7 @@ extend Lowerer {
 	var fn blockAs(block: Block, answered: Ty, ty: Ty): Block = {
 		if answered == ty || answered == NEVER then return block
 		var changed = block
-		if changed.value is .Some(value) then changed.value = .Some(self.coerce(value, ty, .None))
+		if changed.value is .Some(value) then changed.value = self.coerce(value, ty, .None)
 		return changed
 	}
 
@@ -1325,7 +1483,7 @@ extend Lowerer {
 			.None => self.infer(elseBranch, .None)
 		}
 		val ty = self.tyOf(value)
-		return (Block(stmts: Vec(), value: .Some(value), span: expr.span), ty)
+		return (Block(stmts: Vec(), value: value, span: expr.span), ty)
 	}
 }
 

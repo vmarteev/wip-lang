@@ -425,7 +425,7 @@ struct Tree {
 extend Tree {
     fn find(size: i64): Option<&Node> = {
         for i in 0..self.nodes.len() {
-            if self.nodes[i].size == size then return .Some(&self.nodes[i])
+            if self.nodes[i].size == size then return &self.nodes[i]
         }
         return .None
     }
@@ -481,7 +481,7 @@ fn named(node: &Json, wanted: str): Vec<&Json> = {
     var found: Vec<&Json> = Vec()
     if node.get("inner").flatMap((inner) => inner.asArray()) is .Some(nodes) {
         for child in nodes.items() {
-            if kind(child) == .Some(wanted) then found.push(child)
+            if kind(child) == wanted then found.push(child)
         }
     }
     return found

@@ -1,11 +1,12 @@
-// `count` and `fromIndex`: what an enum whose variants carry nothing gets.
+// `count`, `fromIndex`, `all`, `name` and `fromName`: what an enum whose
+// variants carry nothing gets.
 //
 // Such an enum is which variant it holds, and nothing else, so the number of
-// its variants is a constant and the variant with a given number is a switch
-// over the numbers it has.
+// its variants is a constant, the variant with a given number is a switch
+// over the numbers it has, and so is the name of the one held.
 
-import hir::{BOOL, I32, I64, Ty, VariantDef}
-import syntax::{BinaryOp}
+import hir::{BOOL, I32, I64, STR, Ty, VariantDef}
+import syntax::{BinaryOp, Symbol}
 
 /// Where the prelude's `Option` writes its two variants.
 val SOME: u32 = 0
@@ -15,7 +16,7 @@ extend Builder {
 	/// `static fn count(): i64`: how many variants the enum has.
 	var fn countFn(count: u64) = {
 		val ret = self.newLocal(I64, .Return)
-		self.ret = .Some(ret)
+		self.ret = ret
 		self.assign(Place::of(ret), .Use(.Const(.Int(bits: count, ty: I64))))
 		self.terminate(.Return)
 	}
@@ -24,7 +25,7 @@ extend Builder {
 	/// number.
 	var fn allVariantsFn(ty: Ty, array: Ty) = {
 		val ret = self.newLocal(array, .Return)
-		self.ret = .Some(ret)
+		self.ret = ret
 		val at = self.newLocal(I64, .Var)
 		for variant in 0..(self.variantsOf(ty).len() as u32) {
 			self.assign(Place::of(at), .Use(.Const(.Int(bits: variant, ty: I64))))
@@ -40,7 +41,7 @@ extend Builder {
 		val index = self.newLocal(I64, .Param)
 		self.params.push(index)
 		val ret = self.newLocal(option, .Return)
-		self.ret = .Some(ret)
+		self.ret = ret
 		val count = self.variantsOf(ty).len() as u32
 		// A number no variant has answers nothing, which is also what the
 		// switch's other cases answer.
@@ -76,6 +77,95 @@ extend Builder {
 		self.switchTo(none)
 		self.push(.SetVariant(place: Place::of(ret), variant: NONE))
 		self.terminate(.Return)
+	}
+
+	/// `fn name(): str`: the name of the variant `self` holds, as the
+	/// declaration writes it. Each name is a literal, kept once in the
+	/// program's read-only data.
+	var fn variantNameFn(ty: Ty, receiver: Ty) = {
+		val this = self.newLocal(receiver, .Param)
+		self.params.push(this)
+		val ret = self.newLocal(STR, .Return)
+		self.ret = ret
+		val which = self.value(I32, .Variant(Place::of(this).project(.Deref)))
+		val entry = self.current
+		val done = self.newBlock()
+		var cases: Vec<(u32, BlockId)> = Vec()
+		for (variant, name) in self.variantNames(ty).forwards().enumerate() {
+			val block = self.newBlock()
+			self.switchTo(block)
+			self.assignText(Place::of(ret), name)
+			self.terminate(.Goto(done))
+			cases.push((variant as u32, block))
+		}
+		// No value holds a variant the enum does not have.
+		val otherwise = self.newBlock()
+		self.switchTo(otherwise)
+		self.terminate(.Unreachable)
+		self.switchTo(entry)
+		self.terminate(.Switch(value: which, cases: cases, otherwise: otherwise))
+		self.switchTo(done)
+		self.terminate(.Return)
+	}
+
+	/// `static fn fromName(text: str): Option<Self>`: the variant whose name
+	/// is `text`, byte for byte, or nothing where no variant has it.
+	var fn nameToVariantFn(ty: Ty, option: Ty) = {
+		val text = self.newLocal(STR, .Param)
+		self.params.push(text)
+		val ret = self.newLocal(option, .Return)
+		self.ret = ret
+		val found = self.newLocal(ty, .Var)
+		val name = Place::of(self.newLocal(STR, .Var))
+		val same = Place::of(self.newLocal(BOOL, .Var))
+		val some = self.newBlock()
+		// Each name is tried in turn, and the first that is `text` is the
+		// variant.
+		for (variant, written) in self.variantNames(ty).forwards().enumerate() {
+			self.assignText(name.clone(), written)
+			self.push(.Call(
+				callee: .StrEq,
+				args: [
+					Operand::Copy(Place::of(text).project(.Field(0))),
+					Operand::Copy(Place::of(text).project(.Field(1))),
+					Operand::Copy(name.project(.Field(0))),
+					Operand::Copy(name.project(.Field(1))),
+				],
+				dest: same.clone(),
+			))
+			val matched = self.newBlock()
+			val next = self.newBlock()
+			self.terminate(.Branch(cond: .Copy(same.clone()), thenBlock: matched, otherwise: next))
+			self.switchTo(matched)
+			self.push(.SetVariant(place: Place::of(found), variant: variant as u32))
+			self.terminate(.Goto(some))
+			self.switchTo(next)
+		}
+		self.push(.SetVariant(place: Place::of(ret), variant: NONE))
+		self.terminate(.Return)
+		// `.Some(found)`, whose payload is the variant whose name it was.
+		self.switchTo(some)
+		self.push(.SetVariant(place: Place::of(ret), variant: SOME))
+		val payload = Place::of(ret).project(.VariantField(variant: SOME, field: 0))
+		self.assign(payload, .Use(.Copy(Place::of(found))))
+		self.terminate(.Return)
+	}
+
+	/// Writes the `str` of a name into `place`: its bytes, which the program
+	/// keeps once, and its length.
+	var fn assignText(place: Place, text: Symbol) = {
+		val len = self.interner.resolve(text).len() as u128
+		self.assign(place.project(.Field(0)), .Use(.Const(.CStr(text))))
+		self.assign(place.project(.Field(1)), .Use(Builder::int(len, I64)))
+	}
+
+	/// The names of an enum type's variants, in order.
+	fn variantNames(ty: Ty): Vec<Symbol> = {
+		var names: Vec<Symbol> = Vec()
+		for variant in self.variantsOf(ty) {
+			names.push(variant.name)
+		}
+		return names
 	}
 
 	/// The variants of an enum type.

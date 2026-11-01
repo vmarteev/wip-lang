@@ -76,7 +76,6 @@ pub fn expand(files: &[Parsed], interner: &var Interner): Ast = {
 }
 
 /// The interfaces written here.
-@derive(Eq, Clone)
 enum Derive {
 	Eq
 	Ord
@@ -227,11 +226,16 @@ fn asks(annotations: &[Annotation], names: &Names, wanted: Symbol): Option<Span>
 	for annotation in annotations {
 		if annotation.name.sym != names.derive then continue
 		for arg in annotation.args {
-			if arg.value == .Name(wanted) then return .Some(arg.span)
+			if arg.value == .Name(wanted) then return arg.span
 		}
 	}
 	return .None
 }
+
+/// Whether an enum is one of names: it has variants, and none carries
+/// anything. One with none has no value to compare.
+pub fn namesOnly(decl: &EnumDecl): bool =
+	!decl.variants.isEmpty() && decl.variants.all((v) => v.fields.isEmpty())
 
 /// A piece of what `Text` writes: text as it is, or a value that writes
 /// itself.
@@ -242,7 +246,6 @@ enum TextPiece {
 
 /// Which side of a comparison a variant's fields are bound for: `self`'s,
 /// or the other value's.
-@derive(Eq, Clone)
 enum Side {
 	This
 	Other
@@ -268,6 +271,11 @@ extend Builder {
 		item: &Item,
 		source: &Ast,
 	) = {
+		// Where an enum of names is, which is given `Eq` and `Hash` unasked.
+		val unasked = match item {
+			.Enum(decl) if namesOnly(&decl) => .Some(decl.name.span)
+			_ => .None
+		}
 		for derive in [
 			Derive::Eq,
 			Derive::Ord,
@@ -279,11 +287,20 @@ extend Builder {
 		] {
 			// An enum with no variants has no value to clone from.
 			if derive == .Clone && item is .Enum(decl) && decl.variants.isEmpty() then continue
-			val .Some(at) = asks(&annotations, &self.names, derive.interfaceOf(&self.names)) else {
-				continue
+			// An enum of names compares and hashes without asking: which name
+			// it is is all there is to compare.
+			val (at, implicit) = match asks(
+				&annotations,
+				&self.names,
+				derive.interfaceOf(&self.names),
+			) {
+				.Some(at) => (at, false)
+				.None if derive is .Eq | .Hash && unasked.isSome() => (unasked.unwrap(), true)
+				.None => continue
 			}
 			self.at = at
-			val block = self.block(derive, name, &generics, &item, &source)
+			var block = self.block(derive, name, &generics, &item, &source)
+			block.implicit = implicit
 			self.out.items.push(.Extend(block))
 		}
 	}
@@ -317,7 +334,7 @@ extend Builder {
 					_ => panic("a struct or an enum")
 				}
 				val ret = self.namedType(names.boolType)
-				(names.equals, [self.otherParam()], .Some(ret), body)
+				(names.equals, [self.otherParam()], ret, body)
 			}
 			// `fn compare(other: &Self): Ordering`
 			.Ord => {
@@ -330,7 +347,7 @@ extend Builder {
 					_ => panic("a struct or an enum")
 				}
 				val ret = self.preludeType(names.ordering, Vec())
-				(names.compare, [self.otherParam()], .Some(ret), body)
+				(names.compare, [self.otherParam()], ret, body)
 			}
 			// `fn hashInto(out: &var Hasher)`
 			.Hash => {
@@ -365,7 +382,7 @@ extend Builder {
 					_ => panic("a struct or an enum")
 				}
 				val ret = self.namedType(names.selfType)
-				(names.clone, Vec(), .Some(ret), body)
+				(names.clone, Vec(), ret, body)
 			}
 			// `fn encode<E#: Encoder>(into: &var E#)`
 			.Encode => {
@@ -399,7 +416,7 @@ extend Builder {
 					kind: .Path(segments: self.preludePath(names.result), args: [decoded, failed]),
 					span: self.at,
 				))
-				(names.decode, [self.lentParam(names.from, names.decoderParam)], .Some(ret), body)
+				(names.decode, [self.lentParam(names.from, names.decoderParam)], ret, body)
 			}
 		}
 		val (method, params, ret, body) = move made
@@ -412,7 +429,7 @@ extend Builder {
 				bounds: Vec(),
 				default: .None,
 				span: self.at,
-				length: if param.length.isSome() then .Some(self.at) else .None,
+				length: if param.length.isSome() then self.at else .None,
 			))
 		}
 		val declared = FnDecl(
@@ -427,23 +444,23 @@ extend Builder {
 				keeps: Vec(),
 				span: self.at,
 			),
-			body: .Some(body),
+			body: body,
 			isPub: false,
 			pubSpan: .None,
-			receiver: .Some((receiver, self.at)),
+			receiver: (receiver, self.at),
 			span: self.at,
 		)
 		return ExtendBlock(
 			annotations: Vec(),
 			sliceOf: .None,
 			boxed: .None,
-			interfaceName: .Some(self.name(implemented)),
+			interfaceName: self.name(implemented),
 			interfaceModule: self.preludeModule(),
 			interfaceArgs: .None,
 			path: [self.name(ty)],
 			generics: bound,
 			methods: [declared],
-			derived: .Some(self.at),
+			derived: self.at,
 			span: self.at,
 		)
 	}
@@ -599,7 +616,7 @@ extend Builder {
 				val bound = self.binding(field.name.sym, .This)
 				parts.push(self.expr(.Name(bound)))
 			}
-			val body = self.hashParts(.Some(i), parts)
+			val body = self.hashParts(i, parts)
 			val pattern = self.bound(&variant, .This)
 			arms.push(self.arm(pattern, body))
 		}
@@ -695,7 +712,7 @@ extend Builder {
 			val this = self.expr(.SelfRef)
 			val place = self.field(this, field.name.sym)
 			val value = self.cloned(place)
-			names.push(.Some(self.name(field.name.sym)))
+			names.push(self.name(field.name.sym))
 			args.push(value)
 		}
 		val callee = self.expr(.Name(self.names.selfType))
@@ -718,8 +735,8 @@ extend Builder {
 					val named = self.expr(.Name(bound))
 					args.push(self.cloned(named))
 				}
-				val names: Vec<Option<Name>> = variant.fields.map((field) => .Some(
-					self.name(field.name.sym),
+				val names: Vec<Option<Name>> = variant.fields.map((field) => self.name(
+					field.name.sym,
 				))
 				self.expr(.Call(callee: path, args: args, names: names, rest: .None))
 			}
@@ -832,7 +849,7 @@ extend Builder {
 		var names: Vec<Option<Name>> = Vec()
 		for field in fields {
 			args.push(self.fieldRead(&field, .None, &source))
-			names.push(.Some(self.name(field.name.sym)))
+			names.push(self.name(field.name.sym))
 		}
 		val callee = self.expr(.Name(self.names.selfType))
 		val literal = self.expr(.Call(callee: callee, args: args, names: names, rest: .None))
@@ -875,8 +892,8 @@ extend Builder {
 				var args: Vec<ExprId> = Vec()
 				var names: Vec<Option<Name>> = Vec()
 				for field in variant.fields {
-					args.push(self.fieldRead(&field, .Some(variant.name.sym), &source))
-					names.push(.Some(self.name(field.name.sym)))
+					args.push(self.fieldRead(&field, variant.name.sym, &source))
+					names.push(self.name(field.name.sym))
 				}
 				made = self.expr(.Call(callee: path, args: args, names: names, rest: .None))
 			}
@@ -906,7 +923,7 @@ extend Builder {
 					mutable: false,
 					isImplicit: false,
 					name: self.name(self.names.made),
-					ty: .Some(selfTy),
+					ty: selfTy,
 					init: value,
 				),
 				span: self.at,
@@ -924,7 +941,7 @@ extend Builder {
 		val moved = self.expr(.Unary(op: .Move, opSpan: self.at, operand: made))
 		stmts.push(
 			self.out.stmts.add(Stmt(
-				kind: .Return(value: .Some(self.result(self.names.ok, moved))),
+				kind: .Return(value: self.result(self.names.ok, moved)),
 				span: self.at,
 			)),
 		)
@@ -954,7 +971,7 @@ extend Builder {
 		return self.expr(.If(
 			cond: asked,
 			thenBlock: thenBlock,
-			elseBranch: .Some(missing),
+			elseBranch: missing,
 			form: .Written,
 		))
 	}
@@ -983,7 +1000,7 @@ extend Builder {
 		val copied: Vec<TypeId> = args.map((arg) => self.copyType(arg, &source))
 		val typeArgs: Option<TypeArgs> =
 			if copied.isEmpty() then .None
-			else .Some(TypeArgs(after: after as i64, args: copied, span: self.at))
+			else TypeArgs(after: after as i64, args: copied, span: self.at)
 		val callee = self.expr(.Path(leadingDot: false, segments: path, typeArgs: typeArgs))
 		val from = self.expr(.Name(self.names.from))
 		val lent = self.expr(.Unary(op: .RefVar, opSpan: self.at, operand: from))
@@ -1045,7 +1062,7 @@ extend Builder {
 							.Import(ImportDecl(
 								path: decl.path.clone(),
 								alias: .None,
-								items: .Some([name]),
+								items: [name],
 								span: decl.span,
 							)),
 						)
@@ -1089,7 +1106,7 @@ extend Builder {
 
 	/// `{ return value }`.
 	var fn returned(value: ExprId): ExprId = {
-		val leave = self.out.stmts.add(Stmt(kind: .Return(value: .Some(value)), span: self.at))
+		val leave = self.out.stmts.add(Stmt(kind: .Return(value: value), span: self.at))
 		return self.expr(.Block(Block(stmts: [leave], span: self.at)))
 	}
 
@@ -1201,14 +1218,11 @@ extend Builder {
 				val bound = self.binding(field.name.sym, side)
 				listed.push(Binder(
 					field: self.name(field.name.sym),
-					pattern: .Some(Pattern(
-						kind: .Binding(symbol: bound, isVar: false),
-						span: self.at,
-					)),
+					pattern: Pattern(kind: .Binding(symbol: bound, isVar: false), span: self.at),
 					span: self.at,
 				))
 			}
-			binders = .Some(listed)
+			binders = listed
 		}
 		return self.variantPattern(variant.name.sym, binders)
 	}
@@ -1220,7 +1234,7 @@ extend Builder {
 			kind: .Variant(
 				leadingDot: true,
 				segments: [self.name(variant.name.sym)],
-				binders: if rest then .Some(Vec()) else .None,
+				binders: if rest then Vec() else .None,
 				rest: rest,
 			),
 			span: self.at,

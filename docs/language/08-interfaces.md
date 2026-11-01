@@ -274,6 +274,33 @@ fn main() = {
 }
 ```
 
+An enum whose variants carry nothing implements `Eq` and `Hash` without
+`@derive`: a variant equals only itself and hashes as its number, so it
+is compared with `==` and is a key of a map as it is declared. Order and
+text are still asked for, `@derive(Ord)` and `@derive(Text)`, since the
+order variants are written in is not always an order, and a type may want
+to print otherwise. An implementation written by hand takes the place of
+the one the compiler gives, and one whose equality is written by hand is
+not hashed without asking, since a hash of which name it is matches only
+the equality of which name it is:
+
+```wip,run
+import std::collections::{Map}
+
+enum Mode {
+    Fit
+    Grow
+}
+
+fn main() = {
+    var counts: Map<Mode, i64> = Map()
+    counts.put(.Grow, 2)
+    val grow = Mode::Grow
+    assert(counts.get(&grow).isSome())
+    assert(Mode::Fit != .Grow)
+}
+```
+
 A field compares by whatever its type implements — a `Vec<String>`, an
 array — and two values of an enum are ordered by the order its variants
 are written in, and then by their fields.
@@ -325,13 +352,15 @@ turn, a `String`'s bytes and a `Vec`'s elements copied, so that changing
 the copy leaves the original as it was. What owns no memory — a number,
 a `bool`, a `char`, a `str`, a plain struct, a tuple or an array of them —
 is its own clone without being told: its clone is a copy, and it is taken
-where `Clone` is asked for. A generic type clones where its
+where `Clone` is asked for. `@derive(Clone)` on such a type says nothing,
+and is warned of with the fix that takes it away; a generic type keeps
+it where some argument it may take owns memory. A generic type clones where its
 fields do, so a `Vec<T>` field clones where `T` does.
 Each field is cloned as a value of its own type —
 `cloneOf(&self.field)`, which the prelude has — so a view's field that is
 a `&T` is the reference copied, which asks nothing of `T`, and what the
 view owns is cloned.
-A field whose type does not clone — an `own<T>` among
+A field whose type does not clone — an `own<T>` of what does not, among
 them — is reported where it is written:
 
 ```wip,run
@@ -422,8 +451,8 @@ interface, and the operator or the call that wanted it says which argument
 is in the way:
 
 ```wip,error=E0303
-enum Wrong {
-    Empty
+struct Wrong {
+    count: i64
 }
 
 fn main() = {
@@ -463,7 +492,7 @@ extend Countdown: Source<i64> {
     var fn take(): Option<i64> = {
         if self.left == 0 then return .None
         self.left -= 1
-        return .Some(self.left + 1)
+        return self.left + 1
     }
 }
 
@@ -517,7 +546,7 @@ fn main() = {
     val first: &i64 = &one
     val second: &i64 = &also
     assert(same<&i64>(&first, &second))
-    val found: Option<&i64> = .Some(&one)
+    val found: Option<&i64> = &one
     assert(found == .Some(&also))
 }
 ```

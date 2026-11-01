@@ -113,6 +113,12 @@
   function: (variant_expression
     name: (identifier) @constructor))
 
+; `.grow(…)` calls a function of the type expected.
+((call_expression
+  function: (variant_expression
+    name: (identifier) @function.call))
+  (#match? @function.call "^[a-z_]"))
+
 ((call_expression
   function: (scoped_identifier
     (identifier) @constructor .))

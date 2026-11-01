@@ -228,6 +228,37 @@ A method is called with a dot; a `static fn` is called through the type,
 `Counter::by(3)`. A method may be `pub`, which exports it from the module
 as any other name is exported.
 
+Where the type is expected, as it is of a field, an argument or a `val`
+with its type said, a `static fn` that answers the type is called with a
+leading dot, the type's name left out, as a variant is written
+([page 1](01-types.md#enums)): `.by(3)` is `Counter::by(3)` where a
+`Counter` is expected. A generic type's arguments are the type expected's,
+and of several functions of a name, as an interface's implementations
+give, the arguments choose, as they do for `Type::name(…)`. A method, a
+function that answers another type, and a name the type does not have are
+refused; so is the function without its call, which `Counter::by` names:
+
+```wip,run
+struct Counter {
+    count: i64 = 0
+    step: i64 = 1
+
+    static fn by(step: i64): Counter = Counter(step: step)
+}
+
+struct Clocks {
+    fast: Counter
+    slow: Counter
+}
+
+fn main() = {
+    val clocks = Clocks(fast: .by(3), slow: .by(1))
+    var sizes: Vec<i64> = .withCapacity(8)
+    sizes.push(clocks.fast.step)
+    assert(clocks.slow.step == 1 && sizes == [3])
+}
+```
+
 A field and a method may share a name, as `count` does here: `counter.count`
 reads the field, and `counter.count()` calls the method. A field that holds
 a function is called as a method is, so it may not share a method's name.
@@ -242,8 +273,8 @@ goes with it, and what it answers is what is wanted:
 fn main() = {
     val text = "first\nsecond"
     // An iterator made to be asked for one value needs no name.
-    assert(text.lines().next() == .Some("first"))
-    assert(Vec::of([1, 2, 3]).pop() == .Some(3))
+    assert(text.lines().next() == "first")
+    assert(Vec::of([1, 2, 3]).pop() == 3)
 }
 ```
 
@@ -290,7 +321,7 @@ extend Fields {
 
 fn main() = {
     var fields = Fields(parts: pieces("a,b", ","), read: 0)
-    assert(fields.next() == .Some("a") && fields.next() == .Some("b"))
+    assert(fields.next() == "a" && fields.next() == "b")
     assert(fields.next().isNone() && fields.read == 3)
 }
 ```
@@ -454,8 +485,8 @@ struct Interner {
 fn main() = {
     var interner = Interner(names: [])
     assert(interner.ids(["a", "b"]) == [0, 1])
-    val first: Option<str> = .Some("c")
-    assert(first.map((name) => interner.intern(name)) == .Some(2))
+    val first: Option<str> = "c"
+    assert(first.map((name) => interner.intern(name)) == 2)
 }
 ```
 
@@ -544,10 +575,11 @@ fn main() = {
 }
 ```
 
-A function value is passed as it is, and `&` of one is refused: it would
-have a closure's type, `&(…) => R`, and a closure is an environment and its
-code where a function value is code alone. Where a closure is expected, a
-lambda that calls it is one:
+A function value is passed as it is, and `&` or `own` of one is refused: it
+would have a closure's type, `&(…) => R` or `own<(…) => R>`, and a closure is
+an environment and its code where a function value is code alone. Where a
+closure is expected, a function's name goes as it is, and a lambda that
+calls a value held in a variable is one:
 
 ```wip,error=E0450
 fn apply(f: &(x: i64) => i64, x: i64): i64 = f(x)
@@ -555,6 +587,14 @@ fn apply(f: &(x: i64) => i64, x: i64): i64 = f(x)
 fn main() = {
     val double = (x: i64) => x * 2
     assert(apply(&double, 4) == 8)
+}
+```
+
+```wip,error=E0450
+fn double(x: i64): i64 = x * 2
+
+fn main() = {
+    val kept: own<(x: i64) => i64> = own double
 }
 ```
 
@@ -568,7 +608,7 @@ its own terms, and compiled once for each set of type arguments:
 fn firstEqual<T: Eq>(values: &[T], wanted: &T): Option<i64> = {
     var i = 0
     while i < values.len() {
-        if values[i] == wanted then return .Some(i)
+        if values[i] == wanted then return i
         i += 1
     }
     return .None
@@ -576,7 +616,7 @@ fn firstEqual<T: Eq>(values: &[T], wanted: &T): Option<i64> = {
 
 fn main() = {
     val numbers = [3, 9, 4]
-    assert(firstEqual(&numbers, 9) == .Some(1))
+    assert(firstEqual(&numbers, 9) == 1)
     val words = ["a", "b"]
     assert(firstEqual(&words, "c").isNone())
 }
@@ -663,12 +703,12 @@ extend Answer {
 
 fn total(answer: &Answer): Result<i64, DecodeError> = {
     val numbers: Vec<i64> = answer.read()?
-    return .Ok(numbers.sum())
+    return numbers.sum()
 }
 
 fn main() = {
     val answer = Answer(text: String::of("[1, 2, 3]"))
-    assert(total(&answer) == .Ok(6))
+    assert(total(&answer) == 6)
     val numbers: Vec<i64> = answer.read().unwrap()
     assert(numbers.len() == 3)
     val words = answer.read<Vec<String>>()

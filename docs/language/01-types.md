@@ -36,6 +36,31 @@ assert(small == 3)
 assert(ratio > 0.0)
 ```
 
+An integer literal takes a float type expected of it as it takes an
+integer type, where the float holds its value exactly: every whole number
+up to 2²⁴ for an `f32` and up to 2⁵³ for an `f64`, and past that only
+those it holds without rounding. One it would round is an error; written
+as a float literal, `16777217.0`, it says it is rounded. Arithmetic of
+literals is of the type expected of it, so `1 / 3` of an `f32` is a third,
+as `1.0 / 3.0` is. Where literals take their type from each other — an
+`if`'s branches, a list's elements, the two operands — and a float is
+among them, the integers are floats too:
+
+```wip,run
+struct Color {
+    r: f32
+    a: f32
+}
+
+fn main() = {
+    val c = Color(r: 255, a: 255)
+    val half = c.r / 2 // the literal is an f32
+    val third: f32 = 1 / 3
+    val shade = if half > 100.0 then 1 else 0.5 // an f64
+    assert(half == 127.5 && third > 0.33 && third < 0.34 && shade == 1.0)
+}
+```
+
 Beside an operator, on either side, so does what takes its type as a
 literal does: a literal in parentheses, an `if`, a `match` or a block of
 literals. `(if c then 1.0 else -1.0) * x` is of `x`'s type, as `x * (if c
@@ -51,7 +76,7 @@ it is `i64` or `f64`, and a later use that wants another is an error that
 says where the first use was:
 
 ```wip,run
-fn half(x: f32): f32 = x / 2.0
+fn half(x: f32): f32 = x / 2
 
 fn main() = {
     val width: f32 = 4.0
@@ -74,7 +99,8 @@ bitwise and shift operators — not one `@comptime` code works out, and not
 an `as`, which says its type already. Its value cannot change, so nothing
 can be lost, and it says nothing a reader needs; where the program
 computes a value, `as` still says where it changes type. A constant
-where nothing is expected keeps its own type:
+where nothing is expected keeps its own type, and an integer constant
+is not a float where one is expected, as a literal is: `as` makes it one.
 
 ```wip,run
 val GRAPHICS: i32 = 1
@@ -153,7 +179,7 @@ greatest value there is instead:
 
 ```wip,run
 val count: u8 = 200
-assert(count.checkedAdd(100) == .None && count.checkedAdd(50) == .Some(250))
+assert(count.checkedAdd(100) == .None && count.checkedAdd(50) == 250)
 assert(count.saturatingAdd(100) == 255 && (3 as u8).saturatingSub(5) == 0)
 assert((7 as i64).checkedDiv(0) == .None)
 ```
@@ -259,7 +285,9 @@ assert(emoji as u32 == 128578)
 
 A text's bytes are `u8`s, and `b'x'` is the byte of an ASCII character,
 with the escapes a character has. It is a `u8`, and a
-character that is not ASCII, being more than one byte, is not one:
+character that is not ASCII, being more than one byte, is not one. A
+character literal made a byte, `'/' as u8`, is warned of with the fix
+that writes `b'/'`, which says it in one token and cannot fail:
 
 ```wip,run
 val path = "usr/bin"
@@ -762,7 +790,8 @@ fn main() = {
 ## Enums
 
 An enum is one of several variants, each of which may carry values. Where
-the type is known, a variant is written with a leading dot;
+the type is known, a variant is written with a leading dot, as a type's
+function that makes one is called ([page 3](03-functions.md#methods));
 where none is, `.Some` and `.None` are the prelude's `Option`:
 
 ```wip,run
@@ -786,6 +815,12 @@ fn main() = {
     assert(shape is .Circle(..))
 }
 ```
+
+Where an `Option` or a `Result` is expected, a value of the type it holds
+is its `.Some` or its `.Ok`, and a variant the `Option` or the `Result` does
+not have is looked for in that type: `return .Array(items)` where a
+`Result<Json, E>` is expected is the `.Ok` of a `Json`. `.None` and
+`.Err(…)` are written ([page 9](09-errors.md#a-value-where-one-is-expected)).
 
 A variant's field may have a default, which the variant takes where it is
 built without that field, as a struct's field and a parameter do.
@@ -851,11 +886,11 @@ fn main() = {}
 ```
 
 An enum whose variants carry nothing is numbered in the order they are
-written, and answers `count()`, `fromIndex(n)` and `all()`, every variant
-as an array:
+written. It compares and hashes by which variant it is without being told,
+since which name it is is all there is to compare, and it answers
+`count()`, `fromIndex(n)` and `all()`, every variant as an array:
 
 ```wip,run
-@derive(Eq)
 enum Colour {
     Red
     Green
@@ -864,11 +899,38 @@ enum Colour {
 
 fn main() = {
     assert(Colour::count() == 3)
-    assert(Colour::fromIndex(1) == .Some(.Green))
+    assert(Colour::fromIndex(1) == .Green)
     assert(Colour::fromIndex(9).isNone())
     assert(Colour::all() == [Colour::Red, Colour::Green, Colour::Blue])
 }
 ```
+
+It is named as text too. `name()` is the name its variant is written with,
+a `str` the program keeps, so naming one allocates nothing; and
+`fromName(text)` is the variant whose name is `text`, exactly, or nothing.
+A spelling of the program's own is made from the name — a label in lower
+case is `name().toLowercase()` — and a derived `Text` still writes the
+literal, `.Green`:
+
+```wip,run
+enum Colour {
+    Red
+    Green
+    Blue
+}
+
+fn main() = {
+    assert(Colour::Green.name() == "Green")
+    assert(Colour::fromName("Blue") == .Blue)
+    assert(Colour::fromName("blue").isNone())
+    val names = Colour::all().map((colour) => colour.name())
+    assert(names == ["Red", "Green", "Blue"])
+}
+```
+
+A program that declares a method of one of these names keeps its own. An
+enum whose variants carry values has none of them, since a number or a
+name says only which variant a value is, not what it holds.
 
 An enum is its tag and room for its largest variant. One where a single
 variant carries a value and the others carry none, as `Option` is, keeps
@@ -1125,7 +1187,9 @@ fn main() = {
 `void` has one value, so every `void` is equal to every other, comes before
 none, and is written `{}`. What holds one compares where the rest of it
 does, and a function that can fail and answers nothing is tested as any
-other:
+other. `.Ok({})` is written where nothing says it; in a function that
+answers a `Result<void, E>`, `return` alone and the end of its body say it
+([page 9](09-errors.md#a-value-where-one-is-expected)):
 
 ```wip,run
 @derive(Eq, Text)

@@ -38,7 +38,7 @@ fn noArgs(): &[ast::ExprId] = lend NO_ARGS
 /// The first name given among a call's arguments, if one is.
 fn firstName(names: &[Option<ast::Name>]): Option<ast::Name> = {
 	for name in names {
-		if name is .Some(n) then return .Some(n)
+		if name is .Some(n) then return n
 	}
 	return .None
 }
@@ -58,7 +58,7 @@ extend Lowerer {
 	): ExprId = {
 		val file = self.ast
 		val calleeExpr = &file.exprs[callee]
-		var used = ItemUse::plain(.Some(&args), hint, span)
+		var used = ItemUse::plain(&args, hint, span)
 		used.names = &names
 		used.wanted = wanted
 		// A struct, built as a variant is: by its name, or `Self`, where no
@@ -85,7 +85,7 @@ extend Lowerer {
 			}
 			.Field(base, name, typeArgs) => {
 				if typeArgs is .Some(written) {
-					used.typeArgs = .Some(&written)
+					used.typeArgs = &written
 					used.methodTypeArgs = true
 				}
 				if self.variantWithDot(base, name, used) is .Some(variant) then return variant
@@ -184,8 +184,8 @@ extend Lowerer {
 			// else is built when the panic happens.
 			if self.messageText(args[0], PANIC_ARGUMENT, "a panic's message") is .Some(value) then
 				message = match self.state.body.exprs[value].kind {
-					.Str(symbol) => .Some(.Panic(note: .None, message: .Some(symbol)))
-					_ => .Some(.Panic(note: .Some(value), message: .None))
+					.Str(symbol) => .Panic(note: .None, message: symbol)
+					_ => .Panic(note: value, message: .None)
 				}
 		} else {
 			self.report(
@@ -209,11 +209,11 @@ extend Lowerer {
 	/// A panic's message or an assert's note: a `str`, or a `String` lent as
 	/// one. Anything else is reported with `code`.
 	var fn messageText(e: ast::ExprId, code: Code, what: str): Option<ExprId> = {
-		val value = self.inferArgument(e, .Some(STR))
+		val value = self.inferArgument(e, STR)
 		val ty = self.tyOf(value)
 		if self.isPoisoned(ty) then return .None
-		if ty == STR then return .Some(value)
-		if self.lendString(value) is .Some(lent) then return .Some(lent)
+		if ty == STR then return value
+		if self.lendString(value) is .Some(lent) then return lent
 		self.report(
 			Diagnostic::error(
 				code,
@@ -385,6 +385,11 @@ extend Lowerer {
 				_ => h
 			}
 			self.unify(ret, lent, &var inference.tys)
+			// A result wrapped where an `Option` or a `Result` of it is expected
+			// says what its success says, once it is matched as the wrapper
+			// where it can be: `Vec()` where an `Option<Vec<i64>>` is.
+			if self.success(lent) is .Some((enumId, inner)) && !self.ofEnum(ret, enumId) then
+				self.unify(ret, inner, &var inference.tys)
 		}
 		var params: Vec<ParamDef> = Vec()
 		val all = &self.program.fns[callee].params
@@ -405,7 +410,7 @@ extend Lowerer {
 				operands.push(GenericOperand(
 					expr: args[i],
 					declared: params[i].ty,
-					context: .Some((params[i].span, "parameter declared here")),
+					context: (params[i].span, "parameter declared here"),
 					isArg: true,
 					toC: self.program.fns[callee].isExtern,
 				))
@@ -518,9 +523,7 @@ extend Lowerer {
 		for (i, arg) in args.forwards().enumerate() {
 			val value = when {
 				i < declared.len() => {
-					val context: Option<(Span, str)> = .Some(
-						(declared[i].span, "parameter declared here"),
-					)
+					val context: Option<(Span, str)> = (declared[i].span, "parameter declared here")
 					self.checkArgument(arg, declared[i].ty, context)
 				}
 				// A literal has no type of its own yet, and the only string C
@@ -611,7 +614,7 @@ extend Lowerer {
 			operands.push(GenericOperand(
 				expr: args[arg],
 				declared: slots[slot].ty,
-				context: .Some((slots[slot].span, "parameter declared here")),
+				context: (slots[slot].span, "parameter declared here"),
 				isArg: true,
 				toC: self.program.fns[callee].isExtern,
 			))
@@ -638,7 +641,7 @@ extend Lowerer {
 			checked.push(.None)
 		}
 		for (i, (arg, _)) in written.forwards().enumerate() {
-			if i < values.len() then checked[arg] = .Some(values[i])
+			if i < values.len() then checked[arg] = values[i]
 		}
 		for arg in matched.unmatched {
 			self.inferArgument(args[arg], .None)
@@ -735,7 +738,7 @@ extend Lowerer {
 						&item.sym,
 					).map((f) => f.0)
 					_ => match self.typeHere(sym) {
-						.Some(here) => .Some(here.0)
+						.Some(here) => here.0
 						.None => match self.preludeModule(sym) {
 							.Some(prelude) => self.modules[prelude].types.get(&sym).map((f) => f.0)
 							.None => .None
@@ -825,6 +828,7 @@ extend Lowerer {
 			var used = item
 			used.typeArgs = .None
 			used.nameSegment = 0
+			if self.dotFn(segments[0], used) is .Some(made) then return made
 			return self.variantLit(.None, segments[0], used)
 		}
 		return match self.resolvePath(&segments, true, MODULE_NOTE) {
@@ -862,13 +866,106 @@ extend Lowerer {
 					self.noTypeMember(owner, member)
 					return self.giveUpItem(used)
 				}
-				self.variantLit(.Some((module, typeName)), member, used)
+				self.variantLit((module, typeName), member, used)
 			}
 			.Broken => {
 				if item.rest is .Some(r) then self.infer(r, .None)
 				self.giveUpItem(item)
 			}
 		}
+	}
+
+	/// `.name(…)` where a type is expected: the type's function `name`, one
+	/// with no receiver that answers the type, called as `Type::name(…)` is,
+	/// with the type expected's arguments. Nothing where the name is a
+	/// variant of the enum expected, or one the enum does not have, or where
+	/// no type with functions is expected: `variantLit` sees to those.
+	var fn dotFn(name: ast::Name, item: ItemUse): Option<ExprId> = {
+		val ty = self.dotOwnerTy(name, item.hint)?
+		val owner = self.ownerOf(ty)?
+		if owner is .Enum(id) && self.hasVariant(id, name.sym) then return .None
+		val candidates = self.methodsNamed(owner, name.sym)
+		if candidates.isEmpty() {
+			if owner is .Enum(..) then return .None
+			self.noDotMember(owner, name)
+			return self.giveUpItem(item)
+		}
+		val typeName = self.typeName(owner)
+		val text = String::of(self.text(name.sym))
+		if item.args.isNone() {
+			self.report(
+				Diagnostic::error(
+					NOT_A_METHOD,
+					"`\(typeName)::\(text)` is a function, and a leading `.` calls it",
+					name.span,
+					"not called",
+				).withHelp("write `.\(text)(…)`, or `\(typeName)::\(text)` for the function itself"),
+			)
+			return self.giveUpItem(item)
+		}
+		if item.rest is .Some(r) then self.restWithoutStruct(r)
+		var used = item
+		used.ownerTy = ty
+		val made = self.typeFnCall(owner, &candidates, name, used)?
+		val answered = self.tyOf(made)
+		if answered == ty || answered == NEVER || self.isPoisoned(answered) then return made
+		self.report(
+			Diagnostic::error(
+				NOT_A_METHOD,
+				"`\(typeName)::\(text)` answers \(self.tyName(answered)), not \(self.tyName(ty))",
+				name.span,
+				"not a function that makes \(self.tyName(ty))",
+			).withNote(
+				"a leading `.` calls a function of the type expected that answers that type",
+			).withHelp("write `\(typeName)::\(text)(…)`, and make what it answers the type expected"),
+		)
+		return self.errorExpr(item.span)
+	}
+
+	/// The type whose function a `.name(…)` calls: the type expected, through
+	/// `own` and references; where that is an `Option` or a `Result` with no
+	/// member of the name, its success's, as for a variant.
+	fn dotOwnerTy(name: ast::Name, hint: Option<Ty>): Option<Ty> = {
+		val ty = self.underRefs(hint?)
+		if self.isPoisoned(ty) then return .None
+		val .Some((enumId, inner)) = self.success(ty) else return ty
+		if self.hasVariant(enumId, name.sym) ||
+			!self.methodsNamed(.Enum(enumId), name.sym).isEmpty() {
+			return ty
+		}
+		return self.underRefs(inner)
+	}
+
+	/// Whether the enum has a variant of this name.
+	fn hasVariant(id: EnumId, name: Symbol): bool = {
+		for v in self.program.enums[id].variants {
+			if v.name == name then return true
+		}
+		return false
+	}
+
+	/// Reports `.name(…)` where the type expected, which is not an enum, has
+	/// no function of that name.
+	var fn noDotMember(owner: TypeDef, name: ast::Name) = {
+		val typeName = self.typeName(owner)
+		val text = String::of(self.text(name.sym))
+		var candidates: Vec<str> = Vec()
+		for id in self.declaredMethods(owner) {
+			if self.program.fns[id].receiver == .Static then
+				candidates.push(self.text(self.program.fns[id].name))
+		}
+		var diagnostic = Diagnostic::error(
+			NOT_A_METHOD,
+			"`\(typeName)` has no function `\(text)`",
+			name.span,
+			"not a function of `\(typeName)`",
+		).withNote("a leading `.` where `\(typeName)` is expected calls one of its functions that answers it")
+		if suggest(text, &candidates) is .Some(similar) then
+			diagnostic = diagnostic.withFix(
+				"did you mean `\(similar)`?",
+				[Edit::replace(name.span, similar)],
+			)
+		self.report(diagnostic)
 	}
 
 	/// Whether an argument is a variable followed by what reads as type
@@ -918,7 +1015,7 @@ extend Lowerer {
 				Edit::insert(end, ")"),
 			])
 		}
-		return .Some(diagnostic)
+		return diagnostic
 	}
 
 	/// `Type::NAME`: a constant of the type, where it has one of that name.
@@ -951,10 +1048,10 @@ extend Lowerer {
 					"called here",
 				),
 			)
-			return .Some(self.giveUpItem(used))
+			return self.giveUpItem(used)
 		}
 		val value = self.constUse(id, member.span)
-		return .Some(self.referent(value, used.hint, member.span))
+		return self.referent(value, used.hint, member.span)
 	}
 
 	/// Reports `Type::name` where the type, which is not an enum, has no
@@ -964,7 +1061,7 @@ extend Lowerer {
 		val name = String::of(self.text(member.sym))
 		var candidates: Vec<str> = Vec()
 		for id in self.declaredMethods(owner) {
-			if self.program.fns[id].receiver == .Some(.Static) then
+			if self.program.fns[id].receiver == .Static then
 				candidates.push(self.text(self.program.fns[id].name))
 		}
 		for i in 0..self.program.typeConsts.len() {
@@ -988,12 +1085,11 @@ extend Lowerer {
 	/// The type a path names before `::NAME`: a type of that module, or,
 	/// where the path named this module, the prelude's or a built-in one.
 	fn constOwnerNamed(module: i64, typeName: ast::Name): Option<TypeDef> = {
-		if self.modules[module].types.get(&typeName.sym) is .Some((owner, _)) then
-			return .Some(owner)
+		if self.modules[module].types.get(&typeName.sym) is .Some((owner, _)) then return owner
 		if self.moduleOf(module) != self.current then return .None
-		if self.preludeType(typeName.sym) is .Some(owner) then return .Some(owner)
+		if self.preludeType(typeName.sym) is .Some(owner) then return owner
 		val ty = self.builtin(typeName.sym)?
-		return .Some(.Builtin(BuiltinOwner::of(self.kind(ty))?))
+		return .Builtin(BuiltinOwner::of(self.kind(ty))?)
 	}
 
 	/// A function named through its module: `io::print(1)`.
@@ -1041,7 +1137,7 @@ extend Lowerer {
 			)
 		}
 		var found: Option<FnId> = match self.modules[module].fns.get(&item.sym) {
-			.Some(id) => .Some(id)
+			.Some(id) => id
 			.None => .None
 		}
 		// A function of the prelude, where the path named this module.

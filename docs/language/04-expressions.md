@@ -34,6 +34,32 @@ val count = words.copies().
     count()
 ```
 
+A binary operator goes at the end of the line it continues from, as the
+formatter writes an expression too long for its line. A line that starts
+with one is refused (E0113), with the fix that joins it to the line above.
+A `-` can also begin an expression, a negation, so a line that starts with
+it is a statement of its own: `- discount` under `val total = price` would
+negate the discount and drop it, and leave `total` the price. A statement
+that negates a value and drops it is never what was meant, so it is
+refused too, with the same error and the same fix. The formatter writes
+such a line where a statement starts, which shows what it is:
+
+```wip,run
+val (subtotalBeforeTaxes, salesTaxForTheRegion, loyaltyDiscount) = (100, 20, 15)
+val total =
+    subtotalBeforeTaxes +
+    salesTaxForTheRegion -
+    loyaltyDiscount -
+    subtotalBeforeTaxes / 10
+assert(total == 95)
+```
+
+```wip,error=E0113
+val (price, discount) = (100, 15)
+val total = price
+-discount
+```
+
 `val` binds a name to a value; `var` binds one that may be assigned again:
 
 ```wip,run
@@ -97,20 +123,20 @@ fn describe(count: i64): String =
 
 fn firstOf(xs: &[i64]): Option<i64> = {
     if xs.isEmpty() then return .None
-    return .Some(xs[0])
+    return xs[0]
 }
 
 fn doubledFirst(xs: &[i64]): Option<i64> = {
     if xs.isEmpty() then return .None else {
         val n = xs[0]
-        return .Some(n * 2)
+        return n * 2
     }
 }
 
 fn main() = {
     assert(sign(-3) == -1 && sign(0) == 0)
     assert(describe(2) == "2 items")
-    assert(firstOf([4, 5]) == .Some(4) && doubledFirst([4, 5]) == .Some(8))
+    assert(firstOf([4, 5]) == 4 && doubledFirst([4, 5]) == 8)
 
     val n = 7
     val total = if n > 3 {
@@ -125,7 +151,9 @@ An `if`'s branches are one type: what is expected of the `if`, or, where
 nothing is, the type of the first branch that says one. A branch that
 takes the type expected of it — a number, `.None`, a constant — takes the
 other's, whichever comes first, as a literal takes the other operand's;
-so do a `match`'s arms and an array's elements:
+so do a `match`'s arms and an array's elements. Where every one is a
+number literal and a float is among them, the integers are floats:
+`if c then 1 else 0.5` is an `f64`.
 
 ```wip,run
 fn main() = {
@@ -193,7 +221,7 @@ fn main() = {
     assert(
         kind('x') == "a name" && kind('7') == "a number" && kind('"') == "text",
     )
-    val maybe: Option<i64> = .Some(12)
+    val maybe: Option<i64> = 12
     val size = when {
         maybe is .Some(n) && n > 10 => n
         maybe is .Some(n) => n * 10
@@ -218,11 +246,11 @@ fn doubled(text: str): Result<i64, str> = {
         .Ok(n) => n
         .Err(..) => return .Err("not a number")
     }
-    return .Ok(n * 2)
+    return n * 2
 }
 
 fn main() = {
-    assert(doubled("21") == .Ok(42))
+    assert(doubled("21") == 42)
     assert(doubled("x").isErr())
 }
 ```
@@ -243,8 +271,9 @@ Arithmetic panics where the answer will not fit; `/` and `%` by zero panic.
 Between numbers, both sides are of one type, or one is an integer whose
 type the other's holds, which widens to it: `byte + total` of a `u8` and
 an `i64` adds `i64`s ([page 1](01-types.md)). Two integer types neither
-of which holds the other — `i64` and `u64` — and an integer beside a
-float are refused, and `as` converts one.
+of which holds the other — `i64` and `u64` — and an integer variable
+beside a float are refused, and `as` converts one; an integer literal
+beside a float is that float, `width / 2`.
 
 ```wip,run
 val byte: u8 = 200
@@ -345,7 +374,8 @@ val gone = byte >> 8
 ```
 
 ```wip,error=E0303
-val mixed = 1 + 2.5
+val count: i64 = 1
+val mixed = count + 2.5
 ```
 
 A type of a program's own says what it takes on the other side, and what
@@ -485,7 +515,7 @@ chain, wherever the chain is, and the first branch of an `if` or the body
 of a `while` whose condition it is:
 
 ```wip,run
-val found: Option<i64> = .Some(7)
+val found: Option<i64> = 7
 val doubled = if found is .Some(n) && n > 3 then n * 2 else 0
 assert(doubled == 14)
 val small = found is .Some(n) && n < 10
@@ -700,7 +730,7 @@ fn evens(xs: &[i64]): Iterator<i64> = for x in xs { if x % 2 == 0 { yield x } }
 fn main() = {
     val xs = [1, 2, 3, 4, 5, 6]
     var squares = for x in xs { yield x * x }
-    assert(squares.next() == .Some(1))
+    assert(squares.next() == 1)
     assert(squares.take(2).toVec() == [4, 9])
 
     assert(evens(&xs).count() == 3)

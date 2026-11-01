@@ -8,7 +8,7 @@ its tests run, with every change to the compiler.
 |---|---|
 | [hello](hello) | the smallest program: `main`, and `std::io` |
 | [wordcount](wordcount) | options with `std::args`, reading files, a generator, a `Map`, an error type of the program's own |
-| [json-pretty](json-pretty) | `std::json`, recursion over an enum with `match`, text blocks |
+| [json-pretty](json-pretty) | `std::json`, recursion over an enum with `match`, implicit parameters, text blocks |
 | [todo](todo) | subcommands, a list kept in a text file, structs, enums and tests of a module |
 | [life](life) | Conway's Life: a lending `at`, a generator, a constant worked out while compiling, terminal frames |
 | [report-formats](report-formats) | dynamic dispatch with `&dyn`, beside the same code generic, and an interface's default method |

@@ -380,7 +380,7 @@ val PRIMES: [i64; 6] = [2, 3, 5, 7, 11, 13]
 
 fn main() = {
     assert(DIRECTIONS[3].1 == -1)
-    assert(PRIMES.binarySearch(7) == .Ok(3))
+    assert(PRIMES.binarySearch(7) == 3)
     var changed = PRIMES
     changed[0] = 1
     assert(changed[0] == 1 && PRIMES[0] == 2)
@@ -411,13 +411,13 @@ val ARROWS: &[str] = ["up", "down", "left", "right"]
 
 fn commandOf(key: str): Option<str> = {
     for command in COMMANDS {
-        if command.keys.contains(&key) then return .Some(command.name)
+        if command.keys.contains(&key) then return command.name
     }
     return .None
 }
 
 fn main() = {
-    assert(commandOf("Q") == .Some("quit"))
+    assert(commandOf("Q") == "quit")
     assert(commandOf("x") == .None)
     assert(COMMANDS[2].keys.isEmpty() && ARROWS.len() == 4)
 }

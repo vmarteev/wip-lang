@@ -8,29 +8,29 @@ names are reserved, so `Option` means the same type in every program.
 
 ```wip,run
 fn main() = {
-    val found: Option<i64> = .Some(7)
+    val found: Option<i64> = 7
     assert(found.isSome())
     assert(found.unwrapOr(0) == 7)
-    assert(found.map((n) => n * 2) == .Some(14))
+    assert(found.map((n) => n * 2) == 14)
     assert(found.fold(() => 0, (n) => n * 2) == 14)
 
     val missing: Option<i64> = .None
     assert(missing.unwrapOr(0) == 0)
-    assert(missing.or(.Some(1)) == .Some(1))
+    assert(missing.or(1) == 1)
     // Made only where it is needed.
-    assert(missing.orElse(() => .Some(2)) == .Some(2))
+    assert(missing.orElse(() => 2) == 2)
     assert(missing.unwrapOrElse(() => 3) == 3)
     assert(missing.toResult("nothing there").isErr())
 
-    val answer: Result<i64, str> = .Ok(2)
-    assert(answer.map((n) => n + 1) == .Ok(3))
-    assert(answer.toOption() == .Some(2))
+    val answer: Result<i64, str> = 2
+    assert(answer.map((n) => n + 1) == 3)
+    assert(answer.toOption() == 2)
 
     val failed: Result<i64, str> = .Err("no")
     assert(failed.mapErr((e) => e.len()) == .Err(2))
     assert(failed.unwrapOr(9) == 9)
     assert(failed.unwrapOrElse((e) => e.len()) == 2)
-    assert(failed.orElse((e) => .Ok(e.len())) == .Ok(2))
+    assert(failed.orElse((e) => e.len()) == 2)
 }
 ```
 
@@ -55,7 +55,7 @@ An `Option` may be filled where it is empty and written where it is not:
 fn main() = {
     var slot: Option<i64> = .None
     slot.getOrInsert(7) += 1
-    assert(slot == .Some(8))
+    assert(slot == 8)
 }
 ```
 
@@ -73,7 +73,7 @@ fn main() = {
     numbers.push(1)
     numbers.push(2)
     assert(numbers.len() == 2 && numbers[0] == 1)
-    assert(numbers.pop() == .Some(2))
+    assert(numbers.pop() == 2)
 
     var made = Vec::of([3, 1, 2])
     made.sort()
@@ -182,7 +182,7 @@ fn main() = {
     assert(numbers.filter((n) => n > 3) == [4, 5, 9])
     assert(numbers.fold(0, (sum, n) => sum + n) == 23 && numbers.sum() == 23)
     assert(numbers.find((n) => n > 3) == .Some(&4))
-    assert(numbers.first() == .Some(&3) && numbers.max() == .Some(9))
+    assert(numbers.first() == .Some(&3) && numbers.max() == 9)
     assert(numbers.take(2).len() == 2 && numbers.skip(4).len() == 2)
     assert(numbers.join(" ") == "3 1 4 1 5 9")
     val words = ["pear", "fig", "plum"]
@@ -267,9 +267,9 @@ fn main() = {
     val got: Result<i64, str> = buffer.readInto(16, 0, (room) => {
         room[0] = b'o'
         room[1] = b'k'
-        return .Ok(2)
+        return 2
     })
-    assert(got == .Ok(2) && str::fromBytes(&buffer.items()) == "ok")
+    assert(got == 2 && str::fromBytes(&buffer.items()) == "ok")
 }
 ```
 
@@ -289,9 +289,9 @@ fn main() = {
     assert(text.trim() == "one,two")
     assert(text.trim().split(",").count() == 2)
     assert(text.contains("two"))
-    assert(text.indexOf("two") == .Some(6))
-    assert("42".toInt() == .Ok(42))
-    assert("4.5".toFloat() == .Ok(4.5))
+    assert(text.indexOf("two") == 6)
+    assert("42".toInt() == 42)
+    assert("4.5".toFloat() == 4.5)
     assert("\(0.1 + 0.2)" == "0.30000000000000004")
     assert("\(1e20)" == "1e+20")
     assert("añ".chars().count() == 2)
@@ -308,12 +308,12 @@ last character back with `popChar`, as a backspace does:
 ```wip,run
 fn main() = {
     val path = "a/b/c.tar.gz"
-    assert(path.indexOf(".") == .Some(5) && path.lastIndexOf(".") == .Some(9))
+    assert(path.indexOf(".") == 5 && path.lastIndexOf(".") == 9)
     assert("Content-Length".equalsAnyCase("content-length"))
     assert("Content-Type: text/plain".startsWithAnyCase("content-type"))
     assert("Grüße".toAsciiUpper() == "GRüßE")
     var typed = String::of("añ")
-    assert(typed.popChar() == .Some('ñ') && typed == "a")
+    assert(typed.popChar() == 'ñ' && typed == "a")
 }
 ```
 
@@ -376,9 +376,9 @@ same `radix:`:
 ```wip,run
 fn main() = {
     val line = "#define WIDTH 32"
-    assert(line.stripPrefix("#define ") == .Some("WIDTH 32"))
+    assert(line.stripPrefix("#define ") == "WIDTH 32")
     assert(line.stripPrefix("#undef ").isNone())
-    assert("shapes.h".stripSuffix(".h") == .Some("shapes"))
+    assert("shapes.h".stripSuffix(".h") == "shapes")
     val .Some((name, value)) = "WIDTH 32".splitOnce(" ") else return
     assert(name == "WIDTH" && value == "32")
     assert("==title==".trimMatches("=") == "title")
@@ -398,7 +398,7 @@ times over:
 fn main() = {
     assert("a-b-c".replace("-", by: "+") == "a+b+c")
     assert("aaa".replace("aa", by: "b") == "ba")
-    assert("a-b-c".replace("-", by: "+", count: .Some(1)) == "a+b-c")
+    assert("a-b-c".replace("-", by: "+", count: 1) == "a+b-c")
     assert("ab".repeat(3) == "ababab" && "ab".repeat(0) == "")
 }
 ```
@@ -455,7 +455,7 @@ fn main() = {
     assert('é'.isLetter() && '中'.isLetter() && !'_'.isLetter())
     assert('٣'.isNumeric() && !'٣'.isDigit())
     assert("année2".chars().all((c) => c.isAlphanumeric()))
-    assert('f'.digitValue(16) == .Some(15) && 'g'.digitValue(16) == .None)
+    assert('f'.digitValue(16) == 15 && 'g'.digitValue(16) == .None)
 }
 ```
 
@@ -473,8 +473,68 @@ fn main() = {
     val line = "x = 0x1F;"
     assert(line[0].isAsciiLetter() && line[1].isAsciiWhitespace())
     assert(line[2].isAsciiPunctuation() && line[6].isHexDigit())
-    assert(line[7].digitValue(16) == .Some(15))
+    assert(line[7].digitValue(16) == 15)
     assert(!"é"[0].isAsciiPrintable())
+}
+```
+
+### Reading text from the front: `std::text::Scanner`
+
+A parser reads its text through a `Scanner`: the text and `at`, the byte
+offset of what is read next. `peek()` is the byte there, or nothing at
+the end, and `peekAt(n)` one further on; `next()` takes it; `take(byte)`
+and `takeText(text)` take what comes next only where it is that, and say
+whether they did, and `takeTextAnyCase(text)` where it is that in any
+case, as `startsWithAnyCase` compares. `skipWhile(test)` goes past the bytes a test holds for,
+and `takeWhile(test)` answers them; `since(start)` is the text from a
+position to here, the token just read, and `rest()` what is left.
+`peekChar()` and `nextChar()` read a character, where a format lets one be
+anything, and `peekCharAt(n)`, `takeChar(c)`, `skipWhileChar(test)` and
+`takeWhileChar(test)` are the byte operations' twins in characters, for a
+name or a text that may hold any. `peekCharAt(n)` counts characters, and
+reads the ones before it to find it. The byte operations read a syntax of
+ASCII faster, since they decode nothing. What these answer borrows the
+text, not the scanner, so a token is kept while reading goes on, and `at`
+set back to where it has been reads again from there.
+
+```wip,run
+import std::text::{Scanner}
+
+fn main() = {
+    var s = Scanner::of("añob → x")
+    val name = s.takeWhileChar((c) => c.isLetter())
+    s.skipWhileChar((c) => c == ' ')
+    assert(name == "añob" && s.peekCharAt(2) == 'x' && s.takeChar('→'))
+}
+```
+
+`position()` is the line and the column of what is read next, each from 1,
+the column in characters, and `positionAt(at)` those of any byte: they are
+worked out from the start of the text when an error asks for them, and
+reading counts nothing.
+
+```wip,run
+import std::text::{Position, Scanner}
+
+/// The name and the number of a line `name = 640`, or where it is wrong.
+fn setting(line: str): Result<(str, i64), Position> = {
+    var s = Scanner::of(line)
+    val name = s.takeWhile((b) => b.isAsciiLetter())
+    s.skipWhile((b) => b == b' ')
+    if name.isEmpty() || !s.take(b'=') then return .Err(s.position())
+    s.skipWhile((b) => b == b' ')
+    val start = s.at
+    s.skipWhile((b) => b.isDigit())
+    val .Ok(value) = s.since(start).toInt() else {
+        return .Err(s.positionAt(start))
+    }
+    return (name, value)
+}
+
+fn main() = {
+    assert(setting("width = 640") == .Ok(("width", 640)))
+    val .Err(place) = setting("width : 640") else return
+    assert(place.line == 1 && place.column == 7)
 }
 ```
 
@@ -504,11 +564,11 @@ fn main() = {
     assert(text.split(" ").count() == 4)
     assert(text.split(" ").any((w) => w == "fox"))
     assert(text.split(" ").all((w) => w.len() >= 3))
-    assert(text.split(" ").find((w) => w.startsWith("b")) == .Some("brown"))
+    assert(text.split(" ").find((w) => w.startsWith("b")) == "brown")
 
     // `peekable()` looks at the next element before it is taken.
     var letters = "ab".chars().peekable()
-    assert(letters.peek() == .Some(&'a') && letters.next() == .Some('a'))
+    assert(letters.peek() == .Some(&'a') && letters.next() == 'a')
 
     // A slice walks through `copies()`, which copies each element out, and
     // through `forwards()` and `backwards()`, which lend each where it lies.
@@ -566,7 +626,7 @@ fn main() = {
     val prefix = "b"
     val words = "alpha beta bold".split(" ")
     var picked = words.filter((w) => w.startsWith(prefix))
-    assert(picked.next() == .Some("beta") && picked.count() == 1)
+    assert(picked.next() == "beta" && picked.count() == 1)
     assert(doubled([1, 2]).sum() == 6)
 }
 ```
@@ -596,8 +656,8 @@ fn main() = {
     val words = "ab cd".split(" ").map((w) => w.chars()).flatten()
     assert(words.count() == 4)
     assert("12a3".chars().takeWhile((c) => c.isDigit()).count() == 2)
-    assert("a b".split(" ").chain("c".split(" ")).last() == .Some("c"))
-    assert("a b c".split(" ").position((w) => w == "c") == .Some(2))
+    assert("a b".split(" ").chain("c".split(" ")).last() == "c")
+    assert("a b c".split(" ").position((w) => w == "c") == 2)
     var total = 0
     "1 2 3".split(" ").forEach((w) => { total += w.toInt().unwrap() })
     assert(total == 6)
@@ -646,10 +706,10 @@ sought:
 ```wip,run
 fn main() = {
     val numbers = [1, 3, 5, 7]
-    assert(numbers.binarySearch(5) == .Ok(2))
+    assert(numbers.binarySearch(5) == 2)
     assert(numbers.binarySearch(4) == .Err(2))
     val sought = 7
-    assert(numbers.binarySearchBy((n: &i64) => n.compare(&sought)) == .Ok(3))
+    assert(numbers.binarySearchBy((n: &i64) => n.compare(&sought)) == 3)
 }
 ```
 
@@ -662,8 +722,8 @@ of equals, as a slice does ([page 8](08-interfaces.md)):
 fn main() = {
     val text = "wide 字\nab"
     assert(text.chars().map((c) => c.width()).sum() == 9)
-    assert(text.lines().map((line) => line.len()).max() == .Some(8))
-    assert("pear fig plum".split(" ").min() == .Some("fig"))
+    assert(text.lines().map((line) => line.len()).max() == 8)
+    assert("pear fig plum".split(" ").min() == "fig")
     val values = [3, 9, 4]
     assert(values.copies().product() == 108)
     assert(values.backwards().max() == .Some(&9))
@@ -861,7 +921,7 @@ fn main() = {
     var (sounds, mixer) = sync::ring<String>(2)
     assert(sounds.push("coin").isOk() && sounds.push("door").isOk())
     assert(sounds.push("step") == .Err(String::of("step"))) // full
-    assert(mixer.pop() == .Some(String::of("coin")) && mixer.len() == 1)
+    assert(mixer.pop() == String::of("coin") && mixer.len() == 1)
 
     var (samples, played) = sync::ring<i64>(8)
     val (_, total) = future::both(
@@ -952,7 +1012,7 @@ fn options(args: &[cstring]): Result<Options, ArgumentError> = {
             _ => return .Err(argument.unexpected())
         }
     }
-    return .Ok(options)
+    return options
 }
 
 fn main() = {
@@ -1064,7 +1124,7 @@ fn main() = {
     assert(said.stdout == "a;$(rm x) b")
     assert(said.exit.success())
 
-    assert(Command::of("false").run() == .Ok(.Code(1)))
+    assert(Command::of("false").run() == .Code(1))
     assert(Command::of("no-such-program").run() is .Err(.NotFound))
 }
 ```
@@ -1124,7 +1184,7 @@ fn main() = {
     echo.output().readLine(&var line).unwrap()
     assert(line == "one, two")
 
-    echo.output().setTimeout(.Some(Duration::millis(50)))
+    echo.output().setTimeout(Duration::millis(50))
     assert(echo.output().readLine(&var line) == .Err(io::IoError::WouldBlock))
     assert(echo.wait().success())
 }
@@ -1244,11 +1304,11 @@ fn main() = {
     assert(counts.len() == 2)
     assert(counts.at("a") == 1)
     assert(counts.contains("b"))
-    assert(counts.indexOf("a") == .Some(0))
+    assert(counts.indexOf("a") == 0)
     assert(counts.get("a") == .Some(&1) && counts.get("z").isNone())
     assert(counts.keyAt(1) == "b")
     counts.at("a") += 10
-    assert(counts.remove("a") == .Some(11))
+    assert(counts.remove("a") == 11)
     assert(counts == Map::fromPairs([("b", 2)].copies()))
 
     var seen = Set<i64>()
@@ -1283,8 +1343,8 @@ fn main() = {
     waiting.pushBack(3)
     waiting.pushFront(1)
     assert(waiting.len() == 3 && waiting[0] == 1)
-    assert(waiting.popFront() == .Some(1))
-    assert(waiting.popBack() == .Some(3))
+    assert(waiting.popFront() == 1)
+    assert(waiting.popBack() == 3)
     assert(waiting == Deque::of([2]) && waiting.first() == .Some(&2))
 }
 ```
@@ -1318,7 +1378,7 @@ fn depth(tree: &Arena<Node>, node: Handle<Node>): i64 = {
 fn main() = {
     var tree: Arena<Node> = Arena()
     val root = tree.add(Node(value: 1, parent: .None))
-    val leaf = tree.add(Node(value: 2, parent: .Some(root)))
+    val leaf = tree.add(Node(value: 2, parent: root))
     tree[leaf].value += 10
     assert(depth(&tree, leaf) == 1)
     assert(tree.remove(leaf).isSome())
@@ -1416,7 +1476,7 @@ import std::net::{Address, Listener, Stream}
 
 fn main() = {
     // Port 0: the system chooses one, and `localAddress` says which.
-    val listener = Listener::tcp(.Some("127.0.0.1"), 0).unwrap()
+    val listener = Listener::tcp("127.0.0.1", 0).unwrap()
     val .Ok(.V4(port: port, ..)) = listener.localAddress() else return
     val (_, answer) = future::both(
         () => {
@@ -1470,22 +1530,22 @@ import std::net::{Listener, Stream}
 import std::time::{Duration}
 
 fn main() = {
-    val listener = Listener::tcp(.Some("127.0.0.1"), 0).unwrap()
+    val listener = Listener::tcp("127.0.0.1", 0).unwrap()
     val .Ok(.V4(port: port, ..)) = listener.localAddress() else return
     var queue = io::EventQueue::new().unwrap()
     assert(queue.add(listener.descriptor(), .Read, 0).isOk())
     var events: Vec<io::Event> = Vec()
 
     var client = Stream::tcp("127.0.0.1", port).unwrap()
-    assert(queue.wait(.Some(Duration::seconds(5)), &var events).isOk())
+    assert(queue.wait(Duration::seconds(5), &var events).isOk())
     assert(events[0].token == 0 && events[0].readable) // a connection came
     val (served, _) = listener.accept().unwrap()
     assert(queue.add(served.descriptor(), .Read, 1).isOk())
 
     client.writeText("hi").unwrap()
-    assert(queue.wait(.Some(Duration::seconds(5)), &var events).isOk())
+    assert(queue.wait(Duration::seconds(5), &var events).isOk())
     assert(events.len() == 1 && events[0].token == 1 && events[0].readable)
-    assert(queue.wait(.Some(Duration::millis(0)), &var events).isOk())
+    assert(queue.wait(Duration::millis(0), &var events).isOk())
     assert(events.len() == 1) // told again, while it is unread
 }
 ```
@@ -1519,7 +1579,7 @@ import std::http::{Client, Request}
 import std::net::{Listener}
 
 fn main() = {
-    val listener = Listener::tcp(.Some("127.0.0.1"), 0).unwrap()
+    val listener = Listener::tcp("127.0.0.1", 0).unwrap()
     val .Ok(.V4(port: port, ..)) = listener.localAddress() else return
     val (_, response) = future::both(
         () => {
@@ -1676,9 +1736,9 @@ fn main() = {
     assert("\(error)" == "expected a value, at line 2, column 4")
 
     // A field and an element, by reference, and what a value is.
-    assert(doc.get("name").flatMap((name) => name.asText()) == .Some("wip"))
+    assert(doc.get("name").flatMap((name) => name.asText()) == "wip")
     val second = doc.get("tags").flatMap((tags) => tags.item(1))
-    assert(second.flatMap((tag) => tag.asFloat()) == .Some(2.5))
+    assert(second.flatMap((tag) => tag.asFloat()) == 2.5)
     assert(doc.get("size").isNone())
 }
 ```
@@ -1749,8 +1809,8 @@ fn main() = {
     out.u16be(300)
     val written = out.take()
     var read = Reader::of(&written.items())
-    assert(read.u32le() == .Some(0x46424C47) && read.f32le() == .Some(0.5))
-    assert(read.u16be() == .Some(300) && read.u8().isNone())
+    assert(read.u32le() == 0x46424C47 && read.f32le() == 0.5)
+    assert(read.u16be() == 300 && read.u8().isNone())
 
     var header = [0 as u8; 8]
     bytes::putU16be(&var header, 2, 300)
@@ -1802,7 +1862,7 @@ fn main() = {
     val query = "q=\(url::encode("crème brûlée & tea"))"
     assert(query == "q=cr%C3%A8me%20br%C3%BBl%C3%A9e%20%26%20tea")
     assert(url::encode("/a b/c", keep: "/") == "/a%20b/c")
-    assert(url::decode("cr%C3%A8me") == .Ok(String::of("crème")))
+    assert(url::decode("cr%C3%A8me") == String::of("crème"))
 }
 ```
 
@@ -1893,7 +1953,7 @@ fn main() = {
     assert(first.writeAll([1 as u8, 2, 3, 4, 5, 6, 7]).isOk())
     var from = fs::File::open(dir.join("first")).unwrap()
     var to = fs::File::create(dir.join("second")).unwrap()
-    assert(io::copy(&var from, &var to) == .Ok(7))
+    assert(io::copy(&var from, &var to) == 7)
     var again = fs::File::open(dir.join("second")).unwrap()
     assert(counted(&var again) == 7)
     var out = io::stdout()
@@ -1934,7 +1994,7 @@ fn main() = {
     val save = dir.join("save.json")
     assert(fs::replaceFile(save, "{\"coins\": 1}").isOk())
     assert(fs::replaceFile(save, "{\"coins\": 2}").isOk())
-    assert(fs::readFile(save) == .Ok(String::of("{\"coins\": 2}")))
+    assert(fs::readFile(save) == String::of("{\"coins\": 2}"))
     assert(fs::readDir(dir.path).unwrap().len() == 2) // nothing left beside
     assert(dir.path.startsWith(fs::temporaryRoot().trimEndMatches("/")))
 }
@@ -1958,10 +2018,10 @@ fn main() = {
     val root = "target/docs-\(process::id())"
     assert(fs::makeDirs("\(root)/a/b").isOk())
     assert(fs::writeFile("\(root)/a/b/note", "hi").isOk())
-    assert(fs::copy("\(root)/a/b/note", "\(root)/copy") == .Ok(2))
+    assert(fs::copy("\(root)/a/b/note", "\(root)/copy") == 2)
     assert(fs::rename("\(root)/copy", "\(root)/moved").isOk())
     assert(fs::makeLink("a", "\(root)/link").isOk())
-    assert(fs::readFile("\(root)/link/b/note") == .Ok(String::of("hi")))
+    assert(fs::readFile("\(root)/link/b/note") == String::of("hi"))
     assert(fs::removeAll(root).isOk() && !fs::exists(root))
     assert(process::executable().isOk())
     assert(process::besideProgram("levels").endsWith("/levels"))
@@ -1982,7 +2042,7 @@ fn main() = {
     assert(path::name("/a/b/c.tar.gz") == "c.tar.gz")
     assert(path::parent("/a/b/c.tar.gz") == "/a/b")
     assert(path::parent("c") == ".")
-    assert(path::extension("c.tar.gz") == .Some("gz"))
+    assert(path::extension("c.tar.gz") == "gz")
     assert(path::extension(".bashrc").isNone())
     assert(path::stem("c.tar.gz") == "c.tar")
     assert(path::isWithin("/a/b", "/a") && !path::isWithin("/ab", "/a"))
@@ -2134,7 +2194,7 @@ fn main() = {
 
     val crate = Aabb::of(Vec3::splat(-1.0), Vec3::splat(1.0))
     val ray = Ray::of(Vec3::of(0.0, 0.0, 5.0), -Vec3::unitZ())
-    assert(crate.hit(ray) == .Some(4.0))
+    assert(crate.hit(ray) == 4.0)
 
     val ship = Vec3d::of(4.2e9, 0.0, 0.0)
     val camera = Vec3d::of(4.2e9 - 3.5, 0.0, 0.0)
@@ -2167,7 +2227,7 @@ fn main() = {
 | `std::http` | `get`, `Client`, `Request`, `Response` and `Incoming`: HTTP/1.1 requests, a body read whole or as it comes, undone where it was sent gzipped, sent from bytes, a file or any `io::Read` |
 | `std::compress` | `gzip` and `gunzip`, `zlib` and `unzlib`, `deflate` and `inflate`, and `Inflater` and `Deflater` for bytes in pieces: deflate, through the system's zlib |
 | `std::math` | `PI`, `TAU` and `E`, and the vectors, matrices, rotations and shapes above; the functions are methods of `f64` and `f32`, `x.sin()`, written in Wip so that a `@comptime` constant computes the program's bits |
-| `std::text` | `ParseError`, and the `Split`, `Lines` and `Chars` types the prelude's methods answer |
+| `std::text` | `Scanner` and `Position`, above; `ParseError`, and the `Split`, `Lines` and `Chars` types the prelude's methods answer |
 | `std::iter` | `Walk`, `Forwards`, `Backwards`, `Taking` (what a `Vec` gives up to `for x in move v`), and the adapter types `Mapped`, `Filtered`, `FilterMapped`, `FlatMapped`, `Chained`, `Enumerated`, `Taken`, `TakenWhile`, `Skipped`, `Zipped`, `Peekable` |
 | `std::collections` | `Map`, `Set`, `MapEntry`, `Deque`, `PriorityQueue`, and `Arena` with its `Handle`, `ArenaEntry` and `ArenaValues` |
 | `std::time` | `Duration`, a length of time; `Instant`, a moment on a clock that only goes forward; `sleep`; `FixedStep`, a game's updates at a steady rate; `now`, the date it is; `Utc`, a moment as a calendar has it, and `Local`, as it has it where the program runs |
@@ -2262,7 +2322,7 @@ fn main() = {
     )
     assert(moment.httpDate() == "Sun, 06 Nov 1994 08:49:37 GMT")
     assert(moment.iso() == "1994-11-06T08:49:37Z")
-    assert(Utc::parseHttpDate("Sun, 06 Nov 1994 08:49:37 GMT") == .Some(moment))
+    assert(Utc::parseHttpDate("Sun, 06 Nov 1994 08:49:37 GMT") == moment)
     assert(Utc::parseHttpDate("Sunday, 06-Nov-94 08:49:37 GMT").isNone())
 }
 ```

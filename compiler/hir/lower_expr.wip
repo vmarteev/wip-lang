@@ -3,6 +3,7 @@
 
 import syntax as ast
 import syntax::{
+	BYTE_CAST,
 	BinaryOp,
 	CANNOT_INFER,
 	DROP_RULES,
@@ -28,7 +29,6 @@ import syntax::{
 
 /// The implementation an arithmetic operator calls on a type of a program's
 /// own, and what it takes and answers.
-@derive(Clone)
 struct OperatorImpl {
 	method: FnId
 	typeArgs: TyList
@@ -37,7 +37,7 @@ struct OperatorImpl {
 }
 
 /// The one type of a list, where it holds one.
-fn onlyOne(tys: &[Ty]): Option<Ty> = if tys.len() == 1 then .Some(tys[0]) else .None
+fn onlyOne(tys: &[Ty]): Option<Ty> = if tys.len() == 1 then tys[0] else .None
 
 /// Whether an operator compares its operands.
 fn comparison(op: BinaryOp): bool = op is .Eq | .Ne | .Lt | .Le | .Gt | .Ge
@@ -51,21 +51,23 @@ extend Lowerer {
 		val checked = self.state.early.get(&id)?
 		val done = checked
 		self.state.early.remove(&id)
-		return .Some(done)
+		return done
 	}
 
-	var fn infer(id: ast::ExprId, hint: Option<Ty>): ExprId = {
+	var fn infer(id: ast::ExprId, given: Option<Ty>): ExprId = {
 		if self.checkedEarly(id) is .Some(checked) then return checked
+		// An `if`, a `match` or a block of number literals, a float among
+		// them, is a float where nothing says its type.
+		val hint = match self.literalHint(id, given) {
+			.Some(ty) => .Some(ty)
+			.None => self.floatAmong([id])
+		}
 		if self.variantUnderExpression(id, hint) is .Some(refused) then return refused
 		val file = self.ast
 		val expr = &file.exprs[id]
 		val span = expr.span
 		return match expr.kind {
-			.Int(v) => {
-				val ty = self.intLiteralType(hint)
-				val value = self.intLiteral(false, v, ty, span)
-				self.alloc(.Int(value), ty, span)
-			}
+			.Int(v) => self.numberOfInt(false, v, hint, span)
 			.Block(block) => {
 				val (checked, ty) = self.checkBlock(&block, hint)
 				self.alloc(.Block(checked), ty, span)
@@ -82,8 +84,8 @@ extend Lowerer {
 			.Lambda(..) => self.lambda(id, hint, false, span)
 			.Cast(expr: inner, ty, op, wrapping) => self.cast(inner, ty, op, wrapping, span)
 			// Literals take the type expected of them.
-			.Float(v) => self.alloc(.Float(v), if hint == .Some(F32) then F32 else F64, span)
-			.Str(s) => self.alloc(.Str(s), if hint == .Some(CSTRING) then CSTRING else STR, span)
+			.Float(v) => self.alloc(.Float(v), if hint == F32 then F32 else F64, span)
+			.Str(s) => self.alloc(.Str(s), if hint == CSTRING then CSTRING else STR, span)
 			.Bool(b) => self.alloc(.Bool(b), BOOL, span)
 			// A character is its number, in 32 bits.
 			.Char(c) => self.alloc(.Int(c as u128), CHAR, span)
@@ -238,7 +240,7 @@ extend Lowerer {
 	): ExprId = {
 		var elemHint: Option<Ty> = .None
 		if hint is .Some(h) && self.kind(h) is .Own(inner) && self.kind(inner) is .Slice(t) then
-			elemHint = .Some(t)
+			elemHint = t
 		val checked = match elemHint {
 			.Some(ty) => self.check(elem, ty)
 			.None => self.infer(elem, .None)
@@ -254,9 +256,53 @@ extend Lowerer {
 
 	/// The type of an integer literal: the integer type expected of it, or
 	/// `i64`.
-	fn intLiteralType(hint: Option<Ty>): Ty = match hint {
-		.Some(ty) if self.program.types.isInteger(ty) => ty
-		_ => I64
+	/// What a literal, a lambda or an operator's answer is expected to be
+	/// where an `Option` or a `Result` is: the type of its success, which it
+	/// is then wrapped in. Anything else is expected to be what is expected,
+	/// which a name, a call or a block may already be.
+	fn literalHint(id: ast::ExprId, hint: Option<Ty>): Option<Ty> = {
+		val .Some(ty) = hint else return hint
+		return match self.ast.exprs[id].kind {
+			.Int(..) | .Float(..) | .Str(..) | .Null | .Lambda(..) | .Array(..) | .ArrayRepeat(..)
+			| .Unary(..) | .Binary(..) => self.successOr(ty)
+			_ => hint
+		}
+	}
+
+	/// An integer literal, `-magnitude` where `negative`: of the integer type
+	/// expected, or of the float type expected, which it is a float of; an
+	/// `i64` where neither is.
+	var fn numberOfInt(negative: bool, magnitude: u128, hint: Option<Ty>, span: Span): ExprId = {
+		val ty = match hint {
+			.Some(ty) if self.program.types.isNumeric(ty) => ty
+			_ => I64
+		}
+		if self.program.types.isFloat(ty) then
+			return self.alloc(.Float(self.floatOfInt(negative, magnitude, ty, span)), ty, span)
+		return self.alloc(.Int(self.intLiteral(negative, magnitude, ty, span)), ty, span)
+	}
+
+	/// The value of an integer literal of the float type `ty`, `-magnitude`
+	/// where `negative`, reporting it where the float would round it: a whole
+	/// number is held exactly where its significant bits fit the float's,
+	/// 24 of an `f32` and 53 of an `f64`.
+	var fn floatOfInt(negative: bool, magnitude: u128, ty: Ty, span: Span): f64 = {
+		val precision: u128 = if ty == F32 then 24 else 53
+		val significant =
+			if magnitude == 0 then 0 else 128 - magnitude.leadingZeros() - magnitude.trailingZeros()
+		if significant <= precision then
+			return if negative then -(magnitude as f64) else magnitude as f64
+		val name = if ty == F32 then "f32" else "f64"
+		val text = if negative then "-\(magnitude)" else "\(magnitude)"
+		self.report(
+			Diagnostic::error(
+				INTEGER_OUT_OF_RANGE,
+				"an `\(name)` cannot hold the integer literal `\(text)` exactly",
+				span,
+				"it would be rounded",
+			).withNote("an `\(name)` holds every whole number up to \(1 << precision) exactly, and past it only those of \(precision) significant bits").withHelp("write it as a float literal, `\(text).0`, which says it is rounded"),
+		)
+		return 0.0
 	}
 
 	/// The bits of an integer literal of type `ty`, `-magnitude` when
@@ -294,7 +340,7 @@ extend Lowerer {
 		var e = start
 		while self.kind(self.tyOf(e)) is .Ref(inner, kind) &&
 			self.kind(inner) !is .Fn(..) &&
-			!(kind == .Shared && hint == .Some(self.tyOf(e))) {
+			!(kind == .Shared && hint == self.tyOf(e)) {
 			e = self.alloc(.Deref(e), inner, span)
 		}
 		return e
@@ -307,7 +353,7 @@ extend Lowerer {
 	fn keptReference(e: ExprId): Option<ExprId> = {
 		val .Deref(inner) = self.state.body.exprs[e].kind else return .None
 		val .Ref(inner: referent, kind: .Shared) = self.kind(self.tyOf(inner)) else return .None
-		return if self.kind(referent) is .Slice(..) then .Some(inner) else .None
+		return if self.kind(referent) is .Slice(..) then inner else .None
 	}
 
 	/// The amount of a shift of `shifted`, made the shifted value's type
@@ -348,7 +394,7 @@ extend Lowerer {
 		}
 		if elem == ERROR then return hint
 		val text = self.program.isString(elem) && self.writtenAsText(e)
-		return .Some(self.intern(.Slice(if text then STR else elem)))
+		return self.intern(.Slice(if text then STR else elem))
 	}
 
 	/// Whether every element of a list is text written out, `["a", "b"]`.
@@ -368,7 +414,7 @@ extend Lowerer {
 		val span = self.state.body.exprs[e].span
 		if self.program.vecElement(ty).isSome() {
 			val .Items(items, elem) = self.itemsOf(e, ty) else return .None
-			return .Some((items, elem))
+			return (items, elem)
 		}
 		return match self.kind(ty) {
 			.Array(elem, ..) | .ArrayOf(elem, ..) => {
@@ -377,9 +423,9 @@ extend Lowerer {
 					(self.alloc(.SubSlice(base: e, lo: .None, hi: .None), slice, span), elem),
 				)
 			}
-			.Slice(elem) => .Some((e, elem))
+			.Slice(elem) => (e, elem)
 			.Own(inner) | .Ref(inner, ..) => match self.kind(inner) {
-				.Slice(elem) => .Some((self.alloc(.Deref(e), inner, span), elem))
+				.Slice(elem) => (self.alloc(.Deref(e), inner, span), elem)
 				_ => .None
 			}
 			_ => .None
@@ -451,7 +497,7 @@ extend Lowerer {
 				if !pending.literal then self.decide(local, found, span)
 				else self.decideLiteral(
 					local,
-					if found == ERROR then .None else .Some(found),
+					if found == ERROR then .None else self.successOr(found),
 					into: true,
 					from: false,
 					at: span,
@@ -580,6 +626,7 @@ extend Lowerer {
 		// "Q"]`. Where nothing is, tuples say their type a position at a time.
 		var elemHint = self.elementHint(hint)
 		if elemHint.isNone() && elems.len() > 1 then elemHint = self.tuplesBeside(elems)
+		if elemHint.isNone() then elemHint = self.floatAmong(elems)
 		if elems.isEmpty() {
 			val .Some(elem) = elemHint else {
 				self.report(
@@ -638,7 +685,7 @@ extend Lowerer {
 		var elem = decided
 		var inferred: Vec<ExprId> = Vec()
 		for i in 0..elems.len() {
-			val e = if i == deciding then first else self.infer(elems[i], .Some(decided))
+			val e = if i == deciding then first else self.infer(elems[i], decided)
 			if self.partsType(elem, self.tyOf(e)) is .Some(wide) then elem = wide
 			inferred.push(e)
 		}
@@ -672,7 +719,7 @@ extend Lowerer {
 			}
 			tys.push(self.columnType(&column))
 		}
-		return .Some(self.tupleType(&tys))
+		return self.tupleType(&tys)
 	}
 
 	/// The type the parts in one position of an array's tuples have: their
@@ -681,6 +728,7 @@ extend Lowerer {
 	/// read through a reference is the reference, as an element is.
 	var fn columnType(parts: &[ast::ExprId]): Ty = {
 		if self.tuplesBeside(parts) is .Some(ty) then return ty
+		if self.floatAmong(parts) is .Some(ty) then return ty
 		var deciding = parts[0]
 		for part in parts {
 			if tupleWritten(self.ast, part).isNone() && !self.takesTypeBeside(part) {
@@ -700,7 +748,7 @@ extend Lowerer {
 	var fn tupleType(tys: &[Ty]): Ty = {
 		val name = Symbol::tuple(tys.len())
 		val declared: Option<TypeDef> = match self.typeHere(name) {
-			.Some((def, _)) => .Some(def)
+			.Some((def, _)) => def
 			.None => self.preludeType(name)
 		}
 		return match declared {
@@ -713,7 +761,7 @@ extend Lowerer {
 	}
 
 	var fn arrayElement(e: ast::ExprId, elem: Ty): ExprId = {
-		val inferred = self.infer(e, .Some(elem))
+		val inferred = self.infer(e, elem)
 		val kept =
 			if self.kind(elem) is .Ref(..) then self.keptReference(inferred).unwrapOr(inferred)
 			else inferred
@@ -729,7 +777,7 @@ extend Lowerer {
 			_ => h
 		}
 		return match self.kind(wanted) {
-			.Array(elem, ..) | .ArrayOf(elem, ..) | .Slice(elem) => .Some(elem)
+			.Array(elem, ..) | .ArrayOf(elem, ..) | .Slice(elem) => elem
 			_ => .None
 		}
 	}
@@ -759,7 +807,7 @@ extend Lowerer {
 		val .Name(sym) = expr.kind else return .None
 		if self.lookup(sym).isSome() then return .None
 		val name = ast::Name(sym: sym, span: expr.span)
-		return if self.constNamed(name).isSome() then .Some(name) else .None
+		return if self.constNamed(name).isSome() then name else .None
 	}
 
 	var fn unary(op: ast::UnaryOp, operand: ast::ExprId, hint: Option<Ty>, span: Span): ExprId = {
@@ -768,11 +816,8 @@ extend Lowerer {
 			.Neg => {
 				// `-9223372036854775808` is a literal, not the negation of an
 				// out-of-range one.
-				if file.exprs[operand].kind is .Int(v) {
-					val ty = self.intLiteralType(hint)
-					val value = self.intLiteral(true, v, ty, span)
-					return self.alloc(.Int(value), ty, span)
-				}
+				if file.exprs[operand].kind is .Int(v) then
+					return self.numberOfInt(true, v, hint, span)
 				val e = self.operand(operand, hint)
 				val ty = self.tyOf(e)
 				if self.program.types.intTy(ty) is .Some(t) && !t.signed() {
@@ -911,10 +956,30 @@ extend Lowerer {
 		if file.exprs[operand].kind is .Lambda(..) then
 			return self.lambda(operand, hint, true, span)
 		var innerHint: Option<Ty> = .None
-		if hint is .Some(h) && self.kind(h) is .Own(t) then innerHint = .Some(t)
+		if hint is .Some(h) && self.kind(h) is .Own(t) then innerHint = t
 		val e = self.infer(operand, innerHint)
 		val inner = self.tyOf(e)
 		if self.isPoisoned(inner) then return self.errorExpr(span)
+		// `own` of a function value would have an owned closure's type, and a
+		// closure is a pair: a function's name goes where an owned closure is
+		// taken as it is, and a value held in a variable is called from a
+		// lambda.
+		if self.kind(inner) is .Fn(..) {
+			val operand = &self.state.body.exprs[e]
+			var diagnostic = Diagnostic::error(
+				FN_VALUE_REF,
+				"`own` of a function value",
+				span,
+				"a function value, which `own` would make an owned closure's type",
+			).withNote("a closure is an environment and its code; a function value is code alone")
+			diagnostic = if operand.kind is .FnRef(..) then
+				diagnostic.withFix("remove `own`: a function's name goes where an owned closure is taken as it is", [
+					Edit::replace(Span::new(span.lo, operand.span.lo), ""),
+				])
+			else diagnostic.withHelp("call it from a lambda, as in `own (x) => f(x)`")
+			self.report(diagnostic)
+			return self.errorExpr(span)
+		}
 		val ty = self.intern(.Own(inner))
 		return self.alloc(.Own(e), ty, span)
 	}
@@ -957,7 +1022,7 @@ extend Lowerer {
 		val arithmetic =
 			op is .Add | .Sub | .Mul | .Div | .Rem | .BitAnd | .BitOr | .BitXor | .Shl | .Shr
 		val hint: Option<Ty> = match given {
-			.Some(ty) if arithmetic && self.program.types.isNumeric(ty) => .Some(ty)
+			.Some(ty) if arithmetic && self.program.types.isNumeric(ty) => ty
 			_ => .None
 		}
 		// Beside a type of a program's own, a number is what an
@@ -977,6 +1042,10 @@ extend Lowerer {
 		val rightWaits = self.waitingLiteral(rhs)
 		val leftTakes = self.takesOther(lhs) || self.numberShaped(lhs) || leftWaits.isSome()
 		val rightTakes = self.takesOther(rhs) || self.numberShaped(rhs) || rightWaits.isSome()
+		// Number literals on both sides, a float among them, are floats: `1 +
+		// 0.5`, `0 < 0.5`.
+		val besides: Option<Ty> =
+			if hint.isNone() && !shift then self.floatAmong([lhs, rhs]) else hint
 		val (left, right) = if leftTakes && !rightTakes && !shift {
 			val r = self.comparedOperand(op, rhs, hint)
 			val rt = self.tyOf(r)
@@ -988,10 +1057,10 @@ extend Lowerer {
 			// A literal's variable takes what the literal would.
 			if leftWaits is .Some(local) then
 				self.decideBeside(local, r, left.unwrapOr(rt), self.ast.exprs[lhs].span)
-			val l = self.comparedOperand(op, lhs, .Some(left.unwrapOr(rt)))
+			val l = self.comparedOperand(op, lhs, left.unwrapOr(rt))
 			(l, r)
 		} else {
-			val l = self.comparedOperand(op, lhs, hint)
+			val l = self.comparedOperand(op, lhs, besides)
 			val lt = self.tyOf(l)
 			var right: Option<Ty> = .None
 			if which is .Some(w) && !self.operatorApplies(op, lt) {
@@ -1006,10 +1075,10 @@ extend Lowerer {
 				val wanted = right.unwrapOr(lt)
 				if shift then self.decideLiteral(local, .None, into: false, from: false, at: at)
 				else if leftTakes then
-					self.decideLiteral(local, .Some(wanted), into: true, from: false, at: at)
+					self.decideLiteral(local, wanted, into: true, from: false, at: at)
 				else self.decideBeside(local, l, wanted, at)
 			}
-			val r = self.comparedOperand(op, rhs, .Some(right.unwrapOr(lt)))
+			val r = self.comparedOperand(op, rhs, right.unwrapOr(lt))
 			(l, r)
 		}
 		// A constant beside an integer of another type is as the literal it
@@ -1017,10 +1086,13 @@ extend Lowerer {
 		// which may be of any type already.
 		// And an integer beside a wider one widens: `b == n` of a `u8` and an
 		// `i64` compares `i64`s.
-		val (l0, r0) = if shift then (left, right) else {
+		val (l1, r1) = if shift then (left, right) else {
 			val (l, r) = self.constantBeside(left, right)
 			self.widenedBeside(l, r)
 		}
+		// An `Option` or a `Result` compared with a value of its success's type
+		// is compared with its `.Some` or its `.Ok`: `chosen == i`.
+		val (l0, r0) = if op is .Eq | .Ne then self.wrappedBeside(l1, r1) else (l1, r1)
 		val lt0 = self.tyOf(l0)
 		val rt0 = self.tyOf(r0)
 		// `name == null` asks whether a C string is null: `null` has no text
@@ -1139,6 +1211,41 @@ extend Lowerer {
 		return self.alloc(.Binary(op: op, lhs: l, rhs: r, wrapping: wrapping), result, span)
 	}
 
+	/// The operands of `==` or `!=`, where one is an `Option` or a `Result`
+	/// and the other a value of its success's type: that value as its
+	/// `.Some` or its `.Ok`. A `.Some(value)` written beside the other is
+	/// warned of where the value alone would be wrapped.
+	var fn wrappedBeside(lhs: ExprId, rhs: ExprId): (ExprId, ExprId) = {
+		if self.comparedWrapped(rhs, self.tyOf(lhs)) is .Some(r) then return (lhs, r)
+		if self.comparedWrapped(lhs, self.tyOf(rhs)) is .Some(l) then return (l, rhs)
+		for (operand, other) in [(lhs, rhs), (rhs, lhs)] {
+			if self.state.writtenSuccesses.contains(&operand) &&
+				self.tyOf(operand) == self.tyOf(other) &&
+				self.state.body.exprs[operand].kind is .Variant(args, ..) &&
+				self.wrappableBeside(args[0]) &&
+				self.state.body.exprs[args[0]].kind is .Local(..) | .Field(..) | .Index(..)
+				| .Deref(..) | .Int(..) | .Float(..) | .Str(..) | .Bool(..) | .Variant(..)
+				| .Call(..) {
+				self.needlessWrapper(operand)
+			}
+		}
+		return (lhs, rhs)
+	}
+
+	/// `value` as the `.Some` or the `.Ok` of `other`, an `Option` or a
+	/// `Result` of its type, where it is compared with one. Not a place that
+	/// owns memory, which the variant would take: one is compared with
+	/// `.Some(value)` written, which says it is moved.
+	var fn comparedWrapped(value: ExprId, other: Ty): Option<ExprId> = {
+		if !self.wrappableBeside(value) then return .None
+		return self.wrapped(value, other)
+	}
+
+	/// Whether a value compared may be made a `.Some` or an `.Ok` for it:
+	/// plain data, or a value with no place of its own.
+	fn wrappableBeside(value: ExprId): bool =
+		self.program.clonesByCopy(self.tyOf(value)) || self.placeRoot(value) is .NotAPlace
+
 	/// `sameTexts(&strings, &texts)`, where one side's elements are `String`s
 	/// and the other's text.
 	var fn sameTexts(l: ExprId, lElem: Ty, r: ExprId, rElem: Ty, span: Span): Option<ExprId> = {
@@ -1158,17 +1265,15 @@ extend Lowerer {
 			self.intern(.Ref(inner: self.tyOf(texts), kind: .Shared)),
 			span,
 		)
-		return .Some(
-			self.alloc(
-				.Call(
-					callee: compare,
-					args: [lentStrings, lentTexts],
-					typeArgs: TyList::empty(),
-					order: [0, 1],
-				),
-				BOOL,
-				span,
+		return self.alloc(
+			.Call(
+				callee: compare,
+				args: [lentStrings, lentTexts],
+				typeArgs: TyList::empty(),
+				order: [0, 1],
 			),
+			BOOL,
+			span,
 		)
 	}
 
@@ -1190,7 +1295,7 @@ extend Lowerer {
 		// inside it.
 		val local = kind == .Shared && self.state.localReferences.contains(&operand)
 		var innerHint: Option<Ty> = .None
-		if hint is .Some(h) && self.kind(h) is .Ref(inner: t, ..) then innerHint = .Some(t)
+		if hint is .Some(h) && self.kind(h) is .Ref(inner: t, ..) then innerHint = t
 		// The operand may be a range of elements.
 		val e = self.inferBorrowed(operand, innerHint)
 		val inner = self.tyOf(e)
@@ -1303,7 +1408,7 @@ extend Lowerer {
 			if param.index >= self.typeParams.len() then return .None
 			for c in self.typeParams[param.index as i64].interfaces {
 				if c.interfaceId == interfaceId then
-					return .Some(self.program.interfaces[interfaceId].methods[0].id)
+					return self.program.interfaces[interfaceId].methods[0].id
 			}
 			return .None
 		}
@@ -1326,7 +1431,7 @@ extend Lowerer {
 					c.interfaceId == interfaceId &&
 					!list.isEmpty() &&
 					list[0] == rt {
-					found = .Some(c)
+					found = c
 				}
 			}
 			val constraint = found?
@@ -1335,12 +1440,12 @@ extend Lowerer {
 			for a in args {
 				typeArgs.push(a)
 			}
-			return .Some(OperatorImpl(
+			return OperatorImpl(
 				method: self.program.interfaces[interfaceId].methods[0].id,
 				typeArgs: self.program.types.internList(&typeArgs),
 				rhs: rt,
 				out: if args.len() > 1 then args[1] else lt,
-			))
+			)
 		}
 		val owner = self.ownerOf(lt)?
 		val ownerArgs = self.ownerArgs(lt)
@@ -1356,12 +1461,12 @@ extend Lowerer {
 			if self.program.impls[at].methods.isEmpty() then return .None
 			val method = self.program.impls[at].methods[0]
 			val out = self.program.types.subst(args[1], &ownerArgs)
-			return .Some(OperatorImpl(
+			return OperatorImpl(
 				method: method,
 				typeArgs: self.program.types.internList(&ownerArgs),
 				rhs: rhs,
 				out: out,
-			))
+			)
 		}
 		return .None
 	}
@@ -1538,24 +1643,12 @@ extend Lowerer {
 				opSpan,
 				"no implementation takes these two",
 			)
-			lt != rt && allowed => {
-				val d = Diagnostic::error(
-					INVALID_OPERANDS,
-					"cannot apply `\(text)` to \(self.tyName(lt)) and \(self.tyName(rt))",
-					opSpan,
-					"operands of different types",
-				).withNote(self.unconverted(lt, rt))
-				// An integer literal next to a float was almost certainly meant as a
-				// float literal.
-				if self.program.types.isFloat(lt) && self.state.body.exprs[r].kind is .Int(..) {
-					d.withFix("use a float literal", [Edit::insert(rspan.hi, ".0")])
-				} else if self.program.types.isFloat(rt) &&
-					self.state.body.exprs[l].kind is .Int(..) {
-					d.withFix("use a float literal", [Edit::insert(lspan.hi, ".0")])
-				} else {
-					d
-				}
-			}
+			lt != rt && allowed => Diagnostic::error(
+				INVALID_OPERANDS,
+				"cannot apply `\(text)` to \(self.tyName(lt)) and \(self.tyName(rt))",
+				opSpan,
+				"operands of different types",
+			).withNote(self.unconverted(lt, rt))
 			else => {
 				val what = match op {
 					.Rem => "`%` needs integer operands"
@@ -1629,7 +1722,7 @@ extend Lowerer {
 		if lt == rt && wanted is .Some(interfaceId) {
 			val constraint = Constraint(interfaceId: interfaceId, args: TyList::empty())
 			val chain = self.unmetChain(lt, constraint)
-			if !chain.isEmpty() then unmet = .Some((constraint, chain))
+			if !chain.isEmpty() then unmet = (constraint, chain)
 		}
 		// A type says it compares with `@derive(Eq)` and that it is ordered
 		// with `@derive(Ord)`, and the compiler writes both.
@@ -1734,8 +1827,7 @@ extend Lowerer {
 		val target = self.resolveTy(ty)
 		// `null as ptr<T>` is a pointer of the type it is cast to.
 		val hint: Option<Ty> =
-			if self.ast.exprs[expr].kind is .Null && self.kind(target) is .Ptr(..) then
-				.Some(target)
+			if self.ast.exprs[expr].kind is .Null && self.kind(target) is .Ptr(..) then target
 			else .None
 		val e = self.operand(expr, hint)
 		val from = self.tyOf(e)
@@ -1747,8 +1839,10 @@ extend Lowerer {
 			return self.alloc(.Cast(inner: e, wraps: false), target, span)
 		// A character is its number, cut to the integer type's width as any
 		// number is; of the numbers, only a byte is always a character.
-		if from == CHAR && types.isInteger(target) then
+		if from == CHAR && types.isInteger(target) {
+			if target == U8 then self.byteCast(expr, span)
 			return self.alloc(.Cast(inner: e, wraps: false), target, span)
+		}
 		if target == CHAR && from == U8 then
 			return self.alloc(.Cast(inner: e, wraps: false), target, span)
 		if target == CHAR && types.isInteger(from) {
@@ -1817,6 +1911,33 @@ extend Lowerer {
 		}
 		self.report(diagnostic)
 		return self.errorExpr(span)
+	}
+
+	/// Warns of an ASCII character's literal made a byte, `'[' as u8`, which
+	/// the byte literal `b'['` says in one token, and cannot fail. The fix
+	/// keeps the literal as it is written, escapes and all, which a byte
+	/// literal reads the same way.
+	var fn byteCast(expr: ast::ExprId, span: Span) = {
+		val .Char(value) = self.ast.exprs[expr].kind else return
+		val literal = self.ast.exprs[expr].span
+		if value >= 0x80 then return
+		val shown = "`b'\(byteEscaped(value as u8))'`"
+		self.report(
+			Diagnostic::warning(
+				BYTE_CAST,
+				"a byte is written \(shown)",
+				span,
+				"a character made a byte",
+			).withFix(
+				"write \(shown)",
+				[
+					Edit::insert(literal.lo, "b"),
+					Edit::replace(Span::new(lo: literal.hi, hi: span.hi), ""),
+				],
+			).withNote(
+				"`b'x'` is the byte of an ASCII character, one token where a cast is three, and a character that is not ASCII is refused where it is written",
+			),
+		)
 	}
 
 	/// `e as% target`: an integer, or a character, as an integer type,
@@ -1959,7 +2080,7 @@ extend Lowerer {
 		}
 		if !self.ast.lineDots.contains(&field) then return .None
 		val .Field(base, name, ..) = self.ast.exprs[field].kind else return .None
-		if self.state.variantTails.contains(&field) then return .Some(self.infer(base, hint))
+		if self.state.variantTails.contains(&field) then return self.infer(base, hint)
 		val .Some(expected) = hint else return .None
 		val .Enum(id: enumId, ..) = self.kind(expected) else return .None
 		var named = false
@@ -1969,7 +2090,7 @@ extend Lowerer {
 		if !named then return .None
 		self.reportVariantUnder(enumId, base, name)
 		self.infer(base, .None)
-		return .Some(self.errorExpr(self.ast.exprs[id].span))
+		return self.errorExpr(self.ast.exprs[id].span)
 	}
 
 	/// E0126: `.name`, a variant of the enum `enumId`, at the start of a
@@ -1996,3 +2117,16 @@ extend Lowerer {
 /// Whether the integer type `t` holds the value of that sign and magnitude.
 fn holdsValue(t: IntTy, negative: bool, magnitude: u128): bool =
 	if negative then magnitude <= t.minMagnitude() else magnitude <= t.max()
+
+/// A byte as a byte literal writes it between its quotes: an escape where
+/// the character has one or is not printable.
+fn byteEscaped(byte: u8): String = match byte {
+	b'\n' => String::of("\\n")
+	b'\t' => String::of("\\t")
+	b'\r' => String::of("\\r")
+	b'\0' => String::of("\\0")
+	b'\\' => String::of("\\\\")
+	b'\'' => String::of("\\'")
+	_ if byte >= 0x20 && byte < 0x7F => "\(byte as char)"
+	_ => "\\u{\(byte, radix: 16, upper: true)}"
+}

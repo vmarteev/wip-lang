@@ -6,6 +6,7 @@ import syntax::{
 	Edit,
 	INTEGER_OUT_OF_RANGE,
 	MISMATCHED_TYPES,
+	NEEDLESS_WRAPPER,
 	Span,
 	UNSATISFIED_CONSTRAINT
 }
@@ -16,7 +17,7 @@ extend Lowerer {
 	/// Checks `e` against `expected`; `context` labels where the expectation
 	/// comes from, for the mismatch diagnostic.
 	var fn checkIn(e: ast::ExprId, expected: Ty, context: Option<(Span, str)>): ExprId = {
-		val id = self.infer(e, .Some(expected))
+		val id = self.infer(e, expected)
 		return self.coerce(id, expected, context)
 	}
 
@@ -28,7 +29,7 @@ extend Lowerer {
 	}
 
 	var fn checkOperand(e: ast::ExprId, expected: Ty): ExprId = {
-		val id = self.operand(e, .Some(expected))
+		val id = self.operand(e, expected)
 		return self.coerce(id, expected, .None)
 	}
 
@@ -56,7 +57,7 @@ extend Lowerer {
 	var fn checkArgument(e: ast::ExprId, expected: Ty, context: Option<(Span, str)>): ExprId = {
 		// An index handed to `at` is any integer, as `x[i]` takes one.
 		if expected == I64 && self.state.indexOperands.contains(&e) then return self.indexValue(e)
-		val id = self.inferArgument(e, .Some(expected))
+		val id = self.inferArgument(e, expected)
 		return self.coerceTo(id, expected, context, true)
 	}
 
@@ -109,10 +110,10 @@ extend Lowerer {
 					"does not fit in `\(name)`",
 				).withNote(note),
 			)
-			return .Some(self.errorExpr(span))
+			return self.errorExpr(span)
 		}
 		val value = (if negative then 0 -% magnitude else magnitude) & to.mask()
-		return .Some(self.alloc(.Int(value), expected, span))
+		return self.alloc(.Int(value), expected, span)
 	}
 
 	/// The operands of a binary operator, where one is an integer constant of
@@ -155,13 +156,13 @@ extend Lowerer {
 		if self.waitingLiteral(operand) is .Some(local) then
 			self.decideLiteral(
 				local,
-				.Some(pointee),
+				pointee,
 				into: true,
 				from: false,
 				at: file.exprs[operand].span,
 			)
 		val lent = self.reference(op, operand, .None, expr.span, true)
-		val .Ref(inner: target, ..) = self.kind(self.tyOf(lent)) else return .Some(lent)
+		val .Ref(inner: target, ..) = self.kind(self.tyOf(lent)) else return lent
 		val fits =
 			pointee == UNIT ||
 			target == pointee ||
@@ -178,8 +179,10 @@ extend Lowerer {
 		if self.checkedEarly(e) is .Some(checked) then return checked
 		val file = self.ast
 		val expr = &file.exprs[e]
+		// What `&place` lends, where an `Option` or a `Result` of the
+		// reference is expected, is what its success refers to.
 		if expr.kind is .Unary(op, operand, ..) && op is .Ref | .RefVar then
-			return self.reference(op, operand, hint, expr.span, true)
+			return self.reference(op, operand, self.literalHint(e, hint), expr.span, true)
 		if expr.kind is .Block(block) {
 			val (checked, ty) = self.argumentBlock(&block, hint)
 			return self.alloc(.Block(checked), ty, expr.span)
@@ -195,10 +198,30 @@ extend Lowerer {
 		context: Option<(Span, str)>,
 		argument: bool,
 	): ExprId = {
+		val made = self.conversion(id, expected, context, argument)
+		if made != id then self.state.converted.add(made)
+		return made
+	}
+
+	/// What `coerceTo` makes of `id`: itself where it is of the type
+	/// expected, or what it converts to.
+	var fn conversion(
+		id: ExprId,
+		expected: Ty,
+		context: Option<(Span, str)>,
+		argument: bool,
+	): ExprId = {
 		val actual = self.state.body.exprs[id].ty
-		if actual == expected || self.isPoisoned(actual) || self.hasError(expected) then return id
+		if actual == expected {
+			if self.state.writtenSuccesses.contains(&id) then self.needlessWrapper(id)
+			return id
+		}
+		if self.isPoisoned(actual) || self.hasError(expected) then return id
 		// Where nothing is expected, a value is discarded.
 		if expected == UNIT then return self.discard(id)
+		// A value where an `Option` or a `Result` of it is expected is its
+		// `.Some` or its `.Ok`.
+		if self.wrapped(id, expected) is .Some(wrapped) then return wrapped
 		if self.constantAs(id, expected) is .Some(converted) then return converted
 		if self.widened(id, expected) is .Some(widened) then return widened
 		if self.derefCoercion(id, expected) is .Some(coerced) then return coerced
@@ -258,6 +281,66 @@ extend Lowerer {
 		return id
 	}
 
+	/// What a value is where the prelude's `Option` or `Result` is expected:
+	/// the enum, and the type its success holds — `T` of `Option<T>` and of
+	/// `Result<T, E>`, whose `.Some` and `.Ok` each declares first.
+	fn success(expected: Ty): Option<(EnumId, Ty)> = {
+		val .Enum(id, args) = self.kind(expected) else return .None
+		val known = &self.program.preludeItems
+		if known.enumeration(.Option) != id && known.enumeration(.Result) != id then return .None
+		return (id, self.program.types.list(args)[0])
+	}
+
+	/// Whether `ty` is the enum `enumId`, of any arguments.
+	fn ofEnum(ty: Ty, enumId: EnumId): bool = match self.kind(ty) {
+		.Enum(id, ..) => id == enumId
+		_ => false
+	}
+
+	/// The success's type where `expected` is an `Option` or a `Result`, and
+	/// `expected` itself where it is not: what a literal written there is.
+	fn successOr(expected: Ty): Ty = match self.success(expected) {
+		.Some((_, inner)) => inner
+		.None => expected
+	}
+
+	/// A value where an `Option` or a `Result` of its type is expected: its
+	/// `.Some` or its `.Ok`. The value is of the success's type exactly, and
+	/// is wrapped once: an `Option<i64>` where an `Option<Option<i64>>` is
+	/// expected is its `.Some`, and an `i64` there is refused. A value of a
+	/// `Result`'s error type is never its `.Err`, which is written.
+	var fn wrapped(id: ExprId, expected: Ty): Option<ExprId> = {
+		val (enumId, inner) = self.success(expected)?
+		if self.tyOf(id) != inner then return .None
+		val span = self.state.body.exprs[id].span
+		return self.alloc(.Variant(id: enumId, variant: 0, args: [id], order: [0]), expected, span)
+	}
+
+	/// E0469: `.Some(value)` or `.Ok(value)` taken where its type was
+	/// expected, which would be the same written as the value alone.
+	var fn needlessWrapper(id: ExprId) = {
+		self.state.writtenSuccesses.remove(&id)
+		val .Variant(args, ..) = self.state.body.exprs[id].kind else return
+		val span = self.state.body.exprs[id].span
+		val inner = self.state.body.exprs[args[0]].span
+		val ty = self.tyOf(id)
+		val .Some((enumId, _)) = self.success(ty) else return
+		val variant = self.text(self.program.enums[enumId].variants[0].name)
+		val option = self.program.preludeItems.enumeration(.Option) == enumId
+		val wrapper = if option then "an `Option`" else "a `Result`"
+		self.report(
+			Diagnostic::warning(
+				NEEDLESS_WRAPPER,
+				"`.\(variant)` is said by the type expected",
+				Span::new(span.lo, inner.lo),
+				"\(self.tyName(ty)) expected here",
+			).withNote("a value where \(wrapper) of its type is expected is its `.\(variant)`; `.None` and `.Err(…)` are still written").withFix("write the value alone", [
+				Edit::replace(Span::new(span.lo, inner.lo), ""),
+				Edit::replace(Span::new(inner.hi, span.hi), ""),
+			]),
+		)
+	}
+
 	/// Why a number is not taken where a number of type `expected` is.
 	fn notWidened(actual: Ty, expected: Ty): String = {
 		val types = &self.program.types
@@ -274,7 +357,7 @@ extend Lowerer {
 		if self.kind(code) !is .Fn(..) then return .None
 		if self.kind(self.tyOf(id)) != .Ref(inner: code, kind: .Shared) then return .None
 		val span = self.state.body.exprs[id].span
-		return .Some(self.alloc(.LendClosure(id), expected, span))
+		return self.alloc(.LendClosure(id), expected, span)
 	}
 
 	/// Whether `id` is an array written in a constant's value, outside any
@@ -304,7 +387,7 @@ extend Lowerer {
 		val span = self.state.body.exprs[id].span
 		if self.placeRoot(id) !is .NotAPlace then return .None
 		val ty = self.intern(.Ref(inner: actual, kind: .Shared))
-		return .Some(self.alloc(.Ref(id), ty, span))
+		return self.alloc(.Ref(id), ty, span)
 	}
 
 	/// A `String` passed where a `str` is expected lends its bytes for the
@@ -317,14 +400,14 @@ extend Lowerer {
 		// The expression is the argument itself, not something inside it.
 		if !argument then return .None
 		if expected == STR then return self.lendString(id)
-		if self.textAsString(id, expected) is .Some(lent) then return .Some(lent)
+		if self.textAsString(id, expected) is .Some(lent) then return lent
 		if self.kind(expected) != .Ref(inner: STR, kind: .Shared) ||
 			self.kind(self.tyOf(id)) !is .Struct(..) {
 			return .None
 		}
 		val lent = self.lendString(id)?
 		val span = self.state.body.exprs[id].span
-		return .Some(self.alloc(.Ref(lent), expected, span))
+		return self.alloc(.Ref(lent), expected, span)
 	}
 
 	/// Text where a `String` is expected is copied into one, by `String::of`,
@@ -335,12 +418,10 @@ extend Lowerer {
 		if self.tyOf(id) != STR || !self.program.isString(expected) then return .None
 		val of = self.program.preludeItems.function(.StringOf)?
 		val span = self.state.body.exprs[id].span
-		return .Some(
-			self.alloc(
-				.Call(callee: of, args: [id], typeArgs: TyList::empty(), order: [0]),
-				expected,
-				span,
-			),
+		return self.alloc(
+			.Call(callee: of, args: [id], typeArgs: TyList::empty(), order: [0]),
+			expected,
+			span,
 		)
 	}
 
@@ -360,7 +441,7 @@ extend Lowerer {
 			span,
 		)
 		val kept = self.alloc(.Undropped(made), string, span)
-		return .Some(self.alloc(.Ref(kept), expected, span))
+		return self.alloc(.Ref(kept), expected, span)
 	}
 
 	/// A container given where a call expects a slice is lent as the elements
@@ -398,7 +479,7 @@ extend Lowerer {
 		// array or a slice has its own coercions.
 		if (kind == .Var && given != .Var) ||
 			self.kind(container) is .Array(..) | .ArrayOf(..) | .Slice(..) | .Own(..) ||
-			self.itemsElement(container) != .Some(elem) {
+			self.itemsElement(container) != elem {
 			return .None
 		}
 		// What lends: the container `&c` was written of, or what a reference
@@ -413,7 +494,7 @@ extend Lowerer {
 		// A container that cannot be written was reported where `&var` was
 		// written of it; it is lent all the same, so that it is reported once.
 		if kind == .Var then self.writableForWriting(place)
-		return .Some(self.alloc(.Ref(place), expected, span))
+		return self.alloc(.Ref(place), expected, span)
 	}
 
 	/// The type `String::toStr` belongs to: the prelude's `String`.
@@ -426,7 +507,7 @@ extend Lowerer {
 	/// `str`.
 	fn lendsText(ty: Ty): bool = {
 		val .Some(owner) = self.stringOwner() else return false
-		return self.ownerOf(ty) == .Some(owner)
+		return self.ownerOf(ty) == owner
 	}
 
 	/// The value, read as the text it holds, when it is a `String`: `text`
@@ -436,7 +517,7 @@ extend Lowerer {
 	var fn lendString(id: ExprId): Option<ExprId> = {
 		val toStr = self.program.preludeItems.function(.StringToStr)?
 		val owner = self.program.ownerOfFn(toStr)?
-		if self.ownerOf(self.tyOf(id)) != .Some(owner) then return .None
+		if self.ownerOf(self.tyOf(id)) != owner then return .None
 		// What a reference or an `own` holds is the `String` lent: `&text`
 		// where a `str` is taken, and a box a `str`'s method is called on.
 		val text = self.autoderef(id)
@@ -444,12 +525,10 @@ extend Lowerer {
 		val span = self.state.body.exprs[text].span
 		val refTy = self.intern(.Ref(inner: ty, kind: .Shared))
 		val receiver = self.alloc(.Ref(text), refTy, span)
-		return .Some(
-			self.alloc(
-				.Call(callee: toStr, args: [receiver], typeArgs: TyList::empty(), order: [0]),
-				STR,
-				span,
-			),
+		return self.alloc(
+			.Call(callee: toStr, args: [receiver], typeArgs: TyList::empty(), order: [0]),
+			STR,
+			span,
 		)
 	}
 
@@ -465,7 +544,7 @@ extend Lowerer {
 		}
 		if kind != actualKind then return .None
 		val sliceElem: Option<Ty> = match self.kind(target) {
-			.Slice(elem) => .Some(elem)
+			.Slice(elem) => elem
 			_ => .None
 		}
 		// How many `own`s to look through, and whether what is found there is
@@ -492,7 +571,7 @@ extend Lowerer {
 			e = self.alloc(.Deref(e), at, span)
 		}
 		if unsize then e = self.alloc(.SubSlice(base: e, lo: .None, hi: .None), target, span)
-		return .Some(self.alloc(.Ref(e), expected, span))
+		return self.alloc(.Ref(e), expected, span)
 	}
 
 	var fn mismatch(id: ExprId, expected: Ty, context: Option<(Span, str)>) = {
@@ -505,9 +584,14 @@ extend Lowerer {
 		diagnostic = self.withKeptOwn(diagnostic, id, expected)
 		val stringOwner = self.stringOwner()
 		when {
-			self.program.types.isFloat(expected) && kind is .Int(..) =>
-				diagnostic = diagnostic.withFix("use a float literal", [
-					Edit::insert(span.hi, ".0"),
+			// A `Result`'s error where it is expected: the success is said by the
+			// type, and a failure by `.Err`.
+			self.errorOf(expected) == actual =>
+				diagnostic = diagnostic.withNote(
+					"a value where a `Result` is expected is its `.Ok`; a failure is said with `.Err(…)`",
+				).withFix("make it the error", [
+					Edit::insert(span.lo, ".Err("),
+					Edit::insert(span.hi, ")"),
 				])
 			// A number where another kind of number is expected: why it is not
 			// taken as one.
@@ -593,7 +677,7 @@ extend Lowerer {
 			self.kind(expected) is .Ref(inner: target, kind: refKind) &&
 				self.kind(target) is .Slice(elem) &&
 				self.kind(actual) !is .Ref(..) &&
-				self.itemsElement(actual) == .Some(elem) => {
+				self.itemsElement(actual) == elem => {
 				// A container where a slice of its elements is expected: a call lends
 				// them, once it is borrowed.
 				val text = if refKind == .Var then "&var " else "&"
@@ -604,7 +688,7 @@ extend Lowerer {
 			self.kind(expected) is .Ref(inner: target, kind: .Var) &&
 				self.kind(target) is .Slice(elem) &&
 				self.kind(actual) is .Ref(inner: have, kind: .Shared) &&
-				self.itemsElement(have) == .Some(elem) &&
+				self.itemsElement(have) == elem &&
 				kind is .Ref(inner) => {
 				// `&c` where its elements are lent to be written.
 				val between = Span::new(span.lo + 1, self.state.body.exprs[inner].span.lo)

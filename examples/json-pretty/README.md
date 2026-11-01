@@ -15,6 +15,10 @@ What it shows:
   error that says where, by line and column.
 - **Recursion over an enum** with `match`, each case writing into a
   `String` it is lent with `&var`.
+- **Implicit parameters:** the layout and the `String` written into are
+  handed down the recursion without being named at each call. `write` and
+  `indent` say `implicit` in their signatures, and `pretty` declares the
+  `String` an `implicit var`.
 - **A value's own `Text`:** a leaf, and a key, are written as `Json`
   writes them compact, escapes and all.
 - **A struct with defaults,** `Layout()`, that options change field by

@@ -132,6 +132,44 @@ extend Lowerer {
 		.None => false
 	}
 
+	/// `f64`, where `parts` take their type from beside each other and
+	/// nothing else says one: each is number-shaped, and a float literal is
+	/// among them, which makes the integer literals beside it floats, `if
+	/// held then 1 else 0.5`. Nothing otherwise, and the first says the type.
+	fn floatAmong(parts: &[ast::ExprId]): Option<Ty> = {
+		var float = false
+		for part in parts {
+			if !self.numberShaped(part) then return .None
+			if self.floatShaped(part) then float = true
+		}
+		return if float then F64 else .None
+	}
+
+	/// Whether a float literal is among the values of `e`, a number literal
+	/// or an `if`, a `match` or a block of them.
+	fn floatShaped(e: ast::ExprId): bool = {
+		val file = self.ast
+		return match file.exprs[e].kind {
+			.Float(..) => true
+			.Unary(op: .Neg, operand, ..) | .Paren(inner: operand) => self.floatShaped(operand)
+			.If(thenBlock, elseBranch: .Some(other), ..) =>
+				self.blockFloatShaped(&thenBlock) || self.floatShaped(other)
+			.Block(block) => self.blockFloatShaped(&block)
+			.Match(arms, ..) => {
+				for arm in arms {
+					if self.floatShaped(arm.body) then return true
+				}
+				false
+			}
+			_ => false
+		}
+	}
+
+	fn blockFloatShaped(block: &ast::Block): bool = match blockValue(self.ast, &block) {
+		.Some(value) => self.floatShaped(value)
+		.None => false
+	}
+
 	/// Takes back what checking `value` added since `mark`, and answers what
 	/// stands for it until its local's first use: an error of what is known
 	/// of its type. The expressions it added are the arena's last.
@@ -151,7 +189,7 @@ extend Lowerer {
 		val .Name(sym) = self.ast.exprs[e].kind else return .None
 		val local = self.lookup(sym)?
 		return match self.state.pendingLocals.get(&local) {
-			.Some(pending) if !pending.decided => .Some(local)
+			.Some(pending) if !pending.decided => local
 			_ => .None
 		}
 	}
@@ -160,13 +198,13 @@ extend Lowerer {
 	/// type.
 	fn waitingLiteral(e: ast::ExprId): Option<LocalId> = {
 		val local = self.waitingLocal(e)?
-		return if self.state.pendingLocals.at(&local).literal then .Some(local) else .None
+		return if self.state.pendingLocals.at(&local).literal then local else .None
 	}
 
 	/// The first use of a local that is a number literal, where `found` is
 	/// the type the use says, if any. It takes that type where its literal
-	/// would: a type of the literal's kind, integer or float, where the
-	/// literal's own would not do — not where its own widens to the type
+	/// would: a float type, or of an integer literal an integer type, where
+	/// the literal's own would not do — not where its own widens to the type
 	/// expected, `into`, nor where a value of the type found widens to its
 	/// own, `from`, which compile as they are. Otherwise it keeps its own.
 	var fn decideLiteral(local: LocalId, found: Option<Ty>, into: bool, from: bool, at: Span) = {
@@ -179,9 +217,9 @@ extend Lowerer {
 		val ty: Option<Ty> = match found {
 			.Some(t) if t != itsOwn &&
 				types.isNumeric(t) &&
-				types.isInteger(t) == types.isInteger(itsOwn) &&
+				self.literalTakes(itsOwn, t) &&
 				!(into && types.widens(itsOwn, t)) &&
-				!(from && types.widens(t, itsOwn)) => .Some(t)
+				!(from && types.widens(t, itsOwn)) => t
 			_ => .None
 		}
 		if ty is .Some(t) {
@@ -191,16 +229,22 @@ extend Lowerer {
 		self.state.pendingLocals.at(&local).decided = true
 	}
 
+	/// Whether a number literal whose own type is `itsOwn` takes the type
+	/// `wanted` where that is expected: an integer literal any number type, a
+	/// float literal a float type.
+	fn literalTakes(itsOwn: Ty, wanted: Ty): bool = {
+		val types = &self.program.types
+		return types.isFloat(wanted) || types.isInteger(wanted) && types.isInteger(itsOwn)
+	}
+
 	/// `diagnostic`, about `e` where a number of type `wanted` is: where `e`
 	/// is a number literal's local that kept its own type, why, and how to
 	/// say the type.
 	fn withKeptOwn(diagnostic: Diagnostic, e: ExprId, wanted: Ty): Diagnostic = {
 		val .Local(local) = self.state.body.exprs[e].kind else return diagnostic
 		val .Some(kept) = self.state.keptOwn.get(&local) else return diagnostic
-		val types = &self.program.types
 		val itsOwn = self.state.body.locals[local].ty
-		if !types.isNumeric(wanted) || types.isInteger(wanted) != types.isInteger(itsOwn) then
-			return diagnostic
+		if !self.literalTakes(itsOwn, wanted) then return diagnostic
 		val name = self.text(kept.name.sym)
 		val keyword = if kept.mutable then "var" else "val"
 		val said =
@@ -217,7 +261,7 @@ extend Lowerer {
 	/// other is a constant, which takes its type from beside it as the
 	/// literal does.
 	var fn decideBeside(local: LocalId, other: ExprId, wanted: Ty, span: Span) = {
-		val found: Option<Ty> = if self.constantShaped(other) then .None else .Some(wanted)
+		val found: Option<Ty> = if self.constantShaped(other) then .None else wanted
 		self.decideLiteral(local, found, into: true, from: true, at: span)
 	}
 
@@ -236,7 +280,7 @@ extend Lowerer {
 			self.report(self.notKnownHere(&pending, ty, span))
 			return
 		}
-		self.recheck(local, pending, .Some(ty))
+		self.recheck(local, pending, ty)
 	}
 
 	/// Checks a waiting local's value again, against `ty` or as it is, and
@@ -269,8 +313,7 @@ extend Lowerer {
 			val pending = self.state.pendingLocals.remove(&local).unwrap()
 			// A number literal is checked against the type its first use
 			// decided, or its own.
-			val ty: Option<Ty> =
-				if pending.literal then .Some(self.state.body.locals[local].ty) else .None
+			val ty: Option<Ty> = if pending.literal then self.state.body.locals[local].ty else .None
 			self.recheck(local, pending, ty)
 		}
 	}
@@ -278,8 +321,8 @@ extend Lowerer {
 	/// What a use says of a waiting local's type, `found`, laid over what its
 	/// value said, `known`: nothing where the two are different types.
 	var fn filled(known: Ty, found: Ty): Option<Ty> = {
-		if known == ERROR then return .Some(found)
-		if !self.hasError(known) then return .Some(known)
+		if known == ERROR then return found
+		if !self.hasError(known) then return known
 		return match (self.kind(known), self.kind(found)) {
 			(.Struct(id: a, args: x), .Struct(id: b, args: y)) if a == b => {
 				val args = self.filledArgs(x, y)?
@@ -300,7 +343,7 @@ extend Lowerer {
 		for i in 0..knownArgs.len() {
 			args.push(self.filled(knownArgs[i], foundArgs[i])?)
 		}
-		return .Some(self.program.types.internList(&args))
+		return self.program.types.internList(&args)
 	}
 
 	/// `ty`, with each of its own type arguments still unknown given its
@@ -315,14 +358,14 @@ extend Lowerer {
 		val generics = self.typeGenerics(def)
 		var solution: Vec<Option<Ty>> = Vec()
 		for arg in self.program.types.list(list) {
-			solution.push(if arg == ERROR then .None else .Some(arg))
+			solution.push(if arg == ERROR then .None else arg)
 		}
 		if solution.len() != generics.len() then return ty
 		for i in 0..generics.len() {
 			if solution[i].isSome() then continue
 			if generics[i].default is .Ty(default) && self.resolved(default, &solution) {
 				val args = solved(&solution)
-				solution[i] = .Some(self.program.types.subst(default, &args))
+				solution[i] = self.program.types.subst(default, &args)
 			}
 		}
 		val tys = solved(&solution)
@@ -416,7 +459,7 @@ extend Lowerer {
 			var method = self.methodOf(owner, name.sym)
 			if method.isNone() {
 				val (offered, _) = self.offered(owner, known, name.sym)
-				if !offered.isEmpty() then method = .Some(offered[0].method)
+				if !offered.isEmpty() then method = offered[0].method
 			}
 			if method is .Some(id) &&
 				self.program.fns[id].receiver is .Some(kind) &&
@@ -449,7 +492,7 @@ extend Lowerer {
 					.Some(n) => {
 						var position: Option<i64> = .None
 						for p in 1..params.len() {
-							if params[p].name == n.sym then position = .Some(p)
+							if params[p].name == n.sym then position = p
 						}
 						match position {
 							.Some(p) => p

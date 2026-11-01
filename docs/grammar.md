@@ -217,8 +217,11 @@ other than a `|` between alternatives, is an error (E0113), with a fix
 that joins it to the line above; so is a line that ends in `.`, with a fix
 that moves the `.` to the start of the next. A line starting
 with `-` is a new expression, so `total = price` followed by `- discount` on
-the next line is two statements; the type checker warns that the second one
-has no effect (E0320).
+the next line is two statements. The second negates a value and drops it,
+which is never what was meant, and the type checker refuses it with the
+same error and fix (E0113), as it refuses any statement that begins with a
+`-` and whose value is not used. A `-` that begins a block's last line,
+whose value the block answers, is a negation and stays one.
 
 Line breaks right after `{` and right before `}` are always allowed. A
 leading `,` in a brace list is not. Items at the top level need no
@@ -562,8 +565,10 @@ jump        = "return" expr? | "become" expr | "break" IDENT? | "continue" IDENT
                                          (* the arm ends the function or the
                                             loop *)
 
-pathExpr    = "." IDENT | exprPath ;    (* "." takes the expected enum;
-                                           a longer path names a module *)
+pathExpr    = "." IDENT | exprPath ;    (* "." names a variant of the type
+                                           expected, or called, one of its
+                                           functions; a longer path names a
+                                           module *)
 exprPath    = IDENT typeArgs? ( "::" IDENT typeArgs? )* ;
             (* at most one typeArgs, after the generic item's name, and only
                where R7 allows: f<i64>(x), Pair<A, B> { … }, Option<i64>::None *)

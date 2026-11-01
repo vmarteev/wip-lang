@@ -80,7 +80,7 @@ struct Node {
 }
 
 fn main() = {
-    val list = Node(value: 1, next: .Some(own Node(value: 2, next: .None)))
+    val list = Node(value: 1, next: own Node(value: 2, next: .None))
     assert(list.value == 1)
     val .Some(rest) = list.next else {
         assert(false, "there is a second node")
@@ -95,7 +95,23 @@ is freed when the value that owns it ends.
 
 A box clones where what it holds does: its clone is a box of its own,
 holding a clone of the value, so `@derive(Clone)` clones a recursive type
-whose children are boxed, and nothing is shared between the two.
+whose children are boxed, and nothing is shared between the two. It
+compares, orders and hashes as what it holds, and is written as that, so
+such a type derives `Eq`, `Ord`, `Hash` and `Text` too:
+
+```wip,run
+@derive(Eq, Text, Clone)
+enum Tree {
+    Leaf(value: i64)
+    Node(left: own<Tree>, right: own<Tree>)
+}
+
+fn main() = {
+    val tree = Tree::Node(left: own .Leaf(value: 1), right: own .Leaf(value: 2))
+    assert(tree.clone() == tree)
+    assert("\(tree)" == ".Node(left: .Leaf(value: 1), right: .Leaf(value: 2))")
+}
+```
 
 A method called on an `own<T>` is `T`'s, and a field read through it is
 `T`'s, as through a reference. An interface is another matter: an

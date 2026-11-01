@@ -352,7 +352,7 @@ fn firstBig(values: &[i64]): i64 = {
 fn firstIndexOver(values: &[i64], least: i64): Option<i64> = {
     var i = 0
     while i < values.len() {
-        if values[i] > least then return .Some(i)
+        if values[i] > least then return i
         i += 1
     }
     return .None
@@ -408,7 +408,7 @@ struct Point {
     y: i64
 }
 
-fn parse(text: str): Option<i64> = if text == "7" then .Some(7) else .None
+fn parse(text: str): Option<i64> = if text == "7" then 7 else .None
 
 fn main() = {
     var (count, label) = (0, String::of("seen"))
@@ -479,7 +479,7 @@ written through holds its place until its arm or block ends:
 
 ```wip,run
 struct Game {
-    fruit: Option<i64> = .Some(500)
+    fruit: Option<i64> = 500
     score: i64 = 0
 }
 
@@ -533,7 +533,7 @@ struct Board {
 }
 
 fn main() = {
-    var board = Board(selected: .Some(7))
+    var board = Board(selected: 7)
     val .Some(id) = board.selected else {
         assert(false, "something is selected")
         return
@@ -569,10 +569,7 @@ extend Game {
 }
 
 fn main() = {
-    var game = Game(
-        talking: .Some(Talk(who: String::of("Ada"))),
-        said: String::of(""),
-    )
+    var game = Game(talking: Talk(who: String::of("Ada")), said: String::of(""))
     if game.talking is .Some(talk) {
         val greeting = "hello, \(talk.who)"
         game.say(greeting.toStr()) // `talk` is not used again
@@ -675,7 +672,7 @@ struct Point {
 }
 
 fn opened(count: i64): Result<Vec<i64>, str> =
-    if count > 0 then .Ok([count]) else .Err("none")
+    if count > 0 then [count] else .Err("none")
 
 fn grow(list: &var Vec<i64>) = list.push(list.len())
 

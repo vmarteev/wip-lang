@@ -581,8 +581,12 @@ error E0010 digits are separated by one `_`
 
 Some warnings say that code is longer than what it means — a `move` the
 compiler would make (E0451), a copy where a move would do (E0448), a
-`clone()` of plain data (E0464) — and their fixes change nothing a program
-does. `wip fix` applies those. Each program it is given, a file or a
+`clone()` of plain data (E0464), a `@derive` of what the type implements
+without being told, as `Eq` on an enum of names or `Clone` on plain data
+(E0467), a character literal made a byte, `'[' as u8` for `b'['` (E0468),
+a `.Some(value)` or an `.Ok(value)` where the type expected says it, and a
+`return .Ok()` where the result is a `Result<void, E>` (E0469) — and their
+fixes change nothing a program does. `wip fix` applies those. Each program it is given, a file or a
 package's directory as `wip check` takes it, or the current directory's,
 is checked with its tests; where it has no errors, each such fix is made
 in the files under the directory the command is typed in, and the program
