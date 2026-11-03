@@ -1,7 +1,7 @@
 // `wip test`, and what `wip mir` and `wip check` write of a program for
 // people and for tools.
 
-import check::{Gate, wrong, write}
+import check::{Gate, run, wrong, write}
 
 /// `wip test` compiles the `.test.wip` files of every module with the
 /// program, runs each `@test` function, and says so; a test sees the names
@@ -121,20 +121,43 @@ fn testFilesOwnNames(gate: &Gate, root: str): Option<String> = {
 	return .None
 }
 
-/// A test that fails ends the run where it is: the line that names it is
-/// unfinished, and the panic says what was asserted and where.
+/// A test that fails ends itself, not the run: each runs in a process of
+/// its own, the run goes on past it, and names the tests that failed at its
+/// end. What a failed test printed and its panic follow its line; what a
+/// test that passed printed is not shown.
 fn failingTest(gate: &Gate, root: str): Option<String> = {
 	write(root, "main.wip", "fn main() = {}\n")
 	write(
 		root,
 		"main.test.wip",
-		"@test\nfn theSumIsRight() = {\n    var total = 0\n    total += 3\n    assert(total == 7, \"three and four\")\n}\n\n@test\nfn neverReached() = assert(true)\n",
+		"import std::io\n\n@test\nfn theSumIsRight() = {\n    var total = 0\n    total += 3\n    io::println(\"added\")\n    assert(total == 7, \"three and four\")\n}\n\n@test\nfn holds() = assert(true)\n\n@test\nfn printsAndHolds() = io::println(\"not shown\")\n\n@test\nfn alsoFails() = assert(false)\n",
 	)
 	val tested = gate.wip(root, ["test", "main.wip"])
 	if tested.exit != .Code(101) ||
-		tested.stdout != "running 2 tests\ntest theSumIsRight ... " ||
-		!tested.stderr.startsWith("panicked: three and four: total == 7\n  at ") {
+		tested.stdout !=
+			"running 4 tests\ntest theSumIsRight ... FAILED\nadded\ntest holds ... ok\ntest printsAndHolds ... ok\ntest alsoFails ... FAILED\n\n2 tests passed, 2 failed:\n  theSumIsRight\n  alsoFails\n" ||
+		!tested.stderr.startsWith("panicked: three and four: total == 7\n  at ") ||
+		!tested.stderr.contains("\npanicked: assertion failed: false\n  at ") {
 		return wrong("`wip test main.wip`", &tested)
+	}
+	return .None
+}
+
+/// A test that leaves memory allocated fails under its own name, where
+/// leaks are checked: each test's process checks what that test left.
+fn aLeakIsItsTests(gate: &Gate, root: str): Option<String> = {
+	write(root, "main.wip", "fn main() = {}\n")
+	write(
+		root,
+		"main.test.wip",
+		"import std::libc\n\n@test\nfn holds() = assert(true)\n\n@test\nfn leaves() = {\n    val kept = own 1\n    libc::exit(0)\n}\n",
+	)
+	val tested = run(gate.command(root, ["test", "main.wip"]).env("WIP_CHECK_LEAKS", "1"))
+	if tested.exit != .Code(101) ||
+		tested.stdout !=
+			"running 2 tests\ntest holds ... ok\ntest leaves ... FAILED\n\n1 test passed, 1 failed:\n  leaves\n" ||
+		tested.stderr != "wip: 1 allocation was never freed\n" {
+		return wrong("`wip test main.wip`, checking leaks", &tested)
 	}
 	return .None
 }
@@ -159,18 +182,19 @@ fn testsThatPanic(gate: &Gate, root: str): Option<String> = {
 	return .None
 }
 
-/// A test that must panic fails where it returns, and the run ends there,
-/// as a panic ends it, with what the test printed and where it is.
+/// A test that must panic fails where it returns, with what it printed and
+/// where it is; the run goes on.
 fn aTestThatReturnsFails(gate: &Gate, root: str): Option<String> = {
 	write(root, "main.wip", "fn main() = {}\n")
 	write(
 		root,
 		"main.test.wip",
-		"import std::io\n\n@test(panics)\nfn returns() = io::println(\"ran to the end\")\n\n@test\nfn neverReached() = assert(true)\n",
+		"import std::io\n\n@test(panics)\nfn returns() = io::println(\"ran to the end\")\n\n@test\nfn runsAfter() = assert(true)\n",
 	)
 	val tested = gate.wip(root, ["test", "main.wip"])
 	if tested.exit != .Code(101) ||
-		tested.stdout != "running 2 tests\ntest returns ... ran to the end\n" ||
+		tested.stdout !=
+			"running 2 tests\ntest returns ... FAILED\nran to the end\ntest runsAfter ... ok\n\n1 test passed, 1 failed:\n  returns\n" ||
 		!tested.stderr.startsWith("panicked: the test was to panic, and it returned\n  at ") ||
 		!tested.stderr.contains("main.test.wip:4:1") {
 		return wrong("`wip test main.wip`", &tested)
@@ -189,7 +213,8 @@ fn aPanicWithAnotherMessageFails(gate: &Gate, root: str): Option<String> = {
 	)
 	val tested = gate.wip(root, ["test", "main.wip"])
 	if tested.exit != .Code(101) ||
-		tested.stdout != "running 1 test\ntest readPastTheEnd ... " ||
+		tested.stdout !=
+			"running 1 test\ntest readPastTheEnd ... FAILED\n\n0 tests passed, 1 failed:\n  readPastTheEnd\n" ||
 		!tested.stderr.startsWith("panicked: index 3 is out of bounds for length 3\n  at ") ||
 		!tested.stderr.contains(
 			"\npanicked: the test was to panic with a message holding \"out of range\", and it panicked with another message\n  at ",

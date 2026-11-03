@@ -409,6 +409,26 @@ fn main() = {
 }
 ```
 
+An index outside the length panics, which is right where it is a
+mistake. Where being past the end is expected — a reader at the end of
+what it reads — `get(i)` asks instead: the element, by reference, or
+nothing where there is none. A negative position is nothing too, never
+counted from the end:
+
+```wip,run
+fn main() = {
+    val numbers = [10, 20, 30]
+    assert(numbers.get(1) == .Some(&20))
+    assert(numbers.get(3).isNone() && numbers.get(-1).isNone())
+    val line = [b' ', b'\t', b'x']
+    var at = 0
+    while line.get(at) is .Some(b' ' | b'\t') {
+        at += 1
+    }
+    assert(at == 2)
+}
+```
+
 A slice is a reference, so it is passed to a function rather than kept in a
 variable: references are second-class, which is [page 7](07-references.md).
 

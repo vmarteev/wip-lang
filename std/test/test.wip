@@ -1,14 +1,21 @@
 // The runner a program built by `wip test` starts in. Its entry calls
 // `wip_tests_begin`, then `wip_test` or `wip_test_panics` for each test in
-// order, then `wip_tests_end`. A test runs where it is called, and a
-// failure ends the run, as a panic ends any program.
+// order, then `wip_tests_end`.
 //
-// A test that must panic runs in a process of its own, since nothing
-// catches a panic: this program, run again with the test's name in
-// `WIP_TEST`, which runs that test alone and prints nothing of its own.
-// The run goes on where that process panicked as the test said it would,
-// and fails where it returned, ended another way, or panicked with another
-// message. What it printed is shown where it fails.
+// Each test runs in a process of its own, since nothing catches a panic:
+// this program, run again with the test's name in `WIP_TEST`, which runs
+// that test alone and prints nothing of its own. So a test that fails ends
+// only itself, and the run goes on. The first process runs none of the
+// tests. A module keeps nothing from one call to the next, so the whole run
+// is the first call: `wip_tests_begin` asks the program for its tests, run
+// again with `WIP_TEST_LIST`, where each call prints the test it stands
+// for; runs each, says `ok` or `FAILED`, and shows what a failed test
+// printed and why it failed; names the tests that failed; and ends the
+// program, with 101 where any did.
+//
+// A test passes where its process returns, and a test that must panic
+// where its process panicked with a message holding the text it names.
+// What a test that passes printed is not shown.
 
 import std::io
 import std::libc::{exit}
@@ -18,90 +25,69 @@ import std::process::{Command}
 /// The variable of the environment that names the one test a run runs.
 val ONLY: str = "WIP_TEST"
 
+/// The variable of the environment that asks a run for its tests' list.
+val LISTING: str = "WIP_TEST_LIST"
+
+/// The variable of the environment that asks a program for its leaks.
+val LEAKS: str = "WIP_CHECK_LEAKS"
+
 /// The status a panic ends a program with.
 val PANICKED: i64 = 101
 
-/// The run's first line, where it runs every test.
-@export("C")
-fn wip_tests_begin(count: i64) = {
-	if only().isNone() then io::println("running \(count) \(tests(count))")
+/// The status a program that leaked ends with, where its leaks are checked.
+val LEAKED: i64 = 70
+
+/// A test of the list: its name, and, where it must panic, the text its
+/// panic's message must hold, which an empty text always does, and where
+/// the test is declared.
+struct Listed {
+	name: String
+	panics: Option<String>
+	file: String
+	line: i64
+	column: i64
 }
 
-/// The run's last line, where every test held. Where one test was named,
-/// and none had its name, the run says so and fails.
+/// The run, where no test is named and no list asked for: every test, each
+/// in a process of its own, and the program ended with what they came to.
+@export("C")
+fn wip_tests_begin(count: i64) = {
+	if only().isSome() || listing() then return
+	val status = runAll(count)
+	exit(status as c_int)
+}
+
+/// Where one test was named, and none had its name, the run says so and
+/// fails.
 @export("C")
 fn wip_tests_end(count: i64) = {
 	if only() is .Some(name) {
 		io::eprintln("error: there is no test named `\(name)`")
 		exit(2)
 	}
-	io::println("\n\(count) \(tests(count)) passed")
 }
 
-/// A test that must return: run here, between its name and `ok`.
+/// A test that must return: run alone where it is the one named, and a
+/// line of the list where the list is asked for.
 @export("C")
 fn wip_test(name: str, run: () => void) = {
-	if only() is .Some(named) {
-		if named == name then alone(run)
+	if listing() {
+		io::println(escaped(name))
 		return
 	}
-	io::print("test \(name) ... ")
-	run()
-	io::println("ok")
+	if named(name) then alone(run)
 }
 
-/// A test that must panic, with a message holding `holding`, which an
-/// empty text always does: run in a process of its own. A failure says
-/// where the test is, `file`, `line` and `column`.
+/// A test that must panic, with a message holding `holding`: run alone
+/// where it is the one named, and a line of the list, with what it must
+/// panic with and where it is, `file`, `line` and `column`.
 @export("C")
 fn wip_test_panics(name: str, run: () => void, holding: str, file: str, line: i64, column: i64) = {
-	if only() is .Some(named) {
-		if named == name then alone(run)
+	if listing() {
+		io::println("\(escaped(name))\t\(escaped(holding))\t\(escaped(file))\t\(line)\t\(column)")
 		return
 	}
-	io::print("test \(name) ... ")
-	// What the program printed goes out before the test's process starts,
-	// so that the run shows where it is.
-	io::flush()
-	val expected =
-		if holding.isEmpty() then String::of("to panic")
-		else "to panic with a message holding \"\(holding)\""
-	val ran = match process::executable() {
-		.Ok(exe) => Command::of(exe).env(ONLY, name).unset("WIP_CHECK_LEAKS").output()
-		.Err(error) => .Err(error)
-	}
-	val output = match move ran {
-		.Ok(output) => output
-		.Err(error) => failed(
-			"cannot run the test, \(expected), in a process of its own: \(error)",
-			file,
-			line,
-			column,
-		)
-	}
-	match output.exit {
-		.Code(code) if code == PANICKED => {
-			if panicMessage(output.stderr).contains(holding) {
-				io::println("ok")
-				return
-			}
-			shown(&output)
-			failed(
-				"the test was \(expected), and it panicked with another message",
-				file,
-				line,
-				column,
-			)
-		}
-		.Code(0) => {
-			shown(&output)
-			failed("the test was \(expected), and it returned", file, line, column)
-		}
-		ended => {
-			shown(&output)
-			failed("the test was \(expected), and it \(ended)", file, line, column)
-		}
-	}
+	if named(name) then alone(run)
 }
 
 /// The test the environment names, where it names one.
@@ -109,6 +95,13 @@ fn only(): Option<String> = {
 	val named = io::env(ONLY)?
 	return if named.isEmpty() then .None else named
 }
+
+/// Whether the environment names this test. Decided apart from running
+/// it, so that the name read is freed before the test's process ends.
+fn named(name: str): bool = only() is .Some(named) && named == name
+
+/// Whether the environment asks for the list of tests.
+fn listing(): bool = io::env(LISTING) is .Some(asked) && !asked.isEmpty()
 
 /// A test run by itself, in the process run for it, which ends with it: as
 /// a panic ends a program, where the test panics, and well where it
@@ -118,18 +111,129 @@ fn alone(run: () => void): never = {
 	exit(0)
 }
 
-/// What a test's process printed, where the test failed: its standard
-/// output, then its standard error, the panic among it.
-fn shown(output: &process::Output) = {
-	io::print(output.stdout)
-	io::eprint(output.stderr)
+/// Every test, each in a process of its own, in the order declared, with a
+/// line for each, the names of those that failed, and the status the run
+/// ends with: 101 where a test failed, and 0 where none did.
+fn runAll(count: i64): i64 = {
+	io::println("running \(count) \(tests(count))")
+	val exe = match process::executable() {
+		.Ok(exe) => exe
+		.Err(error) => {
+			io::eprintln("error: cannot run the tests, each in a process of its own: \(error)")
+			return PANICKED
+		}
+	}
+	val all = match listOf(exe) {
+		.Ok(all) => all
+		.Err(message) => {
+			io::eprintln("error: \(message)")
+			return PANICKED
+		}
+	}
+	var failed: Vec<String> = Vec()
+	for test in all {
+		io::print("test \(test.name) ... ")
+		// What the run printed goes out before the test's process starts, so
+		// that the run shows where it is.
+		io::flush()
+		if passes(exe, &test) then io::println("ok") else failed.push(test.name.clone())
+	}
+	val passed = all.len() - failed.len()
+	if failed.isEmpty() {
+		io::println("\n\(passed) \(tests(passed)) passed")
+		return 0
+	}
+	io::println("\n\(passed) \(tests(passed)) passed, \(failed.len()) failed:")
+	for name in failed {
+		io::println("  \(name)")
+	}
+	return PANICKED
 }
 
-/// A test that failed, and the run ended as a panic ends it: the message,
-/// and where the test is.
-fn failed(message: str, file: str, line: i64, column: i64): never = {
-	io::eprintln("panicked: \(message)\n  at \(file):\(line):\(column)")
-	exit(PANICKED as c_int)
+/// The program's tests, as it lists them, run again with `WIP_TEST_LIST`:
+/// a line each, its name alone where it must return, and its name, the
+/// text it must panic with and its place, apart by tabs, where it must
+/// panic.
+fn listOf(exe: str): Result<Vec<Listed>, String> = {
+	val output = match Command::of(exe).env(LISTING, "1").unset(ONLY).unset(LEAKS).output() {
+		.Ok(output) => output
+		.Err(error) => return .Err("cannot ask the program for its tests: \(error)")
+	}
+	if !output.exit.success() then
+		return .Err("cannot ask the program for its tests: it \(output.exit)\n\(output.stderr)")
+	var all: Vec<Listed> = Vec()
+	for line in output.stdout.lines() {
+		if line.isEmpty() then continue
+		var fields: Vec<String> = Vec()
+		for field in line.split("\t") {
+			fields.push(unescaped(field))
+		}
+		val test =
+			if fields.len() == 5 then
+				Listed(
+					name: fields[0].clone(),
+					panics: fields[1].clone(),
+					file: fields[2].clone(),
+					line: fields[3].toInt().unwrapOr(0),
+					column: fields[4].toInt().unwrapOr(0),
+				)
+			else Listed(name: fields[0].clone(), panics: .None, file: String(), line: 0, column: 0)
+		all.push(test)
+	}
+	return all
+}
+
+/// Runs `test` in a process of its own, and answers whether it did what it
+/// must. Where it did not, the run says `FAILED`, then what the test
+/// printed, its standard output first, then its standard error, with its
+/// panic, then why it failed, where its process does not say.
+fn passes(exe: str, test: &Listed): bool = {
+	var command = Command::of(exe).env(ONLY, test.name).unset(LISTING)
+	// A panic leaves what it held, which is not a leak.
+	if test.panics.isSome() then command = command.unset(LEAKS)
+	val output = match command.output() {
+		.Ok(output) => output
+		.Err(error) => {
+			io::println("FAILED")
+			io::eprintln("cannot run the test in a process of its own: \(error)")
+			return false
+		}
+	}
+	val why = match test.panics {
+		.Some(holding) => notPanicked(&output, holding, test)
+		.None => notReturned(&output)
+	}
+	val .Some(reason) = why else return true
+	io::println("FAILED")
+	io::print(output.stdout)
+	io::eprint(output.stderr)
+	if !reason.isEmpty() then io::eprintln(reason)
+	return false
+}
+
+/// Why a test that must return did not, where it did not; an empty text
+/// where what it printed says, as a panic and a leak do.
+fn notReturned(output: &process::Output): Option<String> = match output.exit {
+	.Code(0) => .None
+	.Code(code) if code == PANICKED || code == LEAKED => String()
+	ended => "the test \(ended)"
+}
+
+/// Why a test that must panic, with a message holding `holding`, did not,
+/// where it did not, said as a panic at the test's place.
+fn notPanicked(output: &process::Output, holding: str, test: &Listed): Option<String> = {
+	val expected =
+		if holding.isEmpty() then String::of("to panic")
+		else "to panic with a message holding \"\(holding)\""
+	val happened = match output.exit {
+		.Code(code) if code == PANICKED => {
+			if panicMessage(output.stderr).contains(holding) then return .None
+			String::of("panicked with another message")
+		}
+		.Code(0) => String::of("returned")
+		ended => "\(ended)"
+	}
+	return "panicked: the test was \(expected), and it \(happened)\n  at \(test.file):\(test.line):\(test.column)"
 }
 
 /// A panic's message, from what its program wrote on its standard error:
@@ -146,6 +250,41 @@ fn panicMessage(written: str): str = {
 		.Some(end) => rest[0..end]
 		.None => rest
 	}
+}
+
+/// A field of the list, with what would end it written out: a backslash,
+/// a tab and a line break.
+fn escaped(text: str): String = {
+	var out = String()
+	for c in text.chars() {
+		when {
+			c == '\\' => out.push("\\\\")
+			c == '\t' => out.push("\\t")
+			c == '\n' => out.push("\\n")
+			else => out.pushChar(c)
+		}
+	}
+	return out
+}
+
+/// A field of the list as it was before `escaped`.
+fn unescaped(text: str): String = {
+	var out = String()
+	var escaping = false
+	for c in text.chars() {
+		if escaping {
+			out.pushChar(
+				when {
+					c == 't' => '\t'
+					c == 'n' => '\n'
+					else => c
+				},
+			)
+			escaping = false
+		} else if c == '\\' then escaping = true
+		else out.pushChar(c)
+	}
+	return out
 }
 
 /// "test" or "tests", as `count` says.

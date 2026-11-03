@@ -2,6 +2,59 @@
 
 Each version published, newest first.
 
+## 0.13.0 — 2026-11-03
+
+Programs written for 0.12 compile as they did, but where marked
+**breaking**; the compiler's errors say what to write instead.
+
+**The language**
+
+- **A function is told where it was called from.** The prelude's
+  `Location` is a place in a program: its file, line, column and
+  function. An implicit parameter of that type, `implicit at: Location`,
+  is filled where nothing of its name is with the place of the call; a
+  helper that takes one and calls another hands its own on, so the place
+  is the first call into the chain. `panic(message, at: at)` reports that
+  place, so a helper panics at the line that called it.
+- **A pattern tests what a box holds, at any depth:** `.Node(left:
+  .Leaf(n), ..)` where the node holds its children in `own` fields,
+  `.Some(.Leaf(n))` of an `Option<own<E>>`, in `match`, `is` and `val …
+  else`. A binding in a box refers to the value where it lies, and `match
+  move` takes it out, freeing the box.
+- **What a guard's `is` binds reaches its arm:** `.Some(entry) if
+  entry.next is .Some(n) => n + 1`.
+- **`match move` of a box** took what it held and then dropped it again,
+  which crashed where it held a `String`; it frees the box and drops only
+  what the pattern left.
+
+**The library**
+
+- **`unwrap`, `get`, `atLast`, `remove`, `insert`, `copyFrom` and the
+  library's other checks panic at the line that called them,** with the
+  library's line among the calls below. **Breaking:** a function with an
+  implicit parameter is not a value, so these are no longer passed as
+  one; a lambda that calls one, `(o) => o.unwrap()`, is.
+- **An element or nothing,** `values.get(index)`, where `values[index]`
+  would panic, of a slice, an array and a vector; and **a byte of text or
+  nothing,** `text.get(index)`, by value, `line.get(at) == b'/'`.
+- **A value taken out of its box,** `unbox(boxed)`, which frees the box.
+
+**The tools**
+
+- **`wip test` runs every test,** each in a process of its own, so a
+  failure ends only its test: the run says `FAILED` under it with what it
+  printed and its panic, goes on, and names the tests that failed at the
+  end. With `WIP_CHECK_LEAKS`, a leak fails the test that left it.
+  **Breaking:** what a test that passes prints is no longer shown, and
+  tests no longer share a process, so one does not see what another left.
+- **Completion after a leading dot** offers what the type expected has:
+  an enum's variants, and, in a value, the type's functions that answer
+  it.
+- **Clearer help:** a `?` in a lambda says it leaves the lambda, not the
+  function around it, and how `Result::collect` gathers many values for
+  one `?`; a value behind a reference that cannot be moved is told to
+  copy, where it was told to `match move`, which cannot take it either.
+
 ## 0.12.0 — 2026-10-31
 
 Programs written for 0.11 compile as they did, but where marked

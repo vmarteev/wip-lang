@@ -176,6 +176,8 @@ fn main() = {
 
     val boxed = own Point(x: 1, y: 2) // a box on the heap
     assert(boxed.x == 1)
+    val point = unbox(boxed) // the value back out, the box freed
+    assert(point.y == 2)
 }
 
 struct Point {
@@ -306,7 +308,9 @@ fn main() = {
 
 A value where an `Option` or a `Result` is expected is its `.Some` or its
 `.Ok`; `.None` and `.Err(…)` are written. `?` passes an error up; `panic`
-and `assert` stop the program, for what must not happen. [Page 9](09-errors.md)
+and `assert` stop the program, for what must not happen. A helper that
+takes `implicit at: Location` is told its caller's place, and
+`panic(message, at: at)` reports it there. [Page 9](09-errors.md)
 
 ## Interfaces and generics
 

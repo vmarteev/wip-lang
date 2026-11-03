@@ -18,7 +18,8 @@ the bytes of a `String`. What borrows is checked against what it borrows:
 it is refused where that has changed or ended. [Page 7](07-references.md#views)
 
 **box** — an `own<T>`: one value on the heap, owned by whatever holds the
-box, and freed where that ends. [Page 6](06-ownership.md)
+box, and freed where that ends; `unbox(boxed)` takes the value back
+out. [Page 6](06-ownership.md)
 
 **closure** — a lambda that uses names from around it. One **lent** for a
 call reads what is around it while the call runs, `&(x: i64) => i64`, or
@@ -104,6 +105,11 @@ writes it. [Page 7](07-references.md#references)
 **`lend fn`, lending pair** — two methods of one name, one answering `&T`
 and one `&var T`, where the call decides which: `board.at(0)` reads and
 `board.at(0) = 10` writes. `lend fn` writes both from one body. [Page 7](07-references.md#lend-fn-the-pair-from-one-body)
+
+**`Location`** — a place in a program: file, line, column and function.
+An implicit parameter of its type is filled, where nothing of its name is,
+with the place of the call, so a function knows where it was called from;
+`panic(message, at: place)` reports it. [Page 3](03-functions.md#the-callers-place)
 
 **list** — `[a, b, c]`: an array where nothing expects more, a `Vec`
 where one is expected, and a buffer, `own<[T]>`, where one is.

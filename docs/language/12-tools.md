@@ -388,8 +388,9 @@ diagnostic's fix where it has one; formats as `wip fmt` does; gives each
 file an outline of its declarations; shows what a name is, with the `///`
 comment above its declaration; goes to where it was declared, in the
 standard library's sources too; and completes what you are typing: a
-value's fields and methods after `.`, a module's items after `::`, and
-the names in scope. It finds every reference to a name, across the
+value's fields and methods after `.`, a module's items after `::`, what
+the type expected has after a leading `.` (an enum's variants, and, in a
+value, the type's functions that answer it), and the names in scope. It finds every reference to a name, across the
 packages that use it, renames one everywhere it is written, and shows a
 call's signature as its arguments are typed.
 
@@ -471,9 +472,34 @@ A test outside the root module is named by its module. `wip test main.wip
 board` runs only the tests whose name holds `board`. A package's tests run
 in the package's root, so a path a test names — a fixture beside it — is
 the package's wherever the command is typed; a program without a
-`package.wip` runs them where the command is typed. A test that fails
-panics, which prints the message and ends the run: the unfinished line names
-the test, and the exit code is 101.
+`package.wip` runs them where the command is typed.
+
+Each test runs in a process of its own: the test program, run again with
+the test's name in `WIP_TEST`, which runs that one test alone and prints
+nothing of its own. A test that fails panics, and the panic ends its
+process, not the run: the run says `FAILED`, shows what the test printed
+and its panic, and goes on to the next test. What a test that passes
+prints is not shown. After the last test the run names those that failed,
+and the exit code is 101 where any did:
+
+```
+running 4 tests
+test theBoardStartsEmpty ... ok
+test board::aBallCanBePlaced ... FAILED
+placing at (9, 0)
+panicked: assertion failed: board.place((9, 0), .Red)
+  at game/board.test.wip:12:5
+test board::aFullBoardEndsTheGame ... ok
+test board::theBoardIsNine ... ok
+
+3 tests passed, 1 failed:
+  board::aBallCanBePlaced
+```
+
+So each test starts clean, seeing nothing the tests before it did, and a
+test written ahead of what it tests costs the others nothing. Set by hand
+on the built program, `WIP_TEST=name` runs one test alone, and shows what
+it prints.
 
 A test may expect a panic. `@test(panics)` is one that must panic, and
 `@test(panics = "out of bounds")` one whose panic's message must hold that
@@ -496,14 +522,10 @@ fn nothingIsNotUnwrapped() = {
 }
 ```
 
-Nothing catches a panic, so such a test runs in a process of its own: the
-test program, run again with the test's name in `WIP_TEST`, which runs that
-one test alone and prints nothing of its own. It passes where that process
-panicked as the test said, and what it printed there is not shown. It fails
+Such a test passes where its process panicked as the test said. It fails
 where the test returned, ended another way, or panicked with another
 message; the failure shows what the test printed and its panic, then why
-it failed and where the test is, and ends the run as any failure does. The
-tests around it run as the rest do, one after another in the one program.
+it failed and where the test is, as any failure does.
 
 Tests check more than a program does. The program they are built into
 checks its moves: a value whose type has a `destroy` of its own is left
@@ -512,9 +534,11 @@ with `a value was dropped after it was moved away` — a bug in the
 compiler that would otherwise run a `destroy` on nothing.
 `WIP_CHECK_MOVES=1` checks moves in any build, and `WIP_CHECK_MOVES=0`
 turns it off in a test's. `WIP_CHECK_LEAKS=1` in the environment of any
-program makes it report, as it ends, what it allocated and never freed;
-only then, or while a test traces its allocations, does a program count
-them, which threads would otherwise wait on one another to do.
+program makes it report, as it ends, what it allocated and never freed,
+and end with 70; under `wip test`, each test's process reports what that
+test left, which fails it under its name. Only then, or while a test traces
+its allocations, does a program count them, which threads would otherwise
+wait on one another to do.
 
 ## Exit codes
 

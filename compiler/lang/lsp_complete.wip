@@ -7,7 +7,10 @@
 // reported and ignored. What the text before the cursor ends with says what
 // is asked:
 //
-// - after `.`, the fields and methods of the value before it;
+// - after `.`, the fields and methods of the value before it, and after a
+//   leading `.`, what the type expected there has that the dot names: an
+//   enum's variants, and, outside a pattern, the type's functions that
+//   answer it;
 // - after `a::`, the items of the module `a`, or the static functions,
 //   constants and variants of the type `a`;
 // - anywhere else, the names in scope: the function's locals declared above
@@ -16,7 +19,7 @@
 
 import std::collections::{Set}
 import std::path
-import hir::{BuiltinOwner, FloatTy, FnId, IntTy, LocalId, PRELUDE, Program, Ty, TypeDef}
+import hir::{BuiltinOwner, EnumId, FloatTy, FnId, IntTy, LocalId, PRELUDE, Program, Ty, TypeDef}
 import syntax::{Interner, Receiver, Span, Symbol}
 
 /// The name written at the cursor, so that the text there parses.
@@ -227,26 +230,51 @@ extend Candidates {
 			if of == owner && self.sees(p.consts[id].module, p.consts[id].isPub) then
 				self.push(&var out, self.name(p.consts[id].name), COMPLETE_CONSTANT, .Const(id))
 		}
-		val methods: Vec<FnId> = match owner {
-			.Struct(id) => p.structs[id].methods.clone()
-			.Enum(id) => {
-				for (i, variant) in p.enums[id].variants.forwards().enumerate() {
-					self.push(
-						&var out,
-						self.name(variant.name),
-						COMPLETE_ENUM_MEMBER,
-						.Variant(id: id, index: i as u32),
-					)
-				}
-				p.enums[id].methods.clone()
-			}
-			.Builtin(builtin) => builtinMethods(&p, builtin)
+		if owner is .Enum(id) then self.variants(id, &var out)
+		for id in self.staticFns(owner) {
+			self.push(&var out, self.name(self.program.fns[id].name), COMPLETE_FUNCTION, .Fn(id))
 		}
-		for id in methods {
-			val def = &p.fns[id]
-			if def.receiver == .Static && self.sees(def.module, def.isPub) then
+	}
+
+	/// What can follow a leading `.` where `owner` is expected: an enum's
+	/// variants, and, outside a pattern, the type's static functions that
+	/// answer it, which a leading dot calls.
+	fn dotted(owner: TypeDef, pattern: bool, out: &var Listed) = {
+		if owner is .Enum(id) then self.variants(id, &var out)
+		if pattern then return
+		for id in self.staticFns(owner) {
+			val def = &self.program.fns[id]
+			if typeDefOf(self.program, def.ret) == owner then
 				self.push(&var out, self.name(def.name), COMPLETE_FUNCTION, .Fn(id))
 		}
+	}
+
+	/// An enum's variants.
+	fn variants(id: EnumId, out: &var Listed) = {
+		for (i, variant) in self.program.enums[id].variants.forwards().enumerate() {
+			self.push(
+				&var out,
+				self.name(variant.name),
+				COMPLETE_ENUM_MEMBER,
+				.Variant(id: id, index: i as u32),
+			)
+		}
+	}
+
+	/// The static functions of a type that may be named where the cursor is.
+	fn staticFns(owner: TypeDef): Vec<FnId> = {
+		val p = &self.program
+		val methods: Vec<FnId> = match owner {
+			.Struct(id) => p.structs[id].methods.clone()
+			.Enum(id) => p.enums[id].methods.clone()
+			.Builtin(builtin) => builtinMethods(&p, builtin)
+		}
+		var found: Vec<FnId> = Vec()
+		for id in methods {
+			val def = &p.fns[id]
+			if def.receiver == .Static && self.sees(def.module, def.isPub) then found.push(id)
+		}
+		return found
 	}
 
 	/// The items a module declares: all of them from inside it, and what it
@@ -325,14 +353,7 @@ extend Candidates {
 /// lists `max`, and not `sum`.
 fn extensions(program: &Program, ty: Ty): Vec<FnId> = {
 	val kind = program.types.kind(ty)
-	val owner: TypeDef = match kind {
-		.Struct(id, ..) => .Struct(id)
-		.Enum(id, ..) => .Enum(id)
-		_ => match BuiltinOwner::of(kind) {
-			.Some(builtin) => .Builtin(builtin)
-			.None => return Vec()
-		}
-	}
+	val .Some(owner) = typeDefOf(&program, ty) else return Vec()
 	var given: Vec<Ty> = Vec()
 	if kind is .Struct(args, ..) | .Enum(args, ..) {
 		for t in program.types.list(args) {
@@ -364,6 +385,19 @@ fn extensions(program: &Program, ty: Ty): Vec<FnId> = {
 		}
 	}
 	return found
+}
+
+/// The struct, enum or built-in type that `ty` is, where it is one.
+fn typeDefOf(program: &Program, ty: Ty): Option<TypeDef> = {
+	val kind = program.types.kind(ty)
+	return match kind {
+		.Struct(id, ..) => .Struct(id)
+		.Enum(id, ..) => .Enum(id)
+		_ => match BuiltinOwner::of(kind) {
+			.Some(builtin) => .Builtin(builtin)
+			.None => .None
+		}
+	}
 }
 
 /// The methods the prelude gives a built-in type.
@@ -418,6 +452,17 @@ pub fn completionItems(
 	match asked(file.text, cursor) {
 		.Member(dot) => {
 			val end = base + dot as u32
+			// A leading dot: the type the placeholder after it was looked for
+			// in, where it names nothing of it.
+			var dotted: Option<(TypeDef, bool)> = .None
+			for (span, named) in program.names {
+				if span.lo == end + 1 && named is .Dotted(owner, pattern) then
+					dotted = (owner, pattern)
+			}
+			if dotted is .Some((owner, pattern)) {
+				items.dotted(owner, pattern, &var listed)
+				return CompletionList(items: listed.items)
+			}
 			// The largest expression that ends at the `.`, in any body: `a.b`
 			// of `a.b.`, not `b`.
 			var best: Option<(Span, Ty)> = .None

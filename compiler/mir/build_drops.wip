@@ -1,6 +1,7 @@
 // Unwinding and drops: the cleanups of scopes and temporaries, drops
 // elaborated into statements, and drop functions.
 
+import std::collections::{Set}
 import hir as hir
 import hir::{BOOL, ExprId, ExprKind, I32, I64, LocalId, PTR_U8, Ty, TyKind, UNIT}
 import syntax::{BinaryOp}
@@ -548,7 +549,11 @@ extend Builder {
 		if !self.needsDrop(ty) then return
 		// A `match` or a `?` may take the value out of it, and a type that
 		// cleans up after itself cannot say so by its bits, so a flag says it.
-		if place.projections.isEmpty() && !self.zeroesItself(ty) && self.hasOwnDrop(ty) {
+		// So may a `match` through a box take what the box holds, which leaves
+		// the box itself to free: the flag says what it holds is gone.
+		val emptied = self.kind(ty) is .Own(inner) && self.hasOwnDrop(inner)
+		if place.projections.isEmpty() &&
+			(emptied || !self.zeroesItself(ty) && self.hasOwnDrop(ty)) {
 			// A temporary made in one branch of what its statement evaluates is
 			// dropped where the branches join, and on the others there is
 			// nothing to drop.
@@ -580,34 +585,42 @@ extend Builder {
 	}
 
 	/// Whether dropping a value of this type runs a `destroy` a program wrote,
-	/// anywhere inside it. Everything else that a drop does — freeing an `own`,
-	/// and the zeroing that follows — can tell a value that was moved away from
-	/// one that was not.
+	/// anywhere inside it, boxes included. Everything else that a drop does —
+	/// freeing an `own`, and the zeroing that follows — can tell a value that
+	/// was moved away from one that was not.
 	var fn hasOwnDrop(ty: Ty): bool = {
+		var seen: Set<Ty> = Set()
+		return self.ownDropWithin(ty, &var seen)
+	}
+
+	var fn ownDropWithin(ty: Ty, seen: &var Set<Ty>): bool = {
 		if self.program.hasDrop(ty) then return true
+		// A type that holds itself, through a box, is looked into once.
+		if seen.contains(&ty) then return false
+		seen.add(ty)
 		match self.kind(ty) {
 			.Struct(..) | .Array(..) => {
 				for (_, part) in self.parts(ty) {
-					if self.hasOwnDrop(part) then return true
+					if self.ownDropWithin(part, &var seen) then return true
 				}
 			}
 			.Enum(..) => {
 				for parts in self.variantParts(ty) {
 					for (_, part) in parts {
-						if self.hasOwnDrop(part) then return true
+						if self.ownDropWithin(part, &var seen) then return true
 					}
 				}
 			}
-			// An `own` says for itself that it was moved away: its pointer is
-			// null, and nothing below it is reached. That is also what keeps
-			// this from following a type that holds itself.
+			// A box moved away says so itself, its pointer null; but a `match`
+			// may take from inside one, which leaves the pointer as it was.
+			.Own(inner) => return self.ownDropWithin(inner, &var seen)
 			_ => {}
 		}
 		return false
 	}
 
 	/// The value at `place` is no longer the temporary's to drop: a `match` arm
-	/// or a `?` has taken it.
+	/// or a `?` has taken it, or, through a box, taken what the box holds.
 	var fn takenFromTemp(place: &Place) = {
 		if self.tempFlags.get(&place.local) is .Some(flag) then
 			self.assign(Place::of(flag), .Use(.Const(.Bool(false))))
@@ -668,10 +681,21 @@ extend Builder {
 		val live = Operand::Copy(Place::of(flag))
 		val drop = self.newBlock()
 		val next = self.newBlock()
-		self.terminate(.Branch(cond: live, thenBlock: drop, otherwise: next))
+		// A box whose contents were taken is freed, and nothing in it dropped:
+		// what it held is the taker's now, and what the taker left was dropped
+		// where it took.
+		val boxed = self.kind(ty) is .Own(..)
+		val emptied = if boxed then self.newBlock() else next
+		self.terminate(.Branch(cond: live, thenBlock: drop, otherwise: emptied))
 		self.switchTo(drop)
 		self.dropPlace(&place, ty)
 		self.terminate(.Goto(next))
+		if boxed {
+			self.switchTo(emptied)
+			self.push(.Free(.Copy(place.clone())))
+			self.push(.Zero(place.clone()))
+			self.terminate(.Goto(next))
+		}
 		self.switchTo(next)
 	}
 

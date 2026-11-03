@@ -41,8 +41,8 @@ with the error. Both also carry `flatMap`, `fold`, `filter`
 (on `Option`), `any`, `all` and `forEach`. `fold` takes a function for each
 case, and calls only the one that applies: `found.fold(() => 0, (n) => n *
 2)`. Each is given its function for the call, which may change what it
-captures. `unwrap` panics where there is nothing to answer, so it is for
-what cannot happen.
+captures. `unwrap` panics where there is nothing to answer, at the line
+that called it, so it is for what cannot happen.
 
 `asRef()` lends an option's value where it lies, as an `Option<&T>`, which
 `map` makes into what it looks at: an `Option<String>` read as an
@@ -96,8 +96,8 @@ fn main() = {
 }
 ```
 
-`at(i)` is the lending pair behind `v[i]`, `items()` lends the whole as a
-slice, and `v[a..b]` is a range of that slice, as an array's is. A
+`at(i)` is the lending pair behind `v[i]`, and `get(i)` the element or
+nothing where `v[i]` would panic; `items()` lends the whole as a slice, and `v[a..b]` is a range of that slice, as an array's is. A
 container whose `x[i]` is a position and which lends its elements as one
 slice — a `Sequence` and an `Items` — is ranged so: a `Set` by the order
 its keys went in, and a type of a program's own. `truncate`, `clear` and
@@ -314,6 +314,27 @@ fn main() = {
     assert("Grüße".toAsciiUpper() == "GRüßE")
     var typed = String::of("añ")
     assert(typed.popChar() == 'ñ' && typed == "a")
+}
+```
+
+`text[i]` is a byte, a `u8`, and panics past the end; `get(i)` is that
+byte or nothing, by value as `text[i]` is, so it compares with a byte:
+`line.get(at) == b'/'` is false at the end, where nothing is. Its
+opposite is not: `line.get(at) != b' '` is true at the end too, since
+nothing is not a space, so a walk to a byte tests what it found:
+
+```wip,run
+fn main() = {
+    val line = "  \tword!"
+    var at = 0
+    while line.get(at) is .Some(b' ' | b'\t') {
+        at += 1
+    }
+    assert(at == 3 && line.get(at) == b'w')
+    while line.get(at) is .Some(byte) && byte != b'!' {
+        at += 1
+    }
+    assert(line.get(at) == b'!' && line.get(at + 1).isNone())
 }
 ```
 

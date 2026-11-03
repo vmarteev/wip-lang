@@ -88,6 +88,7 @@ extend Lowerer {
 					used.typeArgs = &written
 					used.methodTypeArgs = true
 				}
+				used.place = name.span
 				if self.variantWithDot(base, name, used) is .Some(variant) then return variant
 				// A method of the receiver's type; otherwise a field of function
 				// type, checked below.
@@ -167,43 +168,94 @@ extend Lowerer {
 	}
 
 	/// `panic(message)`: a call the checker knows, of type `never`, whose
-	/// message is any text and whose place comes from its span.
+	/// message is any text and whose place comes from its span; or
+	/// `panic(message, at: place)`, whose place is the `Location` given.
 	var fn panicCall(args: &[ast::ExprId], names: &[Option<ast::Name>], span: Span): ExprId = {
-		if firstName(&names) is .Some(name) then
-			self.report(
-				Diagnostic::error(
-					PANIC_ARGUMENT,
-					"the message of a panic is not named",
-					name.span,
-					"a named argument",
-				).withNote("`panic` takes one string: `panic(\"…\")`"),
-			)
-		var message: Option<ExprKind> = .None
-		if args.len() == 1 {
-			// A string written at the call is kept in the program; anything
-			// else is built when the panic happens.
-			if self.messageText(args[0], PANIC_ARGUMENT, "a panic's message") is .Some(value) then
-				message = match self.state.body.exprs[value].kind {
-					.Str(symbol) => .Panic(note: .None, message: symbol)
-					_ => .Panic(note: value, message: .None)
+		var messages: Vec<ast::ExprId> = Vec()
+		var place: Option<ast::ExprId> = .None
+		var misnamed: Vec<ast::ExprId> = Vec()
+		var refused = false
+		for i in 0..args.len() {
+			val name = if i < names.len() then names[i] else .None
+			match name {
+				.None => messages.push(args[i])
+				.Some(named) if self.text(named.sym) == "at" && place.isNone() => place = args[i]
+				.Some(named) => {
+					self.report(
+						Diagnostic::error(
+							PANIC_ARGUMENT,
+							"`panic` takes no argument named `\(self.text(named.sym))`",
+							named.span,
+							"a named argument",
+						).withNote(
+							"`panic` takes one string, and the place it reports where it is given: `panic(\"…\", at: place)`",
+						),
+					)
+					misnamed.push(args[i])
+					refused = true
 				}
-		} else {
+			}
+		}
+		// A message given a name counts as the message it was meant to be,
+		// where none is given without one, so that the mistake is said once.
+		if messages.isEmpty() && !misnamed.isEmpty() then messages.push(misnamed.remove(0))
+		for extra in misnamed {
+			self.infer(extra, .None)
+		}
+		if messages.len() != 1 {
 			self.report(
 				Diagnostic::error(
 					PANIC_ARGUMENT,
-					"`panic` takes one message, but \(args.len()) were given",
+					"`panic` takes one message, but \(messages.len()) were given",
 					span,
 					"a panic takes one string",
 				),
 			)
-			for arg in args {
-				self.infer(arg, .None)
+			for message in messages {
+				self.infer(message, .None)
 			}
+			refused = true
 		}
-		return match move message {
-			.Some(panicked) => self.alloc(panicked, NEVER, span)
-			.None => self.errorExpr(span)
+		val at: Option<ExprId> = match place {
+			.Some(e) => match self.panicPlace(e) {
+				.Some(value) => value
+				.None => {
+					refused = true
+					Option::None
+				}
+			}
+			.None => .None
 		}
+		if refused {
+			if messages.len() == 1 then self.infer(messages[0], .None)
+			return self.errorExpr(span)
+		}
+		// A string written at the call is kept in the program; anything else
+		// is built when the panic happens.
+		val .Some(value) = self.messageText(messages[0], PANIC_ARGUMENT, "a panic's message") else {
+			return self.errorExpr(span)
+		}
+		val panicked = match self.state.body.exprs[value].kind {
+			.Str(symbol) => ExprKind::Panic(note: .None, message: symbol, at: at)
+			_ => ExprKind::Panic(note: value, message: .None, at: at)
+		}
+		return self.alloc(panicked, NEVER, span)
+	}
+
+	/// The place a panic reports, given as `at:`: a `Location`.
+	var fn panicPlace(e: ast::ExprId): Option<ExprId> = {
+		val .Some(id) = self.program.preludeItems.structure(.Location) else return .None
+		val location = self.intern(.Struct(id: id, args: .empty()))
+		val value = self.inferArgument(e, location)
+		val ty = self.tyOf(value)
+		if self.isPoisoned(ty) then return .None
+		if ty == location then return value
+		self.report(
+			Diagnostic::error(PANIC_ARGUMENT, "the place a panic reports is a `Location`", self.state.body.exprs[value].span, "a value of type \(self.tyName(ty))").withNote(
+				"a function told its caller's place takes `implicit at: Location`, and panics `at: at`",
+			),
+		)
+		return .None
 	}
 
 	/// A panic's message or an assert's note: a `str`, or a `String` lent as
@@ -542,7 +594,7 @@ extend Lowerer {
 		// The call keeps the declaration it names. Which C wrapper it goes
 		// through is settled once every body is checked.
 		return self.alloc(
-			.Call(callee: callee, args: lowered, typeArgs: TyList::empty(), order: Vec()),
+			.Call(callee: callee, args: lowered, typeArgs: .empty(), order: Vec()),
 			ret,
 			item.span,
 		)
@@ -656,7 +708,14 @@ extend Lowerer {
 			val filled = self.program.types.subst(slots[slot].ty, &known)
 			if self.isPoisoned(filled) then inference.explained = true else slots[slot].ty = filled
 		}
-		return self.arrangeArguments(&slots, &matched, &checked, item.span, name)
+		return self.arrangeArguments(
+			&slots,
+			&matched,
+			&checked,
+			item.span,
+			item.place.unwrapOr(item.span),
+			name,
+		)
 	}
 
 	/// Reports arguments left over, and parameters given no value. A call
@@ -945,8 +1004,10 @@ extend Lowerer {
 	}
 
 	/// Reports `.name(…)` where the type expected, which is not an enum, has
-	/// no function of that name.
+	/// no function of that name, and keeps the name with the type, for an
+	/// editor.
 	var fn noDotMember(owner: TypeDef, name: ast::Name) = {
+		self.program.names.push((name.span, .Dotted(owner: owner, pattern: false)))
 		val typeName = self.typeName(owner)
 		val text = String::of(self.text(name.sym))
 		var candidates: Vec<str> = Vec()
@@ -1131,7 +1192,7 @@ extend Lowerer {
 				return self.giveUpItem(used)
 			}
 			return self.alloc(
-				.Call(callee: getter, args: Vec(), typeArgs: TyList::empty(), order: Vec()),
+				.Call(callee: getter, args: Vec(), typeArgs: .empty(), order: Vec()),
 				ty,
 				item.span,
 			)

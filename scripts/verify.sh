@@ -112,18 +112,31 @@ fi
 # compile itself faithfully.
 step=$SECONDS
 if {
-    scripts/build.sh --release --with "$stages/1/bin/wip" --out "$stages/2" &&
+    scripts/build.sh --release --with "$stages/1/bin/wip" --out "$stages/2" >"$out/stage2" 2>&1 &&
         "$stages/1/bin/wip" build --release --emit llvm-bc compiler/main.wip -o "$out/1.bc" &&
         "$stages/2/bin/wip" build --release --emit llvm-bc compiler/main.wip -o "$out/2.bc"
-} </dev/null >"$out/stage2" 2>&1 && cmp -s "$out/1.bc" "$out/2.bc"; then
+} </dev/null >"$out/bitcode" 2>&1 && cmp -s "$out/1.bc" "$out/2.bc"; then
     say "the compiler, built by itself" "ok" $((SECONDS - step))
 else
     say "the compiler, built by itself" "FAILED" $((SECONDS - step))
     tail -20 "$out/stage2"
+    tail -20 "$out/bitcode"
     [ -f "$out/2.bc" ] && echo "stage 1 and stage 2 write different bitcode for the compiler"
     exit 1
 fi
 wip="$stages/2/bin/wip"
+
+# Stage 1 is the source's own compiler, so what it warns of in building
+# stage 2 is in the source, and a build that succeeds shows none of it.
+# Stage 1's own build is not held to this: the seed's compiler is older,
+# and warns by older rules.
+if grep -q '\] Warning:' "$out/stage2"; then
+    say "the compiler, without warnings" "FAILED"
+    cat "$out/stage2"
+    failed=1
+else
+    say "the compiler, without warnings" "ok"
+fi
 
 # The gate's checks of `wip`, a program in Wip, which runs below.
 step=$SECONDS

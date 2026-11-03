@@ -88,8 +88,7 @@ extend Builder {
 			.Return(value) => {
 				match value {
 					.Some(v) if self.ret is .Some(ret) && self.isAggregate(self.localTy(ret)) => {
-						val .Some(r) = self.ret else panic("asked above")
-						self.storeExpr(v, Place::of(r))
+						self.storeExpr(v, Place::of(ret))
 						self.dropTemps(mark)
 						self.dropPendingTemps()
 						self.dropAllScopes()
@@ -567,6 +566,9 @@ extend Builder {
 			// first, since the guard reads them; they alias, so there is nothing
 			// to undo.
 			if arm.guard is .Some(guard) {
+				// What the guard's `is` tests bind is made before it runs, as a
+				// condition's is, and is the arm's.
+				val bound = self.conditionBindings(guard)
 				// What the guard makes exists only where its pattern matched,
 				// so it is dropped here, before either way on, and not where
 				// the `match` ends, which other paths reach too. The guard's
@@ -577,7 +579,19 @@ extend Builder {
 				self.dropTemps(mark)
 				val body = self.newBlock()
 				val next = if i + 1 < tests.len() then tests[i + 1] else unmatched
-				self.terminate(.Branch(cond: test, thenBlock: body, otherwise: next))
+				if bound {
+					// Where the guard fails, what it bound is dropped before the
+					// next arm is tried; where it holds, it ends with the arm's
+					// own bindings.
+					val .Some(bindings) = self.scopes.pop() else panic("the guard's bindings")
+					val failed = self.newBlock()
+					self.terminate(.Branch(cond: test, thenBlock: body, otherwise: failed))
+					self.switchTo(failed)
+					self.unwind(bindings.clone())
+					self.terminate(.Goto(next))
+					val arm = self.scopes.len() - 1
+					self.scopes[arm].pushAll(&bindings)
+				} else self.terminate(.Branch(cond: test, thenBlock: body, otherwise: next))
 				self.switchTo(body)
 			}
 			self.dropUntakenTested(&arm.pattern, &tested)
@@ -679,8 +693,7 @@ extend Builder {
 			.One(place, ty) => self.testPattern(&pattern, &place, ty, matched, next)
 			// Tuples of which any one may match: each is tried on the places, as
 			// one value's alternatives are tried on it.
-			.Many(..) if pattern is .Any(..) => {
-				val .Any(alternatives, binding) = pattern else panic("asked above")
+			.Many(..) if pattern is .Any(alternatives, binding) => {
 				val which: Option<Local> = binding.map((number) => self.alternativeMatched(number))
 				for (i, alternative) in alternatives.forwards().enumerate() {
 					val otherwise = if i + 1 == alternatives.len() then next else self.newBlock()
@@ -710,8 +723,7 @@ extend Builder {
 	var fn bindTested(pattern: &hir::Pattern, tested: &Tested) = match tested {
 		.One(place, ty) => self.bind(&pattern, &place, ty)
 		// From whichever alternative matched.
-		.Many(..) if pattern is .Any(binding: .Some(..), ..) => {
-			val .Any(alternatives, binding: .Some(number)) = pattern else panic("asked above")
+		.Many(..) if pattern is .Any(alternatives, binding: .Some(number)) => {
 			val which = self.alternativeMatched(number)
 			self.eachAlternative(&alternatives, which, EachAlternative::BindTested(tested.clone()))
 		}
@@ -728,8 +740,7 @@ extend Builder {
 	var fn dropUntakenTested(pattern: &hir::Pattern, tested: &Tested) = match tested {
 		.One(place, ty) => self.dropUntaken(&pattern, &place, ty)
 		// What the alternative that matched left.
-		.Many(..) if pattern is .Any(binding: .Some(..), ..) => {
-			val .Any(alternatives, binding: .Some(number)) = pattern else panic("asked above")
+		.Many(..) if pattern is .Any(alternatives, binding: .Some(number)) => {
 			val which = self.alternativeMatched(number)
 			self.eachAlternative(
 				&alternatives,
@@ -1012,6 +1023,11 @@ extend Builder {
 				val (referent, ty) = self.referent(&place, scrutineeTy)
 				self.testPattern(&inner, &referent, ty, matched, next)
 			}
+			// What the box holds is tested, where it lies.
+			.Unbox(inner) => {
+				val contents = place.project(.Deref)
+				self.testPattern(&inner, &contents, self.held(scrutineeTy), matched, next)
+			}
 			// Reported already; nothing reaches the arm.
 			.Error => self.terminate(.Goto(next))
 		}
@@ -1026,6 +1042,14 @@ extend Builder {
 		}
 		if isSlicePointer(self.program, ty) then return (place.clone(), pointee)
 		return (place.project(.Deref), pointee)
+	}
+
+	/// The type of what a box holds.
+	fn held(ty: Ty): Ty = {
+		val .Own(inner) = self.kind(ty) else {
+			panic("a pattern tests through a value that is not a box")
+		}
+		return inner
 	}
 
 	/// The place of an array's or a slice's elements, and how many there are,
@@ -1180,6 +1204,11 @@ extend Builder {
 			val (referent, ty) = self.referent(&place, scrutineeTy)
 			self.bind(&inner, &referent, ty)
 		}
+		// What it binds in the box, where it lies.
+		.Unbox(inner) => {
+			val contents = place.project(.Deref)
+			self.bind(&inner, &contents, self.held(scrutineeTy))
+		}
 	}
 
 	/// The local that says which alternative of the `|` numbered `number`
@@ -1287,6 +1316,21 @@ extend Builder {
 					parts.push((part.clone(), elem, binder.clone()))
 				}
 			}
+			// What the box holds: the parts nothing took, and then the box,
+			// whose contents are the taker's now. Where nothing in it was
+			// taken, it is dropped whole.
+			.Unbox(inner) => {
+				val held = self.held(ty)
+				if !self.takes(&inner, held) {
+					self.dropPlace(&place, ty)
+					return
+				}
+				val contents = place.project(.Deref)
+				self.dropUntakenParts(&inner, &contents, held)
+				self.push(.Free(.Copy(place.clone())))
+				self.push(.Zero(place.clone()))
+				return
+			}
 			_ => return
 		}
 		for (field, fieldTy, binder) in parts {
@@ -1328,6 +1372,7 @@ extend Builder {
 				}
 				return false
 			}
+			.Unbox(inner) => return self.takes(&inner, self.held(ty))
 			_ => return false
 		}
 		for (fieldTy, binder) in fields {
@@ -1409,7 +1454,7 @@ fn tests(pattern: &hir::Pattern): bool = match pattern {
 		}
 		false
 	}
-	.Deref(inner) => tests(&inner)
+	.Deref(inner) | .Unbox(inner) => tests(&inner)
 	_ => true
 }
 

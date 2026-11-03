@@ -212,9 +212,17 @@ extend Checker {
 					self.expr(element, self.lookedAt(element), &var state)
 				}
 				var joined: Option<State> = .None
+				// What a guard did, it did on the way to the arms after it too.
+				var tried = state.clone()
 				for arm in arms {
 					val mark = self.borrows.len()
-					var armState = self.bindPlaces(&arm.pattern, &elements, &state)
+					var armState = self.bindPlaces(&arm.pattern, &elements, &tried)
+					// A guard is a condition: what its `is` tests bind, and the
+					// borrows they hold, last until the arm ends.
+					if arm.guard is .Some(guard) {
+						self.expr(guard, .Value, &var armState)
+						tried = armState.clone()
+					}
 					self.expr(arm.body, .Value, &var armState)
 					self.armEnds(&arm.pattern, arm.body, &var armState)
 					self.borrows.truncate(mark)
@@ -232,11 +240,19 @@ extend Checker {
 			.Match(scrutinee, arms) => {
 				self.expr(scrutinee, self.lookedAt(scrutinee), &var state)
 				var joined: Option<State> = .None
+				// What a guard did, it did on the way to the arms after it too.
+				var tried = state.clone()
 				for arm in arms {
-					var armState = state.clone()
+					var armState = tried.clone()
 					val mark = self.borrows.len()
 					self.bindPattern(&arm.pattern, scrutinee, .Match, &var armState)
 					self.bindViews(&arm.pattern, scrutinee, &var armState)
+					// A guard is a condition: what its `is` tests bind, and the
+					// borrows they hold, last until the arm ends.
+					if arm.guard is .Some(guard) {
+						self.expr(guard, .Value, &var armState)
+						tried = armState.clone()
+					}
 					self.expr(arm.body, .Value, &var armState)
 					self.armEnds(&arm.pattern, arm.body, &var armState)
 					self.borrows.truncate(mark)
@@ -249,10 +265,13 @@ extend Checker {
 			// read from it is copied. A C pointer is plain data: it is copied,
 			// never dropped, and the move checker leaves it alone.
 			.Int(..) | .LengthOf(..) | .Float(..) | .Bool(..) | .Str(..) | .Table(..) | .Null
-			| .Zeroed | .FnRef(..) | .Error => {}
+			| .Zeroed | .FnRef(..) | .Here | .Error => {}
 			// A panic ends the program: nothing after it runs, and nothing is
-			// dropped. A note built for it is read there.
-			.Panic(note, ..) => { if note is .Some(n) then self.expr(n, .Value, &var state) }
+			// dropped. A note built for it is read there, and the place given.
+			.Panic(note, at, ..) => {
+				if note is .Some(n) then self.expr(n, .Value, &var state)
+				if at is .Some(place) then self.expr(place, .Value, &var state)
+			}
 		}
 	}
 
@@ -651,7 +670,15 @@ extend Checker {
 				// there either.
 				val kept = match body.exprs[reference].kind {
 					.Local(l) =>
-						binding && self.keptBindings.contains(&l) && !self.readPlaces.contains(&l)
+						binding &&
+							(self.bindingsBehind.contains(&l) ||
+								self.keptBindings.contains(&l) && !self.readPlaces.contains(&l))
+					_ => false
+				}
+				// A binding that is no alias took a reference the value held:
+				// it refers to nothing of the matched value.
+				val heldReference = match body.exprs[reference].kind {
+					.Local(l) => binding && !body.aliasBindings.contains(&l)
 					_ => false
 				}
 				// What a closure captured: its own, and kept, since it may be
@@ -673,6 +700,7 @@ extend Checker {
 					else "cannot \(verb) `\(name)`, which is behind a reference"
 				val label = when {
 					element => "a `for` binding, which refers to an element"
+					heldReference => "a `match` binding of a reference the matched value held"
 					binding => "a `match` binding, which refers to part of the matched value"
 					lent => "lent by a projection, and owned by the caller"
 					else => "behind a `&` reference"
@@ -697,7 +725,7 @@ extend Checker {
 							else "take `\(base)` by value, for `..` to take its fields from: a `move fn`'s `self`, or a parameter that owns it"
 						diagnostic = diagnostic.withHelp(help)
 					}
-					kept =>
+					kept || heldReference =>
 						diagnostic = diagnostic.withHelp(
 							"it lies behind a reference, which neither `move` nor `match move` takes from; copy it with `clone()`",
 						)
@@ -779,6 +807,12 @@ extend Checker {
 		behindReferences(&pattern, &var behind)
 		for local in behind {
 			if body.aliasBindings.contains(&local) then self.keptBindings.add(local)
+			self.bindingsBehind.add(local)
+		}
+		if self.place(scrutinee) is .Some(.ThroughRef(..)) {
+			for (local, _) in binders {
+				self.bindingsBehind.add(local)
+			}
 		}
 		if self.keptReferenceBehind(scrutinee) is .Some(reference) {
 			val found = self.strRoots(reference, &state)

@@ -247,6 +247,38 @@ fn main() = {
 }
 ```
 
+A guard is a condition, so what an `is` test in it binds is seen by the
+rest of the guard and by the arm, as what an `if`'s condition binds is
+seen by its block. What a test binds into a place holds the place while
+the arm runs, and a value the guard owns is dropped where it fails,
+before the next arm is tried:
+
+```wip,run
+enum Mark {
+    Quote
+    Comma
+    Other
+}
+
+fn named(mark: Mark): Option<str> = match mark {
+    .Quote => "quote"
+    .Comma => "unquote"
+    .Other => .None
+}
+
+fn word(token: Option<Mark>): str = match token {
+    .Some(mark) if named(mark) is .Some(name) => name
+    .Some(_) => "a mark of no name"
+    .None => "the end"
+}
+
+fn main() = {
+    assert(word(.Some(.Comma)) == "unquote")
+    assert(word(.Some(.Other)) == "a mark of no name")
+    assert(word(.None) == "the end")
+}
+```
+
 ## Every value is covered
 
 A `match` must cover every value its scrutinee can have. Where one is left
@@ -655,6 +687,46 @@ needs no `_`. A name at the reference binds the reference itself:
 names there, to read: it cannot be written, `match move` takes nothing
 from behind a reference, and it borrows what the reference borrows, so it
 is not used after that changes.
+
+### Through a box
+
+A pattern that tests a value tests what a box holds the same way, at any
+depth: a tree whose children are boxed is taken apart by one pattern.
+What a box holds belongs to the value that owns the box, so a name below
+it is bound as a field's would be — an alias of the place where the value
+is one, and taken by `match move`, which drops what the arm leaves and
+frees the box:
+
+```wip,run
+enum Tree {
+    Leaf(value: i64)
+    Named(name: String)
+    Node(left: own<Tree>, right: own<Tree>)
+}
+
+fn leftmost(tree: &Tree): i64 = match tree {
+    .Node(left: .Leaf(value), ..) => value
+    .Node(left: .Node(left: .Leaf(value), ..), ..) => value
+    _ => 0
+}
+
+fn leftName(tree: Tree): String = match move tree {
+    .Node(left: .Named(name), ..) => name
+    _ => String()
+}
+
+fn main() = {
+    val tree = Tree::Node(left: own .Leaf(value: 1), right: own .Leaf(value: 2))
+    assert(leftmost(&tree) == 1)
+    assert(tree is .Node(left: .Leaf(1), right: .Leaf(2)))
+    val named = Tree::Node(left: own .Named("ann"), right: own .Leaf(value: 0))
+    assert(leftName(named) == "ann")
+}
+```
+
+As with a reference, the `match` covers every case of what the box holds,
+and a name at the box binds the box itself: `.Node(left, ..)` gives
+`left: own<Tree>`.
 
 ## `var` before a name
 

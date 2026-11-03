@@ -511,8 +511,9 @@ fn main() = {
 
 `value is pattern` answers whether the value matches, and the names the
 pattern binds are in scope where the answer is true: the rest of its `&&`
-chain, wherever the chain is, and the first branch of an `if` or the body
-of a `while` whose condition it is:
+chain, wherever the chain is, and the first branch of an `if`, the body
+of a `while`, the arm of a `when` or the arm of a `match` whose condition
+or guard it is:
 
 ```wip,run
 val found: Option<i64> = 7

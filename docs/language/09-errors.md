@@ -236,6 +236,25 @@ fn main() = {
 }
 ```
 
+So a `?` in the lambda given to `map` cannot return from the function
+around it. To stop at the first error over many values, the lambda answers
+each result as it is, `Result::collect` gathers them, as above, and the `?`
+goes after that, in the function:
+
+```wip,run
+import std::text::{ParseError}
+
+fn total(lines: &[str]): Result<i64, ParseError> = {
+    val values = Result::collect(lines.forwards().map((line) => line.toInt()))?
+    return values.sum()
+}
+
+fn main() = {
+    assert(total(["1", "22", "-3"]) == 20)
+    assert(total(["1", "x", "3"]).isErr())
+}
+```
+
 ## `main` may answer a `Result`
 
 A program's `main` may answer nothing, an `i64` exit code, or a
@@ -294,10 +313,34 @@ fn checkAge(age: i64): i64 =
     if age < 0 then panic("an age cannot be negative") else age
 ```
 
+`panic(message, at: place)` reports `place`, a `Location`, rather than
+where the `panic` is written. A helper that checks something for its
+caller takes the caller's place as an implicit parameter and panics there,
+so the line printed is the caller's ([page 3](03-functions.md#the-callers-place)):
+
+```wip,run
+fn expectPositive(value: i64, implicit at: Location): i64 =
+    if value > 0 then value else panic("\(value) is not positive", at: at)
+
+fn main() = {
+    assert(expectPositive(3) == 3)
+}
+```
+
 A panic is for what must not happen: an index outside a container, a
 division by zero, `unwrap` on nothing, arithmetic that overflows, a number
 made a type that cannot hold it. Those all panic with a message of their
-own, naming the place.
+own, naming the place. Where the mistake is the caller's, as an `unwrap`
+of nothing, a `copyFrom` of another length or an `atLast` of an empty
+vector, the place is the line that called it, and the library's line is
+among the calls below:
+
+```
+panicked: unwrap of an Option that holds nothing
+  at main.wip:5:23
+  in std::prelude::Option.unwrap<i64> (std/prelude/option.wip:22)
+  in main (main.wip:5)
+```
 
 After the place come the calls, innermost first, each with its function
 and line, in a debug build and a release build alike:

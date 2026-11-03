@@ -36,7 +36,7 @@ fn patternHasError(pattern: &Pattern): bool = match pattern {
 		}
 		false
 	}
-	.Deref(inner) => patternHasError(&inner)
+	.Deref(inner) | .Unbox(inner) => patternHasError(&inner)
 	.Variant(binders, ..) | .Fields(binders) => {
 		for b in binders {
 			if b is .Nested(nested) && patternHasError(&nested) then return true
@@ -107,7 +107,7 @@ struct MatchedPlace {
 /// reference, and through alternatives that are each that variant.
 fn onlyVariant(pattern: &Pattern): Option<u32> = match pattern {
 	.Variant(variant, ..) => variant
-	.Deref(inner) => onlyVariant(&inner)
+	.Deref(inner) | .Unbox(inner) => onlyVariant(&inner)
 	.Any(alternatives, ..) => {
 		var found: Option<u32> = .None
 		for alternative in alternatives {
@@ -216,10 +216,12 @@ extend Lowerer {
 			if places.isNone() && onlyVariant(&pattern) is .Some(variant) then
 				self.noteMatched(scrut, variant)
 			// `if …` after the pattern: the bindings are in scope for it, and it
-			// decides whether the arm matches.
+			// decides whether the arm matches. It is a condition, so what its
+			// `is` tests bind is seen by the rest of it and by the arm, as an
+			// `if`'s by its block.
 			if arm.guard is .Some(written) then
 				self.guardTakesNothing(&pattern, alias, arm.pattern.span, written)
-			val guard: Option<ExprId> = arm.guard.map((g) => self.check(g, BOOL))
+			val guard: Option<ExprId> = arm.guard.map((g) => self.bindingCondition(g))
 			if result.isNone() && self.takesTypeBeside(arm.body) {
 				self.takeMatched()
 				val .Some(bindings) = self.state.scopes.pop() else panic("the arm's scope")
@@ -647,7 +649,7 @@ extend Lowerer {
 		span,
 		"a binding",
 	).withNote(
-		"an `is` test binds names for the rest of its `&&` chain, and, in the condition of an `if` or `while`, for its block",
+		"an `is` test binds names for the rest of its `&&` chain, and, in the condition of an `if` or `while`, for its block, and in a guard, for its arm",
 	).withHelp("to test without binding, write `(..)`")
 
 	/// Whether `e` is a place a pattern binds into: a variable, a field or
@@ -1213,6 +1215,17 @@ extend Lowerer {
 			val tested = self.pattern(&pattern, referent, through)
 			if tested is .Error then return .Error
 			return .Deref(own tested)
+		}
+		// So is a box, at any depth: `.Node(.Leaf(n))` where the node holds
+		// its child boxed. What it holds is the value's own, so what the
+		// pattern binds there is bound as a field's binding is. A buffer,
+		// `own<[T]>`, is matched as the slice it is.
+		if self.kind(scrutTy) is .Own(inner: held) &&
+			self.kind(held) !is .Slice(..) &&
+			self.testsAValue(&pattern) {
+			val tested = self.pattern(&pattern, held, binds)
+			if tested is .Error then return .Error
+			return .Unbox(own tested)
 		}
 		return match pattern.kind {
 			.Wildcard => .Wildcard
@@ -1908,10 +1921,10 @@ extend Lowerer {
 		binds: Binds,
 	): Pattern = {
 		// Declare the bindings whatever happens, so the arm body resolves.
-		val .Some((id, index)) = self.resolveVariant(enumName, variant, scrutTy) else {
+		val .Some((id, index)) = self.resolveVariant(enumName, variant, scrutTy, true) else {
 			return self.bindersFailed(fields.binders)
 		}
-		val patternTy = self.intern(.Enum(id: id, args: TyList::empty()))
+		val patternTy = self.intern(.Enum(id: id, args: .empty()))
 		if !(self.kind(scrutTy) is .Enum(id: scrutId, ..) && scrutId == id) {
 			if !self.isPoisoned(scrutTy) then
 				self.report(

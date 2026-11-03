@@ -93,6 +93,32 @@ fn main() = {
 `Option<own<T>>` is one word wide: nothing is the null pointer. The memory
 is freed when the value that owns it ends.
 
+`unbox(boxed)` takes the value back out and frees the box. The box is
+moved by the call, as any value given by value is, so it is used no more,
+and one that is lent cannot be emptied, since it is not the borrower's to
+take. What it held goes on to its new owner and ends once, where that
+owner does:
+
+```wip,run
+enum Datum {
+    Symbol(name: String)
+    Pair(head: own<Datum>, tail: own<Datum>)
+}
+
+fn main() = {
+    val pair = Datum::Pair(head: own .Symbol("a"), tail: own .Symbol("b"))
+    var data: Vec<Datum> = Vec()
+    match move pair {
+        .Pair(head, tail) => {
+            data.push(unbox(head))
+            data.push(unbox(tail))
+        }
+        symbol => data.push(symbol)
+    }
+    assert(data.len() == 2 && data[1] is .Symbol(name) && name == "b")
+}
+```
+
 A box clones where what it holds does: its clone is a box of its own,
 holding a clone of the value, so `@derive(Clone)` clones a recursive type
 whose children are boxed, and nothing is shared between the two. It

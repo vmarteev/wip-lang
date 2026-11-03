@@ -647,6 +647,23 @@ extend FnGen {
 		.DebugBuild => Val::of(.Int(if m.optimize then 0 else 1), .I(8))
 		.DropFn(ty) => Val::of(.Global(m.dropFn(ty, false)), .Ptr)
 		.BlockInvoke(of) => Val::of(.Global(m.blockInvoke(of)), .Ptr)
+		// A part of a call's place: its file and line as a panic names them,
+		// and its function as a trace does.
+		.Located(at, part, function) => {
+			val (file, line, column) = (m.locations)(at)
+			val name = match function {
+				.Some(id) => m.program.fnName(id, m.interner)
+				.None => String()
+			}
+			match part {
+				.File => Val::of(.Global(m.text(file)), .Ptr)
+				.FileLength => Val::of(.Int(file.len() as i64), .I(64))
+				.Line => Val::of(.Int(line as i64), .I(64))
+				.Column => Val::of(.Int(column as i64), .I(64))
+				.Function => Val::of(.Global(m.text(name)), .Ptr)
+				.FunctionLength => Val::of(.Int(name.len() as i64), .I(64))
+			}
+		}
 	}
 
 	/// Stores a scalar in a local's own slot, as its type.
@@ -1016,6 +1033,24 @@ extend FnGen {
 		self.callValues(&var m, id, args)
 	}
 
+	/// A call of the runtime's panic `name`, given the place `located` holds,
+	/// a `Location`, in the place of the panic's own: its file, its length,
+	/// its line and its column, read from it.
+	var fn panicCallLocated(m: &var Llvm, name: str, numbers: Vec<Val>, located: &Place) = {
+		val ty = self.placeTy(&m, &located)
+		val addr = self.placeAddr(&var m, &located)
+		val file = m.layouts.fieldOffset(m.program, ty, 0) as i64
+		val line = m.layouts.fieldOffset(m.program, ty, 1) as i64
+		val column = m.layouts.fieldOffset(m.program, ty, 2) as i64
+		var args = numbers
+		args.push(self.load(self.gep(addr.clone(), file), .Ptr, 8))
+		args.push(self.load(self.gep(addr.clone(), file + 8), .I(64), 8))
+		args.push(self.load(self.gep(addr.clone(), line), .I(64), 8))
+		args.push(self.load(self.gep(addr, column), .I(64), 8))
+		val id = m.runtime(name)
+		self.callValues(&var m, id, args)
+	}
+
 	/// An error made, or one passed on: the runtime keeps where, as the name
 	/// of the function it is in, the file and the line, given as a panic's
 	/// place is.
@@ -1333,7 +1368,7 @@ extend FnGen {
 		if bits > 64 && !unsigned && op is .Div | .Rem {
 			val mostNegative = signed((1 as u128) << (bits - 1), bits)
 			val edge = self.value(
-				.IntCompare(cond: .Eq, left: l.clone(), right: Value::int(mostNegative)),
+				.IntCompare(cond: .Eq, left: l.clone(), right: .int(mostNegative)),
 				.I(1),
 			)
 			val by = self.value(.IntCompare(cond: .Eq, left: right.clone(), right: .Int(-1)), .I(1))
@@ -1807,7 +1842,7 @@ extend FnGen {
 				self.emit(.Ret(Val::of(v, slot.t.clone())))
 			} else self.emit(.Ret(.None))
 		}
-		.Panic(note, message, at) => {
+		.Panic(note, message, at, located) => {
 			val text = match message {
 				.Some(written) => String::of(m.interner.resolve(written))
 				.None => String()
@@ -1817,8 +1852,8 @@ extend FnGen {
 				Val::of(.Global(move data), .Ptr),
 				Val::of(.Int(text.len() as i64), .I(64)),
 			])
-			match note {
-				.None => self.panicCall(&var m, "wip_panic", said, at)
+			val (name, numbers) = match note {
+				.None => ("wip_panic", said)
 				.Some(.Copy(place)) => {
 					val addr = self.placeAddr(&var m, &place)
 					val pointer = self.load(addr.clone(), .Ptr, 8)
@@ -1826,9 +1861,14 @@ extend FnGen {
 					val length = self.load(atLength, .I(64), 8)
 					var numbers = Vec::of([pointer, length])
 					numbers.append(said)
-					self.panicCall(&var m, "wip_panic_noted", numbers, at)
+					("wip_panic_noted", numbers)
 				}
 				.Some(.Const(..)) => panic("a note is a place")
+			}
+			match located {
+				.None => self.panicCall(&var m, name, numbers, at)
+				.Some(.Copy(place)) => self.panicCallLocated(&var m, name, numbers, &place)
+				.Some(.Const(..)) => panic("a place given is a place")
 			}
 			self.emit(.Unreachable)
 		}

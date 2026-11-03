@@ -113,7 +113,8 @@ fn main() = {
 - **Only implicits fill implicits.** An ordinary variable of the name is
   not used, so that declaring one never changes what an unrelated call
   receives. Where nothing implicit has the name, the call is refused
-  (E0455), with the two ways to declare one.
+  (E0455), with the two ways to declare one; but a `Location`, below, is
+  filled with the place of the call.
 - **Implicit parameters come after the others,** and are a reference, `&`
   or `&var`, or plain data, copied; a value that owns memory would be
   moved out of the caller at every call, and so a type parameter taken by
@@ -182,6 +183,44 @@ fn main() = {
     say("not implicit, so not used")
 }
 ```
+
+### The caller's place
+
+The prelude's `Location` is a place in a program: its `file`, `line` and
+`column`, and the `function` it is in, named as a panic's trace names it.
+Its text is `file:line:column`. An implicit parameter of type `Location`
+is found by its name first, as any implicit is; where nothing of its name
+is, it is filled with the place of the call, where the call's name is
+written. So a function that takes one knows where it was called from, and
+one that calls another hands its own on, so that the place is the first
+call into the chain. `panic(message, at: place)` reports the place given
+rather than its own:
+
+```wip,run
+fn expectEqual(actual: i64, expected: i64, implicit at: Location) = {
+    if actual != expected then
+        panic("expected \(expected), found \(actual)", at: at)
+}
+
+// Hands its caller's place on, without a word.
+fn expectZero(value: i64, implicit at: Location) = expectEqual(value, 0)
+
+fn whereFrom(implicit at: Location): Location = at
+
+fn main() = {
+    expectZero(0)
+    val here = whereFrom()
+    assert(here.line == 13 && here.function == "main")
+    // Given by name, as any implicit may be.
+    assert(whereFrom(at: here) == here)
+}
+```
+
+A failed `expectZero` would panic at the line in `main` that called it,
+not at the `panic`. Only `Location` is filled so: the place of the call is
+the one value a reader always knows, since it is where the reader is
+looking. A function that takes one, as any function with implicit
+parameters, is not a value (E0456).
 
 ## Methods
 
