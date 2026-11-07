@@ -327,13 +327,13 @@ nothing is not a space, so a walk to a byte tests what it found:
 fn main() = {
     val line = "  \tword!"
     var at = 0
-    while line.get(at) is .Some(b' ' | b'\t') {
+    while line.get(at) is .Some(b' ' | b'\t') do
         at += 1
-    }
+
     assert(at == 3 && line.get(at) == b'w')
-    while line.get(at) is .Some(byte) && byte != b'!' {
+    while line.get(at) is .Some(byte) && byte != b'!' do
         at += 1
-    }
+
     assert(line.get(at) == b'!' && line.get(at + 1).isNone())
 }
 ```
@@ -377,9 +377,9 @@ import std::collections::{Map}
 
 fn main() = {
     var counts: Map<String, i64> = Map()
-    for word in "the cat and the hat".split(" ") {
+    for word in "the cat and the hat".split(" ") do
         counts.atOrPut(word, 0) += 1
-    }
+
     assert(counts.at("the") == 2 && !counts.contains("dog"))
 }
 ```
@@ -542,7 +542,9 @@ fn setting(line: str): Result<(str, i64), Position> = {
     var s = Scanner::of(line)
     val name = s.takeWhile((b) => b.isAsciiLetter())
     s.skipWhile((b) => b == b' ')
-    if name.isEmpty() || !s.take(b'=') then return .Err(s.position())
+    if name.isEmpty() || !s.take(b'=') then
+        return .Err(s.position())
+
     s.skipWhile((b) => b == b' ')
     val start = s.at
     s.skipWhile((b) => b.isDigit())
@@ -576,9 +578,9 @@ fn main() = {
     assert(long == ["quick", "brown"])
 
     var pairs = 0
-    for (i, word) in text.split(" ").enumerate() {
+    for (i, word) in text.split(" ").enumerate() do
         pairs += i + word.len()
-    }
+
     assert(pairs == 22)
 
     // Consumers walk it to the end, and are lent a closure that may write.
@@ -598,12 +600,12 @@ fn main() = {
     assert(numbers.countWhere((n) => n > 2) == 2)
     val names: Vec<String> = ["a", "b"]
     var seen = String()
-    for (index, name) in names.forwards().enumerate() {
+    for (index, name) in names.forwards().enumerate() do
         seen.push("\(index)\(name)")
-    }
-    for name in names.backwards() {
+
+    for name in names.backwards() do
         seen.push(name)
-    }
+
     assert(seen == "0a1bba")
 }
 ```
@@ -619,7 +621,7 @@ The adapters are `map`, `filter`, `filterMap` — what a closure makes of
 an element, where it makes something — `flatMap`, `flatten` where the
 elements are iterators, `enumerate`, `take`,
 `takeWhile`, `skip`, `chain`, `zip` and `peekable`. The consumers are
-`count`, `toVec`, `toSet` where the elements hash, `find`, `findMap`,
+`count`, `toVec`, `find`, `findMap`,
 `position`, `nth`, `last`, `any`, `all`, `fold`, `forEach`, `minBy` and
 `maxBy`. `nth` passes over the elements before the one it answers, and the
 iterator goes on after it.
@@ -662,7 +664,8 @@ fn main() = {
 }
 ```
 
-A map is made of pairs by `Map::fromPairs`:
+A collection is made from what an iterator hands out by its `collect`,
+as a `Map` is from pairs ([`std::collections`](#stdcollections)):
 
 ```wip,run
 import std::collections::{Map}
@@ -683,7 +686,7 @@ fn main() = {
     "1 2 3".split(" ").forEach((w) => { total += w.toInt().unwrap() })
     assert(total == 6)
     val years = [30, 40]
-    val ages = Map::fromPairs("ann bo".split(" ").zip(years.copies()))
+    val ages = Map::collect("ann bo".split(" ").zip(years.copies()))
     assert(ages.at("bo") == 40)
 }
 ```
@@ -770,23 +773,22 @@ fn main() = {
     val data = Vec::of([1, 2, 3, 4])
     val sum = Future::run(own () => {
         var total = 0
-        for x in data {
+        for x in data do
             total += x
-        }
+
         total
     })
     assert(sum.get() == 10)
 
     val (tx, rx) = channel<String>()
     val producer = Future::run(own () => {
-        for i in 0..3 {
+        for i in 0..3 do
             tx.send("line \(i)")
-        }
     })
     var lines = 0
-    for line in move rx {
+    for line in move rx do
         lines += 1
-    }
+
     assert(lines == 3)
 }
 ```
@@ -821,9 +823,9 @@ import std::sync::{Atomic, Mutex}
 
 fn sum(values: &[i64]): i64 = {
     var total = 0
-    for value in values {
+    for value in values do
         total += value
-    }
+
     return total
 }
 
@@ -901,15 +903,14 @@ fn main() = {
     val mailbox = Mailbox()
     val (_, total) = future::both(
         () => {
-            for i in 1..101 {
+            for i in 1..101 do
                 mailbox.send(i)
-            }
         },
         () => {
             var total = 0
-            for _ in 0..100 {
+            for _ in 0..100 do
                 total += mailbox.receive()
-            }
+
             return total
         },
     )
@@ -990,15 +991,15 @@ struct Body {
 fn main() = {
     val pool = Pool::of(future::cores() - 1)
     var bodies: Vec<Body> = Vec()
-    for i in 0..100 {
+    for i in 0..100 do
         bodies.push(Body(height: i as f64, speed: 0.0))
-    }
-    for _ in 0..60 {
+
+    for _ in 0..60 do
         pool.each(&var bodies.items(), (body) => {
             body.speed -= 9.8 / 60.0
             body.height += body.speed / 60.0
         })
-    }
+
     val heights = pool.map(&bodies.items(), (body) => body.height)
     assert(heights.len() == 100 && heights[99] < 99.0)
 }
@@ -1306,7 +1307,8 @@ fn main() = {
         .Parent(copy) => assert(copy.wait() == .Code(3))
         .Child => libc::exitAtOnce(3)
     }
-    if me.id != 0 then assert(process::becomeUser(0, 0) == .Err(.Denied))
+    if me.id != 0 then
+        assert(process::becomeUser(0, 0) == .Err(.Denied))
 }
 ```
 
@@ -1330,7 +1332,7 @@ fn main() = {
     assert(counts.keyAt(1) == "b")
     counts.at("a") += 10
     assert(counts.remove("a") == 11)
-    assert(counts == Map::fromPairs([("b", 2)].copies()))
+    assert(counts == [("b", 2)])
 
     var seen = Set<i64>()
     assert(seen.add(1))
@@ -1349,6 +1351,48 @@ lends a map's values to walk or to write. `atOrPutWith(key, make)` is
 `atOrPut` whose value is made only where there is none. Two maps are equal
 with the same keys and equal values under them, and two sets with the same
 keys, whatever order they went in.
+
+Each collection that holds what an iterator hands out is made from one by
+a static function of one name, `collect`, which takes any iterator of its
+elements: `Vec`, `Set`, `Deque`, `String` of `char`, and `Map` and
+`PriorityQueue` of pairs. They are the method of the prelude's
+`Collect<T>`, which a type of a program's own implements to be collected
+too. Where the type is expected, the call is `.collect(items)`, and a list
+written there is that collection, made through it. A `Set` keeps the
+first of equals and a `Map` the later value of a key, as `add` and `put`
+do. `iter.toVec()` is `Vec::collect(iter)` at the end of a chain.
+
+```wip,run
+import std::collections::{Deque, Map, Set}
+
+struct Total {
+    sum: i64
+}
+
+extend Total: Collect<i64> {
+    static fn collect<I: Iterator<i64>>(items: I): Total = {
+        var total = Total(sum: 0)
+        for x in move items do
+            total.sum += x
+
+        return total
+    }
+}
+
+fn main() = {
+    val words = ["b", "a", "b"]
+    val seen: Set<str> = .collect(words.copies())
+    assert(seen.len() == 2 && seen[0] == "b")
+    val lengths = Map::collect(words.copies().map((w) => (w, w.len())))
+    assert(lengths.len() == 2)
+    val queue: Deque<i64> = [1, 2, 3]
+    assert(queue[2] == 3)
+    val text: String = .collect("abc".chars().filter((c) => c != 'b'))
+    assert(text == "ac")
+    val total: Total = [1, 2, 3]
+    assert(total.sum == 6)
+}
+```
 
 `Deque<T>` is pushed and taken at either end at the same small cost, where
 a `Vec` is quick at its back alone: a queue, a stack, or a list pushed at
@@ -1639,7 +1683,9 @@ fn firstLine(host: str): String = {
     val .Ok(stream) = TlsStream::connect(host, 443) else return String()
     var secure = stream
     val request = "HEAD / HTTP/1.1\r\nHost: \(host)\r\nConnection: close\r\n\r\n"
-    if secure.writeAll(&request).isErr() then return String()
+    if secure.writeAll(&request).isErr() then
+        return String()
+
     var room = [0 as u8; 64]
     val got = secure.read(&var room).unwrapOr(0)
     return String::of(str::fromBytes(&room[0..got]))
@@ -1698,9 +1744,9 @@ fn main() = {
     watcher.changed() // what came just before
     assert(fs::writeFile(dir.join("level.txt"), "o..o").isOk())
     val began = Instant::now()
-    while !watcher.pending() && began.elapsed() < Duration::seconds(5) {
+    while !watcher.pending() && began.elapsed() < Duration::seconds(5) do
         sleep(Duration::millis(10))
-    }
+
     assert(watcher.changed() == [dir.path.clone()].toVec())
 }
 ```
@@ -1903,9 +1949,8 @@ fn main() = {
         return
     }
     assert(entries.len() >= 2)
-    for entry in entries.items() {
+    for entry in entries.items() do
         assert(entry.kind == .File || entry.isDirectory())
-    }
 
     val .Ok(about) = fs::meta("std/prelude/option.wip") else return
     assert(about.isFile())
@@ -1962,7 +2007,9 @@ fn counted(from: &var dyn io::Read): i64 = {
     var total = 0
     while true {
         val got = from.read(&var room).unwrap()
-        if got == 0 then break
+        if got == 0 then
+            break
+
         total += got
     }
     return total
@@ -2318,9 +2365,9 @@ fn main() = {
     assert(updates == 2 && step.alpha() > 0.39 && step.alpha() < 0.41)
     step.advanceBy(Duration::seconds(3))
     var caught = 0
-    while step.due() {
+    while step.due() do
         caught += 1
-    }
+
     assert(caught == 15, "a quarter of a second, and no more")
 }
 ```

@@ -102,7 +102,7 @@ assert(computed == 15)
 
 Each branch of an `if` is written one of two ways. **`if condition then
 a else b`**, where a branch is one expression — a value, a call, an
-assignment, a `match`, or `return`, `break` or `continue`; and **`if
+assignment, a `match`, or `return`, `break`, `continue` or `yield`; and **`if
 condition { … } else { … }`**, where a branch is a block of statements.
 The branches of one `if` may differ, as a `when`'s arms may: `if
 xs.isEmpty() then return .None else { … }` answers early beside a body,
@@ -122,12 +122,16 @@ fn describe(count: i64): String =
     else "\(count) items"
 
 fn firstOf(xs: &[i64]): Option<i64> = {
-    if xs.isEmpty() then return .None
+    if xs.isEmpty() then
+        return .None
+
     return xs[0]
 }
 
 fn doubledFirst(xs: &[i64]): Option<i64> = {
-    if xs.isEmpty() then return .None else {
+    if xs.isEmpty() then
+        return .None
+    else {
         val n = xs[0]
         return n * 2
     }
@@ -181,7 +185,8 @@ fn main() = {
     var count = 0
     for (x, z) in [(0.0, -reach), (-reach, 0.0)] {
         val across: f32 = x + z
-        if across == -reach then count += 1
+        if across == -reach then
+            count += 1
     }
     assert(count == 2)
 }
@@ -196,7 +201,11 @@ expression, and braces where any is more, or where a condition is too long
 to stay on one line with its `then`.
 
 An `if` without `else` answers nothing, so it stands where a statement
-stands: `if done then return`, whose branch's value is discarded.
+stands: `if done then return`, whose branch's value is discarded. A
+`yield` is a branch there too, `if x > 0 then yield x`, and an arm of a
+`match` that is a statement, `.Leaf(value) => yield value`; it stays a
+statement, never a value, so a branch that is a value beside it would be
+dropped, and is refused (E0477).
 
 A choice among several conditions is a `when`: each arm is a condition, a
 `bool`, and `=>` its body, and the first arm whose condition holds runs —
@@ -562,16 +571,17 @@ array, a slice, a `Vec`, a range, a map, an iterator:
 
 ```wip,run
 var total = 0
-for n in 0..5 {
+for n in 0..5 do
     total += n
-}
+
 assert(total == 10)
 
 val numbers = [3, 1, 4]
 var largest = 0
-for n in numbers {
-    if n > largest then largest = n
-}
+for n in numbers do
+    if n > largest then
+        largest = n
+
 assert(largest == 4)
 
 var countdown = 3
@@ -583,21 +593,60 @@ while countdown > 0 {
 assert(steps == 3)
 ```
 
+A body of one statement is written after `do`, with no braces, as a
+branch of one expression is after `then`: a call, an assignment, a
+`yield`, a jump, or an `if … then` without an `else`. It means what it
+would in braces — a `?` leaves the function, and `break` and `continue`
+are the loop's. The body goes on the line below the `do`, one deeper, and
+a blank line follows it, ending it where a `}` would have; a statement's
+`then` is written the same way. A body of more than one statement is written in braces; so is
+one that is itself a loop, whose words on one line would not say which
+loop is the outer, an `if` with an `else`, and a `match` (E0101, with
+the fix that writes the braces):
+
+```wip,run
+val words = ["a", "bc", "def"]
+var letters = 0
+for word in words do
+    letters += word.len()
+
+assert(letters == 6)
+
+val long = [
+    for word in words do
+        if word.len() > 1 then
+            yield word
+]
+assert(long == ["bc", "def"])
+
+var described = Vec()
+for (index, word) in words.forwards().enumerate() do
+    described.push("word \(index) of the list is `\(word)`, of \(word.len()) letters")
+
+assert(described.len() == 3)
+```
+
+```wip,error=E0101
+fn main() = {
+    for row in [Vec::of([1, 2])] do for n in row do assert(n > 0)
+}
+```
+
 A range `lo..hi` leaves `hi` out, and `lo..=hi` takes it too, in a loop and
 in a slice alike. A range through the largest value its
 type holds stops there, rather than step past it:
 
 ```wip,run
 var sum = 0
-for i in 1..=4 {
+for i in 1..=4 do
     sum += i
-}
+
 assert(sum == 10)
 
 var bytes = 0
-for b in 0 as u8..=255 {
+for b in 0 as u8..=255 do
     bytes += 1
-}
+
 assert(bytes == 256)
 ```
 
@@ -640,9 +689,9 @@ what is being walked:
 
 ```wip,run
 var numbers = Vec::of([1, 2, 3])
-for n in numbers {
+for n in numbers do
     n *= 10
-}
+
 assert(numbers == [10, 20, 30])
 ```
 
@@ -653,15 +702,15 @@ where the whole could be.
 ```wip,run
 val numbers = [1, 2, 3, 4, 5]
 var middle = 0
-for n in numbers[1..4] {
+for n in numbers[1..4] do
     middle += n
-}
+
 assert(middle == 9)
 
 var cells = [0, 0, 0, 0]
-for cell in cells[1..3] {
+for cell in cells[1..3] do
     cell = 7
-}
+
 assert(cells[0] == 0 && cells[1] == 7 && cells[2] == 7 && cells[3] == 0)
 ```
 
@@ -677,9 +726,9 @@ var words: Vec<String> = Vec()
 words.push("one")
 words.push("two")
 var kept: Vec<String> = Vec()
-for word in move words {
+for word in move words do
     kept.push(word)
-}
+
 assert(kept.len() == 2 && kept[0] == "one")
 ```
 
@@ -695,13 +744,13 @@ fn names(): Vec<String> = ["ada", "bob"]
 
 fn main() = {
     var sum = 0
-    for (i, p) in PRIMES.forwards().enumerate() {
+    for (i, p) in PRIMES.forwards().enumerate() do
         sum += i * p
-    }
+
     var letters = 0
-    for (i, name) in names().items().forwards().enumerate() {
+    for (i, name) in names().items().forwards().enumerate() do
         letters += i + name.len()
-    }
+
     assert(sum == 34 && letters == 7)
 }
 ```
@@ -726,11 +775,14 @@ fn words(text: str): Iterator<str> = {
     yield text[start..]
 }
 
-fn evens(xs: &[i64]): Iterator<i64> = for x in xs { if x % 2 == 0 { yield x } }
+fn evens(xs: &[i64]): Iterator<i64> = for x in xs do
+    if x % 2 == 0 then
+        yield x
 
 fn main() = {
     val xs = [1, 2, 3, 4, 5, 6]
-    var squares = for x in xs { yield x * x }
+    var squares = for x in xs do
+        yield x * x
     assert(squares.next() == 1)
     assert(squares.take(2).toVec() == [4, 9])
 
@@ -739,8 +791,10 @@ fn main() = {
 }
 ```
 
-`own for`, which collects what a loop yields at once, is this generator
-run to its end ([page 1](01-types.md)).
+A list that yields, `[for x in xs { yield x }]`, collects what the loop
+yields at once: it is this generator run to its end, into a `Vec`
+([page 1](01-types.md)). The brackets say the list, made now; a loop
+without them, the generator, made as it is read.
 
 A loop that is a generator borrows what it names, as a view does, so what
 it names must not change while it is used; a function's borrows what it
@@ -763,12 +817,11 @@ enum Tree {
 
 fn leaves(tree: &Tree): Iterator<i64> = {
     match tree {
-        .Leaf(value) => { yield value }
+        .Leaf(value) => yield value
         .Node(children) => {
             for child in children {
-                for value in own leaves(&child) {
+                for value in own leaves(&child) do
                     yield value
-                }
             }
         }
     }
@@ -792,9 +845,9 @@ An index outside the container panics.
 ```wip,run
 fn total(values: &[i64]): i64 = {
     var sum = 0
-    for value in values {
+    for value in values do
         sum += value
-    }
+
     return sum
 }
 

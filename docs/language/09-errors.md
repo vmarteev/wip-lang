@@ -19,7 +19,9 @@ enum ParseTrouble {
 }
 
 fn double(text: str): Result<i64, ParseTrouble> = {
-    if text.isEmpty() then return .Err(.Empty)
+    if text.isEmpty() then
+        return .Err(.Empty)
+
     val .Ok(number) = text.toInt() else return .Err(.NotANumber)
     return number * 2
 }
@@ -72,14 +74,20 @@ enum Json {
 }
 
 fn prompt(near: bool, saving: bool): Option<str> = {
-    if near then return "TALK"
-    if saving then return "SAVE"
+    if near then
+        return "TALK"
+
+    if saving then
+        return "SAVE"
+
     return .None
 }
 
 // `.Array` is not a `Result`'s: it is the `Json` the `Result` holds.
 fn array(items: Vec<i64>): Result<Json, str> = {
-    if items.isEmpty() then return .Err("no items")
+    if items.isEmpty() then
+        return .Err("no items")
+
     return .Array(items)
 }
 
@@ -107,7 +115,9 @@ enum Problem {
 }
 
 fn parse(text: str): Result<i64, Problem> = {
-    if text.isEmpty() then return Problem::Empty
+    if text.isEmpty() then
+        return Problem::Empty
+
     return 1
 }
 ```
@@ -118,8 +128,12 @@ function that answers nothing:
 
 ```wip,run
 fn check(age: i64): Result<void, str> = {
-    if age < 0 then return .Err("an age is not negative")
-    if age == 0 then return
+    if age < 0 then
+        return .Err("an age is not negative")
+
+    if age == 0 then
+        return
+
     assert(age > 0)
 }
 
@@ -189,7 +203,9 @@ extend ConfigError: From<ParseError> {
 }
 
 fn port(text: str): Result<i64, ConfigError> = {
-    if text.isEmpty() then return .Err(.Empty)
+    if text.isEmpty() then
+        return .Err(.Empty)
+
     // `toInt` fails with a `ParseError`, which becomes a `ConfigError`
     // on its way out.
     return text.toInt()?
@@ -413,9 +429,10 @@ assert(c::sizeOf<Vertex>() == 12, "a vertex is what the shader reads")
 assert(isSorted(&KEYS), "KEYS is searched by binarySearch")
 
 fn isSorted(values: &[i64]): bool = {
-    for i in 1..values.len() {
-        if values[i - 1] > values[i] then return false
-    }
+    for i in 1..values.len() do
+        if values[i - 1] > values[i] then
+            return false
+
     return true
 }
 

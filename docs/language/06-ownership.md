@@ -267,10 +267,13 @@ fn main() = {
     for round in 0..3 {
         val drawn = mem::using(&var frame, () => {
             var visible = Vec()
-            for i in 0..100 {
-                if i % 3 == 0 then visible.push(i)
-            }
-            if round == 1 then load(&var loaded)
+            for i in 0..100 do
+                if i % 3 == 0 then
+                    visible.push(i)
+
+            if round == 1 then
+                load(&var loaded)
+
             return visible.len()
         })
         assert(drawn == 34 && frame.live() == 0)

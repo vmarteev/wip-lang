@@ -601,6 +601,43 @@ error E0010 digits are separated by one `_`
   edit main.wip:6:13-6:15 _
 ```
 
+### What is never used
+
+A declaration nothing uses is a warning, each with its fix: a `var` that
+nothing writes, which is a `val` (E0470); a local nothing reads (E0471),
+removed where what it is given only reads; a name a pattern binds (E0472)
+and a parameter (E0473) that nothing reads, written `_` — `y: _` where a
+struct is taken apart by its fields' names; an imported name nothing in
+its file names (E0474); and a function of a module's own that nothing
+calls (E0475), which is a decision to remove, and has no fix:
+
+```wip
+import std::collections::{Map, Set} // `Map` is never named
+
+fn area(width: i64, height: i64, scale: i64): i64 = width * height // `scale` is `_`
+
+fn main() = {
+    var total = area(2, 3, 1) // never written: a `val`
+    var seen: Set<i64> = Set()
+    for (i, n) in [4, 5].copies().enumerate() { // `i` is `_`
+        seen.add(n + total)
+    }
+    assert(seen.len() == 2)
+}
+```
+
+What a use is reaches past this target and this build: a name only code
+for another target writes, `@target(os = "linux")` or a `.linux.wip` file,
+is used, and so is a function only a test calls, though `wip check` reads
+no test. A local or a binding that owns memory or has a `destroy` is not
+warned of, since being bound is what keeps it to the end of its block — a
+`_` in its place would drop it at once. Neither is a name that is a
+function's interface to its callers: a `pub` function's parameters, an
+interface method's in each implementation, an implicit, one a call gives
+by name, and C's. A program with errors is told none of these, and an
+editor shows them faded rather than underlined, so that a name declared a
+moment before its use is typed is not marked as wrong.
+
 ### Fixes
 
 Some warnings say that code is longer than what it means — a `move` the
@@ -609,8 +646,18 @@ compiler would make (E0451), a copy where a move would do (E0448), a
 without being told, as `Eq` on an enum of names or `Clone` on plain data
 (E0467), a character literal made a byte, `'[' as u8` for `b'['` (E0468),
 a `.Some(value)` or an `.Ok(value)` where the type expected says it, and a
-`return .Ok()` where the result is a `Result<void, E>` (E0469) — and their
-fixes change nothing a program does. `wip fix` applies those. Each program it is given, a file or a
+`return .Ok()` where the result is a `Result<void, E>` (E0469), what is
+never used but a function (E0470 to E0474), and a lambda that only calls a
+function with its parameters, which the function's name says (E0478,
+[page 3](03-functions.md#functions-as-values)); and loops that say in
+several lines what a value says in one: a `Vec` declared empty and filled
+by the loop after it, of a few statements, which the list that yields is
+(E0479), a list that yields built only to be walked by `sum`, `max` or
+`min`, which the generator walks without allocating (E0480), and a loop
+over a slice, an array or a `Vec` that only tests and returns, which
+`any`, `all` or `find` is (E0481) — and their fixes change
+nothing a program does. `wip fix` applies those, and takes the line a
+removed declaration was on with it. Each program it is given, a file or a
 package's directory as `wip check` takes it, or the current directory's,
 is checked with its tests; where it has no errors, each such fix is made
 in the files under the directory the command is typed in, and the program
@@ -622,10 +669,19 @@ it out, and each file is listed with the codes it was fixed for:
 main.wip: E0448 ×2, E0464
 ```
 
-A program with errors is left as it is; the fixes of errors, and of the
-warnings whose fix changes what a program does, are offered in an editor
-and made by hand. `--check` writes nothing, and fails where something
-would change.
+A fix that says a loop as a list or a search is not offered where it would
+take a comment out of the loop's words; one between the vector and its
+loop goes into the list.
+
+One error's fix is made too: a reference passed to a call by its name
+without the `&` that lends it (E0476), which `&` makes the program its
+code meant before a call asked for it — what moving code written then
+takes. A program with other errors is left as it is; the fixes of errors,
+and of the warnings whose fix changes what a program does, are offered in
+an editor and made by hand. `--check` writes nothing, and fails where something
+would change. `--target`, as `wip check` takes it, fixes what each target
+it names finds, so that code for another system is fixed with the rest:
+`wip fix --target all`.
 
 ### The checked program
 

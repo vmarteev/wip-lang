@@ -331,9 +331,9 @@ fn main() = {
     val dialog = Dialog(" Cannot edit ")
     var names: Vec<String> = Vec()
     names.push("first")
-    for word in "second third".split(" ") {
+    for word in "second third".split(" ") do
         names.push(word)
-    }
+
     assert(dialog.title == " Cannot edit " && names[0] == "first")
     assert(names[2] == "third")
 }
@@ -375,9 +375,9 @@ one is expected.
 ```wip,run
 fn total(values: &[i64]): i64 = {
     var sum = 0
-    for value in values {
+    for value in values do
         sum += value
-    }
+
     return sum
 }
 
@@ -422,9 +422,9 @@ fn main() = {
     assert(numbers.get(3).isNone() && numbers.get(-1).isNone())
     val line = [b' ', b'\t', b'x']
     var at = 0
-    while line.get(at) is .Some(b' ' | b'\t') {
+    while line.get(at) is .Some(b' ' | b'\t') do
         at += 1
-    }
+
     assert(at == 2)
 }
 ```
@@ -441,9 +441,9 @@ there too:
 ```wip,run
 fn total(values: &[i64]): i64 = {
     var sum = 0
-    for value in values {
+    for value in values do
         sum += value
-    }
+
     return sum
 }
 
@@ -502,32 +502,57 @@ assert(zeros.len() == 4)
 assert(zeros[3] == 0)
 ```
 
-A list whose length is decided as it is built is written `own [ … ]`
-with statements among its elements that `yield`, or `own for`, the list
-of what one loop yields; it is an `own<[T]>` too. `yield`
-hands a value to the list being built, and `if` and `for` are the
-statements they always are, adding what they yield:
+A list whose length is decided as it is built is written with statements
+among its elements that `yield`. `yield` hands a value to the list being
+built, and `if` and `for` are the statements they always are, adding what
+they yield; a branch that only yields is written after `then`, as one that
+only returns is. An array's length is part of its type, known where it is
+written, which such a list cannot have, so it is a `Vec<T>`, the growing
+list below:
 
 ```wip,run
 fn main() = {
     val loud = true
-    val names = own [
+    val names = [
         "title",
-        if loud { yield "shouted" },
-        for i in 0..2 { yield if i == 0 then "first" else "second" },
+        if loud then yield "shouted",
+        for i in 0..2 do
+            yield if i == 0 then "first" else "second",
     ]
     assert(names.len() == 4)
     assert(names[1] == "shouted")
     assert(names[3] == "second")
 
-    val evens = own for i in 0..10 { if i % 2 == 0 { yield i } }
-    assert(evens.len() == 5)
+    var evens = [
+        for i in 0..10 do
+            if i % 2 == 0 then
+                yield i
+    ]
+    evens.push(10)
+    assert(evens.len() == 6)
 }
 ```
 
-The elements are moved in. Where nothing expects a `Vec` or an
-`own<[T]>`, such a list without `own` is refused: an array's length is
-part of its type, known where it is written.
+The elements are moved in. Written `own [ … ]`, or `own for`, the list of
+what one loop yields, it is an `own<[T]>` instead, a buffer that does not
+grow:
+
+```wip,run
+val evens = own for i in 0..10 do
+    if i % 2 == 0 then
+        yield i
+assert(evens.len() == 5)
+```
+
+A value beside a `yield`, as the other branch of an `if` or another arm of
+a `match`, is refused (E0477): the `if` is a statement, and the value
+would be dropped. `yield if c then a else b` yields either.
+
+```wip,error=E0477
+fn main() = {
+    val signs = [for i in -2..2 { if i < 0 then yield -1 else 1 }]
+}
+```
 
 `Vec<T>` is the growing one, and is the usual answer; it is on
 [page 10](10-library.md). A list literal takes the type expected of it,
@@ -536,8 +561,13 @@ function answers, a variable declared as one, the branches of an `if` —
 it is a vector, its values moved in, and where an `own<[T]>` is expected
 it is built on the heap. Each element is checked against the element
 type, so text in a `Vec<String>` is a `String`; `[]` is an empty vector,
-and a repeat and a list that yields are vectors too. Only the prelude's
-`Vec` is made so; any other collection is made by a call. Where nothing
+and a repeat and a list that yields are vectors too. Where another
+collection is expected, one that implements the prelude's `Collect<T>` —
+`Set`, `Map` of pairs, `Deque`, `PriorityQueue` of pairs, `String` of
+characters, or a type of a program's own — the list is that collection,
+made by its `collect` of the elements in the order they are written, so
+a `Set` keeps the first of equals and a `Map` the later value of a key
+([page 10](10-library.md#stdcollections)). Where nothing
 expects one, a list is an array, on the stack, and `Vec::of([1, 2, 3])`
 makes it a vector, since `of` expects a buffer. `v.intoBuffer()` hands a
 vector's values back as an `own<[T]>`, neither moving a value.
@@ -550,9 +580,9 @@ struct Call {
 
 fn sum(values: Vec<i64>): i64 = {
     var total = 0
-    for value in values {
+    for value in values do
         total += value
-    }
+
     return total
 }
 
@@ -563,10 +593,51 @@ fn main() = {
     var grown: Vec<i64> = []
     grown.append([4, 5])
     val rows = [10, 20]
-    val built: Vec<i64> = [1, for row in rows { yield row }]
+    val built: Vec<i64> = [
+        1,
+        for row in rows do
+            yield row,
+    ]
     assert(grown == [4, 5] && built == [1, 10, 20])
     val counted = Vec::of([1, 2, 3])
     assert(counted.len() == 3)
+}
+```
+
+```wip,run
+import std::collections::{Map, Set}
+
+struct Person {
+    name: String
+    age: i64
+}
+
+fn main() = {
+    val primes: Set<i64> = [2, 3, 5, 3]
+    assert(primes.len() == 3 && primes.contains(5))
+    val people = [Person(name: "ann", age: 30), Person(name: "bo", age: 12)]
+    val adults: Map<String, i64> = [
+        for p in people do
+            if p.age >= 18 then
+                yield (p.name.clone(), p.age)
+    ]
+    assert(adults.len() == 1 && adults.at("ann") == 30)
+    val word: String = [
+        for c in "a-b".chars() do
+            if c != '-' then
+                yield c
+    ]
+    assert(word == "ab")
+}
+```
+
+A type that does not implement `Collect` is not made from a list:
+
+```wip,error=E0301
+import std::collections::{Arena}
+
+fn main() = {
+    val values: Arena<i64> = [1, 2]
 }
 ```
 
@@ -842,6 +913,40 @@ not have is looked for in that type: `return .Array(items)` where a
 `Result<Json, E>` is expected is the `.Ok` of a `Json`. `.None` and
 `.Err(…)` are written ([page 9](09-errors.md#a-value-where-one-is-expected)).
 
+A variant of one field, named by its path and not called, is the function
+from its field to its enum, as a type's function named by its path is a
+value ([page 3](03-functions.md#functions-as-values)): `HttpError::Io` is
+`(error: IoError) => HttpError`, its parameter named as the field is. It
+goes where a function or a closure is expected, and a generic enum's type
+arguments come from what is expected, `Option::Some` given to a map of
+numbers being `Option<i64>::Some`. One without fields is a value, and one
+of several is built naming each, so neither is a function:
+
+```wip,run
+enum Failure {
+    Io(code: i64)
+    Parse(at: i64, line: i64)
+}
+
+fn main() = {
+    val read: Result<i64, i64> = .Err(5)
+    assert(read.mapErr(Failure::Io) is .Err(.Io(5)))
+    assert([1, 2].copies().map(Option::Some).toVec() == [.Some(1), .Some(2)])
+    val make: (code: i64) => Failure = Failure::Io
+    assert(make(3) is .Io(3))
+}
+```
+
+```wip,error=E0302
+enum Failure {
+    Parse(at: i64, line: i64)
+}
+
+fn main() = {
+    val parsed = [1].copies().map(Failure::Parse).toVec()
+}
+```
+
 A variant's field may have a default, which the variant takes where it is
 built without that field, as a struct's field and a parameter do.
 `()` takes every one:
@@ -1014,7 +1119,9 @@ fn largest<T: Ord>(values: &[T]): &T = {
     var best = 0
     var i = 1
     while i < values.len() {
-        if values[i] > values[best] then best = i
+        if values[i] > values[best] then
+            best = i
+
         i += 1
     }
     lend values[best]
@@ -1093,9 +1200,9 @@ fn filled<T: copy, val N>(value: T): [T; N] = [value; N]
 
 fn total<val N>(numbers: [i64; N]): i64 = {
     var sum = 0
-    for n in numbers {
+    for n in numbers do
         sum += n
-    }
+
     return sum
 }
 
@@ -1143,7 +1250,10 @@ fn main() = {
     var small = Vec()
     var large = Vec()
     for n in 0..5 {
-        if n < 2 then small.push(n) else large.push(n * 10) // Vec<i64>
+        if n < 2 then
+            small.push(n)
+        else
+            large.push(n * 10) // Vec<i64>
     }
     var counts = Map()
     counts.put("one", 1) // Map<str, i64>

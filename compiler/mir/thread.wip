@@ -1,0 +1,416 @@
+// A switch on what a path has just written goes, on that path, straight to
+// the case it chooses.
+//
+// A generator's `next`, spliced into the loop that walks it (`inline.wip`),
+// starts with a switch on where it stopped, `state#`. Each `yield` writes
+// `state#` and the `.Some` of its value, the loop matches the `.Some`, runs
+// its body and comes back round to the switch: what each test reads was
+// written a few blocks before. The blocks from the write to the test are
+// copied, and the copy goes to the case the write chose, so the loop is the
+// generator's own, its body run at the `yield`, as a hand-written iterator
+// spliced into a loop is.
+//
+// A switch is threaded where it tests a local, or a temporary copied from a
+// place of a local reached by fields alone, that nothing outside this body
+// can write: no address of it, or of what holds it, goes anywhere but to
+// the places `simplify` has made the body name directly. A path is followed
+// back from the test through blocks that do not write that place, to one
+// whose last write of it is a constant.
+
+import std::collections::{Map, Set}
+
+/// How many blocks back from a switch a write is looked for.
+val DEPTH: i64 = 64
+
+/// Threads the switches of `body` whose value a path has just written, copying
+/// no more than a share of the body's statements to do it.
+pub fn thread(body: &var Body) = {
+	foldConstants(&var body)
+	var switches = 0
+	var statements = 0
+	for block in body.blocks {
+		if block.terminator is .Switch(..) then
+			switches += 1
+
+		statements += block.statements.len()
+	}
+	if switches == 0 then
+		return
+
+	val escaped = escapedPlaces(&body)
+	var budget = 256 + statements / 4
+	var tried: Set<(u32, u32)> = Set()
+	var rounds = 0
+	var progress = true
+	while progress && rounds < 4096 {
+		progress = false
+		rounds += 1
+		val preds = predecessors(&body)
+		// The shortest way first: a test whose write is nearest is taken out
+		// before the ways through it are copied.
+		var best: Option<(i64, Way)> = .None
+		for b in 0..body.blocks.len() {
+			val .Some(key) = switchOn(&body.blocks[b]) else continue
+			if !trackable(&key, &escaped) then
+				continue
+
+			val .Some(way) = wayTo(&body, &preds, b as u32, &key, &tried) else continue
+			val shorter = match best {
+				.Some((_, found)) => way.blocks.len() < found.blocks.len()
+				.None => true
+			}
+			if shorter then
+				best = (b, way)
+		}
+		val .Some((b, way)) = best else break
+		val cost = threadWay(&var body, &preds, &way, budget)
+		if cost < 0 then
+			tried.add((way.writer, b as u32))
+		else
+			budget -= cost
+
+		progress = true
+	}
+	return
+}
+
+/// A switch, or a branch, on a constant, made the jump it always takes.
+fn foldConstants(body: &var Body) = {
+	for b in 0..body.blocks.len() {
+		val folded: Option<BlockId> = match body.blocks[b].terminator {
+			.Branch(cond: .Const(.Bool(value)), thenBlock, otherwise) =>
+				if value then thenBlock else otherwise
+			.Switch(value: .Const(.Int(bits, ..)), ..) => caseTarget(
+				&body.blocks[b].terminator,
+				(bits & 0xffffffff) as u32,
+			)
+			_ => .None
+		}
+		if folded is .Some(target) then
+			body.blocks[b].terminator = .Goto(target)
+	}
+	return
+}
+
+/// Where a switch goes for `value`.
+fn caseTarget(terminator: &Terminator, value: u32): Option<BlockId> = {
+	val .Switch(cases, otherwise, ..) = terminator else return .None
+	for (case, target) in cases do
+		if case == value then
+			return target
+
+	return otherwise
+}
+
+/// The blocks each block is reached from, each once.
+fn predecessors(body: &Body): Vec<Vec<u32>> = {
+	var preds: Vec<Vec<u32>> = [
+		for _ in 0..body.blocks.len() do
+			yield Vec()
+	]
+	for (b, block) in body.blocks.forwards().enumerate() {
+		for target in block.terminator.successors() {
+			val from = b as u32
+			if !preds[target.index as i64].contains(&from) then
+				preds[target.index as i64].push(from)
+		}
+	}
+	return preds
+}
+
+/// Every local a statement or a terminator names, and the locals its
+/// indexes read.
+struct Named {
+	locals: Vec<Local> = Vec()
+}
+
+extend Named {
+	var fn note(place: &Place) = {
+		self.locals.push(place.local)
+		for p in place.projections do
+			if p is .Index(local) then
+				self.locals.push(local)
+	}
+}
+
+extend Named: Rewrite {
+	var fn read(place: Place): Place = {
+		self.note(&place)
+		return place
+	}
+
+	var fn written(place: Place): Place = {
+		self.note(&place)
+		return place
+	}
+
+	fn rewritesCallee(): bool = true
+}
+
+/// The places whose address may be written through by what this body does
+/// not name: an address kept in a field, or held by a local that is read for
+/// anything but to be copied into another that holds it.
+fn escapedPlaces(body: &Body): Vec<(Local, Vec<Projection>)> = {
+	// Each local that holds an address, and what it is the address of.
+	var holds: Map<Local, (Local, Vec<Projection>)> = Map()
+	var escaped: Vec<(Local, Vec<Projection>)> = Vec()
+	for block in body.blocks {
+		for statement in block.statements {
+			val .Assign(place: dest, rvalue: .AddressOf(target)) = statement else continue
+			val .Some(key) = factKey(&target) else continue
+			if dest.projections.isEmpty() then
+				holds.put(dest.local, key)
+			else
+				escaped.push(key)
+		}
+	}
+	// A copy of a holder holds the same address.
+	var grown = true
+	while grown {
+		grown = false
+		for block in body.blocks {
+			for statement in block.statements {
+				val .Assign(place: dest, rvalue: .Use(.Copy(source))) = statement else continue
+				if !dest.projections.isEmpty() || !source.projections.isEmpty() then
+					continue
+
+				if holds.contains(&dest.local) then
+					continue
+
+				val .Some(key) = holds.get(&source.local) else continue
+				holds.put(dest.local, key.clone())
+				grown = true
+			}
+		}
+	}
+	if holds.isEmpty() then
+		return escaped
+
+	for block in body.blocks {
+		for statement in block.statements {
+			if holderStatement(&statement, &holds) then
+				continue
+
+			var named = Named()
+			rewriteStatement(statement.clone(), &var named)
+			for local in named.locals do
+				if holds.get(&local) is .Some(key) then
+					escaped.push(key.clone())
+		}
+		var named = Named()
+		rewriteTerminator(block.terminator.clone(), &var named)
+		for local in named.locals do
+			if holds.get(&local) is .Some(key) then
+				escaped.push(key.clone())
+	}
+	return escaped
+}
+
+/// Whether a statement only gives a holder its address: takes it, or copies
+/// it from another holder.
+fn holderStatement(
+	statement: &Statement,
+	holds: &Map<Local, (Local, Vec<Projection>)>,
+): bool = match statement {
+	.Assign(place: dest, rvalue: .AddressOf(target)) =>
+		dest.projections.isEmpty() && factKey(&target).isSome()
+	.Assign(place: dest, rvalue: .Use(.Copy(source))) =>
+		dest.projections.isEmpty() &&
+			source.projections.isEmpty() &&
+			holds.contains(&dest.local) &&
+			holds.contains(&source.local)
+	_ => false
+}
+
+/// Whether nothing but what this body names may write the place `key`.
+fn trackable(key: &(Local, Vec<Projection>), escaped: &[(Local, Vec<Projection>)]): bool = {
+	return escaped.all((e) => !(e.0 == key.0 && overlaps(&e.1, &key.1)))
+}
+
+/// The place a block's switch tests, where the statements before the test
+/// do not write it.
+fn switchOn(block: &Block): Option<(Local, Vec<Projection>)> = {
+	val .Switch(value: .Copy(tested), ..) = block.terminator else return .None
+	val .Some(direct) = factKey(&tested) else return .None
+	// The last write of what is tested.
+	var copied: Option<i64> = .None
+	var i = block.statements.len()
+	while i > 0 {
+		i -= 1
+		if writes(&block.statements[i], &direct) {
+			copied = i
+			break
+		}
+	}
+	val .Some(at) = copied else return direct
+	// Only a copy of a place, which it then stands for.
+	val .Assign(place: dest, rvalue: .Use(.Copy(source))) = block.statements[at] else return .None
+	if factKey(&dest) != direct.clone() then
+		return .None
+
+	val .Some(key) = factKey(&source) else return .None
+	for i in 0..at do
+		if writes(&block.statements[i], &key) then
+			return .None
+
+	return key
+}
+
+/// Whether a statement may write any part of the place `key`.
+fn writes(statement: &Statement, key: &(Local, Vec<Projection>)): bool = {
+	val .Some(dest) = writtenPlace(&statement) else return false
+	return match factKey(&dest) {
+		.Some(written) => written.0 == key.0 && overlaps(&written.1, &key.1)
+		// Into an element of the local, or through a pointer, which reaches
+		// none of a place `trackable` keeps.
+		.None => dest.local == key.0 && !behindPointer(&dest)
+	}
+}
+
+/// What a block leaves in the place `key`.
+enum Left {
+	/// A constant, the last that it writes there.
+	Constant(value: u32)
+	/// Something else, or a part of it.
+	Changed
+	/// What it was given: it does not write it.
+	Untouched
+}
+
+fn leftIn(block: &Block, key: &(Local, Vec<Projection>)): Left = {
+	for statement in block.statements.backwards() {
+		if !writes(&statement, &key) then
+			continue
+
+		if statement is .Assign(place: dest, rvalue: .Use(.Const(.Int(bits, ..)))) &&
+			factKey(&dest) == key.clone() {
+			return .Constant((bits & 0xffffffff) as u32)
+		}
+		return .Changed
+	}
+	return .Untouched
+}
+
+/// A way back from a switch to a block that writes what it tests: the block,
+/// the blocks after it up to the switch, and the value written.
+struct Way {
+	writer: u32
+	blocks: Vec<u32>
+	value: u32
+}
+
+/// The nearest way back from the switch of block `b` to a block that writes
+/// a constant in `key`, through blocks that write nothing there.
+fn wayTo(
+	body: &Body,
+	preds: &[Vec<u32>],
+	b: u32,
+	key: &(Local, Vec<Projection>),
+	tried: &Set<(u32, u32)>,
+): Option<Way> = {
+	// Each block reached, and the block after it on the way to `b`.
+	var toward: Map<u32, u32> = Map()
+	var queue: Vec<(u32, i64)> = [(b, 1)]
+	var next = 0
+	while next < queue.len() {
+		val (at, depth) = queue[next]
+		next += 1
+		for from in preds[at as i64] {
+			if from == b || toward.contains(&from) then
+				continue
+
+			toward.put(from, at)
+			match leftIn(&body.blocks[from as i64], &key) {
+				.Constant(value) => {
+					if tried.contains((from, b)) then
+						continue
+
+					var blocks: Vec<u32> = Vec()
+					var on = at
+					while on != b {
+						blocks.push(on)
+						on = toward.at(&on)
+					}
+					blocks.push(b)
+					return Way(writer: from, blocks: blocks, value: value)
+				}
+				.Changed => {}
+				.Untouched => if depth < DEPTH then queue.push((from, depth + 1))
+			}
+		}
+	}
+	return .None
+}
+
+/// Makes the way go to the case its write chose: the blocks of the way from
+/// the first that another way reaches are copied, the copy of the switch
+/// goes to the case, and the way goes into the copies. Answers the statements
+/// copied, or -1 where that is more than `budget`.
+fn threadWay(body: &var Body, preds: &[Vec<u32>], way: &Way, budget: i64): i64 = {
+	val last = way.blocks.len() - 1
+	val switchBlock = way.blocks[last] as i64
+	val .Some(target) = caseTarget(&body.blocks[switchBlock].terminator, way.value) else return -1
+	// The blocks the way alone reaches are its own, and change in place.
+	var shared: Option<i64> = .None
+	for i in 0..way.blocks.len() {
+		val before = if i == 0 then way.writer else way.blocks[i - 1]
+		val from = &preds[way.blocks[i] as i64]
+		if from.len() != 1 || from[0] != before {
+			shared = i
+			break
+		}
+	}
+	val .Some(first) = shared else {
+		body.blocks[switchBlock].terminator = .Goto(target)
+		return 0
+	}
+	var cost = 0
+	for i in first..way.blocks.len() do
+		cost += body.blocks[way.blocks[i] as i64].statements.len()
+
+	if cost > budget then
+		return -1
+
+	val base = body.blocks.len()
+	for i in first..way.blocks.len() {
+		var copy = body.blocks[way.blocks[i] as i64].clone()
+		if i == last then
+			copy.terminator = .Goto(target)
+		else {
+			val onward = BlockId((base + (i + 1 - first)) as u32)
+			copy.terminator = retargeted(&copy.terminator, BlockId(way.blocks[i + 1]), onward)
+		}
+
+		body.blocks.push(copy)
+	}
+	val before = if first == 0 then way.writer else way.blocks[first - 1]
+	val entered = retargeted(
+		&body.blocks[before as i64].terminator,
+		BlockId(way.blocks[first]),
+		BlockId(base as u32),
+	)
+	body.blocks[before as i64].terminator = entered
+	return cost
+}
+
+/// A terminator with each jump to `from` going to `to` instead.
+fn retargeted(terminator: &Terminator, from: BlockId, to: BlockId): Terminator = {
+	val swap = (target: BlockId): BlockId => if target == from then to else target
+	return match terminator {
+		.Goto(target) => .Goto(swap(target))
+		.Branch(cond, thenBlock, otherwise) => .Branch(
+			cond: cond.clone(),
+			thenBlock: swap(thenBlock),
+			otherwise: swap(otherwise),
+		)
+		.Switch(value, cases, otherwise) => .Switch(
+			value: value.clone(),
+			cases: [
+				for (case, target) in cases do
+					yield (case, swap(target))
+			],
+			otherwise: swap(otherwise),
+		)
+		_ => terminator.clone()
+	}
+}

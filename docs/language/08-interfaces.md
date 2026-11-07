@@ -57,9 +57,9 @@ interface Square {
     fn area(): i64 = self.side() * self.side()
     fn side(): i64 = {
         var side = 0
-        while side * side < self.area() {
+        while side * side < self.area() do
             side += 1
-        }
+
         return side
     }
 }
@@ -101,7 +101,9 @@ fn largest<T: Ord>(values: &[T]): &T = {
     var best = 0
     var i = 1
     while i < values.len() {
-        if values[i] > values[best] then best = i
+        if values[i] > values[best] then
+            best = i
+
         i += 1
     }
     lend values[best]
@@ -109,9 +111,9 @@ fn largest<T: Ord>(values: &[T]): &T = {
 
 fn counted<C: Items<i64>>(container: &C): i64 = {
     var count = 0
-    for value in container.items() {
+    for value in container.items() do
         count += value
-    }
+
     return count
 }
 
@@ -141,9 +143,9 @@ reaches, so code generic over numbers is written once:
 ```wip,run
 fn total<T: Add + Zero + copy>(items: &[T]): T = {
     var sum = T::zero()
-    for x in items {
+    for x in items do
         sum = sum + x
-    }
+
     return sum
 }
 
@@ -477,9 +479,9 @@ interface Source<T> {
 extend Source<T: Add + Zero> {
     var fn total(): T = {
         var sum = T::zero()
-        while self.take() is .Some(x) {
+        while self.take() is .Some(x) do
             sum = sum + x
-        }
+
         return sum
     }
 }
@@ -490,7 +492,9 @@ struct Countdown {
 
 extend Countdown: Source<i64> {
     var fn take(): Option<i64> = {
-        if self.left == 0 then return .None
+        if self.left == 0 then
+            return .None
+
         self.left -= 1
         return self.left + 1
     }

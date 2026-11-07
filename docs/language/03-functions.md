@@ -12,7 +12,9 @@ line; the examples here write it.
 fn double(n: i64): i64 = n * 2
 
 fn describe(n: i64): str = {
-    if n < 0 then return "negative"
+    if n < 0 then
+        return "negative"
+
     return if n == 0 then "zero" else "positive"
 }
 
@@ -420,6 +422,38 @@ fn main() = {
 }
 ```
 
+So is a variant of one field, the function from its field to its enum,
+`mapErr(HttpError::Io)` ([page 1](01-types.md#enums)).
+
+A lambda that only calls a function with its parameters, in their order,
+each as it is or with the `&` that lends what it refers to, says no more
+than the function's name, and is a warning whose fix writes the name in
+its place (E0478, which `wip fix` applies). The fix is offered where the
+name is a value of the lambda's type, and so takes its type arguments as
+the call did: not where a parameter is of another type than the
+function's, nor for a function that is not a value, nor where the lambda
+writes its types. A method of the parameter, `(o) => o.isNone()`, is left
+as it is: the lambda says what is asked of the value, where
+`Option::isNone` would name a type it did not need to:
+
+```wip,run
+struct Shape {
+    side: i64
+
+    fn area(): i64 = self.side * self.side
+}
+
+fn doubled(x: i64): i64 = x * 2
+
+fn main() = {
+    val shapes = [Shape(side: 2), Shape(side: 3)]
+    // Rather than `shapes.map((shape) => Shape::area(shape))`.
+    assert(shapes.map(Shape::area) == [4, 9])
+    // Rather than `.map((x) => doubled(x))`.
+    assert([1, 2].copies().map(doubled).toVec() == [2, 4])
+}
+```
+
 A generic type's arguments come from the type expected, as a generic
 function's do, and where a type has one function of the name for each of
 two interfaces, `Meters::from`, the type expected says which. `x.name` is
@@ -443,7 +477,9 @@ fn main() = {
 
 A parameter that is not used is written `_`, in a lambda, a function or a
 function type, as many times as there are such parameters; it is passed,
-and nothing can name it:
+and nothing can name it. One that is named and never read is a warning
+whose fix is the `_`, where nothing calls it by its name ([page
+12](12-tools.md#what-is-never-used)):
 
 ```wip,run
 fn first(a: i64, _: i64): i64 = a
@@ -580,11 +616,16 @@ as it was, in its statement, its `val`'s block or its loop
 ([page 10](10-library.md)). A closure that must outlive the block it is
 written in — one a struct owns, or another thread runs — is written `own`:
 `Future::run(own () => …)`. A named function goes where either kind of
-closure is expected, a module's or a type's, since it captures nothing: it
-is lent for a call, or owned with nothing to own:
+closure is expected, a module's or a type's, generic or not, since it
+captures nothing: it is lent for a call, or owned with nothing to own. A
+generic one takes its type arguments from the closure's type, as a lambda
+takes its parameters' types, so `map(wrap)` for a generic `wrap` learns
+what it wraps from what is mapped:
 
 ```wip,run
 fn double(x: i64): i64 = x * 2
+
+fn wrap<T>(value: T): Option<T> = Option::Some(value)
 
 fn main() = {
     val words = "a bc".split(" ").map(String::of).toVec()
@@ -593,6 +634,8 @@ fn main() = {
     assert(doubled == [2, 4])
     val kept: own<(x: i64) => i64> = double
     assert(kept(21) == 42)
+    val wrapped = [1, 2].copies().map(wrap).toVec()
+    assert(wrapped == [.Some(1), .Some(2)])
 }
 ```
 
@@ -601,9 +644,8 @@ closure reads it where it is, and one that writes may assign it.
 
 ```wip,run
 fn each(n: i64, visit: &var (x: i64) => void) = {
-    for i in 1..n + 1 {
+    for i in 1..n + 1 do
         visit(i)
-    }
 }
 
 fn main() = {
@@ -647,7 +689,9 @@ its own terms, and compiled once for each set of type arguments:
 fn firstEqual<T: Eq>(values: &[T], wanted: &T): Option<i64> = {
     var i = 0
     while i < values.len() {
-        if values[i] == wanted then return i
+        if values[i] == wanted then
+            return i
+
         i += 1
     }
     return .None
@@ -664,7 +708,7 @@ fn main() = {
 Type arguments are inferred from the arguments, from what the
 arguments hold — a `T` from a `ptr<T>` or a `&[T]` — and from what an
 argument's type implements: with `I: Iterator<(K, V)>`, an iterator that
-hands out `(str, i64)` says `K` and `V`, as `Map::fromPairs` is called with
+hands out `(str, i64)` says `K` and `V`, as `Map::collect` is called with
 no type written. A variable's are also inferred from the first place that
 names it ([page 1](01-types.md#generic-types)): `var counts = Map()`, then
 `counts.put(word, 1)`. A length parameter, `val N`, is inferred from the
@@ -838,12 +882,16 @@ however deep they go:
 
 ```wip,run
 fn isEven(n: u64): bool = {
-    if n == 0 then return true
+    if n == 0 then
+        return true
+
     become isOdd(n - 1)
 }
 
 fn isOdd(n: u64): bool = {
-    if n == 0 then return false
+    if n == 0 then
+        return false
+
     become isEven(n - 1)
 }
 

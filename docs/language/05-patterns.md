@@ -186,7 +186,7 @@ value made where it is matched takes it.
 ```wip,run
 fn sum(xs: &[i64]): i64 = match xs {
     [] => 0
-    [first, ..rest] => first + sum(rest)
+    [first, ..rest] => first + sum(&rest)
 }
 
 fn command(words: &[str]): str = match words {
@@ -384,7 +384,9 @@ fn firstBig(values: &[i64]): i64 = {
 fn firstIndexOver(values: &[i64], least: i64): Option<i64> = {
     var i = 0
     while i < values.len() {
-        if values[i] > least then return i
+        if values[i] > least then
+            return i
+
         i += 1
     }
     return .None

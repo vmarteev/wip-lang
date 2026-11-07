@@ -85,15 +85,20 @@ extend char {{
 		val code = self as u32
 		// Everything before the combining marks is one column, but the
 		// controls, which a terminal does not show.
-		if code < 0x300 then return if code < 0x20 || (code >= 0x7F && code < 0xA0) then 0 else 1
+		if code < 0x300 then
+			return if code < 0x20 || (code >= 0x7F && code < 0xA0) then 0 else 1
+
 		var lo = 0
 		var hi = {len(table)} - 1
 		while lo <= hi {{
 			val middle = (lo + hi) / 2
 			val (first, last, columns) = WIDTHS[middle]
-			if code < first then hi = middle - 1
-			else if code > last then lo = middle + 1
-			else return columns
+			if code < first then
+				hi = middle - 1
+			else if code > last then
+				lo = middle + 1
+			else
+				return columns
 		}}
 		return 1
 	}}

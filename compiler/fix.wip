@@ -12,28 +12,56 @@ import std::path
 import fmt::{switchedOff}
 import lang::{Sources, Target, Timings, checkLoaded, findHome, loadFor, renderProgram}
 import syntax::{
+	BINDING_NEVER_READ,
 	BYTE_CAST,
 	CLONE_OF_PLAIN,
 	COPIED_AT_LAST_USE,
 	Code,
 	Diagnostic,
+	IMPORT_NEVER_USED,
+	LIST_ONLY_WALKED,
+	LOOP_AS_LIST,
+	LOOP_AS_SEARCH,
 	MOVE_INFERRED,
 	NEEDLESS_DERIVE,
-	NEEDLESS_WRAPPER
+	NEEDLESS_LAMBDA,
+	NEEDLESS_WRAPPER,
+	NEVER_READ,
+	NEVER_WRITTEN,
+	PARAMETER_NEVER_READ,
+	REFERENCE_PASSED_ON
 }
 
 /// The warnings whose fix changes no meaning, which `wip fix` applies: a
 /// copy where a move would do, a `move` the compiler infers, a `clone()` of
 /// plain data, a `@derive` of what the type has without it, a character
-/// cast to a byte, and a `.Some` or an `.Ok` the type expected says.
-val FIXED: [Code; 6] = [
+/// cast to a byte, a `.Some` or an `.Ok` the type expected says, a `var`
+/// nothing writes, a local nothing reads that is given what only reads, a
+/// binding and a parameter nothing reads, an import nothing names, and a
+/// lambda that only calls a function, which its name says.
+val FIXED: [Code; 15] = [
 	COPIED_AT_LAST_USE,
 	MOVE_INFERRED,
 	CLONE_OF_PLAIN,
 	NEEDLESS_DERIVE,
 	BYTE_CAST,
 	NEEDLESS_WRAPPER,
+	NEVER_WRITTEN,
+	NEVER_READ,
+	BINDING_NEVER_READ,
+	PARAMETER_NEVER_READ,
+	IMPORT_NEVER_USED,
+	NEEDLESS_LAMBDA,
+	LOOP_AS_LIST,
+	LIST_ONLY_WALKED,
+	LOOP_AS_SEARCH,
 ]
+
+/// The errors whose fix gives the program what its code meant before the
+/// language asked for more: a reference passed on by its name, which a call
+/// now lends with `&`. Their fixes are made too, in a program that has no
+/// other error.
+val MIGRATED: [Code; 1] = [REFERENCE_PASSED_ON]
 
 /// How many times a program is checked and fixed again, at most: each round
 /// can make another value's use its last.
@@ -51,10 +79,18 @@ struct FileEdit {
 	first: bool
 }
 
-/// `wip fix`: each program in `paths`, or the current directory's, fixed;
-/// each file changed listed with how many fixes of each code it took. With
-/// `check`, nothing is written, and it fails where something would change.
-fn fixCommand(paths: &[str], check: bool, layout: &Layout, color: bool, threads: i64): i64 = {
+/// `wip fix`: each program in `paths`, or the current directory's, fixed as
+/// each of `targets` checks it, or this machine; each file changed listed
+/// with how many fixes of each code it took. With `check`, nothing is
+/// written, and it fails where something would change.
+fn fixCommand(
+	paths: &[str],
+	targetNames: &[str],
+	check: bool,
+	layout: &Layout,
+	color: bool,
+	threads: i64,
+): i64 = {
 	val programs: Vec<str> = if paths.isEmpty() then ["."].toVec() else paths.toVec()
 	val here = match fs::realPath(".") {
 		.Ok(here) => here
@@ -64,51 +100,100 @@ fn fixCommand(paths: &[str], check: bool, layout: &Layout, color: bool, threads:
 		}
 	}
 	val home = findHome().toOption()
+	var targets: Vec<Target> = Vec()
+	for name in targetNames {
+		match Target::parse(name) {
+			.Ok(parsed) => {
+				for target in parsed do
+					if !targets.contains(&target) then
+						targets.push(target)
+			}
+			.Err(message) => {
+				io::eprintln("error: \(message)")
+				return 2
+			}
+		}
+	}
+	if targets.isEmpty() then
+		targets.push(Target::host())
+
 	var changed: Vec<(String, Vec<Code>)> = Vec()
 	var failed = 0
 	for program in programs {
-		for _ in 0..ROUNDS {
-			var timings = Timings()
-			var loaded = match loadFor(program, .Tests, Target::host(), &var timings, threads) {
-				.Ok(loaded) => loaded
-				.Err(message) => {
-					io::eprintln("error: \(message)")
-					failed += 1
-					break
-				}
-			}
-			val checked = checkLoaded(&var loaded, &var timings)
-			if checked.diagnostics.any((d) => d.isError()) {
-				io::eprint(renderProgram(&checked.diagnostics, &loaded.sources, color))
-				io::eprintln("`\(program)` is left as it is: it has errors")
-				failed += 1
-				break
-			}
-			val files = editsOf(&checked.diagnostics, &loaded.sources, here, &home)
-			if files.isEmpty() then break
-			for (file, edits) in files {
-				val at = match changed.indexWhere((c) => c.0 == file) {
-					.Some(at) => at
-					.None => {
-						changed.push((file.clone(), Vec()))
-						changed.len() - 1
-					}
-				}
-				for edit in edits {
-					if edit.first then changed[at].1.push(edit.code)
-				}
-				if !check && written(file, &edits, &layout, color) is .Err(message) {
-					io::eprintln("error: \(message)")
-					failed += 1
-				}
-			}
-			if check then break
-		}
+		for target in targets do
+			failed += fixedFor(
+				program,
+				target,
+				check,
+				here,
+				&home,
+				&layout,
+				color,
+				threads,
+				&var changed,
+			)
 	}
-	for (file, codes) in changed {
+	for (file, codes) in changed do
 		io::println("\(file.stripPrefix("\(here)/").unwrapOr(&file)): \(counted(&codes))")
-	}
+
 	return if failed > 0 then 1 else if check && !changed.isEmpty() then 1 else 0
+}
+
+/// `program` fixed round after round as `target` checks it, each file it
+/// changed added to `changed` with the codes of its fixes; how many
+/// failures there were.
+fn fixedFor(
+	program: str,
+	target: Target,
+	check: bool,
+	here: str,
+	home: &Option<String>,
+	layout: &Layout,
+	color: bool,
+	threads: i64,
+	changed: &var Vec<(String, Vec<Code>)>,
+): i64 = {
+	var failed = 0
+	for _ in 0..ROUNDS {
+		var timings = Timings()
+		var loaded = match loadFor(program, .Tests, target, &var timings, threads) {
+			.Ok(loaded) => loaded
+			.Err(message) => {
+				io::eprintln("error: \(message)")
+				return failed + 1
+			}
+		}
+		val checked = checkLoaded(&var loaded, &var timings)
+		if checked.diagnostics.any((d) => d.isError() && !MIGRATED.contains(&d.code)) {
+			io::eprint(renderProgram(&checked.diagnostics, &loaded.sources, color))
+			io::eprintln("`\(program)` is left as it is: it has errors")
+			return failed + 1
+		}
+		val files = editsOf(&checked.diagnostics, &loaded.sources, here, &home)
+		if files.isEmpty() then
+			break
+
+		for (file, edits) in files {
+			val at = match changed.indexWhere((c) => c.0 == file) {
+				.Some(at) => at
+				.None => {
+					changed.push((file.clone(), Vec()))
+					changed.len() - 1
+				}
+			}
+			for edit in edits do
+				if edit.first then
+					changed[at].1.push(edit.code)
+
+			if !check && written(file, &edits, &layout, color) is .Err(message) {
+				io::eprintln("error: \(message)")
+				failed += 1
+			}
+		}
+		if check then
+			break
+	}
+	return failed
 }
 
 /// The edits the fixes of `diagnostics` make, file by file: those of the
@@ -124,7 +209,12 @@ fn editsOf(
 ): Vec<(String, Vec<FileEdit>)> = {
 	var files: Vec<(String, Vec<FileEdit>)> = Vec()
 	for diagnostic in diagnostics {
-		if diagnostic.isError() || !FIXED.contains(&diagnostic.code) then continue
+		val fixes =
+			if diagnostic.isError() then MIGRATED.contains(&diagnostic.code)
+			else FIXED.contains(&diagnostic.code)
+		if !fixes then
+			continue
+
 		val .Some(fix) = diagnostic.fix else continue
 		var made: Vec<(String, FileEdit)> = Vec()
 		var whole = true
@@ -153,7 +243,9 @@ fn editsOf(
 			}
 			made.push((file, one))
 		}
-		if !whole then continue
+		if !whole then
+			continue
+
 		for (file, one) in move made {
 			val at = match files.indexWhere((f) => f.0 == file) {
 				.Some(at) => at
@@ -189,15 +281,40 @@ fn fixable(name: str, here: str, home: &Option<String>): Option<String> = {
 
 /// `file` with `edits` made, laid out as `wip fmt` lays it out unless it
 /// says not to be, and written.
+/// `text` without the line at `at`, where an edit has left nothing on it
+/// but its indent: a statement or an import removed leaves no blank line
+/// of its own.
+fn withoutEmptiedLine(text: String, at: i64): String = {
+	var start = at
+	while start > 0 && text[start - 1] != b'\n' do
+		start -= 1
+
+	var end = at
+	while end < text.len() && text[end] != b'\n' do
+		end += 1
+
+	for i in start..end do
+		if text[i] != b' ' && text[i] != b'\t' then
+			return text
+
+	if end >= text.len() then
+		return text
+
+	return "\(text[..start])\(text[end + 1..])"
+}
+
 fn written(file: str, edits: &[FileEdit], layout: &Layout, color: bool): Result<void, String> = {
 	var text = fs::readFile(file).mapErr((error) => "cannot read `\(file)`: \(error)")?
 	var order = edits.toVec()
 	order.sortBy((a, b) => a.lo > b.lo)
 	for edit in order {
 		text = "\(text[..edit.lo as i64])\(edit.replacement)\(text[edit.hi as i64..])"
+		if edit.replacement.isEmpty() && edit.hi > edit.lo then
+			text = withoutEmptiedLine(text, edit.lo as i64)
 	}
 	if !switchedOff(text) && formatText(file, text, &layout, color) is .Some(formatted) then
 		text = formatted
+
 	return fs::writeFile(file, text).mapErr((error) => "cannot write `\(file)`: \(error)")
 }
 

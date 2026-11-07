@@ -26,7 +26,9 @@ extend Parser {
 				return Block(stmts: stmts, span: open.to(self.prevSpan()))
 			}
 			self.beginRegion()
-			if self.leadingOperator() then continue
+			if self.leadingOperator() then
+				continue
+
 			// A `-` that begins a line below a statement may be one cut short.
 			val negGap =
 				if !stmts.isEmpty() && kind == .Minus && self.lineBreak() then
@@ -53,7 +55,9 @@ extend Parser {
 	/// After a statement: `;`, a line break or `}` must follow (E0112).
 	var fn stmtSeparator() = {
 		val kind = self.peek()
-		if kind is .Semi | .RBrace | .Eof || isItemStart(kind) || self.lineBreak() then return
+		if kind is .Semi | .RBrace | .Eof || isItemStart(kind) || self.lineBreak() then
+			return
+
 		val diagnostic = Diagnostic::error(
 			SEPARATOR,
 			"missing `;` between statements on one line",
@@ -71,7 +75,9 @@ extend Parser {
 	/// that one statement.
 	var fn guardStmt(mutable: bool, start: Span, refutable: bool): StmtId = {
 		val pattern = self.pattern()
-		if mutable then self.varInVarPattern(&pattern)
+		if mutable then
+			self.varInVarPattern(&pattern)
+
 		val value = if self.expect(.Eq) then self.expr() else self.errorExpr()
 		var elseBlock: Option<Block> = .None
 		if self.at(.Else) {
@@ -105,7 +111,9 @@ extend Parser {
 	/// `break outer`: which loop the jump leaves, where it is not the
 	/// innermost. It is on the same line as the keyword.
 	var fn jumpLabel(): Option<Name> = {
-		if !isIdent(self.peek()) || self.lineBreak() then return .None
+		if !isIdent(self.peek()) || self.lineBreak() then
+			return .None
+
 		return self.name("a loop's name")
 	}
 
@@ -194,7 +202,7 @@ extend Parser {
 			.While => {
 				self.bump()
 				val cond = self.cond()
-				val body = self.block()
+				val body = self.loopBody()
 				StmtKind::While(label: .None, cond: cond, body: body)
 			}
 			// `outer: while …`, `outer: for …`: a loop with a name, which
@@ -227,7 +235,7 @@ extend Parser {
 					self.skipStmt()
 					return .None
 				}
-				val body = self.block()
+				val body = self.loopBody()
 				StmtKind::For(label: .None, binding: binding, source: move source, body: body)
 			}
 			// `break`, or `break outer`: the loop of that name.
@@ -251,6 +259,96 @@ extend Parser {
 		val span = start.to(self.prevSpan())
 		return self.allocStmt(kind, span)
 	}
+
+	/// A loop's body: statements in braces, or one statement after `do`.
+	var fn loopBody(): Block = {
+		if !self.at(.Do) then
+			return self.block()
+
+		val doSpan = self.bump()
+		return self.doBody(doSpan)
+	}
+
+	/// What follows a loop's `do`: one statement, held as a block of it, as
+	/// a braced body of one would be. A block after it is told to drop the
+	/// `do`; a binding, a loop, an `if` with an `else` or in braces, a
+	/// `match` and a block are each refused with the fix that writes the
+	/// loop's braces, since a line holds one statement, and the words of two
+	/// loops on one would not say which is the outer.
+	var fn doBody(doSpan: Span): Block = {
+		val start = self.span()
+		if self.at(.LBrace) {
+			val diagnostic = Diagnostic::error(
+				EXPECTED,
+				"`do` is followed by one statement, not a block",
+				start,
+				"a block",
+			).withFix("drop `do`, for the braced form", [Edit::replace(doSpan, "")]).withNote(
+				"a loop's body is one statement after `do`, or statements in braces with no `do`",
+			)
+			self.report(diagnostic)
+			return self.block()
+		}
+		var stmts: Vec<StmtId> = Vec()
+		var refused: Option<str> = .None
+		val loopAhead =
+			self.at(.For) ||
+			self.at(.While) ||
+			(isIdent(self.peek()) && self.nth(1) == .Colon && self.nth(2) is .While | .For)
+		match self.peek() {
+			.Return | .Become | .Break | .Continue | .Yield => {
+				if self.stmt() is .Some(stmt) then stmts.push(stmt)
+			}
+			.Val | .Var => {
+				refused = "a binding, which would bind for nothing after it"
+				if self.stmt() is .Some(stmt) then
+					stmts.push(stmt)
+			}
+			_ if loopAhead => {
+				refused = "a loop, and the line would not say which loop is the outer"
+				if self.stmt() is .Some(stmt) then
+					stmts.push(stmt)
+			}
+			kind if canStartExpr(kind) => {
+				val value = self.expr()
+				refused = match self.ast.exprs[value].kind {
+					.If(elseBranch: .Some(_), ..) => "an `if` with an `else`"
+					.If(thenBlock, ..) if !self.isThenBranch(&thenBlock) => "an `if` in braces"
+					.Match(..) => "a `match`"
+					.Block(..) => "a block"
+					_ => .None
+				}
+				val span = self.exprSpan(value)
+				stmts.push(self.allocStmt(.Expr(value: value), span))
+			}
+			_ => {
+				val diagnostic = self.expected("a statement after `do`")
+				self.report(diagnostic)
+			}
+		}
+		val span = start.to(self.prevSpan())
+		if refused is .Some(what) then
+			self.report(
+				Diagnostic::error(
+					EXPECTED,
+					"a loop's body after `do` is one statement, and this is \(what)",
+					span,
+					"more than `do` takes",
+				).withFix("write the body in braces", [
+					Edit::replace(doSpan, "{"),
+					Edit::insert(span.hi, " }"),
+				]).withNote(
+					"`do` takes a call, an assignment, a `yield`, a jump, or an `if … then` without an `else`; more is written in braces",
+				),
+			)
+
+		return Block(stmts: stmts, span: span)
+	}
+
+	/// Whether a branch was written after `then`: it starts where its one
+	/// statement does, where a block in braces starts at its `{`.
+	fn isThenBranch(block: &Block): bool =
+		!block.stmts.isEmpty() && self.ast.stmts[block.stmts[0]].span.lo == block.span.lo
 
 	/// What follows `for`: what each element is bound to, `in`, and what
 	/// is walked — a statement's and a list literal's element's alike.

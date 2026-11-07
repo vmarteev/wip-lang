@@ -1,0 +1,144 @@
+// `c::fieldsOf<T>()`: each field of a struct, as a constant table the
+// program keeps once for each struct asked about. Once every instance is
+// known, each call of one is made a read of that table, as a use of a
+// constant that holds a list is, so what runs it — the evaluator, the
+// backend — reads it as it reads any table.
+
+import std::collections::{Map}
+
+/// Each call of an instance of `fieldsOf` made a read of its struct's table,
+/// which is made here, the first time a struct is asked about.
+pub fn fieldTables(program: &var Program) = {
+	var layouts = Layouts::new()
+	var tables: Map<Ty, ConstId> = Map()
+	for id in program.fns.ids() {
+		if program.fns[id].body.isNone() then
+			continue
+
+		var calls: Vec<(ExprId, FnId)> = Vec()
+		if program.fns[id].body is .Some(body) {
+			for e in body.exprs.ids() {
+				val .Call(callee, ..) = body.exprs[e].kind else continue
+				if program.fns[callee].intrinsic is .Some(.FieldsOf) &&
+					program.fns[callee].instanceOf.isSome() {
+					calls.push((e, callee))
+				}
+			}
+		}
+		for (e, callee) in calls {
+			val .Some((_, typeArgs)) = program.fns[callee].instanceOf else continue
+			val of = program.types.list(typeArgs)[0]
+			val ty = program.fns[callee].ret
+			val table = match tables.get(&of) {
+				.Some(table) => table
+				.None => {
+					val made = fieldsTable(&var program, &var layouts, of, ty, callee)
+					tables.put(of, made)
+					made
+				}
+			}
+			val reference = program.types.intern(.Ref(inner: ty, kind: .Shared))
+			var .Some(body) = program.fns[id].body.take() else continue
+			val span = body.exprs[e].span
+			val address = body.exprs.add(Expr(kind: .Table(table), ty: reference, span: span))
+			body.exprs[e].kind = .Deref(address)
+			program.fns[id].body = body
+		}
+	}
+}
+
+/// The table of the struct `of`'s fields, of type `ty`, the `&[Field]` of
+/// the instance `callee` of `fieldsOf`.
+fn fieldsTable(
+	program: &var Program,
+	layouts: &var Layouts,
+	of: Ty,
+	ty: Ty,
+	callee: FnId,
+): ConstId = {
+	val .Struct(id, ..) = program.types.kind(of) else panic("the checker asked for a struct")
+	var values: Vec<ConstValue> = Vec()
+	val fields = program.fieldTys(of)
+	for i in 0..fields.len() {
+		val numbers: ConstValue = match numbersOf(&program, &var layouts, fields[i]) {
+			// `Option`'s `.Some`, of the scalar and how many.
+			.Some((scalar, count)) => .Variant(variant: 0, fields: [
+				.Struct([.Variant(variant: scalar, fields: Vec()), .Int(count as u128)]),
+			])
+			.None => .Variant(variant: 1, fields: Vec())
+		}
+		values.push(
+			.Struct([
+				.Str(program.structs[id].fields[i].name),
+				.Int(layouts.fieldOffset(&program, of, i as u32) as u128),
+				.Int(layouts.of(&program, fields[i]).size as u128),
+				numbers,
+			]),
+		)
+	}
+	return program.consts.add(ConstDef(
+		name: program.fns[callee].name,
+		ty: ty,
+		value: .List(values),
+		code: .None,
+		module: program.fns[callee].module,
+		isPub: false,
+		span: program.fns[callee].span,
+	))
+}
+
+/// The numbers `ty` is made of, as `Scalar`'s variant and how many, where
+/// they are all of one kind with no bytes between them.
+fn numbersOf(
+	program: &Program,
+	layouts: &var Layouts,
+	ty: Ty,
+): Option<(u32, i64)> = match program.types.kind(ty) {
+	.Int(int) => match int {
+		.I8 => (0, 1)
+		.I16 => (1, 1)
+		.I32 => (2, 1)
+		.I64 | .Isize => (3, 1)
+		.U8 => (4, 1)
+		.U16 => (5, 1)
+		.U32 => (6, 1)
+		.U64 | .Usize => (7, 1)
+		.I128 | .U128 => .None
+	}
+	.Float(float) => if float == .F32 then (8, 1) else (9, 1)
+	.Array(elem, len) => match numbersOf(&program, &var layouts, elem) {
+		.Some((scalar, count)) => (scalar, count * len as i64)
+		.None => .None
+	}
+	.Struct(id, ..) => {
+		if program.structs[id].isOpaque then
+			return .None
+
+		var kind: Option<u32> = .None
+		var count = 0
+		for field in program.fieldTys(ty) {
+			val .Some((scalar, n)) = numbersOf(&program, &var layouts, field) else return .None
+			if kind is .Some(k) && k != scalar then
+				return .None
+
+			kind = scalar
+			count += n
+		}
+		val .Some(scalar) = kind else return .None
+		// Bytes between them, or after, are padding, which no number fills.
+		val size = layouts.of(&program, ty).size as i64
+		if count * scalarSize(scalar) != size then
+			return .None
+
+		(scalar, count)
+	}
+	_ => .None
+}
+
+/// How many bytes a number of `Scalar`'s variant `scalar` takes.
+fn scalarSize(scalar: u32): i64 = match scalar {
+	0 | 4 => 1
+	1 | 5 => 2
+	2 | 6 | 8 => 4
+	_ => 8
+}

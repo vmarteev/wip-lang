@@ -1,0 +1,536 @@
+// Loops that say in several lines what a value says in one: a `Vec` filled by
+// the loop after it, which the list that yields is; a list that yields built
+// only to be walked to its end, which the generator is without allocating;
+// and a loop that only tests and returns, which `any`, `all` or `find` is.
+// Each is a warning whose fix `wip fix` makes, offered only where it changes
+// nothing the program does.
+
+import syntax as ast
+import syntax::{Diagnostic, Edit, LIST_ONLY_WALKED, LOOP_AS_LIST, LOOP_AS_SEARCH, Span, Symbol}
+
+/// The most statements a loop's body may hold, those of its branches and
+/// inner loops counted, to be said as a list: measured on the code, where
+/// four take in all but a few, and a longer body reads as well as the loop.
+val LIST_STATEMENTS = 4
+
+/// What a search loop is said as.
+enum Search {
+	Any
+	All
+	Find
+}
+
+extend Search {
+	fn method(): str = match self {
+		.Any => "any"
+		.All => "all"
+		.Find => "find"
+	}
+}
+
+/// The `push`es a loop's body fills a vector with: each call, and the value
+/// it pushes.
+struct Push {
+	call: Span
+	value: Span
+}
+
+extend Lowerer {
+	/// The loops of a block, checked, that a shorter form says: `stmts` are
+	/// the block's statements as checked, one for each written but its value.
+	var fn loopForms(block: &ast::Block, stmts: &[StmtId]) = {
+		for i in 0..stmts.len() - 1 {
+			if i + 1 >= block.stmts.len() then
+				break
+
+			// A line after the loop that begins with `.`, a variant, would go
+			// on from the list's `]` as a method of it.
+			val dotAfter =
+				i + 2 < block.stmts.len() &&
+				self.ast.stmts[block.stmts[i + 2]].kind is .Expr(e) &&
+				self.startsWithDot(e)
+			if !dotAfter then
+				self.loopAsList(block.stmts[i], block.stmts[i + 1], stmts[i])
+
+			self.loopAsSearch(block.stmts[i], block.stmts[i + 1], stmts[i])
+		}
+	}
+
+	/// Whether an expression's first token is a `.`: a variant, or what is
+	/// built on one.
+	fn startsWithDot(e: ast::ExprId): bool = match self.ast.exprs[e].kind {
+		.Path(leadingDot, ..) => leadingDot
+		.Call(callee: inner, ..) | .Field(base: inner, ..) | .Index(base: inner, ..) | .Try(inner)
+		| .Is(scrutinee: inner, ..) | .Cast(expr: inner, ..) | .Binary(lhs: inner, ..)
+		| .SubSlice(base: inner, ..) | .Range(lo: inner, ..) | .Assign(target: inner, ..) => self.startsWithDot(
+			inner,
+		)
+		_ => false
+	}
+
+	/// `var v = Vec()` and then a `for` that fills it, one `push` an
+	/// element, warned of with the list that yields as the fix: `[` for
+	/// `Vec()`, `yield` for each `push`, and `]` after the loop. What is
+	/// between the declaration and the loop stays, inside the list. The `var`
+	/// stays too: where nothing writes it after, that is a warning of its
+	/// own, whose fix is the `val`.
+	var fn loopAsList(declared: ast::StmtId, next: ast::StmtId, checked: StmtId) = {
+		val file = self.ast
+		val .Let(mutable: true, isImplicit: false, name, init, ..) =
+			file.stmts[declared].kind else {
+			return
+		}
+		val .For(label: .None, body, ..) = file.stmts[next].kind else return
+		if !self.writtenEmpty(init) then
+			return
+
+		// The prelude has no list that yields, since one is the prelude's
+		// `Vec`.
+		if self.preludeType(Symbol::vecType()) is .None then
+			return
+
+		val .Let(local, ..) = self.state.body.stmts[checked].kind else return
+		if self.program.vecElement(self.state.body.locals[local].ty).isNone() then
+			return
+
+		// A long body reads as well as a loop as it does as a list.
+		if self.statementsIn(&body) > LIST_STATEMENTS then
+			return
+
+		var pushes: Vec<Push> = Vec()
+		if !self.pushesIn(&body, name.sym, &var pushes) || pushes.isEmpty() then
+			return
+
+		// The vector is named in the loop by its `push`es alone, as a name or
+		// any other word, and nothing in the loop yields to a list or a
+		// generator that would then be this one.
+		val loop = file.stmts[next].span
+		if self.namedIn(loop, name.sym) != pushes.len() || self.yieldsIn(loop) then
+			return
+
+		if self.lentForCallIn(loop) then
+			return
+
+		val vector = self.text(name.sym)
+		var edits = Vec::of([Edit::replace(file.exprs[init].span, "[")])
+		for push in pushes {
+			edits.push(Edit::replace(Span::new(lo: push.call.lo, hi: push.value.lo), "yield "))
+			edits.push(Edit::replace(Span::new(lo: push.value.hi, hi: push.call.hi), ""))
+		}
+		edits.push(Edit::insert(loop.hi, "]"))
+		self.report(
+			Diagnostic::warning(
+				LOOP_AS_LIST,
+				"a loop that fills `\(vector)`, which a list says",
+				Span::new(lo: file.stmts[declared].span.lo, hi: loop.hi),
+				"declared empty, then pushed to",
+			).withNote(
+				"a list whose loop yields is the vector it fills, built as the loop runs: `[for x in xs { yield f(x) }]`",
+			).withFix("say it as the list that yields", edits.intoBuffer()),
+		)
+	}
+
+	/// `Vec()` or `[]`.
+	fn writtenEmpty(e: ast::ExprId): bool = match self.ast.exprs[e].kind {
+		.Array(elems) => elems.isEmpty()
+		.Call(callee, args, rest: .None, ..) =>
+			args.isEmpty() && self.ast.exprs[callee].kind is .Name(sym) && self.text(sym) == "Vec"
+		_ => false
+	}
+
+	/// The `push`es to `vector` in a loop's body: statements of it, branches
+	/// of an `if` or arms of a `match` in it, and those of a loop inside it.
+	/// False where one is anywhere else or pushes more or less than one
+	/// value, and where the body does anything but work out what it pushes:
+	/// its other statements may only declare, take a value apart, and leave
+	/// the loop or go round it.
+	fn pushesIn(block: &ast::Block, vector: Symbol, found: &var Vec<Push>): bool = {
+		for stmt in block.stmts {
+			val fits = match self.ast.stmts[stmt].kind {
+				.Expr(e) => self.pushesInExpr(e, vector, &var found)
+				.For(body, ..) | .While(body, ..) => self.pushesIn(&body, vector, &var found)
+				.Let(..) | .Guard(..) | .Break(..) | .Continue(..) => true
+				_ => false
+			}
+			if !fits then
+				return false
+		}
+		return true
+	}
+
+	/// How many statements a block holds, those of the blocks in it too.
+	fn statementsIn(block: &ast::Block): i64 = {
+		var count = 0
+		for stmt in block.stmts {
+			count += 1
+			count += match self.ast.stmts[stmt].kind {
+				.For(body, ..) | .While(body, ..) => self.statementsIn(&body)
+				.Expr(e) => self.statementsInExpr(e)
+				_ => 0
+			}
+		}
+		return count
+	}
+
+	fn statementsInExpr(e: ast::ExprId): i64 = match self.ast.exprs[e].kind {
+		.If(thenBlock, elseBranch, ..) => {
+			val inElse = match elseBranch {
+				.Some(other) => self.statementsInExpr(other)
+				.None => 0
+			}
+			self.statementsIn(&thenBlock) - 1 + inElse
+		}
+		.Block(block) => self.statementsIn(&block)
+		.Match(arms, ..) => {
+			var count = 0
+			for arm in arms do
+				count += self.statementsInExpr(arm.body).max(1)
+
+			count
+		}
+		_ => 0
+	}
+
+	/// The same, of an expression that is a statement, a branch or an arm.
+	fn pushesInExpr(e: ast::ExprId, vector: Symbol, found: &var Vec<Push>): bool = {
+		val file = self.ast
+		return match file.exprs[e].kind {
+			.Call(callee, args, names, rest: .None) if self.pushTo(callee, vector) => {
+				if args.len() != 1 || names[0].isSome() then
+					return false
+
+				found.push(Push(call: file.exprs[e].span, value: file.exprs[args[0]].span))
+				true
+			}
+			.If(thenBlock, elseBranch, ..) => {
+				if !self.pushesIn(&thenBlock, vector, &var found) then
+					return false
+
+				match elseBranch {
+					.Some(other) => self.pushesInExpr(other, vector, &var found)
+					.None => true
+				}
+			}
+			.Block(block) => self.pushesIn(&block, vector, &var found)
+			.Match(arms, ..) => {
+				for arm in arms do
+					if !self.pushesInExpr(arm.body, vector, &var found) then
+						return false
+
+				true
+			}
+			// A branch or an arm that leaves or does nothing: `continue`, `{}`.
+			_ => false
+		}
+	}
+
+	/// Whether `callee` is `vector.push`.
+	fn pushTo(callee: ast::ExprId, vector: Symbol): bool = {
+		val .Field(base, name, typeArgs: .None) = self.ast.exprs[callee].kind else return false
+		return self.ast.exprs[base].kind is .Name(sym) &&
+			sym == vector &&
+			self.text(name.sym) == "push"
+	}
+
+	/// How many times `sym` is written within `span`: the fewer of its
+	/// words, which a pattern, a field and a parameter are, and of its names
+	/// as values, which a string's interpolation is too.
+	fn namedIn(span: Span, sym: Symbol): i64 = {
+		var words = 0
+		for (written, at) in self.ast.identifiers do
+			if written == sym && span.lo <= at && at < span.hi then
+				words += 1
+
+		var names = 0
+		for entry in self.ast.exprs {
+			val at = entry.value.span
+			if entry.value.kind is .Name(written) &&
+				written == sym &&
+				span.lo <= at.lo &&
+				at.hi <= span.hi {
+				names += 1
+			}
+		}
+		return words.max(names)
+	}
+
+	/// Whether a `push` within `span` is given its value by a conversion only
+	/// a call's argument has.
+	fn lentForCallIn(span: Span): bool = {
+		for expr in self.state.body.exprs {
+			val at = expr.span
+			if at.lo < span.lo || at.hi > span.hi then
+				continue
+
+			val .Call(callee, args, ..) = expr.kind else continue
+			if args.len() != 2 || self.text(self.program.fns[callee].name) != "push" then
+				continue
+
+			if self.state.lentForCall.contains(&args[1]) then
+				return true
+		}
+		return false
+	}
+
+	/// Whether a `yield` is written within `span`.
+	fn yieldsIn(span: Span): bool = {
+		for entry in self.ast.stmts {
+			val at = entry.value.span
+			if entry.value.kind is .Yield(..) && span.lo <= at.lo && at.hi <= span.hi then
+				return true
+		}
+		return false
+	}
+
+	/// `for x in xs { if c then return a }` and then `return b`, warned of
+	/// where it is `xs.any`, `xs.all` or `xs.find`: `xs` a slice, an array or
+	/// a `Vec`, whose method's closure is lent each element as the loop is,
+	/// and the method's answer the type the function returns. The fix keeps
+	/// what `xs` and `c` are written as.
+	var fn loopAsSearch(loop: ast::StmtId, after: ast::StmtId, checked: StmtId) = {
+		val file = self.ast
+		val .For(label: .None, binding, source: .Elements(source), body) =
+			file.stmts[loop].kind else {
+			return
+		}
+		val .Binding(symbol: element, isVar: false) = binding.kind else return
+		val .Return(.Some(answer)) = file.stmts[after].kind else return
+		if body.stmts.len() != 1 then
+			return
+
+		val .Expr(test) = file.stmts[body.stmts[0]].kind else return
+		val .If(cond, thenBlock, elseBranch: .None, ..) = file.exprs[test].kind else return
+		if thenBlock.stmts.len() != 1 then
+			return
+
+		val .Return(.Some(found)) = file.stmts[thenBlock.stmts[0]].kind else return
+		val search = match (file.exprs[found].kind, file.exprs[answer].kind) {
+			(.Bool(true), .Bool(false)) => Search::Any
+			(.Bool(false), .Bool(true)) => Search::All
+			(_, .Path(leadingDot: true, segments, ..)) if segments.len() == 1 &&
+				self.text(segments[0].sym) == "None" &&
+				self.returnsElement(found, element) => Search::Find
+			_ => return
+		}
+		if !self.postfixSafe(source) || !self.closureSafe(cond) then
+			return
+
+		// The loop that is the method itself stays, or it would call itself.
+		if self.state.function is .Some(f) &&
+			self.text(self.program.fns[f].name) == search.method() {
+			return
+		}
+		// What is walked, and what each element is lent as.
+		val .ForElements(binding: .Binding(bound), elements, body: checkedBody) =
+			self.state.body.stmts[checked].kind else {
+			return
+		}
+		// The condition, as checked, writes nothing through the element: the
+		// closure is lent it to read.
+		if checkedBody.stmts.len() != 1 then
+			return
+
+		val .Expr(checkedIf) = self.state.body.stmts[checkedBody.stmts[0]].kind else return
+		val .If(cond: checkedCond, ..) = self.state.body.exprs[checkedIf].kind else return
+		if self.writesThrough(checkedCond, bound) then
+			return
+
+		if !self.searchable(elements) then
+			return
+
+		val walkedTy = self.tyOf(elements)
+		val elem = match self.kind(walkedTy) {
+			.Array(elem: t, ..) | .ArrayOf(elem: t, ..) | .Slice(elem: t) => t
+			_ => return
+		}
+		val lent = self.intern(.Ref(inner: elem, kind: .Shared))
+		val boundTy = self.state.body.locals[bound].ty
+		val .Ref(inner: boundElem, ..) = self.kind(boundTy) else return
+		if boundElem != elem then
+			return
+
+		// The function answers what the method does.
+		val wanted = match search {
+			.Any | .All => BOOL
+			.Find => match self.optionOf(lent) {
+				.Some(option) => option
+				.None => return
+			}
+		}
+		if self.state.ret != wanted then
+			return
+
+		// The edits: `return xs.any((x) => c)`, with `!` for `all`.
+		val name = self.text(element)
+		val method = search.method()
+		val sourceSpan = file.exprs[source].span
+		val condSpan = file.exprs[cond].span
+		val end = file.stmts[after].span.hi
+		var open = ".\(method)((\(name)) => "
+		var close = ")"
+		var edits: Vec<Edit> = Vec()
+		edits.push(
+			Edit::replace(Span::new(lo: file.stmts[loop].span.lo, hi: sourceSpan.lo), "return "),
+		)
+		if search is .All {
+			match file.exprs[cond].kind {
+				.Unary(op: .Not, operand, ..) => edits.push(
+					Edit::replace(
+						Span::new(lo: sourceSpan.hi, hi: file.exprs[operand].span.lo),
+						open,
+					),
+				)
+				_ => {
+					val bare = self.postfixSafe(cond)
+					open = if bare then "\(open)!" else "\(open)!("
+					if !bare then
+						close = "))"
+
+					edits.push(Edit::replace(Span::new(lo: sourceSpan.hi, hi: condSpan.lo), open))
+				}
+			}
+		} else
+			edits.push(Edit::replace(Span::new(lo: sourceSpan.hi, hi: condSpan.lo), open))
+
+		edits.push(Edit::replace(Span::new(lo: condSpan.hi, hi: end), close))
+		self.report(
+			Diagnostic::warning(
+				LOOP_AS_SEARCH,
+				"a loop that only searches, which `\(method)` says",
+				Span::new(lo: file.stmts[loop].span.lo, hi: end),
+				"tests each element, and returns",
+			).withNote("`\(method)` walks the elements in order and stops where the test says, as the loop does").withFix(
+				"say it as `\(method)`",
+				edits.intoBuffer(),
+			),
+		)
+	}
+
+	/// Whether the elements a loop walks are of what has `any`, `all` and
+	/// `find`: an array or a slice, walked as it is, or a `Vec`, walked
+	/// through the slice it lends. Not text, a set or another container a
+	/// loop walks through its slice too.
+	fn searchable(elements: ExprId): bool = {
+		val walked = &self.state.body.exprs[elements]
+		// A reference to a slice or an array is walked through it.
+		val .Deref(lent) = walked.kind else return true
+		val .Call(args, ..) = self.state.body.exprs[lent].kind else return true
+		if args.isEmpty() then
+			return false
+
+		return self.program.vecElement(self.underRefs(self.tyOf(args[0]))).isSome()
+	}
+
+	/// Whether `found` returns the loop's element: its name, with the `&`
+	/// that passes a reference on or without it, or its `.Some`.
+	fn returnsElement(
+		found: ast::ExprId,
+		element: Symbol,
+	): bool = match self.ast.exprs[found].kind {
+		.Name(sym) => sym == element
+		.Unary(op: .Ref, operand, ..) =>
+			self.ast.exprs[operand].kind is .Name(sym) && sym == element
+		.Call(callee, args, rest: .None, ..) =>
+			args.len() == 1 &&
+				self.ast.exprs[callee].kind is .Path(leadingDot: true, segments, ..) &&
+				segments.len() == 1 &&
+				self.text(segments[0].sym) == "Some" &&
+				self.ast.exprs[args[0]].kind is .Name(sym) &&
+				sym == element
+		_ => false
+	}
+
+	/// Whether `.method(…)` may follow `e` as it is written, and `!` go
+	/// before it: a name, a call, a field, an element, a path or what is in
+	/// parentheses.
+	fn postfixSafe(e: ast::ExprId): bool =
+		self.ast.exprs[e].kind is .Name(..) | .Call(..) | .Field(..) | .Index(..) | .SubSlice(..)
+		| .Path(..) | .Paren(..) | .SelfRef | .Bool(..)
+
+	/// Whether a condition means in a closure what it means in the loop: no
+	/// `?`, which would leave the closure and not the function, and nothing
+	/// that holds statements, which may `return`, `break` or `yield`.
+	fn closureSafe(cond: ast::ExprId): bool = {
+		val span = self.ast.exprs[cond].span
+		for entry in self.ast.exprs {
+			val at = entry.value.span
+			if at.lo < span.lo || at.hi > span.hi then
+				continue
+
+			if entry.value.kind is .Try(..) | .Block(..) | .Match(..) | .If(..) | .Lambda(..)
+			| .ForElement(..) {
+				return false
+			}
+		}
+		return true
+	}
+
+	/// Whether a checked expression writes through the local `bound`: an
+	/// assignment to a place under it, or a `&var` of one.
+	fn writesThrough(e: ExprId, bound: LocalId): bool = {
+		val expr = &self.state.body.exprs[e]
+		val writes = match expr.kind {
+			.Assign(place, ..) => self.under(place, bound)
+			.Ref(inner) => self.kind(expr.ty) is .Ref(kind: .Var, ..) && self.under(inner, bound)
+			_ => false
+		}
+		if writes then
+			return true
+
+		for child in expr.kind.children() do
+			if self.writesThrough(child, bound) then
+				return true
+
+		return false
+	}
+
+	/// Whether a place is the local, or part of what it holds or refers to.
+	fn under(place: ExprId, local: LocalId): bool = match self.state.body.exprs[place].kind {
+		.Local(found) => found == local
+		.Field(base, ..) | .Index(base, ..) | .Deref(base) => self.under(base, local)
+		_ => false
+	}
+
+	/// `Option<T>`, where the prelude has it.
+	var fn optionOf(ty: Ty): Option<Ty> = {
+		val .Some(id) = self.program.preludeItems.enumeration(.Option) else return .None
+		val args = self.program.types.internList([ty])
+		return self.intern(.Enum(id: id, args: args))
+	}
+
+	/// `[for … ].sum()`, `.max()` or `.min()`: a list that yields, built to
+	/// be walked to its end and dropped, warned of with the generator as the
+	/// fix, which walks the same elements in the same order and allocates
+	/// nothing. Not where the walk may stop early, as `any` does: the list's
+	/// loop runs to its end first, and what it does would not all be done.
+	var fn listOnlyWalked(e: ast::ExprId) = {
+		val file = self.ast
+		val .Call(callee, args, rest: .None, ..) = file.exprs[e].kind else return
+		if !args.isEmpty() then
+			return
+
+		val .Field(base, name, typeArgs: .None) = file.exprs[callee].kind else return
+		if self.text(name.sym) !is "sum" | "max" | "min" then
+			return
+
+		val .Array(elems) = file.exprs[base].kind else return
+		if elems.len() != 1 || file.exprs[elems[0]].kind !is .ForElement(..) then
+			return
+
+		val list = file.exprs[base].span
+		val method = self.text(name.sym)
+		self.report(
+			Diagnostic::warning(
+				LIST_ONLY_WALKED,
+				"a list built only to be walked by `\(method)`",
+				list,
+				"allocated, walked once, and dropped",
+			).withNote(
+				"a loop that yields in parentheses is a generator, which hands each value over as it is made and allocates nothing",
+			).withFix("walk the generator", [
+				Edit::replace(Span::new(lo: list.lo, hi: list.lo + 1), "("),
+				Edit::replace(Span::new(lo: list.hi - 1, hi: list.hi), ")"),
+			]),
+		)
+	}
+}

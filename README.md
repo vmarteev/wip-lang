@@ -23,7 +23,9 @@ extend Board {
     fn firstEmpty(): Option<i64> = {
         var i = 0
         while i < self.cells.len() {
-            if self.cells[i] == 0 then return i
+            if self.cells[i] == 0 then
+                return i
+
             i += 1
         }
         return .None

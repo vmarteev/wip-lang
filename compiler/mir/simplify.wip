@@ -25,13 +25,15 @@ import hir::{Program, isAggregate}
 /// Rewrites the places of `body` to the ones they stand for.
 pub fn simplify(program: &Program, body: &var Body) = {
 	var facts = Facts(known: facts(&program, &body))
-	if facts.known.isEmpty() then return
+	if facts.known.isEmpty() then
+		return
+
 	for b in 0..body.blocks.len() {
 		val statements = mem::replace(&var body.blocks[b].statements, Vec())
-		var rewritten: Vec<Statement> = Vec()
-		for statement in move statements {
-			rewritten.push(rewriteStatement(statement, &var facts))
-		}
+		val rewritten: Vec<Statement> = [
+			for statement in move statements do
+				yield rewriteStatement(statement, &var facts)
+		]
 		body.blocks[b].statements = rewritten
 		val terminator = mem::replace(&var body.blocks[b].terminator, .Unreachable)
 		body.blocks[b].terminator = rewriteTerminator(terminator, &var facts)
@@ -49,18 +51,20 @@ enum Fact {
 /// no index in it. An index names a local whose value may change, and a `*`
 /// may be anywhere.
 fn factKey(place: &Place): Option<(Local, Vec<Projection>)> = {
-	for p in place.projections {
-		if p !is .Field(..) | .VariantField(..) then return .None
-	}
+	for p in place.projections do
+		if p !is .Field(..) | .VariantField(..) then
+			return .None
+
 	return (place.local, place.projections.clone())
 }
 
 /// Whether one path passes through the other: writing `p.0` writes part of
 /// `p`, and writing `p` writes all of `p.0`.
 fn overlaps(a: &[Projection], b: &[Projection]): bool = {
-	for i in 0..a.len().min(b.len()) {
-		if a[i] != b[i] then return false
-	}
+	for i in 0..a.len().min(b.len()) do
+		if a[i] != b[i] then
+			return false
+
 	return true
 }
 
@@ -70,9 +74,10 @@ fn writtenOnce(writes: &Map<Local, Vec<Vec<Projection>>>, place: &Place): bool =
 	val .Some((local, projections)) = factKey(&place) else return false
 	val .Some(paths) = writes.get(&local) else return true
 	var count = 0
-	for p in paths {
-		if overlaps(&p, &projections) then count += 1
-	}
+	for p in paths do
+		if overlaps(&p, &projections) then
+			count += 1
+
 	return count <= 1
 }
 
@@ -83,9 +88,9 @@ fn facts(program: &Program, body: &Body): Map<(Local, Vec<Projection>), Fact> = 
 	// `x = p; zero(p)` is a move, and `x` is not another name for `p`. Each
 	// local's writes, by the path written.
 	var writes: Map<Local, Vec<Vec<Projection>>> = Map()
-	for param in body.params {
+	for param in body.params do
 		writes.put(param, [Vec()])
-	}
+
 	// A local nothing can be known about: written through a pointer or an
 	// index, or the target of an address the body then passes around.
 	var unknown: Set<Local> = Set()
@@ -100,17 +105,23 @@ fn facts(program: &Program, body: &Body): Map<(Local, Vec<Projection>), Fact> = 
 				match factKey(&dest) {
 					.Some((local, path)) => writes.atOrPut(local, Vec()).push(path)
 					// A write through a pointer or into an element: what it
-					// reached is not known.
+					// reached is not known. Through a pointer, the pointer is
+					// not written; an element is part of the local it is in.
 					.None => {
-						unknown.add(dest.local)
+						if !behindPointer(&dest) then
+							unknown.add(dest.local)
+
 						// It may have been any place whose address was taken.
 						val deref = Projection::Deref
-						if dest.projections.contains(&deref) then throughAddresses = true
+						if dest.projections.contains(&deref) then
+							throughAddresses = true
 					}
 				}
 			}
 			// A call may write through any address it was given.
-			if statement is .Call(..) | .DropFn(..) | .DropInPlace(..) then throughAddresses = true
+			if statement is .Call(..) | .DropFn(..) | .DropInPlace(..) then
+				throughAddresses = true
+
 			if statement is .Assign(place: dest, rvalue) && factKey(&dest) is .Some(key) {
 				val fact: Fact = match rvalue {
 					// A copy names what it copied only where the two are of one
@@ -126,14 +137,15 @@ fn facts(program: &Program, body: &Body): Map<(Local, Vec<Projection>), Fact> = 
 		}
 	}
 	if throughAddresses {
-		for local in addressed(&body) {
+		for local in addressed(&body) do
 			unknown.add(local)
-		}
 	}
 	var facts: Map<(Local, Vec<Projection>), Fact> = Map()
 	for (dest, fact) in move candidates {
 		val named = Place(local: dest.0, projections: dest.1.clone())
-		if !writtenOnce(&writes, &named) || unknown.contains(&dest.0) then continue
+		if !writtenOnce(&writes, &named) || unknown.contains(&dest.0) then
+			continue
+
 		// An address stays what it is; a copy is only a name for what it copied
 		// while that is what it was.
 		val keep = match fact {
@@ -147,20 +159,36 @@ fn facts(program: &Program, body: &Body): Map<(Local, Vec<Projection>), Fact> = 
 					!unknown.contains(&source.local) &&
 					!isAggregate(&program, placeTy(&program, &body, &named))
 		}
-		if keep then facts.put(dest, fact)
+		if keep then
+			facts.put(dest, fact)
 	}
 	return facts
+}
+
+/// Whether a place is reached through a pointer before any element of the
+/// local it starts at: what it names is behind the pointer, and the local
+/// holds only the pointer.
+fn behindPointer(place: &Place): bool = {
+	for p in place.projections {
+		match p {
+			.Deref => return true
+			.Index(..) | .ConstIndex(..) => return false
+			_ => {}
+		}
+	}
+	return false
 }
 
 /// The locals whose address the body takes, which is what a write through a
 /// pointer may have reached.
 fn addressed(body: &Body): Vec<Local> = {
-	var locals: Vec<Local> = Vec()
-	for block in body.blocks {
+	val locals: Vec<Local> = [for block in body.blocks {
 		for statement in block.statements {
-			if statement is .Assign(rvalue: .AddressOf(target), ..) then locals.push(target.local)
+			// `&(*p).f` is an address behind `p`, not `p`'s own.
+			if statement is .Assign(rvalue: .AddressOf(target), ..) && !behindPointer(&target) then
+				yield target.local
 		}
-	}
+	}]
 	return locals
 }
 

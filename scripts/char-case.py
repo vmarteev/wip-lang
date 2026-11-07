@@ -135,7 +135,9 @@ fn {name}(c: char): char = {{
 			code < first => hi = middle - 1
 			code > last => lo = middle + 1
 			else => {{
-				if ((code - first) as i64) % step != 0 then return c
+				if ((code - first) as i64) % step != 0 then
+					return c
+
 				return char::fromScalar(((code as i64) + delta) as u32)
 			}}
 		}}
@@ -154,9 +156,12 @@ fn {name}(c: char): bool = {{
 	while lo <= hi {{
 		val middle = (lo + hi) / 2
 		val (first, last) = {table}[middle]
-		if code < first then hi = middle - 1
-		else if code > last then lo = middle + 1
-		else return true
+		if code < first then
+			hi = middle - 1
+		else if code > last then
+			lo = middle + 1
+		else
+			return true
 	}}
 	return false
 }}
@@ -200,18 +205,18 @@ extend str {{
 	/// Each of its characters in lower case.
 	pub fn toLowercase(): String = {{
 		var out = String()
-		for c in self.chars() {{
+		for c in self.chars() do
 			out.pushChar(c.toLowercase())
-		}}
+
 		return out
 	}}
 
 	/// Each of its characters in upper case.
 	pub fn toUppercase(): String = {{
 		var out = String()
-		for c in self.chars() {{
+		for c in self.chars() do
 			out.pushChar(c.toUppercase())
-		}}
+
 		return out
 	}}
 
@@ -222,7 +227,8 @@ extend str {{
 		var theirs = other.chars()
 		for c in self.chars() {{
 			val .Some(d) = theirs.next() else return false
-			if c.folded() != d.folded() then return false
+			if c.folded() != d.folded() then
+				return false
 		}}
 		return theirs.next().isNone()
 	}}
@@ -234,7 +240,8 @@ extend str {{
 		var mine = self.chars()
 		for c in prefix.chars() {{
 			val .Some(d) = mine.next() else return false
-			if c.folded() != d.folded() then return false
+			if c.folded() != d.folded() then
+				return false
 		}}
 		return true
 	}}
@@ -243,9 +250,9 @@ extend str {{
 	/// `a.folded() == b.folded()`.
 	pub fn folded(): String = {{
 		var out = String()
-		for c in self.chars() {{
+		for c in self.chars() do
 			out.pushChar(c.folded())
-		}}
+
 		return out
 	}}
 }}

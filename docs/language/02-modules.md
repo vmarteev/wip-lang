@@ -82,7 +82,9 @@ val EDITING: bool = EDITOR && TARGET_OS != "ios"
 fn openEditor(): str = "the editor"
 
 fn main() = {
-    if EDITING then io::println(openEditor())
+    if EDITING then
+        io::println(openEditor())
+
     assert(ZONE_SIZE == 32)
 }
 ```
@@ -410,9 +412,10 @@ val COMMANDS: [Command; 3] = [
 val ARROWS: &[str] = ["up", "down", "left", "right"]
 
 fn commandOf(key: str): Option<str> = {
-    for command in COMMANDS {
-        if command.keys.contains(&key) then return command.name
-    }
+    for command in COMMANDS do
+        if command.keys.contains(&key) then
+            return command.name
+
     return .None
 }
 
@@ -441,17 +444,17 @@ val LIMIT: i64 = nextPowerOfTwo(100)
 
 fn squares(): [i64; 8] = {
     var table: [i64; 8] = [0; 8]
-    for i in 0..8 {
+    for i in 0..8 do
         table[i] = i * i
-    }
+
     return table
 }
 
 fn nextPowerOfTwo(n: i64): i64 = {
     var p = 1
-    while p < n {
+    while p < n do
         p *= 2
-    }
+
     return p
 }
 

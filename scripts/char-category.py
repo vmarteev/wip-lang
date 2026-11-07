@@ -50,9 +50,12 @@ fn {name}(c: char): bool = {{
 	while lo <= hi {{
 		val middle = (lo + hi) / 2
 		val (first, last) = {table}[middle]
-		if code < first then hi = middle - 1
-		else if code > last then lo = middle + 1
-		else return true
+		if code < first then
+			hi = middle - 1
+		else if code > last then
+			lo = middle + 1
+		else
+			return true
 	}}
 	return false
 }}

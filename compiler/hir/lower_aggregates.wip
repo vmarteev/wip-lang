@@ -1,9 +1,10 @@
 // Struct literals and enum variants.
 
-import std::collections::{Map}
+import std::collections::{Map, Set}
 import syntax as ast
 import syntax::{
 	GENERATOR_NAME,
+	MISMATCHED_TYPES,
 	ARGUMENT_COUNT,
 	CANNOT_INFER,
 	Diagnostic,
@@ -105,7 +106,6 @@ extend Lowerer {
 		ty: Ty,
 		taken: &[i64],
 		name: ast::Name,
-		span: Span,
 	): (Vec<(i64, ExprId)>, Option<StmtId>) = {
 		val context: Option<(Span, str)> = (name.span, "the literal's type")
 		val value = self.checkIn(rest, ty, context)
@@ -115,7 +115,7 @@ extend Lowerer {
 		// them missing as well.
 		if self.tyOf(value) != ty {
 			// Reported by the check above.
-			return (self.restBroken(taken, restSpan), .None)
+			return (self.restBroken(&taken, restSpan), .None)
 		}
 		var fields: Vec<(i64, ExprId)> = Vec()
 		if taken.isEmpty() {
@@ -146,7 +146,9 @@ extend Lowerer {
 		}
 		val .Struct(id, ..) = self.kind(ty) else panic("a struct literal's type is a struct")
 		for i in taken {
-			if !self.fieldSettable(id, i) then continue
+			if !self.fieldSettable(id, i) then
+				continue
+
 			val fieldTy = self.program.fieldTy(ty, i as u32)
 			val read = self.alloc(.Field(base: base, index: i as u32), fieldTy, restSpan)
 			self.state.body.restTaken.add(read)
@@ -158,10 +160,10 @@ extend Lowerer {
 	/// The fields `..` would have given, each an error of its own.
 	var fn restBroken(taken: &[i64], span: Span): Vec<(i64, ExprId)> = {
 		val error = self.errorExpr(span)
-		var fields: Vec<(i64, ExprId)> = Vec()
-		for i in taken {
-			fields.push((i, error))
-		}
+		val fields: Vec<(i64, ExprId)> = [
+			for i in taken do
+				yield (i, error)
+		]
 		return fields
 	}
 
@@ -182,18 +184,20 @@ extend Lowerer {
 					"a union's fields are the same bytes, so a literal sets one of them, or none and every byte is zero",
 				),
 			)
+
 		var written: Option<(u32, ExprId)> = .None
 		for (n, f) in fields.forwards().enumerate() {
 			var found: Option<i64> = .None
-			for (i, d) in decls.forwards().enumerate() {
-				if found.isNone() && d.name == f.name.sym then found = i
-			}
+			for (i, d) in decls.forwards().enumerate() do
+				if found.isNone() && d.name == f.name.sym then
+					found = i
+
 			val .Some(i) = found else {
 				val field = self.text(f.name.sym)
-				var texts: Vec<str> = Vec()
-				for d in decls {
-					texts.push(self.text(d.name))
-				}
+				val texts: Vec<str> = [
+					for d in decls do
+						yield self.text(d.name)
+				]
 				var diagnostic = Diagnostic::error(
 					STRUCT_LITERAL_FIELDS,
 					"union `\(unionName)` has no field `\(field)`",
@@ -205,13 +209,15 @@ extend Lowerer {
 						"did you mean `\(similar)`?",
 						[Edit::replace(f.name.span, similar)],
 					)
+
 				self.report(diagnostic)
 				self.infer(f.value, .None)
 				continue
 			}
 			val context: Option<(Span, str)> = (decls[i].span, "field declared here")
 			val value = self.checkIn(f.value, decls[i].ty, context)
-			if n == 0 then written = (i as u32, value)
+			if n == 0 then
+				written = (i as u32, value)
 		}
 		val ty = self.intern(.Struct(id: id, args: .empty()))
 		return self.alloc(.Union(id: id, field: written), ty, span)
@@ -232,7 +238,7 @@ extend Lowerer {
 			if self.program.structs[id].isTuple then written.names.toVec() else {
 				val decls = self.program.structs[id].fields.clone()
 				val path = String::of(self.text(name.sym))
-				self.fieldNames(&path, &decls, args, written.names.toVec())
+				self.fieldNames(&path, &decls, &args, written.names.toVec())
 			}
 		var fields: Vec<FieldInit> = Vec()
 		for (i, value) in args.forwards().enumerate() {
@@ -276,9 +282,10 @@ extend Lowerer {
 		.Array(elem, ..) | .ArrayOf(elem, ..) => self.zeroable(elem)
 		.Struct(id, args) if self.program.structs[id].isExtern => {
 			val list = self.program.types.list(args).toVec()
-			for f in self.program.structs[id].fields {
-				if !self.zeroable(self.program.types.substFind(f.ty, &list)) then return false
-			}
+			for f in self.program.structs[id].fields do
+				if !self.zeroable(self.program.types.substFind(f.ty, &list)) then
+					return false
+
 			true
 		}
 		_ => self.program.nullablePointer(ty)
@@ -326,6 +333,7 @@ extend Lowerer {
 			.Some((.Struct(id), _)) => {
 				if !self.visible(found, self.program.structs[id].isPub) then
 					self.privateItem(found, "struct", name)
+
 				id
 			}
 			other => {
@@ -400,7 +408,9 @@ extend Lowerer {
 		}
 		// A union is one field over the bytes of all of them, so a literal
 		// names one or none, and the rest of the bytes are zero.
-		if self.program.structs[id].isUnion then return self.unionLiteral(id, name, &fields, span)
+		if self.program.structs[id].isUnion then
+			return self.unionLiteral(id, name, &fields, span)
+
 		// Its fields' defaults, which a literal in another's default may need
 		// before their turn.
 		self.ensureDefaults(.Struct(id))
@@ -411,21 +421,22 @@ extend Lowerer {
 		// values are checked together below, since they may decide the
 		// struct's type arguments.
 		var targets: Vec<Option<(i64, bool)>> = Vec()
-		var set: Vec<bool> = Vec()
-		for _ in 0..decls.len() {
-			set.push(false)
-		}
+		var set: Vec<bool> = [
+			for _ in 0..decls.len() do
+				yield false
+		]
 		for f in fields {
 			var found: Option<i64> = .None
-			for (i, d) in decls.forwards().enumerate() {
-				if found.isNone() && d.name == f.name.sym then found = i
-			}
+			for (i, d) in decls.forwards().enumerate() do
+				if found.isNone() && d.name == f.name.sym then
+					found = i
+
 			val .Some(i) = found else {
 				val field = self.text(f.name.sym)
-				var texts: Vec<str> = Vec()
-				for d in decls {
-					texts.push(self.text(d.name))
-				}
+				val texts: Vec<str> = [
+					for d in decls do
+						yield self.text(d.name)
+				]
 				var diagnostic = Diagnostic::error(
 					STRUCT_LITERAL_FIELDS,
 					"struct `\(structName)` has no field `\(field)`",
@@ -438,17 +449,22 @@ extend Lowerer {
 						"did you mean `\(s)`?",
 						[Edit::replace(f.name.span, s)],
 					)
+
 				self.report(diagnostic)
 				// Treat a misspelt field as the field it was probably meant to be,
 				// so the literal is not also reported as missing it.
 				var meant: Option<i64> = .None
 				if similar is .Some(s) {
-					for (k, d) in decls.forwards().enumerate() {
-						if meant.isNone() && self.text(d.name) == s then meant = k
-					}
+					for (k, d) in decls.forwards().enumerate() do
+						if meant.isNone() && self.text(d.name) == s then
+							meant = k
 				}
-				if meant is .Some(k) && set[k] then meant = .None
-				if meant is .Some(k) then set[k] = true
+				if meant is .Some(k) && set[k] then
+					meant = .None
+
+				if meant is .Some(k) then
+					set[k] = true
+
 				targets.push(
 					match meant {
 						.Some(k) => (k, false)
@@ -466,12 +482,15 @@ extend Lowerer {
 						"set again here",
 					),
 				)
+
 			// Another module may set only what is `pub var`: a `pub` field is
 			// read out there and written here, and building a value is writing
 			// every one of its fields.
-			if !self.fieldVisible(id, i) then self.privateField(id, i, f.name.span)
+			if !self.fieldVisible(id, i) then
+				self.privateField(id, i, f.name.span)
 			else if !self.fieldSettable(id, i) then
 				self.readonlyField(id, i, f.name.span, "set here")
+
 			set[i] = true
 			targets.push((i, true))
 		}
@@ -479,10 +498,10 @@ extend Lowerer {
 		// where that type was made.
 		val start: Vec<Option<Ty>> = match known {
 			.Some(tys) => {
-				var given: Vec<Option<Ty>> = Vec()
-				for t in tys {
-					given.push(t)
-				}
+				val given: Vec<Option<Ty>> = [
+					for t in tys do
+						yield t
+				]
 				given
 			}
 			.None =>
@@ -496,23 +515,22 @@ extend Lowerer {
 		// struct's pointer is given one as a C function's is.
 		val isView = self.program.structs[id].isView
 		val isExtern = self.program.structs[id].isExtern
-		var operands: Vec<GenericOperand> = Vec()
-		for (k, f) in fields.forwards().enumerate() {
+		val operands: Vec<GenericOperand> = [for (k, f) in fields.forwards().enumerate() {
 			val .Some((i, declaredHere)) = targets[k] else continue
-			operands.push(GenericOperand(
+			yield GenericOperand(
 				expr: f.value,
 				declared: decls[i].ty,
 				context: if declaredHere then (decls[i].span, "field declared here") else .None,
 				isArg: isView && self.kind(decls[i].ty) is .Ref(..),
 				toC: isExtern && self.kind(decls[i].ty) is .Ptr(..),
-			))
-		}
+			)
+		}]
 		val checked = self.genericOperands(&operands, [], &var inference.tys)
 		var next = 0
-		var values: Vec<Option<ExprId>> = Vec()
-		for _ in 0..decls.len() {
-			values.push(.None)
-		}
+		var values: Vec<Option<ExprId>> = [
+			for _ in 0..decls.len() do
+				yield .None
+		]
 		// The fields are evaluated in the order they are written.
 		var written: Vec<u32> = Vec()
 		for (k, f) in fields.forwards().enumerate() {
@@ -539,11 +557,12 @@ extend Lowerer {
 		// value that has them.
 		var held: Option<StmtId> = .None
 		if lit.rest is .Some(rest) {
-			var taken: Vec<i64> = Vec()
-			for i in 0..decls.len() {
-				if values[i].isNone() then taken.push(i)
-			}
-			val (fields, statement) = self.restFields(rest, ty, &taken, name, span)
+			val taken: Vec<i64> = [
+				for i in 0..decls.len() do
+					if values[i].isNone() then
+						yield i
+			]
+			val (fields, statement) = self.restFields(rest, ty, &taken, name)
 			for (i, value) in fields {
 				values[i] = value
 				written.push(i as u32)
@@ -556,7 +575,9 @@ extend Lowerer {
 		val mark = self.state.unsettledDefaults.len()
 		val args = self.program.types.list(list).toVec()
 		for i in 0..decls.len() {
-			if values[i].isSome() then continue
+			if values[i].isSome() then
+				continue
+
 			val .Some(default) = decls[i].default else continue
 			values[i] = self.useDefault(&default, span, &args)
 			written.push(i as u32)
@@ -566,7 +587,9 @@ extend Lowerer {
 		// initializer leaves one.
 		val cStruct = self.program.structs[id].isExtern && !self.program.structs[id].isUnion
 		for i in 0..decls.len() {
-			if !cStruct || values[i].isSome() then continue
+			if !cStruct || values[i].isSome() then
+				continue
+
 			val fieldTy = self.program.types.subst(decls[i].ty, &args)
 			if self.zeroable(fieldTy) {
 				values[i] = self.alloc(.Zeroed, fieldTy, span)
@@ -575,20 +598,25 @@ extend Lowerer {
 		}
 		// A field another module cannot name is one it cannot leave out either:
 		// the value has to be built where the field is seen.
-		var hidden: Vec<i64> = Vec()
-		for i in 0..decls.len() {
-			if values[i].isNone() && !self.fieldSettable(id, i) then hidden.push(i)
-		}
+		var hidden: Vec<i64> = [
+			for i in 0..decls.len() do
+				if values[i].isNone() && !self.fieldSettable(id, i) then
+					yield i
+		]
 		for i in hidden {
-			if self.fieldVisible(id, i) then self.readonlyField(id, i, name.span, "not set here")
-			else self.privateField(id, i, name.span)
+			if self.fieldVisible(id, i) then
+				self.readonlyField(id, i, name.span, "not set here")
+			else
+				self.privateField(id, i, name.span)
+
 			values[i] = self.errorExpr(span)
 			written.push(i as u32)
 		}
-		var missing: Vec<String> = Vec()
-		for i in 0..decls.len() {
-			if values[i].isNone() then missing.push("`\(self.text(decls[i].name))`")
-		}
+		val missing: Vec<String> = [
+			for i in 0..decls.len() do
+				if values[i].isNone() then
+					yield "`\(self.text(decls[i].name))`"
+		]
 		if !missing.isEmpty() then
 			self.report(
 				Diagnostic::error(
@@ -598,18 +626,18 @@ extend Lowerer {
 					"missing \(missing.join(", "))",
 				),
 			)
-		for i in 0..values.len() {
-			if values[i].isNone() then written.push(i as u32)
-		}
-		var fieldValues: Vec<ExprId> = Vec()
-		for value in values {
-			fieldValues.push(
-				match value {
+
+		for i in 0..values.len() do
+			if values[i].isNone() then
+				written.push(i as u32)
+
+		val fieldValues: Vec<ExprId> = [
+			for value in values do
+				yield match value {
 					.Some(v) => v
 					.None => self.errorExpr(span)
-				},
-			)
-		}
+				}
+		]
 		val built = self.alloc(
 			.Struct(id: id, fields: fieldValues, order: orderOf(written)),
 			ty,
@@ -652,6 +680,7 @@ extend Lowerer {
 		}
 		if enumName.isNone() then
 			self.program.names.push((variant.span, .Dotted(owner: .Enum(id), pattern: pattern)))
+
 		val name = self.text(variant.sym)
 		val texts: Vec<str> = self.program.enums[id].variants.map((v) => self.text(v.name))
 		var diagnostic = Diagnostic::error(
@@ -667,6 +696,7 @@ extend Lowerer {
 				"did you mean `\(similar)`?",
 				[Edit::replace(variant.span, similar)],
 			)
+
 		self.report(diagnostic)
 		return .None
 	}
@@ -681,6 +711,7 @@ extend Lowerer {
 		}
 		if found.isNone() && self.moduleOf(module) == self.current then
 			found = self.preludeType(enumName.sym)
+
 		val id = match found {
 			.Some(.Enum(id)) => id
 			.Some(.Builtin(_)) => panic("a module declares no built-in type")
@@ -710,9 +741,9 @@ extend Lowerer {
 			.None => {
 				var candidates: Vec<str> = Vec()
 				val types = &self.modules[module].types
-				for i in 0..types.len() {
+				for i in 0..types.len() do
 					candidates.push(self.text(types.keyAt(i)))
-				}
+
 				// `Name::member` may be an enum's variant or a type's static
 				// function, so what is missing is a type.
 				var diagnostic = Diagnostic::error(
@@ -721,12 +752,14 @@ extend Lowerer {
 					enumName.span,
 					"unknown type",
 				)
-				if leftThePrelude(text) is .Some(help) then diagnostic = diagnostic.withHelp(help)
+				if leftThePrelude(text) is .Some(help) then
+					diagnostic = diagnostic.withHelp(help)
 				else if suggest(text, &candidates) is .Some(similar) then
 					diagnostic = diagnostic.withFix(
 						"did you mean `\(similar)`?",
 						[Edit::replace(enumName.span, similar)],
 					)
+
 				self.report(diagnostic)
 				return .None
 			}
@@ -751,8 +784,11 @@ extend Lowerer {
 			return id
 		}
 		if expected is .Some(ty) {
-			if self.kind(ty) is .Enum(id, ..) then return id
-			if self.isPoisoned(ty) then return .None
+			if self.kind(ty) is .Enum(id, ..) then
+				return id
+
+			if self.isPoisoned(ty) then
+				return .None
 		}
 		val name = self.text(variant.sym)
 		// A name in lower case is a function's: a type's, or a method of the
@@ -775,6 +811,7 @@ extend Lowerer {
 		).withHelp(help)
 		if expected is .Some(ty) then
 			diagnostic = diagnostic.withNote("the expected type is \(self.tyName(ty))")
+
 		self.report(diagnostic)
 		return .None
 	}
@@ -786,12 +823,19 @@ extend Lowerer {
 		var found: Vec<String> = Vec()
 		for id in self.program.fns.ids() {
 			val def = &self.program.fns[id]
-			if def.name != name || def.receiver != .Static || def.instanceOf.isSome() then continue
+			if def.name != name || def.receiver != .Static || def.instanceOf.isSome() then
+				continue
+
 			val .Some(owner) = def.owner else continue
-			if !self.methodIsVisible(id) then continue
+			if !self.methodIsVisible(id) then
+				continue
+
 			val typeName = self.typeName(owner)
-			if !found.contains(&typeName) then found.push(typeName)
-			if found.len() == 3 then break
+			if !found.contains(&typeName) then
+				found.push(typeName)
+
+			if found.len() == 3 then
+				break
 		}
 		return found
 	}
@@ -799,9 +843,9 @@ extend Lowerer {
 	/// Looks through `own` and references to the value's own type.
 	fn underRefs(start: Ty): Ty = {
 		var ty = start
-		while self.kind(ty) is .Own(inner) | .Ref(inner, ..) {
+		while self.kind(ty) is .Own(inner) | .Ref(inner, ..) do
 			ty = inner
-		}
+
 		return ty
 	}
 
@@ -814,10 +858,14 @@ extend Lowerer {
 		val hint = if enumName.isNone() then self.variantHint(variant, item.hint) else item.hint
 		val span = item.span
 		val .Some((id, index)) = self.resolveVariant(enumName, variant, hint, false) else {
-			if item.rest is .Some(rest) then self.infer(rest, .None)
+			if item.rest is .Some(rest) then
+				self.infer(rest, .None)
+
 			return self.giveUpItem(item)
 		}
-		if item.rest is .Some(rest) then return self.variantFromBase(id, index, variant, rest, item)
+		if item.rest is .Some(rest) then
+			return self.variantFromBase(id, index, variant, rest, item)
+
 		// Defaults that are code, called with the variant's type arguments once
 		// they are known.
 		val defaults = self.state.unsettledDefaults.len()
@@ -833,6 +881,28 @@ extend Lowerer {
 			val expected: Option<Ty> = hint.map((h) => self.underRefs(h))
 			self.expectedArgs(.Enum(id), expected)
 		}
+		// Named by its path where a function is expected, or where nothing is,
+		// a variant of one field is the function from its field to its enum.
+		if item.args.isNone() && enumName.isSome() && !isView && self.isFunctionOf(&fields, hint) {
+			return self.fnValue(self.variantFn(id, index), item, path.toStr())
+		}
+		// One without fields is a value, even where a function is expected.
+		if item.args.isNone() &&
+			fields.isEmpty() &&
+			hint is .Some(wanted) &&
+			self.isFunctionType(wanted) {
+			self.report(
+				Diagnostic::error(
+					MISMATCHED_TYPES,
+					"`\(path)` is a value, and a function is expected here",
+					span,
+					"a variant without fields",
+				).withNote(
+					"a variant without fields is a value of its enum; one of one field is a function of it",
+				),
+			)
+			return self.errorExpr(span)
+		}
 		var inference = Inference::new(start)
 		inference.explained = hint is .Some(h) && self.isPoisoned(h)
 		var hirArgs: Vec<ExprId> = Vec()
@@ -844,6 +914,7 @@ extend Lowerer {
 				&path,
 				&fields,
 				&inference,
+				hint,
 				span,
 			)
 			.None => {}
@@ -859,10 +930,10 @@ extend Lowerer {
 					diagnostic = diagnostic.withFix("remove the parentheses", [
 						Edit::replace(parens, String()),
 					])
+
 				self.report(diagnostic)
-				for a in args {
+				for a in args do
 					self.infer(a, .None)
-				}
 			}
 			// `.Ok()` where the payload is nothing: the parentheses say there is
 			// one, and writing `{}` for it says so twice.
@@ -917,9 +988,10 @@ extend Lowerer {
 	fn variantHint(variant: ast::Name, hint: Option<Ty>): Option<Ty> = {
 		val .Some(ty) = hint else return hint
 		val .Some((enumId, inner)) = self.success(ty) else return hint
-		for v in self.program.enums[enumId].variants {
-			if v.name == variant.sym then return hint
-		}
+		for v in self.program.enums[enumId].variants do
+			if v.name == variant.sym then
+				return hint
+
 		return inner
 	}
 
@@ -941,20 +1013,22 @@ extend Lowerer {
 			return false
 		}
 		var e = written
-		while self.ast.exprs[e].kind is .Paren(inner: within) {
+		while self.ast.exprs[e].kind is .Paren(inner: within) do
 			e = within
-		}
+
 		val path = if self.ast.exprs[e].kind is .Call(callee, ..) then callee else e
 		val named: Option<Symbol> = match self.ast.exprs[path].kind {
 			.Path(leadingDot: true, segments, ..) => segments[0].sym
 			_ => .None
 		}
 		if named is .Some(name) {
-			for v in self.program.enums[enumId].variants {
-				if v.name == name then return false
-			}
+			for v in self.program.enums[enumId].variants do
+				if v.name == name then
+					return false
 		}
-		if self.ast.exprs[e].kind is .Try(..) | .If(..) | .Match(..) | .Block(..) then return false
+		if self.ast.exprs[e].kind is .Try(..) | .If(..) | .Match(..) | .Block(..) then
+			return false
+
 		// `&` of a temporary, which a payload lends and an argument refuses:
 		// written as the argument, it would be the argument's.
 		if self.state.body.exprs[value].kind is .Ref(inner: lent) &&
@@ -963,13 +1037,16 @@ extend Lowerer {
 		}
 		// A reference written without `&`, as a reference parameter passed on:
 		// its name alone is what it refers to.
-		if self.kind(inner) is .Ref(..) && self.ast.exprs[e].kind !is .Unary(..) then return false
+		if self.kind(inner) is .Ref(..) && self.ast.exprs[e].kind !is .Unary(..) then
+			return false
+
 		var made = value
-		while self.state.body.exprs[made].kind is .Deref(inner: under) {
+		while self.state.body.exprs[made].kind is .Deref(inner: under) do
 			made = under
-		}
+
 		if self.state.body.exprs[made].kind is .Call(callee, ..) then
 			return !self.resultAloneGeneric(callee) && !self.resultItsOwnParam(callee)
+
 		return true
 	}
 
@@ -986,15 +1063,21 @@ extend Lowerer {
 	fn resultAloneGeneric(callee: FnId): bool = {
 		val types = &self.program.types
 		val f = &self.program.fns[callee]
-		if !types.isGeneric(f.ret) then return false
+		if !types.isGeneric(f.ret) then
+			return false
+
 		for index in 0..f.generics.len() {
 			val at = index as u32
-			if !types.any(f.ret, (kind) => kind is .Param(p) && p.index == at) then continue
+			if !types.any(f.ret, (kind) => kind is .Param(p) && p.index == at) then
+				continue
+
 			var taken = false
-			for p in f.params {
-				if types.any(p.ty, (kind) => kind is .Param(q) && q.index == at) then taken = true
-			}
-			if !taken then return true
+			for p in f.params do
+				if types.any(p.ty, (kind) => kind is .Param(q) && q.index == at) then
+					taken = true
+
+			if !taken then
+				return true
 		}
 		return false
 	}
@@ -1018,19 +1101,19 @@ extend Lowerer {
 		val path = "\(self.text(enumSym))::\(self.text(variant.sym))"
 		// The value itself, through any reference to it.
 		var base = self.infer(rest, .None)
-		while self.kind(self.tyOf(base)) is .Ref(inner, ..) | .Own(inner) {
+		while self.kind(self.tyOf(base)) is .Ref(inner, ..) | .Own(inner) do
 			base = self.alloc(.Deref(base), inner, restSpan)
-		}
+
 		val baseTy = self.tyOf(base)
 		// The values named, checked against the variant's fields whether or
 		// not `base` can give the rest, so that a refusal of it is the only
 		// one: the type's arguments are `base`'s, where it is of the enum.
 		val start: Vec<Option<Ty>> = match self.kind(baseTy) {
 			.Enum(id: baseId, args: baseArgs) if baseId == id => {
-				var known: Vec<Option<Ty>> = Vec()
-				for t in self.program.types.list(baseArgs).toVec() {
-					known.push(t)
-				}
+				val known: Vec<Option<Ty>> = [
+					for t in self.program.types.list(baseArgs).toVec() do
+						yield t
+				]
 				known
 			}
 			_ => self.expectedArgs(.Enum(id), item.hint.map((h) => self.underRefs(h)))
@@ -1045,14 +1128,16 @@ extend Lowerer {
 		val (matched, _, checked) = self.variantOperands(
 			&path,
 			&fields,
-			written,
+			&written,
 			item,
 			isView,
 			&var inference,
 			span,
 			true,
 		)
-		if self.isPoisoned(baseTy) then return self.errorExpr(span)
+		if self.isPoisoned(baseTy) then
+			return self.errorExpr(span)
+
 		if !self.matchedAs(base, id, index) {
 			val name = self.text(variant.sym)
 			self.report(
@@ -1072,14 +1157,15 @@ extend Lowerer {
 		// The values named, in the order written, each kept in a local of the
 		// literal's own until `base` is taken apart.
 		var stmts: Vec<StmtId> = Vec()
-		var values: Vec<Option<ExprId>> = Vec()
-		for _ in 0..fields.len() {
-			values.push(.None)
-		}
-		var given: Vec<(i64, i64)> = Vec()
-		for (slot, arg) in matched.slots.forwards().enumerate() {
-			if arg is .Some(a) then given.push((a, slot))
-		}
+		var values: Vec<Option<ExprId>> = [
+			for _ in 0..fields.len() do
+				yield .None
+		]
+		var given: Vec<(i64, i64)> = [
+			for (slot, arg) in matched.slots.forwards().enumerate() do
+				if arg is .Some(a) then
+					yield (a, slot)
+		]
 		given.sortUnstable()
 		for (arg, slot) in given {
 			val .Some(value) = checked[arg] else continue
@@ -1105,7 +1191,9 @@ extend Lowerer {
 				continue
 			}
 			val ty = self.program.types.subst(f.ty, &tys)
-			if !self.isPoisoned(ty) && self.owns(ty) then owning = true
+			if !self.isPoisoned(ty) && self.owns(ty) then
+				owning = true
+
 			val local = self.state.body.locals.add(Local(
 				name: f.name,
 				ty: ty,
@@ -1120,10 +1208,10 @@ extend Lowerer {
 			if self.state.body.exprs[base].kind is .Move(taken) then
 				self.state.body.restTaken.add(taken)
 		}
-		var args: Vec<ExprId> = Vec()
-		for value in values {
-			args.push(value.unwrap())
-		}
+		val args: Vec<ExprId> = [
+			for value in values do
+				yield value.unwrap()
+		]
 		val ty = self.intern(.Enum(id: id, args: baseArgs))
 		val literal = self.alloc(
 			.Variant(id: id, variant: index, args: args, order: Vec()),
@@ -1141,8 +1229,147 @@ extend Lowerer {
 			Arm(pattern: .Wildcard, guard: .None, body: panicked, span: span),
 		])
 		val taken = self.alloc(.Match(scrutinee: base, arms: arms), ty, span)
-		if stmts.isEmpty() then return taken
+		if stmts.isEmpty() then
+			return taken
+
 		return self.alloc(.Block(Block(stmts: stmts, value: taken, span: span)), ty, span)
+	}
+
+	/// Whether a variant of these fields, named without them, is a function
+	/// of its one field: where a function value is expected of it, or nothing
+	/// is. One whose field has a default, or holds nothing, is the value `()`
+	/// makes, which is what it is reported as.
+	fn isFunctionOf(fields: &[FieldDef], hint: Option<Ty>): bool = {
+		if fields.len() != 1 || fields[0].default.isSome() || fields[0].ty == UNIT then
+			return false
+
+		return match hint {
+			.Some(ty) => self.isFunctionType(ty)
+			.None => true
+		}
+	}
+
+	/// A function type, or a closure's, lent or owned.
+	fn isFunctionType(ty: Ty): bool = match self.kind(ty) {
+		.Fn(..) => true
+		.Ref(inner, ..) | .Own(inner) => self.kind(inner) is .Fn(..)
+		_ => false
+	}
+
+	/// The function that builds variant `index` of enum `id` from its one
+	/// field, written the first time it is named as a value: generic as the
+	/// enum is, its parameter named as the field is.
+	var fn variantFn(id: EnumId, index: u32): FnId = {
+		if self.program.variantFns.get((id, index)) is .Some(made) then
+			return made
+
+		val generics = self.program.enums[id].generics.clone()
+		val def = &self.program.enums[id].variants[index as i64]
+		val name = def.name
+		val at = def.span
+		val field = def.fields[0].clone()
+		val module = self.program.enums[id].module
+		val ret = self.selfTyOf(.Enum(id), &generics)
+		var body = Body()
+		val local = body.locals.add(Local(name: field.name, ty: field.ty, kind: .Param, span: at))
+		body.params.push(local)
+		val read = body.exprs.add(Expr(kind: .Local(local), ty: field.ty, span: at))
+		// What owns memory is handed on, not copied.
+		val arg =
+			if self.owns(field.ty) then
+				body.exprs.add(Expr(kind: .Move(read), ty: field.ty, span: at))
+			else read
+		body.value = body.exprs.add(Expr(
+			kind: .Variant(id: id, variant: index, args: [arg], order: Vec()),
+			ty: ret,
+			span: at,
+		))
+		val made = self.program.fns.add(FnDef(
+			name: name,
+			nameSpan: at,
+			symbol: .None,
+			receiver: .None,
+			owner: .None,
+			interfaceId: .None,
+			generics: generics,
+			instanceOf: .None,
+			params: [
+				ParamDef(
+					name: field.name,
+					nameSpan: field.span,
+					ty: field.ty,
+					span: field.span,
+					default: .None,
+				),
+			],
+			ret: ret,
+			retSpan: .None,
+			isExtern: false,
+			exportsC: false,
+			header: .None,
+			accesses: .None,
+			isVariadic: false,
+			variadicOf: .None,
+			lendsFrom: .None,
+			keeps: Vec(),
+			keepsAt: .None,
+			isLambda: false,
+			generator: .None,
+			isTailrec: false,
+			test: .None,
+			isInline: false,
+			generated: .None,
+			intrinsic: .None,
+			body: body,
+			projects: .None,
+			compileTime: false,
+			module: module,
+			isPub: true,
+			span: at,
+		))
+		self.program.variantFns.put((id, index), made)
+		return made
+	}
+
+	/// The variants that are functions of their one field, by their names.
+	fn variantsByName(): Map<Symbol, Vec<(EnumId, u32)>> = {
+		var found: Map<Symbol, Vec<(EnumId, u32)>> = Map()
+		for id in self.program.enums.ids() {
+			if self.program.enums[id].isView then
+				continue
+
+			for (index, v) in self.program.enums[id].variants.forwards().enumerate() {
+				if !self.isFunctionOf(&v.fields, .None) then
+					continue
+
+				found.atOrPut(v.name, Vec()).push((id, index as u32))
+			}
+		}
+		return found
+	}
+
+	/// The function of every variant this file may name as a value, made
+	/// before the bodies are checked, since they are checked apart and none
+	/// may declare one: of each variant of one field named as the last name
+	/// of a path that is not called. One that turns out to name something
+	/// else, or a variant of that name in another enum, makes a function
+	/// nothing names.
+	var fn declareVariantFns(byName: &Map<Symbol, Vec<(EnumId, u32)>>) = {
+		val file = self.ast
+		var callees: Set<ast::ExprId> = Set()
+		for entry in file.exprs do
+			if entry.value.kind is .Call(callee, ..) then
+				callees.add(callee)
+
+		for entry in file.exprs {
+			val .Path(leadingDot: false, segments, ..) = entry.value.kind else continue
+			if segments.len() < 2 || callees.contains(&entry.handle) then
+				continue
+
+			val .Some(variants) = byName.get(&segments[segments.len() - 1].sym) else continue
+			for (id, index) in variants do
+				self.variantFn(id, index)
+		}
 	}
 
 	/// `.Variant` written without the fields it has.
@@ -1152,6 +1379,7 @@ extend Lowerer {
 		path: str,
 		fields: &[FieldDef],
 		inference: &Inference,
+		hint: Option<Ty>,
 		span: Span,
 	) = {
 		val diagnostic = Diagnostic::error(
@@ -1173,9 +1401,10 @@ extend Lowerer {
 			voidField = ty == UNIT
 		}
 		var defaulted = true
-		for f in fields {
-			if f.default.isNone() then defaulted = false
-		}
+		for f in fields do
+			if f.default.isNone() then
+				defaulted = false
+
 		// Every field has a default: `()` takes them all, as a call does.
 		val fixed = when {
 			voidField => {
@@ -1189,6 +1418,20 @@ extend Lowerer {
 				"write `\(path)()`, which takes the defaults",
 				[Edit::insert(span.hi, "()")],
 			)
+			// Where a function is expected, the lambda that builds it, naming
+			// each field.
+			hint is .Some(ty) && self.isFunctionType(ty) && fields.len() > 1 => {
+				var names: Vec<String> = Vec()
+				var named: Vec<String> = Vec()
+				for f in fields {
+					val fieldName = self.text(f.name)
+					names.push(String::of(fieldName))
+					named.push("\(fieldName): \(fieldName)")
+				}
+				diagnostic.withNote(
+					"a variant of one field is a function of it; one of several is built naming each",
+				).withHelp("write a lambda that builds it: `(\(names.join(", "))) => \(path)(\(named.join(", ")))`")
+			}
 			else => diagnostic.withHelp("write `\(path)(…)`")
 		}
 		self.report(fixed)
@@ -1207,7 +1450,7 @@ extend Lowerer {
 		val (matched, slots, checked) = self.variantOperands(
 			path,
 			&fields,
-			args,
+			&args,
 			item,
 			isView,
 			&var inference,
@@ -1231,24 +1474,25 @@ extend Lowerer {
 		span: Span,
 		fromBase: bool,
 	): (Matched, Vec<Slot>, Vec<Option<ExprId>>) = {
-		val names = self.fieldNames(path, &fields, args, item.argNames())
-		var slots: Vec<Slot> = Vec()
-		for f in fields {
+		val names = self.fieldNames(path, &fields, &args, item.argNames())
+		var slots: Vec<Slot> = [for f in fields {
 			val default = if fromBase then Option::None else f.default.clone()
-			slots.push(Slot(name: f.name, ty: f.ty, span: f.span, default: default))
-		}
-		val matched = self.matchArguments(&slots, args, &names, "field", path)
+			yield Slot(name: f.name, ty: f.ty, span: f.span, default: default)
+		}]
+		val matched = self.matchArguments(&slots, &args, &names, "field", path)
 		val missing: Vec<i64> = if fromBase then Vec() else matched.missing(&slots)
 		if !missing.isEmpty() || matched.extra > 0 {
 			// Where a field has a default, the count says nothing: what is
 			// missing is named.
 			var plain = true
-			for n in names {
-				if n.isSome() then plain = false
-			}
-			for s in slots {
-				if s.default.isSome() then plain = false
-			}
+			for n in names do
+				if n.isSome() then
+					plain = false
+
+			for s in slots do
+				if s.default.isSome() then
+					plain = false
+
 			val diagnostic = if missing.isEmpty() || plain {
 				Diagnostic::error(
 					ARGUMENT_COUNT,
@@ -1269,43 +1513,39 @@ extend Lowerer {
 			self.report(diagnostic)
 		}
 		// The values as written.
-		var written: Vec<(i64, i64)> = Vec()
-		for (slot, arg) in matched.slots.forwards().enumerate() {
-			if arg is .Some(a) then written.push((a, slot))
-		}
+		var written: Vec<(i64, i64)> = [
+			for (slot, arg) in matched.slots.forwards().enumerate() do
+				if arg is .Some(a) then
+					yield (a, slot)
+		]
 		written.sortUnstable()
-		var operands: Vec<GenericOperand> = Vec()
-		for (arg, slot) in written {
-			operands.push(
-				GenericOperand(
-					expr: args[arg],
-					declared: fields[slot].ty,
-					context: (fields[slot].span, "field declared here"),
-					// A view's reference field is given a `&`, as a parameter is.
-					isArg: isView && self.kind(fields[slot].ty) is .Ref(..),
-				),
+		val operands: Vec<GenericOperand> = [for (arg, slot) in written {
+			yield GenericOperand(
+				expr: args[arg],
+				declared: fields[slot].ty,
+				context: (fields[slot].span, "field declared here"),
+				// A view's reference field is given a `&`, as a parameter is.
+				isArg: isView && self.kind(fields[slot].ty) is .Ref(..),
 			)
-		}
+		}]
 		val values = self.genericOperands(&operands, [], &var inference.tys)
-		var checked: Vec<Option<ExprId>> = Vec()
-		for _ in 0..args.len() {
-			checked.push(.None)
-		}
-		for (i, (arg, _)) in written.forwards().enumerate() {
-			if i < values.len() then checked[arg] = values[i]
-		}
-		for arg in matched.unmatched {
+		var checked: Vec<Option<ExprId>> = [
+			for _ in 0..args.len() do
+				yield .None
+		]
+		for (i, (arg, _)) in written.forwards().enumerate() do
+			if i < values.len() then
+				checked[arg] = values[i]
+
+		for arg in matched.unmatched do
 			self.infer(args[arg], .None)
-		}
+
 		return (matched, slots, checked)
 	}
 
 	/// Whether every field holds nothing in this instance.
 	fn allHoldNothing(fields: &[FieldDef], inference: &Inference): bool = {
-		for f in fields {
-			if !self.holdsNothing(f.ty, &inference) then return false
-		}
-		return true
+		return fields.all((f) => self.holdsNothing(f.ty, &inference))
 	}
 
 	/// Whether a field holds nothing in this instance: its type is `void`, or
@@ -1335,27 +1575,35 @@ extend Lowerer {
 		given: Vec<Option<ast::Name>>,
 	): Vec<Option<ast::Name>> = {
 		var names = given
-		if fields.len() < 2 then return names
+		if fields.len() < 2 then
+			return names
+
 		val file = self.ast
-		var positional: Vec<i64> = Vec()
-		for i in 0..names.len() {
-			if names[i].isNone() then positional.push(i)
-		}
-		if positional.isEmpty() then return names
+		var positional: Vec<i64> = [
+			for i in 0..names.len() do
+				if names[i].isNone() then
+					yield i
+		]
+		if positional.isEmpty() then
+			return names
+
 		// The field each value is meant for: a variable named as one of the
 		// fields, that one; anything else, the first field nothing else names,
 		// in order.
-		var taken: Vec<Symbol> = Vec()
-		for n in names {
-			if n is .Some(named) then taken.push(named.sym)
-		}
-		for i in positional {
-			if self.namedAsField(&fields, args[i]) is .Some(sym) then taken.push(sym)
-		}
-		var free: Vec<Symbol> = Vec()
-		for f in fields {
-			if !taken.contains(&f.name) then free.push(f.name)
-		}
+		var taken: Vec<Symbol> = [
+			for n in names do
+				if n is .Some(named) then
+					yield named.sym
+		]
+		for i in positional do
+			if self.namedAsField(&fields, args[i]) is .Some(sym) then
+				taken.push(sym)
+
+		val free: Vec<Symbol> = [
+			for f in fields do
+				if !taken.contains(&f.name) then
+					yield f.name
+		]
 		var nextFree = 0
 		var meant: Map<i64, Symbol> = Map()
 		for i in positional {
@@ -1369,11 +1617,11 @@ extend Lowerer {
 				}
 			}
 		}
-		var edits: Vec<Edit> = Vec()
-		for i in positional {
-			if meant.get(&i) is .Some(sym) then
-				edits.push(Edit::insert(file.exprs[args[i]].span.lo, "\(self.text(sym)): "))
-		}
+		val edits: Vec<Edit> = [
+			for i in positional do
+				if meant.get(&i) is .Some(sym) then
+					yield Edit::insert(file.exprs[args[i]].span.lo, "\(self.text(sym)): ")
+		]
 		val first = file.exprs[args[positional[0]]].span
 		var diagnostic = Diagnostic::error(
 			UNNAMED_FIELDS,
@@ -1385,20 +1633,22 @@ extend Lowerer {
 		)
 		if edits.len() == positional.len() then
 			diagnostic = diagnostic.withFix("name the fields", (edits).intoBuffer())
+
 		self.report(diagnostic)
-		for i in positional {
+		for i in positional do
 			if meant.get(&i) is .Some(sym) then
 				names[i] = ast::Name(sym: sym, span: file.exprs[args[i]].span)
-		}
+
 		return names
 	}
 
 	/// The field a value written as a variable of a field's name is for.
 	fn namedAsField(fields: &[FieldDef], arg: ast::ExprId): Option<Symbol> = {
 		val .Name(sym) = self.ast.exprs[arg].kind else return .None
-		for f in fields {
-			if f.name == sym then return sym
-		}
+		for f in fields do
+			if f.name == sym then
+				return sym
+
 		return .None
 	}
 
@@ -1408,7 +1658,9 @@ extend Lowerer {
 	var fn variantWithDot(base: ast::ExprId, name: ast::Name, item: ItemUse): Option<ExprId> = {
 		val file = self.ast
 		val .Name(sym) = file.exprs[base].kind else return .None
-		if self.lookup(sym).isSome() then return .None
+		if self.lookup(sym).isSome() then
+			return .None
+
 		// The enum may be one the file imported by name.
 		val named = ast::Name(sym: sym, span: file.exprs[base].span)
 		var module = self.holding(sym)
@@ -1425,10 +1677,13 @@ extend Lowerer {
 		// Only a variant: `Json.parse` is not one written with a dot, and
 		// neither is what an interpolation of the enum's name calls on it.
 		var isVariant = false
-		for v in self.program.enums[id].variants {
-			if v.name == name.sym then isVariant = true
-		}
-		if !isVariant then return .None
+		for v in self.program.enums[id].variants do
+			if v.name == name.sym then
+				isVariant = true
+
+		if !isVariant then
+			return .None
+
 		val baseSpan = file.exprs[base].span
 		val path = "\(self.text(sym))::\(self.text(name.sym))"
 		self.report(

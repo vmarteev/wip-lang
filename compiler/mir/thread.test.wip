@@ -1,0 +1,146 @@
+// Threading a switch on what a path has just written, on bodies written out
+// as a generator spliced into a loop is: a state, a switch on it at the top of
+// each step, and a `yield` that writes it before the loop's body runs and
+// comes back round to the switch.
+
+import std::collections::{Set}
+import hir::{BOOL, I32, I64, Ty}
+
+fn local(index: u32): Place = Place::of(Local::of(index))
+
+fn copy(index: u32): Operand = .Copy(local(index))
+
+fn int(value: i64): Operand = .Const(.Int(bits: value as u128, ty: I64))
+
+fn state(value: u32): Rvalue = .Use(.Const(.Int(bits: value as u128, ty: I32)))
+
+fn to(index: u32): BlockId = BlockId(index)
+
+/// A generator counting to ten, spliced into a loop that adds what it
+/// yields: `_1` is where it stopped, `_3` its count, `_5` what it yields,
+/// `_0` the sum. Where `escapes`, the state's address goes to a call before
+/// the loop, which may write it.
+fn counting(escapes: bool): Body = {
+	val decl = (ty: Ty, kind: LocalKind) => LocalDecl(ty: ty, kind: kind, source: .None)
+	val locals: Vec<LocalDecl> = [
+		decl(I64, .Var),
+		decl(I32, .Var),
+		decl(I32, .Temp),
+		decl(I64, .Var),
+		decl(BOOL, .Temp),
+		decl(I64, .Temp),
+		decl(I64, .Temp),
+	]
+	var entry: Vec<Statement> = [
+		.Assign(place: local(0), rvalue: .Use(int(0))),
+		.Assign(place: local(1), rvalue: state(0)),
+	]
+	if escapes {
+		entry.push(.Assign(place: local(6), rvalue: .AddressOf(local(1))))
+		entry.push(.Call(callee: .Value(copy(6)), args: [copy(6)], dest: .None))
+	}
+	val blocks: Vec<Block> = [
+		Block(statements: entry, terminator: .Goto(to(1))),
+		// The step: on from where it stopped.
+		Block(
+			statements: [.Assign(place: local(2), rvalue: .Use(copy(1)))],
+			terminator: .Switch(value: copy(2), cases: [(0, to(2)), (2, to(4))], otherwise: to(5)),
+		),
+		// Its start.
+		Block(
+			statements: [.Assign(place: local(3), rvalue: .Use(int(0)))],
+			terminator: .Goto(to(3)),
+		),
+		// Its loop's test.
+		Block(
+			statements: [
+				.Assign(place: local(4), rvalue: .Binary(op: .Lt, lhs: copy(3), rhs: int(10))),
+			],
+			terminator: .Branch(cond: copy(4), thenBlock: to(6), otherwise: to(5)),
+		),
+		// On after its `yield`.
+		Block(
+			statements: [
+				.Assign(place: local(3), rvalue: .Binary(op: .Add, lhs: copy(3), rhs: int(1))),
+			],
+			terminator: .Goto(to(3)),
+		),
+		Block(statements: Vec(), terminator: .Return),
+		// The `yield`: what it hands over, and where it stops.
+		Block(
+			statements: [
+				.Assign(place: local(5), rvalue: .Use(copy(3))),
+				.Assign(place: local(1), rvalue: state(2)),
+			],
+			terminator: .Goto(to(7)),
+		),
+		// The loop's body, and back round to the step.
+		Block(
+			statements: [
+				.Assign(place: local(0), rvalue: .Binary(op: .Add, lhs: copy(0), rhs: copy(5))),
+			],
+			terminator: .Goto(to(1)),
+		),
+	]
+	return Body(locals: locals, params: Vec(), ret: .None, blocks: blocks)
+}
+
+/// The blocks control can reach from the entry.
+fn reachable(body: &Body): Set<u32> = {
+	var seen: Set<u32> = Set()
+	var waiting: Vec<u32> = [0]
+	while waiting.pop() is .Some(at) {
+		if !seen.add(at) then
+			continue
+
+		for next in body.blocks[at as i64].terminator.successors() do
+			waiting.push(next.index)
+	}
+	return seen
+}
+
+/// How many switches control can reach.
+fn switches(body: &Body): i64 = {
+	var count = 0
+	for b in reachable(&body) do
+		if body.blocks[b as i64].terminator is .Switch(..) then
+			count += 1
+
+	return count
+}
+
+/// The `yield` goes straight on from where it stopped, and the entry
+/// straight to the start: no switch is left on any way control takes.
+@test
+fn aGeneratorsStepGoesStraightOnFromItsYield() = {
+	var body = counting(false)
+	assert(switches(&body) == 1)
+	thread(&var body)
+	validate(&body)
+	assert(switches(&body) == 0, "a switch is left")
+	// The body's way back goes to what follows the yield.
+	val .Goto(back) = body.blocks[7].terminator else panic("the body goes back round")
+	assert(body.blocks[back.index as i64].terminator == Terminator::Goto(to(4)))
+}
+
+/// A state a call may write keeps its switch.
+@test
+fn aStateACallMayWriteKeepsItsSwitch() = {
+	var body = counting(true)
+	thread(&var body)
+	validate(&body)
+	assert(switches(&body) == 1, "the switch on what a call may write was taken out")
+}
+
+/// A switch on a constant is the jump it always takes.
+@test
+fn aSwitchOnAConstantIsAJump() = {
+	var body = counting(false)
+	body.blocks[1].terminator = .Switch(
+		value: .Const(.Int(bits: 2, ty: I32)),
+		cases: [(0, to(2)), (2, to(4))],
+		otherwise: to(5),
+	)
+	thread(&var body)
+	assert(body.blocks[1].terminator == Terminator::Goto(to(4)))
+}

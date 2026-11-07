@@ -33,7 +33,9 @@ assert("\(name) has \(name.len()) letters" == "wip has 3 letters")
 fn area(width: i64, height: i64 = 1): i64 = width * height
 
 fn describe(n: i64): str = {
-    if n < 0 then return "negative"
+    if n < 0 then
+        return "negative"
+
     return if n == 0 then "zero" else "positive"
 }
 
@@ -78,22 +80,23 @@ var total = 0
 for i in 0..5 {
     total += i // 0, 1, 2, 3, 4
 }
-for x in [10, 20] {
+for x in [10, 20] do
     total += x
-}
+
 var n = 3
-while n > 0 {
+while n > 0 do
     n -= 1
-}
+
 outer: for i in 0..3 {
-    for j in 0..3 {
-        if i * j == 2 then break outer
-    }
+    for j in 0..3 do
+        if i * j == 2 then
+            break outer
 }
 assert(total == 40 && n == 0)
 ```
 
-[Page 4](04-expressions.md#loops)
+`do` before a body of one statement, braces for more, or for a loop in a
+loop. [Page 4](04-expressions.md#loops)
 
 ## Structs and enums
 
@@ -194,9 +197,9 @@ its owner. [Page 6](06-ownership.md)
 ```wip,run
 fn total(values: &[i64]): i64 = {
     var sum = 0
-    for value in values {
+    for value in values do
         sum += value
-    }
+
     return sum
 }
 
@@ -214,7 +217,8 @@ fn main() = {
 ```
 
 A `&var` lives for the call it is lent to; a `&` may also be kept in a
-view. [Page 7](07-references.md)
+view. A reference is passed on as a value is lent, `total(&values)` of a
+`values: &[i64]`, and a closure by its name. [Page 7](07-references.md)
 
 ## Views, projections, `from`, `keeps`, `empties`
 
@@ -234,9 +238,8 @@ struct Words {
 
     // What it puts in `into` borrows `self`, and says so.
     fn into(into: &var Vec<Word>) keeps self = {
-        for name in self.names {
+        for name in self.names do
             into.push(Word(text: name.toStr()))
-        }
     }
 }
 
@@ -284,7 +287,9 @@ fn main() = {
 ```wip,run
 fn parse(text: str): Result<i64, str> = {
     val n = text.toInt().mapErr((_) => "not a number")?
-    if n < 0 then return .Err("negative")
+    if n < 0 then
+        return .Err("negative")
+
     return n // .Ok(n)
 }
 
@@ -294,7 +299,8 @@ fn firstWord(text: str): Option<str> = {
 }
 
 fn save(text: str): Result<void, str> = {
-    if text.isEmpty() then return .Err("nothing to save")
+    if text.isEmpty() then
+        return .Err("nothing to save")
 } // .Ok() at the end, as `return` alone is
 
 fn main() = {
@@ -330,9 +336,9 @@ extend Square: Shape {
 
 fn largest<T: Shape>(shapes: &[T]): f64 = {
     var best = 0.0
-    for shape in shapes {
+    for shape in shapes do
         best = best.max(shape.area())
-    }
+
     return best
 }
 
@@ -389,9 +395,9 @@ fn main() = {
     assert(list == [1, 2, 3, 4])
 
     var counts = Map<str, i64>()
-    for word in "a b a".split(" ") {
+    for word in "a b a".split(" ") do
         counts.atOrPut(word, 0) += 1
-    }
+
     assert(counts.at("a") == 2 && counts.get("z").isNone())
 
     var text = String::of("wip")
@@ -399,6 +405,12 @@ fn main() = {
     assert(text.toUppercase() == "WIP LANG" && text.contains("lang"))
     val evens = list.copies().filter((n) => n % 2 == 0).toVec()
     assert(evens == [2, 4])
+    val odds = [
+        for n in list do
+            if n % 2 == 1 then
+                yield n
+    ] // a Vec
+    assert(odds == [1, 3])
 }
 ```
 

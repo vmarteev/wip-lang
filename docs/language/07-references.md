@@ -11,9 +11,9 @@ which the section on views says.
 ```wip,run
 fn total(values: &[i64]): i64 = {
     var sum = 0
-    for value in values {
+    for value in values do
         sum += value
-    }
+
     return sum
 }
 
@@ -38,14 +38,62 @@ where it is used, and takes no `&`:
 ```wip,run
 fn total(values: &[i64]): i64 = {
     var sum = 0
-    for value in values {
+    for value in values do
         sum += value
-    }
+
     return sum
 }
 
 fn main() = {
     assert(total([1, 2, 3]) == 6)
+}
+```
+
+A reference stands for what it refers to, so passing one on lends what it
+refers to, and is written as lending a value of one's own is: a reference
+parameter, a name a pattern binds behind a reference, and an element a
+`for` walks are each passed with `&`, or `&var` to be written. A call says
+what it lends whatever its arguments are, and a reader does not have to
+know how a name was made to know it. A closure is passed on by its name,
+as a function is:
+
+```wip,run
+fn total(values: &[i64]): i64 = {
+    var sum = 0
+    for value in values do
+        sum += value
+
+    return sum
+}
+
+fn average(values: &[i64]): i64 = total(&values) / values.len()
+
+fn largest(rows: &[Vec<i64>], measure: &(row: &[i64]) => i64): i64 = {
+    var most = 0
+    for row in rows do
+        most = most.max(measure(&row))
+
+    return most
+}
+
+fn main() = {
+    assert(average([2, 4]) == 3)
+    assert(largest([[1, 2], [5]], average) == 5)
+}
+```
+
+Without it, the name is what it refers to, as a value of its own would
+be, and is refused where a reference is expected, with the `&` to write;
+`wip fix` writes them ([page 12](12-tools.md#fixes)):
+
+```wip,error=E0476
+fn size(values: &Vec<i64>): i64 = values.len()
+
+fn twice(values: &Vec<i64>): i64 = size(values) * 2
+
+fn main() = {
+    val numbers: Vec<i64> = [1, 2]
+    assert(twice(&numbers) == 4)
 }
 ```
 
@@ -58,9 +106,9 @@ would outlive it:
 ```wip,run
 fn total(values: &[i64]): i64 = {
     var sum = 0
-    for value in values {
+    for value in values do
         sum += value
-    }
+
     return sum
 }
 
@@ -374,7 +422,9 @@ view enum Token {
 
 fn first(text: str): Token = {
     val trimmed = text.trim()
-    if trimmed.isEmpty() then return .End
+    if trimmed.isEmpty() then
+        return .End
+
     return match trimmed.toInt() {
         .Ok(value) => .Number(value)
         .Err(..) => .Word(trimmed)
@@ -424,9 +474,10 @@ struct Tree {
 
 extend Tree {
     fn find(size: i64): Option<&Node> = {
-        for i in 0..self.nodes.len() {
-            if self.nodes[i].size == size then return &self.nodes[i]
-        }
+        for i in 0..self.nodes.len() do
+            if self.nodes[i].size == size then
+                return &self.nodes[i]
+
         return .None
     }
 }
@@ -480,9 +531,9 @@ fn kind(node: &Json): Option<str> = node.get("kind")?.asText()
 fn named(node: &Json, wanted: str): Vec<&Json> = {
     var found: Vec<&Json> = Vec()
     if node.get("inner").flatMap((inner) => inner.asArray()) is .Some(nodes) {
-        for child in nodes.items() {
-            if kind(child) == wanted then found.push(child)
-        }
+        for child in nodes.items() do
+            if kind(&child) == wanted then
+                found.push(&child)
     }
     return found
 }
@@ -520,9 +571,10 @@ extend Lowerer {
     var fn report(text: str) = self.errors.push("unknown: \(text)")
 
     var fn check() = {
-        for name in self.ast.names.items() {
-            if name.isEmpty() then self.report(self.ast.names[0].toStr())
-        }
+        for name in self.ast.names.items() do
+            if name.isEmpty() then
+                self.report(self.ast.names[0].toStr())
+
         val first = &self.ast.names[0]
         self.errors.clear()
         assert(first == "a")
@@ -602,9 +654,8 @@ view struct Words {
 extend Words {
     var fn refill(line: str) keeps line empties = {
         self.words = Vec()
-        for word in line.split(" ") {
+        for word in line.split(" ") do
             self.words.push(word)
-        }
     }
 }
 
@@ -760,7 +811,8 @@ extend Shelf<T> {
     var fn put(item: T): Handle<T> keeps item = self.items.add(item)
 
     var fn take(handle: Handle<T>) = {
-        if self.items.remove(handle) is .Some(item) then self.taken.push(item)
+        if self.items.remove(handle) is .Some(item) then
+            self.taken.push(item)
     }
 }
 
@@ -806,9 +858,8 @@ view struct Label {
 extend Shelf {
     fn labelled(labels: &var Vec<Label>) keeps self = {
         labels.clear()
-        for name in self.names {
+        for name in self.names do
             labels.push(Label(text: name.toStr()))
-        }
     }
 }
 
@@ -839,9 +890,9 @@ fn main() = {
         words.clear()
         line.clear()
         line.push(text)
-        for word in line.toStr().split(" ") {
+        for word in line.toStr().split(" ") do
             words.push(word)
-        }
+
         count += words.len()
     }
     assert(count == 5)

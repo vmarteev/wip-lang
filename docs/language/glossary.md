@@ -112,7 +112,9 @@ with the place of the call, so a function knows where it was called from;
 `panic(message, at: place)` reports it. [Page 3](03-functions.md#the-callers-place)
 
 **list** — `[a, b, c]`: an array where nothing expects more, a `Vec`
-where one is expected, and a buffer, `own<[T]>`, where one is.
+where one is expected, and a buffer, `own<[T]>`, where one is. A list that
+yields, `[for x in xs { yield x }]`, is a `Vec` where nothing expects
+another.
 [Page 1](01-types.md#arrays-and-slices)
 
 **method** — a function of a type, called with a dot. The word before
@@ -133,7 +135,7 @@ value: it is given, not copied. `move` is written only where a `match`,
 |---|---|
 | `own<T>`, `own Node(…)` | a box, and making one |
 | `own [1, 2, 3]` | a list on the heap, `own<[T]>`, where nothing expects a `Vec` or a buffer |
-| `own for x in xs { yield … }` | the list a loop makes, made now |
+| `own for x in xs { yield … }` | the list a loop makes, made now, a buffer rather than a `Vec` |
 | `own (x) => …` | a closure that owns what it captures |
 | `for x in own leaves(…)` | a generator kept in a box, where a generator walks one of its own kind |
 

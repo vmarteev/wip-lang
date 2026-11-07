@@ -113,9 +113,9 @@ Rules the EBNF does not express:
 ### Keywords
 
 ```
-as  assert  become  break  continue  defer  dyn  else  enum  extern  false  fn
-for  if  import  in  interface  is  lend  match  move  null  own  pub  return
-self  static  struct  then  true  type  val  var  when  while  yield
+as  assert  become  break  continue  defer  do  dyn  else  enum  extern  false
+fn  for  if  import  in  interface  is  lend  match  move  null  own  pub
+return  self  static  struct  then  true  type  val  var  when  while  yield
 ```
 
 A keyword is a name in one place: a field's, where only a field's name
@@ -185,7 +185,7 @@ Where line breaks are significant:
    across a line break once it is complete. A binary operator, `(` or `[` at
    the start of a line begins something new; it does not continue the line
    above. An incomplete expression — a line ending in an operator, `=`,
-   `=>`, `then`, `,` or an open bracket — continues onto the next line. A
+   `=>`, `then`, `do`, `,` or an open bracket — continues onto the next line. A
    line that ends in `.` is an error (E0113), with a fix that moves the `.`
    to the start of the next line.
 3. **Three tokens continue the line above:** `else`, the `|` before a
@@ -461,12 +461,18 @@ becomeStmt  = "become" expr ;            (* a call, which takes the function's f
 yieldStmt   = "yield" expr ;             (* to the list being built,
                                             or to whoever asks the generator it is
                                             in *)
-whileStmt   = ( IDENT ":" )? "while" cond block ;
+whileStmt   = ( IDENT ":" )? "while" cond loopBody ;
                                          (* a name, which `break name` leaves *)
-forStmt     = ( IDENT ":" )? "for" pattern "in" cond block ;
+forStmt     = ( IDENT ":" )? "for" pattern "in" cond loopBody ;
                                          (* a `cond` that is a range counts *)
                                          (* a name, `_`, or a struct taken
                                             apart *)
+loopBody    = block | "do" doBody ;
+doBody      = expr | jump | yieldStmt ;  (* one statement, no braces; not a
+                                            binding, a loop, an `if` with an
+                                            `else` or in braces, a `match` or a
+                                            block, each refused with the fix
+                                            that writes the braces *)
 breakStmt   = "break" IDENT? ;           (* a loop's name *)
 continueStmt = "continue" IDENT? ;
 
@@ -547,15 +553,18 @@ assertExpr  = "assert" "(" expr ( "," STRING )? ")" ;
 
 ifExpr      = "if" cond ( block | "then" branch )
               ( "else" ( block | ifExpr | branch ) )? ;
-branch      = expr | jump ;          (* one expression, no braces; each
+branch      = expr | jump | yieldStmt ;
+                                     (* one expression, no braces; each
                                         branch of an `if` takes its own form,
-                                        and a block after `then` is refused *)
+                                        and a block after `then` is refused;
+                                        a `yield` only where the `if` is a
+                                        statement, and never beside a value *)
 matchExpr   = "match" cond "{" ( arm ( lsep arm )* lsep? )? "}" ;
-arm         = pattern ( "if" cond )? "=>" ( expr | jump ) ;
+arm         = pattern ( "if" cond )? "=>" ( expr | jump | yieldStmt ) ;
                                          (* a guard: the arm matches only where
                                             it is true; its `=>`, see R8 *)
 whenExpr    = "when" "{" whenArm ( lsep whenArm )* lsep? "}" ;
-whenArm     = ( cond | "else" ) "=>" ( expr | jump ) ;
+whenArm     = ( cond | "else" ) "=>" ( expr | jump | yieldStmt ) ;
                                          (* the first arm whose condition is
                                             true runs; `else` is the last arm,
                                             and is needed where the `when` is a
@@ -575,13 +584,13 @@ exprPath    = IDENT typeArgs? ( "::" IDENT typeArgs? )* ;
 
 arrayLit    = "[" ( element ( ";" expr | ( "," element )* ","? ) )? "]" ;
 element     = expr | forElement ;
-forElement  = "for" pattern "in" expr block ;
+forElement  = "for" pattern "in" expr loopBody ;
                             (* an element that yields — a `for`, or an `if`,
                                `match` or block with `yield` inside — makes
                                the length known only as the list is built:
-                               only `own [ … ]` may hold one, and `own
-                               forElement` is the list of what one loop
-                               yields; anywhere else a value
+                               the list is a `Vec`, or with `own` an
+                               own<[T]>, and `own forElement` is the list of
+                               what one loop yields; anywhere else a value
                                stands, a `for` is a generator;
                                where a statement stands, it is a forStmt *)
             (* a count that is not an INT literal needs `own`: own<[T]> *)

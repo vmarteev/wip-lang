@@ -1,10 +1,10 @@
-// A list built as it runs: `own [ … ]` whose elements include statements
-// that `yield`, and `own for`, whose loop does. A `yield` hands its value to
-// the innermost list being built. The list is written into what the rest of
-// the compiler already knows, a vector that is filled and then handed over
-// as a buffer:
+// A list built as it runs: `[ … ]` whose elements include statements that
+// `yield`, and `own for`, whose loop does. A `yield` hands its value to the
+// innermost list being built. The list is written into what the rest of the
+// compiler already knows, a vector that is filled, and then is the answer,
+// or is handed over as a buffer where `own` builds it:
 //
-//     own [a, if c { yield b }, for x in xs { yield f(x) }]
+//     own [a, if c then yield b, for x in xs { yield f(x) }]
 //         ⇒ { var list# = Vec<T>::withCapacity(1)
 //             list#.push(a)
 //             if c { list#.push(b) }
@@ -21,9 +21,9 @@ import syntax::{
 	Diagnostic,
 	ELEMENT_ADDS_NOTHING,
 	Edit,
-	LIST_NEEDS_OWN,
 	Span,
 	Symbol,
+	YIELD_BESIDE_VALUE,
 	YIELD_OUTSIDE_LIST
 }
 
@@ -31,6 +31,75 @@ import syntax::{
 struct ListBuild {
 	local: LocalId
 	elem: Option<Ty>
+}
+
+/// An `if` or a `match` with a branch that yields beside branches that are
+/// values, which are dropped where the `if` is a statement: `if c then
+/// yield a else b` was meant to yield `b` too.
+struct BesideYield {
+	/// Where each branch that is a value is.
+	values: Vec<Span>
+	/// What writes the whole as one value yielded, where every branch is a
+	/// `yield` or a value: `yield if c then a else b`.
+	fix: Option<Vec<Edit>>
+}
+
+/// What a branch of an `if` or a `match` is, for `BesideYield`: a `yield`,
+/// with where its keyword and the space after it are; a value, with where
+/// it is; or anything else.
+enum Branch {
+	Yields(keyword: Span)
+	Value(at: Span)
+	Other
+}
+
+/// The branches of the `if` or the `match` `e`, each a block or the
+/// expression of an arm: an `if`'s through its `else if`s.
+fn branchesOf(file: &ast::Ast, e: ast::ExprId): Vec<Branch> = {
+	var branches: Vec<Branch> = Vec()
+	var at = e
+	while true {
+		match file.exprs[at].kind {
+			.If(thenBlock, elseBranch, ..) => {
+				branches.push(blockBranch(&file, &thenBlock))
+				val .Some(next) = elseBranch else break
+				if file.exprs[next].kind is .If(..) then
+					at = next
+				else {
+					branches.push(exprBranch(&file, next))
+					break
+				}
+			}
+			.Match(arms, ..) => {
+				for arm in arms do
+					branches.push(exprBranch(&file, arm.body))
+
+				break
+			}
+			_ => break
+		}
+	}
+	return branches
+}
+
+/// A branch written as a block: `{ yield x }`, `then yield x`, `{ 5 }`.
+fn blockBranch(file: &ast::Ast, block: &ast::Block): Branch = {
+	if block.stmts.len() != 1 then
+		return .Other
+
+	val stmt = &file.stmts[block.stmts[0]]
+	return match stmt.kind {
+		.Yield(value) => .Yields(keyword: Span::new(stmt.span.lo, file.exprs[value].span.lo))
+		.Expr(value) => exprBranch(&file, value)
+		_ => .Other
+	}
+}
+
+/// A branch that is an expression: an arm's body, the last `else`'s.
+fn exprBranch(file: &ast::Ast, e: ast::ExprId): Branch = match file.exprs[e].kind {
+	.Block(block) => blockBranch(&file, &block)
+	.If(..) | .Match(..) | .Assign(..) | .ForElement(..) => .Other
+	_ => .Value(at: file.exprs[e].span)
 }
 
 /// Whether an element is a statement that gives the list its elements by
@@ -42,9 +111,10 @@ fn yields(file: &ast::Ast, e: ast::ExprId): bool = match file.exprs[e].kind {
 		blockYields(&file, &thenBlock) || (elseBranch is .Some(next) && yields(&file, next))
 	.Block(block) => blockYields(&file, &block)
 	.Match(arms, ..) => {
-		for arm in arms {
-			if yields(&file, arm.body) then return true
-		}
+		for arm in arms do
+			if yields(&file, arm.body) then
+				return true
+
 		false
 	}
 	_ => false
@@ -60,22 +130,18 @@ fn blockYields(file: &ast::Ast, block: &ast::Block): bool = {
 			.Expr(e) => yields(&file, e)
 			_ => false
 		}
-		if found then return true
+		if found then
+			return true
 	}
 	return false
 }
 
 extend Lowerer {
-	/// `own [ … ]` with an element that yields, or `own for`: an `own<[T]>`,
-	/// built as above. Where a `Vec` is expected, `vector`, the vector built
-	/// is the answer, and is not made a buffer.
+	/// A list with an element that yields: a `Vec`, `vector`, where nothing
+	/// else is expected, or one is, or else, for `own [ … ]` and `own for`,
+	/// an `own<[T]>`, built as above.
 	var fn builtList(elems: &[ast::ExprId], hint: Option<Ty>, vector: bool, span: Span): ExprId = {
-		var elemHint: Option<Ty> = .None
-		if hint is .Some(h) &&
-			self.kind(h) is .Own(inner) &&
-			self.kind(inner) is .Slice(elem: t) | .Array(elem: t, ..) | .ArrayOf(elem: t, ..) {
-			elemHint = t
-		}
+		val elemHint = self.elementHint(hint)
 		val .Some(.Struct(vec)) = self.preludeType(Symbol::vecType()) else {
 			// The prelude builds nothing with this; it is not for it.
 			self.report(
@@ -109,7 +175,9 @@ extend Lowerer {
 			)
 			return self.errorExpr(span)
 		}
-		if self.isPoisoned(elem) then return self.errorExpr(span)
+		if self.isPoisoned(elem) then
+			return self.errorExpr(span)
+
 		val args = self.program.types.internList([elem])
 		val vecTy = self.intern(.Struct(id: vec, args: args))
 		self.state.body.locals[local].ty = vecTy
@@ -122,9 +190,10 @@ extend Lowerer {
 		// `var list# = Vec<T>::withCapacity(n)`, room for the elements that are
 		// one each.
 		var plain = 0
-		for e in elems {
-			if !yields(self.ast, e) then plain += 1
-		}
+		for e in elems do
+			if !yields(self.ast, e) then
+				plain += 1
+
 		val count = self.alloc(.Int(plain as u128), I64, span)
 		val init = self.alloc(
 			.Call(callee: withCapacity, args: [count], typeArgs: args, order: [0]),
@@ -141,6 +210,7 @@ extend Lowerer {
 		val moved = self.alloc(.Move(taken), vecTy, span)
 		if vector then
 			return self.alloc(.Block(Block(stmts: stmts, value: moved, span: span)), vecTy, span)
+
 		val slice = self.intern(.Slice(elem))
 		val ty = self.intern(.Own(slice))
 		val value = self.alloc(
@@ -179,6 +249,76 @@ extend Lowerer {
 		return self.pushed(value, span)
 	}
 
+	/// The `if` or the `match` `e`, a statement, where a branch yields and
+	/// another is a value, which the statement drops.
+	fn besideYield(e: ast::ExprId): Option<BesideYield> = {
+		val file = self.ast
+		if file.exprs[e].kind !is .If(..) | .Match(..) then
+			return .None
+
+		val branches = branchesOf(&file, e)
+		var values: Vec<Span> = Vec()
+		var keywords: Vec<Span> = Vec()
+		var whole = true
+		for branch in branches {
+			match branch {
+				.Yields(keyword) => keywords.push(keyword)
+				.Value(at) => values.push(at)
+				.Other => whole = false
+			}
+		}
+		if keywords.isEmpty() || values.isEmpty() then
+			return .None
+
+		// An `if` without `else` yields nothing where it is false, which no
+		// value can be.
+		if file.exprs[e].kind is .If(..) && lacksElse(&file, e) then
+			whole = false
+
+		var fix: Option<Vec<Edit>> = .None
+		if whole {
+			val edits: Vec<Edit> = [
+				Edit::insert(file.exprs[e].span.lo, "yield "),
+				for keyword in keywords do
+					yield Edit::replace(keyword, ""),
+			]
+			fix = edits
+		}
+		return BesideYield(values: values, fix: fix)
+	}
+
+	/// Whether the value at `span`, which is dropped, is a branch beside
+	/// one that yields, and if it is, says so.
+	var fn yieldedBeside(span: Span): bool = {
+		var fix: Option<Vec<Edit>> = .None
+		var found = false
+		for beside in self.state.besideYield {
+			if beside.values.contains(&span) {
+				fix = beside.fix.clone()
+				found = true
+			}
+		}
+		if !found then
+			return false
+
+		var diagnostic = Diagnostic::error(
+			YIELD_BESIDE_VALUE,
+			"a branch that is a value, beside one that yields",
+			span,
+			"this value is dropped, not yielded",
+		).withNote(
+			"`yield` is a statement, and the `if` or `match` around it is one too, so the value of a branch beside it is computed and dropped",
+		)
+		if fix is .Some(edits) then
+			diagnostic = diagnostic.withFix(
+				"yield the value of the whole",
+				edits.clone().intoBuffer(),
+			)
+
+		self.report(diagnostic)
+		return true
+	}
+
 	/// `if c { x }` among a list's elements, as it might be read: an `if`
 	/// without `else` has no value, and hands none over.
 	var fn addsNothing(span: Span, word: str) = {
@@ -189,7 +329,7 @@ extend Lowerer {
 				span,
 				"no value, and no `yield`",
 			).withHelp(
-				"hand the value to a list built as it runs, `own [if c { yield x }]`, or give the `if` an `else`",
+				"hand the value to a list built as it runs, `[if c then yield x]`, or give the `if` an `else`",
 			).withNote("\(word) without `else` is a statement; among a list's elements, what it yields is what it adds"),
 		)
 	}
@@ -200,6 +340,7 @@ extend Lowerer {
 		// the generator's.
 		if self.state.lists.isEmpty() && self.state.generator.isSome() then
 			return self.generatorYield(value, span)
+
 		if self.state.lists.isEmpty() {
 			self.report(
 				Diagnostic::error(
@@ -208,7 +349,7 @@ extend Lowerer {
 					span,
 					"nothing to hand the value to",
 				).withNote(
-					"`yield` hands a value to the list being built around it, `own [ … ]` or `own for`, or to whoever asks a generator for its next one: a loop where a value stands, or a function that answers `Iterator<T>`",
+					"`yield` hands a value to the list being built around it, `[ … ]` or `own for`, or to whoever asks a generator for its next one: a loop where a value stands, or a function that answers `Iterator<T>`",
 				),
 			)
 			// Checked for what else is wrong with it, and nothing more said.
@@ -223,7 +364,9 @@ extend Lowerer {
 	/// which the first one sets where nothing is expected.
 	var fn listValue(e: ast::ExprId): ExprId = {
 		val last = self.state.lists.len() - 1
-		if self.state.lists[last].elem is .Some(t) then return self.check(e, t)
+		if self.state.lists[last].elem is .Some(t) then
+			return self.check(e, t)
+
 		val value = self.infer(e, .None)
 		val ty = self.tyOf(value)
 		val top = self.state.lists.len() - 1
@@ -244,7 +387,9 @@ extend Lowerer {
 		val elem = build.elem.unwrapOr(ERROR)
 		val .Some(.Struct(vec)) = self.preludeType(Symbol::vecType()) else return value
 		val .Some(push) = self.vecMethod(vec, Symbol::push()) else return value
-		if self.isPoisoned(elem) then return value
+		if self.isPoisoned(elem) then
+			return value
+
 		val args = self.program.types.internList([elem])
 		val vecTy = self.intern(.Struct(id: vec, args: args))
 		val list = self.alloc(.Local(local), vecTy, span)
@@ -256,38 +401,29 @@ extend Lowerer {
 			span,
 		)
 	}
-
-	/// A list whose length its `yield`s decide, where no `own` builds it: an
-	/// array literal, or a loop standing for a value.
-	var fn needsOwn(at: Span, whole: Span, what: str): ExprId = {
-		self.report(
-			Diagnostic::error(
-				LIST_NEEDS_OWN,
-				"\(what) is built with `own`",
-				at,
-				"its `yield`s decide how long it is",
-			).withFix("build it on the heap, with `own`", [
-				Edit::insert(whole.lo, "own "),
-			]).withNote(
-				"a list whose `yield`s decide its length is an `own<[T]>`, built as it runs, and `own` says where it goes; a loop standing alone for a value is a generator, which yields one value at a time as it is asked",
-			),
-		)
-		return self.errorExpr(whole)
-	}
 }
 
 // A list literal where a `Vec` or an `own<[T]>` is expected is one, as text
 // is a `String` where one is expected: `args: [id]` of a `Vec<ExprId>` field
 // is `args: Vec::of(own [id])`. The allocation is the one the words wrote,
 // and where nothing expects a vector, a list is an array and costs nothing.
+// Where another collection is expected, one that implements the prelude's
+// `Collect`, the list is that collection's `collect` of its elements:
+//
+//     val primes: Set<i64> = [2, 3, 5]
+//         ⇒ val primes = Set<i64>::collect(Vec::of(own [2, 3, 5]).intoIterator())
 extend Lowerer {
 	/// Whether a list literal is to be made what `hint` is: a `Vec`, or a
 	/// buffer, `own<[T]>`. Not a repeat whose count is known only as it runs,
 	/// which says how to write it.
-	fn listExpected(id: ast::ExprId, hint: Option<Ty>): bool = {
+	var fn listExpected(id: ast::ExprId, hint: Option<Ty>): bool = {
 		val .Some(expected) = hint else return false
 		val buffer = self.kind(expected) is .Own(inner) && self.kind(inner) is .Slice(..)
-		if !buffer && self.program.vecElement(expected).isNone() then return false
+		if !buffer &&
+			self.program.vecElement(expected).isNone() &&
+			self.collectedInto(expected, false).isNone() {
+			return false
+		}
 		return match self.ast.exprs[id].kind {
 			.Array(..) | .ArrayRepeat(count: .Literal(..), ..) => true
 			.ArrayRepeat(count: .Expr(count), ..) => self.constantCount(count).isSome()
@@ -301,6 +437,9 @@ extend Lowerer {
 	/// element type, so text in a `Vec<String>` is a `String`. `[]` where a
 	/// `Vec` is expected is an empty one, which allocates nothing.
 	var fn listAs(id: ast::ExprId, expected: Ty, span: Span): ExprId = {
+		if self.collectedInto(expected, false) is .Some((method, elem)) then
+			return self.collectedList(id, expected, method, elem, span)
+
 		val file = self.ast
 		val elem = self.program.vecElement(expected)
 		val buffer = match elem {
@@ -308,13 +447,17 @@ extend Lowerer {
 			.None => expected
 		}
 		if file.exprs[id].kind is .Array(elems) {
-			if elem.isSome() && elems.isEmpty() then return self.emptyVec(expected, span)
-			for e in elems {
-				if yields(&file, e) then return self.builtList(&elems, buffer, elem.isSome(), span)
-			}
+			if elem.isSome() && elems.isEmpty() then
+				return self.emptyVec(expected, span)
+
+			for e in elems do
+				if yields(&file, e) then
+					return self.builtList(&elems, buffer, elem.isSome(), span)
 		}
 		val built = self.ownExpr(id, buffer, span)
-		if self.isPoisoned(self.tyOf(built)) then return built
+		if self.isPoisoned(self.tyOf(built)) then
+			return built
+
 		// `own<[T; n]>` is the buffer `own<[T]>`, its length in the value.
 		val heaped = self.coerceTo(built, buffer, .None, false)
 		val .Some(t) = elem else return heaped
@@ -324,6 +467,68 @@ extend Lowerer {
 				callee: of,
 				args: [heaped],
 				typeArgs: self.program.types.internList([t]),
+				order: [0],
+			),
+			expected,
+			span,
+		)
+	}
+
+	/// The `collect` that makes `ty` and what it collects, where `ty` is a
+	/// collection other than a `Vec` that implements `Collect<T>`. Where it
+	/// is written with a callee's type parameters, `generic`, what their
+	/// constraints promise is the callee's to check.
+	var fn collectedInto(ty: Ty, generic: bool): Option<(FnId, Ty)> = {
+		if self.program.vecElement(ty).isSome() then
+			return .None
+
+		val interfaceId = self.program.preludeItems.interfaceOf(.Collect)?
+		val owner = self.ownerOf(ty)?
+		val at = self.onlyImpl(owner, interfaceId)?
+		if self.program.impls[at].methods.isEmpty() then
+			return .None
+
+		val args = self.ownerArgs(ty)
+		if !generic && self.unmetCondition(at, &args).isSome() then
+			return .None
+
+		val collected = self.program.types.list(self.program.impls[at].args)
+		if collected.len() != 1 then
+			return .None
+
+		val elem = self.program.types.subst(collected[0], &args)
+		return (self.program.impls[at].methods[0], elem)
+	}
+
+	/// The list literal `id` where `expected`, a collection, is: a `Vec` of
+	/// its elements, as where one is expected, given up to `collect`.
+	var fn collectedList(
+		id: ast::ExprId,
+		expected: Ty,
+		method: FnId,
+		elem: Ty,
+		span: Span,
+	): ExprId = {
+		val .Some(vec) = self.program.preludeItems.structure(.Vec) else return self.errorExpr(span)
+		val vecTy = self.intern(.Struct(id: vec, args: self.program.types.internList([elem])))
+		val built = self.listAs(id, vecTy, span)
+		if self.isPoisoned(self.tyOf(built)) then
+			return built
+
+		return self.collectFrom(built, expected, method, span)
+	}
+
+	/// `expected`'s `collect`, `method`, of the elements of the vector
+	/// `built`, which it gives up.
+	var fn collectFrom(built: ExprId, expected: Ty, method: FnId, span: Span): ExprId = {
+		val .Some((items, _)) = self.givenUpIterator(built) else return self.errorExpr(span)
+		var args = self.ownerArgs(expected)
+		args.push(self.tyOf(items))
+		return self.alloc(
+			.Call(
+				callee: method,
+				args: [items],
+				typeArgs: self.program.types.internList(&args),
 				order: [0],
 			),
 			expected,
@@ -355,29 +560,41 @@ extend Lowerer {
 	/// 2])` of `fn f<T>(xs: Vec<T>)`, whose `T` its elements say — made what
 	/// is expected once that is: a `Vec`, or a buffer.
 	var fn listLiteralAs(id: ExprId, expected: Ty): Option<ExprId> = {
-		if self.state.body.exprs[id].kind !is .Array(..) | .ArrayRepeat(..) then return .None
+		if self.state.body.exprs[id].kind !is .Array(..) | .ArrayRepeat(..) then
+			return .None
+
 		val .Array(elem, ..) | .ArrayOf(elem, ..) = self.kind(self.tyOf(id)) else return .None
+		val collected = self.collectedInto(expected, false)
 		val wanted = match self.program.vecElement(expected) {
 			.Some(t) => t
-			.None => self.bufferElement(expected)?
+			.None => match collected {
+				.Some((_, t)) => t
+				.None => self.bufferElement(expected)?
+			}
 		}
-		if wanted != elem then return .None
+		if wanted != elem then
+			return .None
+
 		val span = self.state.body.exprs[id].span
 		val owned = self.alloc(.Own(id), self.intern(.Own(self.tyOf(id))), span)
 		val buffer = self.intern(.Own(self.intern(.Slice(elem))))
 		val heaped = self.alloc(.Unsize(owned), buffer, span)
-		if self.program.vecElement(expected).isNone() then return heaped
+		if self.program.vecElement(expected).isNone() && collected.isNone() then
+			return heaped
+
 		val of = self.program.preludeItems.function(.VecOf)?
-		return self.alloc(
-			.Call(
-				callee: of,
-				args: [heaped],
-				typeArgs: self.program.types.internList([elem]),
-				order: [0],
-			),
-			expected,
+		val vec = self.program.preludeItems.structure(.Vec)?
+		val elems = self.program.types.internList([elem])
+		val vecTy = self.intern(.Struct(id: vec, args: elems))
+		val made = self.alloc(
+			.Call(callee: of, args: [heaped], typeArgs: elems, order: [0]),
+			vecTy,
 			span,
 		)
+		return match collected {
+			.Some((method, _)) => self.collectFrom(made, expected, method, span)
+			.None => made
+		}
 	}
 
 	/// What a buffer, `own<[T]>`, holds.
@@ -388,15 +605,20 @@ extend Lowerer {
 	}
 
 	/// What a list literal given where `declared` is taken says of the type
-	/// arguments: its element is the `Vec`'s or the buffer's, `T` of
-	/// `Vec<T>`. Nothing where it is not such a literal, or `declared` is
-	/// neither.
-	fn listLiteralElement(id: ExprId, declared: Ty): Option<(Ty, Ty)> = {
-		if self.state.body.exprs[id].kind !is .Array(..) | .ArrayRepeat(..) then return .None
+	/// arguments: its element is the `Vec`'s, the buffer's or the
+	/// collection's, `T` of `Vec<T>` or of `Set<T>`. Nothing where it is not
+	/// such a literal, or `declared` is none of them.
+	var fn listLiteralElement(id: ExprId, declared: Ty): Option<(Ty, Ty)> = {
+		if self.state.body.exprs[id].kind !is .Array(..) | .ArrayRepeat(..) then
+			return .None
+
 		val .Array(elem, ..) | .ArrayOf(elem, ..) = self.kind(self.tyOf(id)) else return .None
 		val wanted = match self.program.vecElement(declared) {
 			.Some(t) => t
-			.None => self.bufferElement(declared)?
+			.None => match self.collectedInto(declared, true) {
+				.Some((_, t)) => t
+				.None => self.bufferElement(declared)?
+			}
 		}
 		return (wanted, elem)
 	}

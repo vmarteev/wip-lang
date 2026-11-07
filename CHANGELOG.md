@@ -2,6 +2,72 @@
 
 Each version published, newest first.
 
+## 0.14.0 — 2026-11-06
+
+Programs written for 0.13 compile as they did, but where marked
+**breaking**; the compiler's errors say what to write instead, and `wip
+fix` writes most of it.
+
+**The language**
+
+- **A loop of one statement is written after `do`,** with no braces:
+  `for name in names do` and the body on the next line, `while i < n do`,
+  and a list's loop, `[for e in elements[1..] do yield analyze(&e)?]`.
+  `do` takes a call, an assignment, a `yield`, a jump or an `if … then`
+  without an `else`; a loop, an `if` with an `else` or a `match` after it
+  is refused, with the fix that writes the braces. **Breaking:** `do` is
+  a keyword.
+- **A reference is passed on with its `&`:** a name that holds a `&T`,
+  given to a call, is lent with `&` as a value of the caller's own is,
+  `size(&values)`. **Breaking:** one passed by its name alone is refused
+  (E0476), and `wip fix` writes the `&`.
+- **`yield` is a branch,** `if c then yield x` and `.Some(v) => yield v`,
+  and a list that yields where nothing expects a collection is a `Vec`;
+  `own [ … ]` and `own for` still make a buffer. A value beside a branch
+  that yields, which the statement would drop, is refused (E0477).
+- **A list is any collection:** `val primes: Set<i64> = [2, 3, 5]`, a
+  `Map` of pairs, a `String` of characters, and a type of a program's own
+  that implements `Collect<T>`; `T::collect(iterator)` makes each.
+  **Breaking:** `Map::fromPairs` and `PriorityQueue::fromPairs` are
+  `collect`, and `Iterator.toSet()` is gone.
+- **A variant of one field is a function of it,**
+  `result.mapErr(HttpError::Io)`, `map(Option::Some)`; and **a generic
+  function goes where a closure is expected,** its type arguments learnt
+  from the closure's type.
+- **A struct's fields as a value,** `c::fieldsOf<T>()`: each field's name,
+  where it lies, its size and the numbers it is made of, as C lays it
+  out, which a top-level `assert` checks while the program is built.
+
+**The tools**
+
+- **`wip fmt` puts every body of one statement on the line below its
+  `then` or `do`,** and a blank line after it before the next statement;
+  a guard's `else` and an `if … else` inside an expression stay on one
+  line. Every program is laid out again.
+- **What is never used is said:** a `var` nothing writes, a local, a
+  binding and a parameter nothing reads, an import nothing names and a
+  module's function nothing calls are warnings, E0470 to E0475; a program
+  with errors is told none of them.
+- **Shorter forms:** a lambda that only calls a function is its name
+  (E0478); a `Vec` declared empty and filled by the loop after it is the
+  list that yields (E0479); a list built only for `sum`, `max` or `min` is
+  the generator (E0480); a loop over a slice or a `Vec` that only searches
+  is `any`, `all` or `find` (E0481).
+- **`wip fix` applies them all,** with what is never used but a function,
+  and the `&` of E0476; `--target` fixes code for another system with the
+  rest. A fix that would take a comment with a loop is not offered.
+
+**The library**
+
+- **A tuple of four is encoded and decoded,** as tuples of two and three
+  are.
+
+**Speed**
+
+- **A generator walked by a loop no longer tests where it stopped on each
+  step** in a release build: `zip` and `chain` written as generators are
+  as fast as the library's adapters, or faster.
+
 ## 0.13.0 — 2026-11-03
 
 Programs written for 0.12 compile as they did, but where marked

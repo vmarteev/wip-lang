@@ -39,7 +39,7 @@ function commaSep(rule) {
 /** The words the lexer keeps, which name a field where only a field's name
  * can stand. */
 const KEYWORDS = [
-  'as', 'assert', 'become', 'break', 'continue', 'defer', 'dyn', 'else',
+  'as', 'assert', 'become', 'break', 'continue', 'defer', 'do', 'dyn', 'else',
   'enum', 'extern', 'false', 'fn', 'for', 'if', 'impl', 'import', 'in',
   'interface', 'is', 'lend', 'let', 'match', 'move', 'null', 'own', 'pub',
   'return', 'self', 'static', 'struct', 'then', 'true', 'type', 'val', 'var',
@@ -493,7 +493,14 @@ module.exports = grammar({
       optional($.label),
       'while',
       field('condition', $._expression),
+      $._loop_body,
+    ),
+
+    // A loop's body: statements in braces, or one statement after `do` —
+    // what a `then` branch takes; the checker refuses the rest.
+    _loop_body: $ => choice(
       field('body', $.block),
+      seq('do', field('body', $._then_branch)),
     ),
 
     // Where a statement stands, a `for` is one; where a value stands, it
@@ -504,7 +511,7 @@ module.exports = grammar({
       field('pattern', $._pattern),
       'in',
       field('value', $._expression),
-      field('body', $.block),
+      $._loop_body,
     )),
 
     break_statement: $ => prec.right(seq('break', optional($.identifier))),
@@ -587,7 +594,7 @@ module.exports = grammar({
       field('pattern', $._pattern),
       'in',
       field('value', $._expression),
-      field('body', $.block),
+      $._loop_body,
     ),
 
     tuple_expression: $ => seq('(', $._expression, repeat1(seq(',', $._expression)), optional(','), ')'),
@@ -746,7 +753,7 @@ module.exports = grammar({
     lend_expression: $ => prec.right(PREC.lend, seq('lend', $._expression)),
 
     // `if c { … } else { … }`, `if c then a else b`, or each branch in its
-    // own form: one expression or a jump after `then` or `else`, a block in
+    // own form: one expression, a jump or a `yield` after `then` or `else`, a block in
     // braces. A block is an expression, so an `else` takes either.
     if_expression: $ => prec.right(seq(
       'if',
@@ -764,6 +771,7 @@ module.exports = grammar({
       $.become_statement,
       $.break_statement,
       $.continue_statement,
+      $.yield_statement,
     ),
 
     match_expression: $ => seq(
@@ -779,7 +787,8 @@ module.exports = grammar({
       '}',
     ),
 
-    // An arm's value may be a jump, which ends the function or the loop.
+    // An arm's value may be a jump, which ends the function or the loop, or
+    // a `yield`.
     match_arm: $ => prec.right(seq(
       field('pattern', $._pattern),
       optional(seq('if', field('guard', $._expression))),
@@ -790,6 +799,7 @@ module.exports = grammar({
         $.become_statement,
         $.break_statement,
         $.continue_statement,
+        $.yield_statement,
       )),
     )),
 
@@ -817,6 +827,7 @@ module.exports = grammar({
         $.become_statement,
         $.break_statement,
         $.continue_statement,
+        $.yield_statement,
       )),
     )),
 

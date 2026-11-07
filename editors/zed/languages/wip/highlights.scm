@@ -214,6 +214,7 @@
 [
   "while"
   "for"
+  "do"
   "in"
   "break"
   "continue"

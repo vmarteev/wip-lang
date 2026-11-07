@@ -61,12 +61,14 @@ fn connected(host: str, port: u16, within: Option<Duration>): Result<TlsStream, 
 		.Some(length) => Stream::tcpWithin(host, port, length)
 		.None => Stream::tcp(host, port)
 	}
-	var stream = match move opened {
+	val stream = match move opened {
 		.Ok(stream) => stream
 		.Err(error) => return .Err(.Io(error))
 	}
 	val context = SSL_CTX_new(TLS_client_method())
-	if context.isNull then return .Err(.Handshake(lastSslError()))
+	if context.isNull then
+		return .Err(.Handshake(lastSslError()))
+
 	SSL_CTX_set_default_verify_paths(context)
 	SSL_CTX_set_verify(context, SSL_VERIFY_PEER, null)
 	SSL_CTX_set_options(context, SSL_OP_IGNORE_UNEXPECTED_EOF)
@@ -75,40 +77,58 @@ fn connected(host: str, port: u16, within: Option<Duration>): Result<TlsStream, 
 		SSL_CTX_free(context)
 		return .Err(.Handshake(lastSslError()))
 	}
-	var tls = TlsStream(stream: stream, ssl: ssl, context: context, timeout: millisOf(within))
+	val tls = TlsStream(stream: stream, ssl: ssl, context: context, timeout: millisOf(within))
 	SSL_set_fd(ssl, tls.stream.descriptor())
 	var name = String::of(host)
-	if isAddress(host) then X509_VERIFY_PARAM_set1_ip_asc(SSL_get0_param(ssl), name.toCstring()) else {
+	if isAddress(host) then
+		X509_VERIFY_PARAM_set1_ip_asc(SSL_get0_param(ssl), name.toCstring())
+	else {
 		SSL_ctrl(ssl, SSL_CTRL_SET_TLSEXT_HOSTNAME, 0, name.toCstring())
 		SSL_set1_host(ssl, name.toCstring())
 	}
+
 	// With a time to keep to, the handshake does not block: it stops where
 	// it waits for the server, and waits as long as is left. Without one,
 	// it stops only where it failed.
 	val timed = within.isSome()
-	if timed then tls.stream.setBlocking(false).mapErr((error) => TlsError::Io(error))?
+	if timed then
+		tls.stream.setBlocking(false).mapErr(TlsError::Io)?
+
 	ERR_clear_error()
 	while true {
 		val answer = quietly(() => SSL_connect(ssl))
-		if answer == 1 then break
+		if answer == 1 then
+			break
+
 		val kind = SSL_get_error(ssl, answer)
 		if timed && (kind == SSL_ERROR_WANT_READ || kind == SSL_ERROR_WANT_WRITE) {
 			val left = millisOf(within) - started.elapsed().asMillis()
-			if left <= 0 then return .Err(.Io(.TimedOut))
+			if left <= 0 then
+				return .Err(.Io(.TimedOut))
+
 			val events = if kind == SSL_ERROR_WANT_READ then libc::POLLIN else libc::POLLOUT
 			var fds = [libc::PollFd(fd: tls.stream.descriptor(), events: events, answered: 0)]
 			val ready = libc::poll(&var fds, left as c_int)
-			if ready == 0 then return .Err(.Io(.TimedOut))
-			if ready < 0 && io::lastError() != .Interrupted then return .Err(.Io(io::lastError()))
+			if ready == 0 then
+				return .Err(.Io(.TimedOut))
+
+			if ready < 0 && io::lastError() != .Interrupted then
+				return .Err(.Io(io::lastError()))
+
 			continue
 		}
 		val verified = SSL_get_verify_result(ssl)
 		if verified != X509_V_OK then
 			return .Err(.Certificate(String::of(X509_verify_cert_error_string(verified).toStr())))
-		if kind == SSL_ERROR_SYSCALL then return .Err(.Io(io::lastError()))
+
+		if kind == SSL_ERROR_SYSCALL then
+			return .Err(.Io(io::lastError()))
+
 		return .Err(.Handshake(lastSslError()))
 	}
-	if timed then tls.stream.setBlocking(true).mapErr((error) => TlsError::Io(error))?
+	if timed then
+		tls.stream.setBlocking(true).mapErr(TlsError::Io)?
+
 	return tls
 }
 
@@ -128,7 +148,9 @@ fn quietly(call: &() => c_int): c_int = {
 /// What OpenSSL last said went wrong.
 fn lastSslError(): String = {
 	val code = ERR_get_error()
-	if code == 0 then return String::of("the connection ended")
+	if code == 0 then
+		return String::of("the connection ended")
+
 	var room = [0 as u8; 256]
 	ERR_error_string_n(code, addressOf<u8>(&var room[0]) as ptr<u8>, 256)
 	val zero: u8 = 0
@@ -140,33 +162,48 @@ extend TlsStream {
 	/// Waits, as long as the timeout says, for bytes to read: OpenSSL may
 	/// hold some already, read from the socket with a record before them.
 	fn waitReadable(): Result<void, io::IoError> = {
-		if self.timeout < 0 || SSL_pending(self.ssl) > 0 then return
+		if self.timeout < 0 || SSL_pending(self.ssl) > 0 then
+			return
+
 		var fds = [libc::PollFd(fd: self.stream.descriptor(), events: libc::POLLIN, answered: 0)]
 		while true {
 			val ready = libc::poll(&var fds, self.timeout as c_int)
-			if ready > 0 then return
-			if ready == 0 then return .Err(.TimedOut)
-			if io::lastError() != .Interrupted then return .Err(io::lastError())
+			if ready > 0 then
+				return
+
+			if ready == 0 then
+				return .Err(.TimedOut)
+
+			if io::lastError() != .Interrupted then
+				return .Err(io::lastError())
 		}
 	}
 }
 
 extend TlsStream: io::Read {
 	var fn read(into: &var [u8]): Result<i64, io::IoError> = {
-		if into.isEmpty() then return 0
+		if into.isEmpty() then
+			return 0
+
 		self.waitReadable()?
 		ERR_clear_error()
 		val count = into.len().min(0x7FFFFFFF) as c_int
 		val ssl = self.ssl
 		val room = addressOf<u8>(&var into[0]) as ptr<u8>
 		val got = quietly(() => SSL_read(ssl, room, count))
-		if got > 0 then return got as i64
+		if got > 0 then
+			return got as i64
+
 		val kind = SSL_get_error(self.ssl, got)
-		if kind == SSL_ERROR_ZERO_RETURN then return 0
+		if kind == SSL_ERROR_ZERO_RETURN then
+			return 0
+
 		// A socket that ended with no word from TLS is an end too, as
 		// servers often close.
 		if kind == SSL_ERROR_SYSCALL {
-			if libc::errno() == 0 then return 0
+			if libc::errno() == 0 then
+				return 0
+
 			return .Err(io::lastError())
 		}
 		return .Err(.InvalidData)
@@ -187,7 +224,9 @@ extend TlsStream: io::Write {
 				continue
 			}
 			val kind = SSL_get_error(self.ssl, put)
-			if kind == SSL_ERROR_SYSCALL then return .Err(io::lastError())
+			if kind == SSL_ERROR_SYSCALL then
+				return .Err(io::lastError())
+
 			return .Err(.BrokenPipe)
 		}
 	}
@@ -205,10 +244,13 @@ extend TlsStream: Destroy {
 /// Whether `host` is an address written out, rather than a name: a name is
 /// what a certificate is checked against and what the server is told.
 fn isAddress(host: str): bool = {
-	if host.contains(":") then return true
+	if host.contains(":") then
+		return true
+
 	for at in 0..host.len() {
 		val byte = host[at]
-		if byte != b'.' && (byte < b'0' || byte > b'9') then return false
+		if byte != b'.' && (byte < b'0' || byte > b'9') then
+			return false
 	}
 	return !host.isEmpty()
 }

@@ -12,7 +12,16 @@
 import std::collections::{Map}
 import std::mem
 import syntax as ast
-import syntax::{Diagnostic, Edit, LAMBDA_CAPTURE, LAMBDA_PARAMS, MISMATCHED_TYPES, Span, Symbol}
+import syntax::{
+	Diagnostic,
+	Edit,
+	LAMBDA_CAPTURE,
+	LAMBDA_PARAMS,
+	MISMATCHED_TYPES,
+	NEEDLESS_LAMBDA,
+	Span,
+	Symbol
+}
 
 /// How a closure holds what it captured.
 @derive(Eq)
@@ -111,7 +120,9 @@ extend Lowerer {
 		var lambdas: Map<ast::ExprId, FnId> = Map()
 		var envs: Map<FnId, StructId> = Map()
 		for entry in file.exprs {
-			if entry.value.kind !is .Lambda(..) then continue
+			if entry.value.kind !is .Lambda(..) then
+				continue
+
 			val span = entry.value.span
 			val id = self.program.fns.add(FnDef(
 				name: self.interner.lambdaSymbol(),
@@ -191,6 +202,7 @@ extend Lowerer {
 				.Fn(..) => (ty, .None)
 				_ => .None
 			}
+
 		val expectsOwned = expectedFn is .Some((_, .Some(.Owned)))
 		// An owned closure is written with `own`, as every other allocation
 		// is; the type alone does not make one.
@@ -245,6 +257,7 @@ extend Lowerer {
 		var expected: Option<(Vec<Ty>, Ty)> = .None
 		if expectedFn is .Some((inner, _)) && self.kind(inner) is .Fn(params: list, ret: r) then
 			expected = (self.program.types.list(list).toVec(), r)
+
 		if expected is .Some((expectedParams, _)) && expectedParams.len() != params.len() {
 			self.report(
 				Diagnostic::error(
@@ -308,7 +321,9 @@ extend Lowerer {
 				.None => .None
 			}
 		}
-		if expectedRet is .Some(r) && self.hasError(r) then expectedRet = .None
+		if expectedRet is .Some(r) && self.hasError(r) then
+			expectedRet = .None
+
 		val id = match self.lambdas.get(&exprId) {
 			.Some(found) => found
 			.None => panic("every lambda has a function")
@@ -339,9 +354,9 @@ extend Lowerer {
 				default: .None,
 			))
 		}
-		for d in defs {
+		for d in defs do
 			allParams.push(d.clone())
-		}
+
 		// A lambda inside a generic function is generic in the same way: its
 		// instance comes with the enclosing one.
 		self.program.fns[id].generics = self.typeParams.clone()
@@ -355,12 +370,19 @@ extend Lowerer {
 		val captures = self.checkLambdaBody(id, body, expectedRet, closure)
 		// The lambda's type takes the parameters it is called with, without
 		// what it captured.
-		var paramTys: Vec<Ty> = Vec()
-		for p in defs {
-			paramTys.push(p.ty)
-		}
+		val paramTys: Vec<Ty> = [
+			for p in defs do
+				yield p.ty
+		]
 		val list = self.program.types.internList(&paramTys)
 		val valueTy = self.intern(.Fn(params: list, ret: self.program.fns[id].ret))
+		val madeTy = match closure {
+			.Some(.Lent(k)) if !kept => self.intern(.Ref(inner: valueTy, kind: k))
+			.Some(.Owned) => self.intern(.Own(valueTy))
+			.None => valueTy
+			_ => ERROR
+		}
+		self.callsOnly(exprId, id, valueTy, madeTy, expectedRet.isSome(), span)
 		// A kept lambda that captured nothing takes no environment: it is a
 		// plain function value, as it was before it could be kept.
 		var made = closure
@@ -375,10 +397,12 @@ extend Lowerer {
 		// A kept closure that writes nothing it captured is one that reads.
 		if kept && made is .Some(.Lent(.Var)) {
 			var writes = false
-			for c in captures {
-				if c.written then writes = true
-			}
-			if !writes then made = .Lent(.Shared)
+			for c in captures do
+				if c.written then
+					writes = true
+
+			if !writes then
+				made = .Lent(.Shared)
 		}
 		// A closure is a pair: what it captured, and its code. A lambda that
 		// captures nothing is a plain function value.
@@ -400,6 +424,143 @@ extend Lowerer {
 				self.alloc(.FnRef(id: id, typeArgs: typeArgs), valueTy, span)
 			}
 		}
+	}
+
+	/// A lambda whose body only calls a function with its parameters, each
+	/// once, in their order, as they are or with the `&` that lends what they
+	/// refer to: warned of, with the function's name to write in its place,
+	/// where the name is a value of the lambda's own type, `valueTy`, or of
+	/// the closure it is, `madeTy`. A method of the parameter is left as
+	/// written, since its type's name is one the lambda did not need; so is a
+	/// lambda whose types are written, which say what the name does not.
+	/// `retKnown` says the result was expected of it, which a generic
+	/// function learns its type arguments from as the lambda did.
+	var fn callsOnly(
+		exprId: ast::ExprId,
+		id: FnId,
+		valueTy: Ty,
+		madeTy: Ty,
+		retKnown: bool,
+		span: Span,
+	) = {
+		val file = self.ast
+		val .Lambda(params, ret, body) = file.exprs[exprId].kind else return
+		if ret.isSome() || params.any((p) => p.ty.isSome()) then
+			return
+
+		val .Call(callee, args, names, rest) = file.exprs[body].kind else return
+		if rest.isSome() || args.len() != params.len() || names.any((n) => n.isSome()) then
+			return
+
+		for (i, arg) in args.forwards().enumerate() {
+			val passed = match file.exprs[arg].kind {
+				.Name(sym) => sym
+				.Unary(op: .Ref, operand, ..) if file.exprs[operand].kind is .Name(sym) => sym
+				_ => return
+			}
+			if passed != params[i].name.sym then
+				return
+		}
+		val named = match file.exprs[callee].kind {
+			.Name(sym) => {
+				if params.any((p) => p.name.sym == sym) then
+					return
+
+				String::of(self.text(sym))
+			}
+			.Path(leadingDot: false, segments, ..) => self.pathText(&segments)
+			_ => return
+		}
+		// Only a lambda of this shape gets here, and its body is a call.
+		val .Some(lambdaBody) = self.program.fns[id].body.clone() else return
+		val value = lambdaBody.valueId()
+		val fits = match lambdaBody.exprs[value].kind {
+			.Call(callee: target, typeArgs, ..) => self.isNamedValue(
+				target,
+				typeArgs,
+				valueTy,
+				retKnown,
+			)
+			.Variant(id: enumId, variant, ..) =>
+				!self.program.enums[enumId].isView &&
+					self.isFunctionOf(
+						&self.program.enums[enumId].variants[variant as i64].fields,
+						.None,
+					) &&
+					self.variantFnTy(enumId, variant, lambdaBody.exprs[value].ty) == valueTy
+			// A closure or a function value the lambda captured, which is what
+			// the lambda would be.
+			.CallClosure(callee: held, ..) | .CallValue(callee: held, ..) =>
+				lambdaBody.exprs[held].ty == madeTy && madeTy != ERROR
+			_ => false
+		}
+		if !fits then
+			return
+
+		val at = file.exprs[callee].span
+		self.report(
+			Diagnostic::warning(
+				NEEDLESS_LAMBDA,
+				"a lambda that only calls `\(named)`",
+				span,
+				"passes its parameters on unchanged",
+			).withNote(
+				"a function's name is a value of its type, lent or owned where a closure is expected, and the lambda says no more than the name does",
+			).withFix(
+				"write `\(named)`",
+				[
+					Edit::replace(Span::new(span.lo, at.lo), ""),
+					Edit::replace(Span::new(at.hi, span.hi), ""),
+				],
+			),
+		)
+	}
+
+	/// Whether function `target`, with `typeArgs`, named as a value is one of
+	/// `ty`: a value at all, of that type, and with type arguments its name
+	/// learns from the type expected as the call learnt them. One that
+	/// appears in no parameter is learnt from the result, where that is
+	/// expected.
+	var fn isNamedValue(target: FnId, typeArgs: TyList, ty: Ty, retKnown: bool): bool = {
+		val def = &self.program.fns[target]
+		if def.isInline || def.intrinsic.isSome() || def.isExtern || def.isVariadic then
+			return false
+
+		if def.params.any((p) => p.implicit) || self.kind(def.ret) is .Ref(..) then
+			return false
+
+		val declared: Vec<Ty> = def.params.map((p) => p.ty)
+		val declaredRet = def.ret
+		val args = self.program.types.list(typeArgs).toVec()
+		val paramTys: Vec<Ty> = [
+			for p in declared do
+				yield self.program.types.subst(p, &args)
+		]
+		val list = self.program.types.internList(&paramTys)
+		val ret = self.program.types.subst(declaredRet, &args)
+		if self.intern(.Fn(params: list, ret: ret)) != ty then
+			return false
+
+		for index in 0..args.len() {
+			val inParams = declared.any((p) => self.mentions(p, index as u32))
+			if !inParams && !(retKnown && self.mentions(declaredRet, index as u32)) then
+				return false
+		}
+		return true
+	}
+
+	/// Whether `ty` names the type parameter `index`.
+	fn mentions(ty: Ty, index: u32): bool = self.program.types.any(ty, (kind) =>
+		kind is .Param(param) && param.index == index)
+
+	/// The type of the function variant `index` of enum `id` is, building
+	/// the enum type `enumTy`.
+	var fn variantFnTy(id: EnumId, index: u32, enumTy: Ty): Ty = {
+		val .Enum(args, ..) = self.kind(enumTy) else return ERROR
+		val list = self.program.types.list(args).toVec()
+		val field = self.program.enums[id].variants[index as i64].fields[0].ty
+		val params = self.program.types.internList([self.program.types.subst(field, &list)])
+		return self.intern(.Fn(params: params, ret: enumTy))
 	}
 
 	/// Checks a lambda's body as a function of its own, whose parameters are
@@ -424,7 +585,10 @@ extend Lowerer {
 		}
 		// Without an expected result, the body's own type is the lambda's.
 		val value = if expectedRet.isSome() {
-			if self.state.ret == UNIT then self.unitBody(body, id) else self.valueBody(body, id)
+			if self.state.ret == UNIT then
+				self.unitBody(body, id)
+			else
+				self.valueBody(body, id)
 		} else {
 			self.state.inferringRet = true
 			val inferred = self.infer(body, .None)
@@ -526,8 +690,10 @@ extend Lowerer {
 					// An owned closure may be kept anywhere, so it would outlive
 					// what the `str` borrows.
 					self.storedViewAt(localTy, capture.span, "an `own` closure", .None)
-					if self.owns(localTy) then self.alloc(.Move(place), localTy, capture.span)
-					else place
+					if self.owns(localTy) then
+						self.alloc(.Move(place), localTy, capture.span)
+					else
+						place
 				}
 				// A reference is copied: what it refers to outlives the call. A
 				// `&var` one that is only read is lent on as a `&`.
@@ -555,10 +721,10 @@ extend Lowerer {
 		}
 		self.program.structs[envId].fields = fields
 		self.program.structs[envId].module = self.current as u32
-		var order: Vec<u32> = Vec()
-		for i in 0..values.len() {
-			order.push(i as u32)
-		}
+		val order: Vec<u32> = [
+			for i in 0..values.len() do
+				yield i as u32
+		]
 		val env = self.alloc(.Struct(id: envId, fields: values, order: order), envTy, span)
 		return match kind {
 			.Lent(_) => env
@@ -576,7 +742,9 @@ extend Lowerer {
 	/// reads them: the body was checked with each as the `&var` it might have
 	/// been, and now names the `&` it is.
 	var fn readCaptures(id: FnId, captures: &[Capture], reads: &[u32]) = {
-		if reads.isEmpty() then return
+		if reads.isEmpty() then
+			return
+
 		var .Some(body) = self.program.fns[id].body.take() else return
 		if !body.params.isEmpty() {
 			val env = body.params[0]
@@ -603,11 +771,17 @@ extend Lowerer {
 		self.state.captures[start].written = true
 		var from = self.state.captures[start].from
 		while from is .Field(field) {
-			if level == 0 then return
+			if level == 0 then
+				return
+
 			level -= 1
-			if self.outer[level].captureKind !is .Some(.Lent(..)) then return
+			if self.outer[level].captureKind !is .Some(.Lent(..)) then
+				return
+
 			val index = field as i64
-			if index >= self.outer[level].captures.len() then return
+			if index >= self.outer[level].captures.len() then
+				return
+
 			self.outer[level].captures[index].written = true
 			from = self.outer[level].captures[index].from
 		}
@@ -615,8 +789,12 @@ extend Lowerer {
 
 	/// Which of the closure's captures `place` is, or is part of.
 	fn capturedUnder(place: ExprId): Option<i64> = {
-		if self.state.captureKind !is .Some(.Lent(..)) then return .None
-		if self.state.body.params.isEmpty() then return .None
+		if self.state.captureKind !is .Some(.Lent(..)) then
+			return .None
+
+		if self.state.body.params.isEmpty() then
+			return .None
+
 		val env = self.state.body.params[0]
 		var at = place
 		while true {
@@ -645,20 +823,22 @@ extend Lowerer {
 	/// owned closure's does.
 	///
 	/// This only marks the closure: its code is the named function itself,
-	/// until `makeFnClosures` writes the function that takes the environment,
-	/// once the bodies are in.
+	/// with a generic one's type arguments beside it, until `makeFnClosures`
+	/// writes the function that takes the environment, once the bodies are
+	/// in.
 	var fn fnAsClosure(value: ExprId, expected: Ty): Option<ExprId> = {
 		val (want, owned) = match self.kind(expected) {
 			.Ref(inner, ..) => (inner, false)
 			.Own(inner) => (inner, true)
 			_ => return .None
 		}
-		if self.kind(want) !is .Fn(..) then return .None
-		// A generic function is left to a lambda that calls it: its instance
-		// would need the arguments the mark has no room for.
+		if self.kind(want) !is .Fn(..) then
+			return .None
+
 		val .FnRef(id: target, typeArgs) = self.state.body.exprs[value].kind else return .None
-		if typeArgs != TyList::empty() then return .None
-		if self.tyOf(value) != want then return .None
+		if self.tyOf(value) != want then
+			return .None
+
 		val span = self.state.body.exprs[value].span
 		val none: [Ty; 0] = []
 		val empty = self.program.types.internList(&none)
@@ -675,150 +855,171 @@ extend Lowerer {
 			val envTy = self.intern(.Struct(id: envId, args: empty))
 			self.alloc(.Struct(id: envId, fields: Vec(), order: Vec()), envTy, span)
 		}
-		return self.alloc(.Closure(id: target, env: env), expected, span)
+		val closure = self.alloc(.Closure(id: target, env: env), expected, span)
+		if typeArgs != TyList::empty() then
+			self.state.body.closureTypeArgs.put(closure, typeArgs)
+
+		return closure
 	}
 
-	/// Writes the code of every closure `fnAsClosure` marked: the
-	/// environment, then the function's parameters, passed on to it.
+	/// Writes the code of every closure `fnAsClosure` marked.
 	var fn makeFnClosures() = {
-		val .Some(lentEnv) = self.program.fnClosureEnv else return
-		val .Some(ownedEnv) = self.program.fnOwnedClosureEnv else return
-		var marked: Vec<MarkedClosure> = Vec()
-		for owner in self.program.fns.ids() {
+		var marked: Vec<MarkedClosure> = [for owner in self.program.fns.ids() {
 			val .Some(body) = self.program.fns[owner].body else continue
 			for at in body.exprs.ids() {
 				val expr = &body.exprs[at]
 				if expr.kind is .Closure(id, ..) && !self.program.fns[id].isLambda then
-					marked.push(MarkedClosure(
+					yield MarkedClosure(
 						owner: owner,
 						at: at,
 						target: id,
 						ty: expr.ty,
 						span: expr.span,
-					))
+					)
+			}
+		}]
+		for mark in marked {
+			val module = self.program.fns[mark.owner].module
+			// A generic function's type arguments may be the parameters of the
+			// function the closure is made in, whose instance makes the code's.
+			var typeArgs = TyList::empty()
+			if self.program.fns[mark.owner].body is .Some(body) &&
+				body.closureTypeArgs.get(&mark.at) is .Some(args) {
+				typeArgs = args
+			}
+			val generics =
+				if typeArgs == TyList::empty() then Vec()
+				else self.program.fns[mark.owner].generics.clone()
+			val .Some(code) = self.closureCode(
+				mark.target,
+				typeArgs,
+				mark.ty,
+				generics,
+				module,
+				mark.span,
+			) else {
+				continue
+			}
+			if self.program.fns[mark.owner].body.take() is .Some(var ownerBody) {
+				if ownerBody.exprs[mark.at].kind is .Closure(env, ..) then
+					ownerBody.exprs[mark.at].kind = .Closure(id: code, env: env)
+
+				self.program.fns[mark.owner].body = ownerBody
 			}
 		}
+	}
+
+	/// The code of a closure made from the function `target`, of the closure
+	/// type `ty`: the environment, then the function's parameters, passed on
+	/// to it with `typeArgs`. `generics` are the code's own: those of the
+	/// function the closure is made in, where `typeArgs` may name them.
+	var fn closureCode(
+		target: FnId,
+		typeArgs: TyList,
+		ty: Ty,
+		generics: Vec<GenericParamDef>,
+		module: u32,
+		span: Span,
+	): Option<FnId> = {
+		val lentEnv = self.program.fnClosureEnv?
+		val ownedEnv = self.program.fnOwnedClosureEnv?
 		val none: [Ty; 0] = []
 		val empty = self.program.types.internList(&none)
-		for mark in marked {
-			val owner = mark.owner
-			val at = mark.at
-			val target = mark.target
-			val ty = mark.ty
-			val span = mark.span
-			// A lent closure's code is lent its environment to write, and an
-			// owned one's to read, as a lambda's is.
-			val (want, envId, envKind) = match self.kind(ty) {
-				.Ref(inner, ..) => (inner, lentEnv, RefKind::Var)
-				.Own(inner) => (inner, ownedEnv, RefKind::Shared)
-				_ => continue
-			}
-			val envTy = self.intern(.Struct(id: envId, args: empty))
-			val envRef = self.intern(.Ref(inner: envTy, kind: envKind))
-			val .Fn(params, ret) = self.kind(want) else continue
-			val paramTys = self.program.types.list(params).toVec()
-			val targetParams = self.program.fns[target].params.clone()
-			var body = Body()
-			var defs = Vec::of([
-				ParamDef(
-					name: self.interner.lambdaSymbol(),
-					nameSpan: span,
-					ty: envRef,
-					span: span,
-					default: .None,
-				),
-			])
-			val envLocal = body.locals.add(Local(
-				name: self.interner.lambdaSymbol(),
-				ty: envRef,
-				kind: .Param,
-				span: span,
-			))
-			body.params.push(envLocal)
-			var args: Vec<ExprId> = Vec()
-			for (i, paramTy) in paramTys.forwards().enumerate() {
-				val name =
-					if i < targetParams.len() then targetParams[i].name
-					else self.interner.lambdaSymbol()
-				defs.push(ParamDef(
-					name: name,
-					nameSpan: span,
-					ty: paramTy,
-					span: span,
-					default: .None,
-				))
-				val local = body.locals.add(Local(
-					name: name,
-					ty: paramTy,
-					kind: .Param,
-					span: span,
-				))
-				body.params.push(local)
-				val read = body.exprs.add(Expr(kind: .Local(local), ty: paramTy, span: span))
-				// What owns memory is handed on, not copied.
-				val arg =
-					if self.owns(paramTy) then
-						body.exprs.add(Expr(kind: .Move(read), ty: paramTy, span: span))
-					else read
-				args.push(arg)
-			}
-			val call = body.exprs.add(Expr(
-				kind: .Call(callee: target, args: args, typeArgs: .empty(), order: Vec()),
-				ty: ret,
-				span: span,
-			))
-			body.value = call
-			val module = self.program.fns[owner].module
-			val code = self.program.fns.add(FnDef(
+		// A lent closure's code is lent its environment to write, and an owned
+		// one's to read, as a lambda's is.
+		val (want, envId, envKind) = match self.kind(ty) {
+			.Ref(inner, ..) => (inner, lentEnv, RefKind::Var)
+			.Own(inner) => (inner, ownedEnv, RefKind::Shared)
+			_ => return .None
+		}
+		val envTy = self.intern(.Struct(id: envId, args: empty))
+		val envRef = self.intern(.Ref(inner: envTy, kind: envKind))
+		val .Fn(params, ret) = self.kind(want) else return .None
+		val paramTys = self.program.types.list(params).toVec()
+		val targetParams = self.program.fns[target].params.clone()
+		var body = Body()
+		var defs = Vec::of([
+			ParamDef(
 				name: self.interner.lambdaSymbol(),
 				nameSpan: span,
-				symbol: .None,
-				receiver: .None,
-				owner: .None,
-				interfaceId: .None,
-				generics: Vec(),
-				instanceOf: .None,
-				params: defs,
-				ret: ret,
-				retSpan: .None,
-				isExtern: false,
-				exportsC: false,
-				header: .None,
-				accesses: .None,
-				isVariadic: false,
-				variadicOf: .None,
-				lendsFrom: .None,
-				keeps: Vec(),
-				keepsAt: .None,
-				isLambda: true,
-				generator: .None,
-				isTailrec: false,
-				test: .None,
-				isInline: false,
-				generated: .None,
-				intrinsic: .None,
-				body: body,
-				projects: .None,
-				compileTime: false,
-				module: module,
-				isPub: false,
+				ty: envRef,
 				span: span,
-			))
-			if self.program.fns[owner].body.take() is .Some(var ownerBody) {
-				if ownerBody.exprs[at].kind is .Closure(env, ..) then
-					ownerBody.exprs[at].kind = .Closure(id: code, env: env)
-				self.program.fns[owner].body = ownerBody
-			}
+				default: .None,
+			),
+		])
+		val envLocal = body.locals.add(Local(
+			name: self.interner.lambdaSymbol(),
+			ty: envRef,
+			kind: .Param,
+			span: span,
+		))
+		body.params.push(envLocal)
+		var args: Vec<ExprId> = Vec()
+		for (i, paramTy) in paramTys.forwards().enumerate() {
+			val name =
+				if i < targetParams.len() then targetParams[i].name
+				else self.interner.lambdaSymbol()
+			defs.push(ParamDef(name: name, nameSpan: span, ty: paramTy, span: span, default: .None))
+			val local = body.locals.add(Local(name: name, ty: paramTy, kind: .Param, span: span))
+			body.params.push(local)
+			val read = body.exprs.add(Expr(kind: .Local(local), ty: paramTy, span: span))
+			// What owns memory is handed on, not copied.
+			val arg =
+				if self.owns(paramTy) then
+					body.exprs.add(Expr(kind: .Move(read), ty: paramTy, span: span))
+				else read
+			args.push(arg)
 		}
+		val call = body.exprs.add(Expr(
+			kind: .Call(callee: target, args: args, typeArgs: typeArgs, order: Vec()),
+			ty: ret,
+			span: span,
+		))
+		body.value = call
+		return self.program.fns.add(FnDef(
+			name: self.interner.lambdaSymbol(),
+			nameSpan: span,
+			symbol: .None,
+			receiver: .None,
+			owner: .None,
+			interfaceId: .None,
+			generics: generics,
+			instanceOf: .None,
+			params: defs,
+			ret: ret,
+			retSpan: .None,
+			isExtern: false,
+			exportsC: false,
+			header: .None,
+			accesses: .None,
+			isVariadic: false,
+			variadicOf: .None,
+			lendsFrom: .None,
+			keeps: Vec(),
+			keepsAt: .None,
+			isLambda: true,
+			generator: .None,
+			isTailrec: false,
+			test: .None,
+			isInline: false,
+			generated: .None,
+			intrinsic: .None,
+			body: body,
+			projects: .None,
+			compileTime: false,
+			module: module,
+			isPub: false,
+			span: span,
+		))
 	}
 
 	/// Whether a name this body does not declare is one of a body around it,
 	/// which a closure or a generator written here would capture.
 	fn namedAround(sym: Symbol): bool = {
 		for state in self.outer {
-			for scope in state.scopes {
-				if scope.contains(&sym) then return true
-			}
+			for scope in state.scopes do
+				if scope.contains(&sym) then
+					return true
 		}
 		return false
 	}
@@ -829,20 +1030,24 @@ extend Lowerer {
 	/// copied; an owned closure's is the value, which is lent from where it
 	/// lies, for as long as the owned closure's call.
 	var fn capturedAround(sym: Symbol, span: Span): Option<(Captured, Ty, bool)> = {
-		if self.outer.len() < 2 then return .None
+		if self.outer.len() < 2 then
+			return .None
+
 		val around = self.outer[self.outer.len() - 1].captureKind?
 		// Resolved in the body around, which captures it in turn.
 		val inner = mem::replace(&var self.state, BodyState())
 		self.state = self.outer.pop().unwrap()
 		val resolved = self.capturedName(sym, span)
 		var captured: Option<(u32, Ty, bool)> = .None
-		for (i, c) in self.state.captures.forwards().enumerate() {
+		for (i, c) in self.state.captures.forwards().enumerate() do
 			if captured.isNone() && c.name == sym then
 				captured = (i as u32 + around.firstField(), c.ty, c.heldAsOne)
-		}
+
 		val back = mem::replace(&var self.state, inner)
 		self.outer.push(back)
-		if resolved.isNone() then return .None
+		if resolved.isNone() then
+			return .None
+
 		val (index, ty, heldAsOne) = captured?
 		return (.Field(index), ty, heldAsOne)
 	}
@@ -850,7 +1055,9 @@ extend Lowerer {
 	/// The type parameters of the function being checked, as arguments for a
 	/// lambda declared inside it.
 	var fn ownTypeArgs(): TyList = {
-		if self.typeParams.isEmpty() then return TyList::empty()
+		if self.typeParams.isEmpty() then
+			return TyList::empty()
+
 		val generics = self.typeParams.clone()
 		val tys = self.paramTys(&generics)
 		return self.program.types.internList(&tys)
@@ -862,9 +1069,9 @@ extend Lowerer {
 	/// any variable does.
 	fn namesAround(sym: Symbol): bool = {
 		for state in self.outer {
-			for scope in state.scopes {
-				if scope.contains(&sym) then return true
-			}
+			for scope in state.scopes do
+				if scope.contains(&sym) then
+					return true
 		}
 		return false
 	}
@@ -873,13 +1080,16 @@ extend Lowerer {
 	/// closure reads it through what it captured; a plain function may capture
 	/// nothing, which is an error.
 	var fn capturedName(sym: Symbol, span: Span): Option<ExprId> = {
-		if self.outer.isEmpty() then return .None
+		if self.outer.isEmpty() then
+			return .None
+
 		val last = self.outer.len() - 1
 		var found: Option<LocalId> = .None
 		var s = self.outer[last].scopes.len()
 		while s > 0 && found.isNone() {
 			s -= 1
-			if self.outer[last].scopes[s].get(&sym) is .Some(local) then found = local
+			if self.outer[last].scopes[s].get(&sym) is .Some(local) then
+				found = local
 		}
 		// A variable around it waiting for its type takes it from a use of its
 		// own body, not a lambda's.
@@ -937,9 +1147,10 @@ extend Lowerer {
 		}
 		// The field of the environment that holds it, made on first use.
 		var index: Option<i64> = .None
-		for (i, c) in self.state.captures.forwards().enumerate() {
-			if index.isNone() && c.from == from then index = i
-		}
+		for (i, c) in self.state.captures.forwards().enumerate() do
+			if index.isNone() && c.from == from then
+				index = i
+
 		if index.isNone() {
 			var heldAsOne = fromHeldAsOne
 			val ty: Ty = match kind {
@@ -996,7 +1207,9 @@ extend Lowerer {
 			index = self.state.captures.len() - 1
 		}
 		val at = index.unwrap()
-		if holdsWriter then self.state.captures[at].written = true
+		if holdsWriter then
+			self.state.captures[at].written = true
+
 		val fieldTy = self.state.captures[at].ty
 		val heldAsOne = self.state.captures[at].heldAsOne
 		val envLocal = self.state.body.params[0]
@@ -1022,7 +1235,9 @@ extend Lowerer {
 				}
 				// A closure lent to the body around is a pair, the code and what
 				// it captured, and is called as it is, as a closure parameter is.
-				if self.kind(inner) is .Fn(..) then return field
+				if self.kind(inner) is .Fn(..) then
+					return field
+
 				val held = self.alloc(.Deref(field), inner, span)
 				// A function value held as an array of one is its element.
 				if heldAsOne &&

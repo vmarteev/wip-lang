@@ -5,8 +5,19 @@ import std::fs
 import std::time::{Instant}
 import analysis
 import mir
-import hir::{ModuleAst, Program, instantiate, lower}
-import syntax::{Ast, Diagnostic, Interner, Span, lexAt, parseAt}
+import hir::{ModuleAst, Program, fieldTables, instantiate, lower}
+import syntax::{
+	Ast,
+	Code,
+	Diagnostic,
+	Interner,
+	LIST_ONLY_WALKED,
+	LOOP_AS_LIST,
+	LOOP_AS_SEARCH,
+	Span,
+	lexAt,
+	parseAt
+}
 
 /// A file's name, as the command line gave it, and its text.
 pub struct SourceFile {
@@ -22,8 +33,11 @@ extend SourceFile {
 		}
 		if !text.isValidUtf8() then
 			return .Err("cannot read `\(path)`: stream did not contain valid UTF-8")
+
 		// Spans are u32 byte offsets.
-		if text.len() > 0xFFFF_FFFF then return .Err("`\(path)` is larger than 4 GiB")
+		if text.len() > 0xFFFF_FFFF then
+			return .Err("`\(path)` is larger than 4 GiB")
+
 		return SourceFile(name: path, text: text)
 	}
 }
@@ -40,12 +54,12 @@ pub fn parseFile(file: &SourceFile): ParsedFile = {
 	val lexed = lexAt(file.text, 0, &var interner)
 	val parsed = parseAt(file.text, 0, &lexed)
 	var diagnostics: Vec<Diagnostic> = Vec()
-	for diagnostic in lexed.diagnostics {
+	for diagnostic in lexed.diagnostics do
 		diagnostics.push(diagnostic.clone())
-	}
-	for diagnostic in parsed.diagnostics {
+
+	for diagnostic in parsed.diagnostics do
 		diagnostics.push(diagnostic.clone())
-	}
+
 	diagnostics.sortByKey((diagnostic) => diagnostic.primary.span.lo)
 	return ParsedFile(ast: parsed.ast, interner: interner, diagnostics: diagnostics)
 }
@@ -68,14 +82,48 @@ pub fn checkLoaded(loaded: &var Loaded, timings: &var Timings): Checked = {
 		mir::generatorFrames(&var program, &loaded.interner)
 		val sources = &loaded.sources
 		val started = Instant::now()
-		val evaluated = mir::evaluateConstants(&var program, &var loaded.interner, (
-			span,
-		) => sources.locate(span))
+		val evaluated = mir::evaluateConstants(
+			&var program,
+			&var loaded.interner,
+			(span) => sources.locate(span),
+		)
 		timings.record("constants", started)
 		diagnostics.append(evaluated)
 	}
+	// A program with errors is not told what it never uses: what it has not
+	// finished writing is often what would use it.
+	if anyError(&diagnostics) then
+		diagnostics.retain((d) => !d.code.saysUnused())
+
+	// A fix that says a loop as a list or a search takes the loop's words
+	// away, and the checker does not see comments: where it would take one
+	// with them, the warning is not given.
+	val sources = &loaded.sources
+	diagnostics.retain((d) => !losesComment(&d, &sources))
 	diagnostics.sortByKey((d) => d.primary.span.lo)
 	return Checked(program: program, diagnostics: diagnostics)
+}
+
+/// The warnings whose fix takes a loop's words away, keeping its parts.
+val MOVES_LOOPS: [Code; 3] = [LOOP_AS_LIST, LIST_ONLY_WALKED, LOOP_AS_SEARCH]
+
+/// Whether a diagnostic's fix, one that moves a loop's code, replaces text
+/// that holds a comment.
+fn losesComment(diagnostic: &Diagnostic, sources: &Sources): bool = {
+	if !MOVES_LOOPS.contains(&diagnostic.code) then
+		return false
+
+	val .Some(fix) = diagnostic.fix else return false
+	for edit in fix.edits {
+		if edit.span.hi <= edit.span.lo then
+			continue
+
+		val .Some((_, text, base)) = sources.of(edit.span) else continue
+		val replaced = text[(edit.span.lo - base) as i64..(edit.span.hi - base) as i64]
+		if replaced.contains("//") then
+			return true
+	}
+	return false
 }
 
 /// What the checker makes of a loaded program: its types checked, its moves
@@ -84,9 +132,9 @@ pub fn checkLoaded(loaded: &var Loaded, timings: &var Timings): Checked = {
 /// What `wip check --dump-hir` writes.
 pub fn checkTypes(loaded: &Loaded, timings: &var Timings): Checked = {
 	var modules: Vec<ModuleAst> = Vec()
-	for module in loaded.modules {
+	for module in loaded.modules do
 		modules.push(module.syntax())
-	}
+
 	var started = Instant::now()
 	val lowered = lower(&modules, &loaded.interner, loaded.threads, loaded.defines.clone())
 	timings.record("type check", started)
@@ -95,10 +143,11 @@ pub fn checkTypes(loaded: &Loaded, timings: &var Timings): Checked = {
 	var broken: Vec<Span> = Vec()
 	for module in loaded.modules {
 		for file in module.written() {
-			for item in itemSpans(&file) {
+			for item in file.items {
+				val span = item.span()
 				for d in loaded.diagnostics {
-					if d.isError() && inside(item, d.primary.span.lo) {
-						broken.push(item)
+					if d.isError() && inside(span, d.primary.span.lo) {
+						broken.push(span)
 						break
 					}
 				}
@@ -108,10 +157,12 @@ pub fn checkTypes(loaded: &Loaded, timings: &var Timings): Checked = {
 	var diagnostics = loaded.diagnostics.clone()
 	for d in lowered.diagnostics {
 		var dropped = false
-		for item in broken {
-			if inside(item, d.primary.span.lo) then dropped = true
-		}
-		if !dropped then diagnostics.push(d.clone())
+		for item in broken do
+			if inside(item, d.primary.span.lo) then
+				dropped = true
+
+		if !dropped then
+			diagnostics.push(d.clone())
 	}
 	var program = lowered.program
 	if !anyError(&diagnostics) {
@@ -123,9 +174,9 @@ pub fn checkTypes(loaded: &Loaded, timings: &var Timings): Checked = {
 		// it as a written one does.
 		for (id, places) in analysed.given {
 			var .Some(body) = program.fns[id].body.take() else continue
-			for place in places {
+			for place in places do
 				body.moveAt(place)
-			}
+
 			program.fns[id].body = body
 		}
 	}
@@ -135,6 +186,9 @@ pub fn checkTypes(loaded: &Loaded, timings: &var Timings): Checked = {
 		val instances = instantiate(&var program, &loaded.interner)
 		timings.record("instances", started)
 		diagnostics.append(instances)
+		// Each struct a `fieldsOf` asks about, as the table it reads.
+		if !anyError(&diagnostics) then
+			fieldTables(&var program)
 	}
 	diagnostics.sortByKey((d) => d.primary.span.lo)
 	return Checked(program: program, diagnostics: diagnostics)
@@ -143,30 +197,5 @@ pub fn checkTypes(loaded: &Loaded, timings: &var Timings): Checked = {
 fn inside(span: Span, pos: u32): bool = span.lo <= pos && pos <= span.hi
 
 fn anyError(diagnostics: &[Diagnostic]): bool = {
-	for d in diagnostics {
-		if d.isError() then return true
-	}
-	return false
-}
-
-/// Where each item of a file is.
-fn itemSpans(file: &Ast): Vec<Span> = {
-	var spans: Vec<Span> = Vec()
-	for item in file.items {
-		spans.push(
-			match item {
-				.Struct(s) => s.span
-				.Enum(e) => e.span
-				.Fn(f) => f.span
-				.Val(v) => v.span
-				.Assert(a) => a.span
-				.Extern(e) => e.span
-				.Import(i) => i.span
-				.Extend(b) => b.span
-				.Interface(i) => i.span
-				.Type(t) => t.span
-			},
-		)
-	}
-	return spans
+	return diagnostics.any((d) => d.isError())
 }
