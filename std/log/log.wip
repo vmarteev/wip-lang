@@ -1,0 +1,129 @@
+// What a program says of what it does, as it runs: a `Log` is the least
+// level it keeps and where its records go. A function that logs is given
+// the program's log as a parameter, `implicit log: &Log`, which every call
+// below the one that made it fills, so its signature says that it logs and
+// nothing is global. Each record knows the place of the call that made it,
+// and when it was made.
+//
+// The library's own modules log nothing: they answer what went wrong, and
+// what of it to say is the program's.
+
+import std::io
+import std::time
+
+@header("<syslog.h>")
+extern "C" {
+	fn syslog(priority: c_int, format: cstring, ...)
+}
+
+// `syslog`'s priorities, the same on every system Wip runs on.
+val LOG_ERR: c_int = 3
+val LOG_WARNING: c_int = 4
+val LOG_INFO: c_int = 6
+val LOG_DEBUG: c_int = 7
+
+/// How much a record matters, least first.
+@derive(Ord)
+pub enum Level {
+	/// What only someone looking for a fault wants.
+	Debug
+	/// What happened, as it should have.
+	Info
+	/// What went wrong, and the program went on.
+	Warn
+	/// What went wrong, and something was not done.
+	Error
+}
+
+extend Level {
+	/// The level as a log line writes it: `DEBUG`, `INFO`, `WARN`, `ERROR`.
+	pub fn word(): str = match self {
+		.Debug => "DEBUG"
+		.Info => "INFO"
+		.Warn => "WARN"
+		.Error => "ERROR"
+	}
+
+	/// The level as `syslog` takes it.
+	fn priority(): c_int = match self {
+		.Debug => LOG_DEBUG
+		.Info => LOG_INFO
+		.Warn => LOG_WARNING
+		.Error => LOG_ERR
+	}
+}
+
+/// What one call of a log said, lent to where it goes.
+pub view struct Record {
+	pub level: Level
+	/// The message, as the call gave it.
+	pub text: str
+	/// The call's place: its file, line, column and function.
+	pub at: Location
+	/// When, in seconds since 1970, as `time::now()` says it.
+	pub time: i64
+}
+
+/// The least level a program keeps, and where what it keeps goes. A
+/// function is lent the program's, `implicit log: &Log`, and so are the
+/// threads it starts: where records go is called from each of them.
+pub struct Log {
+	/// The least level kept; none where nothing is.
+	least: Option<Level>
+	write: own<(record: &Record) => void>
+}
+
+extend Log {
+	/// Each record at `least` or above, a line on standard error: its time
+	/// in UTC, its level and its text, written at once, so that two
+	/// threads' lines do not mix.
+	pub static fn toStderr(least: Level = .Info): Log = Log(least:, write: own (
+		record,
+	) => io::eprint("\(time::Utc::of(record.time).iso()) \(record.level.word()) \(record.text)\n"))
+
+	/// Each record at `least` or above, to the system's log through
+	/// `syslog`, under the program's name: what Console shows on a Mac, and
+	/// `journalctl` on Linux.
+	pub static fn toSystem(least: Level = .Info): Log = Log(
+		least:,
+		write: own (record) => {
+			// `syslog` reads its text to a NUL, which a `str` need not end with.
+			var text = String::of(record.text)
+			syslog(record.level.priority(), "%s", text.toCstring())
+		},
+	)
+
+	/// Each record at `least` or above, given to `write`, which may be
+	/// called from several threads at once.
+	pub static fn to(least: Level, write: own<(record: &Record) => void>): Log = Log(least:, write:)
+
+	/// No record anywhere: for a call that needs a log, from a caller that
+	/// wants none.
+	pub static fn none(): Log = Log(least: .None, write: own (_) => {})
+
+	/// Whether a record at `level` goes anywhere: for a message that costs
+	/// something to make, asked before it is made.
+	pub fn enabled(level: Level): bool = self.least is .Some(least) && level >= least
+
+	/// A record of what only someone looking for a fault wants.
+	pub fn debug(text: str, implicit at: Location) = self.put(.Debug, text, at)
+
+	/// A record of what happened, as it should have.
+	pub fn info(text: str, implicit at: Location) = self.put(.Info, text, at)
+
+	/// A record of what went wrong, where the program goes on.
+	pub fn warn(text: str, implicit at: Location) = self.put(.Warn, text, at)
+
+	/// A record of what went wrong, where something was not done.
+	pub fn error(text: str, implicit at: Location) = self.put(.Error, text, at)
+
+	/// The record, where its level is kept: made, and given to where records
+	/// go.
+	fn put(level: Level, text: str, at: Location) = {
+		if !self.enabled(level) then
+			return
+
+		val record = Record(level:, text:, at:, time: time::now())
+		(self.write)(&record)
+	}
+}

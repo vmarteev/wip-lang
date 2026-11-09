@@ -375,7 +375,7 @@ struct Row {
 fn main() = {
     var tags: Vec<String> = Vec()
     tags.push("new")
-    val row = Row(name: "a", tags: tags)
+    val row = Row(name: "a", tags:)
     var copy = row.clone()
     copy.tags.push("changed")
     assert(row.tags.len() == 1 && copy.tags.len() == 2)
@@ -423,7 +423,7 @@ struct Settings {
 fn main() = {
     var bindings: Map<String, Key> = Map()
     bindings.put("jump", .Letter(char: 'w'))
-    val settings = Settings(bindings: bindings, player: .None)
+    val settings = Settings(bindings:, player: .None)
     val text = json::encode(&settings)
     assert(text.startsWith("{\"volume\":0.8,\"bindings\":{\"jump\":"))
     assert(text.endsWith("{\"Letter\":{\"char\":\"w\"}}}}"), "no player")
@@ -595,6 +595,23 @@ fn main() = {
 a call and not kept ([page 7](07-references.md)). A generic parameter is the
 other way to write the same thing, and compiles to a direct call per type;
 `&dyn` compiles to one function for all of them.
+
+A `dyn` is only ever behind `&` or `&var`, wherever a type is written, a
+type's arguments included. A value of unknown type has no size of its own,
+so neither `dyn Shape` nor `own<dyn Shape>` can be stored:
+
+```wip,error=E0344
+interface Shape {
+    fn area(): i64
+}
+
+struct Scene {
+    shapes: Vec<own<dyn Shape>>
+}
+```
+
+Values of several kinds are kept as an enum of the kinds, and a `match`
+over it is checked for the kinds it leaves out.
 
 ## Another module's interface
 

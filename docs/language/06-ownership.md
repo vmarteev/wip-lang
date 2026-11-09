@@ -165,7 +165,7 @@ extend own<T: Describe>: Describe {
 fn told<T: Describe>(x: &T): String = x.describe()
 
 fn main() = {
-    val boxed = own Leaf(name: String::of("a"))
+    val boxed = own Leaf(name: "a")
     assert(told(&boxed) == "boxed leaf a")
     // Called on the box, the method is the leaf's.
     assert(boxed.describe() == "leaf a")

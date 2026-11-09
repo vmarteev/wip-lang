@@ -6,6 +6,8 @@ import syntax::{
 	Edit,
 	INTEGER_OUT_OF_RANGE,
 	MISMATCHED_TYPES,
+	NEEDLESS_STRING_OF,
+	NEEDLESS_VEC_OF,
 	NEEDLESS_WRAPPER,
 	REFERENCE_PASSED_ON,
 	Span,
@@ -241,6 +243,9 @@ extend Lowerer {
 			if self.state.writtenSuccesses.contains(&id) then
 				self.needlessWrapper(id)
 
+			if self.state.writtenConversions.get(&id) is .Some(kept) then
+				self.needlessConversion(id, kept)
+
 			return id
 		}
 		if self.isPoisoned(actual) || self.hasError(expected) then
@@ -308,7 +313,7 @@ extend Lowerer {
 				value = self.alloc(.Deref(value), pointee, span)
 				pointee = inner
 			}
-			val wanted = Constraint(interfaceId: interfaceId, args: dynArgs)
+			val wanted = Constraint(interfaceId:, args: dynArgs)
 			if !self.implementsWith(pointee, wanted) {
 				val name = self.constraintName(wanted, pointee)
 				self.report(
@@ -321,7 +326,7 @@ extend Lowerer {
 				)
 				return self.errorExpr(span)
 			}
-			return self.alloc(.DynRef(value: value, interfaceId: interfaceId), expected, span)
+			return self.alloc(.DynRef(value:, interfaceId:), expected, span)
 		}
 		// An array on the heap becomes a buffer: its length moves from the type
 		// into the value.
@@ -401,11 +406,101 @@ extend Lowerer {
 		)
 	}
 
+	/// Marks `String::of(text)` of a `str`, or `Vec::of([…])` of a list
+	/// written there, made where its type was expected before it was
+	/// checked: what that type makes of the text or the list alone, which
+	/// `conversion` warns of where the call is taken as that type. Not
+	/// `String::of` of a `String`, lent to it, which the name alone would
+	/// move, nor of a call whose result is a type the call alone decides,
+	/// which the `String` expected would decide instead; nor `Vec::of` of a
+	/// buffer held elsewhere, which a list would not be. Nor in a waiting
+	/// local's value, checked again against a type that is partly its own.
+	var fn markWrittenConversion(made: ExprId, args: &[ast::ExprId], hint: Option<Ty>) = {
+		val .Some(expected) = hint else return
+		if args.len() != 1 ||
+			self.inDerived() ||
+			self.state.rechecking > 0 ||
+			self.tyOf(made) != expected {
+			return
+		}
+
+		val .Call(callee, args: given, ..) = self.state.body.exprs[made].kind else return
+		if given.len() != 1 then
+			return
+
+		var written = args[0]
+		while self.ast.exprs[written].kind is .Paren(inner) do
+			written = inner
+
+		val known = &self.program.preludeItems
+		if known.function(.StringOf) == callee {
+			if self.tyOf(given[0]) != STR || self.state.converted.contains(&given[0]) then
+				return
+
+			var value = given[0]
+			while self.state.body.exprs[value].kind is .Deref(inner) do
+				value = inner
+
+			if self.state.body.exprs[value].kind is .Call(callee: inner, ..) &&
+				(self.resultAloneGeneric(inner) || self.resultItsOwnParam(inner)) {
+				return
+			}
+		} else if known.function(.VecOf) == callee {
+			if self.ast.exprs[written].kind is .Unary(op: .Own, operand, ..) {
+				written = operand
+				while self.ast.exprs[written].kind is .Paren(inner) do
+					written = inner
+			}
+			if self.ast.exprs[written].kind !is .Array(..) then
+				return
+		} else
+			return
+
+		self.state.writtenConversions.put(made, self.ast.exprs[written].span)
+	}
+
+	/// E0483 and E0484: `String::of(text)` or `Vec::of([…])` taken where its
+	/// type was expected, which would be the same written as the text or
+	/// the list alone, at `kept`.
+	var fn needlessConversion(id: ExprId, kept: Span) = {
+		self.state.writtenConversions.remove(&id)
+		self.state.saidConversions.add(id)
+		val .Call(callee, ..) = self.state.body.exprs[id].kind else return
+		val span = self.state.body.exprs[id].span
+		val ty = self.tyOf(id)
+		val text = self.program.preludeItems.function(.StringOf) == callee
+		val (code, call, note, fix) =
+			if text then
+				(
+					NEEDLESS_STRING_OF,
+					"String::of",
+					"text where a `String` is expected is copied into one, as `String::of` copies it",
+					"write the text alone",
+				)
+			else (
+				NEEDLESS_VEC_OF,
+				"Vec::of",
+				"a list where a `Vec` is expected is one, its elements on the heap, as `Vec::of` puts them",
+				"write the list alone",
+			)
+		self.report(
+			Diagnostic::warning(
+				code,
+				"`\(call)` is said by the type expected",
+				Span::new(span.lo, kept.lo),
+				"\(self.tyName(ty)) expected here",
+			).withNote(note).withFix(fix, [
+				Edit::replace(Span::new(span.lo, kept.lo), ""),
+				Edit::replace(Span::new(kept.hi, span.hi), ""),
+			]),
+		)
+	}
+
 	/// Why a number is not taken where a number of type `expected` is.
 	fn notWidened(actual: Ty, expected: Ty): String = {
 		val types = &self.program.types
 		if !types.isInteger(actual) || !types.isInteger(expected) then
-			return String::of(self.unconverted(actual, expected))
+			return self.unconverted(actual, expected)
 
 		return "\(self.tyName(expected)) does not hold every value of \(self.tyName(actual)), so it is not widened to it; `as` converts it, keeping the low bits of a value that does not fit"
 	}
@@ -827,9 +922,9 @@ extend Lowerer {
 	}
 
 	var fn alloc(kind: ExprKind, ty: Ty, span: Span): ExprId = self.state.body.exprs.add(Expr(
-		kind: kind,
-		ty: ty,
-		span: span,
+		kind:,
+		ty:,
+		span:,
 	))
 
 	var fn errorExpr(span: Span): ExprId = self.alloc(.Error, ERROR, span)

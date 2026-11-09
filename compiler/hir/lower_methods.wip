@@ -8,6 +8,7 @@ import syntax::{
 	DROP_RULES,
 	Diagnostic,
 	Edit,
+	FORWARDS_ENUMERATED,
 	INTERPOLATION_OPTION,
 	NOT_A_METHOD,
 	PRIVATE_ITEM,
@@ -163,7 +164,7 @@ extend Lowerer {
 	fn implementedName(method: FnId): String = {
 		val name = self.program.fns[method].name
 		var found: Option<i64> = .None
-		for (at, i) in self.program.impls.forwards().enumerate() do
+		for (at, i) in self.program.impls.indexed() do
 			if found.isNone() && i.methods.contains(&method) then
 				found = at
 
@@ -365,6 +366,9 @@ extend Lowerer {
 		if self.text(name.sym) == "clone" && noArgs && item.names.isEmpty() then
 			self.cloneOfPlain(base, receiver, ty, name, &item)
 
+		if self.text(name.sym) == "enumerate" && noArgs && item.names.isEmpty() then
+			self.forwardsEnumerated(base, receiver, &item)
+
 		// Plain data is its own clone, which no method of its type need say.
 		val ownClone = match self.ownerOf(ty) {
 			.Some(owner) => self.methodOf(owner, name.sym).isSome()
@@ -436,6 +440,52 @@ extend Lowerer {
 			]).withNote(
 				"plain data owns no memory — no `own`, no `String`, no `Vec`, nothing with a `destroy` — and is copied wherever it is named",
 			),
+		)
+	}
+
+	/// Warns of `xs.forwards().enumerate()`, where `forwards` is a slice's or
+	/// a `Vec`'s, the library's: the list's `indexed()` is the same walk. An
+	/// iterator's `enumerate()` after any other walk says what `indexed()`
+	/// does not, and is left.
+	var fn forwardsEnumerated(base: ast::ExprId, receiver: ExprId, item: &ItemUse) = {
+		var written = base
+		while self.ast.exprs[written].kind is .Paren(inner) do
+			written = inner
+
+		val .Call(callee, args, ..) = self.ast.exprs[written].kind else return
+		if !args.isEmpty() then
+			return
+
+		val .Field(name: walk, ..) = self.ast.exprs[callee].kind else return
+		if self.text(walk.sym) != "forwards" then
+			return
+
+		var made = receiver
+		while self.state.body.exprs[made].kind is .Deref(inner) | .Ref(inner, ..) do
+			made = inner
+
+		val .Call(callee: id, ..) = self.state.body.exprs[made].kind else return
+		val f = &self.program.fns[id]
+		val library = self.prelude == .Some(f.module as i64)
+		val list = match f.owner {
+			.Some(.Builtin(.Slice)) => true
+			.Some(.Struct(id: owner)) => self.program.preludeItems.structure(.Vec) == owner
+			_ => false
+		}
+		if !library || !list || self.inDerived() then
+			return
+
+		self.report(
+			Diagnostic::warning(
+				FORWARDS_ENUMERATED,
+				"`forwards().enumerate()` is the list's `indexed()`",
+				Span::new(walk.span.lo, item.span.hi),
+				"each element with its position",
+			).withNote(
+				"`indexed()` walks a slice, an array or a `Vec` from the first element, each lent with its position from 0",
+			).withFix("write `indexed()`", [
+				Edit::replace(Span::new(walk.span.lo, item.span.hi), "indexed()"),
+			]),
 		)
 	}
 
@@ -713,7 +763,7 @@ extend Lowerer {
 			return TyList::empty()
 
 		var found: Option<i64> = .None
-		for (at, i) in self.program.impls.forwards().enumerate() {
+		for (at, i) in self.program.impls.indexed() {
 			if found.isNone() &&
 				i.interfaceId == interfaceId &&
 				i.ty == owner &&
@@ -722,7 +772,7 @@ extend Lowerer {
 			}
 		}
 		if found.isNone() {
-			for (at, i) in self.program.impls.forwards().enumerate() do
+			for (at, i) in self.program.impls.indexed() do
 				if found.isNone() && i.interfaceId == interfaceId && i.ty == owner then
 					found = at
 		}
@@ -753,7 +803,7 @@ extend Lowerer {
 	): Option<ExprId> = {
 		val methods = self.program.interfaces[interfaceId].methods.clone()
 		var found: Option<i64> = .None
-		for (at, m) in methods.forwards().enumerate() do
+		for (at, m) in methods.indexed() do
 			if found.isNone() && self.program.fns[m.id].name == name.sym then
 				found = at
 
@@ -782,7 +832,7 @@ extend Lowerer {
 		var checked: Vec<ExprId> = [
 			// Checked as any call's arguments are: `&place` and `&var place` lend,
 			// where a parameter takes a reference.
-			for (i, arg) in args.forwards().enumerate() {
+			for (i, arg) in args.indexed() {
 				val value =
 					if i + 1 < params.len() then self.checkArgument(arg, params[i + 1].ty, .None)
 					else self.inferArgument(arg, .None)
@@ -835,15 +885,9 @@ extend Lowerer {
 			paramTys.push(params[i].ty)
 
 		val list = self.program.types.internList(&paramTys)
-		val fnTy = self.intern(.Fn(params: list, ret: ret))
+		val fnTy = self.intern(.Fn(params: list, ret:))
 		return self.alloc(
-			.DynCall(
-				interfaceId: interfaceId,
-				index: index as u32,
-				fnTy: fnTy,
-				args: hirArgs,
-				order: Vec(),
-			),
+			.DynCall(interfaceId:, index: index as u32, fnTy:, args: hirArgs, order: Vec()),
 			ret,
 			item.span,
 		)

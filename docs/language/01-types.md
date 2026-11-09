@@ -320,7 +320,10 @@ number takes the type expected of it, and any other `str` — a parameter, a
 piece of a line, what a call answers. That is a field, an argument, what a
 function answers, an element pushed, a variable declared or assigned as a
 `String`. Where nothing expects a `String`, text is a `str`, which costs
-nothing.
+nothing. So `String::of(text)` written where a `String` is expected says
+what the type already does, and is a warning, whose fix writes the text
+alone (E0483); where nothing else says it, `val name = String::of(line)`,
+the call is what makes the value a `String`, and stays.
 
 ```wip,run
 struct Dialog {
@@ -488,7 +491,7 @@ type expected:
 val squares: [i64; 4] = madeBy((i) => i * i)
 assert(squares == [0, 1, 4, 9])
 var lists: [Vec<String>; 3] = madeBy((_) => Vec())
-lists[1].push(String::of("one"))
+lists[1].push("one")
 assert(lists[0].isEmpty() && lists[1].len() == 1)
 ```
 
@@ -569,7 +572,9 @@ made by its `collect` of the elements in the order they are written, so
 a `Set` keeps the first of equals and a `Map` the later value of a key
 ([page 10](10-library.md#stdcollections)). Where nothing
 expects one, a list is an array, on the stack, and `Vec::of([1, 2, 3])`
-makes it a vector, since `of` expects a buffer. `v.intoBuffer()` hands a
+makes it a vector, since `of` expects a buffer; where a `Vec` is expected,
+the call says what the list already is, and is a warning, whose fix
+writes the list alone (E0484). `v.intoBuffer()` hands a
 vector's values back as an `own<[T]>`, neither moving a value.
 
 ```wip,run
@@ -664,8 +669,10 @@ tuple apart by position, and a struct by its fields' names
 
 A struct is named fields, and is built as a variant is: its name, with the
 fields as a call's arguments, by a call's rules. Where there are two or
-more, each is named, a variable of a field's name too: `File(fileNo: fileNo,
-name: n)`. One field is given by position or by name. A field is private
+more, each is named, a variable of a field's name too, which is written
+once, the name and its colon: `File(fileNo:, name: n)`, for `fileNo:
+fileNo` ([page 3](03-functions.md#arguments)). One field is given by
+position or by name. A field is private
 to the module unless it says `pub`, and may have a default, which a literal
 that leaves it out takes:
 
@@ -726,7 +733,7 @@ so it may be code — an empty list, a text — as well as a constant:
 
 ```wip,run
 struct Queue {
-    name: String = String::of("jobs")
+    name: String = "jobs"
     waiting: Vec<i64> = Vec()
 }
 
@@ -753,19 +760,15 @@ struct Job {
 }
 
 fn main() = {
-    var job = Job(
-        done: false,
-        name: String::of("parse"),
-        steps: Vec::of([1, 2]),
-    )
+    var job = Job(done: false, name: "parse", steps: [1, 2])
     job.done = true
     // `name` and `steps` are moved out of `job`; `done` was named.
     val retried = Job(done: false, ..job)
     assert(!retried.done && retried.name == "parse" && retried.steps.len() == 2)
     assert(job.done)
 
-    val kept = Job(done: true, name: String::of("link"), steps: Vec())
-    val again = Job(done: false, ..Job(steps: Vec::of([3]), ..kept))
+    val kept = Job(done: true, name: "link", steps: Vec())
+    val again = Job(done: false, ..Job(steps: [3], ..kept))
     assert(again.steps.len() == 1 && again.name == "link")
 }
 ```
@@ -992,7 +995,7 @@ extend Thing {
 }
 
 fn main() = {
-    val door = Thing::Door(name: String::of("gate"), turn: 300, open: false)
+    val door = Thing::Door(name: "gate", turn: 300, open: false)
     assert(door.turned(90) is .Door(name: "gate", turn: 30, open: false))
 }
 ```

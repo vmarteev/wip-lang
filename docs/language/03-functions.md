@@ -50,6 +50,71 @@ fn main() = {
 A name at the call is checked against the parameter's, so a call that names
 the wrong one is refused rather than passed along.
 
+A named argument whose value is the variable of its name is written once,
+the name and its colon before a `,` or the `)`: `area(width:, height:)` is
+`area(width: width, height: height)`. The value is the name as an
+expression, a local, a parameter, a captured variable or a constant, and
+the argument is named in every other way: in any order after the
+positional ones, checked against the parameter's name and type, and moved
+where it is the variable's last use. The colon is what names it, so a bare
+variable stays an argument by position. Nothing is added: a reference is
+still lent with its `&`, `values: &values`, written out.
+
+```wip,run
+val LIMIT = 8
+
+struct Window {
+    width: i64
+    height: i64
+    limit: i64
+}
+
+fn area(width: i64, height: i64): i64 = width * height
+
+fn main() = {
+    val width = 3
+    val height = 4
+    assert(area(height:, width:) == 12)
+    val tall = [1, 2].map((extra) => Window(
+        width:,
+        height: height + extra,
+        limit: LIMIT,
+    ))
+    assert(tall[1].height == 6 && tall[0].limit == 8)
+}
+```
+
+A reference parameter has no default, since a value is not a place to
+lend from (E0330), but for a closure lent for the call, `&(…) => R` or
+`&var (…) => R`, whose default may be a lambda that captures nothing or a
+function's name: what a call leaves out is that function, lent with
+nothing behind it, as an argument naming it would be. A builder's
+children, where most elements have none, say so once. In a generic
+function, the default is a function's name:
+
+```wip,run
+struct Page {
+    lines: Vec<String> = Vec()
+}
+
+extend Page {
+    var fn section(
+        title: str,
+        body: &var (page: &var Page) => void = (_) => {},
+    ) = {
+        self.lines.push(title)
+        body(&var self)
+    }
+}
+
+fn main() = {
+    var page = Page()
+    page.section("Contents")
+    page.section("Chapter", (p) => p.section("Verse"))
+    assert(page.lines == ["Contents", "Chapter", "Verse"])
+}
+```
+
 An argument by position goes where its position says, whatever it is
 called. So `draw(height, width)`, for `draw(width: i64, height: i64)`, puts
 the height in `width`, and nothing on the line says so: it is a warning
@@ -201,7 +266,7 @@ rather than its own:
 ```wip,run
 fn expectEqual(actual: i64, expected: i64, implicit at: Location) = {
     if actual != expected then
-        panic("expected \(expected), found \(actual)", at: at)
+        panic("expected \(expected), found \(actual)", at:)
 }
 
 // Hands its caller's place on, without a word.
@@ -245,7 +310,7 @@ struct Counter {
 }
 
 extend Counter {
-    static fn by(step: i64): Counter = Counter(count: 0, step: step)
+    static fn by(step: i64): Counter = Counter(count: 0, step:)
 
     fn count(): i64 = self.count
 
@@ -284,7 +349,7 @@ struct Counter {
     count: i64 = 0
     step: i64 = 1
 
-    static fn by(step: i64): Counter = Counter(step: step)
+    static fn by(step: i64): Counter = Counter(step:)
 }
 
 struct Clocks {
@@ -790,7 +855,7 @@ fn total(answer: &Answer): Result<i64, DecodeError> = {
 }
 
 fn main() = {
-    val answer = Answer(text: String::of("[1, 2, 3]"))
+    val answer = Answer(text: "[1, 2, 3]")
     assert(total(&answer) == 6)
     val numbers: Vec<i64> = answer.read().unwrap()
     assert(numbers.len() == 3)

@@ -109,8 +109,8 @@ fn run(word: String): i64 = match word {
 }
 
 fn main() = {
-    assert(run(String::of("remove")) == 2)
-    val problem = Problem::Unknown(String::of("frob"))
+    assert(run("remove") == 2)
+    val problem = Problem::Unknown("frob")
     assert(problem is .Unknown("frob"))
 }
 ```
@@ -598,12 +598,12 @@ struct Game {
 
 extend Game {
     var fn say(text: str) = {
-        self.said = String::of(text)
+        self.said = text
     }
 }
 
 fn main() = {
-    var game = Game(talking: Talk(who: String::of("Ada")), said: String::of(""))
+    var game = Game(talking: Talk(who: "Ada"), said: "")
     if game.talking is .Some(talk) {
         val greeting = "hello, \(talk.who)"
         game.say(greeting.toStr()) // `talk` is not used again
@@ -646,7 +646,7 @@ fn same(a: &Shape, b: &Shape): bool = match (a, b) {
 }
 
 fn main() = {
-    val one = Shape::Named(String::of("one"))
+    val one = Shape::Named("one")
     assert(same(&one, &one))
     assert(!same(&one, Shape::Circle(radius: 1)))
 }

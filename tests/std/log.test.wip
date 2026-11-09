@@ -1,0 +1,112 @@
+// `std::log`: a log's least level, the records it keeps and where
+// they go, the place each says it was made, and one log lent to many
+// threads.
+
+import std::future
+import std::log::{Level, Log}
+import std::shared::{Shared}
+import std::sync::{Mutex}
+
+/// A log at `least` that keeps each record as a line, its level, the line
+/// of its call and its text, and what it kept.
+fn kept(least: Level): (Log, Shared<Mutex<Vec<String>>>) = {
+	val lines = Shared::of(Mutex::of(Vec<String>()))
+	val into = lines.share()
+	val log = Log::to(least, own (record) => into.value().lock(
+		(all) => all.push("\(record.level.word()) \(record.at.line) \(record.text)"),
+	))
+	return (log, lines)
+}
+
+/// What the log `kept` made has kept.
+fn linesOf(lines: &Shared<Mutex<Vec<String>>>): Vec<String> = lines.value().lock(
+	(all) => all.clone(),
+)
+
+/// The place of the call.
+fn here(implicit at: Location): Location = at
+
+@test
+fn theLevelsAreInOrderAndWrittenAsWords() = {
+	assert(Level::Debug < Level::Info && Level::Info < Level::Warn && Level::Warn < Level::Error)
+	assert(
+		[
+			for level in Level::all() do
+				yield level.word()
+		] ==
+			["DEBUG", "INFO", "WARN", "ERROR"].toVec(),
+	)
+}
+
+@test
+fn aRecordBelowTheLeastIsDropped() = {
+	val (log, lines) = kept(.Warn)
+	log.debug("looking")
+	log.info("served")
+	log.warn("slow")
+	log.error("failed")
+	val written = linesOf(&lines)
+	assert(written.len() == 2 && written[0].endsWith("slow") && written[1].endsWith("failed"))
+	assert(written[0].startsWith("WARN ") && written[1].startsWith("ERROR "))
+}
+
+@test
+fn aLogSaysWhetherALevelIsKept() = {
+	val (log, _) = kept(.Info)
+	assert(!log.enabled(.Debug) && log.enabled(.Info) && log.enabled(.Error))
+	val none = Log::none()
+	assert(!none.enabled(.Debug) && !none.enabled(.Error))
+	none.error("nowhere")
+}
+
+@test
+fn aRecordSaysThePlaceOfItsCall() = {
+	val (log, lines) = kept(.Debug)
+	// The call is on the line after this one.
+	val line = here().line + 1
+	log.info("here")
+	assert(linesOf(&lines) == ["INFO \(line) here"].toVec())
+}
+
+/// A warning that says where its caller is, as a function that takes the
+/// caller's place hands it on.
+fn warnHere(log: &Log, text: str, implicit at: Location) = log.warn(text)
+
+@test
+fn aPlaceHandedOnIsTheFirstCallers() = {
+	val (log, lines) = kept(.Debug)
+	// The call is on the line after this one.
+	val line = here().line + 1
+	warnHere(&log, "handed on")
+	assert(linesOf(&lines) == ["WARN \(line) handed on"].toVec())
+}
+
+/// Work that logs, given the log by its caller.
+fn doubled(n: i64, implicit log: &Log): i64 = {
+	log.info("doubling \(n)")
+	return n * 2
+}
+
+@test
+fn aLogIsGivenToEachCallThatTakesOne() = {
+	val (made, lines) = kept(.Info)
+	implicit val log = made
+	assert(doubled(4) == 8)
+	assert(linesOf(&lines).len() == 1 && linesOf(&lines)[0].endsWith("doubling 4"))
+}
+
+@test
+fn oneLogIsLentToEveryThread() = {
+	val (made, lines) = kept(.Info)
+	implicit val log = made
+	val numbers = [
+		for n in 0..64 do
+			yield n
+	]
+	val results = future::map(&numbers, (n) => doubled(n))
+	assert(results.len() == 64)
+	val written = linesOf(&lines)
+	assert(written.len() == 64)
+	for n in 0..64 do
+		assert(written.any((line) => line.endsWith(" doubling \(n)")))
+}

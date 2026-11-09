@@ -249,9 +249,9 @@ fn main() = {
     val again = draw // plain data: copied
     assert(again.constants.len() == 3 && draw.constants[2] == 3)
     var names: InlineVec<String, 2> = InlineVec()
-    names.push(String::of("one"))
-    assert(names.tryPush(String::of("two")))
-    assert(!names.tryPush(String::of("three")) && names.isFull())
+    names.push("one")
+    assert(names.tryPush("two"))
+    assert(!names.tryPush("three") && names.isFull())
     assert(names.items() == ["one", "two"])
 }
 ```
@@ -593,14 +593,15 @@ fn main() = {
     var letters = "ab".chars().peekable()
     assert(letters.peek() == .Some(&'a') && letters.next() == 'a')
 
-    // A slice walks through `copies()`, which copies each element out, and
-    // through `forwards()` and `backwards()`, which lend each where it lies.
+    // A slice walks through `copies()`, which copies each element out,
+    // through `forwards()` and `backwards()`, which lend each where it lies,
+    // and through `indexed()`, which lends each with its position.
     val numbers = [1, 2, 3, 4]
     assert(numbers.copies().skip(1).take(2).toVec() == [2, 3])
     assert(numbers.countWhere((n) => n > 2) == 2)
     val names: Vec<String> = ["a", "b"]
     var seen = String()
-    for (index, name) in names.forwards().enumerate() do
+    for (index, name) in names.indexed() do
         seen.push("\(index)\(name)")
 
     for name in names.backwards() do
@@ -612,7 +613,12 @@ fn main() = {
 
 `copies()` hands out copies, so its elements are plain data, which is what
 `sum` and arithmetic on them want; `forwards()` and `backwards()` lend
-them, `&T`, so they walk any list, from the first element or from the last.
+them, `&T`, so they walk any list, from the first element or from the last;
+`indexed()` lends them from the first, each in a pair with its position from
+0, `(i64, &T)`. It is the walk `forwards().enumerate()` makes, which is
+warned of on a list, with the fix that writes `indexed()` (E0482); an
+`enumerate()` after `backwards()` or `copies()` counts what they hand out,
+and stays.
 Over values that own memory, `copies()` is refused, and names `forwards()`.
 Three walks, then, by what they do: they lend, they copy, or — `for x in
 move c` and `intoIterator()` — they take.
@@ -942,7 +948,7 @@ import std::sync
 fn main() = {
     var (sounds, mixer) = sync::ring<String>(2)
     assert(sounds.push("coin").isOk() && sounds.push("door").isOk())
-    assert(sounds.push("step") == .Err(String::of("step"))) // full
+    assert(sounds.push("step") == .Err("step")) // full
     assert(mixer.pop() == String::of("coin") && mixer.len() == 1)
 
     var (samples, played) = sync::ring<i64>(8)
@@ -1004,6 +1010,53 @@ fn main() = {
     assert(heights.len() == 100 && heights[99] < 99.0)
 }
 ```
+
+## Logs: `std::log`
+
+A `Log` is the least level a program keeps, `Level`'s `.Debug`, `.Info`,
+`.Warn` or `.Error`, and where what it keeps goes. A function that logs
+takes the program's log as an implicit parameter named `log`, `implicit
+log: &Log` ([page 3](03-functions.md)), and is given it by every call that
+has one, so its signature says that it logs, and a library and a program
+that both name it `log` meet with nothing to set up. There is no global
+log. A log is lent shared, so one serves every thread it is lent to.
+
+`debug`, `info`, `warn` and `error` each make a `Record`, its level, its
+text, the place of the call and the time, where the level is kept, and
+give it to where the log's records go:
+
+- **`Log::toStderr(least)`** writes each as a line on standard error, its
+  time in UTC, its level and its text, in one write, so two threads' lines
+  do not mix.
+- **`Log::toSystem(least)`** gives each to the system's log, through
+  `syslog`, under the program's name: Console shows it on a Mac, and
+  `journalctl` on Linux.
+- **`Log::to(least, write)`** gives each to `write`, a closure that may be
+  called from several threads at once: a line of the program's own, JSON,
+  or what a test keeps.
+- **`Log::none()`** keeps nothing, for a caller that needs no log.
+
+```wip,run
+import std::log::{Log}
+
+fn served(path: str, implicit log: &Log) = {
+    log.info("served \(path)")
+    log.debug("not kept: below the least level")
+}
+
+fn main() = {
+    implicit val log = Log::toStderr(least: .Info)
+    served("/index.html")
+    assert(log.enabled(.Warn) && !log.enabled(.Debug))
+}
+```
+
+A message is made before the call, so `log.debug("\(tree)")` writes the
+tree's text even where `.Debug` is not kept. Where that costs, ask first:
+`if log.enabled(.Debug) then log.debug("\(tree)")`.
+
+The library's own modules log nothing. They answer what went wrong, and
+what of it to log is the program's to decide.
 
 ## A program's arguments: `std::args`
 
@@ -1688,7 +1741,7 @@ fn firstLine(host: str): String = {
 
     var room = [0 as u8; 64]
     val got = secure.read(&var room).unwrapOr(0)
-    return String::of(str::fromBytes(&room[0..got]))
+    return str::fromBytes(&room[0..got])
 }
 
 fn main() = io::println(firstLine("example.com"))
@@ -1796,7 +1849,7 @@ fn main() = {
     }
     assert("\(doc)" == "{\"name\":\"wip\",\"tags\":[1,2.5,null]}")
     val .Object(fields) = doc else return
-    assert(fields[0].0 == "name" && fields[0].1 == .Text(String::of("wip")))
+    assert(fields[0].0 == "name" && fields[0].1 == .Text("wip"))
     assert(fields[1].0 == "tags" && "\(fields[1].1)" == "[1,2.5,null]")
 
     val .Err(error) = json::parse("[1,\n 2,]") else return
@@ -1851,7 +1904,9 @@ answering a `BinaryError` that says what was wrong and at which byte. It
 holds what JSON does — a record keeps its fields' names, read in any
 order, so a save written by one version of a program loads in the next,
 which has a field more or one less — in less room, with whole numbers and
-lengths in as few bytes as they need, and with no text to parse:
+lengths in as few bytes as they need, each field's and each variant's name
+spelled once and said after by where it was, and with no text to parse.
+Bytes written before names were spelled once are read as they were:
 
 ```wip,run
 import std::bytes
@@ -2298,6 +2353,7 @@ fn main() = {
 | `std::text` | `Scanner` and `Position`, above; `ParseError`, and the `Split`, `Lines` and `Chars` types the prelude's methods answer |
 | `std::iter` | `Walk`, `Forwards`, `Backwards`, `Taking` (what a `Vec` gives up to `for x in move v`), and the adapter types `Mapped`, `Filtered`, `FilterMapped`, `FlatMapped`, `Chained`, `Enumerated`, `Taken`, `TakenWhile`, `Skipped`, `Zipped`, `Peekable` |
 | `std::collections` | `Map`, `Set`, `MapEntry`, `Deque`, `PriorityQueue`, and `Arena` with its `Handle`, `ArenaEntry` and `ArenaValues` |
+| `std::log` | `Log`, `Level` and `Record`: what a program says as it runs, kept from a least level, to standard error, the system's log or a closure of the program's |
 | `std::time` | `Duration`, a length of time; `Instant`, a moment on a clock that only goes forward; `sleep`; `FixedStep`, a game's updates at a steady rate; `now`, the date it is; `Utc`, a moment as a calendar has it, and `Local`, as it has it where the program runs |
 | `std::bytes` | numbers read and written at a place in bytes, `u32le` and `putU32le`; `Reader` and `Writer`, the same in turn; and a binary format for `Encode` and `Decode` |
 | `std::base64` | `encode` and `decode`, in the standard alphabet or the one for URLs, padded or not, and `Base64Error` |

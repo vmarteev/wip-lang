@@ -112,7 +112,8 @@ extend Lowerer {
 		return true
 	}
 
-	/// Whether a `dyn` type is anywhere but directly behind `&` or `&var`.
+	/// Whether a `dyn` type is anywhere but directly behind `&` or `&var`:
+	/// a type's arguments and a function type's parts included.
 	fn hasBareDyn(ty: Ty): bool = match self.kind(ty) {
 		.Dyn(..) => true
 		.Ref(inner, ..) if self.kind(inner) is .Dyn(..) => false
@@ -120,25 +121,75 @@ extend Lowerer {
 			inner,
 		)
 		.Slice(elem) => self.hasBareDyn(elem)
+		.Struct(args, ..) | .Enum(args, ..) => self.anyBareDyn(args)
+		.Fn(params, ret) => self.anyBareDyn(params) || self.hasBareDyn(ret)
 		_ => false
 	}
 
-	/// Reports a `dyn` type anywhere but behind `&`. Returns whether it did.
+	fn anyBareDyn(tys: TyList): bool = {
+		for ty in self.program.types.list(tys) do
+			if self.hasBareDyn(ty) then
+				return true
+
+		return false
+	}
+
+	/// The `dyn` written in a type but not directly behind `&` or `&var`,
+	/// the first where there are several; none where the type names it
+	/// through an alias.
+	fn writtenBareDyn(
+		typeId: ast::TypeId,
+	): Option<ast::TypeId> = match self.ast.types[typeId].kind {
+		.Dyn(..) => typeId
+		.Ref(inner, ..) if self.ast.types[inner].kind is .Dyn(..) => .None
+		.Ref(inner, ..) | .Own(inner) | .Array(elem: inner, ..) | .Slice(elem: inner) => self.writtenBareDyn(
+			inner,
+		)
+		.Named(args, ..) | .Path(args, ..) => self.firstBareDyn(&args.items())
+		.Fn(params, ret) => {
+			for param in params do
+				if self.writtenBareDyn(param.ty) is .Some(found) then
+					return found
+
+			return self.writtenBareDyn(ret)
+		}
+		_ => .None
+	}
+
+	fn firstBareDyn(typeIds: &[ast::TypeId]): Option<ast::TypeId> = {
+		for typeId in typeIds do
+			if self.writtenBareDyn(typeId) is .Some(found) then
+				return found
+
+		return .None
+	}
+
+	/// Reports a `dyn` type anywhere but behind `&`, at the `dyn` as written
+	/// where it can be found. Returns whether it did.
 	var fn bareDyn(ty: Ty, typeId: ast::TypeId): bool = {
 		if !self.hasBareDyn(ty) then
 			return false
 
-		val span = self.ast.types[typeId].span
-		self.report(
-			Diagnostic::error(
-				UNSIZED_DYN,
-				"a `dyn` type must be borrowed",
-				span,
-				"a value of unknown type has no size of its own",
-			).withNote(
-				"a `dyn` value lives somewhere else, and is known by a pointer and a table of methods, so it exists only behind `&` or `&var`",
-			).withFix("borrow it", [Edit::insert(span.lo, "&")]),
+		val written = self.writtenBareDyn(typeId)
+		val at = written.unwrapOr(typeId)
+		val span = self.ast.types[at].span
+		var diagnostic = Diagnostic::error(
+			UNSIZED_DYN,
+			"a `dyn` type must be borrowed",
+			span,
+			"a value of unknown type has no size of its own",
+		).withNote(
+			"a `dyn` value lives somewhere else, and is known by a pointer and a table of methods, so it exists only behind `&` or `&var`",
 		)
+		// Borrowed where the whole type is the `dyn`; deeper in a type, as in
+		// `Vec<own<dyn Shape>>`, a `&` would make it a view, which is kept
+		// only where a view may be.
+		diagnostic = if at == typeId then
+			diagnostic.withFix("borrow it", [Edit::insert(span.lo, "&")])
+		else diagnostic.withHelp(
+			"to keep values of several kinds, make the kinds an enum; for one kind the caller chooses, take a type parameter",
+		)
+		self.report(diagnostic)
 		return true
 	}
 

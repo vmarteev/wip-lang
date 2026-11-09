@@ -509,7 +509,7 @@ extend Failure: Text {
 }
 
 fn main() = {
-    val failure = Failure::NotFound(String::of("a.txt"))
+    val failure = Failure::NotFound("a.txt")
     assert("error: \(failure)" == "error: no such file: a.txt")
     assert(Failure::Denied.toString() == "permission denied")
     assert(42.toString() == "42")
@@ -620,7 +620,7 @@ val long = [
 assert(long == ["bc", "def"])
 
 var described = Vec()
-for (index, word) in words.forwards().enumerate() do
+for (index, word) in words.indexed() do
     described.push("word \(index) of the list is `\(word)`, of \(word.len()) letters")
 
 assert(described.len() == 3)
@@ -744,11 +744,11 @@ fn names(): Vec<String> = ["ada", "bob"]
 
 fn main() = {
     var sum = 0
-    for (i, p) in PRIMES.forwards().enumerate() do
+    for (i, p) in PRIMES.indexed() do
         sum += i * p
 
     var letters = 0
-    for (i, name) in names().items().forwards().enumerate() do
+    for (i, name) in names().items().indexed() do
         letters += i + name.len()
 
     assert(sum == 34 && letters == 7)

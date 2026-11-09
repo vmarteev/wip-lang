@@ -642,6 +642,8 @@ binder      = IDENT ( ":" pattern )? | keyword ":" pattern | "var" IDENT | patte
 args        = arg ( "," arg )* ( "," ".." expr )? ","?
             | ".." expr ","? ;
 arg         = ( fieldName ":" )? expr ; (* a named argument; positional ones come first *)
+            | fieldName ":" ;     (* before a `,` or the `)`: the named argument
+                                     whose value is the name, `x:` for `x: x` *)
             (* a call whose callee names a struct or a variant builds it, its
                arguments its fields; `..base` gives the fields it does not
                name, last and once *)

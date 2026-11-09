@@ -6,6 +6,14 @@
 // a program loads in the next, which may have a field more or one less: it
 // is read by name, in any order, as JSON is, in less room and with no text
 // to parse.
+//
+// A name — a field's, a variant's — is written in full once, and where it
+// comes again, as where it was: a list of a thousand records spells their
+// fields' names once. Where it was is a place in the bytes, not a number in
+// a table, so the decoder, which passes over values and comes back to them,
+// reads a name wherever it meets it, in any order.
+
+import std::collections::{Map}
 
 // The byte before each value.
 val NOTHING: u8 = 0
@@ -21,17 +29,45 @@ val MAP: u8 = 9
 val RECORD: u8 = 10
 val VARIANT: u8 = 11
 
+/// The first byte of what is written since names are written once. Bytes
+/// that start with any other were written before, each name in full, and
+/// are read so.
+val NAMED_ONCE: u8 = 12
+
+/// A writer whose bytes say how they are written.
+fn marked(): Writer = {
+	var out = Writer()
+	out.u8(NAMED_ONCE)
+	return out
+}
+
 /// Writes a value in the binary format.
 pub struct BinaryEncoder {
-	out: Writer = Writer()
+	out: Writer = marked()
+	/// Where each name was first written, which a later use says.
+	names: Map<String, i64> = Map()
 }
 
 extend BinaryEncoder {
 	/// What it has written, handed over.
 	pub move fn take(): Vec<u8> = self.out.take()
 
-	var fn name(text: str) = {
+	/// A text: its length, and its bytes.
+	var fn chars(text: str) = {
 		self.varint(text.len() as u64)
+		self.out.bytes(&text.items())
+	}
+
+	/// A name: where it is met first, its length twice over and its bytes;
+	/// after, where that was, twice over and one, so the low bit says which.
+	var fn name(text: str) = {
+		val key = String::of(text)
+		if self.names.get(&key) is .Some(at) {
+			self.varint(((at as u64) << 1) | 1)
+			return
+		}
+		self.names.put(key, self.out.len())
+		self.varint((text.len() as u64) << 1)
 		self.out.bytes(&text.items())
 	}
 
@@ -73,7 +109,7 @@ extend BinaryEncoder: Encoder {
 
 	var fn text(value: str) = {
 		self.out.u8(TEXT)
-		self.name(value)
+		self.chars(value)
 	}
 
 	var fn nothing() = self.out.u8(NOTHING)
@@ -123,6 +159,9 @@ pub view struct BinaryDecoder {
 	read: Reader
 	/// For each sequence, map or record being read: what is left of it.
 	reading: Vec<Reading> = Vec()
+	/// Whether each name is written once and said where it was after, as
+	/// the bytes' first says; or each in full, as they were written before.
+	namedOnce: bool = false
 }
 
 /// A sequence's elements left, a map's entries left, or a record's fields,
@@ -135,7 +174,14 @@ enum Reading {
 
 extend BinaryDecoder {
 	/// A decoder of `bytes`.
-	pub static fn of(bytes: &[u8]): BinaryDecoder = BinaryDecoder(read: Reader::of(&bytes))
+	pub static fn of(bytes: &[u8]): BinaryDecoder = {
+		var decoder = BinaryDecoder(read: Reader::of(&bytes))
+		if !bytes.isEmpty() && bytes[0] == NAMED_ONCE {
+			decoder.namedOnce = true
+			decoder.read.seek(1)
+		}
+		return decoder
+	}
 
 	fn error(
 		message: str,
@@ -176,15 +222,45 @@ extend BinaryDecoder {
 		return value
 	}
 
-	/// A name or a text: its length, and its bytes.
-	var fn name(): Result<String, BinaryError> = {
+	/// A text: its length, and its bytes.
+	var fn chars(): Result<String, BinaryError> = {
 		val length = self.count()?
+		return self.charsOf(length)
+	}
+
+	/// The next `length` bytes, as text.
+	var fn charsOf(length: i64): Result<String, BinaryError> = {
 		val .Some(bytes) = self.read.bytes(length) else {
 			return .Err(self.error("the bytes end in a text"))
 		}
 		val text = str::fromBytes(&bytes.items())
 		return if text.isValidUtf8() then String::of(text)
 		else .Err(self.error("a text is not UTF-8"))
+	}
+
+	/// A name: written in full, or where it was written before, which is
+	/// read there and left again.
+	var fn name(): Result<String, BinaryError> = {
+		if !self.namedOnce then
+			return self.chars()
+
+		val written = self.varint()?
+		if written & 1 == 0 then
+			return self.charsOf((written >> 1) as% i64)
+
+		val back = self.read.position()
+		val at = (written >> 1) as% i64
+		if at >= back || self.read.seek(at).isNone() then
+			return .Err(self.error("a name says it was written where nothing was"))
+
+		val first = self.varint()
+		val name: Result<String, BinaryError> = match move first {
+			.Ok(full) if full & 1 == 0 => self.charsOf((full >> 1) as% i64)
+			.Ok(_) => .Err(self.error("a name says it was written where another name says so"))
+			.Err(error) => .Err(error)
+		}
+		self.read.seek(back)
+		return name
 	}
 
 	/// Passes over the next value, whatever it is.
@@ -281,7 +357,7 @@ extend BinaryDecoder: Decoder<BinaryError> {
 
 	var fn text(): Result<String, BinaryError> = {
 		self.expect(TEXT, "text")?
-		return self.name()
+		return self.chars()
 	}
 
 	var fn nothing(): Result<bool, BinaryError> = {
@@ -327,7 +403,7 @@ extend BinaryDecoder: Decoder<BinaryError> {
 			fields.push((field, self.read.position()))
 			self.skip()?
 		}
-		self.reading.push(.Fields(fields: fields, end: self.read.position()))
+		self.reading.push(.Fields(fields:, end: self.read.position()))
 	}
 
 	var fn field(name: str): Result<bool, BinaryError> = {

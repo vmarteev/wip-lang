@@ -627,10 +627,12 @@ module.exports = grammar({
 
     rest_argument: $ => seq('..', $._expression),
 
+    // `name: value`, or `name:` alone before a `,` or the `)`, whose value
+    // is the variable of that name.
     named_argument: $ => seq(
       field('name', choice($.identifier, $._keyword_field)),
       ':',
-      field('value', $._expression),
+      optional(field('value', $._expression)),
     ),
 
     // `x.decode<T>(…)`: a method's type arguments, which win where the

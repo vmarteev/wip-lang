@@ -336,7 +336,7 @@ so the line printed is the caller's ([page 3](03-functions.md#the-callers-place)
 
 ```wip,run
 fn expectPositive(value: i64, implicit at: Location): i64 =
-    if value > 0 then value else panic("\(value) is not positive", at: at)
+    if value > 0 then value else panic("\(value) is not positive", at:)
 
 fn main() = {
     assert(expectPositive(3) == 3)

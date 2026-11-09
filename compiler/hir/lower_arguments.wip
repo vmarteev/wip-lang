@@ -14,6 +14,7 @@ import syntax::{
 	Edit,
 	INVALID_DEFAULT,
 	MISMATCHED_TYPES,
+	NAME_SAID_TWICE,
 	NO_IMPLICIT,
 	Span,
 	Symbol,
@@ -67,7 +68,7 @@ extend Matched {
 
 /// The slot of a name, among `slots`.
 fn slotNamed(slots: &[Slot], sym: Symbol): Option<i64> = {
-	for (i, s) in slots.forwards().enumerate() do
+	for (i, s) in slots.indexed() do
 		if s.name == sym then
 			return i
 
@@ -92,7 +93,7 @@ extend Lowerer {
 		]
 		var matched = Matched(slots: slotted, unmatched: Vec(), extra: 0, unknown: false)
 		var positional = 0
-		for (i, name) in names.forwards().enumerate() {
+		for (i, name) in names.indexed() {
 			// `f(style = x)`, meant as `f(style: x)`: an assignment to a
 			// parameter's name, where nothing of that name is in scope.
 			var meant: Option<Symbol> = .None
@@ -148,6 +149,7 @@ extend Lowerer {
 					}
 					slot = found
 					matched.named.push(found)
+					self.nameSaidTwice(&n, args[i])
 				}
 				meant is .Some(sym) => {
 					slot = slotNamed(&slots, sym).unwrap()
@@ -276,7 +278,7 @@ extend Lowerer {
 		var values: Vec<ExprId> = Vec()
 		var written: Vec<(i64, u32)> = Vec()
 		var rest: Vec<u32> = Vec()
-		for (slot, arg) in matched.slots.forwards().enumerate() {
+		for (slot, arg) in matched.slots.indexed() {
 			val value = match arg {
 				.Some(a) => {
 					written.push((a, slot as u32))
@@ -442,10 +444,10 @@ extend Lowerer {
 			}
 			val ret = self.program.types.subst(self.program.fns[callee].ret, &args)
 			self.state.body.exprs[call].kind = .Call(
-				callee: callee,
+				callee:,
 				args: callArgs,
 				typeArgs: list,
-				order: order,
+				order:,
 			)
 			self.state.body.exprs[call].ty = ret
 		}
@@ -461,12 +463,12 @@ extend Lowerer {
 			else self.program.types.subst(exprs[id].ty, &typeArgs)
 		val kind: ExprKind = match exprs[id].kind {
 			.Unary(op, operand) => .Unary(
-				op: op,
+				op:,
 				operand: self.copyDefault(&exprs, operand, span, &typeArgs),
 			)
 			.Variant(id: enumId, variant, args, order) => .Variant(
 				id: enumId,
-				variant: variant,
+				variant:,
 				args: args.map((a) => self.copyDefault(&exprs, a, span, &typeArgs)),
 				order: order.clone(),
 			)
@@ -478,7 +480,13 @@ extend Lowerer {
 			.Array(elems) => .Array(elems.map((e) => self.copyDefault(&exprs, e, span, &typeArgs)))
 			.ArrayRepeat(elem, count) => .ArrayRepeat(
 				elem: self.copyDefault(&exprs, elem, span, &typeArgs),
-				count: count,
+				count:,
+			)
+			// A lent closure's default: the function, with an environment of
+			// nothing built where the call is.
+			.Closure(id: code, env) => .Closure(
+				id: code,
+				env: self.copyDefault(&exprs, env, span, &typeArgs),
 			)
 			other => other.clone()
 		}
@@ -486,13 +494,14 @@ extend Lowerer {
 	}
 
 	/// Whether a parameter may have a default at all: a C function's may not,
-	/// nor may a reference parameter, which a value would not be a place for.
-	/// What is refused is reported.
+	/// nor may a reference parameter, which a value would not be a place for,
+	/// but a lent closure's, whose default is a function that captures
+	/// nothing and needs no place. What is refused is reported.
 	var fn defaultAllowed(value: ast::ExprId, ty: Ty, param: &ast::Param, isExtern: bool): bool = {
 		val span = self.ast.exprs[value].span
 		val refusal: Option<str> =
 			if isExtern then "a C function's parameters have no defaults"
-			else if self.kind(ty) is .Ref(..) then
+			else if self.kind(ty) is .Ref(..) && !self.isLentClosure(ty) then
 				"a reference parameter has no default: a value is not a place"
 			else .None
 		if refusal is .Some(message) {
@@ -505,6 +514,23 @@ extend Lowerer {
 			return false
 		}
 		return true
+	}
+
+	/// Whether a type is a closure lent for a call, `&(…) => R` or `&var (…)
+	/// => R`.
+	fn isLentClosure(ty: Ty): bool = self.kind(ty) is .Ref(inner, ..) && self.kind(inner) is .Fn(..)
+
+	/// Whether a checked default of a lent closure is a function that
+	/// captures nothing: a lambda whose environment is empty, or a function
+	/// named, lent with an environment of nothing. Not one generic in what
+	/// it belongs to, whose instance the caller could not make.
+	fn plainFunction(exprs: &Arena<Expr>, root: ExprId, body: &Body): bool = {
+		val .Closure(id: code, env) = exprs[root].kind else return false
+		val .Struct(fields, ..) = exprs[env].kind else return false
+		if !fields.isEmpty() then
+			return false
+
+		return self.program.fns[code].generics.isEmpty() && !body.closureTypeArgs.contains(&root)
 	}
 
 	/// A default, checked as a value of the type it is for, once every
@@ -522,14 +548,49 @@ extend Lowerer {
 		// the default is.
 		self.state.ret = ty
 		self.state.retSpan = .None
+		val errors = self.errorsReported()
 		val root = self.check(value, ty)
+		val refused = self.errorsReported() > errors
 		val constant = self.isConstant(root)
 		var body = mem::replace(&var self.state.body, outer)
 		self.state.scopes = scopes
 		self.state.ret = ret
 		self.state.retSpan = retSpan
+		// A lent closure's default is copied into each call that leaves it
+		// out, its empty environment the caller's, as an argument's is; a
+		// value that captures has nothing in the signature to capture from.
+		if self.isLentClosure(ty) {
+			if self.plainFunction(&body.exprs, root, &body) then
+				return .Constant(exprs: body.exprs, root:)
+
+			// What was wrong with the value is said already.
+			if refused then
+				return .None
+
+			// A lambda of a generic function is generic in its parameters, and
+			// the call that leaves it out could not make its instance.
+			val generic = body.exprs[root].kind is .Closure(..) && !self.typeParams.isEmpty()
+			val diagnostic =
+				if generic then
+					Diagnostic::error(
+						INVALID_DEFAULT,
+						"a lent closure's default in a generic function is a function's name",
+						span,
+						"a lambda of a generic function",
+					).withHelp("declare the function outside, and name it here")
+				else Diagnostic::error(
+					INVALID_DEFAULT,
+					"a lent closure's default is a lambda or a function's name",
+					span,
+					"another value",
+				).withNote(
+					"a default is lent to the call that leaves it out, and a function that captures nothing is the one value lent with nothing behind it",
+				)
+			self.report(diagnostic)
+			return .None
+		}
 		if constant then
-			return .Constant(exprs: body.exprs, root: root)
+			return .Constant(exprs: body.exprs, root:)
 
 		body.value = root
 		val code = self.program.fns.add(FnDef(
@@ -560,12 +621,12 @@ extend Lowerer {
 			isInline: false,
 			generated: .None,
 			intrinsic: .None,
-			body: body,
+			body:,
 			projects: .None,
 			compileTime: false,
 			module: self.current as u32,
 			isPub: false,
-			span: span,
+			span:,
 		))
 		return .Code(code)
 	}
@@ -584,6 +645,51 @@ extend Lowerer {
 		.ArrayRepeat(elem, ..) => self.isConstant(elem)
 		_ => false
 	}
+
+	/// E0485: a named argument whose value is the variable of its name,
+	/// `x: x`, which `x:` says. Not one written so already, whose value is
+	/// at the name's own span, nor what `@derive` writes, nor one the parser
+	/// made of an interpolation's options, whose names the program did not
+	/// write where they stand.
+	var fn nameSaidTwice(name: &ast::Name, value: ast::ExprId) = {
+		val written = &self.ast.exprs[value]
+		val .Name(symbol) = written.kind else return
+		if symbol != name.sym || written.span == name.span then
+			return
+
+		if self.inDerived() || !self.writtenAt(name.sym, name.span.lo) then
+			return
+
+		val text = self.text(name.sym)
+		self.report(
+			Diagnostic::warning(
+				NAME_SAID_TWICE,
+				"`\(text): \(text)` is `\(text):`",
+				Span::new(name.span.lo, written.span.hi),
+				"the name, and a value of the same name",
+			).withNote(
+				"a named argument written `name:`, before a `,` or the `)`, is given the value of that name",
+			).withFix("write the name once", [
+				Edit::replace(Span::new(name.span.hi, written.span.hi), ":"),
+			]),
+		)
+	}
+
+	/// Whether the file writes `sym` at `at`: its identifiers are kept in the
+	/// order they are written, so it is looked for by halves.
+	fn writtenAt(sym: Symbol, at: u32): bool = {
+		val written = &self.ast.identifiers
+		var lo = 0
+		var hi = written.len()
+		while lo < hi {
+			val middle = (lo + hi) / 2
+			if written[middle].1 < at then
+				lo = middle + 1
+			else
+				hi = middle
+		}
+		return lo < written.len() && written[lo].1 == at && written[lo].0 == sym
+	}
 }
 
 /// The parameter a value given at `at` is named as, where it is another
@@ -593,7 +699,7 @@ fn paramElsewhere(params: &[ParamDef], given: &[Option<Symbol>], at: i64): Optio
 		return .None
 
 	val .Some(sym) = given[at] else return .None
-	for (other, p) in params.forwards().enumerate() do
+	for (other, p) in params.indexed() do
 		if p.name == sym then
 			return if other != at then other else .None
 

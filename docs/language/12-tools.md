@@ -646,9 +646,13 @@ compiler would make (E0451), a copy where a move would do (E0448), a
 without being told, as `Eq` on an enum of names or `Clone` on plain data
 (E0467), a character literal made a byte, `'[' as u8` for `b'['` (E0468),
 a `.Some(value)` or an `.Ok(value)` where the type expected says it, and a
-`return .Ok()` where the result is a `Result<void, E>` (E0469), what is
-never used but a function (E0470 to E0474), and a lambda that only calls a
-function with its parameters, which the function's name says (E0478,
+`return .Ok()` where the result is a `Result<void, E>` (E0469), a
+`String::of(text)` or a `Vec::of([…])` where the type expected says it
+(E0483 and E0484), a list walked by `forwards().enumerate()`, which its
+`indexed()` is (E0482), a named argument `x: x`, which `x:` says
+(E0485, [page 3](03-functions.md#arguments)), what is never used but a
+function (E0470 to E0474), and a lambda that only calls a function with
+its parameters, which the function's name says (E0478,
 [page 3](03-functions.md#functions-as-values)); and loops that say in
 several lines what a value says in one: a `Vec` declared empty and filled
 by the loop after it, of a few statements, which the list that yields is

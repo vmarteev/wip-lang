@@ -322,7 +322,7 @@ view struct Words {
 }
 
 extend Words {
-    static fn of(text: str): Words = Words(text: text, at: 0)
+    static fn of(text: str): Words = Words(text:, at: 0)
 
     fn rest(): str = self.text[self.at..]
 }
@@ -397,7 +397,7 @@ extend Tree {
 }
 
 fn main() = {
-    val tree = Tree([Node(size: 3, name: String::of("root"))])
+    val tree = Tree([Node(size: 3, name: "root")])
     var name = String::of("a")
     val found = tree.first(name.toStr())
     name.clear()

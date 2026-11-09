@@ -2,6 +2,56 @@
 
 Each version published, newest first.
 
+## 0.15.0 — 2026-11-09
+
+Programs written for 0.14 compile as they did, but where marked
+**breaking**; the compiler's errors say what to write instead, and `wip
+fix` writes the rest.
+
+**The language**
+
+- **A named argument whose value is the variable of its name is written
+  once:** `Point(x:, y:)`, `Log(least:, write:)`, in a call, a struct's
+  and a variant's build and `panic`'s `at`. `x: x` is a warning (E0485),
+  and `wip fix` writes `x:`; so do the fixes that build a struct.
+- **A closure lent for the call may have a default:** a parameter of
+  type `&(…) => R` or `&var (…) => R` may default to a lambda that
+  captures nothing or a function's name, so a builder's children, where
+  most elements have none, say so once. Any other default for a
+  reference is still refused (E0330).
+- **A `dyn` is only behind a reference, wherever it is written:** inside
+  a type's arguments, `Vec<own<dyn Shape>>`, and in a function type's
+  parts, as well as in a field, a parameter or a result, and in a local's,
+  a constant's and a type argument's type. The error points at the `dyn`
+  and says what to write instead: an enum of the kinds, or a type
+  parameter. **Breaking:** these were accepted before (E0344).
+
+**The library**
+
+- **A module for logs, `std::log`.** A `Log` keeps records at its least
+  level or above and writes them to standard error (`Log::toStderr()`),
+  to the system's log through `syslog` (`Log::toSystem()`), or to a
+  closure of the program's own (`Log::to`); `Log::none()` keeps nothing.
+  A function that logs takes the program's log as `implicit log: &Log`,
+  and each record knows the file and line of the call that made it. One
+  log is shared by every thread it is lent to.
+- **A walk with positions,** `values.indexed()`, of a slice, an array
+  and a `Vec`: each element lent with its index. `forwards().enumerate()`
+  on a list is a warning (E0482), and `wip fix` writes `indexed()`.
+- **The binary format spells each name once:** a field's or a variant's
+  name is written in full the first time it comes, and as the place it
+  was written each time after, so a list of a thousand records spells its
+  fields' names once. Bytes written by an earlier version are read as
+  they were.
+
+**The tools**
+
+- **Shorter forms:** `String::of(text)` of a `str` where a `String` is
+  expected (E0483) and `Vec::of` of a list written where a `Vec` is
+  (E0484) are warnings, and `wip fix` takes them away.
+- **An empty list whose annotation was refused** is no longer also told
+  it needs one (E0315).
+
 ## 0.14.0 — 2026-11-06
 
 Programs written for 0.13 compile as they did, but where marked
