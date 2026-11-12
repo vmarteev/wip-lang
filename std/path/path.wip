@@ -74,6 +74,213 @@ pub fn isWithin(path: str, dir: str): bool = {
 	return inner.len() > outer.len() && inner.startsWith(outer) && inner[outer.len()] == b'/'
 }
 
+/// The path written plainly, by its text alone: doubled `/`s are one, `.`
+/// is left out, `..` takes away the name before it, a `..` at the root is
+/// the root and one at the start of a relative path stays, a `/` at the
+/// end goes, and the empty path is `.`. `/a/./b//c/../d/` is `/a/b/d`. A
+/// `..` after a link is taken as the name's parent, as nothing here asks
+/// the disk; `fs::realPath` follows links.
+pub fn clean(path: str): String = {
+	val rooted = path.startsWith("/")
+	var kept: Vec<str> = Vec()
+	for part in path.split("/") {
+		if part.isEmpty() || part == "." then
+			continue
+
+		if part != ".." then
+			kept.push(part)
+		else if kept.last() is .Some(last) && last != ".." then
+			kept.pop()
+		else if !rooted then
+			kept.push(part)
+	}
+	val names = kept.join("/")
+	return if rooted then "/\(names)" else if names.isEmpty() then "." else names
+}
+
+/// `path` from `dir`, where it is within it, name by name as `isWithin`
+/// says: `b/c.txt` of `/a/b/c.txt` from `/a`, the empty text for `dir`
+/// itself, and nothing for a path outside it. Both are taken as written,
+/// so a caller whose paths may hold `.` or `..` cleans them first.
+pub fn relative(path: str, dir: str): Option<str> = {
+	if !isWithin(path, dir) then
+		return .None
+
+	val inner = trimmed(path)
+	val outer = trimmed(dir)
+	if inner == outer then
+		return ""
+
+	val start = if outer == "/" then 1 else outer.len() + 1
+	return inner[start..inner.len()]
+}
+
+/// The path with its name's extension replaced by `extension`, or with it
+/// added where the name has none: `a/b.o` of `a/b.wip`, and
+/// `a/.bashrc.bak` of `a/.bashrc`, by `extension`'s rule for what one is.
+pub fn withExtension(path: str, extension: str): String = {
+	val whole = trimmed(path)
+	val base = name(whole)
+	val end = match lastDot(base) {
+		.Some(at) => whole.len() - base.len() + at
+		.None => whole.len()
+	}
+	return "\(whole[0..end]).\(extension)"
+}
+
+/// Whether `path` matches the glob `pattern` as git matches one, the
+/// whole path: `*` is any run of what is not `/`, `?` one character but
+/// `/`, `[…]` one character of a set, with ranges, and `[!…]` or `[^…]`
+/// one outside it, and `**`, alone between `/`s or at an end, any number
+/// of whole directories, none among them. `\` takes the character after
+/// it as it is, and a `[` with no `]` is itself, as the shells take it.
+pub fn matches(pattern: str, path: str): bool = matchesFrom(pattern, 0, path, 0)
+
+fn matchesFrom(pattern: str, p: i64, path: str, t: i64): bool = {
+	var pi = p
+	var ti = t
+	while pi < pattern.len() {
+		val c = pattern[pi]
+		if c == b'*' {
+			// `**` alone between slashes, or at an end, is any number of
+			// directories; anywhere else it is `*`.
+			val double = pattern.get(pi + 1) == b'*'
+			val alone =
+				(pi == 0 || pattern[pi - 1] == b'/') &&
+				(pi + 2 == pattern.len() || pattern.get(pi + 2) == b'/')
+			if double && alone {
+				if pi + 2 == pattern.len() then
+					return true
+
+				// `**/`: the rest here, or after each `/` further on.
+				val rest = pi + 3
+				if matchesFrom(pattern, rest, path, ti) then
+					return true
+
+				for at in ti..path.len() do
+					if path[at] == b'/' && matchesFrom(pattern, rest, path, at + 1) then
+						return true
+
+				return false
+			}
+			var next = pi + 1
+			while pattern.get(next) == b'*' do
+				next += 1
+
+			// Any run of what is not `/`, the shortest first.
+			var at = ti
+			while true {
+				if matchesFrom(pattern, next, path, at) then
+					return true
+
+				if at >= path.len() || path[at] == b'/' then
+					return false
+
+				at += charLength(path, at)
+			}
+		}
+		if ti >= path.len() then
+			return false
+
+		if c == b'?' {
+			if path[ti] == b'/' then
+				return false
+
+			pi += 1
+			ti += charLength(path, ti)
+			continue
+		}
+		if c == b'[' {
+			val (inSet, after) = inClass(pattern, pi, path, ti)
+			if after < 0 {
+				// No `]`: the `[` is itself.
+				if path[ti] != b'[' then
+					return false
+
+				pi += 1
+				ti += 1
+				continue
+			}
+			if !inSet then
+				return false
+
+			pi = after
+			ti += charLength(path, ti)
+			continue
+		}
+		var literal = c
+		if c == b'\\' && pi + 1 < pattern.len() {
+			pi += 1
+			literal = pattern[pi]
+		}
+		if path[ti] != literal then
+			return false
+
+		pi += 1
+		ti += 1
+	}
+	return ti == path.len()
+}
+
+/// Whether the character at `ti` is in the set `[…]` that begins at `pi`,
+/// and where the pattern goes on after it; -1 where the set is not closed.
+fn inClass(pattern: str, pi: i64, path: str, ti: i64): (bool, i64) = {
+	val (subject, _) = path.charAt(ti)
+	if subject == '/' then
+		return (false, closing(pattern, pi))
+
+	var at = pi + 1
+	var negated = false
+	if at < pattern.len() && (pattern[at] == b'!' || pattern[at] == b'^') {
+		negated = true
+		at += 1
+	}
+	var found = false
+	var first = true
+	while at < pattern.len() {
+		if pattern[at] == b']' && !first then
+			return (found != negated, at + 1)
+
+		first = false
+		var (low, width) = pattern.charAt(at)
+		if low == '\\' && at + 1 < pattern.len() {
+			at += 1
+			val (escaped, escapedWidth) = pattern.charAt(at)
+			low = escaped
+			width = escapedWidth
+		}
+		at += width
+		var high = low
+		if at + 1 < pattern.len() && pattern[at] == b'-' && pattern[at + 1] != b']' {
+			val (upper, upperWidth) = pattern.charAt(at + 1)
+			high = upper
+			at += 1 + upperWidth
+		}
+		if subject >= low && subject <= high then
+			found = true
+	}
+	return (false, -1)
+}
+
+/// Where the set that begins at `pi` ends, after its `]`; -1 where it does
+/// not.
+fn closing(pattern: str, pi: i64): i64 = {
+	var at = pi + 2
+	while at < pattern.len() {
+		if pattern[at] == b']' then
+			return at + 1
+
+		at += 1
+	}
+	return -1
+}
+
+/// How many bytes the character at `at` takes.
+fn charLength(text: str, at: i64): i64 = {
+	val (_, width) = text.charAt(at)
+	return width
+}
+
 /// The path without the `/`s it ends with, but the root's own.
 fn trimmed(path: str): str = {
 	var end = path.len()

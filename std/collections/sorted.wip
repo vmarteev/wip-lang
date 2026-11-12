@@ -1,0 +1,352 @@
+// A map and a set kept in the order of their keys, written in Wip over
+// `Vec<T>` and `Ord`.
+//
+// They answer what `Map` and `Set` answer, by the same names, but their
+// entries lie in the order of their keys rather than the order they went
+// in, found by halves: `for entry in map` visits the least key first,
+// whatever order the keys were put in. A lookup is a binary search, and a
+// new key moves the entries after it, as `Vec::insert` does; a list
+// collected into one is sorted once. What only an order answers is theirs
+// alone: the first and last entries, and the positions from a key and
+// between two.
+
+import std::iter::{Taking}
+
+/// Keys and the values under them, in the order of the keys.
+/// `SortedMap()` is an empty one, which takes no memory until a key goes
+/// in.
+pub struct SortedMap<K: Ord, V> {
+	// The entries, in the order of their keys, kept in the part `values()`
+	// lends.
+	row: MapValues<K, V> = MapValues(Vec())
+}
+
+extend SortedMap<K, V>: Items<MapEntry<K, V>> {
+	// The entries, lent as a slice, which is what `for entry in map`
+	// walks.
+	fn items(): &[MapEntry<K, V>] = lend self.row.entries.items()
+}
+
+// `for (key, value) in move map`: each entry, as a `MapEntry`, the loop's
+// to keep, in the order of the keys.
+extend SortedMap<K, V>: IntoIterator<Taking<MapEntry<K, V>>> {
+	move fn intoIterator(): Taking<MapEntry<K, V>> = {
+		val all = self
+		return (all.row.entries).intoIterator()
+	}
+}
+
+// Each pair's value under its key, a later value for a key in the place of
+// an earlier, as `put` keeps it; sorted once, however many there are.
+extend SortedMap<K, V>: Collect<(K, V)> {
+	static fn collect<I: Iterator<(K, V)>>(pairs: I): SortedMap<K, V> = {
+		var entries: Vec<MapEntry<K, V>> = [
+			for (key, value) in move pairs do
+				yield MapEntry(key:, value:)
+		]
+
+		// The sort keeps the order of equal keys, so the last of each run is
+		// the one put last.
+		entries.sortBy((a, b) => a.key.compare(&b.key).isLess())
+		var kept: Vec<MapEntry<K, V>> = .withCapacity(entries.len())
+		for entry in move entries {
+			if kept.last() is .Some(last) && last.key.compare(&entry.key).isSame() then
+				kept[kept.len() - 1] = entry
+			else
+				kept.push(entry)
+		}
+		return SortedMap(row: MapValues(kept))
+	}
+}
+
+extend SortedMap<K, V> {
+	/// The values, to walk one at a time in the order of their keys: `for
+	/// count in counts.values()` writes each in a `var`.
+	pub lend fn values(): &MapValues<K, V> = lend self.row
+
+	/// The key at position `at`, counted from 0 in the order of the keys.
+	pub fn keyAt(at: i64): &K = lend self.row.entries.at(at).key
+
+	/// The value at position `at`.
+	pub lend fn valueAt(at: i64): &V = lend self.row.entries.at(at).value
+
+	/// How many keys the map holds.
+	pub fn len(): i64 = self.row.entries.len()
+
+	/// Whether the map holds no keys.
+	pub fn isEmpty(): bool = self.row.entries.isEmpty()
+
+	/// Whether the map holds `key`.
+	pub fn contains(key: &K): bool = self.indexOf(&key).isSome()
+
+	/// Where `key`'s entry is, or nothing where the map does not hold it,
+	/// found by halves. The position holds until a key before it is put or
+	/// removed.
+	pub fn indexOf(key: &K): Option<i64> = match self.search(&key) {
+		.Ok(at) => at
+		.Err(_) => .None
+	}
+
+	/// The value under `key`, by reference, or nothing where the map does
+	/// not hold it.
+	pub fn get(key: &K): Option<&V> = match self.search(&key) {
+		.Ok(at) => &self.row.entries.at(at).value
+		.Err(_) => .None
+	}
+
+	/// The value under `key`, or a panic when there is none, to read or to
+	/// write: `map.at(key) = value`.
+	pub lend fn at(key: &K): &V = {
+		val .Ok(position) = self.search(&key) else panic("no such key in the map")
+		lend self.row.entries.at(position).value
+	}
+
+	/// The entry of the least key, or nothing where the map is empty.
+	pub fn first(): Option<&MapEntry<K, V>> = self.row.entries.first()
+
+	/// The entry of the greatest key, or nothing where the map is empty.
+	pub fn last(): Option<&MapEntry<K, V>> = self.row.entries.last()
+
+	/// The position of the first key that is not less than `key`: every key
+	/// before it is less, and `len()` where every key is.
+	pub fn positionOf(key: &K): i64 = match self.search(&key) {
+		.Ok(at) => at
+		.Err(at) => at
+	}
+
+	/// The positions of the keys from `from`, and up to, not including,
+	/// `to`: empty where `to` is not after `from`.
+	pub fn within(from: &K, to: &K): Range<i64> = {
+		val start = self.positionOf(&from)
+		return start..self.positionOf(&to).max(start)
+	}
+
+	/// Puts `value` under `key`, dropping the value that was there.
+	pub var fn put(key: K, value: V) keeps value, key = match self.search(&key) {
+		.Ok(at) => self.row.entries.at(at).value = value
+		.Err(at) => self.row.entries.insert(at, MapEntry(key:, value:))
+	}
+
+	/// The value under `key`, put there first where there was none: what
+	/// counting is written with, `map.atOrPut(word, 0) += 1`.
+	pub var fn atOrPut(key: K, value: V): &var V keeps key, value = {
+		val at = match self.search(&key) {
+			.Ok(at) => at
+			.Err(at) => {
+				self.row.entries.insert(at, MapEntry(key:, value:))
+				at
+			}
+		}
+		lend self.row.entries.at(at).value
+	}
+
+	/// The value under `key`, made by `make` and put there first where
+	/// there was none; `make` is not called where there is one.
+	pub var fn atOrPutWith(key: K, make: &var () => V): &var V keeps key = {
+		val at = match self.search(&key) {
+			.Ok(at) => at
+			.Err(at) => {
+				self.row.entries.insert(at, MapEntry(key:, value: make()))
+				at
+			}
+		}
+		lend self.row.entries.at(at).value
+	}
+
+	/// Takes `key` out, with the value it held. The keys after it each move
+	/// one place forward, so this costs the entries after it.
+	pub var fn remove(key: &K): Option<V> = {
+		val .Ok(at) = self.search(&key) else return .None
+		val entry = self.row.entries.remove(at)
+		return entry.value
+	}
+
+	/// Keeps the entries `keep` answers `true` for, in their order, and
+	/// drops the rest.
+	pub var fn retain(keep: &(key: &K, value: &V) => bool) = self.row.entries.retain(
+		(entry) => keep(&entry.key, &entry.value),
+	)
+
+	/// Ends every key and value, keeping the memory.
+	pub var fn clear() empties = self.row.entries.clear()
+
+	/// What it holds, leaving it empty, as `Option`'s `take` leaves
+	/// nothing.
+	pub var fn takeAll(): SortedMap<K, V> empties = {
+		val all = self
+		self = SortedMap()
+		return all
+	}
+
+	// Where `key` is, or would go.
+	fn search(key: &K): Result<i64, i64> = self.row.entries.binarySearchBy(
+		(entry) => entry.key.compare(&key),
+	)
+}
+
+// A map's entries, each key and value cloned, in their order.
+extend SortedMap<K: Clone, V: Clone>: Clone {
+	fn clone(): SortedMap<K, V> = SortedMap(
+		row: MapValues([
+			for entry in self.row.entries do
+				yield MapEntry(key: entry.key.clone(), value: entry.value.clone())
+		]),
+	)
+}
+
+// Two maps are equal where they have the same keys, each with an equal
+// value under it: entry by entry, since both are in the order of their
+// keys.
+extend SortedMap<K, V: Eq>: Eq {
+	fn equals(other: &SortedMap<K, V>): bool = {
+		if self.len() != other.len() then
+			return false
+
+		for at in 0..self.len() {
+			if !self.keyAt(at).compare(&other.keyAt(at)).isSame() ||
+				self.valueAt(at) != other.valueAt(at) {
+				return false
+			}
+		}
+
+		return true
+	}
+}
+
+/// Keys, each held once, in their order. `SortedSet()` is an empty one,
+/// which takes no memory until a key goes in.
+pub struct SortedSet<K: Ord> {
+	// The keys, in their order.
+	keys: Vec<K> = Vec()
+}
+
+extend SortedSet<K>: Items<K> {
+	// The keys, lent as a slice, which is what `for key in set` walks.
+	fn items(): &[K] = lend self.keys.items()
+}
+
+// `for key in move set`: each key, the loop's to keep, in their order.
+extend SortedSet<K>: IntoIterator<Taking<K>> {
+	move fn intoIterator(): Taking<K> = {
+		val all = self
+		return (all.keys).intoIterator()
+	}
+}
+
+// The elements an iterator hands out, each once, sorted once: the first of
+// equals is kept, as `add` keeps it.
+extend SortedSet<K>: Collect<K> {
+	static fn collect<I: Iterator<K>>(items: I): SortedSet<K> = {
+		var all: Vec<K> = [
+			for key in move items do
+				yield key
+		]
+
+		all.sortBy((a, b) => a.compare(&b).isLess())
+		var kept: Vec<K> = .withCapacity(all.len())
+		for key in move all {
+			if kept.last() is .Some(last) && last.compare(&key).isSame() then
+				destroy(key)
+			else
+				kept.push(key)
+		}
+		return SortedSet(keys: kept)
+	}
+}
+
+// A set is a sequence of its keys, in their order: `set.len()`, and
+// `set[i]` or `set.at(i)` for the key at position `i`. It is read only: a
+// key written in place could leave the keys out of order.
+extend SortedSet<K>: Sequence<K> {
+	/// How many keys the set holds.
+	fn len(): i64 = self.keys.len()
+
+	/// The key at position `i`, counted from 0.
+	fn at(i: i64): &K = lend self.keys.at(i)
+}
+
+extend SortedSet<K> {
+	/// Whether the set holds no keys.
+	pub fn isEmpty(): bool = self.keys.isEmpty()
+
+	/// Whether the set holds `key`.
+	pub fn contains(key: &K): bool = self.keys.binarySearch(&key).isOk()
+
+	/// Where `key` is, or nothing where the set does not hold it, found by
+	/// halves.
+	pub fn indexOf(key: &K): Option<i64> = match self.keys.binarySearch(&key) {
+		.Ok(at) => at
+		.Err(_) => .None
+	}
+
+	/// The least key, or nothing where the set is empty.
+	pub fn first(): Option<&K> = self.keys.first()
+
+	/// The greatest key, or nothing where the set is empty.
+	pub fn last(): Option<&K> = self.keys.last()
+
+	/// The position of the first key that is not less than `key`: every key
+	/// before it is less, and `len()` where every key is.
+	pub fn positionOf(key: &K): i64 = match self.keys.binarySearch(&key) {
+		.Ok(at) => at
+		.Err(at) => at
+	}
+
+	/// The positions of the keys from `from`, and up to, not including,
+	/// `to`: empty where `to` is not after `from`.
+	pub fn within(from: &K, to: &K): Range<i64> = {
+		val start = self.positionOf(&from)
+		return start..self.positionOf(&to).max(start)
+	}
+
+	/// Puts `key` in, and answers whether it was not there before.
+	pub var fn add(key: K): bool keeps key = match self.keys.binarySearch(&key) {
+		.Ok(_) => false
+		.Err(at) => {
+			self.keys.insert(at, key)
+			true
+		}
+	}
+
+	/// Takes `key` out, and answers whether it was there. The keys after it
+	/// each move one place forward.
+	pub var fn remove(key: &K): bool = match self.keys.binarySearch(&key) {
+		.Ok(at) => {
+			destroy(self.keys.remove(at))
+			true
+		}
+		.Err(_) => false
+	}
+
+	/// Keeps the keys `keep` answers `true` for, in their order.
+	pub var fn retain(keep: &(key: &K) => bool) = self.keys.retain(keep)
+
+	/// Ends every key, keeping the memory.
+	pub var fn clear() empties = self.keys.clear()
+
+	/// What it holds, leaving it empty.
+	pub var fn takeAll(): SortedSet<K> empties = {
+		val all = self
+		self = SortedSet()
+		return all
+	}
+}
+
+// A set's keys, each cloned, in their order.
+extend SortedSet<K: Clone>: Clone {
+	fn clone(): SortedSet<K> = SortedSet(keys: self.keys.clone())
+}
+
+// Two sets are equal where they hold the same keys, key by key.
+extend SortedSet<K>: Eq {
+	fn equals(other: &SortedSet<K>): bool = {
+		if self.len() != other.len() then
+			return false
+
+		for at in 0..self.len() do
+			if !self.keys[at].compare(&other.keys[at]).isSame() then
+				return false
+
+		return true
+	}
+}

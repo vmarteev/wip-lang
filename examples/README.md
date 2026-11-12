@@ -13,6 +13,7 @@ its tests run, with every change to the compiler.
 | [life](life) | Conway's Life: a lending `at`, a generator, a constant worked out while compiling, terminal frames |
 | [report-formats](report-formats) | dynamic dispatch with `&dyn`, beside the same code generic, and an interface's default method |
 | [http-hello](http-hello) | a tiny web server: `std::net`, threads that borrow with `future::each`, an `Atomic` |
+| [bookmarks](bookmarks) | a page and a feed built as `Html` and `Xml`: literals that build the type expected, each value escaped as its place needs, a page made of pieces |
 | [fetch](fetch) | a URL fetched with `std::http`, its body streamed through `io::copy` to a file or the terminal, over `https` too |
 | [parallel-sum](parallel-sum) | work on several threads three ways: `future::map`, `both` and `each` |
 | [shapes-package](shapes-package) | a program that is a package, depending on a library package, with `internal/` |

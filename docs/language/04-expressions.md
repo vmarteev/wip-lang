@@ -443,8 +443,9 @@ fn main() = {
 
 ## Text built where it is written
 
-A literal may hold expressions between `\(` and `)`. What they answer is
-appended through `Text`, and the whole is a `String`:
+A literal may hold expressions between `\(` and `)`, its holes. Where
+nothing else is expected the whole is a `String`, each hole's value written
+by its `Text`:
 
 ```wip,run
 val name = "world"
@@ -515,6 +516,64 @@ fn main() = {
     assert(42.toString() == "42")
 }
 ```
+
+### What a literal builds
+
+Where a type that implements the prelude's `Template` is expected, an
+interpolated literal builds that type instead. Its own text goes to the
+type's `pushLiteral` as it was written, and each hole's value to its
+`pushValue`, lent, with the hole's options as named arguments; a hole of
+the type itself goes to `pushBuilt`, joined as it is. So the type decides
+what a value becomes in it, and the literal reads as any other. A literal
+with no holes where a template is expected builds it too.
+
+`String` is a template, the one built where no other is expected: its
+`pushValue` takes any `Text`, and `width`, `fill` and `align`. A template
+of a program's own takes what it says. A query that binds each value as a
+parameter, never written into its text:
+
+```wip,run
+struct Query {
+    text: String = String()
+    bound: Vec<String> = Vec()
+}
+
+extend Query: Template {
+    static fn withCapacity(capacity: i64): Query = Query(
+        text: .withCapacity(capacity),
+    )
+
+    var fn pushLiteral(text: str) = self.text.push(text)
+
+    var fn pushBuilt(built: &Query, implicit at: Location) = {
+        self.text.push(built.text.toStr())
+        for value in built.bound do
+            self.bound.push(value.clone())
+    }
+}
+
+extend Query {
+    pub var fn pushValue<T: Text>(value: &T) = {
+        self.text.push("?")
+        self.bound.push("\(value)")
+    }
+}
+
+fn main() = {
+    val name = "O'Brien"
+    val query: Query = "select * from users where name = \(name)"
+    assert(query.text == "select * from users where name = ?")
+    assert(query.bound == ["O'Brien"].toVec())
+}
+```
+
+Nothing else is made a template: a `str` or a `String` where one is
+expected is a mismatch, so text from outside enters one only through a
+hole, as its `pushValue` writes it. An option a type's `pushValue` does not
+take is refused at the hole, and so is a value it does not take. Where no
+type is written, a literal is a `String`: `val row = "<li>\(name)</li>"`
+is text, and `val row: Html = …` says it is HTML, which `std::markup`
+builds (page 10).
 
 ## `is`
 

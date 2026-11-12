@@ -1177,6 +1177,50 @@ fn main() = {
 }
 ```
 
+## Secrets and signatures: `std::secret` and `std::digest`
+
+What an attacker must not guess — a key, a session's token, a salt — is
+made by `std::secret`, from the system's generator for secrets:
+`secret::bytes(count)` is that many bytes, and `secret::fill(&var key)`
+fills an array. `Random` is never the answer, however it is seeded.
+
+A signature is checked with `secret::equal(a, b)`, never `==`: `==` stops
+at the first byte that differs, so how long it takes says how many were
+right, and a signature can be found a byte at a time. `equal` looks at
+every byte whatever they hold, in a time that depends on their lengths
+alone, and the optimiser is kept from ending it early.
+
+`std::digest` has SHA-256, SHA-512 and SHA-1, each a function of bytes in
+hand and a type written in pieces, and HMAC over each, a digest under a
+key: `hmacSha256(key, message)`, `hmacSha512` and `hmacSha1`. SHA-1 is
+broken for signatures, since two inputs with one digest are made at will,
+and is there for the formats that name data by it, as git and WebSocket's
+handshake do; HMAC-SHA1, a one-time code's, is not broken by it. A webhook
+signed as GitHub signs one, with the HMAC in hex after `sha256=`:
+
+```wip,run
+import std::digest
+import std::hex
+import std::secret
+
+/// Whether `body` was signed with `key`, as the header says.
+fn signed(body: &[u8], header: str, key: &[u8]): bool = {
+    val .Some(("sha256", given)) = header.splitOnce("=") else return false
+    val .Ok(sent) = hex::decode(given) else return false
+    return secret::equal(&sent, digest::hmacSha256(&key, &body))
+}
+
+fn main() = {
+    val key = secret::bytes(32)
+    val body = "{\"action\": \"opened\"}"
+    val header = "sha256=\(hex::encode(digest::hmacSha256(&key, &body)))"
+    assert(signed(&body, header.toStr(), &key))
+    assert(!signed(&body, "sha256=00", &key))
+    val token = hex::encode(secret::bytes(16))
+    assert(token.len() == 32)
+}
+```
+
 ## Other programs: `std::process`
 
 A `Command` names a program and its arguments, which no shell reads: each
@@ -1229,6 +1273,34 @@ fn main() = {
         return
     }
     assert(said.stdout == "hello nowhere\n")
+}
+```
+
+The program's own environment is `std::io`'s. `io::env(name)` reads one
+variable, copied, and `io::environment()` lists every one, as name and
+value. `io::setEnv(name, value)` and `io::unsetEnv(name)` change it for
+what reads it from then on: this program, the C it links, which is told
+some things only by a variable, `TZ` among them, and every program it
+starts. They panic where the process runs a second thread, since C's
+library does not make a change safe beside another thread's read, and a
+thread a C library started reads too. So the environment is changed
+before the first thread starts, and a program started is given a
+variable of its own by its `Command`, which changes nothing here:
+
+```wip,run
+import std::io
+
+fn main() = {
+    io::setEnv("GREETING", "hello")
+    assert(io::env("GREETING") is .Some(said) && said == "hello")
+    var seen = 0
+    for (name, value) in io::environment() do
+        if name == "GREETING" && value == "hello" then
+            seen += 1
+
+    assert(seen == 1)
+    io::unsetEnv("GREETING")
+    assert(io::env("GREETING").isNone())
 }
 ```
 
@@ -1405,10 +1477,43 @@ lends a map's values to walk or to write. `atOrPutWith(key, make)` is
 with the same keys and equal values under them, and two sets with the same
 keys, whatever order they went in.
 
+`SortedMap<K, V>` and `SortedSet<K>` answer what `Map` and `Set` answer,
+by the same names, for a key that is `Ord` rather than `Hash`, and keep
+what they hold in the order of the keys, whatever order it went in: a
+walk of one starts at its least key, and two are equal entry by entry.
+What only an order answers is theirs: `first()` and `last()`, the entries
+of the least and the greatest key; `positionOf(key)`, where the first key
+not less than `key` is, and `len()` where every key is; and `within(from,
+to)`, the positions of the keys from `from` up to `to`, which a walk
+takes and `keyAt` and `values()` read. Their entries lie in one vector,
+found by halves, so a lookup is quick and a new key moves those after
+it; a list collected into one is sorted once:
+
+```wip,run
+import std::collections::{SortedMap, SortedSet}
+
+fn main() = {
+    var ages: SortedMap<str, i64> = [("cy", 3), ("ada", 1), ("bob", 2)]
+    ages.put("dee", 4)
+    assert(ages.keyAt(0) == "ada" && ages.at("bob") == 2)
+    assert(ages.first() is .Some(least) && least.key == "ada")
+    assert(ages.last() is .Some(most) && most.value == 4)
+    assert(ages.positionOf("b") == 1)
+    val between: Vec<str> = [
+        for at in ages.within("b", "d") do
+            yield ages.keyAt(at)
+    ]
+    assert(between == ["bob", "cy"])
+
+    var seen: SortedSet<i64> = [3, 1, 2]
+    assert(!seen.add(2) && seen.items() == [1, 2, 3])
+}
+```
+
 Each collection that holds what an iterator hands out is made from one by
 a static function of one name, `collect`, which takes any iterator of its
-elements: `Vec`, `Set`, `Deque`, `String` of `char`, and `Map` and
-`PriorityQueue` of pairs. They are the method of the prelude's
+elements: `Vec`, `Set`, `SortedSet`, `Deque`, `String` of `char`, and
+`Map`, `SortedMap` and `PriorityQueue` of pairs. They are the method of the prelude's
 `Collect<T>`, which a type of a program's own implements to be collected
 too. Where the type is expected, the call is `.collect(items)`, and a list
 written there is that collection, made through it. A `Set` keeps the
@@ -1948,6 +2053,96 @@ fn main() = {
 }
 ```
 
+## HTML and XML: `std::markup`
+
+`Html` and `Xml` are templates: where one is expected, an interpolated
+literal builds it, its own text as written and each value escaped as its
+place in the page needs. A value of `Html` in a hole is joined as it is,
+so a page is built from functions that answer `Html`, and a title, a name
+or a number is text, escaped with no call to say so:
+
+```wip,run
+import std::markup::{Html}
+
+fn row(id: i64, name: str): Html = {
+    val href = "/users/\(id)"
+    return "<li><a href=\"\(href)\">\(name)</a></li>"
+}
+
+fn page(title: str, rows: Html): Html = {
+    return "<title>\(title)</title><ul>\(rows)</ul>"
+}
+
+fn main() = {
+    var rows = Html()
+    rows.push(row(1, "Ada & Bob"))
+    rows.push(row(2, "<script>"))
+    val written = page("Users", rows)
+    assert(
+        written.toStr() ==
+            "<title>Users</title><ul><li><a href=\"/users/1\">Ada &amp; Bob</a></li><li><a href=\"/users/2\">&lt;script&gt;</a></li></ul>",
+    )
+}
+```
+
+`Html` reads where each hole is from the text written before it, as a
+browser's tokenizer does, tag and attribute names in any case. Between
+tags, in `<title>` and `<textarea>`, and in a quoted attribute's value, a
+value's `&`, `<`, `>`, `"` and `'` are written as entities. In a link's
+value — `href`, `src`, `action`, `formaction`, `cite`, `poster`, `data` and
+`manifest` — a `:` a value writes before the link's scheme is known is
+written `%3A` unless the scheme is `http`, `https` or `mailto`, so that
+`javascript:` from outside is a relative path, which runs nothing and
+still names the file it spells.
+
+Anywhere else a value is not written safely by entities, and a hole there
+panics, naming the hole's line: inside `<script>` or `<style>`; in `style`,
+`srcset`, `srcdoc` and any attribute whose name starts `on`; in an
+attribute's value with no quotes; in a tag, between its attributes or in
+its name; and in a comment or a doctype. Where a hole is follows from the
+literal's own text, so the first time a page is written shows a refusal,
+and any test of it does. A script is given its data in an attribute,
+escaped, and an attribute that is there or not is two literals:
+
+```wip,run
+import std::markup::{Html}
+
+fn link(href: str): Html = "<a href=\"\(href)\">link</a>"
+
+fn checkbox(done: bool): Html =
+    if done then "<input type=\"checkbox\" checked>"
+    else "<input type=\"checkbox\">"
+
+fn main() = {
+    assert(
+        link("javascript:go()").toStr() ==
+            "<a href=\"javascript%3Ago()\">link</a>",
+    )
+    assert(
+        link("https://example.com").toStr() ==
+            "<a href=\"https://example.com\">link</a>",
+    )
+    val user = "Ada"
+    val data: Html = "<main data-user=\"\(user)\"><script src=\"app.js\"></script>"
+    assert(data.toStr().contains("data-user=\"Ada\""))
+    assert(checkbox(true).toStr().contains("checked"))
+}
+```
+
+`Html` is joined only between tags, and only `Html` that ends there: a
+piece left inside a tag, a comment or a `<script>` is refused where it is
+joined, so a function's piece cannot leave its caller's page in a place it
+does not know of. `push` adds `Html` at the end, `Html::joined(&pieces,
+", ")` puts a separator between pieces, and `Html::trusted(text)` is HTML
+another writer made, a renderer's or a sanitizer's, which the caller vouches
+for. Written out, through `Text`, `Html` is its text as it is, and a
+`String` put back into a hole is text again.
+
+`Xml` is the same without what is HTML's alone: a value between tags or in
+a quoted attribute's value is escaped, and a hole in a tag, in an
+unquoted value, a comment, CDATA or a processing instruction panics. A
+`<script>` in XML is an element like any other.
+
 ## Bytes as text: `std::base64`, `std::hex` and `std::url`
 
 Bytes that must travel as text — in JSON, a header, a URL, a line a
@@ -2036,6 +2231,37 @@ still means what it did. Entries come in the order the filesystem gives
 them, without `.` and `..`, and sorting is the caller's. `realPath`
 answers where a path really is: absolute, with no `.`, `..` or link on the
 way.
+
+`fs::walk(dir)` is every entry under a directory, at any depth, each an
+`Entry` whose `name` is its path from `dir`, `lang/main.wip`: depth first,
+a directory before what it holds. A link is an entry and is not
+followed. Its second argument says which directories it enters, and one
+it does not enter is still an entry. It fails only where `dir` cannot be
+read; a directory under it that cannot be is an entry with nothing under
+it:
+
+```wip,run
+import std::fs
+import std::path
+
+/// A directory to go into: one that is not hidden.
+fn shown(entry: &fs::Entry): bool = !path::name(entry.name).startsWith(".")
+
+fn main() = {
+    // The library's sources, but not what is in a hidden directory.
+    val .Ok(walked) = fs::walk("std", shown) else {
+        // Run from somewhere else, there is nothing to walk.
+        return
+    }
+    val sources: Vec<String> = [
+        for entry in walked do
+            if entry.kind == .File && path::matches("**/*.wip", entry.name) then
+                yield path::join("std", entry.name)
+    ]
+    assert(sources.any((file) => file == "std/path/path.wip"))
+    assert(walked.any((entry) => entry.name == "prelude"))
+}
+```
 
 Bytes as they come are `std::io`'s two interfaces. `io::Read` is what
 bytes are read from: an open `File`, standard input and a program's output
@@ -2155,7 +2381,11 @@ fn main() = {
 
 `std::path` takes a path apart and puts one together, as text: a `str`
 of names between `/`s, which is what `std::fs` takes. Nothing in it reads
-the disk:
+the disk. `clean` writes a path plainly, its `.`, `..` and doubled `/`s
+worked out by the text alone, so a `..` after a link is taken as the
+name's parent, where `fs::realPath` would follow the link. `relative`
+answers a path from a directory it is within, and nothing for one it is
+not. `withExtension` replaces a name's extension, or adds one:
 
 ```wip,run
 import std::path
@@ -2169,6 +2399,33 @@ fn main() = {
     assert(path::extension(".bashrc").isNone())
     assert(path::stem("c.tar.gz") == "c.tar")
     assert(path::isWithin("/a/b", "/a") && !path::isWithin("/ab", "/a"))
+
+    assert(path::clean("/a/./b//c/../d/") == "/a/b/d")
+    assert(path::clean("../a/../../b") == "../../b")
+    assert(path::relative("/a/b/c.txt", "/a") == "b/c.txt")
+    assert(path::relative("/ab/c", "/a").isNone())
+    assert(path::withExtension("a/b.wip", "o") == "a/b.o")
+}
+```
+
+`path::matches(pattern, path)` says whether a whole path matches a glob,
+as git matches the patterns of a `.gitignore`: `*` is any run of what is
+not `/`, `?` one character but `/`, `[…]` one character of a set, with
+ranges, and `[!…]` one outside it, and `**`, alone between `/`s or at an
+end, any number of whole directories, none among them. `\` takes the
+character after it as it is:
+
+```wip,run
+import std::path
+
+fn main() = {
+    assert(path::matches("*.wip", "main.wip"))
+    assert(!path::matches("*.wip", "lang/main.wip"))
+    assert(path::matches("**/*.wip", "lang/main.wip"))
+    assert(path::matches("**/*.wip", "main.wip"))
+    assert(path::matches("src/**/test_?.c", "src/a/b/test_1.c"))
+    assert(path::matches("[!.]*", "shown"))
+    assert(!path::matches("[!.]*", ".hidden"))
 }
 ```
 
@@ -2332,19 +2589,21 @@ fn main() = {
 | Module | What is in it |
 |---|---|
 | `std::args` | `Arguments`, `Argument` and `ArgumentError`: the program's arguments, read as options |
-| `std::io` | `print`, `println`, `printInt`, `eprintln`, `flush`, `stdin`, `Reader`, `env`, `isTerminal`, `IoError`; `Read` and `Write`, what bytes are read from and written to, `copy`, and `stdout`, `stderr` and their `Printer`; and `EventQueue` with its `Interest` and `Event` |
-| `std::fs` | whole files, written, read and replaced; reading a directory; what the filesystem says about a path, its owner among it; a path's mode and owner set; directories for a while |
+| `std::io` | `print`, `println`, `printInt`, `eprintln`, `flush`, `stdin`, `Reader`, `env`, `environment`, `setEnv`, `unsetEnv`, `isTerminal`, `IoError`; `Read` and `Write`, what bytes are read from and written to, `copy`, and `stdout`, `stderr` and their `Printer`; and `EventQueue` with its `Interest` and `Event` |
+| `std::fs` | whole files, written, read and replaced; reading a directory, and walking the tree under one; what the filesystem says about a path, its owner among it; a path's mode and owner set; directories for a while |
 | `std::process` | `Command`, `Child` and `Exit`: other programs started and waited for; the program's own `currentDir`, `setCurrentDir`, `executable`, `besideProgram` and `id`; `Signals` and `Signal`: Ctrl-C and its like, caught; `fork`, `newGroup` and `sendToGroup`; `userId`, `becomeUser` and `changeRoot`; `limit` and `setLimit` |
 | `std::users` | `User` and `Group`: the system's users and groups, found by name or by number |
-| `std::path` | a path joined, and taken apart: its name, parent, extension and stem |
+| `std::path` | a path joined, and taken apart: its name, parent, extension and stem; cleaned, made relative, its extension replaced; matched by a glob |
 | `std::mem` | `replace`, a place's value taken out with another left in, and `swap`, two places' values exchanged |
-| `std::digest` | `sha256(bytes)`, the SHA-256 digest of bytes in hand, and `Sha256`, one written in pieces and then finished; `crc32(bytes)` and `adler32(bytes)`, the checksums gzip, zip, PNG and zlib end their data with, and `Crc32` and `Adler32`, written in pieces and read after any |
+| `std::digest` | `sha256(bytes)`, `sha512(bytes)` and `sha1(bytes)`, digests of bytes in hand, and `Sha256`, `Sha512` and `Sha1`, written in pieces and then finished; `hmacSha256`, `hmacSha512` and `hmacSha1`, a digest under a key; `crc32(bytes)` and `adler32(bytes)`, the checksums gzip, zip, PNG and zlib end their data with, and `Crc32` and `Adler32`, written in pieces and read after any |
 | `std::c` | a value lent to C as a callback's `void *`, and had back in the callback; `Pinned`, a value C holds until it lets go; a slice's address for C to read; C's `sizeof` and `_Alignof` |
 | `std::embed` | a file's bytes or text, read when the program is compiled, as a constant |
 | `std::watch` | `Watcher`: which files and directories changed, as the system tells |
 | `std::sync` | `Atomic<T>` and `Mutex<T>`: what several threads may change at once; `ring`, its `Filler` and `Drainer`: values handed between two threads without waiting |
 | `std::shared` | `Shared<T>` and `Weak<T>`: a value several owners hold and read |
 | `std::random` | `Random`: numbers seeded or from the system, not for cryptography |
+| `std::markup` | `Html` and `Xml`: templates an interpolated literal builds, each value escaped as its place in the page needs, and a hole refused where it cannot be; `push`, `joined` and `trusted` |
+| `std::secret` | `bytes` and `fill`, from the system's generator for secrets; `equal`, two secrets compared in a time that does not say where they differ |
 | `std::net` | `Listener`, `Stream` and `Address`: TCP and Unix-domain connections |
 | `std::tls` | `TlsStream` and `TlsError`: a TLS connection, the server's certificate checked by the system |
 | `std::http` | `get`, `Client`, `Request`, `Response` and `Incoming`: HTTP/1.1 requests, a body read whole or as it comes, undone where it was sent gzipped, sent from bytes, a file or any `io::Read` |
@@ -2352,7 +2611,7 @@ fn main() = {
 | `std::math` | `PI`, `TAU` and `E`, and the vectors, matrices, rotations and shapes above; the functions are methods of `f64` and `f32`, `x.sin()`, written in Wip so that a `@comptime` constant computes the program's bits |
 | `std::text` | `Scanner` and `Position`, above; `ParseError`, and the `Split`, `Lines` and `Chars` types the prelude's methods answer |
 | `std::iter` | `Walk`, `Forwards`, `Backwards`, `Taking` (what a `Vec` gives up to `for x in move v`), and the adapter types `Mapped`, `Filtered`, `FilterMapped`, `FlatMapped`, `Chained`, `Enumerated`, `Taken`, `TakenWhile`, `Skipped`, `Zipped`, `Peekable` |
-| `std::collections` | `Map`, `Set`, `MapEntry`, `Deque`, `PriorityQueue`, and `Arena` with its `Handle`, `ArenaEntry` and `ArenaValues` |
+| `std::collections` | `Map`, `Set`, `MapEntry`, `SortedMap`, `SortedSet`, `Deque`, `PriorityQueue`, and `Arena` with its `Handle`, `ArenaEntry` and `ArenaValues` |
 | `std::log` | `Log`, `Level` and `Record`: what a program says as it runs, kept from a least level, to standard error, the system's log or a closure of the program's |
 | `std::time` | `Duration`, a length of time; `Instant`, a moment on a clock that only goes forward; `sleep`; `FixedStep`, a game's updates at a steady rate; `now`, the date it is; `Utc`, a moment as a calendar has it, and `Local`, as it has it where the program runs |
 | `std::bytes` | numbers read and written at a place in bytes, `u32le` and `putU32le`; `Reader` and `Writer`, the same in turn; and a binary format for `Encode` and `Decode` |
@@ -2431,8 +2690,12 @@ fn main() = {
 The date it is is another clock: `time::now()` answers the seconds since
 1970 as the system says, which may be set back, and a `Utc` is such a
 moment as a calendar has it — year, month, day, hour, minute, second and
-weekday, in UTC, with no time zone and no leap second. It
-is written as HTTP and as ISO 8601 write it, and HTTP's form is read back:
+weekday, in UTC, with no time zone and no leap second. `Utc::of` makes
+one from its seconds, and `Utc::at` from its date and time of day, or
+answers nothing for a day the month does not have, the 30th of February,
+or an hour past 23. It is written as HTTP and as ISO 8601 write it, and
+both are read back: `parseIso` reads RFC 3339's form, the one `iso()`
+writes, with `Z` or any offset, and a fraction of a second left out:
 
 ```wip,run
 import std::time
@@ -2440,14 +2703,41 @@ import std::time::{Utc}
 
 fn main() = {
     assert(time::now() > 0)
-    val moment = Utc::of(784111777)
-    assert(
-        moment.year() == 1994 && moment.month() == 11 && moment.weekday() == 0,
-    )
+    val moment = Utc::at(
+        year: 1994,
+        month: 11,
+        day: 6,
+        hour: 8,
+        minute: 49,
+        second: 37,
+    ).unwrap()
+    assert(moment.seconds() == 784111777 && moment.weekday() == 0)
+    assert(Utc::at(year: 2100, month: 2, day: 29).isNone(), "not a leap year")
     assert(moment.httpDate() == "Sun, 06 Nov 1994 08:49:37 GMT")
     assert(moment.iso() == "1994-11-06T08:49:37Z")
     assert(Utc::parseHttpDate("Sun, 06 Nov 1994 08:49:37 GMT") == moment)
-    assert(Utc::parseHttpDate("Sunday, 06-Nov-94 08:49:37 GMT").isNone())
+    assert(Utc::parseIso("1994-11-06T01:49:37.250-07:00") == moment)
+    assert(Utc::parseIso("1994-11-06").isNone(), "a date alone")
+}
+```
+
+A `Utc` is moved and measured by a `Duration`, as an `Instant` is, with
+`after`, `before` and `since`, in whole seconds. A calendar's arithmetic
+is its own: `addDays` keeps the time of day, `addMonths` keeps the day
+of the month, or takes the month's last where it is shorter, and
+`daysSince` counts the dates between two moments, not their hours:
+
+```wip,run
+import std::time::{Duration, Utc}
+
+fn main() = {
+    val due = Utc::at(year: 2026, month: 1, day: 31, hour: 9).unwrap()
+    val next = due.addMonths(1)
+    assert(next.month() == 2 && next.day() == 28 && next.hour() == 9)
+    assert(due.addDays(1).month() == 2 && due.addDays(1).day() == 1)
+    val later = due.after(Duration::seconds(90))
+    assert(later.since(&due) == Duration::seconds(90))
+    assert(next.daysSince(&due) == 28)
 }
 ```
 

@@ -1,0 +1,233 @@
+// An interpolated literal, built into the type expected of it: a template,
+// which takes the literal's own text and each hole's value apart, or a
+// `String` where none is expected. What is written is the block a program
+// would write,
+//
+//     {
+//         var text# = Html::withCapacity(17)
+//         text#.pushLiteral("<li>")
+//         text#.pushValue(&name)
+//         text#.pushLiteral("</li>")
+//         text#
+//     }
+//
+// each call checked as the program's own would be, at the place of the
+// piece it is for.
+
+import syntax as ast
+import syntax::{
+	Diagnostic,
+	INTERPOLATION_OPTION,
+	NOT_A_METHOD,
+	Span,
+	Symbol,
+	UNSATISFIED_CONSTRAINT
+}
+
+extend Lowerer {
+	/// The template an interpolation builds where `hint` is expected: the
+	/// type itself where it implements the prelude's `Template`, or the
+	/// success of an `Option` or a `Result` that does, since a value there
+	/// is its success. Nothing where neither does, and a `String` is built.
+	fn templateFor(hint: Option<Ty>): Option<Ty> = {
+		val expected = hint?
+		val template = self.program.preludeItems.interfaceOf(.Template)?
+		if self.program.isString(expected) then
+			return .None
+
+		if self.kind(expected) is .Struct(..) | .Enum(..) &&
+			self.program.implements(expected, template) {
+			return expected
+		}
+		val (_, success) = self.success(expected)?
+		return self.templateFor(success)
+	}
+
+	/// The prelude's `String`, which an interpolation builds where no
+	/// template is expected.
+	var fn stringTy(): Option<Ty> = {
+		val id = self.program.preludeItems.structure(.String)?
+		return self.intern(.Struct(id:, args: .empty()))
+	}
+
+	/// `"<li>\(name)</li>"`, and a literal with no holes where a template
+	/// is expected: the block above, of the template `hint` asks for or of
+	/// a `String`.
+	var fn interpolation(
+		pieces: &[ast::Piece],
+		capacity: i64,
+		hint: Option<Ty>,
+		span: Span,
+	): ExprId = {
+		val chosen = match self.templateFor(hint) {
+			.Some(template) => Option::Some(template)
+			.None => self.stringTy()
+		}
+		val .Some(built) = chosen else return self.errorExpr(span)
+		val .Some(owner) = self.ownerOf(built) else return self.errorExpr(span)
+		val .Some(made) = self.templateMade(owner, built, capacity, span) else {
+			return self.errorExpr(span)
+		}
+		val local = self.state.body.locals.add(Local(
+			name: Symbol::text(),
+			ty: built,
+			kind: .Var,
+			span:,
+		))
+		var stmts = Vec::of([
+			self.state.body.stmts.add(Stmt(kind: .Let(local:, init: made), span:)),
+		])
+		val [pushLiteral, pushValue, pushBuilt] = Symbol::templateMethods()
+		for piece in pieces {
+			val step: Option<ExprId> = match piece {
+				.Text(literal) => {
+					val at = self.ast.exprs[literal].span
+					val receiver = self.alloc(.Local(local), built, at)
+					val text = [literal]
+					val unnamed: [Option<ast::Name>; 1] = [.None]
+					val item = pieceUse(&text, &unnamed, at)
+					self.dispatch(receiver, owner, ast::Name(sym: pushLiteral, span: at), item)
+				}
+				.Hole(args, names, span: at) => {
+					// The value is checked first, for its type says whether it
+					// is joined as it is or given to `pushValue`, and is lent
+					// to the call as a receiver would be: a hole moves nothing,
+					// and a range of elements may be one. A value of the type
+					// being built is joined, unless it says a width, which only
+					// `pushValue` can make up.
+					val value = self.inferBorrowed(args[0], .None)
+					val valueTy = self.tyOf(value)
+					val joined = self.underRefs(valueTy) == built && args.len() == 1
+					val method = if joined then pushBuilt else pushValue
+					val name = ast::Name(sym: method, span: at)
+					if self.isPoisoned(valueTy) {
+						Option::None
+					} else if !joined && self.methodOf(owner, pushValue).isNone() {
+						self.noPushValue(built, at)
+						Option::None
+					} else if !joined && !self.optionsTaken(owner, built, &names) {
+						Option::None
+					} else if !joined &&
+						!self.valueTaken(owner, built, self.underRefs(valueTy), at) {
+						Option::None
+					} else {
+						match self.receiverExpr(value, .Read, name, false) {
+							.Some(lent) => {
+								self.state.early.put(args[0], lent)
+								val receiver = self.alloc(.Local(local), built, at)
+								val item = pieceUse(&args, &names, at)
+								self.dispatch(receiver, owner, name, item)
+							}
+							.None => Option::None
+						}
+					}
+				}
+			}
+			if step is .Some(call) then
+				stmts.push(self.state.body.stmts.add(Stmt(kind: .Expr(call), span:)))
+		}
+		// The block's value is what it built, which it hands over: a value
+		// that owns memory is moved, never copied.
+		val held = self.alloc(.Local(local), built, span)
+		val moved = self.alloc(.Move(held), built, span)
+		return self.alloc(.Block(Block(stmts:, value: moved, span:)), built, span)
+	}
+
+	/// `Template::withCapacity(capacity)` of the type being built.
+	var fn templateMade(owner: TypeDef, built: Ty, capacity: i64, span: Span): Option<ExprId> = {
+		val id = self.methodOf(owner, Symbol::withCapacity())?
+		val room = self.alloc(.Int(capacity as u128), I64, span)
+		val typeArgs = self.program.types.internList(self.ownerArgs(built))
+		return self.alloc(.Call(callee: id, args: [room], typeArgs:, order: [0]), built, span)
+	}
+
+	/// Whether the type's `pushValue` takes each option the hole gives,
+	/// which is said of the hole where it does not: a `String` takes a
+	/// width, and `Html` none.
+	var fn optionsTaken(owner: TypeDef, built: Ty, names: &[Option<ast::Name>]): bool = {
+		val .Some(id) = self.methodOf(owner, Symbol::templateMethods()[1]) else return false
+		var taken = true
+		for given in names {
+			val .Some(name) = given else continue
+			val params = &self.program.fns[id].params
+			if params.any((param) => param.name == name.sym && !param.implicit) then
+				continue
+
+			taken = false
+			val option = String::of(self.text(name.sym))
+			val options: Vec<String> = [
+				for param in params do
+					if param.default.isSome() && !param.implicit then
+						yield "`\(self.text(param.name))`"
+			]
+			val said: String =
+				if options.isEmpty() then "no options" else "only \(options.join(", "))"
+			self.report(
+				Diagnostic::error(
+					INTERPOLATION_OPTION,
+					"a hole of \(self.tyName(built)) takes no `\(option)`",
+					name.span,
+					"not an option it takes",
+				).withNote("a hole's options are the named arguments of the `pushValue` of the type the literal builds, which takes \(said)"),
+			)
+		}
+		return taken
+	}
+
+	/// Whether a hole's value is one the type's `pushValue` takes, which is
+	/// said of the hole where it is not: a `String`'s takes any `Text`.
+	var fn valueTaken(owner: TypeDef, built: Ty, value: Ty, at: Span): bool = {
+		val .Some(id) = self.methodOf(owner, Symbol::templateMethods()[1]) else return true
+		val method = &self.program.fns[id]
+		if method.params.len() < 2 then
+			return true
+
+		// The first parameter is the receiver, and the second the value.
+		val .Ref(inner: wanted, ..) = self.kind(method.params[1].ty) else return true
+		val .Param(param) = self.kind(wanted) else return true
+		if param.index >= method.generics.len() then
+			return true
+
+		for wantedOf in method.generics[param.index].interfaces {
+			if self.implementsWith(value, wantedOf) then
+				continue
+
+			val wantedName = self.constraintName(wantedOf, value)
+			val subject = self.tyName(value)
+			val template = self.tyName(built)
+			var diagnostic = Diagnostic::error(
+				UNSATISFIED_CONSTRAINT,
+				"\(subject) cannot be written in a hole of \(template): it does not implement `\(wantedName)`",
+				at,
+				"not `\(wantedName)`",
+			)
+			diagnostic = if self.kind(value) is .Fn(..) then
+				diagnostic.withNote("a hole's value is given to the `pushValue` of \(template), which takes a `\(wantedName)`, and a function cannot implement one")
+			else diagnostic.withNote("a hole's value is given to the `pushValue` of \(template), which takes a `\(wantedName)`").withHelp("write `extend \(subject.replace("`", by: "")): \(wantedName)`")
+			self.report(diagnostic)
+			return false
+		}
+		return true
+	}
+
+	/// A template with no `pushValue`, given a hole.
+	var fn noPushValue(built: Ty, at: Span) = self.report(
+		Diagnostic::error(
+			NOT_A_METHOD,
+			"\(self.tyName(built)) has no `pushValue` for a hole",
+			at,
+			"a hole",
+		).withNote(
+			"an interpolated literal gives each hole's value to the `pushValue` of the type it builds, which says what values it takes",
+		),
+	)
+}
+
+/// A piece's call: its arguments as written, at the piece's place, which a
+/// `Location` it takes is filled with.
+fn pieceUse(args: &[ast::ExprId], names: &[Option<ast::Name>], at: Span): ItemUse = {
+	var item = ItemUse::plain(&args, UNIT, at)
+	item.names = names
+	item.place = at
+	return item
+}

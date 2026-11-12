@@ -2,6 +2,7 @@
 
 import std::fs
 import std::future
+import std::process::{Command}
 
 /// What the linker is told after the objects, in order: where to look for
 /// libraries, the libraries, the frameworks on an Apple target, and the
@@ -95,4 +96,50 @@ fn aReferenceReadFromMemoryPromisesOnlyWhatHoldsEverywhere() = {
 	}
 	assert(loads > 0, "no reference is loaded")
 	assert(ir.contains("nonnull dereferenceable("), "a parameter promises it")
+}
+
+/// A comparison in constant time keeps its loop whole in a release build:
+/// what `opaque` hides is read and written back by volatile steps, which
+/// the optimiser keeps, so it cannot end the loop at the first byte that
+/// differs, nor skip a step. Checked after `clang -O2`, from the IR as text
+/// and as bitcode.
+@test
+fn aComparisonInConstantTimeKeepsItsLoopOptimised() = {
+	val unique = Unique::new()
+	val .Ok(clang) = findClang(&unique) else panic("a clang to build with")
+	val .Ok(dir) = fs::TempDir::new() else panic("a temporary directory")
+	val main = dir.join("main.wip")
+	val program =
+		"import std::io\nimport std::secret\n\nfn main() = {\n\tval a = secret::bytes(64)\n\tval b = secret::bytes(64)\n\tio::println(\"\\(secret::equal(&a, &b))\")\n}\n"
+	assert(fs::writeFile(main.toStr(), program).isOk())
+	for (emit, name) in [(Emit::LlvmIr, "main.ll"), (Emit::LlvmBc, "main.bc")] {
+		var timings = Timings()
+		val .Ok(loaded) = loadMode(main.toStr(), .Program, &var timings, future::cores()) else {
+			panic("the program is read")
+		}
+		var read = loaded
+		val output = dir.join(name)
+		val options = BuildOptions(emit:, profile: .Release)
+		assert(buildLoaded(&var read, output.toStr(), &options, &unique, &var timings).isOk())
+		val optimized = dir.join("\(name).opt.ll")
+		val ran = Command::of(clang.path.toStr()).args([
+			"-O2",
+			"-S",
+			"-emit-llvm",
+			"-Wno-override-module",
+			output.toStr(),
+			"-o",
+			optimized.toStr(),
+		]).output()
+		assert(ran is .Ok(done) && done.exit.success(), "clang optimises \(name)")
+		val .Ok(ir) = fs::readFile(optimized.toStr()) else panic("the IR is written")
+		// The program has no other volatile step, wherever `equal` was
+		// inlined: each iteration of its loop reads and writes one back.
+		var volatile = 0
+		for line in ir.lines() do
+			if line.contains("load volatile") || line.contains("store volatile") then
+				volatile += 1
+
+		assert(volatile >= 2, "the loop keeps its volatile steps, from \(name)")
+	}
 }

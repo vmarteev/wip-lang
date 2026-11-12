@@ -1,0 +1,286 @@
+// Where in a page the next byte goes, read from the bytes written before
+// it, as a browser's tokenizer reads them: between tags, in a tag's name,
+// between its attributes, in an attribute's value, in a comment, or in the
+// raw text of a `<script>`. Nothing is parsed into a tree, and nothing
+// checks that tags are closed or nested. HTML's places are XML's, and HTML
+// has more: elements whose text is raw or not markup, and attributes whose
+// values are links or scripts.
+
+/// A place in a page.
+@derive(Eq)
+enum Place {
+	/// Between tags.
+	Text
+	/// The text of `<script>` or `<style>`, which nothing escapes; `tag`
+	/// names the element.
+	Raw
+	/// The text of `<title>` or `<textarea>`, escaped and not markup.
+	Escapable
+	/// After a `<`.
+	TagOpen
+	/// A start tag's name.
+	StartName
+	/// An end tag's name, after `</`.
+	EndName
+	/// In a tag, between its attributes.
+	InTag
+	/// An attribute's name.
+	AttributeName
+	/// After an attribute's name, before a `=` or the next.
+	AfterName
+	/// After an attribute's `=`, before its value.
+	BeforeValue
+	/// An attribute's value in quotes, the quote it ends with.
+	Quoted(quote: u8)
+	/// An attribute's value with no quotes.
+	Unquoted
+	/// After `<!`, until it is known what follows.
+	Bang
+	/// `<!-- … -->`.
+	Comment
+	/// `<![CDATA[ … ]]>`.
+	Cdata
+	/// `<!doctype …>`, or another `<!` that is not a comment.
+	Declaration
+	/// `<? … ?>`.
+	Instruction
+}
+
+/// How the bytes written so far leave a page.
+@derive(Eq, Clone)
+struct Reading {
+	/// Whether the page is HTML, with HTML's own places, or XML.
+	html: bool
+	place: Place = .Text
+	/// The tag being read, or whose raw text the page is in, in lower case.
+	tag: String = String()
+	/// Whether the tag is an end tag.
+	closing: bool = false
+	/// The attribute being read, in lower case.
+	attribute: String = String()
+	/// What is read of what ends the place: the `--` of a comment, the `]]`
+	/// of CDATA, the `</script` of raw text.
+	matched: i64 = 0
+	/// After `<!`, what follows, until it says what it is.
+	opening: String = String()
+	/// For a link's value: what was written of it before its scheme was
+	/// known, and whether it is known.
+	scheme: String = String()
+	settled: bool = false
+}
+
+/// What a link's value may begin with: the schemes that run nothing.
+val SCHEMES: [str; 3] = ["http", "https", "mailto"]
+
+/// The attributes whose value is a link.
+val LINKS: [str; 8] = ["href", "src", "action", "formaction", "cite", "poster", "data", "manifest"]
+
+/// Whether `byte` ends a word in a tag, as HTML's tokenizer reads them.
+fn isSpace(byte: u8): bool = byte is b' ' | b'\t' | b'\n' | b'\r' | 0x0C
+
+fn lower(byte: u8): u8 = if byte is b'A'..=b'Z' then byte + 32 else byte
+
+extend Reading {
+	static fn of(html: bool): Reading = Reading(html:)
+
+	/// Whether a value may be written here, and how: what the place is
+	/// called where it may not.
+	fn refusal(): Option<str> = match self.place {
+		.Text | .Escapable => .None
+		.Quoted(..) => self.attributeRefusal()
+		.Raw => if self.tag == "script" then "inside `<script>`" else "inside `<style>`"
+		.TagOpen | .StartName | .EndName => "in a tag's name"
+		.InTag | .AttributeName | .AfterName => "between a tag's attributes"
+		.BeforeValue | .Unquoted => "in an attribute's value with no quotes"
+		.Bang | .Comment => "inside a comment"
+		.Cdata => "inside `<![CDATA[`"
+		.Declaration => "inside a doctype or a declaration"
+		.Instruction => "inside a processing instruction"
+	}
+
+	/// An HTML attribute whose value is CSS, JavaScript, a list of links or
+	/// a page of its own, which a value's text escaped by entities does not
+	/// make safe.
+	fn attributeRefusal(): Option<str> = {
+		if !self.html then
+			return .None
+
+		val name = self.attribute.toStr()
+		return when {
+			name.startsWith("on") => "in an `on…` attribute, which is JavaScript"
+			name == "style" => "in `style`, which is CSS"
+			name == "srcset" => "in `srcset`, a list of links"
+			name == "srcdoc" => "in `srcdoc`, a page of its own"
+			else => .None
+		}
+	}
+
+	/// Whether the value being written is a link's, whose scheme is checked.
+	fn inLink(): bool =
+		self.html && self.place is .Quoted(..) && LINKS.contains(self.attribute.toStr())
+
+	/// Whether the page is between tags, where a page may be joined.
+	fn betweenTags(): bool = self.place == Place::Text
+
+	/// The bytes of the program's own text, read for where they leave the
+	/// page.
+	var fn read(text: str) = {
+		for byte in text do
+			self.step(byte)
+	}
+
+	/// One byte of the program's own.
+	var fn step(byte: u8) = match self.place {
+		.Text => if byte == b'<' then self.place = .TagOpen
+		.Escapable | .Raw => self.rawStep(byte)
+		.TagOpen => when {
+			byte is b'a'..=b'z' | b'A'..=b'Z' => {
+				self.tag = String()
+				self.tag.pushByte(lower(byte))
+				self.closing = false
+				self.place = .StartName
+			}
+			byte == b'/' => {
+				self.tag = String()
+				self.closing = true
+				self.place = .EndName
+			}
+			byte == b'!' => {
+				self.opening = String()
+				self.place = .Bang
+			}
+			byte == b'?' => self.place = .Instruction
+			// A `<` that begins no tag is text.
+			else => self.place = .Text
+		}
+		.StartName | .EndName => when {
+			isSpace(byte) => self.place = .InTag
+			byte == b'/' => self.place = .InTag
+			byte == b'>' => self.tagEnded()
+			else => self.tag.pushByte(lower(byte))
+		}
+		.InTag => when {
+			isSpace(byte) || byte == b'/' => {}
+			byte == b'>' => self.tagEnded()
+			else => {
+				self.attribute = String()
+				self.attribute.pushByte(lower(byte))
+				self.place = .AttributeName
+			}
+		}
+		.AttributeName => when {
+			isSpace(byte) => self.place = .AfterName
+			byte == b'=' => self.place = .BeforeValue
+			byte == b'>' => self.tagEnded()
+			byte == b'/' => self.place = .InTag
+			else => self.attribute.pushByte(lower(byte))
+		}
+		.AfterName => when {
+			isSpace(byte) => {}
+			byte == b'=' => self.place = .BeforeValue
+			byte == b'>' => self.tagEnded()
+			byte == b'/' => self.place = .InTag
+			else => {
+				self.attribute = String()
+				self.attribute.pushByte(lower(byte))
+				self.place = .AttributeName
+			}
+		}
+		.BeforeValue => when {
+			isSpace(byte) => {}
+			byte is b'"' | b'\'' => {
+				self.place = .Quoted(quote: byte)
+				self.scheme = String()
+				self.settled = false
+			}
+			byte == b'>' => self.tagEnded()
+			else => self.place = .Unquoted
+		}
+		.Quoted(quote) => {
+			if byte == quote then self.place = .InTag
+			else if !self.settled && byte is b':' | b'/' | b'?' | b'#' then self.settled = true
+			else if !self.settled then self.scheme.pushByte(byte)
+		}
+		.Unquoted => when {
+			isSpace(byte) => self.place = .InTag
+			byte == b'>' => self.tagEnded()
+			else => {}
+		}
+		.Bang => {
+			self.opening.pushByte(byte)
+			val so = self.opening.toStr()
+			when {
+				so == "--" => {
+					self.matched = 0
+					self.place = .Comment
+				}
+				so == "[CDATA[" => {
+					self.matched = 0
+					self.place = .Cdata
+				}
+				"--".startsWith(so) || "[CDATA[".startsWith(so) => {}
+				byte == b'>' => self.place = .Text
+				else => self.place = .Declaration
+			}
+		}
+		.Comment => {
+			if byte == b'>' && self.matched >= 2 then self.place = .Text
+			else if byte == b'-' then self.matched += 1
+			else self.matched = 0
+		}
+		.Cdata => {
+			if byte == b'>' && self.matched >= 2 then self.place = .Text
+			else if byte == b']' then self.matched += 1
+			else self.matched = 0
+		}
+		.Declaration => if byte == b'>' then self.place = .Text
+		.Instruction => {
+			// HTML ends one at its first `>`, and XML at its `?>`.
+			if byte == b'>' && (self.html || self.matched == 1) then
+				self.place = .Text
+			else
+				self.matched = if byte == b'?' then 1 else 0
+		}
+	}
+
+	/// A tag's `>`: the text after a start tag of HTML's raw elements is
+	/// theirs.
+	var fn tagEnded() = {
+		self.place = .Text
+		if !self.html || self.closing then
+			return
+
+		val name = self.tag.toStr()
+		if name == "script" || name == "style" {
+			self.matched = 0
+			self.place = .Raw
+		} else if name == "title" || name == "textarea" {
+			self.matched = 0
+			self.place = .Escapable
+		}
+	}
+
+	/// A byte of raw or escapable text, which ends only at `</` and the
+	/// element's name, in any case, and then a space, a `/` or a `>`.
+	var fn rawStep(byte: u8) = {
+		val name = self.tag.toStr()
+		val length = name.len() + 2
+		if self.matched == length {
+			if isSpace(byte) || byte is b'/' | b'>' {
+				self.closing = true
+				self.place = .EndName
+				self.step(byte)
+				return
+			}
+			self.matched = 0
+		}
+		val wanted = when {
+			self.matched == 0 => b'<'
+			self.matched == 1 => b'/'
+			else => name[self.matched - 2]
+		}
+		self.matched = if lower(byte) == wanted then self.matched + 1
+		else if byte == b'<' then 1
+		else 0
+	}
+}

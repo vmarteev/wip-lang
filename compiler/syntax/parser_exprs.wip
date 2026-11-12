@@ -416,31 +416,22 @@ extend Parser {
 		return e
 	}
 
-	/// An interpolated literal, `"read \(rows) rows"`, rewritten here into
-	/// the block a program would write itself:
-	///
-	///     {
-	///         var text# = String::withCapacity(16)
-	///         text#.push("read ")
-	///         rows.appendTo(&var text#)
-	///         text#.push(" rows")
-	///         text#
-	///     }
-	///
-	/// Nothing after the parser knows the literal was one: the value is a
-	/// `String`, the errors are the errors of those calls, and a literal
-	/// with no `\(` in it stays a `str` that allocates nothing.
+	/// An interpolated literal, `"read \(rows) rows"`: its pieces of text and
+	/// its holes, in order, which the checker builds into the type expected
+	/// of it, a template or a `String`. A literal with no `\(` in it stays a
+	/// `str`, which allocates nothing.
 	var fn interpolation(first: Symbol): ExprId = {
 		val start = self.span()
 		self.bump()
-		var stmts: Vec<StmtId> = Vec()
+		var pieces: Vec<Piece> = Vec()
 		// How many bytes to ask for: the text as it is written, and a guess
 		// for each value. Space at the start and end of a line is left out,
 		// so that a text block asks for the same however it is indented.
 		var capacity = 0
 		var piece = (first, start, 3)
 		while true {
-			capacity += self.pushText(&var stmts, piece)
+			capacity += self.textPiece(&var pieces, piece)
+			val holeStart = self.span()
 			val (value, options) = self.inParens((p) => {
 				val value = p.expr()
 				return (value, p.pieceOptions())
@@ -452,10 +443,7 @@ extend Parser {
 				.Some(how) => self.writtenAs(value, how)
 				.None => value
 			}
-			match options.fitting {
-				.Some(fitting) => self.pushFitted(&var stmts, written, fitting)
-				.None => self.pushAppend(&var stmts, written)
-			}
+			pieces.push(self.hole(written, options.fitting, holeStart.to(self.prevSpan())))
 			match self.peek() {
 				.StrMid(symbol) => {
 					val span = self.span()
@@ -465,7 +453,7 @@ extend Parser {
 				.StrEnd(symbol) => {
 					val span = self.span()
 					self.bump()
-					capacity += self.pushText(&var stmts, (symbol, span, 2))
+					capacity += self.textPiece(&var pieces, (symbol, span, 2))
 					break
 				}
 				// The literal was not closed, which the lexer has reported.
@@ -473,43 +461,13 @@ extend Parser {
 			}
 		}
 		val span = start.to(self.prevSpan())
-		val init = self.stringInit(capacity, span)
-		stmts.insert(0, init)
-		// The block's value is the `String` it built, which it hands over:
-		// a value that owns memory is moved, never copied.
-		val built = self.allocExpr(.Name(symbol: Symbol::text()), span)
-		val moved = self.allocExpr(.Unary(op: .Move, opSpan: span, operand: built), span)
-		val last = self.allocStmt(.Expr(value: moved), span)
-		stmts.push(last)
-		return self.allocExpr(.Block(block: Block(stmts:, span:)), span)
+		return self.allocExpr(.Interpolation(pieces:, capacity:), span)
 	}
 
-	/// `var text# = String::withCapacity(capacity)`.
-	var fn stringInit(capacity: i64, span: Span): StmtId = {
-		val segments = Vec::of([
-			Name(sym: Symbol::stringType(), span:),
-			Name(sym: Symbol::withCapacity(), span:),
-		])
-		val callee = self.allocExpr(.Path(leadingDot: false, segments:, typeArgs: .None), span)
-		val count = self.allocExpr(.Int(value: capacity as u128), span)
-		val init = self.allocExpr(.Call(callee:, args: [count], names: [.None], rest: .None), span)
-		return self.allocStmt(
-			.Let(
-				mutable: true,
-				isImplicit: false,
-				name: Name(sym: Symbol::text(), span:),
-				ty: .None,
-				init:,
-			),
-			span,
-		)
-	}
-
-	/// `text#.push("…")`, for a piece of the literal's own text. The piece is
-	/// `(contents, span, how many bytes of that span are delimiters)`, and
-	/// what comes back is how much room the text asks for. An empty piece
-	/// pushes nothing.
-	var fn pushText(stmts: &var Vec<StmtId>, piece: (Symbol, Span, i64)): i64 = {
+	/// A piece of the literal's own text. The piece is `(contents, span, how
+	/// many bytes of that span are delimiters)`, and what comes back is how
+	/// much room the text asks for. An empty piece is left out.
+	var fn textPiece(pieces: &var Vec<Piece>, piece: (Symbol, Span, i64)): i64 = {
 		val (symbol, span, delimiters) = piece
 		val written = self.text(span)
 		var length = 0
@@ -521,9 +479,31 @@ extend Parser {
 			return 0
 
 		val text = self.allocExpr(.Str(symbol:), span)
-		val call = self.methodCall(Symbol::push(), text, span)
-		stmts.push(self.allocStmt(.Expr(value: call), span))
+		pieces.push(.Text(literal: text))
 		return bytes
+	}
+
+	/// A hole: its value, and its width, fill and alignment as the named
+	/// arguments of the call it is given to. The names stand where the
+	/// value does, so nothing reads them as written twice.
+	var fn hole(value: ExprId, fitting: Option<Fitting>, span: Span): Piece = {
+		var args = Vec::of([value])
+		var names: Vec<Option<Name>> = [.None]
+		if fitting is .Some(fitting) {
+			val [width, fill, align] = Symbol::fittingOptions()
+			val at = self.exprSpan(value)
+			args.push(fitting.width)
+			names.push(Name(sym: width, span: at))
+			if fitting.fill is .Some(given) {
+				args.push(given)
+				names.push(Name(sym: fill, span: at))
+			}
+			if fitting.align is .Some(given) {
+				args.push(given)
+				names.push(Name(sym: align, span: at))
+			}
+		}
+		return Piece::Hole(args:, names:, span:)
 	}
 
 	/// What a piece of an interpolation says after a comma: its width,
@@ -658,71 +638,6 @@ extend Parser {
 		return self.allocExpr(.Call(callee:, args:, names:, rest: .None), span)
 	}
 
-	/// `value.appendFitted(&var text#, width: …, fill: …, align: .Some(…))`:
-	/// a piece of an interpolation padded to its width.
-	var fn pushFitted(stmts: &var Vec<StmtId>, value: ExprId, fitting: Fitting) = {
-		val span = self.exprSpan(value)
-		val out = self.allocExpr(.Name(symbol: Symbol::text()), span)
-		val reference = self.allocExpr(.Unary(op: .RefVar, opSpan: span, operand: out), span)
-		val callee = self.allocExpr(
-			.Field(base: value, name: Name(sym: Symbol::appendFitted(), span:), typeArgs: .None),
-			span,
-		)
-		val [width, fill, align] = Symbol::fittingOptions()
-		var args = Vec::of([reference, fitting.width])
-		var names: Vec<Option<Name>> = [.None, Name(sym: width, span:)]
-		if fitting.fill is .Some(given) {
-			args.push(given)
-			names.push(Name(sym: fill, span:))
-		}
-		if fitting.align is .Some(given) {
-			// The alignment said, where the parameter's `.None` lets the
-			// value choose.
-			val at = self.exprSpan(given)
-			val some = self.allocExpr(
-				.Path(
-					leadingDot: true,
-					segments: [Name(sym: Symbol::some(), span: at)],
-					typeArgs: .None,
-				),
-				at,
-			)
-			val wrapped = self.allocExpr(
-				.Call(callee: some, args: [given], names: [.None], rest: .None),
-				at,
-			)
-			args.push(wrapped)
-			names.push(Name(sym: align, span:))
-		}
-		val call = self.allocExpr(.Call(callee:, args:, names:, rest: .None), span)
-		stmts.push(self.allocStmt(.Expr(value: call), span))
-	}
-
-	var fn pushAppend(stmts: &var Vec<StmtId>, value: ExprId) = {
-		val span = self.exprSpan(value)
-		val out = self.allocExpr(.Name(symbol: Symbol::text()), span)
-		val reference = self.allocExpr(.Unary(op: .RefVar, opSpan: span, operand: out), span)
-		val callee = self.allocExpr(
-			.Field(base: value, name: Name(sym: Symbol::appendTo(), span:), typeArgs: .None),
-			span,
-		)
-		val call = self.allocExpr(
-			.Call(callee:, args: [reference], names: [.None], rest: .None),
-			span,
-		)
-		stmts.push(self.allocStmt(.Expr(value: call), span))
-	}
-
-	/// `text#.name(arg)`.
-	var fn methodCall(name: Symbol, arg: ExprId, span: Span): ExprId = {
-		val receiver = self.allocExpr(.Name(symbol: Symbol::text()), span)
-		val callee = self.allocExpr(
-			.Field(base: receiver, name: Name(sym: name, span:), typeArgs: .None),
-			span,
-		)
-		return self.allocExpr(.Call(callee:, args: [arg], names: [.None], rest: .None), span)
-	}
-
 	var fn primary(): ExprId = {
 		val start = self.span()
 		val kind: ExprKind = match self.peek() {
@@ -756,7 +671,8 @@ extend Parser {
 				self.bump()
 				ExprKind::Byte(value:)
 			}
-			// `"a\(x)b"`: a `String` built by pushes.
+			// `"a\(x)b"`: a `String`, or the template expected, built piece by
+			// piece.
 			.StrStart(symbol) => return self.interpolation(symbol)
 			.Null => {
 				self.bump()

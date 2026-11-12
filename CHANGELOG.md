@@ -2,6 +2,65 @@
 
 Each version published, newest first.
 
+## 0.16.0 — 2026-11-12
+
+Programs written for 0.15 compile as they did: an interpolated literal
+builds the `String` it built wherever no other type is expected of it.
+
+**The language**
+
+- **An interpolated literal builds the type expected of it.** Where a type
+  that implements the prelude's new `Template` is expected, the literal's
+  own text goes to its `pushLiteral` and each hole's value to its
+  `pushValue`, lent, with the hole's options as named arguments; a hole
+  of the type itself is joined by `pushBuilt`. So the type decides what a
+  value becomes in it: a query that binds each value as a parameter, a
+  page that escapes it. A literal with no holes where a template is
+  expected builds one too. `String` is a template, the one built where no
+  other is expected. A hole's option or value that its `pushValue` does
+  not take is refused at the hole (E0134, E0342).
+
+**The library**
+
+- **HTML and XML, `std::markup`.** `Html` and `Xml` are templates: every
+  value written into one is escaped as its place in the page needs, with
+  no call to say so. `Html` reads where each hole is: it escapes text and
+  quoted attributes, writes a link's `:` as `%3A` where it would make a
+  scheme that runs a script, and refuses a hole in a `<script>`, a
+  `<style>`, an `on…` attribute, an unquoted value, a tag or a comment,
+  with a panic at the hole. `Html` is joined only between tags;
+  `Html::joined` and `Html::trusted` are there for lists and for HTML
+  another writer made.
+- **Secrets, `std::secret`:** `bytes` and `fill` from the system's
+  generator for secrets, and `equal`, two secrets compared in a time that
+  does not say where they differ, which the optimiser is kept from ending
+  early.
+- **Digests:** `sha1`, `sha512` and their running `Sha1` and `Sha512`
+  beside SHA-256, and HMAC over each: `hmacSha1`, `hmacSha256`,
+  `hmacSha512`.
+- **Sorted collections:** `SortedMap` and `SortedSet`, `Map`'s and `Set`'s
+  functions kept in the order of their keys, with `first`, `last`,
+  `positionOf` and `within`.
+- **Dates:** `Utc::at(year:, month:, day:, …)`, which refuses a day the
+  month does not have; `Utc::parseIso`, RFC 3339 with any offset; `after`,
+  `before` and `since`, as `Instant` has; and `addDays`, `addMonths`,
+  which keeps a month's end, and `daysSince`.
+- **The environment:** `io::setEnv` and `io::unsetEnv`, which panic where
+  a second thread runs, since another may be reading it, and
+  `io::environment()`, every variable.
+- **Paths and trees:** `path::clean`, `relative`, `withExtension` and
+  `matches`, a glob as git matches one; and `fs::walk`, every entry under
+  a directory, with a closure that says which directories to enter.
+
+**The tools**
+
+- **`wip doc`** writes its pages as `Html`.
+
+**Examples**
+
+- **`bookmarks`:** a page and an RSS feed of bookmarks read from a file,
+  built as `Html` and `Xml`, a link that would run a script among them.
+
 ## 0.15.0 — 2026-11-09
 
 Programs written for 0.14 compile as they did, but where marked

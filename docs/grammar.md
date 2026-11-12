@@ -50,8 +50,8 @@ charChar    = (* any character except "'", "\" and newline *) ;
 (* The byte of one ASCII character, a u8. *)
 BYTE        = "b'" ( charChar | escape ) "'" ;
 
-(* A literal with "\(" in it is interpolated, and its value is a String
-   rather than a str. *)
+(* A literal with "\(" in it is interpolated, and its value is a String,
+   or the template expected of it, rather than a str. *)
 INTERP      = '"' piece ( "\(" expr ( "," IDENT ":" expr )* ")" piece )+ '"' ;
                                          (* after the value, `width`, `fill`,
                                             `align`, and `precision` or `radix`,
