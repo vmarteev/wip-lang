@@ -2,6 +2,23 @@
 
 Each version published, newest first.
 
+## 0.17.1 — 2026-11-16
+
+What the first run of CI on Windows found, which was in the tests and the
+reference, not in Wip.
+
+- **Assembly on Windows x86-64** takes its arguments in `rcx` and `rdx`,
+  where every other x86-64 system has them in `rdi` and `rsi`: the
+  reference's example, and the gate's, choose with `#if defined(_WIN32)`,
+  as they choose Apple's underscore.
+- **The gate asks no `nm` on Windows,** where a program's names are in its
+  PDB, which `nm` does not read.
+- **`scripts\verify.ps1`** says what `scripts/verify.sh` says, step for
+  step, and checks on Windows what only Windows compiles: that the
+  compiler builds itself without a warning, and `wip fmt`.
+  `scripts\bootstrap.ps1 -Kept` keeps the seed's compiler it built
+  before, as `bootstrap.sh --kept` does.
+
 ## 0.17.0 — 2026-11-15
 
 **Breaking:** `std::http` sends to a `Url`, lent, where it took text.

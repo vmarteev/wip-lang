@@ -1,7 +1,7 @@
 # Builds `wip` from this checkout on Windows, with Visual Studio's `clang`
 # and Microsoft's linker alone, as `scripts/bootstrap.sh` does on a Unix.
 #
-#   powershell -File scripts\bootstrap.ps1 [-Out DIR]
+#   powershell -File scripts\bootstrap.ps1 [-Out DIR] [-Kept]
 #
 # 1. Stage A: this system's seed, `bootstrap\<system>\wip.bc.gz`, compiled
 #    by `clang` and linked as its `link.txt` says, with an empty table of
@@ -16,7 +16,10 @@
 # the checkout's `std\` and `tools\`, as junctions. `clang` is
 # `$env:WIP_CLANG`, or the one Visual Studio's installer says it has: its
 # Build Tools, with the C++ tools and Clang, for this machine's processor.
-param([string]$Out = "target\bootstrap")
+#
+# `-Kept` keeps a `wip` it built before, in the same `-Out`, unless the
+# seed is newer, as `bootstrap.sh --kept` does.
+param([string]$Out = "target\bootstrap", [switch]$Kept)
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 Set-Location (Join-Path $PSScriptRoot '..')
@@ -28,6 +31,10 @@ $system = switch ($env:PROCESSOR_ARCHITECTURE) {
 }
 $seed = "bootstrap\$system"
 if (-not (Test-Path "$seed\wip.bc.gz")) { throw "there is no seed in $seed" }
+if ($Kept -and (Test-Path "$Out\bin\wip.exe") -and
+	(Get-Item "$seed\wip.bc.gz").LastWriteTime -le (Get-Item "$Out\bin\wip.exe").LastWriteTime) {
+	exit 0
+}
 
 $clang = $env:WIP_CLANG
 if (-not $clang) {
