@@ -28,11 +28,15 @@ function Say($name, $how, $since) {
 	'{0,-34} {1,-8} {2}' -f $name, $how, $took
 }
 # A command, its output into `$log`, and whether it succeeded: what it
-# writes on its stderr is its words, which PowerShell would stop at.
+# writes on its stderr is its words, which PowerShell would stop at. The
+# log is written even where the command says nothing, which `Set-Content`
+# at the end of a pipeline given nothing does not do.
 function Ran($tool, [string[]]$arguments, $log) {
 	$ErrorActionPreference = 'Continue'
-	& $tool @arguments *>&1 | ForEach-Object { "$_" } | Set-Content -Encoding utf8 $log
-	return $LASTEXITCODE -eq 0
+	$said = @(& $tool @arguments *>&1 | ForEach-Object { "$_" })
+	$succeeded = $LASTEXITCODE -eq 0
+	[System.IO.File]::WriteAllLines($log, [string[]]$said)
+	return $succeeded
 }
 
 # Visual Studio's `clang`, where none is named: one on the `Path`, as

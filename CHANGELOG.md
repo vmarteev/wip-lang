@@ -2,6 +2,14 @@
 
 Each version published, newest first.
 
+## 0.17.2 — 2026-11-16
+
+- **`scripts\verify.ps1`** writes a step's log even when the step says
+  nothing: a compiler built without a warning left none, and the check
+  for warnings, which reads it, stopped the gate on Windows.
+- **CI runs once for a version,** on its branch, and not again for its
+  tag, which is pushed with the same commit.
+
 ## 0.17.1 — 2026-11-16
 
 What the first run of CI on Windows found, which was in the tests and the
