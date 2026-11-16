@@ -273,7 +273,7 @@ if __name__ == "__main__":
     path = "std/prelude/case.wip"
     wanted = text()
     if "--check" in sys.argv:
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             found = f.read()
         written = re.search(r"from Unicode ([0-9.]+);", found)
         if written is None or written.group(1) != unicodedata.unidata_version:
@@ -282,5 +282,5 @@ if __name__ == "__main__":
         if found != wanted:
             sys.exit(f"{path} is not what scripts/char-case.py writes")
         sys.exit(0)
-    with open(path, "w") as f:
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
         f.write(wanted)

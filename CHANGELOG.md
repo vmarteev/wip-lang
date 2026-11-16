@@ -2,6 +2,13 @@
 
 Each version published, newest first.
 
+## 0.17.3 — 2026-11-16
+
+- **The character tables' scripts** read and write their files as UTF-8,
+  with LF line endings, on every system: on Windows, where Python opens a
+  file in the system's code page, the check of `category.wip` could not
+  read it. The tables are the same bytes.
+
 ## 0.17.2 — 2026-11-16
 
 - **`scripts\verify.ps1`** writes a step's log even when the step says
