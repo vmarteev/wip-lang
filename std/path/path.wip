@@ -1,32 +1,57 @@
 // A path taken apart and put together, as text: a `str`
 // of names between `/`s, as `std::fs` takes one. Nothing here reads the
 // disk; where a path really is, is `fs::realPath`'s.
+//
+// On Windows a path's names are between `\`s, and a `/` is read as one
+// too; its root may be a drive's, `C:\`, or a share's, `\\server\share\`.
+// What a separator is, which one a path is written with, and how much of a
+// path is its root are each family's (`path.unix.wip`, `path.windows.wip`),
+// and what is below says `/` for whichever it is.
 
 /// `dir` and `name` as one path: `/a/b` of `/a` and `b`. One `/` goes
 /// between them, and none after a `dir` that ends with one; a `name` that
 /// is absolute is the path itself, and an empty `dir` leaves `name` alone.
 pub fn join(dir: str, name: str): String = {
-	if dir.isEmpty() || name.startsWith("/") then
+	if dir.isEmpty() || rootLength(name) > 0 then
 		return name
 
 	var out = String::of(dir)
-	if !dir.endsWith("/") then
-		out.push("/")
+	if !isSeparator(dir[dir.len() - 1]) then
+		out.push(SEPARATOR)
 
 	out.push(name)
 	return out
 }
 
+/// `name` in the directory `dir`, joined with the separator `dir` is
+/// written with: on Windows, where a path may be written with `/`, with
+/// `/` where `dir` is written with `/` alone, so that a path a person
+/// gave is echoed back as they wrote it — `game/board.wip` of `game/` —
+/// and as `join` joins otherwise.
+pub fn joinAsWritten(dir: str, name: str): String = {
+	val slashed = dir.contains("/") && !dir.contains(SEPARATOR)
+	if !slashed || rootLength(name) > 0 then
+		return join(dir, name)
+
+	return if dir.endsWith("/") then "\(dir)\(name)" else "\(dir)/\(name)"
+}
+
+/// What a path begins at: `/` of `/a/b`, and nothing of a relative path;
+/// on Windows `C:\` of `C:\a`, `C:` of `C:a`, and `\\server\share\` of a
+/// path on a share.
+pub fn root(path: str): str = path[0..rootLength(path)]
+
 /// The last name of a path: `c.txt` of `/a/b/c.txt`, and `b` of `/a/b/`,
 /// since a `/` at the end is not one. The root has none: the empty text.
 pub fn name(path: str): str = {
 	val whole = trimmed(path)
-	if whole == "/" then
+	val root = rootLength(whole)
+	if whole.len() <= root then
 		return ""
 
 	return match lastSlash(whole) {
-		.Some(at) => whole[at + 1..whole.len()]
-		.None => whole
+		.Some(at) if at >= root => whole[at + 1..whole.len()]
+		_ => whole[root..whole.len()]
 	}
 }
 
@@ -34,9 +59,10 @@ pub fn name(path: str): str = {
 /// `/`, and `.` of a name alone.
 pub fn parent(path: str): str = {
 	val whole = trimmed(path)
+	val root = rootLength(whole)
 	return match lastSlash(whole) {
-		.None => "."
-		.Some(0) => "/"
+		.None => if root > 0 then whole[0..root] else "."
+		.Some(at) if at < root => whole[0..root]
 		.Some(at) => trimmed(whole[0..at])
 	}
 }
@@ -68,10 +94,10 @@ pub fn isWithin(path: str, dir: str): bool = {
 	if inner == outer then
 		return true
 
-	if outer == "/" then
-		return inner.startsWith("/")
+	if outer.len() == rootLength(outer) then
+		return inner.startsWith(outer)
 
-	return inner.len() > outer.len() && inner.startsWith(outer) && inner[outer.len()] == b'/'
+	return inner.len() > outer.len() && inner.startsWith(outer) && isSeparator(inner[outer.len()])
 }
 
 /// The path written plainly, by its text alone: doubled `/`s are one, `.`
@@ -81,9 +107,17 @@ pub fn isWithin(path: str, dir: str): bool = {
 /// `..` after a link is taken as the name's parent, as nothing here asks
 /// the disk; `fs::realPath` follows links.
 pub fn clean(path: str): String = {
-	val rooted = path.startsWith("/")
+	val root = rootLength(path)
+	val rooted = root > 0
 	var kept: Vec<str> = Vec()
-	for part in path.split("/") {
+	var at = root
+	while at <= path.len() {
+		var end = at
+		while end < path.len() && !isSeparator(path[end]) do
+			end += 1
+
+		val part = path[at..end]
+		at = end + 1
 		if part.isEmpty() || part == "." then
 			continue
 
@@ -94,8 +128,21 @@ pub fn clean(path: str): String = {
 		else if !rooted then
 			kept.push(part)
 	}
-	val names = kept.join("/")
-	return if rooted then "/\(names)" else if names.isEmpty() then "." else names
+	val names = kept.join(SEPARATOR)
+	// The root, its separators written as the path's are.
+	var out = String()
+	for byte in path[0..root] {
+		if isSeparator(byte) then
+			out.push(SEPARATOR)
+		else
+			out.pushByte(byte)
+	}
+
+	if names.isEmpty() && !rooted then
+		return "."
+
+	out.push(names)
+	return out
 }
 
 /// `path` from `dir`, where it is within it, name by name as `isWithin`
@@ -111,7 +158,7 @@ pub fn relative(path: str, dir: str): Option<str> = {
 	if inner == outer then
 		return ""
 
-	val start = if outer == "/" then 1 else outer.len() + 1
+	val start = if outer.len() == rootLength(outer) then outer.len() else outer.len() + 1
 	return inner[start..inner.len()]
 }
 
@@ -283,8 +330,9 @@ fn charLength(text: str, at: i64): i64 = {
 
 /// The path without the `/`s it ends with, but the root's own.
 fn trimmed(path: str): str = {
+	val root = rootLength(path).max(1)
 	var end = path.len()
-	while end > 1 && path[end - 1] == b'/' do
+	while end > root && isSeparator(path[end - 1]) do
 		end -= 1
 
 	return path[0..end]
@@ -295,7 +343,7 @@ fn lastSlash(path: str): Option<i64> = {
 	var at = path.len()
 	while at > 0 {
 		at -= 1
-		if path[at] == b'/' then
+		if isSeparator(path[at]) then
 			return at
 	}
 	return .None

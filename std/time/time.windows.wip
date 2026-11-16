@@ -1,0 +1,96 @@
+// Windows' clocks: the performance counter, which only goes forward, the
+// precise time of day, `Sleep`, and the UCRT's calendar, whose `struct tm`
+// has no field for the zone, so its offset is worked out and its name asked.
+
+import std::libc
+
+extern "C" {
+	/// A moment as the UCRT's calendar has it: C's nine fields alone.
+	struct tm {
+		tm_sec: c_int
+		tm_min: c_int
+		tm_hour: c_int
+		tm_mday: c_int
+		tm_mon: c_int
+		tm_year: c_int
+		tm_wday: c_int
+		tm_yday: c_int
+		tm_isdst: c_int
+	}
+
+	/// `clock` in the zone the program runs in, into `result`: 0 where it
+	/// could be.
+	@symbol("_localtime64_s")
+	fn localtimeOf(result: &var tm, clock: &i64): c_int
+	/// The seconds since 1970 a moment written in UTC is.
+	@symbol("_mkgmtime64")
+	fn secondsOfUtc(parts: &var tm): i64
+	/// The zone's name, standard (`index` 0) or for summer (1).
+	@symbol("_get_tzname")
+	fn zoneName(size: &var size_t, into: &var [u8], index: c_int): c_int
+	@symbol("_tzset")
+	fn tzset()
+}
+
+/// The hundreds of nanoseconds between 1601, where Windows counts the time
+/// of day from, and 1970.
+val UNIX_FROM_1601: u64 = 116444736000000000
+
+/// Nanoseconds on the clock that only goes forward: the performance
+/// counter, as many as it counts a second.
+fn monotonicNanos(): i64 = {
+	var count: i64 = 0
+	var frequency: i64 = 0
+	libc::QueryPerformanceCounter(&var count)
+	libc::QueryPerformanceFrequency(&var frequency)
+	// Whole seconds and what is left apart, so that the product fits.
+	val seconds = count / frequency
+	val rest = count % frequency
+	return seconds * NANOS_PER_SECOND + rest * NANOS_PER_SECOND / frequency
+}
+
+/// Sleeps for `nanos`, more than none: `Sleep` counts milliseconds, so a
+/// part of one is a whole one.
+fn sleepNanos(nanos: i64) = {
+	val millis = (nanos + NANOS_PER_MILLI - 1) / NANOS_PER_MILLI
+	libc::Sleep(millis.min(0xFFFFFFFE) as u32)
+}
+
+/// The seconds since the start of 1970, as the system's clock says.
+fn secondsNow(): i64 = {
+	var time: u64 = 0
+	libc::GetSystemTimePreciseAsFileTime(&var time)
+	return ((time - UNIX_FROM_1601) / 10000000) as i64
+}
+
+/// The offset from UTC the zone the program runs in has at `seconds`, and
+/// the zone's name then; nothing where the UCRT cannot place the moment.
+/// `TZ` is read again each time.
+fn zoneAt(seconds: i64): Option<(i64, String)> = {
+	tzset()
+	var parts = tm(
+		tm_sec: 0,
+		tm_min: 0,
+		tm_hour: 0,
+		tm_mday: 0,
+		tm_mon: 0,
+		tm_year: 0,
+		tm_wday: 0,
+		tm_yday: 0,
+		tm_isdst: 0,
+	)
+	if localtimeOf(&var parts, &seconds) != 0 then
+		return .None
+
+	// The local fields read as if they were UTC are the moment moved by the
+	// offset.
+	val isSummer = parts.tm_isdst > 0
+	val offset = secondsOfUtc(&var parts) - seconds
+	var room = [0 as u8; 64]
+	var size: size_t = 0
+	val zone =
+		if zoneName(&var size, &var room, if isSummer then 1 else 0) == 0 && size > 1 then
+			String::of(str::fromBytes(&room[0..(size - 1) as i64]))
+		else String()
+	return (offset, zone)
+}

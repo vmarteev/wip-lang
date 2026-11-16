@@ -88,9 +88,13 @@ say "stage B, built by A"
 scripts/build.sh --release --with "$work/B/bin/wip" --out "$out" >/dev/null
 say "stage C, built by B"
 
-"$work/B/bin/wip" build --release --emit llvm-bc compiler/main.wip -o "$work/B.bc"
-"$out/bin/wip" build --release --emit llvm-bc compiler/main.wip -o "$work/C.bc"
-if ! cmp -s "$work/B.bc" "$work/C.bc"; then
+# Every part of it: a release build's bitcode is the compiler in parts,
+# `B.bc`, `B.1.bc` and on.
+rm -rf "$work/B-bc" "$work/C-bc"
+mkdir -p "$work/B-bc" "$work/C-bc"
+"$work/B/bin/wip" build --release --emit llvm-bc compiler/main.wip -o "$work/B-bc/wip.bc"
+"$out/bin/wip" build --release --emit llvm-bc compiler/main.wip -o "$work/C-bc/wip.bc"
+if ! diff -rq "$work/B-bc" "$work/C-bc" >/dev/null; then
     echo "error: stages B and C write different bitcode for the compiler" >&2
     exit 1
 fi

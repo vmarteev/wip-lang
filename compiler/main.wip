@@ -32,6 +32,7 @@ import lang::{
 	checkLoaded,
 	checkTypes,
 	cleanCache,
+	compiler as cCompiler,
 	debug,
 	dump as dumpDiagnosticsOf,
 	findClang,
@@ -435,11 +436,14 @@ fn main(args: &[cstring]): i64 = {
 		io::eprintln("error: `\(option)` is an option of `build`, `run` and `test`")
 		return 2
 	}
-	if command != "build" && buildOption is .Some(option) {
+	// A test runner built as its objects, for a machine that links and
+	// runs it, takes `--emit objects` and `-o` too.
+	val testObjects = command == "test" && emitOption == "objects"
+	if command != "build" && buildOption is .Some(option) && !(testObjects && option == "--emit") {
 		io::eprintln("error: `\(option)` is an option of `build`")
 		return 2
 	}
-	if command !is .Some("build") | .Some("doc") && outputOption.isSome() {
+	if command !is .Some("build") | .Some("doc") && outputOption.isSome() && !testObjects {
 		io::eprintln("error: `--output` is an option of `build` and `doc`")
 		return 2
 	}
@@ -541,7 +545,14 @@ fn main(args: &[cstring]): i64 = {
 					return 2
 				}
 			}
-			if target.buildable() is .Err(message) {
+			val .Some(emit) = Emit::parse(emitOption) else {
+				io::eprintln("error: `--emit` is `program`, `static`, `dynamic`, `llvm-ir`, `llvm-bc` or `objects`, not `\(emitOption)`")
+				return 2
+			}
+			// What `wip run` builds, and `wip test` but as objects, is linked,
+			// and run, here.
+			val linked = emit is .Program | .Static | .Dynamic || command is .Some("run")
+			if target.buildable(linked) is .Err(message) {
 				io::eprintln("error: \(message)")
 				return 2
 			}
@@ -551,10 +562,6 @@ fn main(args: &[cstring]): i64 = {
 					io::eprintln("error: invalid value '\(cpuOption)' for '--cpu <CPU>': \(message)")
 					return 2
 				}
-			}
-			val .Some(emit) = Emit::parse(emitOption) else {
-				io::eprintln("error: `--emit` is `program`, `static`, `dynamic` or `llvm-ir`, not `\(emitOption)`")
-				return 2
 			}
 			val options = BuildOptions(
 				search:,
@@ -571,7 +578,15 @@ fn main(args: &[cstring]): i64 = {
 			)
 			match command {
 				.Some("run") => runCommand(path, &options, &shipping, &programArgs, color, threads)
-				.Some("test") => testCommand(path, &options, &shipping, filter, color, threads)
+				.Some("test") => testCommand(
+					path,
+					outputOption,
+					&options,
+					&shipping,
+					filter,
+					color,
+					threads,
+				)
 				_ => buildCommand(
 					path,
 					outputOption,
@@ -898,7 +913,7 @@ fn runCommand(
 		.None => "program"
 	}
 	val bundle = dir.join("\(stem).app")
-	val exe = if app.isSome() then path::join(bundle, stem) else dir.join("program")
+	val exe = if app.isSome() then path::join(bundle, stem) else dir.join(programName("program"))
 	if app.isSome() && fs::makeDirs(bundle) is .Err(error) {
 		io::eprintln("error: cannot make `\(bundle)`: \(error)")
 		return 1
@@ -976,6 +991,7 @@ fn here(): String = match fs::realPath(".") {
 /// code is this command's. For iOS, in the simulator.
 fn testCommand(
 	path: str,
+	output: Option<str>,
 	given: &BuildOptions,
 	shipping: &Shipping,
 	filter: Option<str>,
@@ -1007,7 +1023,12 @@ fn testCommand(
 			return 1
 		}
 	}
-	val exe = dir.join("tests")
+	// The runner's objects, for another machine to link and run, where they
+	// are asked for.
+	val objects = options.emit == Emit::Objects
+	val exe =
+		if objects then String::of(output.unwrapOr("tests.objects"))
+		else dir.join(programName("tests"))
 	match buildTests(&var loaded, exe, &options, filter, &unique, &var timings) {
 		.Ok((warnings, count)) => {
 			io::eprint(renderProgram(&warnings, &loaded.sources, color))
@@ -1020,6 +1041,8 @@ fn testCommand(
 				io::println("running 0 tests")
 				return 0
 			}
+			if objects then
+				return 0
 		}
 		.Err(.Diagnostics(diagnostics)) => {
 			io::eprint(renderProgram(&diagnostics, &loaded.sources, color))
@@ -1123,10 +1146,16 @@ fn bindgenCommand(args: &[str], color: bool, threads: i64): i64 = {
 			return 1
 		}
 	}
-	// The tool asks `wip` about the Wip types `--type` names: this one.
+	// The tool asks `wip` about the Wip types `--type` names: this one. On
+	// Windows, which has no `cc`, it reads a header with the `clang` `wip`
+	// builds with, Visual Studio's; elsewhere it finds its own, where `cc`
+	// may be another compiler than a `clang`.
 	var command = Command::of(exe).args(&args)
 	if process::executable() is .Ok(wip) then
 		command = command.env("WIP", wip)
+
+	if TARGET_OS == "windows" && io::env("CC").isNone() then
+		command = command.env("CC", cCompiler())
 
 	return match command.run() {
 		.Ok(.Code(code)) => code
@@ -1233,14 +1262,27 @@ fn clangFound(unique: &Unique): bool = match findClang(&unique) {
 	}
 }
 
+/// A program's file named `stem`, as this system names one: `stem.exe` on
+/// Windows, which runs a file by its extension.
+fn programName(stem: str): String = if TARGET_OS == "windows" then "\(stem).exe" else stem
+
 /// What a build writes when `-o` does not say: `board`, `board.ll`,
-/// `libboard.a`, `libboard.dylib`.
-fn defaultOutput(stem: str, emit: Emit): String = match emit {
-	.Program => stem
-	.LlvmIr => "\(stem).ll"
-	.LlvmBc => "\(stem).bc"
-	.Static => "lib\(stem).a"
-	.Dynamic => if TARGET_VENDOR == "apple" then "lib\(stem).dylib" else "lib\(stem).so"
+/// `board.objects`, `libboard.a`, `libboard.dylib`; on Windows `board.exe`,
+/// `board.lib` and `board.dll`, as Windows names them.
+fn defaultOutput(stem: str, emit: Emit): String = {
+	val windows = TARGET_OS == "windows"
+	return match emit {
+		.Program => if windows then "\(stem).exe" else stem
+		.LlvmIr => "\(stem).ll"
+		.LlvmBc => "\(stem).bc"
+		.Objects => "\(stem).objects"
+		.Static => if windows then "\(stem).lib" else "lib\(stem).a"
+		.Dynamic => when {
+			windows => "\(stem).dll"
+			TARGET_VENDOR == "apple" => "lib\(stem).dylib"
+			else => "lib\(stem).so"
+		}
+	}
 }
 
 /// One diagnostic, said once, as `check --target` found it: with the first
@@ -1551,16 +1593,24 @@ fn comparePaths(a: str, b: str): i64 = {
 /// 2 `..` and 3 a name.
 fn components(p: str): Vec<(i64, str)> = {
 	var parts: Vec<(i64, str)> = Vec()
-	if p.startsWith("/") then
-		parts.push((0, "/"))
+	val root = path::root(p)
+	if !root.isEmpty() then
+		parts.push((0, root))
 
 	var first = true
-	for part in p.split("/") {
+	var at = root.len()
+	while at < p.len() {
+		var end = at
+		while end < p.len() && !path::isSeparator(p[end]) do
+			end += 1
+
+		val part = p[at..end]
+		at = end + 1
 		if part.isEmpty() then
 			continue
 
 		match part {
-			"." => if first && !p.startsWith("/") then parts.push((1, "."))
+			"." => if first && root.isEmpty() then parts.push((1, "."))
 			".." => parts.push((2, ".."))
 			_ => parts.push((3, part))
 		}

@@ -1,0 +1,150 @@
+// Windows' environment and waits: the environment Windows keeps, which a
+// program started is given, and a descriptor's handle waited on as its
+// kind needs — a console's until a key comes, a pipe's until bytes do, a
+// file's never.
+//
+// The C library keeps a copy of the environment, which its `getenv` reads
+// and C a program links reads with it: a change is made to both, but for
+// a variable set to the empty text, which Windows holds and the copy
+// cannot, since there an empty value takes the variable out.
+
+import std::libc
+
+/// Sets the variable `key` to `value`: whether it could be. The C
+/// library's copy is changed first, since taking a variable out of it, as
+/// an empty value does, takes it out of Windows' too.
+fn setVariable(key: &var String, value: &var String): bool = {
+	if libc::putenv(key.toCstring(), value.toCstring()) != 0 then
+		return false
+
+	return libc::SetEnvironmentVariableA(key.toCstring(), value.toCstring()) != 0
+}
+
+/// Takes the variable `key` out: whether it could be.
+fn unsetVariable(key: &var String): bool = {
+	var empty = String()
+	if libc::SetEnvironmentVariableA(key.toCstring(), null) == 0 &&
+		libc::GetLastError() != ENVVAR_NOT_FOUND {
+		return false
+	}
+
+	return libc::putenv(key.toCstring(), empty.toCstring()) == 0
+}
+
+/// `GetLastError`: there is no such variable.
+val ENVVAR_NOT_FOUND: u32 = 203
+
+/// What the variable `key` holds, copied, or nothing.
+fn variable(key: &var String): Option<String> = {
+	var room: Vec<u8> = .filled(256, 0)
+	while true {
+		val got =
+			libc::GetEnvironmentVariableA(
+				key.toCstring(),
+				&var room.items(),
+				room.len() as u32,
+			) as i64
+		if got == 0 && libc::GetLastError() == ENVVAR_NOT_FOUND then
+			return .None
+
+		// Too little room answers how much is needed, the NUL among it.
+		if got < room.len() then
+			return String::of(str::fromBytes(&room[0..got]))
+
+		room = .filled(got, 0)
+	}
+	return .None
+}
+
+/// Every variable, as Windows keeps them: `NAME=value` strings one after
+/// another, an empty one at the end. Those whose names begin with `=`,
+/// which Windows keeps of each drive's current directory, are not
+/// variables, and are left out.
+fn variables(): Vec<(String, String)> = {
+	var all: Vec<(String, String)> = Vec()
+	val block = libc::GetEnvironmentStringsA()
+	if block.isNull then
+		return all
+
+	var at = 0
+	while block[at] != 0 {
+		var end = at
+		while block[end] != 0 do
+			end += 1
+
+		val entry = str::fromBytes(&block[at..end])
+		if !entry.startsWith("=") && entry.splitOnce("=") is .Some((name, value)) then
+			all.push((name, value))
+
+		at = end + 1
+	}
+	libc::FreeEnvironmentStringsA(block)
+	return all
+}
+
+/// What the last of Windows' own calls that failed said, as `lastError`
+/// says what C's did. It is `pub` for the modules that call Windows.
+pub fn lastSystemError(): IoError = systemError(libc::GetLastError())
+
+/// A Windows error, as one of `IoError`'s: its own, and Winsock's, which
+/// `GetLastError` answers too.
+pub fn systemError(code: u32): IoError = match code {
+	2 | 3 | 11001 => .NotFound
+	// Access refused, and a file another holds: what a sharing or a lock
+	// violation is, and the nearest of a Unix's errors.
+	5 | 32 | 33 | 10013 => .Denied
+	80 | 183 => .AlreadyExists
+	109 | 232 | 10058 => .BrokenPipe
+	50 | 10045 | 10047 => .Unsupported
+	258 | 1460 | 10060 => .TimedOut
+	10004 => .Interrupted
+	10035 => .WouldBlock
+	10048 => .AddressInUse
+	10053 | 10054 => .ConnectionReset
+	10057 => .NotConnected
+	10061 => .ConnectionRefused
+	_ => .Other(code as i32)
+}
+
+@link("kernel32")
+extern "C" {
+	fn GetFileType(handle: i64): u32
+}
+
+/// `GetFileType`: a console.
+val FILE_TYPE_CHAR: u32 = 2
+/// `GetFileType`: a pipe.
+val FILE_TYPE_PIPE: u32 = 3
+
+/// Whether something comes to be read on `fd`, or its input ends, within
+/// `millis`, -1 waiting as long as it takes. A pipe tells nothing of what
+/// comes, so it is looked at each millisecond.
+fn readyWithin(fd: i32, millis: i64): Result<bool, IoError> = {
+	val handle = libc::handleOf(fd)
+	val kind = GetFileType(handle)
+	return when {
+		kind == FILE_TYPE_CHAR => {
+			val wait = if millis < 0 then libc::INFINITE else millis.min(0xFFFFFFFE) as u32
+			Result::Ok(libc::WaitForSingleObject(handle, wait) == 0)
+		}
+		kind == FILE_TYPE_PIPE => {
+			var waited = 0
+			while true {
+				var available: u32 = 0
+				// A pipe whose writer is gone answers 0: its end is there to be
+				// read.
+				if libc::PeekNamedPipe(handle, null, 0, null, &var available, null) == 0 ||
+					available > 0 {
+					return true
+				}
+				if millis >= 0 && waited >= millis then
+					return false
+
+				libc::Sleep(1)
+				waited += 1
+			}
+			Result::Ok(false)
+		}
+		else => Result::Ok(true)
+	}
+}

@@ -52,6 +52,9 @@ pub view struct ModuleAst {
 	/// target's, and its tests' where tests are not — which say that a
 	/// function of its own is called.
 	pub var elsewhere: Set<String> = Set()
+	/// What the module's files for another target declare, each name with
+	/// the target it is for.
+	pub var declaredElsewhere: Map<String, String> = Map()
 }
 
 extend ModuleAst {
@@ -171,6 +174,9 @@ struct ModuleScope {
 	consts: Map<Symbol, ConstId> = Map()
 	/// The variables C owns that the module declares.
 	globals: Map<Symbol, GlobalId> = Map()
+	/// What the module declares only for another target — in a file of its
+	/// or under an `@target` — each name with the target it is for.
+	declaredElsewhere: Map<String, String> = Map()
 }
 
 /// A scope of test files' names inside the scope `inside`, of `module`'s,
@@ -224,17 +230,23 @@ pub fn lower(
 	if files.isEmpty() then
 		return Lowered(program:, diagnostics: Vec())
 
-	var scopes: Vec<ModuleScope> = [
-		for module in modules do
-			yield ModuleScope(
-				path: module.path.clone(),
-				prefix: module.prefix.clone(),
-				depends: module.depends.clone(),
-				dir: module.dir.clone(),
-				root: module.root.clone(),
-				packageFiles: module.packageFiles.clone(),
-			)
-	]
+	var scopes: Vec<ModuleScope> = [for module in modules {
+		var declaredElsewhere = module.declaredElsewhere.clone()
+		for file in module.files {
+			for entry in file.withheldItems do
+				declaredElsewhere.put(interner.resolve(entry.key), entry.value.clone())
+		}
+
+		yield ModuleScope(
+			path: module.path.clone(),
+			prefix: module.prefix.clone(),
+			depends: module.depends.clone(),
+			dir: module.dir.clone(),
+			root: module.root.clone(),
+			packageFiles: module.packageFiles.clone(),
+			declaredElsewhere:,
+		)
+	}]
 	// Each module's test files: a scope their `pub` names share, inside the
 	// module's, and inside that a scope of each one's own; and what each file
 	// sees beyond its module before its imports are read, which for a test
@@ -600,6 +612,7 @@ pub fn lower(
 				worker.phase = phase
 				worker.program.names.clear()
 				worker.program.implicitFills.clear()
+				worker.program.templateChecks.clear()
 				worker.checkBodies(
 					&work[range.0..range.1],
 					&files.items(),
@@ -643,6 +656,9 @@ pub fn lower(
 	lowerer.checkGeneratorCycles()
 	// An `@inline` function that reaches itself could never be spliced.
 	lowerer.checkInlineCycles()
+	// A template's `refusal` that its literals cannot be asked of, and a
+	// `finished` they cannot end with.
+	lowerer.checkTemplateMethods()
 	// With every body checked, each call to a C function that takes more
 	// than it declares is pointed at a declaration of what it passes.
 	resolveVariadicCalls(&var lowerer.program)
@@ -689,6 +705,8 @@ struct CheckedBodies {
 	names: Vec<(Span, Named)>
 	/// The implicits its calls filled.
 	implicitFills: Vec<(u32, String)>
+	/// The literals it checked whose template is asked what it refuses.
+	templateChecks: Vec<TemplateCheck>
 	diagnostics: Vec<Diagnostic>
 }
 
@@ -1090,6 +1108,18 @@ extend Lowerer {
 		else if isPub then self.modules[self.names].inside.unwrapOr(self.current)
 		else self.names
 
+	/// `diagnostic`, of `name` not found in the module of `scope`, with a
+	/// note where the module declares it for another target: a program
+	/// built for one target cannot use what is only another's, and is told
+	/// so, not only that nothing is there.
+	fn withElsewhere(diagnostic: Diagnostic, scope: i64, name: str): Diagnostic = {
+		val key = String::of(name)
+		val module = self.moduleOf(scope)
+		val .Some(said) = self.modules[module].declaredElsewhere.get(&key) else return diagnostic
+		val place = if module == self.moduleOf(self.current) then "here" else "there"
+		return diagnostic.withNote("`\(name)` is declared \(place) for `\(said)` alone, which this program is not built for")
+	}
+
 	/// The module a scope is of: itself, for a module's own.
 	fn moduleOf(scope: i64): i64 = {
 		var at = scope
@@ -1317,12 +1347,21 @@ extend Lowerer {
 				),
 			)
 
+		// The literals it found to ask their templates of.
+		var templateChecks = mem::replace(&var self.program.templateChecks, Vec())
+		if renumber {
+			for check in templateChecks {
+				check.template = map.get(check.template)
+				check.typeArgs = map.getList(check.typeArgs)
+			}
+		}
 		return CheckedBodies(
 			bodies:,
 			lambdas:,
 			envStructs:,
 			generators:,
 			names:,
+			templateChecks:,
 			implicitFills: mem::replace(&var self.program.implicitFills, Vec()),
 			diagnostics: mem::replace(&var self.diagnostics, Vec()),
 		)
@@ -1350,6 +1389,7 @@ extend Lowerer {
 		}
 		self.program.names.append(checked.names)
 		self.program.implicitFills.append(checked.implicitFills)
+		self.program.templateChecks.append(checked.templateChecks)
 		self.diagnostics.append(checked.diagnostics)
 	}
 

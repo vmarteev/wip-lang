@@ -20,6 +20,14 @@
 // and `$$` is a `$`.
 //
 // Positions are byte offsets into the text, as a `str`'s slices are.
+//
+// A `Regex` is a template: where one is expected, a literal is its
+// pattern, `val digits: Regex = "\\d+"`, checked while the program is
+// compiled and compiled where the literal runs. A hole's value is matched
+// as the text it is, every character that means something in a pattern
+// escaped, and a hole of a `Regex` is its pattern, as a group that does not
+// capture. A hole is refused where a value cannot be text: inside a class,
+// inside a repetition's braces, and after a `\`.
 
 /// The most times a bounded repetition may name: `{0,1000}` is a program
 /// a thousand copies long, and more would be a program no one meant.
@@ -54,28 +62,215 @@ pub enum Problem {
 	UnknownGroup
 }
 
-extend RegexError: Text {
-	fn appendTo(out: &var String) = {
-		val what = match self.problem {
-			.UnclosedGroup => "a group is not closed"
-			.UnopenedGroup => "a `)` closes no group"
-			.UnclosedClass => "a `[` is not closed"
-			.NothingToRepeat => "there is nothing before it to repeat"
-			.BadRepeat => "a repetition is not {n}, {n,} or {n,m} of at most a thousand"
-			.BadEscape => "a `\\` escapes nothing it knows"
-			.BackwardsRange => "a range ends before it starts"
-			.UnknownGroup => "a group of a kind there is not: only (…) and (?:…)"
-		}
-		out.push("\(what), at byte \(self.at)")
+extend Problem {
+	/// What is wrong, in words.
+	pub fn said(): str = match self {
+		.UnclosedGroup => "a group is not closed"
+		.UnopenedGroup => "a `)` closes no group"
+		.UnclosedClass => "a `[` is not closed"
+		.NothingToRepeat => "there is nothing before it to repeat"
+		.BadRepeat => "a repetition is not {n}, {n,} or {n,m} of at most a thousand"
+		.BadEscape => "a `\\` escapes nothing it knows"
+		.BackwardsRange => "a range ends before it starts"
+		.UnknownGroup => "a group of a kind there is not: only (…) and (?:…)"
 	}
 }
 
-/// A compiled pattern, to match and replace with.
+extend RegexError: Text {
+	fn appendTo(out: &var String) = out.push("\(self.problem.said()), at byte \(self.at)")
+}
+
+/// A compiled pattern, to match and replace with. Built by a literal where
+/// one is expected, or by `Regex::new` from a pattern that comes from
+/// outside.
 pub struct Regex {
-	program: Vec<Op>
-	sets: Vec<CharSet>
+	program: Vec<Op> = Vec()
+	sets: Vec<CharSet> = Vec()
 	/// How many groups capture, not counting the whole match.
-	groups: i64
+	groups: i64 = 0
+	/// The pattern, as it was written, which a hole of it joins.
+	pattern: String = String()
+	/// Where in the pattern the next byte goes, as a literal builds it.
+	place: Place = .Plain
+	/// Whether the program is the pattern's, compiled: a literal's is
+	/// once it is finished.
+	compiled: bool = false
+	/// Whether it matches ASCII letters in either case, which a pattern
+	/// cannot say, so one that does is not joined into another.
+	anyCase: bool = false
+}
+
+/// Where in a pattern a byte goes, for what a hole may be: a value is text
+/// only outside a class and braces, and not after a `\`.
+enum Place {
+	Plain
+	/// After a `\`, where the next character is what is escaped.
+	Escape
+	/// Just after a class's `[`, where a `^` negates it and a `]` is itself.
+	ClassOpen
+	/// After a class's `[^`, where a `]` is itself.
+	ClassFirst
+	Class
+	/// After a `\` inside a class.
+	ClassEscape
+	/// Inside a repetition's `{…}`.
+	Braces
+}
+
+extend Place {
+	/// Where the byte after `byte` goes.
+	fn after(byte: u8): Place = match self {
+		.Plain => match byte {
+			b'\\' => .Escape
+			b'[' => .ClassOpen
+			b'{' => .Braces
+			_ => .Plain
+		}
+		.Escape => .Plain
+		.ClassOpen => match byte {
+			b'^' => .ClassFirst
+			b'\\' => .ClassEscape
+			_ => .Class
+		}
+		.ClassFirst | .Class => match byte {
+			b'\\' => .ClassEscape
+			b']' if self == Place::Class => .Plain
+			_ => .Class
+		}
+		.ClassEscape => .Class
+		.Braces => if byte == b'}' then .Plain else .Braces
+	}
+
+	/// Why a hole cannot be here, where it cannot.
+	fn refusal(): Option<str> = match self {
+		.Plain => .None
+		.Escape => "after a `\\`, where it would be what is escaped"
+		.ClassOpen | .ClassFirst | .Class | .ClassEscape => "inside a class, `[…]`"
+		.Braces => "inside a repetition's braces, `{…}`"
+	}
+
+	/// The place after `text`.
+	fn read(text: str): Place = {
+		var place = self
+		for byte in text do
+			place = place.after(byte)
+
+		return place
+	}
+}
+
+/// What a pattern matches as `text`: each character that means something in
+/// a pattern escaped with a `\`, so that `a.b` matches `a.b` and not
+/// `axb`. For a pattern built another way than by a literal, whose holes
+/// are escaped already.
+pub fn escape(text: str): String = {
+	var out = String()
+	escapeInto(&var out, text)
+	return out
+}
+
+fn escapeInto(out: &var String, text: str) = {
+	for byte in text {
+		if byte is b'\\' | b'.' | b'+' | b'*' | b'?' | b'(' | b')' | b'|' | b'[' | b']' | b'{'
+		| b'}' | b'^' | b'$' {
+			out.pushByte(b'\\')
+		}
+
+		out.pushByte(byte)
+	}
+}
+
+extend Regex: Template {
+	/// A pattern, not yet compiled, with room for `capacity` bytes.
+	static fn withCapacity(capacity: i64): Regex = Regex(pattern: .withCapacity(capacity))
+
+	/// Pattern syntax, as written.
+	var fn pushLiteral(text: str) = {
+		self.pattern.push(text)
+		self.place = self.place.read(text)
+		self.compiled = false
+	}
+
+	/// Another pattern, as a group that does not capture, so that its `|`
+	/// stays inside it; its groups are numbered after those before it.
+	var fn pushBuilt(built: &Regex, implicit at: Location) = {
+		if self.place.refusal() is .Some(why) then
+			panic("a `Regex` joined \(why)", at:)
+
+		if built.anyCase then
+			panic(
+				"a `Regex` that ignores case joined into another, which a pattern cannot say",
+				at:,
+			)
+
+		self.pattern.push("(?:")
+		self.pattern.push(built.pattern.toStr())
+		self.pattern.push(")")
+		self.compiled = false
+	}
+}
+
+extend Regex {
+	/// A hole's value, matched as the text it is: each character that
+	/// means something in a pattern escaped, in a group of its own, so that
+	/// a repetition after the hole repeats all of it. A panic where the
+	/// place is one a value cannot be text in.
+	pub var fn pushValue<T: Text>(value: &T, implicit at: Location) = {
+		if self.place.refusal() is .Some(why) then
+			panic("a hole \(why), where a `Regex` cannot match a value as text", at:)
+
+		var text = String()
+		value.appendTo(&var text)
+		self.pattern.push("(?:")
+		escapeInto(&var self.pattern, text.toStr())
+		self.pattern.push(")")
+		self.compiled = false
+	}
+
+	/// What a literal built, compiled; a panic where it is not a pattern,
+	/// which a literal's own text never reaches, since the compiler asks
+	/// `refusal` of it.
+	pub move fn finished(implicit at: Location): Regex = match Regex::new(self.pattern.toStr()) {
+		.Ok(compiled) => compiled
+		.Err(error) => panic("the pattern `\(self.pattern)` does not compile: \(error)", at:)
+	}
+
+	/// What `Regex` refuses in a literal, which the compiler asks of each
+	/// literal that builds one: a hole where a value cannot be text, and the
+	/// byte of the literal's own text where it is not a pattern. The
+	/// pattern is read with each hole as what it will be, a group.
+	pub static fn refusal(pieces: &[str], joined: &[bool]): Option<Refusal> = {
+		var pattern = String()
+		// Where each piece begins in the pattern, and each hole.
+		var starts: Vec<i64> = Vec()
+		var holes: Vec<(i64, i64)> = Vec()
+		var place = Place::Plain
+		for (i, piece) in pieces.indexed() {
+			starts.push(pattern.len())
+			pattern.push(piece)
+			place = place.read(piece)
+			if i >= joined.len() then
+				break
+
+			if place.refusal() is .Some(why) then
+				return .Hole(index: i, why:)
+
+			val start = pattern.len()
+			pattern.push(if joined[i] then "(?:)" else "(?:x)")
+			holes.push((start, pattern.len()))
+		}
+		val .Err(error) = Regex::new(pattern.toStr()) else return .None
+		for (i, (start, end)) in holes.indexed() do
+			if error.at >= start && error.at < end then
+				return .Hole(index: i, why: error.problem.said())
+
+		var piece = 0
+		for (i, start) in starts.indexed() do
+			if start <= error.at then
+				piece = i
+
+		return .Text(piece:, at: error.at - starts[piece], why: error.problem.said())
+	}
 }
 
 /// Where a pattern matched: the whole match, and each group's span, or
@@ -191,8 +386,18 @@ extend Regex {
 		if anyCase then
 			foldCase(&var program, &var building.sets)
 
-		return Regex(program:, sets: building.sets, groups: building.groups)
+		return Regex(
+			program:,
+			sets: building.sets,
+			groups: building.groups,
+			pattern:,
+			compiled: true,
+			anyCase:,
+		)
 	}
+
+	/// The pattern, as it was written.
+	pub fn pattern(): str = self.pattern.toStr()
 
 	/// How many groups capture, not counting the whole match.
 	pub fn groups(): i64 = self.groups
@@ -207,6 +412,11 @@ extend Regex {
 
 	/// The first match at or after byte `from`.
 	pub fn findFrom(text: str, from: i64): Option<Found> = {
+		if !self.compiled then
+			panic(
+				"a `Regex` built by `pushLiteral` and `pushValue` is matched before `finished` compiles it",
+			)
+
 		val slots = (self.groups + 1) * 2
 		var current: Vec<Thread> = Vec()
 		var next: Vec<Thread> = Vec()

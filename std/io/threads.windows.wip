@@ -1,0 +1,97 @@
+// Windows: the threads the process runs, as the system's list of every
+// thread says, those whose process is this one — but those Windows starts
+// for itself, its loader's and its thread pool's, which begin in `ntdll`,
+// where no thread a program or a C library starts begins.
+
+import std::libc
+
+@link("kernel32")
+extern "C" {
+	fn CreateToolhelp32Snapshot(flags: u32, process: u32): i64
+	fn Thread32First(snapshot: i64, entry: &var ThreadEntry): c_int
+	fn Thread32Next(snapshot: i64, entry: &var ThreadEntry): c_int
+	fn OpenThread(access: u32, inherits: c_int, thread: u32): i64
+	fn GetModuleHandleA(name: cstring): i64
+	fn GetModuleHandleExA(flags: u32, address: u64, module: &var i64): c_int
+}
+
+@link("ntdll")
+extern "C" {
+	/// What the system knows of a thread: here, where it began.
+	fn NtQueryInformationThread(
+		thread: i64,
+		class: c_int,
+		information: &var u64,
+		size: u32,
+		returned: ptr<u32>,
+	): i32
+}
+
+/// A `THREADENTRY32`: its size first, which the system checks.
+extern struct ThreadEntry {
+	size: u32 = 28
+	usage: u32 = 0
+	thread: u32 = 0
+	process: u32 = 0
+	basePriority: i32 = 0
+	deltaPriority: i32 = 0
+	flags: u32 = 0
+}
+
+/// `CreateToolhelp32Snapshot`: every thread of the system.
+val TH32CS_SNAPTHREAD: u32 = 4
+/// What `CreateToolhelp32Snapshot` answers where it fails.
+val INVALID_HANDLE: i64 = -1
+/// `OpenThread`: enough to ask where it began, which the limited right
+/// is not.
+val THREAD_QUERY_INFORMATION: u32 = 0x40
+/// `NtQueryInformationThread`: the address the thread began at.
+val THREAD_QUERY_SET_WIN32_START_ADDRESS: c_int = 9
+/// `GetModuleHandleExA`: the module an address is in, its count left.
+val MODULE_OF_ADDRESS: u32 = 0x4 | 0x2
+
+/// How many threads the process runs, or nothing where the system does not
+/// say.
+fn threadCount(): Option<i64> = {
+	val snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0)
+	if snapshot == INVALID_HANDLE then
+		return .None
+
+	val mine = libc::GetCurrentProcessId()
+	var name = String::of("ntdll.dll")
+	val ntdll = GetModuleHandleA(name.toCstring())
+	var entry = ThreadEntry()
+	var count = 0
+	var more = Thread32First(snapshot, &var entry) != 0
+	while more {
+		if entry.process == mine && !beganIn(entry.thread, ntdll) then
+			count += 1
+
+		entry = ThreadEntry()
+		more = Thread32Next(snapshot, &var entry) != 0
+	}
+	libc::CloseHandle(snapshot)
+	return if count > 0 then count else .None
+}
+
+/// Whether the thread `id` began in `module`: what Windows' own threads
+/// do in `ntdll`. A thread that cannot be asked is counted.
+fn beganIn(id: u32, module: i64): bool = {
+	val thread = OpenThread(THREAD_QUERY_INFORMATION, 0, id)
+	if thread == 0 then
+		return false
+
+	var start: u64 = 0
+	val asked = NtQueryInformationThread(
+		thread,
+		THREAD_QUERY_SET_WIN32_START_ADDRESS,
+		&var start,
+		8,
+		null,
+	)
+	libc::CloseHandle(thread)
+	var found: i64 = 0
+	return asked == 0 &&
+		GetModuleHandleExA(MODULE_OF_ADDRESS, start, &var found) != 0 &&
+		found == module
+}

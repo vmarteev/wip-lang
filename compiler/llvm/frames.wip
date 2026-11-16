@@ -34,9 +34,12 @@
 // what was called, and from which line of what.
 
 import std::collections::{Map}
+import std::path
 
 /// The runtime's own file, and the runner of the tests: their functions
 /// are how a panic is told, or how a test is called, not where it happened.
+/// Each is matched with `/` between its names, as a compiler on Windows
+/// names it with `\`.
 val PASSED_OVER: [str; 2] = ["std/prelude/runtime.wip", "std/test/test.wip"]
 
 /// The sections of DWARF a reader of it loads, each with its relocations.
@@ -86,9 +89,9 @@ fn relocationsOf(file: &Object, section: &ObjectSection): Result<Map<u64, (bool,
 }
 
 /// An address in `section` of the object, where every section of code has a
-/// place of its own: a Mach-O object's sections have theirs, and an ELF
-/// object's each begin at 0, so each is given a base of its own — LLVM may put
-/// a cold function in a section other than the rest. An address in any other
+/// place of its own: a Mach-O object's sections have theirs, and an ELF or a
+/// COFF object's each begin at 0, so each is given a base of its own — LLVM
+/// may put a cold function in a section other than the rest. An address in any other
 /// section is a distance into it, as DWARF reads one in its own sections;
 /// DWARF names no other code or data.
 fn address(file: &Object, section: Option<i64>, at: u64): u64 = {
@@ -97,7 +100,7 @@ fn address(file: &Object, section: Option<i64>, at: u64): u64 = {
 	if !found.text then
 		return at
 
-	return if file.format == Format::Elf then ((index as u64) << 32) + at else found.address + at
+	return if file.format == Format::Macho then found.address + at else ((index as u64) << 32) + at
 }
 
 /// A function of the program as the DWARF describes it.
@@ -163,8 +166,12 @@ pub fn withFrameTables(
 		return .Err("no object to add the table to")
 
 	val (shared, entries) = table.layout(key)
-	if readObject(&objects[0])?.format == Format::Macho then
+	val format = readObject(&objects[0])?.format
+	if format == Format::Macho then
 		return withMachoData(&objects[0], machoTable(&shared, &entries, symbol))
+
+	if format == Format::Coff then
+		return withCoffData(&objects[0], coffTable(&shared, &entries, symbol))
 
 	var added = Vec::of([elfData(".data.rel.ro.wip.frames", &shared, String::of(symbol), .None)])
 	if tied {
@@ -186,12 +193,20 @@ pub fn withFrameTables(
 /// program with no entries — built without debug information — must still
 /// have where they begin and end: a Mac's linker gives them for the empty
 /// section the list carries, and ELF's for none, so ELF's are named weakly,
-/// and are 0 where there is no section.
-pub fn frameListAssembly(tables: &[(u64, String)], macho: bool): String = {
-	val (start, end) =
-		if macho then
-			("section$start$__DATA_CONST$__wip_frames", "section$end$__DATA_CONST$__wip_frames")
-		else ("__start_wip_frames", "__stop_wip_frames")
+/// and are 0 where there is no section. Microsoft's linker gives neither:
+/// it puts the pieces of a section named `.wipf$…` together in the order of
+/// what follows the `$`, so the list marks the start in `.wipf$a` and the
+/// end in `.wipf$z`, and the entries go between.
+pub fn frameListAssembly(tables: &[(u64, String)], format: Format): String = {
+	val macho = format == Format::Macho
+	val (start, end) = match format {
+		.Macho => (
+			"section$start$__DATA_CONST$__wip_frames",
+			"section$end$__DATA_CONST$__wip_frames",
+		)
+		.Elf => ("__start_wip_frames", "__stop_wip_frames")
+		.Coff => ("wip.frames.start", "wip.frames.end")
+	}
 	var items: Vec<Item> = [
 		Item::Address(.Symbol(start)),
 		Item::Address(.Symbol(end)),
@@ -202,10 +217,14 @@ pub fn frameListAssembly(tables: &[(u64, String)], macho: bool): String = {
 		items.push(.Address(.Symbol(if macho then "_\(table)" else table.clone())))
 	}
 	var out = String()
-	if !macho then
+	if format == Format::Elf then
 		out.push("\t.weak\t\"\(start)\"\n\t.weak\t\"\(end)\"\n")
 
-	out.push(assembly(&items, TABLES, macho))
+	if format == Format::Coff {
+		out.push("\t.section\t.wipf$a,\"dr\"\n\t.p2align\t3\n\"\(start)\":\n")
+		out.push("\t.section\t.wipf$z,\"dr\"\n\"\(end)\":\n")
+	}
+	out.push(assembly(&items, TABLES, format))
 	if macho then
 		out.push("\t.section\t__DATA_CONST,__wip_frames,regular,live_support\n\t.p2align\t3\n")
 
@@ -428,11 +447,23 @@ fn fileName(
 		.Some(value) => dwarf.string(&value)
 		.None => String()
 	}
-	val path = "\(directory)/\(name)"
-	return match files.get(&path) {
-		.Some(shown) => shown.clone()
-		.None => name
+	// Joined as the system that named it joins a path: with `\\` on
+	// Windows.
+	val path = path::join(directory, name)
+	if files.get(&path) is .Some(shown) then
+		return shown.clone()
+
+	// A file named relative to another directory than the one the DWARF
+	// says: `clang` on Windows writes `std/prelude/runtime.wip`, named from
+	// the library's home, as that directory and `runtime.wip`. It is found
+	// by the end of its path, its names between `/`s.
+	val seen = path.replace("\\", by: "/")
+	for entry in files {
+		val known = entry.key.replace("\\", by: "/")
+		if seen == known || seen.endsWith("/\(known)") then
+			return entry.value.clone()
 	}
+	return name
 }
 
 /// A subprogram's name, and whether a panic's calls pass over it: code the
@@ -466,7 +497,10 @@ fn described(
 	}
 	val artificial = entry.attr(DW_AT_artificial) is .Some((_, .Flag(true)))
 	val runtime = match fileIndex(&entry, DW_AT_decl_file) {
-		.Some(index) => PASSED_OVER.contains(table.files[fileOf(&unitFiles, index)].toStr())
+		.Some(index) => {
+			val file = table.files[fileOf(&unitFiles, index)].replace("\\", by: "/")
+			PASSED_OVER.contains(file.toStr())
+		}
 		.None => false
 	}
 	return (name, artificial || runtime)
@@ -691,15 +725,20 @@ extend Table {
 
 /// A table's shared piece or the list as assembly, in the program's data,
 /// named `symbol`.
-fn assembly(items: &[Item], symbol: str, macho: bool): String = {
-	val named = if macho then "\"_\(symbol)\"" else "\"\(symbol)\""
+fn assembly(items: &[Item], symbol: str, format: Format): String = {
+	val named = if format == Format::Macho then "\"_\(symbol)\"" else "\"\(symbol)\""
 	var out = String::of("\n")
-	if macho {
-		out.push("\t.section\t__DATA,__const\n")
-		out.push("\t.private_extern\t\(named)\n")
-	} else {
-		out.push("\t.section\t.data.rel.ro,\"aw\",@progbits\n")
-		out.push("\t.hidden\t\(named)\n")
+	match format {
+		.Macho => {
+			out.push("\t.section\t__DATA,__const\n")
+			out.push("\t.private_extern\t\(named)\n")
+		}
+		.Elf => {
+			out.push("\t.section\t.data.rel.ro,\"aw\",@progbits\n")
+			out.push("\t.hidden\t\(named)\n")
+		}
+		// A program is one image, whose symbols are its own.
+		.Coff => out.push("\t.section\t.rdata,\"dr\"\n")
 	}
 	out.push("\t.globl\t\(named)\n\t.p2align\t3\n\(named):\n")
 	itemsAssembly(&var out, &items, named)
@@ -772,6 +811,32 @@ fn machoTable(shared: &[Item], entries: &[FrameEntry], symbol: str): Vec<MachoDa
 			labels:,
 			addresses:,
 		),
+	]
+}
+
+/// A table as the two sections of a COFF object that hold it: the shared
+/// piece, named `symbol`, and the entries, one after another, in
+/// `.wipf$m`, which Microsoft's linker puts between the list's start, in
+/// `.wipf$a`, and its end, in `.wipf$z`. Each part's entries are whole, so
+/// nothing is tied to a function's section: a Windows build keeps its code
+/// whole, as a debug build does.
+fn coffTable(shared: &[Item], entries: &[FrameEntry], symbol: str): Vec<CoffData> = {
+	var sharedBytes: Vec<u8> = Vec()
+	var sharedAddresses: Vec<(u64, Address)> = Vec()
+	itemBytes(&shared, &var sharedBytes, &var sharedAddresses)
+	var bytes: Vec<u8> = Vec()
+	var addresses: Vec<(u64, Address)> = Vec()
+	for entry in entries do
+		itemBytes(&entry.items, &var bytes, &var addresses)
+
+	return [
+		CoffData(
+			name: ".rdata",
+			bytes: sharedBytes,
+			symbol: String::of(symbol),
+			addresses: sharedAddresses,
+		),
+		CoffData(name: ".wipf$m", bytes:, symbol: .None, addresses:),
 	]
 }
 

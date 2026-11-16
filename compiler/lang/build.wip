@@ -5,7 +5,7 @@ import std::fs
 import std::io
 import std::path
 import std::process::{Command}
-import std::time::{Instant}
+import std::time::{Duration, Instant, sleep}
 import hir::{FnId, Program, checkMain}
 import llvm
 import mir
@@ -26,11 +26,16 @@ pub enum Emit {
 	LlvmIr
 	/// The same, as LLVM's bitcode.
 	LlvmBc
+	/// The program's objects, which a linker on another machine links: a
+	/// directory of them, with what the link takes beside them in
+	/// `link.txt`, an object or a library a line. A Windows program is built so from
+	/// another system, and linked on Windows.
+	Objects
 }
 
 extend Emit {
 	/// Whether what is written needs a `main` — a library does not.
-	pub fn isProgram(): bool = self is .Program | .LlvmIr | .LlvmBc
+	pub fn isProgram(): bool = self is .Program | .LlvmIr | .LlvmBc | .Objects
 
 	/// What the flag's value is written as, for a message.
 	pub fn text(): str = match self {
@@ -39,6 +44,7 @@ extend Emit {
 		.Dynamic => "dynamic"
 		.LlvmIr => "llvm-ir"
 		.LlvmBc => "llvm-bc"
+		.Objects => "objects"
 	}
 
 	/// The flag's value, read.
@@ -48,6 +54,7 @@ extend Emit {
 		"dynamic" => .Dynamic
 		"llvm-ir" => .LlvmIr
 		"llvm-bc" => .LlvmBc
+		"objects" => .Objects
 		_ => .None
 	}
 }
@@ -172,6 +179,7 @@ fn writeBinary(
 		optimize,
 		loaded.threads,
 		arch,
+		options.target.os == .Windows,
 	)
 	if !options.debugInfo then
 		ir.dropDebugInfo()
@@ -229,6 +237,7 @@ fn linkProgram(
 	// is why they join the files here rather than where the modules were
 	// read.
 	val cFiles = cSources(&program, &dirs, &loaded.cFiles, &options.target)?
+	val exports = mir::exportedSymbols(&program, &loaded.interner)
 	val linking = Linking(
 		cFiles: &cFiles,
 		shims: match shims {
@@ -239,16 +248,153 @@ fn linkProgram(
 		search: &options.search,
 		libraries: &program.libraries,
 		frameworks: &program.frameworks,
+		exports: &exports,
 		emit: options.emit,
 		profile: options.profile,
 		cpu: &options.cpu,
 		target: &options.target,
 		targetFlags: &options.targetFlags,
 	)
+	if options.emit == Emit::Objects then
+		return writeObjects(&objects, &linking, output)
+
 	return link(&objects, &linking, output, &unique)
 }
 
-/// Compiles a loaded program's tests to a runner at `output`: it calls each
+/// The objects in the directory `output`, each part an object of its own,
+/// and `link.txt` beside them: what the link takes, one a line — `object
+/// NAME` for each object, in the order it is linked, since the directory
+/// may hold others of an earlier build; `library NAME` for each library
+/// the program links; and for Windows `object program.res`, the
+/// program's manifest as a resource, written beside them, `runtime
+/// compiler-rt` and each `option` the linker is given, as
+/// `windowsLinking` says. The C a program carries is compiled where it
+/// is linked, which is not yet done, so a program with C is refused.
+fn writeObjects(objects: &[Vec<u8>], linking: &Linking, output: str): Result<void, BuildError> = {
+	if !linking.cFiles.isEmpty() || linking.shims.isSome() then
+		return .Err(
+			.Link(
+				"the program carries C, which `--emit objects` does not compile: it is compiled where it is linked, which is not yet done",
+			),
+		)
+
+	if fs::makeDirs(output) is .Err(error) then
+		return .Err(.Link("cannot make `\(output)`: \(error)"))
+
+	val windows = linking.target.os == .Windows
+	val extension = if windows then "obj" else "o"
+	var listed = String()
+	for (i, object) in objects.indexed() {
+		val name = "part\(i).\(extension)"
+		val path = path::join(output, name)
+		if fs::writeFile(path, str::fromBytes(&object.items())) is .Err(error) then
+			return .Err(.Link("cannot write `\(path)`: \(error)"))
+
+		listed.push("object \(name)\n")
+	}
+	for library in linking.libraries do
+		listed.push("library \(library)\n")
+
+	if windows {
+		val resource = path::join(output, "program.res")
+		if writeBytes(resource, manifestResource()) is .Err(error) then
+			return .Err(.Link("cannot write `\(resource)`: \(error)"))
+
+		listed.push("object program.res\n")
+		listed.push("runtime compiler-rt\n")
+		for option in windowsOptions(linking.profile) do
+			listed.push("option \(option)\n")
+	}
+	val list = path::join(output, "link.txt")
+	if fs::writeFile(list, listed) is .Err(error) then
+		return .Err(.Link("cannot write `\(list)`: \(error)"))
+
+	return
+}
+
+/// What Microsoft's linker is given for a Windows program, beside its
+/// objects, its manifest and Clang's runtime, which the code calls for
+/// what the processor has no instruction for, as a 128-bit division, and
+/// which Clang gives a Unix's linker by itself and not Microsoft's: the
+/// debug information into a PDB beside the program (`/DEBUG`); no linking
+/// in steps, which may pad between the pieces of a section, where the
+/// entries of a panic's table, gathered in one, would read the padding;
+/// and in a release, what nothing reaches left out (`/OPT:REF`), as
+/// `--gc-sections` does on Linux.
+fn windowsOptions(profile: Profile): Vec<String> = {
+	var options: Vec<String> = ["/DEBUG", "/INCREMENTAL:NO"]
+	if profile.optimizes() then
+		options.push("/OPT:REF")
+
+	return options
+}
+
+/// The program's manifest as a compiled resource, a `.res`, which the
+/// linker takes as it takes an object: no `mt.exe` is needed to put it
+/// into the program. The file is an empty entry, as every `.res` begins,
+/// and then the manifest's: its size, its header's, its type, 24, a
+/// manifest, and its name, 1, the program's own, each as a number after
+/// `0xFFFF`; and the text, padded to four bytes.
+fn manifestResource(): Vec<u8> = {
+	var out: Vec<u8> = Vec()
+	resourceEntry(&var out, 0, 0, 0, 0)
+	resourceEntry(&var out, WINDOWS_MANIFEST.len(), RT_MANIFEST, 1, LANGUAGE_NEUTRAL)
+	out.pushAll(WINDOWS_MANIFEST)
+	while out.len() % 4 != 0 do
+		out.push(0)
+
+	return out
+}
+
+/// `RT_MANIFEST`, the type of a manifest's resource.
+val RT_MANIFEST: u16 = 24
+
+/// A resource for every language.
+val LANGUAGE_NEUTRAL: u16 = 0
+
+/// One resource's header, 32 bytes, for `size` bytes of it, its type and
+/// name numbers: what is moved and dropped as Windows likes, `0x1030`, for
+/// one with something in it.
+fn resourceEntry(out: &var Vec<u8>, size: i64, kind: u16, name: u16, language: u16) = {
+	pushU32(&var out, size as u32)
+	pushU32(&var out, 32)
+	pushU16(&var out, 0xFFFF)
+	pushU16(&var out, kind)
+	pushU16(&var out, 0xFFFF)
+	pushU16(&var out, name)
+	pushU32(&var out, 0)
+	pushU16(&var out, if size > 0 then 0x1030 else 0)
+	pushU16(&var out, language)
+	pushU32(&var out, 0)
+	pushU32(&var out, 0)
+}
+
+fn pushU16(out: &var Vec<u8>, value: u16) = {
+	out.push((value & 0xFF) as u8)
+	out.push((value >> 8) as u8)
+}
+
+fn pushU32(out: &var Vec<u8>, value: u32) = {
+	pushU16(&var out, (value & 0xFFFF) as u16)
+	pushU16(&var out, (value >> 16) as u16)
+}
+
+/// What a Windows program says of itself to Windows: that its code page is
+/// UTF-8, so that the C library's text — a path, an argument, a variable —
+/// is UTF-8, as Wip's is.
+val WINDOWS_MANIFEST: str = """
+	<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+	<assembly manifestVersion="1.0" xmlns="urn:schemas-microsoft-com:asm.v1">
+	  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+	    <windowsSettings>
+	      <activeCodePage xmlns="http://schemas.microsoft.com/SMI/2019/WindowsSettings">UTF-8</activeCodePage>
+	    </windowsSettings>
+	  </application>
+	</assembly>
+	"""
+
+/// Compiles a loaded program's tests to a runner at `output`, or its objects
+/// where `options` asks for them: it calls each
 /// test the program declares, in declaration order, and `filter` keeps the
 /// ones whose name, as the runner prints it — `board::placesABall` — holds
 /// it. The count is how many tests the runner holds. What `options` say of
@@ -284,7 +430,7 @@ pub fn buildTests(
 	val count = tests.len()
 	val written = BuildOptions(
 		search: options.search.clone(),
-		emit: .Program,
+		emit: if options.emit == Emit::Objects then Emit::Objects else Emit::Program,
 		header: .None,
 		profile: move profile,
 		cpu: options.cpu,
@@ -436,11 +582,19 @@ fn ownerOf(file: str, dirs: &[String]): Option<i64> = {
 /// How many names a path is made of: `/` and `.` count as one each, as
 /// Rust's components do.
 fn components(dir: str): i64 = {
-	var count = if dir.startsWith("/") then 1 else 0
-	for name in dir.split("/") do
+	val root = path::root(dir)
+	var count = if root.isEmpty() then 0 else 1
+	var at = root.len()
+	while at < dir.len() {
+		var end = at
+		while end < dir.len() && !path::isSeparator(dir[end]) do
+			end += 1
+
+		val name = dir[at..end]
+		at = end + 1
 		if !name.isEmpty() && !(name == "." && count > 0) then
 			count += 1
-
+	}
 	return count
 }
 
@@ -517,6 +671,8 @@ view struct Linking {
 	search: &Search
 	libraries: &[String]
 	frameworks: &[String]
+	/// What a library exports to C, by its symbols.
+	exports: &[String]
 	emit: Emit
 	profile: Profile
 	cpu: &Cpu
@@ -531,10 +687,13 @@ fn shims(program: &Program, interner: &Interner, target: &Target): Option<String
 	return mir::writeShims(&program, &interner, &shimmed)
 }
 
-/// The rules C calls by on `target`, where they are written: Apple's arm64
-/// packs what goes on the stack, as Linux's does not.
+/// The rules C calls by on `target`: Apple's arm64 packs what goes on the
+/// stack, as Linux's does not; Windows on Arm64 passes a struct as AAPCS64
+/// does, its variadic calls aside, which LLVM lays out for the target; and
+/// Windows on x86-64 by Microsoft's own rules, not System V's.
 fn abiOf(target: &Target): Option<mir::Arch> = match (target.os, target.arch) {
-	(.Windows, _) => .None
+	(.Windows, .Arm64) => .Arm64
+	(.Windows, .X86_64) => .WindowsX64
 	(_, .X86_64) => .X86_64
 	(_, .Arm64) => .Some(if target.isApple() then .AppleArm64 else .Arm64)
 }
@@ -613,7 +772,15 @@ fn link(
 	for object in compiled.objects do
 		members.push(object.clone())
 
-	// An archive is made of objects, and `ar` collects them.
+	// An archive is made of objects, and `ar` collects them; on Windows,
+	// which has none, `llvm-lib`, which comes with Visual Studio's `clang`.
+	if linking.emit == Emit::Static && linking.target.os == .Windows {
+		var args: Vec<String> = ["/OUT:\(output)"]
+		for member in members do
+			args.push(member.clone())
+
+		return run(windowsArchiver(), strs(&args))
+	}
 	if linking.emit == Emit::Static {
 		var args: Vec<String> = Vec()
 		args.push("rcs")
@@ -627,6 +794,9 @@ fn link(
 		}
 		return run(ar, strs(&args))
 	}
+	if linking.target.os == .Windows then
+		return linkWindows(&members, &linking, output, &dir)
+
 	var args: Vec<String> = [
 		for flag in linking.targetFlags do
 			yield flag.clone()
@@ -703,6 +873,102 @@ fn link(
 	return
 }
 
+/// A Windows program, or a DLL, linked by Microsoft's linker through
+/// `clang`, with its manifest, made a resource in `dir`, and what
+/// `windowsOptions` says; the PDB is written beside it.
+fn linkWindows(
+	members: &[String],
+	linking: &Linking,
+	output: str,
+	dir: &fs::TempDir,
+): Result<void, BuildError> = {
+	val resource = dir.join("program.res")
+	if writeBytes(resource, manifestResource()) is .Err(error) then
+		return .Err(.Link("cannot write temporary files: \(error)"))
+
+	var args: Vec<String> = [
+		for flag in linking.targetFlags do
+			yield flag.clone()
+	]
+	args.push("-fuse-ld=link")
+	// A DLL exports only what it is told to: each function the library
+	// exports to C, which C linking against it, through the import library
+	// written beside it, finds.
+	if linking.emit == Emit::Dynamic {
+		args.push("-shared")
+		for symbol in linking.exports do
+			args.push("-Wl,/EXPORT:\(symbol)")
+	}
+
+	// A program is linked beside where it goes and moved there: Windows
+	// holds a program's file a moment after it ran, and a scanner holds a
+	// new one, where the linker would be refused it. Its PDB is named as the
+	// program is, `board.pdb` beside `board.exe`.
+	val program = linking.emit == Emit::Program
+	val written: String = if program then "\(output).linking" else output
+	args.push("-o")
+	args.push(written.clone())
+	if program then
+		args.push("-Wl,/PDB:\(path::join(path::parent(output), "\(path::stem(output)).pdb"))")
+
+	for member in members do
+		args.push(member.clone())
+
+	args.push(resource)
+	for arg in linkArgs(
+		&linking.search.libraryPaths,
+		linking.libraries,
+		linking.frameworks,
+		linking.target,
+	) do
+		args.push(arg)
+
+	args.push("--rtlib=compiler-rt")
+	for option in windowsOptions(linking.profile) do
+		args.push("-Wl,\(option)")
+
+	run(compiler(), strs(&args))?
+	if program then
+		return movedInto(written, output)
+
+	return
+}
+
+/// `from` moved to `to`, in place of what is there: tried again for a
+/// second while Windows holds `to`, a program that ran a moment ago, or
+/// one a scanner is reading.
+fn movedInto(from: str, to: str): Result<void, BuildError> = {
+	var tries = 0
+	while true {
+		match fs::rename(from, to) {
+			.Ok(..) => return
+			.Err(.Denied) if tries < 100 => {
+				tries += 1
+				sleep(Duration::millis(10))
+			}
+			.Err(error) => {
+				fs::removeFile(from)
+				return .Err(.Link("cannot put the program at `\(to)`: \(error)"))
+			}
+		}
+	}
+	return
+}
+
+/// What makes an archive on Windows: `$AR`, or the `llvm-lib` beside the
+/// `clang` a build runs, or one on the path.
+fn windowsArchiver(): String = {
+	if io::env("AR") is .Some(ar) && !ar.isEmpty() then
+		return ar
+
+	val clang = compiler()
+	val beside = path::join(path::parent(clang), "llvm-lib.exe")
+	if !path::root(clang).isEmpty() && fs::exists(beside) then
+		return beside
+
+	return "llvm-lib"
+}
+
 /// A directory the program's C looks in, as the file system names it, where
 /// it is not there already.
 fn addInclude(includes: &var Vec<String>, given: str) = {
@@ -730,8 +996,10 @@ fn run(tool: str, args: &[str]): Result<void, BuildError> = {
 		.Ok(result) => result
 		.Err(error) => return .Err(.Link("cannot run `\(tool)`: \(error)"))
 	}
+	// What went wrong may be said on either stream: Microsoft's linker,
+	// which `clang` runs on Windows, says it on its output.
 	if !result.exit.success() then
-		return .Err(.Link("`\(tool)` failed:\n\(result.stderr)"))
+		return .Err(.Link("`\(tool)` failed:\n\(result.stdout)\(result.stderr)"))
 
 	return
 }

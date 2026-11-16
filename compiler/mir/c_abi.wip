@@ -2,30 +2,34 @@
 //
 // Wip passes an aggregate by its address; C passes a struct in registers, by
 // rules that differ per target. This module says, for one C function, how
-// each struct parameter and the result travel, on the three targets Wip
-// supports. It covers what Wip can write at the boundary — scalars, pointers,
+// each struct parameter and the result travel, on the four sets of rules
+// Wip's targets follow. It covers what Wip can write at the boundary — scalars, pointers,
 // and structs of those — and answers nothing for anything else, which then
 // goes through a wrapper in C as it always did.
 //
-// Apple arm64 and Linux arm64 follow AAPCS64, and for this subset they agree:
-// Apple's divergences are about variadic arguments and about small arguments
-// on the stack. x86-64 is the System V ABI.
+// Apple arm64, Linux arm64 and Windows arm64 follow AAPCS64, and for this
+// subset they agree: Apple's divergences are about variadic arguments and
+// about small arguments on the stack. x86-64 is the System V ABI, but on
+// Windows, whose convention is Microsoft's own.
 
 import std::collections::{Set}
 import std::io
 import hir::{FnDef, FnId, Layouts, Program, Ty, UNIT, nextMultiple}
 import syntax::{Diagnostic, Interner, UNSUPPORTED}
 
-/// The processor, which is what decides how C passes a struct. Windows would
-/// be a third set of rules, and is not written.
+/// The rules C passes a struct by: the processor's, and on x86-64 the
+/// system's too.
 @derive(Text)
 pub enum Arch {
-	/// Linux arm64: AAPCS64 as written.
+	/// Linux arm64, and Windows': AAPCS64 as written.
 	Arm64
 	/// Apple arm64: AAPCS64, but with arguments on the stack packed at their
 	/// natural alignment rather than in eight-byte slots.
 	AppleArm64
+	/// x86-64 by System V's rules, every system's but Windows'.
 	X86_64
+	/// Windows on x86-64: Microsoft's x64 convention.
+	WindowsX64
 }
 
 extend Arch {
@@ -293,6 +297,9 @@ pub fn classify(
 	def: &FnDef,
 	arch: Arch,
 ): Option<CCall> = {
+	if arch == Arch::WindowsX64 then
+		return classifyWindowsX64(&program, &var layouts, &def)
+
 	var regs = Registers::of(arch)
 	var ret = Answer::Plain
 	if crossesAsStruct(&program, def.ret) {
@@ -390,6 +397,52 @@ pub fn classify(
 	return CCall(params:, ret:)
 }
 
+/// Microsoft's x64 convention, which is simpler than System V's: a struct
+/// of one, two, four or eight bytes travels as an integer of its size,
+/// floats in it included, and any other as a pointer to a copy the caller
+/// makes; a result that is not an integer's size comes back through an
+/// address the caller gives, the first argument. Every argument has a slot
+/// of its own — a register for the first four, the stack after — which the
+/// code generator gives it by its place, so nothing here counts registers.
+fn classifyWindowsX64(program: &Program, layouts: &var Layouts, def: &FnDef): Option<CCall> = {
+	var ret = Answer::Plain
+	if crossesAsStruct(&program, def.ret) {
+		val size = layouts.of(&program, def.ret).size
+		if size == 0 then
+			return .None
+
+		ret = match windowsX64Pieces(size) {
+			.Some(parts) => .Parts(parts)
+			.None => Answer::Hidden
+		}
+	}
+	var params: Vec<Pass> = Vec()
+	for param in def.params {
+		if !crossesAsStruct(&program, param.ty) {
+			params.push(.Plain)
+			continue
+		}
+		val size = layouts.of(&program, param.ty).size
+		if size == 0 then
+			return .None
+
+		params.push(
+			match windowsX64Pieces(size) {
+				.Some(parts) => Pass::Parts(parts)
+				.None => Pass::Copy
+			},
+		)
+	}
+	return CCall(params:, ret:)
+}
+
+/// The register a struct of `size` bytes travels in on Windows x64, one
+/// integer's, or nothing where it goes through memory.
+fn windowsX64Pieces(size: u32): Option<Vec<Part>> = match size {
+	1 | 2 | 4 | 8 => [Part(offset: 0, reg: .I64)].toVec()
+	_ => .None
+}
+
 /// Whether a type reaches C as a pointer and a length.
 fn isPair(program: &Program, ty: Ty): bool = match program.types.kind(ty) {
 	.Str | .Slice(..) => true
@@ -409,6 +462,9 @@ extend Registers {
 		.Arm64 | .AppleArm64 => Registers(ints: 8, floats: 8)
 		// rdi, rsi, rdx, rcx, r8, r9; xmm0–xmm7.
 		.X86_64 => Registers(ints: 6, floats: 8)
+		// rcx, rdx, r8, r9, or xmm0–xmm3, by the argument's place: four in
+		// all, which `classifyWindowsX64` has no need to count.
+		.WindowsX64 => Registers(ints: 4, floats: 4)
 	}
 
 	var fn takeInt() = {
@@ -585,7 +641,7 @@ pub fn refusedExports(
 					def.nameSpan,
 					"a struct by value the compiler cannot pass as C does here",
 				).withNote(
-					"how C passes a struct by value is written for Apple arm64, Linux arm64 and Linux x86-64 only; a call into C goes through a wrapper in C elsewhere, but a call from C has none",
+					"how C passes a struct by value is written for arm64, and for x86-64 on Linux and Windows, only; a call into C goes through a wrapper in C elsewhere, but a call from C has none",
 				).withHelp("take the struct by reference, `&T`, which C sees as a pointer"),
 			)
 		else if asValues.contains(&id) then

@@ -1,0 +1,89 @@
+// A table written into a COFF object `clang` wrote for Windows on Arm64:
+// every section, symbol and relocation of the object is as it was, moved;
+// the DWARF beside the CodeView is read; and the table's entries name the
+// functions, the one the object keeps to itself among them.
+
+import std::collections::{Map}
+import std::fs
+import std::io
+import std::process::{Command}
+
+@test
+fn aTableIsWrittenIntoACoffObjectClangWrote() = {
+	val .Ok(dir) = fs::TempDir::new() else panic("a temporary directory")
+	val source = dir.join("table.c")
+	val first = dir.join("first.obj")
+	assert(fs::writeFile(source, SOURCE).isOk())
+	val clang = match io::env("WIP_CLANG") {
+		.Some(clang) => clang
+		.None => "clang"
+	}
+	val compiled = Command::of(clang).args([
+		"-c",
+		"-g",
+		"-gcodeview",
+		"-gdwarf",
+		"-O0",
+		"-target",
+		"aarch64-pc-windows-msvc",
+		source.toStr(),
+		"-o",
+		first.toStr(),
+	]).output()
+	assert(compiled is .Ok(result) && result.exit.success(), "clang writes a COFF object")
+	val object = bytesOf(first)
+	val files: Map<String, String> = Map()
+	val .Ok(written) = withFrameTables([object.clone()], &files, "wip.frames.test", 7, false) else {
+		panic("the table is written into the object")
+	}
+	val .Ok(before) = readObject(&object) else panic("the object is read")
+	val .Ok(after) = readObject(&written) else panic("the object written is read")
+	assert(after.format == Format::Coff)
+
+	// Every section as it was, at its number, with its relocations naming
+	// what they named.
+	for section in before.sections {
+		val .Some(again) = after.sectionAt(section.index) else {
+			panic("section \(section.index) is there")
+		}
+		assert(again.name == section.name && again.size == section.size)
+		assert(again.relocations.len() == section.relocations.len())
+		for (i, r) in section.relocations.indexed() {
+			val moved = &again.relocations[i]
+			assert(moved.offset == r.offset)
+			assert(
+				named(&before, &r.target) == named(&after, &moved.target),
+				"a relocation names what it named",
+			)
+		}
+		if section.size > 0 then
+			assert(
+				object[section.offset..(section.offset + section.size)] ==
+					written[again.offset..(again.offset + again.size)],
+			)
+	}
+	// Every symbol as it was, at its index.
+	for (i, symbol) in before.symbols.indexed() {
+		val .Some(s) = symbol else continue
+		val .Some(o) = after.symbols[i] else panic("\(s.name) is there")
+		assert(o.name == s.name && o.address == s.address && o.section == s.section)
+	}
+	// The table: its shared piece named, and an entry for each function.
+	val functions: Vec<String> = [for section in after.sections {
+		if section.name != ".wipf$m" then
+			continue
+
+		for r in section.relocations do
+			yield named(&after, &r.target)
+	}]
+	assert(
+		functions.contains("twice") && functions.contains("shown") && functions.contains("main"),
+		"\(functions)",
+	)
+	var shared = false
+	for symbol in after.symbols do
+		if symbol is .Some(s) && s.name == "wip.frames.test" && !s.undefined then
+			shared = true
+
+	assert(shared, "the shared piece is named")
+}

@@ -1,22 +1,462 @@
-// Percent-encoding: text made fit to stand in a part of a URL — a query's
-// value, a path's segment — each byte that may not stand there as `%` and
-// two hexadecimal digits, as RFC 3986 has it. What may stand anywhere is
-// its unreserved characters, letters, digits, `-`, `.`, `_` and `~`;
-// every other byte is encoded, a character beyond ASCII as each byte of
-// its UTF-8, unless the caller keeps it.
+// URLs: `Url`, a URL's text and its parts, and percent-encoding, text made
+// fit to stand in a part of a URL — a query's value, a path's segment —
+// each byte that may not stand there as `%` and two hexadecimal digits, as
+// RFC 3986 has it. What may stand anywhere is its unreserved characters,
+// letters, digits, `-`, `.`, `_` and `~`; every other byte is encoded, a
+// character beyond ASCII as each byte of its UTF-8, unless the caller
+// keeps it.
+//
+// `Url` is a template: where one is expected, a literal is a URL, checked
+// while the program is compiled, and each hole's value is encoded as the
+// part it stands in needs, so that a value is always the one part it was
+// written in.
 
-/// Why text could not be decoded: the `%` at `at` is not followed by two
-/// hexadecimal digits.
+/// Why text is not a URL, or could not be decoded, and the byte where it
+/// goes wrong.
 @derive(Eq)
 pub enum UrlError {
+	/// A `%` not followed by two hexadecimal digits.
 	BadEscape(at: i64)
+	/// What is before the first `:` is not a scheme: a letter, then
+	/// letters, digits, `+`, `-` or `.`.
+	BadScheme(at: i64)
+	/// A port that is not a number up to 65535.
+	BadPort(at: i64)
+	/// A `[` that begins an IPv6 address with no `]`.
+	UnclosedBracket(at: i64)
+	/// A space or a control character, which a URL holds only encoded.
+	NotAllowed(at: i64)
+}
+
+extend UrlError {
+	/// Where it goes wrong.
+	pub fn at(): i64 = match self {
+		.BadEscape(at) | .BadScheme(at) | .BadPort(at) | .UnclosedBracket(at) | .NotAllowed(at) =>
+			at
+	}
+
+	/// What is wrong, in words.
+	pub fn said(): str = match self {
+		.BadEscape(..) => "a `%` is not followed by two hexadecimal digits"
+		.BadScheme(..) => "a scheme is a letter, then letters, digits, `+`, `-` or `.`"
+		.BadPort(..) => "a port is a number up to 65535"
+		.UnclosedBracket(..) => "an IPv6 address's `[` has no `]`"
+		.NotAllowed(..) => "a space or a control character, which a URL holds only encoded"
+	}
 }
 
 extend UrlError: Text {
-	fn toString(): String = match self {
-		.BadEscape(at) =>
-			"not percent-encoded: the `%` at \(at) is not followed by two hexadecimal digits"
+	fn toString(): String = "\(self.said()), at \(self.at())"
+}
+
+/// A URL: its text, and its parts, which it answers as written. It may be
+/// relative, `/users/7?tab=posts`, as a link is. Built by a literal where
+/// one is expected, each hole encoded as its part needs, or read from text
+/// with `Url::parse`.
+@derive(Clone)
+pub struct Url {
+	text: String = String()
+	/// Where the next byte goes, as a literal builds it.
+	place: Place = .Start
+	/// How many hexadecimal digits of a `%` are still to come.
+	escape: i64 = 0
+}
+
+/// Where in a URL a byte goes, read from the bytes before it.
+enum Place {
+	/// Nothing yet.
+	Start
+	/// What may be a scheme, before its `:`.
+	Scheme
+	/// After a scheme's `:`.
+	AfterScheme
+	/// After a `/` that may begin `//`, and the authority.
+	Slash
+	Host
+	/// Inside an IPv6 address's brackets.
+	Bracket
+	Port
+	Path
+	Query
+	Fragment
+}
+
+extend Place {
+	/// Where the byte after `byte` goes.
+	fn after(byte: u8): Place = match self {
+		.Start => when {
+			byte.isAsciiLetter() => .Scheme
+			byte == b'/' => .Slash
+			else => Place::Path.after(byte)
+		}
+		.Scheme => when {
+			byte.isAsciiLetter() || byte.isDigit() || byte is b'+' | b'-' | b'.' => .Scheme
+			byte == b':' => .AfterScheme
+			else => Place::Path.after(byte)
+		}
+		.AfterScheme => if byte == b'/' then .Slash else Place::Path.after(byte)
+		.Slash => if byte == b'/' then .Host else Place::Path.after(byte)
+		.Host => match byte {
+			b'[' => .Bracket
+			b':' => .Port
+			b'@' => .Host
+			b'/' => .Path
+			b'?' => .Query
+			b'#' => .Fragment
+			_ => .Host
+		}
+		.Bracket => if byte == b']' then .Host else .Bracket
+		.Port => match byte {
+			b'@' => .Host
+			b'/' => .Path
+			b'?' => .Query
+			b'#' => .Fragment
+			_ => .Port
+		}
+		.Path => match byte {
+			b'?' => .Query
+			b'#' => .Fragment
+			_ => .Path
+		}
+		.Query => if byte == b'#' then .Fragment else .Query
+		.Fragment => .Fragment
 	}
+
+	/// Why a value cannot be written here, where it cannot.
+	fn refusal(): Option<str> = match self {
+		.Start | .Scheme => "in the scheme, where a value would say what kind of URL it is"
+		_ => .None
+	}
+}
+
+extend Url {
+	/// `text` read as a URL, or the byte where it is not one.
+	pub static fn parse(text: str): Result<Url, UrlError> = {
+		checked(text)?
+		var url = Url()
+		url.read(text)
+		return url
+	}
+
+	/// Its scheme, `https`, or nothing for a relative URL.
+	pub fn scheme(): Option<str> = self.slice(parts(self.text.toStr()).scheme)
+
+	/// Its host, without an IPv6 address's brackets; nothing where it has
+	/// no authority.
+	pub fn host(): Option<str> = {
+		val .Some((start, end)) = parts(self.text.toStr()).host else return .None
+		val host = self.text.toStr()[start..end]
+		return if host.startsWith("[") && host.endsWith("]") then host[1..host.len() - 1] else host
+	}
+
+	/// What is before its host's `@`, which `std::http` refuses to send.
+	pub fn userInfo(): Option<str> = self.slice(parts(self.text.toStr()).user)
+
+	/// Its port, where one is written and is a number; nothing where none
+	/// is, and the scheme's is meant.
+	pub fn port(): Option<u16> = {
+		val .Some(written) = self.portText() else return .None
+		val .Ok(number) = written.toInt() else return .None
+		return if number < 0 || number > 65535 then .None else number as u16
+	}
+
+	/// Its port's text, as written, which may not be a number.
+	pub fn portText(): Option<str> = self.slice(parts(self.text.toStr()).port)
+
+	/// Its path, as written: empty where it has none.
+	pub fn path(): str = match parts(self.text.toStr()).path {
+		.Some((start, end)) => self.text.toStr()[start..end]
+		.None => ""
+	}
+
+	/// What is after its `?`, as written.
+	pub fn query(): Option<str> = self.slice(parts(self.text.toStr()).query)
+
+	/// What is after its `#`, as written.
+	pub fn fragment(): Option<str> = self.slice(parts(self.text.toStr()).fragment)
+
+	/// The text, as it is.
+	pub fn toStr(): str = self.text.toStr()
+
+	/// The bytes written so far, read for where the next goes.
+	var fn read(text: str) = {
+		for byte in text {
+			if self.escape > 0 then
+				self.escape -= 1
+			else if byte == b'%' then
+				self.escape = 2
+			else
+				self.place = self.place.after(byte)
+		}
+		self.text.push(text)
+	}
+
+	/// Its text from and to where `span` says, if it says.
+	fn slice(span: Option<(i64, i64)>): Option<str> = match span {
+		.Some((start, end)) => self.text.toStr()[start..end]
+		.None => .None
+	}
+}
+
+/// Where each part of a URL's text is, as byte offsets.
+struct Spans {
+	scheme: Option<(i64, i64)> = .None
+	user: Option<(i64, i64)> = .None
+	host: Option<(i64, i64)> = .None
+	port: Option<(i64, i64)> = .None
+	path: Option<(i64, i64)> = .None
+	query: Option<(i64, i64)> = .None
+	fragment: Option<(i64, i64)> = .None
+}
+
+/// Where each part of `text` is, as RFC 3986 splits a URL: a scheme
+/// before the first `:` that comes before any `/`, `?` or `#`, an
+/// authority after `//`, a path, a query after `?`, and a fragment after
+/// `#`. Whatever the text, it is split.
+fn parts(text: str): Spans = {
+	var spans = Spans()
+	var at = 0
+	var schemeEnd = 0
+	while schemeEnd < text.len() && text[schemeEnd] !is b':' | b'/' | b'?' | b'#' do
+		schemeEnd += 1
+
+	if schemeEnd > 0 && schemeEnd < text.len() && text[schemeEnd] == b':' {
+		spans.scheme = (0, schemeEnd)
+		at = schemeEnd + 1
+	}
+	if text[at..text.len()].startsWith("//") {
+		at += 2
+		var end = at
+		while end < text.len() && text[end] !is b'/' | b'?' | b'#' do
+			end += 1
+
+		var hostStart = at
+		if text[at..end].lastIndexOf("@") is .Some(sign) {
+			spans.user = (at, at + sign)
+			hostStart = at + sign + 1
+		}
+		// The port is after the last `:` that is not inside brackets.
+		var hostEnd = end
+		var colon: Option<i64> = .None
+		var inside = false
+		for i in hostStart..end {
+			if text[i] == b'[' then
+				inside = true
+			else if text[i] == b']' then
+				inside = false
+			else if text[i] == b':' && !inside then
+				colon = i
+		}
+		if colon is .Some(c) {
+			hostEnd = c
+			spans.port = (c + 1, end)
+		}
+		spans.host = (hostStart, hostEnd)
+		at = end
+	}
+	var pathEnd = at
+	while pathEnd < text.len() && text[pathEnd] !is b'?' | b'#' do
+		pathEnd += 1
+
+	spans.path = (at, pathEnd)
+	at = pathEnd
+	if at < text.len() && text[at] == b'?' {
+		var end = at + 1
+		while end < text.len() && text[end] != b'#' do
+			end += 1
+
+		spans.query = (at + 1, end)
+		at = end
+	}
+	if at < text.len() && text[at] == b'#' then
+		spans.fragment = (at + 1, text.len())
+
+	return spans
+}
+
+/// Whether `text` is a URL: where it is not, the byte that says so.
+fn checked(text: str): Result<void, UrlError> = {
+	checkedBytes(text)?
+	val spans = parts(text)
+	if spans.scheme is .Some((start, end)) {
+		if !text[start].isAsciiLetter() then
+			return .Err(.BadScheme(start))
+
+		for at in start..end {
+			if !(text[at].isAsciiLetter() || text[at].isDigit() || text[at] is b'+' | b'-' | b'.') {
+				return .Err(.BadScheme(at))
+			}
+		}
+	} else if text.startsWith(":") then
+		return .Err(.BadScheme(0))
+
+	if spans.host is .Some((start, end)) {
+		if text[start..end].indexOf("[") is .Some(open) {
+			if !text[start + open..end].contains("]") then
+				return .Err(.UnclosedBracket(start + open))
+		}
+	}
+	if spans.port is .Some((start, end)) {
+		for at in start..end do
+			if !text[at].isDigit() then
+				return .Err(.BadPort(at))
+
+		if end > start && text[start..end].toInt() is .Ok(number) && number > 65535 then
+			return .Err(.BadPort(start))
+	}
+}
+
+fn isHex(byte: u8): bool = byte.digitValue(16).isSome()
+
+extend Url: Template {
+	/// An empty URL, with room for `capacity` bytes.
+	static fn withCapacity(capacity: i64): Url = Url(text: .withCapacity(capacity))
+
+	/// The URL's own text, as written.
+	var fn pushLiteral(text: str) = self.read(text)
+
+	/// A URL the rest goes on from, at the start, and nowhere else.
+	var fn pushBuilt(built: &Url, implicit at: Location) = {
+		if !self.text.isEmpty() then
+			panic(
+				"a `Url` joined after the start, where only the URL the rest goes on from can be",
+				at:,
+			)
+
+		self.text.push(built.text.toStr())
+		self.place = built.place
+		self.escape = built.escape
+	}
+}
+
+extend Url {
+	/// A hole's value, encoded as the part it stands in needs, so that it
+	/// is that part and no other; a panic where it would be the scheme, or
+	/// inside a `%` and its digits.
+	pub var fn pushValue<T: Text>(value: &T, implicit at: Location) = {
+		if self.escape > 0 then
+			panic("a hole inside a `%` and its two digits", at:)
+
+		if self.place.refusal() is .Some(why) then
+			panic("a hole \(why)", at:)
+
+		var written = String()
+		value.appendTo(&var written)
+		val encoded = match self.place {
+			// A host keeps its own characters, and encodes the URL's.
+			.Host => encodeHost(written.toStr())
+			// An IPv6 address keeps its digits, `:` and `.`, and nothing else.
+			.Bracket => encodeExcept(
+				written.toStr(),
+				(byte) => byte.isHexDigit() || byte is b':' | b'.',
+			)
+			.Port => encodeExcept(written.toStr(), (byte) => byte.isDigit())
+			_ => encode(written.toStr())
+		}
+		// What is encoded leaves the place as it was.
+		self.text.push(encoded)
+	}
+
+	/// What `Url` refuses in a literal, which the compiler asks of each
+	/// literal that builds one: a hole in the scheme or inside a `%`
+	/// escape, a `Url` joined anywhere but the start, and the literal's own
+	/// text where it is not a URL. After a `Url` joined at the start, where
+	/// the rest goes is the joined one's, known as the program runs, which
+	/// asks it then.
+	pub static fn refusal(pieces: &[str], joined: &[bool]): Option<Refusal> = {
+		var url = Url()
+		var text = String()
+		var starts: Vec<i64> = Vec()
+		var holes: Vec<(i64, i64)> = Vec()
+		val based = !joined.isEmpty() && joined[0] && pieces[0].isEmpty()
+		for (i, piece) in pieces.indexed() {
+			starts.push(text.len())
+			text.push(piece)
+			url.read(piece)
+			if i >= joined.len() then
+				break
+
+			if joined[i] && (i > 0 || !piece.isEmpty()) then
+				return .Hole(
+					index: i,
+					why: "after the start, where only the URL the rest goes on from can be joined",
+				)
+
+			if url.escape > 0 then
+				return .Hole(index: i, why: "inside a `%` and its two digits")
+
+			if !based && url.place.refusal() is .Some(why) then
+				return .Hole(index: i, why:)
+
+			// A value as what it will be: a digit in a port, a letter
+			// anywhere else; a URL joined at the start, as one.
+			val start = text.len()
+			val standIn = if joined[i] then "http://x" else if url.place is .Port then "1" else "x"
+			text.push(standIn)
+			url.read(standIn)
+			holes.push((start, text.len()))
+		}
+		// What follows a joined URL may be any part of one: only what
+		// holds anywhere is asked of it.
+		val result = if based then checkedBytes(text.toStr()) else checked(text.toStr())
+		val .Err(error) = result else return .None
+		val at = error.at()
+		for (i, (start, end)) in holes.indexed() do
+			if at >= start && at < end then
+				return .Hole(index: i, why: error.said())
+
+		var piece = 0
+		for (i, start) in starts.indexed() do
+			if start <= at then
+				piece = i
+
+		return .Text(piece:, at: at - starts[piece], why: error.said())
+	}
+}
+
+/// What holds of every byte of a URL, whatever part it is in: no space,
+/// and a `%` before two hexadecimal digits.
+fn checkedBytes(text: str): Result<void, UrlError> = {
+	for at in 0..text.len() {
+		val byte = text[at]
+		if byte <= b' ' || byte == 0x7F then
+			return .Err(.NotAllowed(at))
+
+		if byte == b'%' && (at + 2 >= text.len() || !isHex(text[at + 1]) || !isHex(text[at + 2])) {
+			return .Err(.BadEscape(at))
+		}
+	}
+}
+
+/// A host's value: its own characters as they are, and what would end it,
+/// a space, and every byte beyond ASCII, encoded.
+fn encodeHost(text: str): String = encodeExcept(text, (byte) =>
+	byte > b' ' && byte < 0x7F && byte !is b'/' | b'?' | b'#' | b'@' | b':' | b'[' | b']' | b'%')
+
+/// `text` with every byte `kept` does not keep as `%` and two digits.
+fn encodeExcept(text: str, kept: &(byte: u8) => bool): String = {
+	val digits = "0123456789ABCDEF"
+	var out = String::withCapacity(text.len())
+	for byte in text {
+		if kept(byte) then
+			out.pushByte(byte)
+		else {
+			out.pushByte(b'%')
+			out.pushByte(digits[(byte >> 4) as i64])
+			out.pushByte(digits[(byte & 15) as i64])
+		}
+	}
+	return out
+}
+
+// Written out, a URL is its text.
+extend Url: Text {
+	fn appendTo(out: &var String) = out.push(self.text.toStr())
+}
+
+// Two URLs are equal where their text is.
+extend Url: Eq {
+	fn equals(other: &Url): bool = self.text == other.text
 }
 
 /// `text` with every byte but the unreserved characters, and those in

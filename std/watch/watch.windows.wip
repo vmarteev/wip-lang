@@ -1,0 +1,286 @@
+// Windows: `ReadDirectoryChangesW`, a thread for each path watched, of its
+// directory, telling of each entry that changed. The thread counts what is
+// the watch's into an atomic and writes a byte to a socket, whose other
+// end is the watcher's descriptor — a socket, which is what Windows' event
+// queue waits on — and `changed` compares each count with the last it saw,
+// as a Mac's watcher does. The thread waits for a change and for word to
+// stop at once, so that a watch let go ends it.
+
+import std::bytes
+import std::future::{Future}
+import std::io
+import std::libc
+import std::net::{Listener, Stream}
+import std::shared::{Shared}
+import std::sync::{Atomic}
+
+@link("kernel32")
+extern "C" {
+	fn CreateFileA(
+		name: cstring,
+		access: u32,
+		share: u32,
+		attributes: ptr<u8>,
+		disposition: u32,
+		flags: u32,
+		template: i64,
+	): i64
+	/// What changed in a directory, into `into`, its count of bytes the
+	/// slice's length.
+	fn ReadDirectoryChangesW(
+		directory: i64,
+		into: &var [u8],
+		subtree: c_int,
+		filter: u32,
+		returned: ptr<u32>,
+		overlapped: &var Overlapped,
+		routine: ptr<u8>,
+	): c_int
+	fn GetOverlappedResult(
+		file: i64,
+		overlapped: &var Overlapped,
+		got: &var u32,
+		wait: c_int,
+	): c_int
+	fn CancelIoEx(file: i64, overlapped: &var Overlapped): c_int
+	fn CreateEventA(attributes: ptr<u8>, manual: c_int, signalled: c_int, name: ptr<u8>): i64
+	fn SetEvent(event: i64): c_int
+	fn ResetEvent(event: i64): c_int
+	fn WaitForMultipleObjects(count: u32, handles: ptr<i64>, all: c_int, millis: u32): u32
+}
+
+@link("ws2_32")
+extern "C" {
+	@symbol("send")
+	fn sendTo(socket: u64, bytes: &[u8], flags: c_int): c_int
+}
+
+/// `OVERLAPPED`: an operation that answers later, and the event it sets
+/// when it has.
+extern struct Overlapped {
+	internal: u64 = 0
+	internalHigh: u64 = 0
+	offsetLow: u32 = 0
+	offsetHigh: u32 = 0
+	event: i64 = 0
+}
+
+/// A directory opened to be read for its changes, by a read that answers
+/// later.
+val FILE_LIST_DIRECTORY: u32 = 0x1
+val SHARE_ALL: u32 = 7
+val OPEN_EXISTING: u32 = 3
+val FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x02000000
+val FILE_FLAG_OVERLAPPED: u32 = 0x40000000
+val INVALID_HANDLE: i64 = -1
+
+/// What changes a directory's entries: one made, removed or renamed, a
+/// file or a directory; its attributes, its size, its writing, its making.
+val WATCHED: u32 = 0x1 | 0x2 | 0x4 | 0x8 | 0x10 | 0x40
+
+/// How many bytes of changes a read takes at once.
+val ROOM: i64 = 65536
+
+/// The socket pair a watch's thread writes to and the watcher reads from.
+struct Source {
+	reading: Stream
+	writing: Stream
+}
+
+/// What a watch's thread and the watcher share: how many changes were the
+/// watch's, a file's name in its directory, and the socket to wake the
+/// watcher with.
+struct Told {
+	count: Atomic<i64>
+	name: Option<String>
+	writing: u64
+}
+
+/// A watch: what its thread tells, which the thread holds too, the event
+/// that stops it, and the thread, until it is waited for.
+struct Handle {
+	told: Shared<Told>
+	/// Set to stop the thread.
+	stop: i64
+	thread: Option<Future<void>>
+	/// The count when the watcher last looked.
+	seen: i64
+}
+
+/// A socket pair, over the loopback: Windows has no `socketpair`. The
+/// connection accepted is the one made, by its address, not another's.
+fn opened(): Result<Source, io::IoError> = {
+	val listener = Listener::tcp("127.0.0.1", 0)?
+	val .V4(port: port, ..) = listener.localAddress()? else return .Err(.Unsupported)
+	val writing = Stream::tcp("127.0.0.1", port)?
+	val made = writing.localAddress()?
+	while true {
+		val (reading, from) = listener.accept()?
+		if from != made then
+			continue
+
+		reading.setBlocking(false)?
+		writing.setBlocking(false)?
+		return Source(reading:, writing:)
+	}
+	return .Err(.Unsupported)
+}
+
+fn closed(_: &var Source) = {}
+
+fn descriptorOf(source: &Source): i32 = source.reading.descriptor()
+
+fn started(
+	source: &var Source,
+	directory: str,
+	name: &Option<String>,
+): Result<Handle, io::IoError> = {
+	var path = String::of(directory)
+	val opened = CreateFileA(
+		path.toCstring(),
+		FILE_LIST_DIRECTORY,
+		SHARE_ALL,
+		null,
+		OPEN_EXISTING,
+		FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED,
+		0,
+	)
+	if opened == INVALID_HANDLE then
+		return .Err(io::lastSystemError())
+
+	val stop = CreateEventA(null, 1, 0, null)
+	if stop == 0 {
+		val error = io::lastSystemError()
+		libc::CloseHandle(opened)
+		return .Err(error)
+	}
+	val told = Shared::of(Told(
+		count: Atomic::of(0 as i64),
+		name: name.clone(),
+		writing: source.writing.descriptor() as i64 as u64,
+	))
+	val its = told.share()
+	val thread = Future::run(own () => watching(&its.value(), opened, stop))
+	return Handle(told:, stop:, thread:, seen: 0)
+}
+
+/// The thread told to stop and waited for: only then is the event it
+/// waits on let go.
+fn stopped(_: &var Source, handle: Handle, _: &[Watched]) = {
+	var ending = handle
+	SetEvent(ending.stop)
+	if ending.thread.take() is .Some(thread) then
+		thread.get()
+
+	libc::CloseHandle(ending.stop)
+}
+
+fn gathered(source: &var Source, watched: &var [Watched]) = {
+	// The socket emptied: the counts say what changed.
+	var bytes = [0 as u8; 256]
+	while source.reading.read(&var bytes) is .Ok(got) && got > 0 {}
+	for i in 0..watched.len() {
+		val count = watched[i].handle.told.value().count.load()
+		if count == watched[i].handle.seen then
+			continue
+
+		watched[i].handle.seen = count
+		watched[i].fired = true
+	}
+}
+
+fn waiting(_: &Source, watched: &[Watched]): bool = watched.any((one) =>
+	one.handle.told.value().count.load() != one.handle.seen)
+
+/// A watch's thread: reads what changes in `directory` until `stop` is
+/// set, telling of each change that is the watch's, and then lets the
+/// directory go. A read that fails — the directory removed — or that lost
+/// what changed is told of as a change, and a read that fails ends the
+/// watch.
+fn watching(told: &Told, directory: i64, stop: i64) = {
+	val done = CreateEventA(null, 1, 0, null)
+	var room: Vec<u8> = .filled(ROOM, 0)
+	while true {
+		ResetEvent(done)
+		var overlapped = Overlapped(event: done)
+		if ReadDirectoryChangesW(
+			directory,
+			&var room.items(),
+			0,
+			WATCHED,
+			null,
+			&var overlapped,
+			null,
+		) ==
+			0 {
+			tell(&told)
+			break
+		}
+		val handles = [done, stop]
+		if WaitForMultipleObjects(2, &handles, 0, libc::INFINITE) != 0 {
+			CancelIoEx(directory, &var overlapped)
+			var ignored: u32 = 0
+			GetOverlappedResult(directory, &var overlapped, &var ignored, 1)
+			break
+		}
+		var got: u32 = 0
+		if GetOverlappedResult(directory, &var overlapped, &var got, 0) == 0 {
+			tell(&told)
+			break
+		}
+		// No bytes: more changed than the room held, and anything may have.
+		if got == 0 || isTheWatchs(&told, &room[0..got as i64]) then
+			tell(&told)
+	}
+	libc::CloseHandle(done)
+	libc::CloseHandle(directory)
+}
+
+/// Whether the changes in `records` — `FILE_NOTIFY_INFORMATION`s, one
+/// after another, each the distance to the next, what changed and a name
+/// of so many bytes of UTF-16 — are the watch's: any, for a directory; the
+/// file's own, for a file.
+fn isTheWatchs(told: &Told, records: &[u8]): bool = {
+	val .Some(name) = told.name else return !records.isEmpty()
+	var at = 0
+	while at + 12 <= records.len() {
+		val next = bytes::u32le(&records, at) as i64
+		val length = bytes::u32le(&records, at + 8) as i64
+		val changed = fromWide(&records, at + 12, length.min(records.len() - at - 12))
+		if changed.toAsciiLower() == name.toAsciiLower() then
+			return true
+
+		if next == 0 then
+			break
+
+		at += next
+	}
+	return false
+}
+
+/// The watch's change counted, and the watcher woken.
+fn tell(told: &Told) = {
+	told.count.add(1)
+	sendTo(told.writing, [1 as u8], 0)
+}
+
+/// `length` bytes of UTF-16 at `at`, as text: a half of a pair alone is
+/// U+FFFD.
+fn fromWide(bytes: &[u8], at: i64, length: i64): String = {
+	var out = String()
+	var i = at
+	while i + 1 < at + length {
+		val unit = bytes::u16le(&bytes, i) as i64
+		i += 2
+		var code = unit
+		if unit is 0xD800..=0xDBFF && i + 1 < at + length {
+			val low = bytes::u16le(&bytes, i) as i64
+			if low is 0xDC00..=0xDFFF {
+				code = 0x10000 + (unit - 0xD800) * 0x400 + (low - 0xDC00)
+				i += 2
+			}
+		}
+		out.pushChar(char::fromInt(code).unwrapOr('\u{FFFD}'))
+	}
+	return out
+}

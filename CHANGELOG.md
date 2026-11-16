@@ -2,6 +2,71 @@
 
 Each version published, newest first.
 
+## 0.17.0 — 2026-11-15
+
+**Breaking:** `std::http` sends to a `Url`, lent, where it took text.
+A literal is one where it is expected, so `http::get("https://…/\(id)")`
+compiles as before, its holes now encoded. Text that is not a literal —
+a variable, a command-line argument — is read first:
+`http::get(&Url::parse(&text)?)`; a URL kept in a local says its type,
+`val url: Url = "…"`, and is lent, `Request::get(&url)`. `Request.url()`
+answers a `&Url`.
+
+**Windows,** on arm64 and x86-64: the compiler runs there, built from its own seed
+with Visual Studio's Build Tools and their Clang alone
+(`scripts\bootstrap.ps1`), and builds programs linked by Microsoft's
+linker, `main.exe` with `main.pdb` beside it, a library `.lib` or `.dll`.
+The library is there on Windows' own calls — files, paths with either
+separator, processes, threads, sockets on Winsock, TLS on SChannel,
+`http`, the event queue, watching on `ReadDirectoryChangesW`, a panic's
+trace — but for `std::compress`, which needs a zlib Windows has not, and
+`std::users`, signals and `fork`, which are a Unix's; what is declared for
+another target alone is said to be, where a program reaches for it. A
+file `name.windows.wip` or `name.unix.wip` is compiled for that family
+alone. On x86-64, C is called by Microsoft's x64 rules: a struct of one,
+two, four or eight bytes crosses as an integer of its size, any other as
+a pointer to a copy.
+
+**The language**
+
+- **A template's literals are checked while the program is compiled.** A
+  template may declare `static fn refusal(pieces: &[str], joined: &[bool]):
+  Option<Refusal>`, which the compiler runs for each literal that builds
+  it; what it refuses is an error at the hole, or at the byte of the
+  literal's text as the source writes it (E0486). `Html` and `Xml`
+  declare one, so a hole in a `<script>`, an `on…` attribute or a tag is
+  an error where it is written, in the editor too, not a panic the first
+  time the page is written.
+- **A template may finish what a literal built:** where it declares `move
+  fn finished(): Self`, the literal ends with that call, at the literal's
+  place (E0487 for one of another shape).
+- **A literal where a `&` of a template is expected** builds it, a
+  temporary, and lends it.
+
+**The library**
+
+- **`Regex` is a template.** Where one is expected, a literal is its
+  pattern, checked while the program is compiled; a hole's value is
+  matched as the text it is, and a hole of a `Regex` is joined as a group.
+  A hole inside a class, inside braces or after a `\` is refused.
+  `regex::escape` and `Regex::pattern()`.
+- **Waits that give up, a lock only tried, and a value made once.**
+  `Mutex.lockWhenWithin`, `Receiver.receiveWithin` and
+  `Future.pollWithin` wait at most a `Duration`, measured on the clock
+  that only goes forward; `Mutex.tryLock` locks only where no one holds
+  the lock; and `sync::Lazy<T>` is a value made by the first thread that
+  asks for it and lent to every thread after.
+- **`std::url::Url`,** a URL's text and its parts, `Url::parse`, and a
+  template: each hole of a literal is percent-encoded as the part it
+  stands in needs, so a value can never add a path segment or a query
+  parameter; a `Url` joined at the start is the URL the rest goes on
+  from. `UrlError` says what is wrong with a URL and at which byte.
+
+**Examples**
+
+- **`fetch`** reads its URL with `Url::parse`, and says one is not a URL
+  before it connects.
+
 ## 0.16.0 — 2026-11-12
 
 Programs written for 0.15 compile as they did: an interpolated literal

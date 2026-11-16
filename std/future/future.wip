@@ -4,30 +4,17 @@
 // closure holds only what it owns, so what it touches is
 // the thread's alone, and what crosses a channel is moved.
 //
-// The threads are pthreads, and a channel is a queue of addresses under
-// a lock, both in memory C and Wip reach alike. What
+// The threads are the system's — pthreads on a Unix, Windows' own there
+// (`future.unix.wip`, `future.windows.wip`) — and a channel is a queue of
+// addresses under a lock, both in memory C and Wip reach alike. What
 // crosses is the address of a box, which `intoAddress` and `fromAddress`
 // make of an `own` and back.
 
 import std::collections::{Deque}
 import std::shared::{Shared}
 import std::sync::{Mutex}
-import std::libc::{
-	SC_NPROCESSORS_ONLN,
-	abort,
-	fflush,
-	fprintf,
-	hidden,
-	pthread_attr_destroy,
-	pthread_attr_init,
-	pthread_attr_setstacksize,
-	pthread_create,
-	pthread_join,
-	stderr,
-	stdout,
-	strerror,
-	sysconf
-}
+import std::time::{Duration}
+import std::libc::{abort, fflush, fprintf, stderr, stdout, strerror}
 
 /// The box an `own` points to, as an address C can hold. The `own` is
 /// gone; `fromAddress` is the only way back to it.
@@ -89,6 +76,16 @@ extend Queue<T> {
 		return self.state.lock((state) => taken(&var state, &var out))
 	}
 
+	// The same, waiting for at most `within`: 0 where nothing came in time.
+	fn receiveWithin(out: &var ptr<T>, within: Duration): i64 = match self.state.lockWhenWithin(
+		(state) => !state.items.isEmpty() || state.senders == 0,
+		within,
+		(state) => taken(&var state, &var out),
+	) {
+		.Some(got) => got
+		.None => 0
+	}
+
 	fn addSender() = self.state.lock((state) => { state.senders += 1 })
 
 	// A receiver that waits hears that nothing more is coming: the lock's end
@@ -108,8 +105,9 @@ fn taken<T>(state: &var QueueState<T>, out: &var ptr<T>): i64 = {
 	return if state.senders > 0 then 0 else -1
 }
 
-// A thread: its pthread, the job it runs, and whether it has finished,
-// which the thread writes and the future reads at once.
+// A thread: the system's, a pthread or a handle, the job it runs, and
+// whether it has finished, which the thread writes and the future reads at
+// once.
 extern struct Thread {
 	id: u64
 	job: ptr<u8>
@@ -131,14 +129,10 @@ fn startThread(entry: (argument: ptr<u8>) => ptr<u8>, job: ptr<u8>): ptr<Thread>
 	val thread = intoAddress(made) as ptr<Thread>
 	// As much stack as the main thread has, so that what runs there runs
 	// here too.
-	var attributes = hidden()
-	pthread_attr_init(&var attributes)
-	pthread_attr_setstacksize(&var attributes, (8 * 1024 * 1024) as size_t)
-	val failed = pthread_create(&var thread.id, &attributes, entry, thread as ptr<u8>)
-	pthread_attr_destroy(&var attributes)
+	val failed = begun(thread, entry, 8 * 1024 * 1024)
 	if failed != 0 {
-		fflush(stdout)
-		fprintf(stderr, "wip: cannot start a thread: %s\n", strerror(failed))
+		fflush(stdout())
+		fprintf(stderr(), "wip: cannot start a thread: %s\n", strerror(failed))
 		abort()
 	}
 	return thread
@@ -147,7 +141,7 @@ fn startThread(entry: (argument: ptr<u8>) => ptr<u8>, job: ptr<u8>): ptr<Thread>
 fn threadDone(thread: ptr<Thread>): bool = atomicLoad(finishedFlag(thread)) != 0
 
 fn joinThread(thread: ptr<Thread>) = {
-	pthread_join(thread.id, null)
+	joined(thread)
 	val gone: own<Thread> = fromAddress(thread as ptr<u8>)
 }
 
@@ -210,9 +204,23 @@ extend Receiver<T> {
 	/// The next value if there is one, without waiting.
 	pub fn tryReceive(): Received<T> = self.take(false)
 
+	/// The next value, waiting for at most `within`: `Empty` where nothing
+	/// came in time, `Closed` where every sender is gone.
+	pub fn receiveWithin(within: Duration): Received<T> = {
+		var address: ptr<T> = null
+		val got = self.channel.value().receiveWithin(&var address, within)
+		return self.received(got, address)
+	}
+
 	fn take(wait: bool): Received<T> = {
 		var address: ptr<T> = null
 		val got = self.channel.value().receive(&var address, wait)
+		return self.received(got, address)
+	}
+
+	/// What a queue's answer is: a value at `address`, nothing yet, or
+	/// nothing ever.
+	fn received(got: i64, address: ptr<T>): Received<T> = {
 		if got == 1 {
 			val boxed: own<T> = fromAddress(address as ptr<u8>)
 			return .Value(unbox(boxed))
@@ -272,6 +280,16 @@ extend Future<T> {
 	/// The value, if it is there, without waiting. It is handed over once;
 	/// after that the future holds nothing, and is done.
 	pub var fn poll(): Option<T> = match self.answer.tryReceive() {
+		.Value(value) => {
+			self.taken = true
+			Option::Some(value)
+		}
+		_ => .None
+	}
+
+	/// The value, waiting for at most `within` for it; nothing where it has
+	/// not come. It is handed over once, as `poll` hands it.
+	pub var fn pollWithin(within: Duration): Option<T> = match self.answer.receiveWithin(within) {
 		.Value(value) => {
 			self.taken = true
 			Option::Some(value)
@@ -387,14 +405,6 @@ fn mapAcross<T, R>(items: &[T], work: &(item: &T) => R, threads: i64): Vec<R> = 
 	)
 	answers.append(rest)
 	return answers
-}
-
-/// How many processors are working: how many threads `each` and `map` use,
-/// and how many parts a program that splits its own work makes of it. At
-/// least one.
-pub fn cores(): i64 = {
-	val working = sysconf(SC_NPROCESSORS_ONLN)
-	return if working < 1 then 1 else working
 }
 
 /// A closure lent for a call, as the address of its code.

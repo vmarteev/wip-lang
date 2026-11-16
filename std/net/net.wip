@@ -12,7 +12,12 @@
 // A write to a connection the other end has closed answers `.BrokenPipe`.
 // C would deliver `SIGPIPE`, which ends a program by default; here Linux's
 // writes pass `MSG_NOSIGNAL` and a Mac's sockets carry `SO_NOSIGPIPE`, so no
-// program has to change what it does with signals.
+// program has to change what it does with signals. Windows has none.
+//
+// A socket is each family's (`net.unix.wip`, `net.windows.wip`): a
+// descriptor on a Unix, and on Windows a handle of Winsock's, which
+// `descriptor()` answers as the 32-bit number Windows keeps a handle's
+// value within.
 
 import std::bytes
 import std::io
@@ -30,24 +35,20 @@ pub enum Address {
 
 /// Waits for connections, and answers each.
 pub struct Listener {
-	descriptor: c_int
+	socket: Socket
 }
 
 /// One connection, read and written as bytes.
 pub struct Stream {
-	descriptor: c_int
+	socket: Socket
 }
 
 extend Listener: Destroy {
-	var fn destroy() = {
-		libc::close(self.descriptor)
-	}
+	var fn destroy() = closeSocket(self.socket)
 }
 
 extend Stream: Destroy {
-	var fn destroy() = {
-		libc::close(self.descriptor)
-	}
+	var fn destroy() = closeSocket(self.socket)
 }
 
 extend Listener {
@@ -57,13 +58,14 @@ extend Listener {
 	/// `::` listen on every address. It listens with the longest queue the
 	/// system allows.
 	pub static fn tcp(host: Option<str>, port: u16): Result<Listener, io::IoError> = {
-		val fd = resolved(host, port, (fd, address, length) => bindTo(fd, address, length) == 0)?
-		if listen(fd, SOMAXCONN) < 0 {
-			val error = io::lastError()
-			libc::close(fd)
+		val socket =
+			resolved(host, port, (socket, address, length) => bindTo(socket, address, length) == 0)?
+		if listen(socket, SOMAXCONN) < 0 {
+			val error = socketError()
+			closeSocket(socket)
 			return .Err(error)
 		}
-		return Listener(fd)
+		return Listener(socket)
 	}
 
 	/// A listener on a Unix-domain socket made at `path`, which must not be
@@ -71,16 +73,16 @@ extend Listener {
 	pub static fn unix(path: str): Result<Listener, io::IoError> = {
 		var address = SockAddr()
 		val length = unixAddress(path, &var address)?
-		val fd = openSocket(AF_UNIX, SOCK_STREAM, 0)
-		if fd < 0 then
-			return .Err(io::lastError())
+		val socket = openSocket(AF_UNIX, SOCK_STREAM, 0)
+		if socket == NO_SOCKET then
+			return .Err(socketError())
 
-		if bindLocal(fd, &address, length) < 0 || listen(fd, SOMAXCONN) < 0 {
-			val error = io::lastError()
-			libc::close(fd)
+		if bindLocal(socket, &address, length) < 0 || listen(socket, SOMAXCONN) < 0 {
+			val error = socketError()
+			closeSocket(socket)
 			return .Err(error)
 		}
-		return Listener(fd)
+		return Listener(socket)
 	}
 
 	/// The next connection, and where it came from. Any number of threads
@@ -88,36 +90,36 @@ extend Listener {
 	pub fn accept(): Result<(Stream, Address), io::IoError> = {
 		var address = SockAddr()
 		var length = SOCKADDR_ROOM
-		val fd = accepted(self.descriptor, &var address, &var length)
-		if fd < 0 then
-			return .Err(io::lastError())
+		val socket = accepted(self.socket, &var address, &var length)
+		if socket == NO_SOCKET then
+			return .Err(socketError())
 
-		quiet(fd)
-		return (Stream(fd), addressOf(&address, length))
+		quiet(socket)
+		return (Stream(socket), addressOf(&address, length))
 	}
 
 	/// Where it listens: the port the system chose for port 0 among it.
-	pub fn localAddress(): Result<Address, io::IoError> = local(self.descriptor)
+	pub fn localAddress(): Result<Address, io::IoError> = local(self.socket)
 
 	/// Whether `accept` waits for a connection, or answers `.WouldBlock`.
 	pub fn setBlocking(blocking: bool): Result<void, io::IoError> = setBlockingOf(
-		self.descriptor,
+		self.socket,
 		blocking,
 	)
 
 	/// The descriptor, for an event queue to watch.
-	pub fn descriptor(): i32 = self.descriptor
+	pub fn descriptor(): i32 = descriptorOf(self.socket)
 }
 
 // Reads what has come, up to `into.len()` bytes, and answers how many;
 // `0` where the other end has closed.
 extend Stream: io::Read {
 	var fn read(into: &var [u8]): Result<i64, io::IoError> = {
-		val got = libc::read(self.descriptor, &var into)
+		val got = received(self.socket, &var into)
 		if got < 0 then
-			return .Err(io::lastError())
+			return .Err(socketError())
 
-		return got as i64
+		return got
 	}
 }
 
@@ -141,9 +143,11 @@ extend Stream {
 	/// A connection to `port` of `host`, the first of its addresses that
 	/// answers.
 	pub static fn tcp(host: str, port: u16): Result<Stream, io::IoError> = {
-		val fd = resolved(host, port, (fd, address, length) => connectTo(fd, address, length) == 0)?
-		quiet(fd)
-		return Stream(fd)
+		val socket =
+			resolved(host, port, (socket, address, length) =>
+				connectTo(socket, address, length) == 0)?
+		quiet(socket)
+		return Stream(socket)
 	}
 
 	/// The same, waiting at most `within` for each of the host's addresses
@@ -151,64 +155,80 @@ extend Stream {
 	/// answers in time is `.TimedOut`. Finding the addresses is not timed.
 	pub static fn tcpWithin(host: str, port: u16, within: Duration): Result<Stream, io::IoError> = {
 		val millis = within.asMillis().max(0).min(0x7FFFFFFF) as c_int
-		val fd =
-			resolved(host, port, (fd, address, length) => connectWithin(
-				fd,
+		val socket =
+			resolved(host, port, (socket, address, length) => connectWithin(
+				socket,
 				address,
 				length,
 				millis,
 			))?
-		quiet(fd)
-		return Stream(fd)
+		quiet(socket)
+		return Stream(socket)
 	}
 
 	/// A connection to the Unix-domain socket at `path`.
 	pub static fn unix(path: str): Result<Stream, io::IoError> = {
 		var address = SockAddr()
 		val length = unixAddress(path, &var address)?
-		val fd = openSocket(AF_UNIX, SOCK_STREAM, 0)
-		if fd < 0 then
-			return .Err(io::lastError())
+		val socket = openSocket(AF_UNIX, SOCK_STREAM, 0)
+		if socket == NO_SOCKET then
+			return .Err(socketError())
 
-		if connectLocal(fd, &address, length) < 0 {
-			val error = io::lastError()
-			libc::close(fd)
+		if connectLocal(socket, &address, length) < 0 {
+			val error = socketError()
+			closeSocket(socket)
 			return .Err(error)
 		}
-		quiet(fd)
-		return Stream(fd)
+		quiet(socket)
+		return Stream(socket)
 	}
 
 	/// Writes what the connection takes now of `bytes`, and answers how
 	/// many; it may be fewer than given.
 	pub fn write(bytes: &[u8]): Result<i64, io::IoError> = {
-		val sent = send(self.descriptor, &bytes, SEND_FLAGS)
+		val sent = sent(self.socket, &bytes)
 		if sent < 0 then
-			return .Err(io::lastError())
+			return .Err(socketError())
 
-		return sent as i64
+		return sent
 	}
 
 	/// Writes all of `text`, as `writeAll` writes bytes.
 	pub var fn writeText(text: str): Result<void, io::IoError> = self.writeAll(&text)
 
+	/// Where this end of the connection is: the port the system chose for
+	/// it among it.
+	pub fn localAddress(): Result<Address, io::IoError> = local(self.socket)
+
 	/// Ends the connection in both directions; the descriptor stays open
 	/// until the stream ends.
 	pub fn shutdown(): Result<void, io::IoError> = {
-		if shutdown(self.descriptor, SHUT_RDWR) < 0 then
-			return .Err(io::lastError())
+		if shutdown(self.socket, SHUT_RDWR) < 0 then
+			return .Err(socketError())
 
 		return
 	}
 
 	/// Whether reading and writing wait, or answer `.WouldBlock`.
 	pub fn setBlocking(blocking: bool): Result<void, io::IoError> = setBlockingOf(
-		self.descriptor,
+		self.socket,
 		blocking,
 	)
 
+	/// Waits at most `within` for something to read, or for the other end
+	/// to close, so that a read after it does not wait: `.TimedOut` where
+	/// nothing came. For a read with a timeout, which a program waiting on
+	/// one connection needs, where one waiting on many has an event queue.
+	pub fn waitReadable(within: Duration): Result<void, io::IoError> = {
+		val millis = within.asMillis().max(0).min(0x7FFFFFFF) as c_int
+		if !readableWithin(self.socket, millis)? then
+			return .Err(.TimedOut)
+
+		return
+	}
+
 	/// The descriptor, for an event queue to watch.
-	pub fn descriptor(): i32 = self.descriptor
+	pub fn descriptor(): i32 = descriptorOf(self.socket)
 }
 
 // What `inet_ntop` writes: `127.0.0.1:8080`, `[::1]:8080`, a path as it is.
@@ -328,53 +348,12 @@ extern struct SockAddr {
 
 val SOCKADDR_ROOM: u32 = 128
 
-// A socket and a connection accepted are closed in a program started,
-// from the moment they are made: Linux marks them so as it makes them; a
-// Mac marks them once made, and starts a program with every descriptor
-// closed but those it is given, so no program another thread starts in
-// between is given them.
-
-extern "C" {
-	fn socket(family: c_int, kind: c_int, protocol: c_int): c_int
-	@symbol("bind")
-	fn bindTo(fd: c_int, address: ptr<u8>, length: u32): c_int
-	@symbol("bind")
-	fn bindLocal(fd: c_int, address: &SockAddr, length: u32): c_int
-	@symbol("connect")
-	fn connectTo(fd: c_int, address: ptr<u8>, length: u32): c_int
-	@symbol("connect")
-	fn connectLocal(fd: c_int, address: &SockAddr, length: u32): c_int
-	fn listen(fd: c_int, backlog: c_int): c_int
-	fn accept(fd: c_int, address: &var SockAddr, length: &var u32): c_int
-	fn getsockname(fd: c_int, address: &var SockAddr, length: &var u32): c_int
-	fn setsockopt(fd: c_int, level: c_int, name: c_int, value: &c_int, length: u32): c_int
-	fn getsockopt(fd: c_int, level: c_int, name: c_int, value: &var c_int, length: &var u32): c_int
-	fn shutdown(fd: c_int, how: c_int): c_int
-	fn send(fd: c_int, bytes: &[u8], flags: c_int): ssize_t
-	fn getaddrinfo(
-		host: cstring,
-		service: cstring,
-		hints: &AddrInfo,
-		answers: &var ptr<AddrInfo>,
-	): c_int
-	/// The same with no host: its pointer is null.
-	@symbol("getaddrinfo")
-	fn getaddrinfoLocal(
-		host: ptr<u8>,
-		service: cstring,
-		hints: &AddrInfo,
-		answers: &var ptr<AddrInfo>,
-	): c_int
-	fn freeaddrinfo(answers: ptr<AddrInfo>)
-}
-
 val AF_UNSPEC: c_int = 0
 val AF_UNIX: c_int = 1
 val AF_INET: c_int = 2
 
 val SOCK_STREAM: c_int = 1
 val SHUT_RDWR: c_int = 2
-val F_GETFL: c_int = 3
 
 val AI_PASSIVE: c_int = 1
 
@@ -385,8 +364,8 @@ val AI_PASSIVE: c_int = 1
 fn resolved(
 	host: Option<str>,
 	port: u16,
-	use: &(fd: c_int, address: ptr<u8>, length: u32) => bool,
-): Result<c_int, io::IoError> = {
+	use: &(socket: Socket, address: ptr<u8>, length: u32) => bool,
+): Result<Socket, io::IoError> = {
 	val hints = AddrInfo(
 		flags: AI_NUMERICSERV,
 		family: AF_UNSPEC,
@@ -399,6 +378,8 @@ fn resolved(
 	)
 	var service = port.toString()
 	var answers: ptr<AddrInfo> = null
+	// The system's sockets, started for the lookup, where they need to be.
+	val sockets = Sockets::started()?
 	val failed = match host {
 		.Some(name) => {
 			var named = String::of(name)
@@ -412,17 +393,17 @@ fn resolved(
 	var error: io::IoError = .NotFound
 	var at = answers
 	while !at.isNull {
-		val fd = openSocket(at.family, at.socktype, at.protocol)
-		if fd >= 0 {
-			setOption(fd, SO_REUSEADDR)
-			if use(fd, at.address, at.addressLength) {
+		val socket = openSocket(at.family, at.socktype, at.protocol)
+		if socket != NO_SOCKET {
+			reusable(socket)
+			if use(socket, at.address, at.addressLength) {
 				freeaddrinfo(answers)
-				return fd
+				return socket
 			}
-			error = io::lastError()
-			libc::close(fd)
+			error = socketError()
+			closeSocket(socket)
 		} else
-			error = io::lastError()
+			error = socketError()
 
 		at = at.next
 	}
@@ -430,64 +411,11 @@ fn resolved(
 	return .Err(error)
 }
 
-/// `fd` connected to `address`, waiting at most `millis`: the connection
-/// begun without waiting, then waited for with `poll`. Where it fails, or
-/// takes longer, `errno` says why.
-fn connectWithin(fd: c_int, address: ptr<u8>, length: u32, millis: c_int): bool = {
-	if setBlockingOf(fd, false).isErr() then
-		return false
-
-	if connectTo(fd, address, length) != 0 {
-		if libc::errno() != EINPROGRESS then
-			return false
-
-		var fds = [libc::PollFd(fd:, events: libc::POLLOUT, answered: 0)]
-		var ready = libc::poll(&var fds, millis)
-		while ready < 0 && libc::errno() == libc::EINTR do
-			ready = libc::poll(&var fds, millis)
-
-		if ready < 0 then
-			return false
-
-		if ready == 0 {
-			libc::errnoAt()[0] = libc::ETIMEDOUT
-			return false
-		}
-		var failed: c_int = 0
-		var size: u32 = 4
-		if getsockopt(fd, SOL_SOCKET, SO_ERROR, &var failed, &var size) != 0 then
-			return false
-
-		if failed != 0 {
-			libc::errnoAt()[0] = failed
-			return false
-		}
-	}
-	return setBlockingOf(fd, true).isOk()
-}
-
-fn setOption(fd: c_int, name: c_int) = {
-	val on = 1
-	setsockopt(fd, SOL_SOCKET, name, &on, 4)
-}
-
-fn setBlockingOf(fd: c_int, blocking: bool): Result<void, io::IoError> = {
-	val flags = libc::fcntl(fd, F_GETFL, 0)
-	if flags < 0 then
-		return .Err(io::lastError())
-
-	val wanted = if blocking then flags & !libc::O_NONBLOCK else flags | libc::O_NONBLOCK
-	if libc::fcntl(fd, libc::F_SETFL, wanted) < 0 then
-		return .Err(io::lastError())
-
-	return
-}
-
-fn local(fd: c_int): Result<Address, io::IoError> = {
+fn local(socket: Socket): Result<Address, io::IoError> = {
 	var address = SockAddr()
 	var length = SOCKADDR_ROOM
-	if getsockname(fd, &var address, &var length) < 0 then
-		return .Err(io::lastError())
+	if getsockname(socket, &var address, &var length) < 0 then
+		return .Err(socketError())
 
 	return addressOf(&address, length)
 }

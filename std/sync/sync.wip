@@ -2,7 +2,12 @@
 // changed in one step that no thread sees half of, and `Mutex<T>`, reached
 // by one thread at a time. They are the two ways to change a place through
 // a `&`, which is what makes them safe to borrow from threads that
-// `future::both` and `future::each` run.
+// `future::both` and `future::each` run. `Lazy<T>` is a value made by the
+// first thread that asks for it, and lent to every thread after.
+//
+// A wait gives up where it is told to, after a `Duration` measured on the
+// clock that only goes forward, so that setting the time of day neither
+// ends a wait early nor makes it longer.
 //
 // Every atomic operation is sequentially consistent unless it is given
 // another order: all threads agree on one order of every such operation,
@@ -11,18 +16,8 @@
 // less where the processor orders less by itself. What adds and takes away
 // wraps for integers, as `+%` and `-%` do.
 
-import std::libc::{
-	Hidden,
-	hidden,
-	pthread_cond_broadcast,
-	pthread_cond_destroy,
-	pthread_cond_init,
-	pthread_cond_wait,
-	pthread_mutex_destroy,
-	pthread_mutex_init,
-	pthread_mutex_lock,
-	pthread_mutex_unlock
-}
+import std::libc::{Hidden, hidden}
+import std::time::{Duration, Instant}
 
 /// What an `Atomic` may hold: `bool`, the integers and floats of up to 64
 /// bits, and C pointers.
@@ -198,8 +193,11 @@ pub struct Mutex<T> {
 	value: ptr<T>
 }
 
-// The lock and what waits for a change, boxed: a pthread mutex must not move
-// once made, and a `Mutex` may.
+// The lock and what waits for a change, boxed: a system's lock must not move
+// once made, and a `Mutex` may. Each family's are its own
+// (`sync.unix.wip`, `sync.windows.wip`), reached through `madeState`,
+// `acquire`, `tryAcquire`, `release` — which wakes whoever waits —
+// `unlock`, `waitFor`, `waitAtMost` and `freedState`.
 extern struct MutexState {
 	lock: Hidden
 	changed: Hidden
@@ -210,8 +208,7 @@ extend Mutex<T> {
 	pub static fn of(value: T): Mutex<T> = {
 		val made = own MutexState(lock: hidden(), changed: hidden())
 		val state = intoAddress(made) as ptr<MutexState>
-		pthread_mutex_init(&var state.lock, null)
-		pthread_cond_init(&var state.changed, null)
+		madeState(state)
 		return Mutex(state:, value: intoAddress(own (value)) as ptr<T>)
 	}
 
@@ -219,10 +216,9 @@ extend Mutex<T> {
 	/// it answers; what `body` answers, this answers. The threads waiting in
 	/// `lockWhen` are told it may have changed.
 	pub fn lock<R>(body: &var (value: &var T) => R): R = {
-		pthread_mutex_lock(&var self.state.lock)
+		acquire(self.state)
 		val answer = body(&var referenceAt<T>(self.value as ptr<void>))
-		pthread_cond_broadcast(&var self.state.changed)
-		pthread_mutex_unlock(&var self.state.lock)
+		release(self.state)
 		return answer
 	}
 
@@ -230,13 +226,49 @@ extend Mutex<T> {
 	/// time another thread's `lock` or `lockWhen` ends — and then runs `body`
 	/// with it, as `lock` does.
 	pub fn lockWhen<R>(ready: &(value: &T) => bool, body: &var (value: &var T) => R): R = {
-		pthread_mutex_lock(&var self.state.lock)
+		acquire(self.state)
 		while !ready(&referenceAt<T>(self.value as ptr<void>)) do
-			pthread_cond_wait(&var self.state.changed, &var self.state.lock)
+			waitFor(self.state)
 
 		val answer = body(&var referenceAt<T>(self.value as ptr<void>))
-		pthread_cond_broadcast(&var self.state.changed)
-		pthread_mutex_unlock(&var self.state.lock)
+		release(self.state)
+		return answer
+	}
+
+	/// Waits until `ready` says what is inside is ready, as `lockWhen` does,
+	/// for at most `within`, and then runs `body` with it. Nothing, and
+	/// `body` not run, where it was not ready in time. A wait woken before
+	/// its time with `ready` still false waits out the rest.
+	pub fn lockWhenWithin<R>(
+		ready: &(value: &T) => bool,
+		within: Duration,
+		body: &var (value: &var T) => R,
+	): Option<R> = {
+		val deadline = Instant::now().after(within)
+		acquire(self.state)
+		while !ready(&referenceAt<T>(self.value as ptr<void>)) {
+			val left = deadline.since(Instant::now())
+			if left.asNanos() <= 0 {
+				unlock(self.state)
+				return .None
+			}
+			waitAtMost(self.state, left)
+		}
+		val answer = body(&var referenceAt<T>(self.value as ptr<void>))
+		release(self.state)
+		return answer
+	}
+
+	/// Runs `body` with what is inside, as `lock` does, where no other
+	/// thread holds the lock; nothing, and `body` not run, where one does.
+	/// For a thread with other work while another holds it, such as a
+	/// frame drawn with the last frame's state.
+	pub fn tryLock<R>(body: &var (value: &var T) => R): Option<R> = {
+		if !tryAcquire(self.state) then
+			return .None
+
+		val answer = body(&var referenceAt<T>(self.value as ptr<void>))
+		release(self.state)
 		return answer
 	}
 
@@ -254,11 +286,75 @@ extend Mutex<T>: Destroy {
 		if self.value != null {
 			val gone: own<T> = fromAddress(self.value as ptr<u8>)
 		}
-		pthread_cond_destroy(&var self.state.changed)
-		pthread_mutex_destroy(&var self.state.lock)
+		freedState(self.state)
 		val freed: own<MutexState> = fromAddress(self.state as ptr<u8>)
 	}
 }
+
+/// A value made by the first call of `get`, by the closure it was made
+/// with, and lent to every call after, from any thread: one that asks while
+/// another makes it waits for it. It is a field of what the threads share,
+/// made only where one of them needs it. `make` runs once, and goes once it
+/// has; a `make` that asks for its own value waits for ever.
+pub struct Lazy<T> {
+	/// Whether the value is made, read without a lock once it is.
+	ready: Atomic<bool>
+	/// What makes it, until it has: whoever takes it makes the value.
+	make: Mutex<Option<own<() => T>>>
+	/// The value, nothing until it is made: written once, under `make`'s
+	/// lock, before `ready` says so, and only read after.
+	slot: own<Made<T>>
+}
+
+struct Made<T> {
+	value: Option<T>
+}
+
+extend Lazy<T> {
+	/// A value `make` makes when it is first asked for.
+	pub static fn of(make: own<() => T>): Lazy<T> = Lazy(
+		ready: Atomic::of(false),
+		make: Mutex::of(Option::Some(make)),
+		slot: own Made(value: .None),
+	)
+
+	/// The value, made where it is not yet.
+	pub fn get(): &T = {
+		if !self.ready.load(.Acquire) {
+			self.make.lock(
+				(make) => {
+					// Another thread may have made it while this one waited.
+					if make.take() is .Some(making) {
+						val made = making()
+						referenceAt<Made<T>>(boxAddress(&self.slot)).value = made
+						self.ready.store(true, .Release)
+					}
+				},
+			)
+		}
+		lend assumed(&self.slot.value)
+	}
+
+	/// The value, where it has been made; nothing, and nothing made, where
+	/// it has not.
+	pub fn made(): Option<&T> = {
+		if !self.ready.load(.Acquire) then
+			return .None
+
+		return match self.slot.value {
+			.Some(value) => &value
+			.None => .None
+		}
+	}
+}
+
+/// The box an `own` holds, as an address the `own` keeps.
+@intrinsic
+fn boxAddress<T>(value: &own<T>): ptr<void>
+
+/// What an option holds, lent to read; it must hold something.
+@intrinsic
+fn assumed<T>(option: &Option<T>): &T
 
 /// The box an `own` points to, as an address C can hold.
 @intrinsic

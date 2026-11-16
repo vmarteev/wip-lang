@@ -57,8 +57,8 @@ output is byte for byte the C library's.
 What it does not have yet:
 
 - **Targets** beyond Apple arm64 — a Mac, and from a Mac an iPad, an
-  iPhone and the iOS simulator — and Linux on arm64 and x86-64. There is
-  no Windows.
+  iPhone and the iOS simulator — Linux on arm64 and x86-64, and Windows
+  on arm64 and x86-64.
 - **Packages fetched from anywhere:** a program depends on another by its
   path, and nothing is downloaded.
 - **Asynchronous input and output:** threads and futures are there, an
@@ -66,8 +66,8 @@ What it does not have yet:
 
 ## Installing
 
-Wip runs on macOS on Apple silicon and on Linux on arm64 and x86-64, and
-builds from a Mac for iOS, where Xcode is installed. Every
+Wip runs on macOS on Apple silicon, on Linux on arm64 and x86-64, and on
+Windows on arm64 and x86-64, and builds from a Mac for iOS, where Xcode is installed. Every
 program it builds goes through a `clang` 15 or newer, which it looks for
 as `clang`, or as `WIP_CLANG` names it, and is linked by the system's C
 compiler, `cc`. On a Mac, the Command Line Tools have both
@@ -78,34 +78,30 @@ On Linux, a program that imports `std::tls`, `std::http` or
 finds on Debian once `libssl-dev` and `zlib1g-dev` are installed; a Mac
 has both.
 
+On Windows, Wip builds with Visual Studio's Build Tools, with the C++
+tools and their Clang ("C++ Clang Compiler for Windows"), whose `clang`
+it finds through Visual Studio's installer, and links with Microsoft's
+linker. Windows has no zlib, so `std::compress` is not there, and
+`std::http` asks for a body as it is; `std::users` and a Unix's signals
+and `fork` are a Unix's alone.
+
 `wip` is a directory: `bin/wip`, and beside it the standard library,
 `std/`, and the tools, `tools/`, which it finds from where `bin/wip` is.
 Keep the three together; a link to `bin/wip` from elsewhere on the `PATH`
 works, a copy of it alone does not.
 
-**From a release.** Each version has an archive for each system,
-`wip-<version>-<system>.tar.gz`, on [the releases
-page](https://github.com/vmarteev/wip-lang/releases). Unpack it where it
-is to live, and put its `bin` on the `PATH` in your shell's profile:
+Wip is built from a checkout of this repository, with nothing but
+`clang`; each version is a tag, `v<version>`:
 
 ```sh
-curl -LO https://github.com/vmarteev/wip-lang/releases/download/v0.3.1/wip-0.3.1-macos-arm64.tar.gz
-tar -xzf wip-0.3.1-macos-arm64.tar.gz
-mv wip-0.3.1-macos-arm64 ~/wip
+git clone https://github.com/vmarteev/wip-lang && cd wip-lang
+git checkout "$(git describe --tags --abbrev=0)"      # the latest version, or stay on main
+scripts/bootstrap.sh --out ~/wip
 echo 'export PATH="$HOME/wip/bin:$PATH"' >> ~/.zshrc   # ~/.bashrc for bash
 ```
 
-The systems are `macos-arm64`, `linux-arm64` and `linux-x86_64`. A Mac
-refuses to run a program downloaded through a browser until it is told
-otherwise: `xattr -dr com.apple.quarantine ~/wip`. To upgrade, put the
-new version's directory in the old one's place.
-
-**From a checkout of this repository,** with nothing but `clang`:
-
-```sh
-scripts/bootstrap.sh --out ~/wip
-echo 'export PATH="$HOME/wip/bin:$PATH"' >> ~/.zshrc
-```
+On Windows, `powershell -File scripts\bootstrap.ps1 -Out %USERPROFILE%\wip`,
+then add `%USERPROFILE%\wip\bin` to the `Path` in the system's settings.
 
 The compiler is written in Wip, and `bootstrap/` holds it for each system
 as LLVM's bitcode, which `clang` compiles into a first `wip`; that one
@@ -120,8 +116,8 @@ source:
 scripts/build.sh --release --out ~/wip
 ```
 
-`wip --version` says which you have: `wip 0.3.1` for a release, and with
-the commit and its day after it for a build from a checkout.
+`wip --version` says which you have: its version, and the commit it was
+built from and that commit's day.
 
 ## Try it
 

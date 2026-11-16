@@ -1,0 +1,532 @@
+// Files on Windows: Windows' own calls, over paths that are UTF-8, which a
+// program's manifest makes the code page of the calls that take them. A
+// file is opened with `CreateFileA`, shared so that it may be read, written,
+// renamed and removed by others while it is open, as a Unix's may, and its
+// handle made a descriptor of the C library's, which `io::Reader` reads.
+//
+// A file's mode is what Windows keeps of one: whether it is read only. It
+// answers `0o444` or `0o644` of a file and `0o555` or `0o755` of a
+// directory, and a mode set says read only where its owner may not write.
+// A file has no user or group numbers, which are 0.
+
+import std::io
+import std::libc
+import std::path
+import std::process
+
+@link("kernel32")
+extern "C" {
+	fn CreateFileA(
+		name: cstring,
+		access: u32,
+		share: u32,
+		attributes: ptr<u8>,
+		disposition: u32,
+		flags: u32,
+		template: i64,
+	): i64
+	fn GetFileInformationByHandle(file: i64, information: &var FileInformation): c_int
+	fn GetFileSizeEx(file: i64, size: &var i64): c_int
+	fn FlushFileBuffers(file: i64): c_int
+	fn ReadFile(
+		file: i64,
+		into: ptr<u8>,
+		count: u32,
+		read: &var u32,
+		overlapped: &var Overlapped,
+	): c_int
+	fn GetFinalPathNameByHandleA(file: i64, into: ptr<u8>, size: u32, flags: u32): u32
+	fn GetFileAttributesA(name: cstring): u32
+	fn SetFileAttributesA(name: cstring, attributes: u32): c_int
+	fn FindFirstFileExA(
+		name: cstring,
+		level: c_int,
+		found: &var FindData,
+		search: c_int,
+		filter: ptr<u8>,
+		flags: u32,
+	): i64
+	fn FindNextFileA(find: i64, found: &var FindData): c_int
+	fn FindClose(find: i64): c_int
+	fn CreateDirectoryA(name: cstring, attributes: ptr<u8>): c_int
+	fn RemoveDirectoryA(name: cstring): c_int
+	fn DeleteFileA(name: cstring): c_int
+	fn MoveFileExA(from: cstring, to: cstring, flags: u32): c_int
+	fn CreateSymbolicLinkA(at: cstring, target: cstring, flags: u32): u8
+	fn GetTempPathA(size: u32, into: ptr<u8>): u32
+}
+
+/// `BY_HANDLE_FILE_INFORMATION`: what a file is, by its open handle.
+extern struct FileInformation {
+	attributes: u32 = 0
+	// Each time a `FILETIME`: two 32-bit words, low first, which a `u64`
+	// would align apart from what is before them.
+	created: [u32; 2] = [0; 2]
+	accessed: [u32; 2] = [0; 2]
+	written: [u32; 2] = [0; 2]
+	volume: u32 = 0
+	sizeHigh: u32 = 0
+	sizeLow: u32 = 0
+	links: u32 = 0
+	indexHigh: u32 = 0
+	indexLow: u32 = 0
+}
+
+/// `OVERLAPPED`: where in a file a read begins.
+extern struct Overlapped {
+	internal: u64 = 0
+	internalHigh: u64 = 0
+	offsetLow: u32 = 0
+	offsetHigh: u32 = 0
+	event: i64 = 0
+}
+
+/// `WIN32_FIND_DATAA`: an entry of a directory, its name in 260 bytes.
+extern struct FindData {
+	attributes: u32 = 0
+	// Each time a `FILETIME`: two 32-bit words, low first, which a `u64`
+	// would align apart from what is before them.
+	created: [u32; 2] = [0; 2]
+	accessed: [u32; 2] = [0; 2]
+	written: [u32; 2] = [0; 2]
+	sizeHigh: u32 = 0
+	sizeLow: u32 = 0
+	/// The kind of a reparse point, where it is one: a link's.
+	tag: u32 = 0
+	reserved: u32 = 0
+	name: [u8; 260] = [0; 260]
+	shortName: [u8; 14] = [0; 14]
+}
+
+val GENERIC_READ: u32 = 0x80000000
+val GENERIC_WRITE: u32 = 0x40000000
+val FILE_APPEND_DATA: u32 = 4
+/// Shared to be read, written and removed or renamed.
+val SHARE_ALL: u32 = 7
+val CREATE_NEW: u32 = 1
+val CREATE_ALWAYS: u32 = 2
+val OPEN_EXISTING: u32 = 3
+val OPEN_ALWAYS: u32 = 4
+val FILE_ATTRIBUTE_READONLY: u32 = 0x1
+val FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10
+val FILE_ATTRIBUTE_NORMAL: u32 = 0x80
+val FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400
+val INVALID_ATTRIBUTES: u32 = 0xFFFFFFFF
+/// A directory opened as a handle, and a link opened as itself.
+val FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x02000000
+val FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x00200000
+/// What a reparse point's kind says: that it names another path, as a
+/// symbolic link and a directory's junction do — a "name surrogate" —
+/// and that it is a Unix-domain socket.
+val NAME_SURROGATE: u32 = 0x20000000
+val IO_REPARSE_TAG_AF_UNIX: u32 = 0x80000023
+val MOVEFILE_REPLACE_EXISTING: u32 = 1
+val SYMBOLIC_LINK_FLAG_DIRECTORY: u32 = 1
+/// Made by a user who is not an administrator, where developer mode allows.
+val SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE: u32 = 2
+/// `FindFirstFileExA`: the entries' names and what they are, not their
+/// short names, fetched many at a time.
+val FIND_EX_INFO_BASIC: c_int = 1
+val FIND_EX_SEARCH_NAME_MATCH: c_int = 0
+val FIND_FIRST_EX_LARGE_FETCH: u32 = 2
+/// A read past the end, which is the end.
+val ERROR_HANDLE_EOF: u32 = 38
+val ERROR_FILE_NOT_FOUND: u32 = 2
+val INVALID_HANDLE: i64 = -1
+/// The room most paths fit in: `MAX_PATH`, 260 bytes, and their NUL.
+val PATH_ROOM: i64 = 261
+/// The hundreds of nanoseconds between 1601, which Windows counts a file's
+/// times from, and 1970.
+val UNIX_FROM_1601: u64 = 116444736000000000
+
+extend File {
+	/// What was written handed to the disk, `FlushFileBuffers`: there before
+	/// anything done after it, a rename among them.
+	pub fn sync(): Result<void, io::IoError> = {
+		if FlushFileBuffers(libc::handleOf(io::descriptorOf(&self.reader))) == 0 then
+			return .Err(io::lastSystemError())
+
+		return
+	}
+
+	/// Reads up to `into.len()` bytes from `offset`, and answers how many,
+	/// `0` at the end, so that threads may read one file at once, each where
+	/// it asks. A read that goes on from where another stopped, `read`,
+	/// goes on from here after it, as Windows has it.
+	pub fn readAt(offset: i64, into: &var [u8]): Result<i64, io::IoError> = {
+		var where = Overlapped(
+			offsetLow: (offset & 0xFFFFFFFF) as u32,
+			offsetHigh: (offset >> 32) as u32,
+		)
+		var got: u32 = 0
+		val count = into.len().min(0x7FFFFFFF) as u32
+		val handle = libc::handleOf(io::descriptorOf(&self.reader))
+		if ReadFile(handle, &var into, count, &var got, &var where) == 0 {
+			if libc::GetLastError() == ERROR_HANDLE_EOF then
+				return 0
+
+			return .Err(io::lastSystemError())
+		}
+		return got as i64
+	}
+
+	/// How many bytes the file holds.
+	pub fn size(): Result<i64, io::IoError> = {
+		var size: i64 = 0
+		if GetFileSizeEx(libc::handleOf(io::descriptorOf(&self.reader)), &var size) == 0 then
+			return .Err(io::lastSystemError())
+
+		return size
+	}
+}
+
+fn opened(path: str, how: Opening): Result<File, io::IoError> = {
+	var name = String::of(path)
+	val (access, disposition, flags) = match how {
+		.Read => (GENERIC_READ, OPEN_EXISTING, libc::O_RDONLY)
+		.Create => (GENERIC_WRITE, CREATE_ALWAYS, libc::O_WRONLY)
+		.Append => (FILE_APPEND_DATA, OPEN_ALWAYS, libc::O_WRONLY | libc::O_APPEND)
+		.CreateNew => (GENERIC_WRITE, CREATE_NEW, libc::O_WRONLY)
+	}
+	val handle = CreateFileA(
+		name.toCstring(),
+		access,
+		SHARE_ALL,
+		null,
+		disposition,
+		FILE_ATTRIBUTE_NORMAL,
+		0,
+	)
+	if handle == INVALID_HANDLE then
+		return .Err(io::lastSystemError())
+
+	val fd = libc::descriptorOf(handle, flags | libc::O_BINARY)
+	if fd < 0 {
+		libc::CloseHandle(handle)
+		return .Err(io::lastError())
+	}
+	return File(io::reader(fd))
+}
+
+/// Sets what Windows keeps of the permission bits of `path`: read only
+/// where `mode` says its owner may not write, `0o444`, and written where it
+/// says it may, `0o644`.
+pub fn setMode(path: str, mode: i64): Result<void, io::IoError> = {
+	var name = String::of(path)
+	val attributes = GetFileAttributesA(name.toCstring())
+	if attributes == INVALID_ATTRIBUTES then
+		return .Err(io::lastSystemError())
+
+	val set =
+		if mode & 0o200 == 0 then attributes | FILE_ATTRIBUTE_READONLY
+		else attributes & !FILE_ATTRIBUTE_READONLY
+	if set != attributes && SetFileAttributesA(name.toCstring(), set) == 0 then
+		return .Err(io::lastSystemError())
+
+	return
+}
+
+/// Where `path` really is: absolute, with no `.`, `..` or link on the way;
+/// an error where there is nothing there.
+pub fn realPath(path: str): Result<String, io::IoError> = {
+	val handle = openedToAsk(path, true)?
+	// Asked with room for most, and again with as much as Windows says it
+	// needs, its end's NUL and all, where that is more.
+	var room: Vec<u8> = .filled(PATH_ROOM, 0)
+	var got = GetFinalPathNameByHandleA(handle, &var room.items(), room.len() as u32, 0)
+	if got as i64 >= room.len() {
+		room = .filled(got as i64, 0)
+		got = GetFinalPathNameByHandleA(handle, &var room.items(), room.len() as u32, 0)
+	}
+	val failed = io::lastSystemError()
+	libc::CloseHandle(handle)
+	if got == 0 || got as i64 >= room.len() then
+		return .Err(failed)
+
+	// Windows answers the path with `\\?\` before it, and `\\?\UNC\` before
+	// a share's, which a path written plainly has not.
+	val found = str::fromBytes(&room[0..got as i64])
+	if found.startsWith("\\\\?\\UNC\\") then
+		return "\\\\\(found[8..found.len()])"
+
+	return String::of(found.stripPrefix("\\\\?\\").unwrapOr(found))
+}
+
+/// A handle of what is at `path`, to ask about and not to read: a
+/// directory's too, and a link's own where `following` does not say to
+/// follow it.
+fn openedToAsk(path: str, following: bool): Result<i64, io::IoError> = {
+	var name = String::of(path)
+	val link: u32 = if following then 0 else FILE_FLAG_OPEN_REPARSE_POINT
+	val handle = CreateFileA(
+		name.toCstring(),
+		0,
+		SHARE_ALL,
+		null,
+		OPEN_EXISTING,
+		FILE_FLAG_BACKUP_SEMANTICS | link,
+		0,
+	)
+	if handle == INVALID_HANDLE then
+		return .Err(io::lastSystemError())
+
+	return handle
+}
+
+/// The entries of a directory, in the order the filesystem gives them,
+/// without `.` and `..`. Sorting is the caller's.
+pub fn readDir(path: str): Result<Vec<Entry>, io::IoError> = {
+	var pattern = path::join(path, "*")
+	var found = FindData()
+	val find = FindFirstFileExA(
+		pattern.toCstring(),
+		FIND_EX_INFO_BASIC,
+		&var found,
+		FIND_EX_SEARCH_NAME_MATCH,
+		null,
+		FIND_FIRST_EX_LARGE_FETCH,
+	)
+	var entries: Vec<Entry> = Vec()
+	if find == INVALID_HANDLE {
+		// A directory with nothing in it, the root of a drive's: no entry.
+		if libc::GetLastError() == ERROR_FILE_NOT_FOUND then
+			return entries
+
+		return .Err(io::lastSystemError())
+	}
+	var more = true
+	while more {
+		var end = 0
+		while end < 260 && found.name[end] != 0 do
+			end += 1
+
+		val text = String::of(str::fromBytes(&found.name[0..end]))
+		if text != "." && text != ".." then
+			entries.push(Entry(name: text, kind: kindOf(found.attributes, found.tag)))
+
+		found = FindData()
+		more = FindNextFileA(find, &var found) != 0
+	}
+	FindClose(find)
+	return entries
+}
+
+/// What a file's attributes, and its reparse point's kind, say it is: a
+/// reparse point that names another path a link, a junction as a symbolic
+/// link, so that what is removed through one is the link alone; and one
+/// of a Unix-domain socket a socket.
+fn kindOf(attributes: u32, tag: u32): Kind = {
+	val reparse = attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+	return when {
+		reparse && tag & NAME_SURROGATE != 0 => .Link
+		reparse && tag == IO_REPARSE_TAG_AF_UNIX => .Socket
+		attributes & FILE_ATTRIBUTE_DIRECTORY != 0 => .Directory
+		else => .File
+	}
+}
+
+/// Makes a directory, and fails where one is already there.
+pub fn makeDir(path: str): Result<void, io::IoError> = {
+	var name = String::of(path)
+	if CreateDirectoryA(name.toCstring(), null) == 0 then
+		return .Err(io::lastSystemError())
+
+	return
+}
+
+/// Removes an empty directory; one with anything in it is refused.
+pub fn removeDir(path: str): Result<void, io::IoError> = {
+	var name = String::of(path)
+	if RemoveDirectoryA(name.toCstring()) == 0 then
+		return .Err(io::lastSystemError())
+
+	return
+}
+
+/// Moves `from` to `to`, in place of a file there; within one volume, where
+/// a move is a rename.
+pub fn rename(from: str, to: str): Result<void, io::IoError> = {
+	var source = String::of(from)
+	var target = String::of(to)
+	if MoveFileExA(source.toCstring(), target.toCstring(), MOVEFILE_REPLACE_EXISTING) == 0 then
+		return .Err(io::lastSystemError())
+
+	return
+}
+
+/// Makes a symbolic link at `at` that names `target`, which is read as the
+/// link is followed: relative to the link's directory, unless it is a whole
+/// path. Windows makes a link to a directory apart from one to a file, so a
+/// `target` that is a directory where the link is made is linked as one.
+/// Windows makes one only for an administrator, or where developer mode is
+/// on. Windows follows a link only by a target written with `\`, so one
+/// with `/`s is written with `\`s. Where something is at `at` already,
+/// Windows says the link is denied, and this says it is there, as a Unix
+/// does.
+pub fn makeLink(target: str, at: str): Result<void, io::IoError> = {
+	var named = target.replace("/", by: "\\")
+	var link = String::of(at)
+	val seen = if path::root(target).isEmpty() then path::join(path::parent(at), target) else target
+	val directory = meta(seen) is .Ok(about) && about.kind == .Directory
+	val flags =
+		SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE |
+		(if directory then SYMBOLIC_LINK_FLAG_DIRECTORY else 0)
+	if CreateSymbolicLinkA(link.toCstring(), named.toCstring(), flags) == 0 {
+		val failed = io::lastSystemError()
+		if failed == .Denied && linkMeta(at).isOk() then
+			return .Err(.AlreadyExists)
+
+		return .Err(failed)
+	}
+
+	return
+}
+
+/// Removes a file, or a link without what it names; a directory is
+/// refused. A file that is read only is removed too, as a Unix removes one
+/// whose directory it may write; and a link to a directory, which Windows
+/// removes as it removes a directory.
+pub fn removeFile(path: str): Result<void, io::IoError> = {
+	var name = String::of(path)
+	if DeleteFileA(name.toCstring()) != 0 then
+		return
+
+	val failed = io::lastSystemError()
+	// What is there itself, not what a link names.
+	val attributes = GetFileAttributesA(name.toCstring())
+	if failed != .Denied || attributes == INVALID_ATTRIBUTES then
+		return .Err(failed)
+
+	val directory = attributes & FILE_ATTRIBUTE_DIRECTORY != 0
+	val removed = when {
+		directory && attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 =>
+			RemoveDirectoryA(name.toCstring()) != 0
+		!directory && attributes & FILE_ATTRIBUTE_READONLY != 0 => {
+			SetFileAttributesA(name.toCstring(), attributes & !FILE_ATTRIBUTE_READONLY)
+			DeleteFileA(name.toCstring()) != 0
+		}
+		else => false
+	}
+	if removed then
+		return
+
+	return .Err(failed)
+}
+
+extend TempDir {
+	/// A new directory in `temporaryRoot()`, named for the program, this
+	/// process and a count, made where nothing is: `C:\Users\ada\AppData\
+	/// Local\Temp\marble-4120-1`. The user's own directory of temporary
+	/// files is theirs alone, and so is what is made in it.
+	pub static fn new(): Result<TempDir, io::IoError> = {
+		val program = match process::executable() {
+			.Ok(file) => String::of(path::stem(file))
+			.Err(..) => "wip"
+		}
+		val root = temporaryRoot()
+		var attempt = 0
+		while true {
+			attempt += 1
+			val made = path::join(root, "\(program)-\(process::id())-\(attempt)")
+			match makeDir(made) {
+				.Ok(..) => return TempDir(path: made)
+				.Err(.AlreadyExists) => {}
+				.Err(why) => return .Err(why)
+			}
+		}
+		return .Err(.AlreadyExists)
+	}
+}
+
+/// The system's directory of temporary files, as `GetTempPathA` says:
+/// `%TMP%`, `%TEMP%`, or the user's own. What is kept there across runs, a
+/// cache, is put in it by name; what is wanted for a while is a `TempDir`.
+pub fn temporaryRoot(): String = {
+	// Asked with room for most, and again with as much as Windows says it
+	// needs where that is more. Asked with room for 32767 bytes or more, as
+	// many as a path may have, Windows' own room for it overflows, and the
+	// program is stopped.
+	var room: Vec<u8> = .filled(PATH_ROOM, 0)
+	var got = GetTempPathA(room.len() as u32, &var room.items())
+	if got as i64 > room.len() {
+		room = .filled(got as i64, 0)
+		got = GetTempPathA(room.len() as u32, &var room.items())
+	}
+	if got == 0 || got as i64 > room.len() then
+		return "C:\\Windows\\Temp"
+
+	// Its path ends with a `\`, which a path here does not.
+	var end = got as i64
+	while end > 1 &&
+		path::isSeparator(room[end - 1]) &&
+		end > path::root(str::fromBytes(&room[0..end])).len() do
+		end -= 1
+
+	return str::fromBytes(&room[0..end])
+}
+
+fn metaOf(path: str, following: bool): Result<Meta, io::IoError> = {
+	// What is followed is a link: a reparse point of another kind, a
+	// socket's, is the file itself, which Windows cannot open by following.
+	val handle = openedToAsk(path, following && !isOwnReparsePoint(path))?
+	var information = FileInformation()
+	val asked = GetFileInformationByHandle(handle, &var information)
+	val failed = io::lastSystemError()
+	libc::CloseHandle(handle)
+	if asked == 0 then
+		return .Err(failed)
+
+	// A link's own, where it is not followed, is said by its reparse
+	// point's kind, which a directory's listing has.
+	val tag =
+		if information.attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 then linkTag(path) else 0
+	val kind = kindOf(information.attributes, tag)
+	val readOnly = information.attributes & FILE_ATTRIBUTE_READONLY != 0
+	val mode = match kind {
+		.Directory => if readOnly then 0o555 else 0o755
+		_ => if readOnly then 0o444 else 0o644
+	}
+	// A file's time, in hundreds of nanoseconds since 1601.
+	val written = ((information.written[1] as u64) << 32) | (information.written[0] as u64)
+	val since = written -% UNIX_FROM_1601
+	return Meta(
+		kind:,
+		size: ((information.sizeHigh as i64) << 32) | (information.sizeLow as i64),
+		modified: (since / 10000000) as i64,
+		modifiedNanos: ((since % 10000000) * 100) as i64,
+		mode:,
+		user: 0,
+		group: 0,
+		device: information.volume as i64,
+		inode: ((information.indexHigh as i64) << 32) | (information.indexLow as i64),
+	)
+}
+
+/// Whether `path` is a reparse point that names no other path, which is
+/// what it is itself.
+fn isOwnReparsePoint(path: str): bool = {
+	var name = String::of(path)
+	val attributes = GetFileAttributesA(name.toCstring())
+	return attributes != INVALID_ATTRIBUTES &&
+		attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 &&
+		linkTag(path) & NAME_SURROGATE == 0
+}
+
+/// The kind of the reparse point at `path`, as its directory lists it.
+fn linkTag(path: str): u32 = {
+	var name = String::of(path)
+	var found = FindData()
+	val find = FindFirstFileExA(
+		name.toCstring(),
+		FIND_EX_INFO_BASIC,
+		&var found,
+		FIND_EX_SEARCH_NAME_MATCH,
+		null,
+		0,
+	)
+	if find == INVALID_HANDLE then
+		return 0
+
+	FindClose(find)
+	return found.tag
+}

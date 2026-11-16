@@ -6,18 +6,38 @@ import std::fs
 import std::io
 import std::path
 import std::process::{Command}
-import check::{Gate, isFile, listed, read, run, wrong, write}
+import check::{Gate, isFile, listed, read, run, said, wrong, write}
 
 /// A C compiler that writes down how it was called, to `calls.txt` under
-/// `root`, and then calls the real one: `$CC`, or `cc`.
-fn recordingCompiler(root: str): String = {
-	val real = io::env("CC").unwrapOr("cc")
+/// `root`, a line a call, and then calls the real one: `$CC`, or `cc`, or
+/// on Windows, which has no `cc`, the `clang` `$WIP_CLANG` names. It is a
+/// program of Wip, built here, so that it runs where a shell does not.
+fn recordingCompiler(gate: &Gate, root: str): Result<String, String> = {
+	val fallback = if TARGET_OS == "windows" then io::env("WIP_CLANG").unwrapOr("clang") else "cc"
+	val real = io::env("CC").unwrapOr(fallback)
 	val log = path::join(root, "calls.txt")
-	val script = path::join(root, "cc.sh")
-	fs::writeFile(script, "#!/bin/sh\necho \"$*\" >> '\(log)'\nexec \(real) \"$@\"\n")
-	run(Command::of("chmod").args(["755", script.toStr()]))
-	return script
+	val dir = path::join(root, "recorder")
+	write(dir, "main.wip", "import std::fs\nimport std::process::{Command}\n\nfn main(args: &[cstring]): i64 = {\n    val given: Vec<str> = [for i in 1..args.len() do yield args[i].toStr()]\n    if fs::File::append(\(literal(log))) is .Ok(file) {\n        var record = file\n        record.write(\"\\(given.join(\" \"))\\n\")\n    }\n    return match Command::of(\(literal(real))).args(&given).run() {\n        .Ok(.Code(code)) => code\n        _ => 1\n    }\n}\n")
+	val recorder = path::join(dir, if TARGET_OS == "windows" then "recorder.exe" else "recorder")
+	val built = gate.wip(dir, ["build", "main.wip", "-o", recorder.toStr()])
+	if !built.exit.success() then
+		return .Err("the C compiler that writes down its calls is not built\(said(&built))")
+
+	return recorder
 }
+
+/// What the program `name` under `root` holds, its functions' names among
+/// it: on Windows, where they are in the PDB beside it, that too.
+fn namesIn(root: str, name: str): String = {
+	var text = read(root, name)
+	if TARGET_OS == "windows" then
+		text.push(read(root, "\(path::stem(name)).pdb"))
+
+	return text
+}
+
+/// `text` as a Wip string literal says it.
+fn literal(text: str): String = "\"\(text.replace("\\", by: "\\\\").replace("\"", by: "\\\""))\""
 
 /// A program of Wip alone compiles no C: the runtime is Wip, and `cc` is
 /// asked once, to link.
@@ -25,9 +45,12 @@ fn wipAloneCompilesNoC(gate: &Gate, root: str): Option<String> = {
 	write(
 		root,
 		"main.wip",
-		"import std::fs\nimport std::future::{Future}\nimport std::io\nimport std::process::{Command}\n\nfn main() = {\n    val answer = Future::run(own () => 6 * 7).get()\n    io::println(\"\\(answer) \\(fs::exists(\"main.wip\"))\")\n    val said = Command::of(\"echo\").arg(\"hello\").output()\n    if said is .Ok(..) {\n        io::println(\"spawned\")\n    }\n}\n",
+		"import std::fs\nimport std::future::{Future}\nimport std::io\nimport std::process::{Command}\n\nfn main() = {\n    val answer = Future::run(own () => 6 * 7).get()\n    io::println(\"\\(answer) \\(fs::exists(\"main.wip\"))\")\n    val said = if TARGET_FAMILY == \"windows\" then Command::of(\"cmd\").args([\"/c\", \"echo\", \"hello\"]).output() else Command::of(\"echo\").arg(\"hello\").output()\n    if said is .Ok(..) {\n        io::println(\"spawned\")\n    }\n}\n",
 	)
-	val cc = recordingCompiler(root)
+	val cc = match recordingCompiler(&gate, root) {
+		.Ok(cc) => cc
+		.Err(why) => return why
+	}
 	val cache = path::join(root, "cache")
 	val ran = run(
 		gate.command(root, ["run", "main.wip"])
@@ -39,7 +62,7 @@ fn wipAloneCompilesNoC(gate: &Gate, root: str): Option<String> = {
 		return wrong("`wip run main.wip`", &ran)
 
 	val calls = linesOf(read(root, "calls.txt"))
-	if calls.len() != 1 || !calls[0].startsWith("-o ") then
+	if calls.len() != 1 || !calls[0].split(" ").any((word) => word == "-o") then
 		return .Some("the C compiler was called otherwise than once, to link: \(calls.join(" | "))")
 
 	return .None
@@ -77,7 +100,10 @@ fn releaseOptimizes(gate: &Gate, root: str): Option<String> = {
 		"#include <stdint.h>\nint64_t twice(int64_t n) { return n * 2; }\n",
 	)
 	write(root, "main.test.wip", "@test\nfn itDoubles() = assert(twice::twice(4) == 8)\n")
-	val cc = recordingCompiler(root)
+	val cc = match recordingCompiler(&gate, root) {
+		.Ok(cc) => cc
+		.Err(why) => return why
+	}
 	val cache = path::join(root, "cache")
 	val withCc = (arguments: &[str]) => run(
 		gate.command(root, &arguments).env("CC", cc).env("WIP_CACHE_DIR", cache),
@@ -196,17 +222,27 @@ fn libraryForC(gate: &Gate, root: str): Option<String> = {
 		"c/main.c",
 		"#include <stdio.h>\n#include \"board.h\"\n\nint main(void) {\n    int64_t counts[] = {3, 9, 4};\n    printf(\"%lld %lld %lld\\n\", (long long)board_score(4, 2),\n        (long long)board_best(counts, 3), (long long)board_greet(\"lines\"));\n    return 0;\n}\n",
 	)
-	val cc = io::env("CC").unwrapOr("cc")
-	var link = Command::of(cc).args(["c/main.c", "libboard.a", "-o", "c/program"]).directory(root)
-	if needsLibm then
-		link = link.arg("-lm")
+	// Linked with what the header says to, by a C compiler: `cc`, or on
+	// Windows, which has none, the `clang` `$WIP_CLANG` names.
+	val fallback = if TARGET_OS == "windows" then io::env("WIP_CLANG").unwrapOr("clang") else "cc"
+	val cc = io::env("CC").unwrapOr(fallback)
+	val program = if TARGET_OS == "windows" then "c/program.exe" else "c/program"
+	var link = Command::of(cc).args(["c/main.c", "libboard.a", "-o", program]).directory(root)
+	val said = "/* Link what this declares with: "
+	if header.lines().find((line) => line.startsWith(said)) is .Some(line) {
+		val libraries = line[said.len()..line.len()].stripSuffix(" */").unwrapOr("")
+		for library in libraries.split(" ") do
+			if !library.isEmpty() then
+				link = link.arg(library)
+	}
 
 	val linked = run(link)
 	if !linked.exit.success() then
 		return wrong("the C program does not link", &linked)
 
-	val ran = run(Command::of(path::join(root, "c/program")))
-	if ran.stdout != "42 9 5\n" then
+	// C's `printf` ends a line with `\r\n` on Windows.
+	val ran = run(Command::of(path::join(root, program)))
+	if ran.stdout.replace("\r\n", by: "\n") != "42 9 5\n" then
 		return wrong("the C program", &ran)
 
 	return .None
@@ -232,7 +268,7 @@ fn holdsWhatItReaches(gate: &Gate, root: str): Option<String> = {
 	if ran.stdout != "2 2 1\nended\n" then
 		return wrong("the program", &ran)
 
-	val program = read(root, "program")
+	val program = namesIn(root, "program")
 	for name in ["wip.reached.", "wip.asAValue.", "wip.Held.destroy."] do
 		if !program.contains(name) then
 			return .Some("`\(name)` is reached, and is not in the program")
@@ -316,7 +352,11 @@ fn x86Has(features: &[str]): bool = {
 fn sharedLibrary(gate: &Gate, root: str): Option<String> = {
 	write(root, "twice.wip", "@export(\"C\")\nfn wip_twice(n: i64): i64 = n * 2\n")
 	val built = gate.wip(root, ["build", "twice.wip", "--emit", "dynamic"])
-	val name = if TARGET_VENDOR == "apple" then "libtwice.dylib" else "libtwice.so"
+	val name = when {
+		TARGET_OS == "windows" => "twice.dll"
+		TARGET_VENDOR == "apple" => "libtwice.dylib"
+		else => "libtwice.so"
+	}
 	if !built.exit.success() || !isFile(root, name) then
 		return wrong("`wip build --emit dynamic` wrote no `\(name)`", &built)
 
@@ -383,7 +423,10 @@ fn assembly(gate: &Gate, root: str): Option<String> = {
 	)
 	write(root, "adds/one_arm64.s", "    .text\n    .globl \(name("adds_one"))\n    .p2align 2\n\(name("adds_one")):\n    add x0, x0, #1\n    ret\n")
 	write(root, "adds/one_x86_64.s", "    .text\n    .globl \(name("adds_one"))\n\(name("adds_one")):\n    leaq 1(%rdi), %rax\n    ret\n")
-	val cc = recordingCompiler(root)
+	val cc = match recordingCompiler(&gate, root) {
+		.Ok(cc) => cc
+		.Err(why) => return why
+	}
 	val cache = path::join(root, "cache")
 	val ran = run(gate.command(root, ["run", "main.wip"]).env("CC", cc).env("WIP_CACHE_DIR", cache))
 	if !ran.exit.success() || ran.stdout != "42 42\n" then
@@ -439,7 +482,10 @@ fn cPlusPlus(gate: &Gate, root: str): Option<String> = {
 		"single/twice.h",
 		"#ifdef __cplusplus\nextern \"C\" {\n#endif\nlong twice(long x);\n#ifdef __cplusplus\n}\n#endif\n#ifdef TWICE_IMPL\n#if __cplusplus < 202002L\n#error \"needs C++20\"\n#endif\n#include <array>\nextern \"C\" long twice(long x) { std::array<long, 1> a{x}; return a[0] * 2; }\n#endif\n",
 	)
-	val cc = recordingCompiler(root)
+	val cc = match recordingCompiler(&gate, root) {
+		.Ok(cc) => cc
+		.Err(why) => return why
+	}
 	val cache = path::join(root, "cache")
 	val ran = run(
 		gate.command(root, ["run", "main.wip"])
@@ -461,8 +507,13 @@ fn cPlusPlus(gate: &Gate, root: str): Option<String> = {
 		if call.contains("twice.h") && call.contains("-x c++") && call.contains("-std=c++20") then
 			header = true
 
-		if call.startsWith("-o ") then
-			linked = call.contains(if TARGET_VENDOR == "apple" then "-lc++" else "-lstdc++")
+		// The link: what writes `-o` but compiles nothing. On Windows an
+		// object of C++ names its own library to the linker.
+		val words: Vec<str> = call.split(" ").toVec()
+		if words.contains("-o") && !words.contains("-c") && !words.contains("--version") then
+			linked =
+				TARGET_OS == "windows" ||
+					call.contains(if TARGET_VENDOR == "apple" then "-lc++" else "-lstdc++")
 	}
 	if !cpp || !header || !linked then
 		return .Some("the C++ was not compiled or linked as said: \(calls.join(" | "))")
@@ -578,7 +629,7 @@ fn definesSetConstants(gate: &Gate, root: str): Option<String> = {
 	write(
 		root,
 		"main.wip",
-		"import std::io\nimport world\n\n@define\nval EDITOR: bool = true\n\n@define\nval LEVEL: i64 = 1\n\n@define\nval TITLE: str = \"Marble\"\n\n@define\nval SHARED: bool = false\n\nval TOOLS: bool = EDITOR && TARGET_OS != \"nowhere\"\n\nfn editorOnly(n: i64): i64 = n * 7\n\nfn toolsOnly(n: i64): i64 = n * 3\n\nfn windowsOnly(n: i64): i64 = n * 11\n\nfn main() = {\n    if EDITOR then io::println(\"editor \\(editorOnly(6))\")\n    if TOOLS then io::println(\"tools \\(toolsOnly(2))\")\n    if TARGET_OS == \"windows\" then io::println(\"\\(windowsOnly(2))\")\n    io::println(\"\\(TITLE) \\(LEVEL) \\(world::DEBUG) \\(SHARED)\")\n}\n",
+		"import std::io\nimport world\n\n@define\nval EDITOR: bool = true\n\n@define\nval LEVEL: i64 = 1\n\n@define\nval TITLE: str = \"Marble\"\n\n@define\nval SHARED: bool = false\n\nval TOOLS: bool = EDITOR && TARGET_OS != \"nowhere\"\n\nfn editorOnly(n: i64): i64 = n * 7\n\nfn toolsOnly(n: i64): i64 = n * 3\n\nfn iosOnly(n: i64): i64 = n * 11\n\nfn main() = {\n    if EDITOR then io::println(\"editor \\(editorOnly(6))\")\n    if TOOLS then io::println(\"tools \\(toolsOnly(2))\")\n    if TARGET_OS == \"ios\" then io::println(\"\\(iosOnly(2))\")\n    io::println(\"\\(TITLE) \\(LEVEL) \\(world::DEBUG) \\(SHARED)\")\n}\n",
 	)
 	write(
 		root,
@@ -593,12 +644,12 @@ fn definesSetConstants(gate: &Gate, root: str): Option<String> = {
 	if ran.stdout != "editor 42\ntools 6\nMarble 1 false false\n" then
 		return wrong("the program", &ran)
 
-	val program = read(root, "program")
+	val program = namesIn(root, "program")
 	if !program.contains("wip.editorOnly.") then
 		return .Some("`editorOnly` is reached, and is not in the program")
 
-	if program.contains("wip.windowsOnly.") && TARGET_OS != "windows" then
-		return .Some("`windowsOnly` is in a branch no target here takes, and is in the program")
+	if program.contains("wip.iosOnly.") then
+		return .Some("`iosOnly` is in a branch no target here takes, and is in the program")
 
 	val defined = gate.wip(root, [
 		"build",
@@ -699,13 +750,77 @@ fn checkedForAnotherTarget(gate: &Gate, root: str): Option<String> = {
 	if countOf(twice.stderr, "cannot find `notDeclaredAnywhere`") != 1 then
 		return wrong("`wip check --target linux --target linux`", &twice)
 
-	val windows = gate.wip(root, ["check", "--target", "windows", "main.wip"])
-	if windows.exit != .Code(2) || !windows.stderr.contains("not written for Windows") then
-		return wrong("`wip check --target windows`", &windows)
+	// Windows is checked for too, and has no `place` of its own.
+	val windows = gate.wip(root, ["check", "--target", "windows-arm64", "main.wip"])
+	if windows.exit != .Code(1) || !windows.stderr.contains("cannot find `place`") then
+		return wrong("`wip check --target windows-arm64`", &windows)
 
 	val unknown = gate.wip(root, ["check", "--target", "linux-riscv64", "main.wip"])
 	if unknown.exit != .Code(2) || !unknown.stderr.contains("`linux-riscv64` is not a target") then
 		return wrong("`wip check --target linux-riscv64`", &unknown)
+
+	return .None
+}
+
+/// A program for Windows is built on another system as its objects, which
+/// Windows' linker links: `--emit objects` writes them, COFF for the
+/// processor named, with what the link takes listed beside them and the
+/// manifest that makes the program's text UTF-8. A program itself is not
+/// linked here, and says where it is.
+fn windowsObjects(gate: &Gate, root: str): Option<String> = {
+	// On Windows a Windows program is linked here.
+	if TARGET_OS == "windows" then
+		return .None
+
+	write(root, "main.wip", "import std::io\n\nfn main() = io::println(\"hello\")\n")
+	val built = gate.wip(root, [
+		"build",
+		"--target",
+		"windows-arm64",
+		"--emit",
+		"objects",
+		"main.wip",
+		"-o",
+		"out",
+	])
+	if !built.exit.success() then
+		return wrong("`wip build --target windows-arm64 --emit objects`", &built)
+
+	// IMAGE_FILE_MACHINE_ARM64, 0xAA64, little-endian, at the object's start.
+	val object = read(root, "out/part0.obj")
+	if object.len() < 2 || object[0] != 0x64 || object[1] != 0xAA then
+		return .Some("`out/part0.obj` is not an Arm64 COFF object")
+
+	val listed = read(root, "out/link.txt")
+	if !listed.startsWith("object part0.obj\n") ||
+		!listed.contains("library kernel32\n") ||
+		!listed.contains("runtime compiler-rt\n") ||
+		!listed.contains("object program.res\n") ||
+		!listed.contains("option /INCREMENTAL:NO\n") {
+		return .Some("`out/link.txt` does not say what the link takes: \(listed)")
+	}
+
+	if !read(root, "out/program.res").contains("<activeCodePage") then
+		return .Some("`out/program.res` does not make the code page UTF-8")
+
+	// A runner of the tests, the same.
+	write(root, "main.test.wip", "@test\nfn passes() = assert(true)\n")
+	val tests = gate.wip(root, [
+		"test",
+		"--target",
+		"windows-arm64",
+		"--emit",
+		"objects",
+		"main.wip",
+		"-o",
+		"tests",
+	])
+	if !tests.exit.success() || !read(root, "tests/link.txt").contains("object program.res") then
+		return wrong("`wip test --target windows-arm64 --emit objects`", &tests)
+
+	val linked = gate.wip(root, ["build", "--target", "windows-arm64", "main.wip"])
+	if linked.exit.success() || !linked.stderr.contains("is linked on Windows") then
+		return wrong("`wip build --target windows-arm64`", &linked)
 
 	return .None
 }

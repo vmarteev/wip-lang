@@ -1,0 +1,93 @@
+// A `Mutex`'s lock on a Unix: a pthread mutex, and a pthread condition
+// that waits for a change.
+
+import std::libc
+import std::libc::{
+	Hidden,
+	hidden,
+	pthread_cond_broadcast,
+	pthread_cond_destroy,
+	pthread_cond_init,
+	pthread_cond_wait,
+	pthread_mutex_destroy,
+	pthread_mutex_init,
+	pthread_mutex_lock,
+	pthread_mutex_trylock,
+	pthread_mutex_unlock
+}
+import std::time::{Duration}
+
+/// The lock and its condition, made in place.
+fn madeState(state: ptr<MutexState>) = {
+	pthread_mutex_init(&var state.lock, null)
+	initChanged(&var state.changed)
+}
+
+fn acquire(state: ptr<MutexState>) = {
+	pthread_mutex_lock(&var state.lock)
+}
+
+/// Whether the lock was taken, where no other thread held it.
+fn tryAcquire(state: ptr<MutexState>): bool = pthread_mutex_trylock(&var state.lock) == 0
+
+/// The lock let go, and every thread that waits for a change woken.
+fn release(state: ptr<MutexState>) = {
+	pthread_cond_broadcast(&var state.changed)
+	pthread_mutex_unlock(&var state.lock)
+}
+
+/// The lock let go, waking nobody.
+fn unlock(state: ptr<MutexState>) = {
+	pthread_mutex_unlock(&var state.lock)
+}
+
+/// Waits for a change, the lock held: let go while it waits, and held
+/// again when it answers.
+fn waitFor(state: ptr<MutexState>) = {
+	pthread_cond_wait(&var state.changed, &var state.lock)
+}
+
+fn freedState(state: ptr<MutexState>) = {
+	pthread_cond_destroy(&var state.changed)
+	pthread_mutex_destroy(&var state.lock)
+}
+
+/// A mutex's condition, made: Apple's systems wait for a length of time,
+/// which no clock is set under, and need nothing more.
+@target(vendor = "apple")
+fn initChanged(changed: &var Hidden) = pthread_cond_init(&var changed, null)
+
+/// On Linux a timed wait's deadline is a moment, on the condition's clock,
+/// which is made the one that only goes forward.
+@target(os = "linux")
+fn initChanged(changed: &var Hidden) = {
+	var attributes = hidden()
+	libc::pthread_condattr_init(&var attributes)
+	libc::pthread_condattr_setclock(&var attributes, libc::CLOCK_MONOTONIC)
+	libc::condInitWith(&var changed, &attributes)
+	libc::pthread_condattr_destroy(&var attributes)
+}
+
+/// Waits on a mutex's condition, its lock held, for at most `left`: woken
+/// by a change, or not.
+@target(vendor = "apple")
+fn waitAtMost(state: ptr<MutexState>, left: Duration) = {
+	val length = timeSpec(left.asNanos())
+	libc::pthread_cond_timedwait_relative_np(&var state.changed, &var state.lock, &length)
+}
+
+@target(os = "linux")
+fn waitAtMost(state: ptr<MutexState>, left: Duration) = {
+	var now = libc::TimeSpec()
+	libc::clock_gettime(libc::CLOCK_MONOTONIC, &var now)
+	val deadline = timeSpec(now.seconds * NANOS + (now.nanos as i64) + left.asNanos())
+	libc::pthread_cond_timedwait(&var state.changed, &var state.lock, &deadline)
+}
+
+val NANOS: i64 = 1000000000
+
+/// `nanos` as C counts a time: seconds, and the nanoseconds past them.
+fn timeSpec(nanos: i64): libc::TimeSpec = libc::TimeSpec(
+	seconds: nanos / NANOS,
+	nanos: (nanos % NANOS) as c_long,
+)

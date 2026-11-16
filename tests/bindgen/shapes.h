@@ -85,7 +85,8 @@ struct Pair {
 
 enum Corner { TOP_LEFT, TOP_RIGHT, BOTTOM_LEFT = 10, BOTTOM_RIGHT };
 
-// An enumerator past an `int` makes the enum's `unsigned int`; a `static
+// An enumerator past an `int` makes the enum's `unsigned int` on a Unix,
+// where Microsoft's C keeps every enum an `int`; a `static
 // const` number is a constant, as a 64-bit flag past any enum is written.
 enum Layer { LAYER_BASE = 1, LAYER_TOP = 0x80000000u };
 static const uint64_t SHAPES_STAGE_TOP = 0x8000000000000000ULL;

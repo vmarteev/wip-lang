@@ -9,6 +9,8 @@ and nothing of Wip's: for each system, the compiler as LLVM bitcode.
 | `macos-arm64/` | macOS on Apple silicon |
 | `linux-arm64/` | Linux on 64-bit Arm |
 | `linux-x86_64/` | Linux on x86-64 |
+| `windows-arm64/` | Windows on 64-bit Arm |
+| `windows-x86_64/` | Windows on x86-64 |
 
 Each holds:
 
@@ -16,7 +18,9 @@ Each holds:
   information, optimised for size by `clang` 15 and compressed. LLVM reads
   bitcode that an older LLVM wrote, so every `clang` from 15 on reads it.
 - **`link.txt`** — the libraries and frameworks it is linked with, one a
-  line; empty where the C library is all it needs.
+  line; empty where the C library is all it needs. Windows' names Clang's
+  runtime too, `--rtlib=compiler-rt`, which Microsoft's linker is not
+  given by itself.
 
 ## Building from them
 
@@ -24,12 +28,18 @@ Each holds:
 scripts/bootstrap.sh
 ```
 
+or on Windows, with Visual Studio's Build Tools and their Clang,
+
+```
+powershell -File scripts\bootstrap.ps1
+```
+
 compiles this system's seed with `clang` into a `wip` (stage A), which
 builds the compiler from `compiler/` (stage B), which builds it again
 (stage C). B and C must write the same bitcode for the compiler: that is
 the compiler compiling itself faithfully. C is the `wip` it leaves, in
-`target/bootstrap/bin/wip`, beside the library it reads; `--out` puts it
-elsewhere. A seed may be older than the source; stage B is always the
+`target/bootstrap/bin/wip`, beside the library it reads (`target\bootstrap\bin\wip.exe` on Windows);
+`--out`, or `-Out`, puts it elsewhere. A seed may be older than the source; stage B is always the
 source's own compiler. `scripts/build.sh` and the gate build the compiler
 with it where they are given no other `wip`, and build it first where it
 is not there.
@@ -39,8 +49,9 @@ is not there.
 A seed is made again only when the compiler's source uses something the
 seed's compiler cannot compile, so that the repository does not grow with
 every version. `scripts/seed.sh`, run on a Mac with Apple silicon, makes
-all three: the Mac's there, and the Linux ones in the Linux guests that
-`scripts/linux.sh` starts.
+them all: the Mac's there, Windows' there too, since any system writes the
+bitcode of another's compiler, and the Linux ones in the Linux guests that
+`scripts/linux.sh` starts. `--only` makes one system's alone.
 
 A seed frees the build from Rust and from binaries, not from trusting
 what made it. The longer way is the chain it shortens: the compiler in

@@ -525,7 +525,9 @@ type's `pushLiteral` as it was written, and each hole's value to its
 `pushValue`, lent, with the hole's options as named arguments; a hole of
 the type itself goes to `pushBuilt`, joined as it is. So the type decides
 what a value becomes in it, and the literal reads as any other. A literal
-with no holes where a template is expected builds it too.
+with no holes where a template is expected builds it too, and so does one
+where a `&` of a template is expected, as a temporary, lent: a function
+that reads a page or a URL takes a literal as it takes a variable's.
 
 `String` is a template, the one built where no other is expected: its
 `pushValue` takes any `Text`, and `width`, `fill` and `align`. A template
@@ -574,6 +576,69 @@ take is refused at the hole, and so is a value it does not take. Where no
 type is written, a literal is a `String`: `val row = "<li>\(name)</li>"`
 is text, and `val row: Html = …` says it is HTML, which `std::markup`
 builds (page 10).
+
+A template may say what it refuses in a literal, from the literal's own
+text, by a static function of its own, `refusal`. The compiler runs it
+for each literal that builds the type, while the program is compiled, as
+it runs a `@comptime` constant's code, and what it refuses is an error
+there, in the editor as the line is typed. It is given the literal's text
+between its holes, one piece more than there are holes, and of each hole
+whether its value is of the template's own type, and answers an
+`Option<Refusal>`: `.Hole(index:, why:)` refuses a hole, and
+`.Text(piece:, at:, why:)` the byte `at` of a piece, which the error points
+at as the source writes it. A query that would bind a value inside a
+quoted string refuses the hole:
+
+```wip,error=E0486
+struct Query {
+    text: String = String()
+}
+
+extend Query: Template {
+    static fn withCapacity(capacity: i64): Query = Query(
+        text: .withCapacity(capacity),
+    )
+
+    var fn pushLiteral(text: str) = self.text.push(text)
+
+    var fn pushBuilt(built: &Query, implicit at: Location) = self.text.push(
+        built.text.toStr(),
+    )
+}
+
+extend Query {
+    pub var fn pushValue<T: Text>(value: &T) = self.text.push("?")
+
+    /// A hole inside a quoted string, which a parameter cannot be.
+    pub static fn refusal(pieces: &[str], joined: &[bool]): Option<Refusal> = {
+        var quoted = false
+        for (i, piece) in pieces.indexed() {
+            for byte in piece do
+                if byte == b'\'' then
+                    quoted = !quoted
+
+            if quoted && i < joined.len() then
+                return .Hole(index: i, why: "inside a quoted string")
+        }
+        return .None
+    }
+}
+
+fn main() = {
+    val name = "Ada"
+    val query: Query = "select * from users where name = '\(name)'"
+}
+```
+
+What depends on values is not asked: a function that is not a literal's,
+a hole of the template's own type built elsewhere, and `pushValue` called
+by name are checked as the program runs, by the template's own code.
+
+A template may also finish what a literal built, by a method of its own,
+`move fn finished(): Self`: the literal's block ends by giving it what the
+pieces built, and its answer is the literal's value, with a `Location` it
+takes the literal's. `Regex` compiles its pattern there, once it is
+whole (page 10).
 
 ## `is`
 

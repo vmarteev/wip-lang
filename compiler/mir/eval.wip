@@ -23,7 +23,9 @@ import syntax::{
 	Interner,
 	NOT_RUN_AT_COMPILE_TIME,
 	Span,
-	Symbol
+	Symbol,
+	TEMPLATE_REFUSED,
+	writtenAt
 }
 
 /// How many statements a constant may run, the constants it reads included:
@@ -46,20 +48,23 @@ val RUNTIME_WORDS: u64 = 8
 val THREAD_WORDS: u64 = 4
 
 /// Works out every constant that is to be run, and sets its value, then checks
-/// every top-level `assert`; answers what went wrong, each at the constant or
-/// the assert it went wrong in. `locate` names the file, line and column of a
-/// place in the source.
+/// every top-level `assert`, and asks each template what it refuses in its
+/// literals; answers what went wrong, each at the constant, the assert or
+/// the literal it went wrong in. `locate` names the file, line and column of
+/// a place in the source, and `written` answers the text written there.
 pub fn evaluateConstants(
 	program: &var Program,
 	interner: &var Interner,
 	locate: &(at: Span) => (String, u32, u32),
-): Vec<Diagnostic> = evaluateWithin(&var program, &var interner, locate, STEPS)
+	written: &(at: Span) => String,
+): Vec<Diagnostic> = evaluateWithin(&var program, &var interner, locate, written, STEPS)
 
 /// The same, with a budget of `steps` for each constant.
 pub fn evaluateWithin(
 	program: &var Program,
 	interner: &var Interner,
 	locate: &(at: Span) => (String, u32, u32),
+	written: &(at: Span) => String,
 	steps: u64,
 ): Vec<Diagnostic> = {
 	var ids: Vec<ConstId> = Vec()
@@ -68,8 +73,12 @@ pub fn evaluateWithin(
 		if def.code.isSome() && def.value.isNone() then
 			ids.push(id)
 	}
-	if ids.isEmpty() && program.asserts.isEmpty() && program.instanceAsserts.isEmpty() then
+	if ids.isEmpty() &&
+		program.asserts.isEmpty() &&
+		program.instanceAsserts.isEmpty() &&
+		program.templateChecks.isEmpty() {
 		return Vec()
+	}
 
 	var diagnostics: Vec<Diagnostic> = Vec()
 	var values: Vec<(ConstId, Built)> = Vec()
@@ -118,6 +127,38 @@ pub fn evaluateWithin(
 					diagnostics.push(d.clone())
 			}
 		}
+		// What each template refuses in each literal that builds it, asked
+		// once of each text and holes: the same literal written twice is
+		// refused twice, where each is.
+		var asked: Map<(FnId, Vec<Option<Symbol>>, Vec<bool>), Option<Refused>> = Map()
+		for index in 0..program.templateChecks.len() {
+			val check = &program.templateChecks[index]
+			val texts: Vec<Option<Symbol>> = [
+				for piece in check.pieces do
+					yield if piece is .Some((symbol, _)) then Option::Some(symbol) else .None
+			]
+			val key = (check.refusal, texts, check.joined.clone())
+			val answer: Option<Refused> = match asked.get(&key) {
+				.Some(known) => known.clone()
+				.None => {
+					machine.steps = 0
+					val answered = match machine.refusal(index) {
+						.Ok(refused) => refused
+						.Err(failure) => {
+							machine.calls.clear()
+							if machine.report(.Template(index), failure, locate) is .Some(d) then
+								diagnostics.push(d.clone())
+
+							Option::None
+						}
+					}
+					asked.put(key, answered.clone())
+					answered
+				}
+			}
+			if answer is .Some(refused) then
+				diagnostics.push(machine.refused(index, &refused, written))
+		}
 	}
 	for (id, built) in move values do
 		program.consts[id].value = built.intoValue(&var interner)
@@ -158,6 +199,13 @@ fn allValues(parts: &[Built], interner: &var Interner): Vec<ConstValue> = {
 	return values
 }
 
+/// What a template refuses in a literal, as its `refusal` answered it.
+@derive(Clone)
+enum Refused {
+	Hole(index: i64, why: String)
+	Text(piece: i64, at: i64, why: String)
+}
+
 /// What was being run when something went wrong.
 enum Subject {
 	Constant(id: ConstId)
@@ -166,6 +214,8 @@ enum Subject {
 	/// A generic's signature `assert`, made for an instance: which of the
 	/// program's.
 	InstanceAssert(index: i64)
+	/// A template's `refusal`, asked of a literal: which of the program's.
+	Template(index: i64)
 }
 
 /// Why running stopped.
@@ -395,6 +445,15 @@ extend Machine {
 					"what `\(name)` asserts cannot be checked while the program is compiled",
 				)
 			}
+			.Template(index) => {
+				val check = &self.program.templateChecks[index]
+				val name = self.program.tyName(check.template, self.interner)
+				(
+					check.literal,
+					"asking `\(name)` what it refuses in this literal",
+					"`\(name)` cannot be asked what it refuses in this literal while the program is compiled",
+				)
+			}
 		}
 		val instance: Option<i64> = match subject {
 			.InstanceAssert(index) => index
@@ -450,6 +509,150 @@ extend Machine {
 			noted = noted.withNote("in \(function) (\(file):\(line))")
 		}
 		return noted
+	}
+
+	// --- Templates -------------------------------------------------------
+
+	/// What the template of the `index`th literal refuses in it: its
+	/// `refusal` run on the literal's text and which holes are joined, each
+	/// a slice in memory as the program would lend it.
+	var fn refusal(index: i64): Result<Option<Refused>, Failure> = {
+		val check = &self.program.templateChecks[index]
+		val depth = self.calls.len()
+		return match self.askRefusal(check.refusal, &check.pieces, &check.joined) {
+			.Ok(answer) => Result::Ok(answer)
+			.Err(stop) => {
+				val calls = self.stack()
+				self.calls.truncate(depth)
+				Result::Err(Failure(stop:, calls:))
+			}
+		}
+	}
+
+	var fn askRefusal(
+		refusal: FnId,
+		pieces: &[Option<(Symbol, Span)>],
+		joined: &[bool],
+	): Result<Option<Refused>, Stop> = {
+		// Each piece a `str`: where its bytes are, and how many. An empty one
+		// points at the list itself, and has none.
+		val texts = self.alloc((pieces.len() * 16).max(1) as u64)?
+		for (i, piece) in pieces.indexed() {
+			val at = texts + i as u64 * 16
+			match piece {
+				.Some((symbol, _)) => {
+					val bytes = self.string(symbol)?
+					self.writeWord(at, bytes)?
+					self.writeWord(at + 8, self.interner.resolve(symbol).len() as u64)?
+				}
+				.None => self.writeWord(at, texts)?
+			}
+		}
+		val joins = self.alloc(joined.len().max(1) as u64)?
+		for (i, join) in joined.indexed() do
+			self.writeInt(joins + i as u64, 1, if join then 1 else 0)?
+
+		val textSlice = self.slice(texts, pieces.len())?
+		val joinSlice = self.slice(joins, joined.len())?
+		val ret = self.program.fns[refusal].ret
+		val answer = self.alloc(self.size(ret).max(1))?
+		self.call(.Fn(refusal), [.Address(textSlice), .Address(joinSlice)], answer)?
+		// `Option<Refusal>`: nothing, or a hole or a place in the text, read
+		// field by field, since what it says is a `String`.
+		val program = self.program
+		val some = self.variant(answer, ret)?
+		val options = program.variantFieldTys(ret)
+		if options[some].len() != 1 then
+			return .Ok(.None)
+
+		val refusalTy = options[some][0]
+		val at = answer + self.layouts.variantOffset(&program, ret, some, 0)
+		val variant = self.variant(at, refusalTy)?
+		val fieldTys = program.variantFieldTys(refusalTy)
+		var numbers: Vec<i64> = Vec()
+		var why = String()
+		for (i, field) in fieldTys[variant].indexed() {
+			val offset = self.layouts.variantOffset(&program, refusalTy, variant, i as u32)
+			if program.isString(field) then
+				why = self.stringAt(at + offset, field)?
+			else
+				numbers.push(self.load(at + offset, field)? as i64)
+		}
+		return .Ok(
+			when {
+				variant == 0 && numbers.len() == 1 => Option::Some(Refused::Hole(
+					index: numbers[0],
+					why:,
+				))
+				variant == 1 && numbers.len() == 2 => Option::Some(Refused::Text(
+					piece: numbers[0],
+					at: numbers[1],
+					why:,
+				))
+				else => .None
+			},
+		)
+	}
+
+	/// A `String`'s text, read where the `String` is.
+	var fn stringAt(address: u64, ty: Ty): Result<String, Stop> = {
+		val program = self.program
+		val bytes = program.fieldTys(ty)[0]
+		val vec = address + self.layouts.fieldOffset(&program, ty, 0)
+		val pointer = self.readWord(vec + self.layouts.fieldOffset(&program, bytes, 0))?
+		val length = self.readWord(vec + self.layouts.fieldOffset(&program, bytes, 1))?
+		return self.text(pointer, length)
+	}
+
+	/// A slice of `count` elements at `elements`, as a `&[T]` is: where they
+	/// are, and how many.
+	var fn slice(elements: u64, count: i64): Result<u64, Stop> = {
+		val address = self.alloc(16)?
+		self.writeWord(address, elements)?
+		self.writeWord(address + 8, count as u64)?
+		return address
+	}
+
+	/// The error a template's refusal of the `index`th literal is: at the
+	/// hole it refused, or at the byte of its text, as the source writes it.
+	fn refused(index: i64, refused: &Refused, written: &(at: Span) => String): Diagnostic = {
+		val check = &self.program.templateChecks[index]
+		val name = self.program.tyName(check.template, self.interner)
+		val diagnostic = match refused {
+			.Hole(index: hole, why) => {
+				val known = hole >= 0 && hole < check.holes.len()
+				val at = if known then check.holes[hole] else check.literal
+				val what = if known && check.joined[hole] then "a hole of `\(name)`" else "a hole"
+				Diagnostic::error(
+					TEMPLATE_REFUSED,
+					"`\(name)` refuses \(what) \(why)",
+					at,
+					why.clone(),
+				)
+			}
+			.Text(piece, at, why) => Diagnostic::error(
+				TEMPLATE_REFUSED,
+				"`\(name)` refuses this text: \(why)",
+				self.textAt(index, piece, at, written),
+				why.clone(),
+			)
+		}
+		return diagnostic.withNote("`\(name)` says what it refuses in a literal by its `refusal`, which is asked of each literal that builds it while the program is compiled")
+	}
+
+	/// Where the byte `at` of the `piece`th piece of the `index`th literal's
+	/// text is written: the escape or the character that writes it, or the
+	/// literal where the piece has no such byte.
+	fn textAt(index: i64, piece: i64, at: i64, written: &(at: Span) => String): Span = {
+		val check = &self.program.templateChecks[index]
+		if piece < 0 || piece >= check.pieces.len() then
+			return check.literal
+
+		val .Some((_, span)) = check.pieces[piece] else return check.literal
+		val text = written(check.literal)
+		val start = (span.lo - check.literal.lo) as i64
+		val .Some((lo, hi)) = writtenAt(text.toStr(), start, at) else return span
+		return Span::new(check.literal.lo + lo as u32, check.literal.lo + hi as u32)
 	}
 
 	/// The generic whose signature asserts what the `index`th instance assert

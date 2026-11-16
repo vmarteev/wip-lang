@@ -14,6 +14,7 @@
 // each call checked as the program's own would be, at the place of the
 // piece it is for.
 
+import std::collections::{Set}
 import syntax as ast
 import syntax::{
 	Diagnostic,
@@ -21,19 +22,26 @@ import syntax::{
 	NOT_A_METHOD,
 	Span,
 	Symbol,
+	TEMPLATE_FINISHED,
+	TEMPLATE_REFUSED,
 	UNSATISFIED_CONSTRAINT
 }
 
 extend Lowerer {
 	/// The template an interpolation builds where `hint` is expected: the
-	/// type itself where it implements the prelude's `Template`, or the
-	/// success of an `Option` or a `Result` that does, since a value there
-	/// is its success. Nothing where neither does, and a `String` is built.
+	/// type itself where it implements the prelude's `Template`, the type
+	/// a `&` lends where it does, since a literal there is a temporary lent,
+	/// or the success of an `Option` or a `Result` that does, since a value
+	/// there is its success. Nothing where none does, and a `String` is
+	/// built.
 	fn templateFor(hint: Option<Ty>): Option<Ty> = {
 		val expected = hint?
 		val template = self.program.preludeItems.interfaceOf(.Template)?
 		if self.program.isString(expected) then
 			return .None
+
+		if self.kind(expected) is .Ref(inner, kind: .Shared) then
+			return if self.program.isString(inner) then .None else self.templateFor(inner)
 
 		if self.kind(expected) is .Struct(..) | .Enum(..) &&
 			self.program.implements(expected, template) {
@@ -78,10 +86,19 @@ extend Lowerer {
 			self.state.body.stmts.add(Stmt(kind: .Let(local:, init: made), span:)),
 		])
 		val [pushLiteral, pushValue, pushBuilt] = Symbol::templateMethods()
+		// What the literal says, for the template's `refusal`: its text
+		// between the holes, and of each hole whether it is joined.
+		var texts: Vec<Option<(Symbol, Span)>> = Vec()
+		var text: Option<(Symbol, Span)> = .None
+		var joins: Vec<bool> = Vec()
+		var holes: Vec<Span> = Vec()
 		for piece in pieces {
 			val step: Option<ExprId> = match piece {
 				.Text(literal) => {
 					val at = self.ast.exprs[literal].span
+					if self.ast.exprs[literal].kind is .Str(symbol) then
+						text = (symbol, at)
+
 					val receiver = self.alloc(.Local(local), built, at)
 					val text = [literal]
 					val unnamed: [Option<ast::Name>; 1] = [.None]
@@ -98,6 +115,9 @@ extend Lowerer {
 					val value = self.inferBorrowed(args[0], .None)
 					val valueTy = self.tyOf(value)
 					val joined = self.underRefs(valueTy) == built && args.len() == 1
+					texts.push(text.take())
+					joins.push(joined)
+					holes.push(at)
 					val method = if joined then pushBuilt else pushValue
 					val name = ast::Name(sym: method, span: at)
 					if self.isPoisoned(valueTy) {
@@ -126,11 +146,152 @@ extend Lowerer {
 			if step is .Some(call) then
 				stmts.push(self.state.body.stmts.add(Stmt(kind: .Expr(call), span:)))
 		}
+		texts.push(text.take())
+		if self.refusalOf(owner, built) is .Some(refusal) then
+			self.program.templateChecks.push(TemplateCheck(
+				refusal:,
+				typeArgs: self.program.types.internList(self.ownerArgs(built)),
+				module: self.current as u32,
+				template: built,
+				pieces: texts,
+				joined: joins,
+				holes:,
+				literal: span,
+			))
+
 		// The block's value is what it built, which it hands over: a value
-		// that owns memory is moved, never copied.
+		// that owns memory is moved, never copied. A template that finishes
+		// what a literal built is given it, at the literal's place, and its
+		// answer is the value.
 		val held = self.alloc(.Local(local), built, span)
-		val moved = self.alloc(.Move(held), built, span)
-		return self.alloc(.Block(Block(stmts:, value: moved, span:)), built, span)
+		val value = match self.finishedOf(owner, built) {
+			.Some(_) => {
+				val none: [ast::ExprId; 0] = []
+				val unnamed: [Option<ast::Name>; 0] = []
+				val item = pieceUse(&none, &unnamed, span)
+				val name = ast::Name(sym: Symbol::finished(), span:)
+				match self.dispatch(held, owner, name, item) {
+					.Some(call) => call
+					.None => return self.errorExpr(span)
+				}
+			}
+			.None => self.alloc(.Move(held), built, span)
+		}
+		return self.alloc(.Block(Block(stmts:, value:, span:)), built, span)
+	}
+
+	/// The template's `refusal`, which its literals are asked of while the
+	/// program is compiled: nothing where it has none, where it takes
+	/// something other than a literal's text and holes, which is said where
+	/// it is declared, or where the type is one of a generic's parameters,
+	/// which each instance would have to ask.
+	fn refusalOf(owner: TypeDef, built: Ty): Option<FnId> = {
+		val id = self.methodOf(owner, Symbol::refusal())?
+		val asked =
+			!self.program.types.isGeneric(built) &&
+			self.refusalTakesALiteral(id) &&
+			self.program.fns[id].generics.len() == self.ownerArgs(built).len()
+		return if asked then id else .None
+	}
+
+	/// A template's `finished`, which its literals end with: a `move fn`
+	/// that takes nothing but implicits and answers the template, of the
+	/// type's own parameters. Nothing where it has none or it is not one,
+	/// which is said where it is declared.
+	fn finishedOf(owner: TypeDef, built: Ty): Option<FnId> = {
+		val id = self.methodOf(owner, Symbol::finished())?
+		return if self.finishes(id, self.ownerArgs(built).len()) then id else .None
+	}
+
+	fn finishes(id: FnId, params: i64): bool = {
+		val function = &self.program.fns[id]
+		if function.receiver != .Move || function.generics.len() != params then
+			return false
+
+		for (i, param) in function.params.indexed() do
+			if i > 0 && !param.implicit then
+				return false
+
+		val .Some(owner) = function.owner else return false
+		return match (owner, self.kind(function.ret)) {
+			(.Struct(id: made), .Struct(id, ..)) => id == made
+			(.Enum(id: made), .Enum(id, ..)) => id == made
+			_ => false
+		}
+	}
+
+	/// Says of each template whose `refusal` or `finished` is not what a
+	/// literal is asked of or ended with that it is not, where the function
+	/// is declared: its literals do without it.
+	var fn checkTemplateMethods() = {
+		val .Some(template) = self.program.preludeItems.interfaceOf(.Template) else return
+		var seen: Set<FnId> = Set()
+		for index in 0..self.program.impls.len() {
+			val implementation = &self.program.impls[index]
+			if implementation.interfaceId != template then
+				continue
+
+			val params = implementation.conditions.len()
+			val owner = implementation.ty
+			if self.methodOf(owner, Symbol::refusal()) is .Some(id) &&
+				seen.add(id) &&
+				!(self.refusalTakesALiteral(id) && self.program.fns[id].generics.len() == params) {
+				self.report(
+					Diagnostic::error(
+						TEMPLATE_REFUSED,
+						"a template's `refusal` takes the literal's text and which holes are joined",
+						self.program.fns[id].nameSpan,
+						"not what a literal says",
+					).withNote(
+						"the compiler asks a template's `refusal` of each literal that builds it, while the program is compiled, and passes it the literal's text between its holes and which holes are of the template's own type",
+					).withHelp(
+						"declare it `static fn refusal(pieces: &[str], joined: &[bool]): Option<Refusal>`",
+					),
+				)
+			}
+			if self.methodOf(owner, Symbol::finished()) is .Some(id) &&
+				seen.add(id) &&
+				!self.finishes(id, params) {
+				self.report(
+					Diagnostic::error(
+						TEMPLATE_FINISHED,
+						"a template's `finished` takes the template and answers it",
+						self.program.fns[id].nameSpan,
+						"not what a literal ends with",
+					).withNote(
+						"a literal's block ends by giving what it built to the template's `finished`, whose answer is the literal's value, of the type the literal builds",
+					).withHelp("declare it `move fn finished(): Self`"),
+				)
+			}
+		}
+	}
+
+	/// Whether a template's `refusal` is static and takes a literal's text
+	/// and which holes are joined, answering what it refuses.
+	fn refusalTakesALiteral(id: FnId): bool = {
+		val function = &self.program.fns[id]
+		if function.receiver !is .None | .Some(.Static) || function.params.len() != 2 then
+			return false
+
+		val .Some(refused) = self.program.preludeItems.enumeration(.Refusal) else return false
+		val .Some(option) = self.program.preludeItems.enumeration(.Option) else return false
+		val texts = self.sliceOf(function.params[0].ty) is .Some(text) && self.kind(text) is .Str
+		val joins = self.sliceOf(function.params[1].ty) is .Some(join) && self.kind(join) is .Bool
+		val .Enum(id: answer, args) = self.kind(function.ret) else return false
+		val listed = self.program.types.list(args)
+		return texts &&
+			joins &&
+			answer == option &&
+			listed.len() == 1 &&
+			self.kind(listed[0]) is .Enum(id: refusal, ..) &&
+			refusal == refused
+	}
+
+	/// The elements of `&[T]`, where `ty` is one.
+	fn sliceOf(ty: Ty): Option<Ty> = {
+		val .Ref(inner, kind: .Shared) = self.kind(ty) else return .None
+		val .Slice(elem) = self.kind(inner) else return .None
+		return elem
 	}
 
 	/// `Template::withCapacity(capacity)` of the type being built.

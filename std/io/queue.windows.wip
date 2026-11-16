@@ -1,0 +1,116 @@
+// Windows' event queue: the sockets a program waits on, which it keeps
+// itself, and `WSAPoll`, asked of them all at each wait, which tells of a
+// socket while it is ready, as `poll` does. Windows waits so on sockets
+// alone: a descriptor is a socket's, as `net`'s `descriptor()` answers it.
+
+import std::libc
+import std::time::{Duration, Instant}
+
+/// A socket waited on: its number, what for, and the program's token.
+struct Watched {
+	descriptor: i32
+	interest: Interest
+	token: u64
+}
+
+/// The sockets a program waits on.
+pub struct EventQueue {
+	watched: Vec<Watched>
+}
+
+extend EventQueue {
+	/// A queue waiting on nothing.
+	pub static fn new(): Result<EventQueue, IoError> = EventQueue(Vec())
+
+	/// Waits on `descriptor` for `interest`, and tells of it by `token`.
+	pub var fn add(descriptor: i32, interest: Interest, token: u64): Result<void, IoError> = {
+		if self.watched.any((one) => one.descriptor == descriptor) then
+			return .Err(.AlreadyExists)
+
+		self.watched.push(Watched(descriptor:, interest:, token:))
+	}
+
+	/// Waits on `descriptor`, added already, for `interest` instead.
+	pub var fn change(descriptor: i32, interest: Interest, token: u64): Result<void, IoError> = {
+		val .Some(at) = self.watched.items().indexWhere((one) =>
+			one.descriptor == descriptor) else {
+			return .Err(.NotFound)
+		}
+		self.watched[at] = Watched(descriptor:, interest:, token:)
+	}
+
+	/// No longer waits on `descriptor`.
+	pub var fn remove(descriptor: i32): Result<void, IoError> = {
+		val .Some(at) = self.watched.items().indexWhere((one) =>
+			one.descriptor == descriptor) else {
+			return .Err(.NotFound)
+		}
+		self.watched.remove(at)
+		return
+	}
+
+	/// Sleeps until a socket is ready, or `timeout` has passed — `.None`
+	/// waits as long as it takes, and no time only looks — and puts what is
+	/// ready into `into`, emptied first, one event a socket.
+	pub var fn wait(timeout: Option<Duration>, into: &var Vec<Event>): Result<void, IoError> = {
+		into.clear()
+		// Windows' waits end on its timer's ticks, about every 16
+		// milliseconds, and may end a tick before their time: a wait that
+		// ends with nothing ready waits out what is left.
+		val deadline: Option<Instant> = match timeout {
+			.Some(length) => Instant::now().after(length)
+			.None => .None
+		}
+		var sockets: Vec<libc::PollSocket> = [
+			for one in self.watched do
+				yield libc::PollSocket(
+					socket: socketOf(one.descriptor),
+					events: eventsOf(one.interest),
+				)
+		]
+		while true {
+			// Milliseconds, rounded up, so that a wait is never cut short.
+			val millis = match deadline {
+				.Some(end) => ((end.since(Instant::now()).asNanos().max(0) + 999999) / 1000000).min(
+					i32::MAX as i64,
+				)
+				.None => -1
+			}
+			// `WSAPoll` is given at least one socket: with none, the wait is a
+			// sleep.
+			if sockets.isEmpty() then
+				libc::Sleep(if millis < 0 then libc::INFINITE else millis as u32)
+			else {
+				val count = libc::WSAPoll(&var sockets.items(), millis as c_int)
+				if count < 0 then
+					return .Err(lastSystemError())
+
+				if count > 0 then
+					break
+			}
+
+			if deadline is .Some(end) && Instant::now() >= end then
+				return
+		}
+		for (at, socket) in sockets.indexed() {
+			if socket.answered == 0 then
+				continue
+
+			into.push(Event(
+				token: self.watched[at].token,
+				readable: socket.answered & libc::POLLRDNORM != 0,
+				writable: socket.answered & libc::POLLWRNORM != 0,
+				closed: socket.answered & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0,
+			))
+		}
+	}
+}
+
+/// What `WSAPoll` is asked of a socket for `interest`.
+fn eventsOf(interest: Interest): i16 =
+	(if interest.reads() then libc::POLLRDNORM else 0) |
+	(if interest.writes() then libc::POLLWRNORM else 0)
+
+/// The socket whose 32-bit number `descriptor` is: widened as Windows
+/// widens a handle's value.
+fn socketOf(descriptor: i32): u64 = descriptor as i64 as u64

@@ -1,0 +1,357 @@
+// A COFF object, Windows', read as far as the table a panic reads needs and
+// added to: its sections, its symbols and their relocations, as `elf.wip`
+// and `macho.wip` read and add to theirs.
+//
+// A COFF object is its header, then a header for each section, then each
+// section's bytes and its relocations, then the symbols and after them their
+// names. The sections' headers come first, so a section added moves every
+// byte after them: the object is laid out again, its sections' bytes and
+// relocations as they were, at new places, the added sections after them,
+// then the symbols as they were with the added ones after them, so that no
+// relocation the object holds names another symbol. Each symbol is 18 bytes,
+// and may be followed by records of its own that the table counts as
+// symbols too.
+
+import std::bytes
+import std::collections::{Map}
+
+val COFF_HEADER: i64 = 20
+val COFF_SECTION: i64 = 40
+val COFF_SYMBOL: i64 = 18
+val COFF_RELOCATION: i64 = 10
+
+val IMAGE_FILE_MACHINE_ARM64: u16 = 0xAA64
+val IMAGE_FILE_MACHINE_AMD64: u16 = 0x8664
+/// A section of code.
+val IMAGE_SCN_CNT_CODE: u32 = 0x20
+/// A section of data, read only, aligned to eight bytes.
+val READ_ONLY_DATA: u32 = 0x40 | 0x00400000 | 0x40000000
+/// A symbol another object defines, or this one does for others.
+val IMAGE_SYM_CLASS_EXTERNAL: u8 = 2
+/// A symbol of a function.
+val IMAGE_SYM_DTYPE_FUNCTION: u16 = 0x20
+/// An address, of eight bytes, and a distance into a section, of four, on
+/// each processor: what DWARF's relocations are.
+val ARM64_ADDR64: u16 = 0x000E
+val ARM64_SECREL: u16 = 0x0008
+val AMD64_ADDR64: u16 = 0x0001
+val AMD64_SECREL: u16 = 0x000B
+
+/// Whether `bytes` begin as a COFF object of a processor Wip builds for.
+fn isCoff(bytes: &[u8]): bool = {
+	if bytes.len() < COFF_HEADER then
+		return false
+
+	val machine = bytes::u16le(&bytes, 0)
+	return machine == IMAGE_FILE_MACHINE_ARM64 || machine == IMAGE_FILE_MACHINE_AMD64
+}
+
+/// The object `bytes` are, read as COFF.
+fn readCoff(bytes: &[u8]): Result<Object, String> = {
+	val machine = bytes::u16le(&bytes, 0)
+	val count = bytes::u16le(&bytes, 2) as i64
+	val symbolsAt = bytes::u32le(&bytes, 8) as i64
+	val symbolCount = bytes::u32le(&bytes, 12) as i64
+	val optional = bytes::u16le(&bytes, 16) as i64
+	val stringsAt = symbolsAt + symbolCount * COFF_SYMBOL
+	val headersAt = COFF_HEADER + optional
+	if headersAt + count * COFF_SECTION > bytes.len() || stringsAt + 4 > bytes.len() then
+		return .Err("the COFF object's headers are past its end")
+
+	val (addr64, secrel) =
+		if machine == IMAGE_FILE_MACHINE_ARM64 then (ARM64_ADDR64, ARM64_SECREL)
+		else (AMD64_ADDR64, AMD64_SECREL)
+	var sections: Vec<ObjectSection> = Vec()
+	for i in 0..count {
+		val h = headersAt + i * COFF_SECTION
+		val characteristics = bytes::u32le(&bytes, h + 36)
+		val relocationsAt = bytes::u32le(&bytes, h + 24) as i64
+		val relocationCount = bytes::u16le(&bytes, h + 32) as i64
+		val relocations: Vec<Relocation> = [for r in 0..relocationCount {
+			val at = relocationsAt + r * COFF_RELOCATION
+			val kind = bytes::u16le(&bytes, at + 8)
+			val absolute = kind == addr64 || kind == secrel
+			yield Relocation(
+				offset: bytes::u32le(&bytes, at) as u64,
+				absolute:,
+				kind: if absolute then "Absolute" else "a COFF relocation of type \(kind)",
+				target: RelocationTarget::Symbol(bytes::u32le(&bytes, at + 4) as i64),
+				addend: 0,
+				// COFF keeps the addend in the bytes the relocation is at.
+				implicit: true,
+			)
+		}]
+		sections.push(
+			ObjectSection(
+				name: coffName(&bytes, h, stringsAt),
+				// Numbered from 1, as a symbol names its section.
+				index: i + 1,
+				address: 0,
+				offset: bytes::u32le(&bytes, h + 20) as i64,
+				size: bytes::u32le(&bytes, h + 16) as i64,
+				text: characteristics & IMAGE_SCN_CNT_CODE != 0,
+				relocations:,
+			),
+		)
+	}
+	// A symbol, then as many records of its own as it says, which are no
+	// symbols but are counted as they are.
+	var symbols: Vec<Option<ObjectSymbol>> = Vec()
+	var s = 0
+	while s < symbolCount {
+		val at = symbolsAt + s * COFF_SYMBOL
+		val number = bytes::i16le(&bytes, at + 12) as i64
+		val kind = bytes::u16le(&bytes, at + 14)
+		val records = bytes[at + 17] as i64
+		symbols.push(ObjectSymbol(
+			name: coffName(&bytes, at, stringsAt),
+			section: if number > 0 then number else .None,
+			address: bytes::u32le(&bytes, at + 8) as u64,
+			text: kind == IMAGE_SYM_DTYPE_FUNCTION,
+			undefined: number == 0,
+			sectionSymbol: false,
+		))
+		for _ in 0..records do
+			symbols.push(.None)
+
+		s += 1 + records
+	}
+	return Object(format: .Coff, bytes: bytes.toVec(), sections:, symbols:)
+}
+
+/// The name in a section's header or a symbol at `at`: eight bytes, or, for
+/// a longer one, where it is in the names after the symbols — `/` and that
+/// place in digits in a section's header, four zeros and the place in a
+/// symbol.
+fn coffName(bytes: &[u8], at: i64, stringsAt: i64): String = {
+	if bytes[at] == b'/' {
+		var offset = 0
+		for i in 1..8 {
+			val digit = bytes[at + i]
+			if digit < b'0' || digit > b'9' then
+				break
+
+			offset = offset * 10 + (digit - b'0') as i64
+		}
+		return cString(&bytes, stringsAt + offset)
+	}
+	if bytes::u32le(&bytes, at) == 0 then
+		return cString(&bytes, stringsAt + bytes::u32le(&bytes, at + 4) as i64)
+
+	var end = at
+	while end < at + 8 && bytes[end] != 0 do
+		end += 1
+
+	return str::fromBytes(&bytes[at..end])
+}
+
+/// A section of read-only data to add: its name, its bytes, the global
+/// symbol at its start where it has one, and where in it an address goes,
+/// and of what.
+struct CoffData {
+	name: String
+	bytes: Vec<u8>
+	symbol: Option<String>
+	addresses: Vec<(u64, Address)>
+}
+
+/// `object` with the sections `added` after its own, as Microsoft's linker
+/// reads one: each address in them a relocation of eight bytes, of a symbol
+/// the object has, defines or not, or of one added, undefined, for the
+/// linker to find in another object; a place in a section itself, of a
+/// symbol at its start, with the distance written where it goes.
+fn withCoffData(object: &[u8], added: &[CoffData]): Result<Vec<u8>, String> = {
+	val read = readCoff(&object)?
+	val machine = bytes::u16le(&object, 0)
+	val count = bytes::u16le(&object, 2) as i64
+	val symbolsAt = bytes::u32le(&object, 8) as i64
+	val symbolCount = bytes::u32le(&object, 12) as i64
+	val optional = bytes::u16le(&object, 16) as i64
+	val stringsAt = symbolsAt + symbolCount * COFF_SYMBOL
+	val stringsSize = bytes::u32le(&object, stringsAt) as i64
+	val addr64 = if machine == IMAGE_FILE_MACHINE_ARM64 then ARM64_ADDR64 else AMD64_ADDR64
+	// The names after the symbols, kept as they are, and added to.
+	var strings: Vec<u8> = object[stringsAt..stringsAt + stringsSize].toVec()
+	// The symbols, by name, at their index.
+	var named: Map<String, u32> = Map()
+	for (i, symbol) in read.symbols.indexed() {
+		val .Some(found) = symbol else continue
+		if !named.contains(&found.name) then
+			named.put(found.name.clone(), i as u32)
+	}
+	var symbols: Vec<u8> = object[symbolsAt..stringsAt].toVec()
+	var nextSymbol = symbolCount as u32
+	// Each added section's symbol at its start: its own, or a static one, for
+	// a place in it.
+	var starts: Vec<u32> = Vec()
+	for (i, data) in added.indexed() {
+		val section = (count + i + 1) as i16
+		val (name, class) = match data.symbol {
+			.Some(name) => (name.clone(), IMAGE_SYM_CLASS_EXTERNAL)
+			.None => (data.name.clone(), 3 as u8)
+		}
+		pushSymbol(&var symbols, &var strings, name, 0, section, 0, class)
+		if data.symbol is .Some(global) then
+			named.put(global.clone(), nextSymbol)
+
+		starts.push(nextSymbol)
+		nextSymbol += 1
+	}
+	// What the added sections name that the object does not: functions of
+	// another part, which the linker finds.
+	for data in added {
+		for (_, address) in data.addresses {
+			val .Symbol(name) = address else continue
+			if named.contains(&name) then
+				continue
+
+			pushSymbol(
+				&var symbols,
+				&var strings,
+				name.clone(),
+				0,
+				0,
+				IMAGE_SYM_DTYPE_FUNCTION,
+				IMAGE_SYM_CLASS_EXTERNAL,
+			)
+			named.put(name.clone(), nextSymbol)
+			nextSymbol += 1
+		}
+	}
+	// The headers, then the old sections' bytes and relocations, then the
+	// new sections'.
+	val headersAt = COFF_HEADER + optional
+	val newCount = count + added.len()
+	var out: Vec<u8> = object[0..headersAt].toVec()
+	var headers: Vec<u8> = object[headersAt..headersAt + count * COFF_SECTION].toVec()
+	for _ in 0..added.len() * COFF_SECTION do
+		headers.push(0)
+
+	var body: Vec<u8> = Vec()
+	val bodyAt = headersAt + newCount * COFF_SECTION
+	for i in 0..count {
+		val h = i * COFF_SECTION
+		val rawAt = bytes::u32le(&headers, h + 20) as i64
+		val rawSize = bytes::u32le(&headers, h + 16) as i64
+		val relocationsAt = bytes::u32le(&headers, h + 24) as i64
+		val relocationCount = bytes::u16le(&headers, h + 32) as i64
+		if rawAt != 0 && rawSize > 0 {
+			padTo(&var body, bodyAt, 4)
+			setU32(&var headers, h + 20, (bodyAt + body.len()) as u32)
+			body.pushAll(&object[rawAt..rawAt + rawSize])
+		}
+		if relocationCount > 0 {
+			padTo(&var body, bodyAt, 2)
+			setU32(&var headers, h + 24, (bodyAt + body.len()) as u32)
+			body.pushAll(&object[relocationsAt..relocationsAt + relocationCount * COFF_RELOCATION])
+		}
+		// No line numbers: COFF's own, which nothing writes now.
+		setU32(&var headers, h + 28, 0)
+	}
+	for (i, data) in added.indexed() {
+		val h = (count + i) * COFF_SECTION
+		var bytes = data.bytes.clone()
+		var relocations: Vec<u8> = Vec()
+		for (offset, address) in data.addresses {
+			val (symbol, addend) = match address {
+				.Symbol(name) => match named.get(&name) {
+					.Some(index) => (index, 0 as u64)
+					.None => return .Err("no symbol `\(name)` for the table")
+				}
+				.Here(at) => (starts[i], at)
+			}
+			setU64(&var bytes, offset as i64, addend)
+			putU32(&var relocations, offset as u32)
+			putU32(&var relocations, symbol)
+			putU16(&var relocations, addr64)
+		}
+		padTo(&var body, bodyAt, 8)
+		val rawAt = bodyAt + body.len()
+		body.pushAll(&bytes)
+		padTo(&var body, bodyAt, 2)
+		val relocationsAt = bodyAt + body.len()
+		body.pushAll(&relocations)
+		// A name longer than eight bytes is `/` and where it is in the names.
+		val written: String = if data.name.len() > 8 then "/\(strings.len())" else data.name.clone()
+		if data.name.len() > 8 then
+			pushCName(&var strings, data.name)
+
+		for b in 0..8 do
+			headers[h + b] = if b < written.len() then written[b] else 0
+
+		setU32(&var headers, h + 16, bytes.len() as u32)
+		setU32(&var headers, h + 20, rawAt as u32)
+		setU32(&var headers, h + 24, relocationsAt as u32)
+		setU16(&var headers, h + 32, data.addresses.len() as u16)
+		setU32(&var headers, h + 36, READ_ONLY_DATA)
+	}
+	out.pushAll(&headers)
+	out.pushAll(&body)
+	padTo(&var out, 0, 4)
+	val newSymbolsAt = out.len()
+	out.pushAll(&symbols)
+	setU32(&var strings, 0, strings.len() as u32)
+	out.pushAll(&strings)
+	setU16(&var out, 2, newCount as u16)
+	setU32(&var out, 8, newSymbolsAt as u32)
+	setU32(&var out, 12, nextSymbol)
+	return out
+}
+
+/// A symbol, at the end of `symbols`: its name, eight bytes or a place in
+/// `strings`, its value, section, type and class, and no records of its
+/// own.
+fn pushSymbol(
+	symbols: &var Vec<u8>,
+	strings: &var Vec<u8>,
+	name: String,
+	value: u32,
+	section: i16,
+	kind: u16,
+	class: u8,
+) = {
+	if name.len() > 8 {
+		putU32(&var symbols, 0)
+		putU32(&var symbols, strings.len() as u32)
+		pushCName(&var strings, name)
+	} else {
+		for b in 0..8 do
+			symbols.push(if b < name.len() then name[b] else 0)
+	}
+
+	putU32(&var symbols, value)
+	putU16(&var symbols, section as% u16)
+	putU16(&var symbols, kind)
+	symbols.push(class)
+	symbols.push(0)
+}
+
+/// Zeros at the end of `out` until where it ends, from `base`, is a
+/// multiple of `to`.
+fn padTo(out: &var Vec<u8>, base: i64, to: i64) = {
+	while (base + out.len()) % to != 0 do
+		out.push(0)
+}
+
+fn putU16(out: &var Vec<u8>, value: u16) = {
+	out.push((value & 0xff) as u8)
+	out.push((value >> 8) as u8)
+}
+
+fn putU32(out: &var Vec<u8>, value: u32) = {
+	for i in 0..4 do
+		out.push(((value >> (8 * i) as u32) & 0xff) as u8)
+}
+
+fn setU16(out: &var Vec<u8>, at: i64, value: u16) = {
+	out[at] = (value & 0xff) as u8
+	out[at + 1] = (value >> 8) as u8
+}
+
+/// `name` and a NUL, at the end of the names after the symbols.
+fn pushCName(out: &var Vec<u8>, name: str) = {
+	for b in name do
+		out.push(b)
+
+	out.push(0)
+}

@@ -1,0 +1,554 @@
+// Windows: TLS through SChannel, the system's own, over a `net::Stream`.
+// The credentials say nothing but the protocol: SChannel checks the
+// server's certificate against the system's roots and the name asked for
+// by itself, as it does for every program on the machine.
+//
+// A handshake is tokens handed back and forth: what the server sent is
+// given to `InitializeSecurityContextA`, which answers what to send it,
+// until the context is made. Then each record is sealed with
+// `EncryptMessage`, a header and a trailer about the bytes, and opened
+// with `DecryptMessage`, in place, in what was read; what was read past a
+// record is kept for the next.
+
+import std::io
+import std::libc
+import std::net::{Stream}
+import std::time::{Duration, Instant}
+
+/// A TLS connection to a server: an `io::Read` and an `io::Write`, as a
+/// `net::Stream` is.
+pub struct TlsStream {
+	stream: Stream
+	/// The name the server is told, and its certificate checked against.
+	host: String
+	credentials: SecHandle
+	context: SecHandle
+	sizes: StreamSizes
+	/// What was read from the socket and not yet opened: the start of a
+	/// record, or more.
+	sealed: Vec<u8>
+	/// What was opened and not yet read.
+	opened: Vec<u8>
+	/// Whether the server has said the connection is over.
+	ended: bool = false
+	/// How many milliseconds a read waits; -1 waits as long as it takes.
+	timeout: i64 = -1
+}
+
+// A status is SChannel's `SECURITY_STATUS`, its bits read as a `u32`.
+
+@link("secur32")
+extern "C" {
+	fn AcquireCredentialsHandleA(
+		principal: ptr<u8>,
+		package: cstring,
+		use: u32,
+		logon: ptr<u8>,
+		data: &Credentials,
+		getKey: ptr<u8>,
+		getKeyArgument: ptr<u8>,
+		credentials: &var SecHandle,
+		expiry: &var i64,
+	): u32
+	fn FreeCredentialsHandle(credentials: &var SecHandle): u32
+	/// The first of a handshake's calls, with no context yet and nothing
+	/// from the server.
+	@symbol("InitializeSecurityContextA")
+	fn firstContext(
+		credentials: &var SecHandle,
+		context: ptr<u8>,
+		target: cstring,
+		wanted: u32,
+		reserved: u32,
+		representation: u32,
+		input: ptr<u8>,
+		reserved2: u32,
+		made: &var SecHandle,
+		output: &var SecBufferDesc,
+		attributes: &var u32,
+		expiry: ptr<u8>,
+	): u32
+	/// Each call after it, with the context and what the server sent.
+	@symbol("InitializeSecurityContextA")
+	fn nextContext(
+		credentials: &var SecHandle,
+		context: &var SecHandle,
+		target: cstring,
+		wanted: u32,
+		reserved: u32,
+		representation: u32,
+		input: &var SecBufferDesc,
+		reserved2: u32,
+		made: &var SecHandle,
+		output: &var SecBufferDesc,
+		attributes: &var u32,
+		expiry: ptr<u8>,
+	): u32
+	fn DeleteSecurityContext(context: &var SecHandle): u32
+	fn QueryContextAttributesA(context: &var SecHandle, attribute: u32, into: &var StreamSizes): u32
+	fn EncryptMessage(
+		context: &var SecHandle,
+		quality: u32,
+		message: &var SecBufferDesc,
+		sequence: u32,
+	): u32
+	fn DecryptMessage(
+		context: &var SecHandle,
+		message: &var SecBufferDesc,
+		sequence: u32,
+		quality: ptr<u32>,
+	): u32
+	fn ApplyControlToken(context: &var SecHandle, input: &var SecBufferDesc): u32
+	fn FreeContextBuffer(buffer: ptr<u8>): u32
+}
+
+@link("kernel32")
+extern "C" {
+	/// What Windows says of an error, into `into`: how many bytes.
+	fn FormatMessageA(
+		flags: u32,
+		source: ptr<u8>,
+		code: u32,
+		language: u32,
+		into: &var [u8],
+		arguments: ptr<u8>,
+	): u32
+}
+
+/// `CredHandle` and `CtxtHandle`: two words SChannel keeps.
+extern struct SecHandle {
+	lower: u64 = 0
+	upper: u64 = 0
+}
+
+/// `SCH_CREDENTIALS`: nothing but its version and the flags, so that
+/// SChannel chooses the protocols and checks the server itself.
+extern struct Credentials {
+	version: u32 = 5
+	format: u32 = 0
+	count: u32 = 0
+	certificates: ptr<u8> = null
+	rootStore: ptr<u8> = null
+	mappers: u32 = 0
+	mapperList: ptr<u8> = null
+	lifespan: u32 = 0
+	flags: u32 = 0
+	parameterCount: u32 = 0
+	parameters: ptr<u8> = null
+}
+
+/// `SecBuffer`: a piece of a message, its length, its kind and its bytes.
+extern struct SecBuffer {
+	size: u32 = 0
+	kind: u32 = 0
+	bytes: ptr<u8> = null
+}
+
+/// `SecBufferDesc`: a message, as its pieces.
+extern struct SecBufferDesc {
+	version: u32 = 0
+	count: u32 = 0
+	buffers: ptr<SecBuffer> = null
+}
+
+/// `SecPkgContext_StreamSizes`: how much a record adds before and after
+/// what it seals, and the most it seals.
+extern struct StreamSizes {
+	header: u32 = 0
+	trailer: u32 = 0
+	most: u32 = 0
+	buffers: u32 = 0
+	block: u32 = 0
+}
+
+val UNISP_NAME: str = "Microsoft Unified Security Protocol Provider"
+val SECPKG_CRED_OUTBOUND: u32 = 2
+val SECPKG_ATTR_STREAM_SIZES: u32 = 4
+val SCH_CRED_NO_DEFAULT_CREDS: u32 = 0x10
+val SCH_USE_STRONG_CRYPTO: u32 = 0x00400000
+
+/// What the context is asked to be: records in order, each once, sealed,
+/// over a stream, with its tokens in memory SChannel gives.
+val ISC_WANTED: u32 = 0x4 | 0x8 | 0x10 | 0x100 | 0x8000 | 0x4000
+
+val SECBUFFER_EMPTY: u32 = 0
+val SECBUFFER_DATA: u32 = 1
+val SECBUFFER_TOKEN: u32 = 2
+val SECBUFFER_EXTRA: u32 = 5
+val SECBUFFER_STREAM_TRAILER: u32 = 6
+val SECBUFFER_STREAM_HEADER: u32 = 7
+
+val SEC_E_OK: u32 = 0
+val SEC_I_CONTINUE_NEEDED: u32 = 0x00090312
+val SEC_I_CONTEXT_EXPIRED: u32 = 0x00090317
+val SEC_I_RENEGOTIATE: u32 = 0x00090321
+val SEC_E_INCOMPLETE_MESSAGE: u32 = 0x80090318
+
+/// What SChannel answers of a certificate it refused.
+val CERTIFICATE_ERRORS: [u32; 7] = [
+	// SEC_E_WRONG_PRINCIPAL, SEC_E_CERT_UNKNOWN, SEC_E_CERT_EXPIRED,
+	// SEC_E_UNTRUSTED_ROOT
+	0x80090322,
+	0x80090327,
+	0x80090328,
+	0x80090325,
+	// CERT_E_UNTRUSTEDROOT, CERT_E_CN_NO_MATCH, CRYPT_E_REVOKED
+	0x800B0109,
+	0x800B010F,
+	0x80092010,
+]
+
+/// `ApplyControlToken`: the context is to be shut.
+val SCHANNEL_SHUTDOWN: u32 = 1
+
+/// How much is read from the socket at a time.
+val READ_ROOM: i64 = 16384
+
+fn connected(host: str, port: u16, within: Option<Duration>): Result<TlsStream, TlsError> = {
+	val deadline: Option<Instant> = match within {
+		.Some(length) => Instant::now().after(length)
+		.None => .None
+	}
+	val opened = match within {
+		.Some(length) => Stream::tcpWithin(host, port, length)
+		.None => Stream::tcp(host, port)
+	}
+	val stream = match move opened {
+		.Ok(stream) => stream
+		.Err(error) => return .Err(.Io(error))
+	}
+	var credentials = SecHandle()
+	val settings = Credentials(flags: SCH_CRED_NO_DEFAULT_CREDS | SCH_USE_STRONG_CRYPTO)
+	var expiry: i64 = 0
+	var package = String::of(UNISP_NAME)
+	val status = AcquireCredentialsHandleA(
+		null,
+		package.toCstring(),
+		SECPKG_CRED_OUTBOUND,
+		null,
+		&settings,
+		null,
+		null,
+		&var credentials,
+		&var expiry,
+	)
+	if status != SEC_E_OK then
+		return .Err(.Handshake(messageOf(status)))
+
+	var tls = TlsStream(
+		stream:,
+		host:,
+		credentials:,
+		context: SecHandle(),
+		sizes: StreamSizes(),
+		sealed: Vec(),
+		opened: Vec(),
+		timeout: millisOf(within),
+	)
+	tls.shakeHands(deadline)?
+	if QueryContextAttributesA(&var tls.context, SECPKG_ATTR_STREAM_SIZES, &var tls.sizes) !=
+		SEC_E_OK {
+		return .Err(.Handshake("the connection's sizes are not known"))
+	}
+
+	return tls
+}
+
+/// How many milliseconds are left before `deadline`, -1 for none.
+fn millisLeft(deadline: Option<Instant>): i64 = match deadline {
+	.Some(end) => end.since(Instant::now()).asMillis().max(0)
+	.None => -1
+}
+
+extend TlsStream {
+	/// Whether SChannel has made a context, which is deleted where the
+	/// stream ends.
+	fn made(): bool = self.context.lower != 0 || self.context.upper != 0
+
+	/// The handshake, or what the server sends after it, taken until the
+	/// context is made: each token SChannel answers sent, and what the
+	/// server sends read until SChannel has a whole message of it. A
+	/// `deadline` it is not done by is `.TimedOut`.
+	var fn shakeHands(deadline: Option<Instant>): Result<void, TlsError> = {
+		while true {
+			val status = self.step()?
+			if status == SEC_E_OK then
+				return
+
+			if status == SEC_I_CONTINUE_NEEDED && !self.sealed.isEmpty() then
+				continue
+
+			if status != SEC_I_CONTINUE_NEEDED && status != SEC_E_INCOMPLETE_MESSAGE then
+				return .Err(refusal(status))
+
+			// More from the server.
+			val left = millisLeft(deadline)
+			if deadline.isSome() && left <= 0 then
+				return .Err(.Io(.TimedOut))
+
+			if !self.readSealed(left).mapErr(TlsError::Io)? then
+				return .Err(.Handshake("the server broke off"))
+		}
+		return
+	}
+
+	/// One call of `InitializeSecurityContextA` with what was read: its
+	/// token sent, and what it did not take kept.
+	var fn step(): Result<u32, TlsError> = {
+		var target = self.host.clone()
+		var input = [
+			SecBuffer(
+				size: self.sealed.len() as u32,
+				kind: SECBUFFER_TOKEN,
+				bytes: start(&var self.sealed),
+			),
+			SecBuffer(),
+		]
+		var output = [SecBuffer(kind: SECBUFFER_TOKEN)]
+		var given = SecBufferDesc(
+			count: 2,
+			buffers: addressOf<SecBuffer>(&var input[0]) as ptr<SecBuffer>,
+		)
+		var answer = SecBufferDesc(
+			count: 1,
+			buffers: addressOf<SecBuffer>(&var output[0]) as ptr<SecBuffer>,
+		)
+		var attributes: u32 = 0
+		val status = if self.made() {
+			var current = SecHandle(lower: self.context.lower, upper: self.context.upper)
+			nextContext(
+				&var self.credentials,
+				&var current,
+				target.toCstring(),
+				ISC_WANTED,
+				0,
+				0,
+				&var given,
+				0,
+				&var self.context,
+				&var answer,
+				&var attributes,
+				null,
+			)
+		} else firstContext(
+			&var self.credentials,
+			null,
+			target.toCstring(),
+			ISC_WANTED,
+			0,
+			0,
+			null,
+			0,
+			&var self.context,
+			&var answer,
+			&var attributes,
+			null,
+		)
+		if output[0].size > 0 && !output[0].bytes.isNull {
+			val sent = self.stream.writeAll(&output[0].bytes[0..output[0].size as i64])
+			FreeContextBuffer(output[0].bytes)
+			sent.mapErr(TlsError::Io)?
+		}
+		// What SChannel did not take is the start of what comes next.
+		if status != SEC_E_INCOMPLETE_MESSAGE {
+			if input[1].kind == SECBUFFER_EXTRA {
+				val kept = self.sealed.len() - input[1].size as i64
+				self.sealed = self.sealed.splitOff(kept)
+			} else
+				self.sealed.clear()
+		}
+		return status
+	}
+
+	/// More of what the server sends, at the end of `sealed`, waiting at
+	/// most `millis`, -1 as long as it takes: false where the server has
+	/// closed.
+	var fn readSealed(millis: i64): Result<bool, io::IoError> = {
+		waitReadable(&self.stream, millis)?
+		var room: Vec<u8> = .filled(READ_ROOM, 0)
+		val got = self.stream.read(&var room.items())?
+		self.sealed.pushAll(&room[0..got])
+		return got > 0
+	}
+
+	/// The next record opened, at the end of `opened`, or more read where
+	/// there is not yet a whole one.
+	var fn openRecord(): Result<void, io::IoError> = {
+		if !self.sealed.isEmpty() {
+			var pieces = [
+				SecBuffer(
+					size: self.sealed.len() as u32,
+					kind: SECBUFFER_DATA,
+					bytes: start(&var self.sealed),
+				),
+				SecBuffer(),
+				SecBuffer(),
+				SecBuffer(),
+			]
+			var message = SecBufferDesc(
+				count: 4,
+				buffers: addressOf<SecBuffer>(&var pieces[0]) as ptr<SecBuffer>,
+			)
+			val status = DecryptMessage(&var self.context, &var message, 0, null)
+			if status == SEC_E_OK ||
+				status == SEC_I_RENEGOTIATE ||
+				status == SEC_I_CONTEXT_EXPIRED {
+				var left: Vec<u8> = Vec()
+				for piece in pieces {
+					if piece.kind == SECBUFFER_DATA then
+						self.opened.pushAll(&piece.bytes[0..piece.size as i64])
+					else if piece.kind == SECBUFFER_EXTRA then
+						left.pushAll(&piece.bytes[0..piece.size as i64])
+				}
+				self.sealed = left
+				if status == SEC_I_CONTEXT_EXPIRED then
+					self.ended = true
+
+				// What the server sends after the handshake — a ticket for
+				// the next connection, a new key — is SChannel's to take.
+				if status == SEC_I_RENEGOTIATE then
+					self.shakeHands(.None).mapErr((_) => io::IoError::InvalidData)?
+
+				return
+			}
+			if status != SEC_E_INCOMPLETE_MESSAGE then
+				return .Err(.InvalidData)
+		}
+		// A socket that ends with no word from TLS is an end too, as
+		// servers often close.
+		if !self.readSealed(self.timeout)? then
+			self.ended = true
+
+		return
+	}
+
+	/// Tells the server the connection is over: the token SChannel makes of
+	/// it sent, what goes wrong left, since the stream ends anyway.
+	var fn shutDown() = {
+		var kind = SCHANNEL_SHUTDOWN
+		var token = [
+			SecBuffer(size: 4, kind: SECBUFFER_TOKEN, bytes: addressOf<u32>(&var kind) as ptr<u8>),
+		]
+		var message = SecBufferDesc(
+			count: 1,
+			buffers: addressOf<SecBuffer>(&var token[0]) as ptr<SecBuffer>,
+		)
+		if ApplyControlToken(&var self.context, &var message) != SEC_E_OK then
+			return
+
+		self.sealed.clear()
+		self.step()
+	}
+}
+
+extend TlsStream: io::Read {
+	var fn read(into: &var [u8]): Result<i64, io::IoError> = {
+		if into.isEmpty() then
+			return 0
+
+		while self.opened.isEmpty() {
+			if self.ended then
+				return 0
+
+			self.openRecord()?
+		}
+		val count = into.len().min(self.opened.len())
+		into[0..count].copyFrom(&self.opened[0..count])
+		self.opened = self.opened.splitOff(count)
+		return count
+	}
+}
+
+extend TlsStream: io::Write {
+	var fn writeAll(bytes: &[u8]): Result<void, io::IoError> = {
+		val header = self.sizes.header as i64
+		val trailer = self.sizes.trailer as i64
+		var at = 0
+		while at < bytes.len() {
+			val count = (bytes.len() - at).min(self.sizes.most as i64)
+			var record: Vec<u8> = .filled(header + count + trailer, 0)
+			record[header..header + count].copyFrom(&bytes[at..at + count])
+			val base = start(&var record)
+			var pieces = [
+				SecBuffer(size: header as u32, kind: SECBUFFER_STREAM_HEADER, bytes: base),
+				SecBuffer(
+					size: count as u32,
+					kind: SECBUFFER_DATA,
+					bytes: offsetBytes(base, header),
+				),
+				SecBuffer(
+					size: trailer as u32,
+					kind: SECBUFFER_STREAM_TRAILER,
+					bytes: offsetBytes(base, header + count),
+				),
+				SecBuffer(),
+			]
+			var message = SecBufferDesc(
+				count: 4,
+				buffers: addressOf<SecBuffer>(&var pieces[0]) as ptr<SecBuffer>,
+			)
+			if EncryptMessage(&var self.context, 0, &var message, 0) != SEC_E_OK then
+				return .Err(.InvalidData)
+
+			val written = (pieces[0].size + pieces[1].size + pieces[2].size) as i64
+			self.stream.writeAll(&record[0..written])?
+			at += count
+		}
+	}
+}
+
+extend TlsStream: Destroy {
+	var fn destroy() = {
+		if self.made() {
+			self.shutDown()
+			DeleteSecurityContext(&var self.context)
+		}
+		FreeCredentialsHandle(&var self.credentials)
+	}
+}
+
+/// Waits at most `millis` for `stream` to have something to read; -1
+/// does not wait, and the read that follows waits as long as it takes.
+fn waitReadable(stream: &Stream, millis: i64): Result<void, io::IoError> = {
+	if millis < 0 then
+		return
+
+	return stream.waitReadable(Duration::millis(millis))
+}
+
+/// Why SChannel refused: a certificate it does not trust, or not for the
+/// host, or a handshake that failed.
+fn refusal(status: u32): TlsError =
+	if CERTIFICATE_ERRORS.contains(&status) then .Certificate(messageOf(status))
+	else .Handshake(messageOf(status))
+
+/// What Windows says of `status`, and its number.
+fn messageOf(status: u32): String = {
+	var room = [0 as u8; 512]
+	val got =
+		FormatMessageA(
+			FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+			null,
+			status,
+			0,
+			&var room,
+			null,
+		) as i64
+	val text = str::fromBytes(&room[0..got]).trimEnd()
+	val code = "0x\(status.inRadix(16))"
+	return if text.isEmpty() then code else "\(text) (\(code))"
+}
+
+val FORMAT_MESSAGE_FROM_SYSTEM: u32 = 0x1000
+val FORMAT_MESSAGE_IGNORE_INSERTS: u32 = 0x200
+
+/// Where `bytes` begin, for SChannel to read and write in place; null for
+/// none.
+fn start(bytes: &var Vec<u8>): ptr<u8> =
+	if bytes.isEmpty() then null else addressOf<u8>(&var bytes[0]) as ptr<u8>
+
+@intrinsic
+fn addressOf<T>(value: &var T): ptr<void>
+
+@intrinsic
+fn offsetBytes(pointer: ptr<u8>, bytes: i64): ptr<u8>

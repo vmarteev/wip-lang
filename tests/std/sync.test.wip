@@ -2,7 +2,9 @@ import std::c
 import std::future
 import std::shared::{Shared}
 import std::sync
-import std::sync::{Atomic, LoadOrder, Order, StoreOrder}
+import std::sync::{Atomic, Lazy, LoadOrder, Mutex, Order, StoreOrder}
+import std::time
+import std::time::{Duration, Instant}
 
 @test
 fn everyOrderReadsAndWritesTheValue() = {
@@ -227,4 +229,107 @@ fn aRingCarriesValuesBetweenThreads() = {
 @test(panics = "a ring of 0 slots: it has one at least")
 fn aRingOfNoSlotsIsRefused() = {
 	val ends = sync::ring<i64>(0)
+}
+
+// Waits that give up, a lock only tried, and a value made once.
+
+@test
+fn aWaitThatIsNotReadyInTimeGivesUp() = {
+	val count = Mutex::of(0)
+	val began = Instant::now()
+	val answer = count.lockWhenWithin((n) => n > 0, Duration::millis(50), (n) => n)
+	val waited = began.elapsed()
+	assert(answer.isNone())
+	assert(waited >= Duration::millis(50) && waited < Duration::seconds(5), "\(waited)")
+	// What is ready already runs at once, whatever the time.
+	assert(count.lockWhenWithin((n) => n == 0, Duration::nanos(0), (n) => n + 1) == Option::Some(1))
+}
+
+@test
+fn aChangeEndsAWaitBeforeItsTime() = {
+	val count = Mutex::of(0)
+	val began = Instant::now()
+	val (answer, _) = future::both(
+		() => count.lockWhenWithin((n) => n > 0, Duration::seconds(10), (n) => n * 10),
+		() => {
+			time::sleep(Duration::millis(20))
+			count.lock((n) => { n = 4 })
+		},
+	)
+	assert(answer == Option::Some(40))
+	assert(began.elapsed() < Duration::seconds(5), "ended by the change, not the time")
+}
+
+@test
+fn aWaitWokenForNothingWaitsOutTheRest() = {
+	val state = Mutex::of((false, 0))
+	val began = Instant::now()
+	val (answer, _) = future::both(
+		() => state.lockWhenWithin((pair) => pair.0, Duration::millis(100), (pair) => pair.1),
+		() => {
+			// Each lock wakes the waiter, and none makes it ready.
+			for _ in 0..20 {
+				state.lock((pair) => { pair.1 += 1 })
+				time::sleep(Duration::millis(2))
+			}
+		},
+	)
+	assert(answer.isNone())
+	assert(began.elapsed() >= Duration::millis(100))
+}
+
+@test
+fn aLockTriedWhileAnotherHoldsItRunsNothing() = {
+	val value = Mutex::of(1)
+	val held = Atomic::of(false)
+	val tried = Atomic::of(false)
+	val (_, refused) = future::both(
+		() => value.lock((n) => {
+			held.store(true)
+			while !tried.load() do
+				time::sleep(Duration::millis(1))
+
+			n += 1
+		}),
+		() => {
+			while !held.load() do
+				time::sleep(Duration::millis(1))
+
+			val answer = value.tryLock((n) => n)
+			tried.store(true)
+			return answer
+		},
+	)
+	assert(refused.isNone())
+	assert(value.tryLock((n) => n) == Option::Some(2), "free, it locks")
+}
+
+@test
+fn aLazyValueIsMadeOnceForEveryThread() = {
+	val makes: Shared<Atomic<i64>> = Shared::of(Atomic::of(0))
+	val counted = makes.share()
+	val answer = Lazy::of(own () => {
+		counted.value().add(1)
+		time::sleep(Duration::millis(20))
+		return 42
+	})
+	assert(answer.made().isNone())
+	var seen = [0; 8]
+	future::each(&var seen, (one) => { one = answer.get() })
+	assert(seen == [42; 8])
+	assert(makes.value().load() == 1, "made once")
+	assert(answer.made() is .Some(42) && answer.get() == 42)
+}
+
+@test
+fn aLazyValueNeverAskedForIsNeverMade() = {
+	val makes: Shared<Atomic<i64>> = Shared::of(Atomic::of(0))
+	val counted = makes.share()
+	{
+		val unused = Lazy::of(own () => {
+			counted.value().add(1)
+			return String::of("made")
+		})
+	}
+	assert(makes.value().load() == 0)
 }

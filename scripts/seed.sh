@@ -3,11 +3,15 @@
 # builds a `wip` from with `clang` alone: for each system, the compiler as
 # LLVM bitcode, `wip.bc.gz`, and the libraries it links, `link.txt`.
 #
-#   scripts/seed.sh [--with WIP]
+#   scripts/seed.sh [--with WIP] [--only SYSTEM]
 #
 # Run on a Mac with Apple silicon: it makes the Mac's seed here, and the
 # Linux ones in the guests `scripts/linux.sh` starts, arm64 and x86-64, the
-# second through Rosetta and slow. In each, the compiler is built from
+# second through Rosetta and slow; and Windows', `windows-arm64` and
+# `windows-x86_64`, here too, since any system writes the bitcode of
+# another's compiler. `--only` makes
+# one system's seed alone, as one is added: the others are left as they
+# are. In each, the compiler is built from
 # `compiler/` by the `wip` there — `--with` here, where it is given one,
 # and otherwise, and in the guests, the one that system's seed builds — and
 # that compiler writes its own bitcode, a release build without debug
@@ -26,6 +30,7 @@ cd "$(dirname "$0")/.."
 
 with=""
 step=""
+only=""
 while [ $# -gt 0 ]; do
     case $1 in
     --with)
@@ -34,6 +39,10 @@ while [ $# -gt 0 ]; do
         ;;
     --step)
         step=$2
+        shift
+        ;;
+    --only)
+        only=$2
         shift
         ;;
     *)
@@ -91,6 +100,26 @@ make_raw() {
     echo "$name: $(du -ch "$raw/$name"/*.bc | tail -1 | cut -f1) of bitcode, $(ls "$raw/$name" | wc -l | tr -d ' ') parts"
 }
 
+# Windows' compiler as bitcode, made here — any system writes another's —
+# and what its link takes past its objects, which `--emit objects` lists:
+# each library, and Clang's runtime, which Microsoft's linker is not given
+# by itself. Stage A links without the manifest, which stage B, built by
+# `wip`, has. The `wip` built here writes either processor's.
+make_windows_raw() {
+    local name=$1 out
+    out=$(mktemp -d)
+    WIP_CACHE_DIR="$out/cache" scripts/build.sh --release ${with:+--with "$with"} --out "$out/stage"
+    mkdir -p "$raw/$name"
+    WIP_HOME="$PWD" "$out/stage/bin/wip" build --release --no-debug-info --emit llvm-bc \
+        --target "$name" compiler/main.wip -o "$raw/$name/wip.bc"
+    WIP_HOME="$PWD" "$out/stage/bin/wip" build --release --target "$name" --emit objects \
+        compiler/main.wip -o "$out/objects"
+    awk '$1 == "library" { print "-l" $2 } $1 == "runtime" { print "--rtlib=" $2 }' \
+        "$out/objects/link.txt" >"$raw/$name.link"
+    rm -rf "$out"
+    echo "$name: $(du -ch "$raw/$name"/*.bc | tail -1 | cut -f1) of bitcode, $(ls "$raw/$name" | wc -l | tr -d ' ') parts"
+}
+
 # Every raw seed's parts joined into one module by llvm-link-15, in their
 # order — a copy a part holds of another's function gives way to the
 # definition — optimised for size by clang-15 and compressed, into
@@ -111,7 +140,14 @@ optimise() {
         done
         llvm-link-15 "${parts[@]}" -o "$raw/$name.bc"
         mkdir -p "bootstrap/$name"
-        clang-15 -Oz -c -emit-llvm -Wno-override-module "$raw/$name.bc" -o "$raw/$name.oz.bc"
+        # Optimised for the system it is for, whose C library it may call:
+        # not as Linux's, which has `bcmp` where Microsoft's has not.
+        local target=()
+        case "$name" in
+        windows-arm64) target=(--target=aarch64-pc-windows-msvc) ;;
+        windows-x86_64) target=(--target=x86_64-pc-windows-msvc) ;;
+        esac
+        clang-15 ${target[@]+"${target[@]}"} -Oz -c -emit-llvm -Wno-override-module "$raw/$name.bc" -o "$raw/$name.oz.bc"
         gzip -9 -n -c "$raw/$name.oz.bc" >"bootstrap/$name/wip.bc.gz"
         cp "$raw/$name.link" "bootstrap/$name/link.txt"
         echo "$name: $(du -h "bootstrap/$name/wip.bc.gz" | cut -f1) gzipped"
@@ -139,8 +175,22 @@ if [ "$(system)" != macos-arm64 ]; then
     exit 2
 fi
 rm -rf "$raw"
-make_raw
-WIP_LINUX_RUN=scripts/seed.sh scripts/linux.sh --step raw
-WIP_LINUX_RUN=scripts/seed.sh WIP_LINUX_ARCH=amd64 scripts/linux.sh --step raw
+case "$only" in
+"")
+    make_raw
+    make_windows_raw windows-arm64
+    make_windows_raw windows-x86_64
+    WIP_LINUX_RUN=scripts/seed.sh scripts/linux.sh --step raw
+    WIP_LINUX_RUN=scripts/seed.sh WIP_LINUX_ARCH=amd64 scripts/linux.sh --step raw
+    ;;
+macos-arm64) make_raw ;;
+windows-arm64 | windows-x86_64) make_windows_raw "$only" ;;
+linux-arm64) WIP_LINUX_RUN=scripts/seed.sh scripts/linux.sh --step raw ;;
+linux-x86_64) WIP_LINUX_RUN=scripts/seed.sh WIP_LINUX_ARCH=amd64 scripts/linux.sh --step raw ;;
+*)
+    echo "error: no seed is made for \`$only\`" >&2
+    exit 2
+    ;;
+esac
 WIP_LINUX_RUN=scripts/seed.sh scripts/linux.sh --step optimise
 echo "the seeds are in bootstrap/, made by the compiler of $(git --no-pager rev-parse --short=12 HEAD)"

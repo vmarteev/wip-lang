@@ -98,6 +98,16 @@ extend Sources {
 		return (name.toStr(), text.toStr(), base)
 	}
 
+	/// The text a span covers, as written; nothing where it is in no file.
+	pub fn written(span: Span): String = {
+		val .Some((_, text, base)) = self.of(span) else return String()
+		val hi = (span.hi - base) as i64
+		if hi > text.len() || span.hi < span.lo then
+			return String()
+
+		return text[(span.lo - base) as i64..hi]
+	}
+
 	pub fn isEmpty(): bool = self.files.isEmpty()
 
 	/// The index of the last file that begins at or before `span`.
@@ -144,6 +154,9 @@ pub struct LoadedModule {
 	/// The words of its files that are not compiled: another target's, and
 	/// its tests' where tests are not.
 	pub elsewhere: Set<String> = Set()
+	/// What another target's files of it declare, each name with the
+	/// target it is for.
+	pub declaredElsewhere: Map<String, String> = Map()
 }
 
 /// A program: every module it reaches, and every file's text.
@@ -253,10 +266,12 @@ pub fn loadFor(
 
 /// A file's directory as a path names it: empty for a bare file name,
 /// which the loader reads as the current directory.
-fn parentOf(file: str): str = match file.rsplitOnce("/") {
-	.Some(("", _)) => "/"
-	.Some((dir, _)) => dir
-	.None => ""
+fn parentOf(file: str): str = {
+	for at in 0..file.len() do
+		if path::isSeparator(file[at]) then
+			return path::parent(file)
+
+	return if path::root(file).isEmpty() then "" else path::parent(file)
 }
 
 /// Texts that stand in for files on disk: what an editor has not saved. A
@@ -459,9 +474,11 @@ fn loadWith(
 		var owners: Vec<i64> = Vec()
 		// For each module of the wave, the words of its files not compiled.
 		var elsewhere: Vec<Set<String>> = Vec()
+		var declaredElsewhere: Vec<Map<String, String>> = Vec()
 		var places: Vec<(String, Option<i64>)> = Vec()
 		for (module, modulePath) in wave.indexed() {
 			elsewhere.push(Set())
+			declaredElsewhere.push(Map())
 			var made: Option<i64> = .None
 			for (i, g) in generated.indexed() do
 				if made.isNone() && g.path == modulePath then
@@ -482,7 +499,13 @@ fn loadWith(
 
 							val .Some(dir) = home else panic("the home was found above")
 							files = stdFiles(dir, modulePath, target)?
-							stdElsewhere(dir, modulePath, target, &var elsewhere[module])
+							stdElsewhere(
+								dir,
+								modulePath,
+								target,
+								&var elsewhere[module],
+								&var declaredElsewhere[module],
+							)
 						}
 						.Some((package, local)) => {
 							val dir = loaded.packages[package].dir.clone()
@@ -497,6 +520,7 @@ fn loadWith(
 								target,
 								&overlay,
 								&var elsewhere[module],
+								&var declaredElsewhere[module],
 							)
 							timings.record("read", started)
 							files = read?
@@ -657,9 +681,12 @@ fn loadWith(
 		for (module, modulePath) in wave.indexed() {
 			val allFiles = mem::replace(&var files[module], Vec())
 			// A directory with no files is no module: the import that named
-			// it reports it, with the span of the path it wrote.
-			if allFiles.isEmpty() && !modulePath.isEmpty() then
+			// it reports it, with the span of the path it wrote. One whose
+			// files are all another target's is a module here, empty, so that
+			// each of its names is refused as that target's.
+			if allFiles.isEmpty() && !modulePath.isEmpty() && declaredElsewhere[module].isEmpty() {
 				continue
+			}
 
 			// Its own files, and its tests', which come after them.
 			var moduleFiles: Vec<Parsed> = Vec()
@@ -705,6 +732,7 @@ fn loadWith(
 				root: packageRoot,
 				packageFiles:,
 				elsewhere: mem::replace(&var elsewhere[module], Set()),
+				declaredElsewhere: mem::replace(&var declaredElsewhere[module], Map()),
 			))
 		}
 		wave = next
@@ -729,6 +757,7 @@ fn moduleFiles(
 	target: Target,
 	overlay: &Overlay,
 	elsewhere: &var Set<String>,
+	declared: &var Map<String, String>,
 ): Result<Vec<(String, String)>, String> = {
 	val dir = moduleDir(root, module)
 	// An empty path is the current directory: `wip run main.wip`. Reading it
@@ -758,13 +787,15 @@ fn moduleFiles(
 		// file may say which target it is for. What one not compiled names is
 		// kept, as words: a function of the module only it calls is called.
 		if !mode.takes(name) || !takesFile(name, target) {
-			if overlay.read(path::join(dir, name)) is .Ok(text) then
+			if overlay.read(path::join(dir, name)) is .Ok(text) {
 				wordsOf(&text, &var elsewhere)
-
+				if mode.takes(name) then
+					declaredIn(name, &text, &var declared)
+			}
 			continue
 		}
 		// Named as the user wrote the path: `main.wip`, not `./main.wip`.
-		val file = path::join(dir, name)
+		val file = path::joinAsWritten(dir, name)
 		val text = match overlay.read(file) {
 			.Ok(text) => text
 			.Err(error) => return .Err("cannot read `\(file)`: \(error)")
@@ -788,6 +819,20 @@ fn moduleFiles(
 /// The words of `text`, each run of letters, digits and `_` that starts
 /// with a letter or `_`, added to `into`: what a file not compiled names,
 /// comments and strings with it, which only ever makes more names used.
+/// What a file another target takes declares at its top, each name added
+/// to `into` with the target its name says: what a name not found in its
+/// module may be.
+pub fn declaredIn(name: str, text: str, into: &var Map<String, String>) = {
+	val .Some((_, said)) = fileTarget(name) else return
+	var interner = Interner::new()
+	val lexed = lexAt(text, 0, &var interner)
+	val parsed = parseAt(text, 0, &lexed)
+	for item in parsed.ast.items {
+		for declared in item.declared() do
+			into.put(interner.resolve(declared.sym), said)
+	}
+}
+
 fn wordsOf(text: str, into: &var Set<String>) = {
 	var i = 0
 	while i < text.len() {
@@ -816,16 +861,17 @@ fn packageModules(dir: str, out: &var Vec<String>) = {
 			if entry.kind == .File && path::extension(entry.name) == "wip" then
 				yield path::parent(entry.name)
 	]
-	// Each name is an identifier, whose every character sorts after `/`, so
-	// the paths in their order put a module before those in it.
+	// Each name is an identifier, whose every character sorts after `/` and
+	// `\`, so the paths in their order put a module before those in it.
 	var modules: Vec<str> = [
 		for module in holding.items() do
 			if module != "." then
 				yield module
 	]
 	modules.sort()
+	// Its names between `/`s, or on Windows `\`s, each a module's.
 	for module in modules do
-		out.push(module.replace("/", by: "::"))
+		out.push(module.replace("\\", by: "::").replace("/", by: "::"))
 }
 
 /// Whether `name`, a directory under the package at `dir`, may be a
@@ -883,7 +929,7 @@ fn isModule(packages: &[Package], module: str, overlay: &Overlay): bool = {
 		if !entries.items().any((entry) => entry.isDirectory() && entry.name == segment) then
 			return false
 
-		dir = path::join(dir, segment)
+		dir = path::joinAsWritten(dir, segment)
 	}
 	val listing = if dir.isEmpty() then "." else dir.toStr()
 	var names = overlay.unsavedIn(listing)
@@ -921,7 +967,7 @@ pub fn moduleDir(root: str, module: str): String = {
 		if segment.isEmpty() then
 			continue
 
-		dir = path::join(dir, segment)
+		dir = path::joinAsWritten(dir, segment)
 	}
 	return dir
 }
@@ -979,6 +1025,7 @@ extend LoadedModule {
 			packageFiles: self.packageFiles.clone(),
 			tests:,
 			elsewhere: self.elsewhere.clone(),
+			declaredElsewhere: self.declaredElsewhere.clone(),
 		)
 	}
 }

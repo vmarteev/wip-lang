@@ -768,9 +768,12 @@ yields where a value stands, or a function that answers `Iterator<T>`
 
 `Future::run` runs an owned closure on a thread of its own, and hands
 back a `Future<T>` of what it answers: `get()` waits for it, `poll()`
-takes it if it is there without waiting, and `isDone()` says whether the
-work has finished. A channel moves values between threads; its receiver
-is an `Iterator`, which a loop reads until every sender is gone:
+takes it if it is there without waiting, `pollWithin(duration)` waits for
+it that long at most, and `isDone()` says whether the work has finished.
+A channel moves values between threads; its receiver is an `Iterator`,
+which a loop reads until every sender is gone. `tryReceive()` answers a
+`Received` — a `Value`, `Empty` or `Closed` — without waiting, and
+`receiveWithin(duration)` the same once a value comes or the time is up:
 
 ```wip,run
 import std::future::{Future, channel}
@@ -858,6 +861,55 @@ fn main() = {
         () => names.lock((all) => all.push("bob")),
     )
     assert(names.lock((all) => all.len()) == 2)
+}
+```
+
+A wait may give up. `lockWhenWithin(ready, duration, body)` waits as
+`lockWhen` does, for that long at most, and answers what `body` answered,
+or nothing where it was not ready in time; a wait woken before its time,
+and still not ready, waits out the rest. The time is measured on the clock
+that only goes forward, so setting the time of day changes no wait.
+`tryLock(body)` runs `body` only where no other thread holds the lock, for
+a thread that has other work meanwhile. `sync::Lazy<T>` is a value made
+by the first thread that asks for it, by the closure it was made with,
+and lent to every thread after: a field of what the threads share, made
+only where one of them needs it. `get()` answers it, and `made()` answers
+it only where it is made already:
+
+```wip,run
+import std::future
+import std::sync::{Lazy, Mutex}
+import std::time::{Duration}
+
+struct Shared {
+    words: Lazy<Vec<String>>
+}
+
+fn main() = {
+    val queue: Mutex<Vec<i64>> = Mutex::of(Vec())
+    val waited = queue.lockWhenWithin(
+        (jobs) => !jobs.isEmpty(),
+        Duration::millis(10),
+        (jobs) => jobs.pop(),
+    )
+    assert(waited.isNone())
+    assert(queue.tryLock((jobs) => jobs.len()) == .Some(0))
+
+    val shared = Shared(
+        words: Lazy::of(own () => {
+            var words: Vec<String> = Vec()
+            for word in "a b c".split(" ") do
+                words.push(word)
+
+            return words
+        }),
+    )
+    assert(shared.words.made().isNone())
+    val (first, second) = future::both(
+        () => shared.words.get().len(),
+        () => shared.words.get().len(),
+    )
+    assert(first == 3 && second == 3)
 }
 ```
 
@@ -1229,7 +1281,7 @@ terminal and waits for it, `output()` keeps what it printed, `start()`
 keeps it running as a `Child`, which is waited for where it is dropped,
 and `launch()` lets it go:
 
-```wip,run
+```wip,run,unix
 import std::process::{Command}
 
 fn main() = {
@@ -1262,7 +1314,7 @@ one out, each in the order written, and `directory(path)` is where it
 starts. It is given none of the files, sockets and pipes this program has
 open, only its standard streams:
 
-```wip,run
+```wip,run,unix
 import std::process::{Command}
 
 fn main() = {
@@ -1316,7 +1368,7 @@ something to come, `setTimeout(.Some(Duration::seconds(5)))`, after which
 it answers `.WouldBlock`; what it had read is appended where it was asked
 for, so that asking again with the same `String` goes on from there:
 
-```wip,run
+```wip,run,unix
 import std::io
 import std::process::{Command}
 import std::time::{Duration}
@@ -1342,7 +1394,7 @@ fn main() = {
 writes before it waits. A program that stops reading ends the writing,
 and the rest is dropped:
 
-```wip,run
+```wip,run,unix
 import std::process::{Command}
 
 fn main() = {
@@ -1368,7 +1420,7 @@ it was; a program started meanwhile handles them as it would have. On
 Linux a signal is held back in the thread that catches it and those it
 starts after, so a program catches what it wants as it begins:
 
-```wip,run
+```wip,run,unix
 import std::libc
 import std::process
 import std::process::{Signal, Signals}
@@ -1393,7 +1445,9 @@ says whose a file is, `meta.user` and `meta.group`; `fs::setMode(path,
 `.OpenFiles`, `.Processes`, `.CoreFile`, `.Stack` — as a `Limit` of what
 it holds to now, `current`, and the most it may raise that to, `most`,
 each nothing for no limit; any program may lower either, and only root
-raise the most.
+raise the most. Users and groups by number, the limits, `fork` and the
+rest of this are a Unix's: Windows names its users otherwise, and a
+program built for it that uses them is told they are a Unix's.
 
 `fork()` copies the program: it answers `.Parent(child)` here, the copy
 a `Child` as a program started is, and `.Child` in the copy, which goes
@@ -1406,7 +1460,7 @@ makes a directory the program's `/`, moving into it, and
 good, in the order that works; each is root's to do, and is refused
 otherwise with `.Denied`:
 
-```wip,run
+```wip,run,unix
 import std::fs
 import std::libc
 import std::process
@@ -1782,12 +1836,20 @@ a `404` is a `Response`, and an `HttpError` is what kept an answer from
 coming — a URL it cannot send to, the connection, TLS, a timeout, too
 many redirects, or an answer that is not HTTP.
 
+Every request is sent to a `Url` (`std::url`, below), lent. A literal is
+one where it is expected, `http::get("https://example.com/")`, its holes
+encoded by their places; text from outside is read first, with
+`Url::parse(text)?`. What only HTTP refuses of a URL is refused as it is
+sent: a scheme other than `http` and `https`, credentials, a port that is
+not a number.
+
 A `Client` sends any `Request` — `Request::get(url)`, `post`, `put`,
 `patch`, `delete`, `head`, each given `.header(name, value)` and a body
 of `.body(bytes)`, `.text(text)`, `.json(&value)` or `.file(path)` — and
 keeps a connection to each host between requests, follows redirects up
 to its `redirects`, ten unless set, and stops waiting after its
-`timeout`, where one is set. It asks for gzip, and undoes a body sent so.
+`timeout`, where one is set. It asks for gzip, and undoes a body sent so;
+on Windows, which has no zlib, it asks for the body as it is.
 `https` is the system's TLS, which refuses a server whose certificate it
 does not trust; `Client::overUnix(path)` sends every request over one
 Unix-domain socket. `client.open(request)` answers once the status and
@@ -1800,6 +1862,7 @@ read, so that a body larger than memory is never held whole;
 import std::future
 import std::http::{Client, Request}
 import std::net::{Listener}
+import std::url::{Url}
 
 fn main() = {
     val listener = Listener::tcp("127.0.0.1", 0).unwrap()
@@ -1816,8 +1879,8 @@ fn main() = {
         () => {
             var client = Client()
             val item = [1, 2, 3]
-            val url = "http://127.0.0.1:\(port)/items"
-            return client.send(Request::post(url).json(&item)).unwrap()
+            val url: Url = "http://127.0.0.1:\(port)/items"
+            return client.send(Request::post(&url).json(&item)).unwrap()
         },
     )
     assert(response.status == 201 && response.isSuccess())
@@ -1860,9 +1923,10 @@ a PNG and HTTP's `deflate` hold, and `deflate` and `inflate` none. What
 cannot be undone answers a `CompressError`: cut short, or not the format.
 An `Inflater` and a `Deflater` take bytes in pieces, appending what each
 makes to a `Vec<u8>`, so that nothing larger than a piece is held. It is
-the system's zlib:
+the system's zlib, which Windows does not have: there the module declares
+nothing, and its names are refused as a Unix's:
 
-```wip,run
+```wip,run,unix
 import std::compress
 
 fn main() = {
@@ -1886,7 +1950,8 @@ would answer anything; `unwatch(path)` lets one go. Writing a file is many
 changes, and they are told once or twice, not once each; what changed a
 moment before a path was watched may be told of too. `descriptor()` is
 ready to read while a change waits, for an event queue. It is FSEvents on
-a Mac and inotify on Linux; on iOS, which lets an app watch nothing,
+a Mac, inotify on Linux and `ReadDirectoryChangesW` on Windows; on iOS,
+which lets an app watch nothing,
 `Watcher::new()` answers `.Unsupported`:
 
 ```wip,run
@@ -1915,16 +1980,44 @@ A pattern is compiled once and then matched, searched and replaced with.
 Matching takes time in proportion to the text times the pattern, whatever
 either holds: no pattern backtracks without end.
 
+`Regex` is a template: where one is expected, a literal is its pattern,
+checked while the program is compiled and compiled where the literal
+runs. A hole's value is matched as the text it is, each character that
+means something in a pattern escaped, so `tar.gz` from outside matches
+`tar.gz` and not `tarXgz`; and a hole of a `Regex` is its pattern, joined
+as a group that does not capture, its groups counted after those before
+it. `Regex::new(text)` compiles a pattern that comes from outside, and
+answers what is wrong with it.
+
 ```wip,run
 import std::regex::{Regex}
 
 fn main() = {
-    val .Ok(numbered) = Regex::new("(\\d+)") else return
+    val numbered: Regex = "(\\d+)"
     assert(numbered.isMatch("img12.jpg"))
     assert(numbered.replaceAll("img12-3.jpg", "<$1>") == "img<12>-<3>.jpg")
     val .Some(found) = numbered.find("a1b22") else return
     assert(found.start == 1 && found.group(1) == .Some((1, 2)))
+
+    val extension = "tar.gz"
+    val ending: Regex = "\\.\(extension)$"
+    assert(ending.isMatch("logs.tar.gz") && !ending.isMatch("logs.tarXgz"))
+    val pair: Regex = "^\(numbered)-\(numbered)$"
+    assert(pair.groups() == 2 && pair.isMatch("12-3"))
+
     assert(Regex::new("(unclosed").isErr())
+}
+```
+
+A literal that is not a pattern is an error at the byte that stops it,
+and a hole is refused where a value cannot be text: inside a class,
+`[…]`, inside a repetition's braces, `{…}`, and after a `\`.
+
+```wip,error=E0486
+import std::regex::{Regex}
+
+fn main() = {
+    val line: Regex = "// \\[((java|c) line (\\d+)\\] (Error.*)"
 }
 ```
 
@@ -1935,7 +2028,9 @@ be. A replacement names what matched as `$0` and a group as `$1` or
 `${1}`. What is not a pattern is a `RegexError`, which says what and at
 which byte. `Regex::anyCase(pattern)` compiles one that matches ASCII
 letters in either case, as POSIX's `REG_ICASE` does, so a host name
-matches however it is written.
+matches however it is written; a pattern cannot say so, so one is not
+joined into another. `regex::escape(text)` is what a hole writes, for a
+pattern built another way.
 
 ## JSON: `std::json`
 
@@ -2096,13 +2191,26 @@ written `%3A` unless the scheme is `http`, `https` or `mailto`, so that
 still names the file it spells.
 
 Anywhere else a value is not written safely by entities, and a hole there
-panics, naming the hole's line: inside `<script>` or `<style>`; in `style`,
-`srcset`, `srcdoc` and any attribute whose name starts `on`; in an
-attribute's value with no quotes; in a tag, between its attributes or in
-its name; and in a comment or a doctype. Where a hole is follows from the
-literal's own text, so the first time a page is written shows a refusal,
-and any test of it does. A script is given its data in an attribute,
-escaped, and an attribute that is there or not is two literals:
+is refused: inside `<script>` or `<style>`; in `style`, `srcset`, `srcdoc`
+and any attribute whose name starts `on`; in an attribute's value with no
+quotes; in a tag, between its attributes or in its name; and in a comment
+or a doctype. Where a hole is follows from the literal's own text, so
+`Html`'s `refusal` reads each literal as it reads a page, and the compiler
+asks it of every literal that builds `Html`: a refused hole is an error
+where it is written, whether or not the program ever writes the page.
+
+```wip,error=E0486
+import std::markup::{Html}
+
+fn greeting(name: str): Html = "<script>const user = \"\(name)\";</script>"
+
+fn main() = {
+    val page = greeting("Ada")
+}
+```
+
+A script is given its data in an attribute, escaped, and an attribute that
+is there or not is two literals:
 
 ```wip,run
 import std::markup::{Html}
@@ -2129,10 +2237,13 @@ fn main() = {
 }
 ```
 
-`Html` is joined only between tags, and only `Html` that ends there: a
-piece left inside a tag, a comment or a `<script>` is refused where it is
-joined, so a function's piece cannot leave its caller's page in a place it
-does not know of. `push` adds `Html` at the end, `Html::joined(&pieces,
+`Html` is joined only between tags, and only `Html` that ends there. A
+hole of `Html` anywhere else in a literal is refused with the rest, while
+the program is compiled; a piece left inside a tag, a comment or a
+`<script>` is refused as the page is written, with a panic where it is
+joined, since where a piece ends depends on how it was built. So a
+function's piece cannot leave its caller's page in a place it does not
+know of. `push` adds `Html` at the end, `Html::joined(&pieces,
 ", ")` puts a separator between pieces, and `Html::trusted(text)` is HTML
 another writer made, a renderer's or a sanitizer's, which the caller vouches
 for. Written out, through `Text`, `Html` is its text as it is, and a
@@ -2140,8 +2251,10 @@ for. Written out, through `Text`, `Html` is its text as it is, and a
 
 `Xml` is the same without what is HTML's alone: a value between tags or in
 a quoted attribute's value is escaped, and a hole in a tag, in an
-unquoted value, a comment, CDATA or a processing instruction panics. A
-`<script>` in XML is an element like any other.
+unquoted value, a comment, CDATA or a processing instruction is refused.
+A `<script>` in XML is an element like any other. A value given to
+`pushValue` by name, not in a literal, is refused as the page is written,
+with a panic at the call.
 
 ## Bytes as text: `std::base64`, `std::hex` and `std::url`
 
@@ -2180,6 +2293,46 @@ fn main() = {
     assert(query == "q=cr%C3%A8me%20br%C3%BBl%C3%A9e%20%26%20tea")
     assert(url::encode("/a b/c", keep: "/") == "/a%20b/c")
     assert(url::decode("cr%C3%A8me") == String::of("crème"))
+}
+```
+
+`Url` is a URL's text and its parts: `scheme`, `host`, without an IPv6
+address's brackets, `port`, `path`, `query` and `fragment`, each as
+written, and `userInfo`. It may be relative, as a link is.
+`Url::parse(text)` reads one, or answers the byte where the text is not
+a URL: a scheme that is not a letter and then letters, digits, `+`, `-`
+or `.`, a port that is not a number, a `%` without its two digits, a `[`
+with no `]`, a space.
+
+`Url` is a template: where one is expected, a literal is a URL, checked
+while the program is compiled, and each hole's value is percent-encoded
+as the part it stands in needs, so that it is always that part. In a path
+it cannot add a segment, in a query it cannot add a parameter, and in a
+host it cannot become a path; a port's value keeps only its digits as
+they are. A hole in the scheme or inside a `%` and its digits is refused.
+A `Url` in a hole is joined only at the start, as the URL the rest goes
+on from, and adds to whatever part it ended in:
+
+```wip,run
+import std::url::{Url}
+
+fn main() = {
+    val api: Url = "https://api.example.com/v1"
+    val user = "../admin"
+    val tag = "a&admin=true"
+    val posts: Url = "\(api)/users/\(user)/posts?tag=\(tag)"
+    assert(
+        posts.toStr() ==
+            "https://api.example.com/v1/users/..%2Fadmin/posts?tag=a%26admin%3Dtrue",
+    )
+    assert(
+        posts.host() == "api.example.com" &&
+            posts.query() == "tag=a%26admin%3Dtrue",
+    )
+
+    val .Ok(read) = Url::parse("http://[::1]:8080/a?b=1#c") else return
+    assert(read.host() == "::1" && read.port() == .Some(8080 as u16))
+    assert(Url::parse("http://example.com:80a/").isErr())
 }
 ```
 
@@ -2361,6 +2514,7 @@ is what decides whether to colour what is written:
 ```wip,run
 import std::fs
 import std::io
+import std::path
 import std::process
 
 fn main() = {
@@ -2373,7 +2527,7 @@ fn main() = {
     assert(fs::readFile("\(root)/link/b/note") == String::of("hi"))
     assert(fs::removeAll(root).isOk() && !fs::exists(root))
     assert(process::executable().isOk())
-    assert(process::besideProgram("levels").endsWith("/levels"))
+    assert(path::name(process::besideProgram("levels")) == "levels")
     val colour = io::isTerminal(.Output)
     assert(colour || !colour)
 }
@@ -2385,13 +2539,21 @@ the disk. `clean` writes a path plainly, its `.`, `..` and doubled `/`s
 worked out by the text alone, so a `..` after a link is taken as the
 name's parent, where `fs::realPath` would follow the link. `relative`
 answers a path from a directory it is within, and nothing for one it is
-not. `withExtension` replaces a name's extension, or adds one:
+not. `withExtension` replaces a name's extension, or adds one. On Windows a
+path's names are between `\`s, and a `/` is read as one too; `root` is
+what a path begins at — `/` on a Unix, a drive's `C:\` or a share's
+`\\server\share\` on Windows — and nothing of a relative path; `join`
+puts the system's separator between, and `joinAsWritten` the one the
+directory is written with, so that a path a person gave as `game/levels`
+is echoed back as they wrote it:
 
-```wip,run
+```wip,run,unix
 import std::path
 
 fn main() = {
     assert(path::join("/a", "b") == "/a/b")
+    assert(path::joinAsWritten("a/b", "c") == path::join("a/b", "c"))
+    assert(path::root("/a/b") == "/" && path::root("a/b").isEmpty())
     assert(path::name("/a/b/c.tar.gz") == "c.tar.gz")
     assert(path::parent("/a/b/c.tar.gz") == "/a/b")
     assert(path::parent("c") == ".")
@@ -2469,17 +2631,19 @@ val BUILT: str = embed::textOr("built.txt", "")
 
 ## What the target is
 
-Three constants the compiler writes say what machine the program is being
+Four constants the compiler writes say what machine the program is being
 compiled for: `TARGET_OS` is `macos`, `linux`,
 `windows` or `ios`, which the simulator is too; `TARGET_ARCH` is `arm64` or
 `x86_64`; `TARGET_VENDOR` is `apple` on a Mac and on iOS, and empty
-elsewhere.
+elsewhere; and `TARGET_FAMILY` is `windows` on Windows and `unix` on every
+other system.
 
 ```wip,run
 fn main() = {
-    val separator = if TARGET_OS == "windows" then "\\" else "/"
+    val separator = if TARGET_FAMILY == "windows" then "\\" else "/"
     assert(separator == "/" || TARGET_OS == "windows")
     assert(TARGET_VENDOR == "apple" || TARGET_OS != "macos")
+    assert(TARGET_FAMILY == "unix" || TARGET_OS == "windows")
 }
 ```
 
@@ -2592,14 +2756,14 @@ fn main() = {
 | `std::io` | `print`, `println`, `printInt`, `eprintln`, `flush`, `stdin`, `Reader`, `env`, `environment`, `setEnv`, `unsetEnv`, `isTerminal`, `IoError`; `Read` and `Write`, what bytes are read from and written to, `copy`, and `stdout`, `stderr` and their `Printer`; and `EventQueue` with its `Interest` and `Event` |
 | `std::fs` | whole files, written, read and replaced; reading a directory, and walking the tree under one; what the filesystem says about a path, its owner among it; a path's mode and owner set; directories for a while |
 | `std::process` | `Command`, `Child` and `Exit`: other programs started and waited for; the program's own `currentDir`, `setCurrentDir`, `executable`, `besideProgram` and `id`; `Signals` and `Signal`: Ctrl-C and its like, caught; `fork`, `newGroup` and `sendToGroup`; `userId`, `becomeUser` and `changeRoot`; `limit` and `setLimit` |
-| `std::users` | `User` and `Group`: the system's users and groups, found by name or by number |
+| `std::users` | `User` and `Group`: the system's users and groups, found by name or by number, a Unix's |
 | `std::path` | a path joined, and taken apart: its name, parent, extension and stem; cleaned, made relative, its extension replaced; matched by a glob |
 | `std::mem` | `replace`, a place's value taken out with another left in, and `swap`, two places' values exchanged |
 | `std::digest` | `sha256(bytes)`, `sha512(bytes)` and `sha1(bytes)`, digests of bytes in hand, and `Sha256`, `Sha512` and `Sha1`, written in pieces and then finished; `hmacSha256`, `hmacSha512` and `hmacSha1`, a digest under a key; `crc32(bytes)` and `adler32(bytes)`, the checksums gzip, zip, PNG and zlib end their data with, and `Crc32` and `Adler32`, written in pieces and read after any |
 | `std::c` | a value lent to C as a callback's `void *`, and had back in the callback; `Pinned`, a value C holds until it lets go; a slice's address for C to read; C's `sizeof` and `_Alignof` |
 | `std::embed` | a file's bytes or text, read when the program is compiled, as a constant |
 | `std::watch` | `Watcher`: which files and directories changed, as the system tells |
-| `std::sync` | `Atomic<T>` and `Mutex<T>`: what several threads may change at once; `ring`, its `Filler` and `Drainer`: values handed between two threads without waiting |
+| `std::sync` | `Atomic<T>` and `Mutex<T>`: what several threads may change at once, with waits that give up and a lock only tried; `Lazy<T>`, a value made once, by the first thread that asks; `ring`, its `Filler` and `Drainer`: values handed between two threads without waiting |
 | `std::shared` | `Shared<T>` and `Weak<T>`: a value several owners hold and read |
 | `std::random` | `Random`: numbers seeded or from the system, not for cryptography |
 | `std::markup` | `Html` and `Xml`: templates an interpolated literal builds, each value escaped as its place in the page needs, and a hole refused where it cannot be; `push`, `joined` and `trusted` |
@@ -2607,7 +2771,7 @@ fn main() = {
 | `std::net` | `Listener`, `Stream` and `Address`: TCP and Unix-domain connections |
 | `std::tls` | `TlsStream` and `TlsError`: a TLS connection, the server's certificate checked by the system |
 | `std::http` | `get`, `Client`, `Request`, `Response` and `Incoming`: HTTP/1.1 requests, a body read whole or as it comes, undone where it was sent gzipped, sent from bytes, a file or any `io::Read` |
-| `std::compress` | `gzip` and `gunzip`, `zlib` and `unzlib`, `deflate` and `inflate`, and `Inflater` and `Deflater` for bytes in pieces: deflate, through the system's zlib |
+| `std::compress` | `gzip` and `gunzip`, `zlib` and `unzlib`, `deflate` and `inflate`, and `Inflater` and `Deflater` for bytes in pieces: deflate, through the system's zlib, a Unix's alone |
 | `std::math` | `PI`, `TAU` and `E`, and the vectors, matrices, rotations and shapes above; the functions are methods of `f64` and `f32`, `x.sin()`, written in Wip so that a `@comptime` constant computes the program's bits |
 | `std::text` | `Scanner` and `Position`, above; `ParseError`, and the `Split`, `Lines` and `Chars` types the prelude's methods answer |
 | `std::iter` | `Walk`, `Forwards`, `Backwards`, `Taking` (what a `Vec` gives up to `for x in move v`), and the adapter types `Mapped`, `Filtered`, `FilterMapped`, `FlatMapped`, `Chained`, `Enumerated`, `Taken`, `TakenWhile`, `Skipped`, `Zipped`, `Peekable` |
@@ -2617,7 +2781,7 @@ fn main() = {
 | `std::bytes` | numbers read and written at a place in bytes, `u32le` and `putU32le`; `Reader` and `Writer`, the same in turn; and a binary format for `Encode` and `Decode` |
 | `std::base64` | `encode` and `decode`, in the standard alphabet or the one for URLs, padded or not, and `Base64Error` |
 | `std::hex` | `encode` and `decode`, two digits a byte, and `HexError` |
-| `std::url` | `encode` and `decode`, percent-encoding for any part of a URL, and `UrlError` |
+| `std::url` | `Url`, a URL's text and its parts, read with `parse` or built by a literal, each hole encoded as its part needs; `encode` and `decode`, percent-encoding for any part of a URL, and `UrlError` |
 | `std::libc` | the C library as std calls it: `printf`, `fwrite`, `stdout`, `read`, `open` and its flags, `getentropy`, `errno()` — C's, promising nothing C does not |
 
 ```wip,run

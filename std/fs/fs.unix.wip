@@ -1,0 +1,301 @@
+// Files on a Unix: POSIX's calls — `open`, `stat`, `readdir`, `rename` —
+// over `std::libc`, each system's layout of `stat` and `readdir` in its own
+// file.
+
+import std::io
+import std::libc
+import std::path
+import std::process
+
+extend File {
+	/// What was written handed to the disk, C's `fsync`: there before
+	/// anything done after it, a rename among them.
+	pub fn sync(): Result<void, io::IoError> = {
+		if libc::fsync(io::descriptorOf(&self.reader)) != 0 then
+			return .Err(io::lastError())
+
+		return
+	}
+
+	/// Reads up to `into.len()` bytes from `offset`, and answers how many,
+	/// `0` at the end: C's `pread`. Nothing later reads from where it
+	/// stopped, so threads may read one file at once, each where it asks.
+	pub fn readAt(offset: i64, into: &var [u8]): Result<i64, io::IoError> = {
+		val fd = io::descriptorOf(&self.reader)
+		while true {
+			val got = libc::pread(fd, &var into, offset)
+			if got >= 0 then
+				return got
+
+			if io::lastError() != .Interrupted then
+				return .Err(io::lastError())
+		}
+		return 0
+	}
+
+	/// How many bytes the file holds, as `fstat` says.
+	pub fn size(): Result<i64, io::IoError> = {
+		val stated = descriptorNumbers(io::descriptorOf(&self.reader))?
+		return stated.size
+	}
+}
+
+/// What a file made here may be: read and written by anyone, as the
+/// process's umask allows.
+val MADE_MODE: c_uint = 0o666
+
+/// How a file is opened to be written.
+val WRITES: c_int = libc::O_WRONLY | libc::O_CLOEXEC
+
+fn opened(path: str, how: Opening): Result<File, io::IoError> = {
+	var name = String::of(path)
+	val c = name.toCstring()
+	// Closed in a program this one starts, from the moment it is open.
+	val fd = match how {
+		.Read => libc::open(c, libc::O_RDONLY | libc::O_CLOEXEC)
+		.Create => libc::open(c, WRITES | libc::O_CREAT | libc::O_TRUNC, MADE_MODE)
+		.Append => libc::open(c, WRITES | libc::O_CREAT | libc::O_APPEND, MADE_MODE)
+		.CreateNew => libc::open(c, WRITES | libc::O_CREAT | libc::O_EXCL, MADE_MODE)
+	}
+	if fd < 0 then
+		return .Err(io::lastError())
+
+	return File(io::reader(fd))
+}
+
+/// Sets the permission bits of `path`, as `chmod` writes them: `0o644`.
+/// Its owner may, and root.
+pub fn setMode(path: str, mode: i64): Result<void, io::IoError> = {
+	var name = String::of(path)
+	if libc::chmod(name.toCstring(), mode as c_uint) != 0 then
+		return .Err(io::lastError())
+
+	return
+}
+
+/// Gives `path` to the user numbered `user`, in the group numbered `group`,
+/// as `users::User` and `users::Group` number them. Root may give it to
+/// anyone; its owner may only change its group to one of its own.
+pub fn setOwner(path: str, user: u32, group: u32): Result<void, io::IoError> = {
+	var name = String::of(path)
+	if libc::chown(name.toCstring(), user, group) != 0 then
+		return .Err(io::lastError())
+
+	return
+}
+
+/// Where `path` really is: absolute, with no `.`, `..` or link on the way,
+/// as C's `realpath` answers; an error where there is nothing there.
+pub fn realPath(path: str): Result<String, io::IoError> = {
+	var name = String::of(path)
+	val found = libc::realpath(name.toCstring(), null)
+	if found.isNull then
+		return .Err(io::lastError())
+
+	var out = String()
+	out.pushBytes(&found[0..libc::strlen(found) as i64])
+	libc::free(found)
+	return out
+}
+
+/// The entries of a directory, in the order the filesystem gives them,
+/// without `.` and `..`. Sorting is the caller's.
+pub fn readDir(path: str): Result<Vec<Entry>, io::IoError> = {
+	var name = String::of(path)
+	val dir = opendir(name.toCstring())
+	if dir.isNull then
+		return .Err(io::lastError())
+
+	var entries: Vec<Entry> = Vec()
+	while true {
+		// `readdir` answers null at the end and where it fails, and only
+		// `errno` tells them apart.
+		libc::errnoAt()[0] = 0
+		val entry = readdir(dir)
+		if entry.isNull {
+			if libc::errno() != 0 {
+				val why = io::lastError()
+				closedir(dir)
+				return .Err(why)
+			}
+			closedir(dir)
+			return entries
+		}
+		// The name is C's, ended by a NUL within the room it has.
+		var text = String()
+		var i = 0
+		while entry.name[i] != 0 {
+			text.pushByte(entry.name[i])
+			i += 1
+		}
+		if text.toStr() == "." || text.toStr() == ".." then
+			continue
+
+		val kind = kindOfEntry(entry.kind, path, text)
+		entries.push(Entry(name: text, kind:))
+	}
+	closedir(dir)
+	return entries
+}
+
+/// Makes a directory, and fails where one is already there.
+pub fn makeDir(path: str): Result<void, io::IoError> = {
+	var name = String::of(path)
+	// Read and entered by anyone, written by its owner, as the process's
+	// umask allows.
+	if libc::mkdir(name.toCstring(), 0o755) != 0 then
+		return .Err(io::lastError())
+
+	return
+}
+
+/// Removes an empty directory; one with anything in it is refused.
+pub fn removeDir(path: str): Result<void, io::IoError> = {
+	var name = String::of(path)
+	if libc::rmdir(name.toCstring()) != 0 then
+		return .Err(io::lastError())
+
+	return
+}
+
+/// Moves `from` to `to`, in place of anything there but a directory with
+/// something in it; within one filesystem, where a move is a rename.
+pub fn rename(from: str, to: str): Result<void, io::IoError> = {
+	var source = String::of(from)
+	var target = String::of(to)
+	if libc::rename(source.toCstring(), target.toCstring()) != 0 then
+		return .Err(io::lastError())
+
+	return
+}
+
+/// Makes a symbolic link at `at` that names `target`, which is read as the
+/// link is followed: relative to the link's directory, unless it is a whole
+/// path. Nothing need be at `target`; something at `at` is refused.
+pub fn makeLink(target: str, at: str): Result<void, io::IoError> = {
+	var named = String::of(target)
+	var link = String::of(at)
+	if libc::symlink(named.toCstring(), link.toCstring()) != 0 then
+		return .Err(io::lastError())
+
+	return
+}
+
+/// Removes a file, or a link without what it names; a directory is
+/// refused.
+pub fn removeFile(path: str): Result<void, io::IoError> = {
+	var name = String::of(path)
+	if libc::unlink(name.toCstring()) != 0 then
+		return .Err(io::lastError())
+
+	return
+}
+
+extend TempDir {
+	/// A new directory in `temporaryRoot()`, named for the program and six
+	/// characters the system chooses where nothing is, and readable by its
+	/// owner alone, so that no other process is given it or makes it
+	/// first: `/tmp/marble-k2Jd8w`.
+	pub static fn new(): Result<TempDir, io::IoError> = {
+		val program = match process::executable() {
+			.Ok(file) => String::of(path::name(file))
+			.Err(..) => "wip"
+		}
+		var template = path::join(temporaryRoot(), "\(program)-XXXXXX")
+		val made = libc::mkdtemp(template.toCstring())
+		if made.isNull then
+			return .Err(io::lastError())
+
+		return TempDir(path: made.toStr())
+	}
+}
+
+/// The system's directory of temporary files: `$TMPDIR` where it is set,
+/// and `/tmp` where it is not. What is kept there across runs, a cache, is
+/// put in it by name; what is wanted for a while is a `TempDir`.
+pub fn temporaryRoot(): String = {
+	if io::env("TMPDIR") is .Some(dir) && !dir.isEmpty() then
+		return dir
+
+	return "/tmp"
+}
+
+fn metaOf(path: str, following: bool): Result<Meta, io::IoError> = {
+	var name = String::of(path)
+	val stated = statNumbers(name.toCstring(), following)?
+	val mode = stated.mode
+	// The kind is in the mode's top bits, numbered alike on every system
+	// Wip targets.
+	val kind = match mode & 0o170000 {
+		0o100000 => Kind::File
+		0o040000 => Kind::Directory
+		0o120000 => Kind::Link
+		0o010000 => Kind::Pipe
+		0o140000 => Kind::Socket
+		0o020000 => Kind::CharDevice
+		0o060000 => Kind::BlockDevice
+		_ => Kind::Other
+	}
+	return Meta(
+		kind:,
+		size: stated.size,
+		modified: stated.modified,
+		modifiedNanos: stated.modifiedNanos,
+		mode: mode & 0o7777,
+		user: stated.user,
+		group: stated.group,
+		device: stated.device,
+		inode: stated.inode,
+	)
+}
+
+/// What `stat` says, as numbers: the mode with its kind, the size, when it
+/// was last modified in seconds, and the device and inode that are which
+/// file it is.
+struct Stated {
+	mode: i64
+	user: u32
+	group: u32
+	size: i64
+	modified: i64
+	modifiedNanos: i64
+	device: i64
+	inode: i64
+}
+
+// A directory entry's `d_type`, as the kind it stands for, numbered alike
+// on every system Wip targets. A filesystem that does not say is asked
+// with `lstat` instead.
+val DT_UNKNOWN: u8 = 0
+val DT_FIFO: u8 = 1
+val DT_CHR: u8 = 2
+val DT_DIR: u8 = 4
+val DT_BLK: u8 = 6
+val DT_REG: u8 = 8
+val DT_LNK: u8 = 10
+val DT_SOCK: u8 = 12
+
+fn kindOfEntry(code: u8, directory: str, name: str): Kind = match code {
+	DT_REG => .File
+	DT_DIR => .Directory
+	DT_LNK => .Link
+	DT_FIFO => .Pipe
+	DT_SOCK => .Socket
+	DT_CHR => .CharDevice
+	DT_BLK => .BlockDevice
+	DT_UNKNOWN => match linkMeta("\(directory)/\(name)") {
+		.Ok(meta) => meta.kind
+		.Err(..) => .Other
+	}
+	_ => .Other
+}
+
+// `stat` and `readdir` fill in structs each system lays out its own way.
+// Each is written here as far as the fields read, at the
+// offsets the system has them; what they are filled into is room enough
+// for the whole, which is at most 256 bytes on any of them.
+val ROOM: i64 = 256
+
+extern "C" {
+	fn closedir(dir: ptr<u8>): c_int
+}

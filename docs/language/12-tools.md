@@ -103,10 +103,11 @@ written for: `wip check --target linux` reads the items under
 `@target(os = "linux")` and the `.linux.wip` files ([page 2](02-modules.md))
 on a Mac, and checks them as Linux would. The names are `macos-arm64`,
 `macos-x86_64`, `linux-arm64`, `linux-x86_64`, `ios-arm64` and
-`ios-arm64-simulator`; `macos` and `linux` alone are on this machine's
-processor, and `ios` is the device; `all` is every one but the simulator,
-which answers as the device does, and `--target` may be given more than
-once. A mistake several targets find is said once, and one that not every
+`ios-arm64-simulator`, and `windows-arm64` and `windows-x86_64`, whose
+library is being written module by module; `macos` and `linux` alone are
+on this machine's processor, and `ios` is the device; `all` is every one
+but the simulator, which answers as the device does, and Windows, and
+`--target` may be given more than once. A mistake several targets find is said once, and one that not every
 target finds says which did. What a check cannot see is what only the
 target's machine knows — how its C lays a struct out, which symbols its
 libraries have.
@@ -164,8 +165,13 @@ that overflows, an index out of bounds and an `assert` that fails panic in
 both.
 
 Every build's code is **LLVM's**, which a `clang` of version 15 or newer
-compiles — the one `WIP_CLANG` names, or `clang`. Where there is none, the
-build says so before it reads the program:
+compiles — the one `WIP_CLANG` names, or `clang`. On Windows, where Visual
+Studio does not put its `clang` on the path, it is the one Visual Studio's
+installer says it has, where none is on the path: its Build Tools, with
+the C++ tools and Clang. A program there is linked by Microsoft's linker
+through that `clang`, `main.exe` with its debug information in
+`main.pdb` beside it. Where there is no `clang`, the build says so before
+it reads the program:
 
 ```
 error: wip builds with a clang 15 or newer: `clang` is not a clang 15 or newer, or is not there; WIP_CLANG names one
@@ -250,7 +256,7 @@ that led there, and a debugger sees only the names of functions.
 |---|---|
 | `-o name` | where to write it, making its directory if there is none |
 | `-I dir`, `-L dir` | where C headers and libraries are on this machine |
-| `--emit program\|static\|dynamic\|llvm-ir\|llvm-bc` | an executable, a library C links against, or the program's LLVM IR, as text or as bitcode |
+| `--emit program\|static\|dynamic\|llvm-ir\|llvm-bc\|objects` | an executable, a library C links against, the program's LLVM IR, as text or as bitcode, or its objects, for a linker on another machine |
 | `--header board.h` | write the C declarations of what the library exports |
 | `--cpu baseline\|native\|level` | the processor it is for, as above |
 | `--no-debug-info` | write no debug information, as above |
@@ -258,12 +264,37 @@ that led there, and a debugger sees only the names of functions.
 
 `--cpu` goes with `wip run` and `wip test` too, as `--release` does.
 
+`--emit static` writes an archive C links against, `libboard.a`, or on
+Windows `board.lib`, made with `llvm-lib`, which comes with Visual Studio's
+`clang`; `--emit dynamic` a shared library, `libboard.so`, on a Mac
+`libboard.dylib`, or on Windows `board.dll`, which exports each function
+the library exports to C, and nothing else. The header `--header` writes
+begins with what the library is to be linked with, where it is anything.
+
 `--emit llvm-ir` writes what the compiler hands LLVM, as text, and stops
 there: no `clang` is run, so it works on a machine without one. A build is
 cut into parts that are compiled at once, and writes each, `main.ll` and
 beside it `main.1.ll`, `main.2.ll` and on; a small program is one part.
 `--emit llvm-bc` writes the same modules as LLVM's bitcode, which is what
 `clang` is given to compile: `main.bc`, and `main.1.bc` and on.
+
+`--emit objects` writes the program's objects into a directory, `-o main`
+or `main.objects`, each part an object of its own, and `link.txt` beside
+them: what the link takes, one a line, `object NAME` for each object in
+the order it is linked, and `library NAME` for each library the program
+links. The directory may hold objects of an earlier build, which the list
+leaves out. It is how a program for Windows is built from another
+system: `wip build --target windows-arm64 --emit objects main.wip` writes
+its COFF objects and the manifest that makes the program's text UTF-8,
+which Visual Studio's tools link on Windows. The manifest is a compiled
+resource, `program.res`, which the list names as an object, since the
+linker takes it as one; the list says `runtime compiler-rt` for Clang's
+runtime, which the code calls for arithmetic the processor has no
+instruction for, as a 128-bit division, and which Microsoft's linker is
+not given by itself; and `option` for each option the linker is given.
+`wip test --emit objects -o dir` writes the objects of the runner of a
+program's tests the same way, to be linked and run there. A program that
+carries C of its own is not built so yet.
 
 ## Formatting
 
@@ -558,8 +589,9 @@ of a program is kept the same way, by this compiler, the `clang`, the flags
 and the IR — a debug build's part by part — so that a program built again
 unchanged compiles none of it, and one built after an edit only what the
 edit changed. The cache is `$WIP_CACHE_DIR`, or the platform's cache
-directory when that is not set: `~/Library/Caches/wip` on a Mac, and
-`$XDG_CACHE_HOME/wip` or `~/.cache/wip` elsewhere.
+directory when that is not set: `~/Library/Caches/wip` on a Mac,
+`%LOCALAPPDATA%\wip` on Windows, and `$XDG_CACHE_HOME/wip` or
+`~/.cache/wip` elsewhere.
 
 Nothing is ever removed from it by a build, and each edit to a debug build
 adds what it compiled, so it grows. `wip cache clean` empties it of what

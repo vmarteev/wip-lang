@@ -118,6 +118,11 @@ pub fn cacheDir(): String = {
 	if io::env("WIP_CACHE_DIR") is .Some(dir) && !dir.isEmpty() then
 		return dir
 
+	// Windows keeps what each user's programs cache in their local
+	// application data.
+	if TARGET_OS == "windows" && io::env("LOCALAPPDATA") is .Some(dir) && !dir.isEmpty() then
+		return path::join(dir, "wip")
+
 	val home = io::env("HOME")
 	if TARGET_OS == "macos" && home is .Some(home) then
 		return path::join(home, "Library/Caches/wip")
@@ -173,10 +178,50 @@ fn sizeOf(path: str): i64 = {
 	return size
 }
 
-/// The C compiler: `$CC`, or `cc`.
+/// The C compiler: `$CC`, or `cc`; on Windows, which has no `cc`, the
+/// `clang` a build runs where none is named.
 pub fn compiler(): String = match io::env("CC") {
 	.Some(cc) => cc
-	.None => "cc"
+	.None => if TARGET_OS == "windows" then defaultClang() else "cc"
+}
+
+/// The `clang` a build runs where none is named: `clang`, on the path; on
+/// Windows, where Visual Studio does not put its `clang` on the path, the
+/// one Visual Studio's installer says it has, where none is.
+pub fn defaultClang(): String = {
+	if TARGET_OS != "windows" then
+		return "clang"
+
+	if Command::of("clang").arg("--version").output() is .Ok(answer) && answer.exit.success() then
+		return "clang"
+
+	return visualStudioClang().unwrapOr("clang")
+}
+
+/// Visual Studio's `clang` for this machine's processor, in the newest
+/// installation with its Clang, as `vswhere` finds it: where Visual
+/// Studio's own tools look.
+fn visualStudioClang(): Option<String> = {
+	val programs = io::env("ProgramFiles(x86)")?
+	val vswhere = path::join(programs, "Microsoft Visual Studio\\Installer\\vswhere.exe")
+	val .Ok(found) = Command::of(vswhere).args([
+		"-latest",
+		"-products",
+		"*",
+		"-requires",
+		"Microsoft.VisualStudio.Component.VC.Llvm.Clang",
+		"-property",
+		"installationPath",
+	]).output() else {
+		return .None
+	}
+	val installed = found.stdout.toStr().trim()
+	if !found.exit.success() || installed.isEmpty() then
+		return .None
+
+	val host = if TARGET_ARCH == "arm64" then "ARM64" else "x64"
+	val clang = path::join(installed, "VC\\Tools\\Llvm\\\(host)\\bin\\clang.exe")
+	return if fs::exists(clang) then clang else .None
 }
 
 /// Who the compiler is, as far as an object depends on it: its name and
@@ -302,7 +347,8 @@ fn flags(
 	args.push("-c")
 	args.push(if optimize then "-O2" else "-O0")
 	args.push("-g")
-	if positionIndependent then
+	// Windows' images are moved wherever they are loaded without it.
+	if positionIndependent && target.os != .Windows then
 		args.push("-fPIC")
 
 	// For the system and the processor Wip's code is for, so that the C

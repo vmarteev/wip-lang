@@ -18,7 +18,7 @@ import std::io
 import std::path
 import std::process
 import std::process::{Command}
-import llvm::{Ir, frameListAssembly, withFrameTables}
+import llvm::{Format, Ir, frameListAssembly, withFrameTables}
 import llvm
 
 /// A `clang` that compiles the LLVM backend's IR, and who it is: its name
@@ -29,12 +29,13 @@ pub struct FoundClang {
 }
 
 /// The `clang` that compiles the LLVM backend's IR: the one `WIP_CLANG`
-/// names, or `clang`, if it reads the IR; what is wrong where there is
-/// none. The answer is kept in the cache, so that a `clang` is asked once.
+/// names, or the one a build runs where none is named, if it reads the IR;
+/// what is wrong where there is none. The answer is kept in the cache, so
+/// that a `clang` is asked once.
 pub fn findClang(unique: &Unique): Result<FoundClang, String> = {
 	val clang = match io::env("WIP_CLANG") {
 		.Some(clang) => clang
-		.None => "clang"
+		.None => defaultClang()
 	}
 	val identity = toolIdentity(clang)
 	if !readsTheIr(clang, &identity) then
@@ -46,6 +47,8 @@ pub fn findClang(unique: &Unique): Result<FoundClang, String> = {
 /// Why there is no `clang` for LLVM, and what to do.
 fn missing(): String = match io::env("WIP_CLANG") {
 	.Some(clang) => "`\(clang)`, which WIP_CLANG names, is not a clang 15 or newer, or is not there"
+	.None if TARGET_OS == "windows" =>
+		"no `clang` 15 or newer is on the path or in Visual Studio, whose Build Tools with the C++ tools and Clang have one; WIP_CLANG names another"
 	.None => "`clang` is not a clang 15 or newer, or is not there; WIP_CLANG names one"
 }
 
@@ -147,8 +150,9 @@ view struct Clang {
 	/// Code for the system the program is for, where a position-independent
 	/// program is loaded, for the processor the program's C is built for.
 	target: Vec<String>
-	/// Whether the objects are Mach-O, Apple's, rather than ELF.
-	apple: bool
+	/// What the objects are: Mach-O on Apple's systems, COFF on Windows, and
+	/// ELF elsewhere.
+	format: Format
 	/// What compiles a module, before what it compiles.
 	compile: Vec<String>
 	/// This compiler, as far as an object depends on it.
@@ -163,12 +167,16 @@ extend Clang {
 		optimize: bool,
 		unique: &Unique,
 	): Clang = {
-		val apple = options.target.isApple()
+		val format =
+			if options.target.isApple() then Format::Macho
+			else if options.target.os == .Windows then Format::Coff
+			else Format::Elf
 		var target: Vec<String> = [
 			for flag in options.targetFlags do
 				yield flag.clone()
 		]
-		if !apple then
+		// A Windows program is loaded where it says, and relocated by Windows.
+		if format == Format::Elf then
 			target.push("-fPIC")
 
 		target.push(cpuFlag(&options.cpu, &options.target))
@@ -199,7 +207,7 @@ extend Clang {
 		// Each function in a section of its own on ELF, so that a release
 		// build's linker drops one that nothing reaches, and the table's
 		// entry for it, which is tied to its section.
-		if optimize && !apple then
+		if optimize && format == Format::Elf then
 			compile.push("-ffunction-sections")
 
 		for arg in target do
@@ -208,7 +216,7 @@ extend Clang {
 		return Clang(
 			found: &found,
 			target:,
-			apple:,
+			format:,
 			compile:,
 			compiler: thisCompiler(),
 			unique: &unique,
@@ -329,7 +337,7 @@ extend Clang {
 		val dir = temporaryDir()?
 		val assembly = dir.join("list.s")
 		val list = dir.join("list.o")
-		if fs::writeFile(assembly, frameListAssembly(&tables, self.apple)) is .Err(error) then
+		if fs::writeFile(assembly, frameListAssembly(&tables, self.format)) is .Err(error) then
 			return .Err(.Link("cannot write the assembly: \(error)"))
 
 		self.assemble(assembly, list)?

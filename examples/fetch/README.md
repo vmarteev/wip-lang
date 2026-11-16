@@ -13,6 +13,8 @@ body is an `io::Read` that comes as it is read — undone where the server
 sent it gzipped — and `io::copy`, which writes it to any `io::Write`, a
 file or standard output, so that a body larger than memory is never held
 whole. `https` is the system's TLS, which checks the server's certificate.
+The URL from the command line is read with `Url::parse` first, so one that
+is not a URL is said to be before anything connects.
 
 Its tests, `wip test examples/fetch/main.wip`, fetch from a server they
 start themselves, and need no network.

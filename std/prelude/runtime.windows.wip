@@ -1,0 +1,95 @@
+// The runtime's own on Windows: what C's `main` calls first, and the calls
+// that led to a panic, as Windows walks them.
+
+import std::libc
+
+/// What C's `main` calls before the program's: the three standard streams
+/// made bytes as they come, where the C library would write `\n` as `\r\n`,
+/// and a console told the text is UTF-8.
+@export("C")
+fn wip_start() = {
+	for fd in 0..3 do
+		libc::setmode(fd as c_int, libc::O_BINARY)
+
+	libc::SetConsoleOutputCP(libc::CP_UTF8)
+}
+
+/// The address each call that led here returns to, innermost first, into
+/// `frames` while there is room: each frame taken back one call at a time
+/// by its function's unwind information, as a debugger walks them. Windows'
+/// `RtlCaptureStackBackTrace` follows the chain of frame pointers on Arm64,
+/// which code that keeps none breaks, and loses calls. Spliced where it is
+/// called, so that the first is its caller's.
+@inline
+fn collectFrames(frames: &var Frames) = {
+	var room: ContextRoom = [0; CONTEXT_ROOM]
+	// Windows asks for a `CONTEXT` 16 bytes aligned.
+	val start = addressOf<ContextRoom>(&var room) as i64
+	val context = (if start % 16 == 0 then start else start +% 8) as ptr<u64>
+	libc::RtlCaptureContext(context as ptr<u8>)
+	while frames.len() < MOST_FRAMES {
+		val pc = context[PC_AT]
+		var base: u64 = 0
+		val function = libc::RtlLookupFunctionEntry(pc, &var base, null)
+		if function.isNull then
+			returnedFromLeaf(context)
+		else {
+			var handler: ptr<u8> = null
+			var frame: u64 = 0
+			libc::RtlVirtualUnwind(
+				0,
+				base,
+				pc,
+				function,
+				context as ptr<u8>,
+				&var handler,
+				&var frame,
+				null,
+			)
+		}
+
+		val next = context[PC_AT]
+		if next == 0 || next == pc || !frames.tryPush(next as i64) then
+			return
+	}
+}
+
+/// Room for a `CONTEXT`, in words, and one more, to align it in.
+type ContextRoom = [u64; CONTEXT_ROOM]
+
+// Arm64's `CONTEXT`: its program counter, and the link register a leaf
+// returns by.
+@target(arch = "arm64")
+val CONTEXT_ROOM: i64 = 0x390 / 8 + 1
+
+@target(arch = "arm64")
+val PC_AT: i64 = 0x108 / 8
+
+@target(arch = "arm64")
+val LR_AT: i64 = 0xF8 / 8
+
+/// A leaf, which has no unwind information, returns to its link register.
+@target(arch = "arm64")
+fn returnedFromLeaf(context: ptr<u64>) = {
+	context[PC_AT] = context[LR_AT]
+}
+
+// x64's `CONTEXT`: its instruction pointer, and its stack pointer, where a
+// leaf's return address is.
+@target(arch = "x86_64")
+val CONTEXT_ROOM: i64 = 0x4D0 / 8 + 1
+
+@target(arch = "x86_64")
+val PC_AT: i64 = 0xF8 / 8
+
+@target(arch = "x86_64")
+val SP_AT: i64 = 0x98 / 8
+
+/// A leaf, which has no unwind information, returns to the address at the
+/// top of the stack, which the return takes off.
+@target(arch = "x86_64")
+fn returnedFromLeaf(context: ptr<u64>) = {
+	val stack = context[SP_AT]
+	context[PC_AT] = (stack as ptr<u64>)[0]
+	context[SP_AT] = stack +% 8
+}

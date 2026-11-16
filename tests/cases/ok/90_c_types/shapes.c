@@ -1,13 +1,18 @@
 /* C's own types, seen from C: the binding beside this file must name them
-   `c_int`, `c_long` and `size_t` rather than guess. */
+   `c_int`, `c_longlong` and `size_t` rather than guess, and `c_long` as
+   wide as `sizeof` says. */
 #include <stddef.h>
 
 int area(int width, int height) {
     return width * height;
 }
 
-long widen(int x) {
-    return (long) x * 1000000000L;
+long long widen(int x) {
+    return (long long) x * 1000000000LL;
+}
+
+int long_bytes(void) {
+    return (int) sizeof(long);
 }
 
 size_t count_bytes(const char *text) {

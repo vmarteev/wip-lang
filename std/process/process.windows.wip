@@ -1,0 +1,793 @@
+// Starting another program on Windows: `CreateProcessA`, given the command
+// line Microsoft's C library reads back as the arguments it was made of,
+// and the program's handle, which it is waited for and ended by. A program
+// is found as Windows finds one: beside this one, where it runs, in the
+// system's directories, and on `PATH`, `.exe` added where it has no
+// extension. It is given nothing this program has open but what its command
+// says: the handles it inherits are listed, and are only its three streams.
+//
+// Its pipes are made descriptors of the C library's, which `io::Reader`
+// reads as it reads any descriptor. Text is UTF-8, which a program's
+// manifest makes the code page of the calls that take it.
+
+import std::c
+import std::io
+import std::libc
+
+@link("kernel32")
+extern "C" {
+	fn CreateProcessA(
+		application: ptr<u8>,
+		commandLine: ptr<u8>,
+		processAttributes: ptr<u8>,
+		threadAttributes: ptr<u8>,
+		inherits: c_int,
+		flags: u32,
+		environment: ptr<u8>,
+		directory: ptr<u8>,
+		startup: &var StartupInfo,
+		information: &var ProcessInformation,
+	): c_int
+	fn CreatePipe(reading: &var i64, writing: &var i64, attributes: &Security, size: u32): c_int
+	fn SetHandleInformation(handle: i64, mask: u32, flags: u32): c_int
+	fn DuplicateHandle(
+		fromProcess: i64,
+		handle: i64,
+		toProcess: i64,
+		copy: &var i64,
+		access: u32,
+		inherits: c_int,
+		options: u32,
+	): c_int
+	fn GetCurrentProcess(): i64
+	fn GetStdHandle(which: u32): i64
+	fn CreateFileA(
+		name: cstring,
+		access: u32,
+		share: u32,
+		attributes: &Security,
+		disposition: u32,
+		flags: u32,
+		template: i64,
+	): i64
+	fn InitializeProcThreadAttributeList(
+		list: ptr<u8>,
+		count: u32,
+		flags: u32,
+		size: &var size_t,
+	): c_int
+	fn UpdateProcThreadAttribute(
+		list: ptr<u8>,
+		flags: u32,
+		attribute: u64,
+		value: ptr<i64>,
+		size: size_t,
+		previous: ptr<u8>,
+		returned: ptr<u8>,
+	): c_int
+	fn DeleteProcThreadAttributeList(list: ptr<u8>)
+	fn GetExitCodeProcess(process: i64, code: &var u32): c_int
+	fn TerminateProcess(process: i64, code: u32): c_int
+	fn WriteFile(
+		file: i64,
+		bytes: ptr<u8>,
+		count: u32,
+		written: &var u32,
+		overlapped: ptr<u8>,
+	): c_int
+	fn SetNamedPipeHandleState(pipe: i64, mode: &var u32, count: ptr<u32>, timeout: ptr<u32>): c_int
+	fn SetCurrentDirectoryA(path: cstring): c_int
+	/// This program's file's path, into `into`: how many bytes it is.
+	fn GetModuleFileNameA(module: i64, into: &var [u8]): u32
+	/// The directory this program runs in, in memory `malloc` gave.
+	@symbol("_getcwd")
+	fn currentDirectory(into: ptr<u8>, size: c_int): ptr<u8>
+}
+
+/// `SECURITY_ATTRIBUTES`: whether a handle made is inherited.
+extern struct Security {
+	size: u32 = 24
+	descriptor: i64 = 0
+	inherits: c_int = 1
+}
+
+/// `STARTUPINFOEXA`: the streams a program is given, and the list of what
+/// it inherits.
+extern struct StartupInfo {
+	size: u32 = 112
+	reserved: i64 = 0
+	desktop: i64 = 0
+	title: i64 = 0
+	x: u32 = 0
+	y: u32 = 0
+	width: u32 = 0
+	height: u32 = 0
+	columns: u32 = 0
+	rows: u32 = 0
+	fill: u32 = 0
+	flags: u32 = 0
+	show: u16 = 0
+	reservedSize: u16 = 0
+	reservedBytes: i64 = 0
+	input: i64 = 0
+	output: i64 = 0
+	errors: i64 = 0
+	attributes: i64 = 0
+}
+
+/// `PROCESS_INFORMATION`: the program started, its first thread, and their
+/// numbers.
+extern struct ProcessInformation {
+	process: i64 = 0
+	thread: i64 = 0
+	processId: u32 = 0
+	threadId: u32 = 0
+}
+
+/// `StartupInfo.flags`: its three streams are the handles given.
+val STARTF_USESTDHANDLES: u32 = 0x100
+/// `CreateProcessA`: the startup information has a list of attributes.
+val EXTENDED_STARTUPINFO_PRESENT: u32 = 0x00080000
+/// The attribute that lists the handles a program inherits.
+val PROC_THREAD_ATTRIBUTE_HANDLE_LIST: u64 = 0x20002
+val HANDLE_FLAG_INHERIT: u32 = 1
+val DUPLICATE_SAME_ACCESS: u32 = 2
+/// `GetStdHandle`'s three, as the system numbers them.
+val STD_INPUT_HANDLE: u32 = 0xFFFFFFF6
+val STD_OUTPUT_HANDLE: u32 = 0xFFFFFFF5
+val STD_ERROR_HANDLE: u32 = 0xFFFFFFF4
+val GENERIC_READ_WRITE: u32 = 0xC0000000
+val FILE_SHARE_READ_WRITE: u32 = 3
+val OPEN_EXISTING: u32 = 3
+/// `SetNamedPipeHandleState`: a write takes what there is room for, and
+/// does not wait.
+val PIPE_NOWAIT: u32 = 1
+val INVALID_HANDLE: i64 = -1
+
+extend Command {
+	/// Starts it with this program's streams, and waits for it.
+	pub fn run(): Result<Exit, io::IoError> = {
+		val started = self.spawn(0, self.given.isSome())?
+		if self.given is .Some(text) {
+			var input = started.input
+			var written = 0
+			while input >= 0 do
+				writeAll(&var input, text, &var written)
+		}
+		return waitFor(&started)
+	}
+
+	/// Starts it with its standard output and errors read into `String`s,
+	/// both at once, and waits for it. Its standard input reads what
+	/// `input` gave it, written as the program reads it, or nothing.
+	pub fn output(): Result<Output, io::IoError> = {
+		var started = self.spawn(2, self.given.isSome())?
+		val text = match self.given {
+			.Some(text) => text.toStr()
+			.None => ""
+		}
+		// The input does not wait for room, so that a program that writes
+		// while it reads is read from in the meantime.
+		if started.input >= 0 {
+			var mode = PIPE_NOWAIT
+			SetNamedPipeHandleState(libc::handleOf(started.input as c_int), &var mode, null, null)
+		}
+		var written = 0
+		var stdout = String()
+		var stderr = String()
+		var buffer = own [0 as u8; 65536]
+		var which = 0
+		while true {
+			val got = readOrWrite(
+				&var started.output,
+				&var started.errors,
+				&var started.input,
+				text,
+				&var written,
+				&var buffer,
+				&var which,
+			)
+			if got <= 0 then
+				break
+
+			val read = str::fromBytes(&buffer[0..got])
+			if which == 1 then
+				stdout.push(read)
+			else
+				stderr.push(read)
+		}
+		val exit = waitFor(&started)?
+		return Output(exit:, stdout:, stderr:)
+	}
+
+	/// Starts it with this program's streams, and goes on.
+	pub fn start(): Result<Child, io::IoError> = {
+		val started = self.spawn(0, false)?
+		return Child(id: started.id, handle: started.handle)
+	}
+
+	/// Starts it with its streams reading and writing nothing, and lets it
+	/// go: it runs on, after this program too.
+	pub fn launch(): Result<void, io::IoError> = {
+		val started = self.spawn(1, false)?
+		libc::CloseHandle(started.handle)
+		return
+	}
+
+	/// Starts it with its standard input and output connected to this
+	/// program, to be talked to; its standard error is this program's.
+	pub fn connect(): Result<Connected, io::IoError> = {
+		val started = self.spawn(3, true)?
+		return Connected(
+			id: started.id,
+			handle: started.handle,
+			input: started.input,
+			reading: io::reader(started.output as i32),
+		)
+	}
+
+	/// Starts it: 0 with this program's streams, 1 with none, 2 with its
+	/// output and errors in pipes, 3 with its output in a pipe and its errors
+	/// this program's; and where `fed`, its standard input a pipe too. The
+	/// ends of the pipes this program keeps are descriptors, -1 where there
+	/// is none.
+	fn spawn(mode: i64, fed: bool): Result<Started, io::IoError> = {
+		val inherited = Security()
+		var given = [INVALID_HANDLE; 3]
+		// What this program keeps of the pipes: its ends, as handles.
+		var kept = [INVALID_HANDLE; 3]
+		// The handles made for the program alone, closed once it has them.
+		var made: Vec<i64> = Vec()
+		val streams = [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE]
+		for stream in 0..3 {
+			val piped = stream == 0 && fed || stream > 0 && (mode == 2 || stream == 1 && mode == 3)
+			if piped {
+				var reading = INVALID_HANDLE
+				var writing = INVALID_HANDLE
+				if CreatePipe(&var reading, &var writing, &inherited, 0) == 0 {
+					val failed = io::lastSystemError()
+					closeAll(&made)
+					closeAll(&kept)
+					return .Err(failed)
+				}
+				// The child's end is inherited; this program's is not.
+				val (theirs, ours) = if stream == 0 then (reading, writing) else (writing, reading)
+				SetHandleInformation(ours, HANDLE_FLAG_INHERIT, 0)
+				given[stream] = theirs
+				kept[stream] = ours
+				made.push(theirs)
+			} else if mode == 1 || stream == 0 && mode == 2 {
+				// Nothing to read and nowhere to write: Windows' null device.
+				val none = CreateFileA(
+					"NUL",
+					GENERIC_READ_WRITE,
+					FILE_SHARE_READ_WRITE,
+					&inherited,
+					OPEN_EXISTING,
+					0,
+					0,
+				)
+				given[stream] = none
+				made.push(none)
+			} else {
+				// This program's own, copied to be inherited.
+				val mine = GetStdHandle(streams[stream])
+				var copy = INVALID_HANDLE
+				if mine != 0 &&
+					mine != INVALID_HANDLE &&
+					DuplicateHandle(
+						GetCurrentProcess(),
+						mine,
+						GetCurrentProcess(),
+						&var copy,
+						0,
+						1,
+						DUPLICATE_SAME_ACCESS,
+					) !=
+						0 {
+					given[stream] = copy
+					made.push(copy)
+				} else {
+					val none = CreateFileA(
+						"NUL",
+						GENERIC_READ_WRITE,
+						FILE_SHARE_READ_WRITE,
+						&inherited,
+						OPEN_EXISTING,
+						0,
+						0,
+					)
+					given[stream] = none
+					made.push(none)
+				}
+			}
+		}
+		val launched = self.created(&given)
+		closeAll(&made)
+		val (process, id) = match launched {
+			.Ok(made) => made
+			.Err(error) => {
+				closeAll(&kept)
+				return .Err(error)
+			}
+		}
+		// This program's ends as descriptors, which `io::Reader` reads.
+		val input =
+			if kept[0] != INVALID_HANDLE then
+				libc::descriptorOf(kept[0], libc::O_WRONLY | libc::O_BINARY) as i64
+			else -1
+		val output =
+			if kept[1] != INVALID_HANDLE then
+				libc::descriptorOf(kept[1], libc::O_RDONLY | libc::O_BINARY) as i64
+			else -1
+		val errors =
+			if kept[2] != INVALID_HANDLE then
+				libc::descriptorOf(kept[2], libc::O_RDONLY | libc::O_BINARY) as i64
+			else -1
+		return Started(id:, handle: process, input:, output:, errors:)
+	}
+
+	/// The program, made with `streams` its three, which are the handles it
+	/// inherits and no other: its handle and its number.
+	fn created(streams: &[i64; 3]): Result<(i64, i64), io::IoError> = {
+		var line = commandLine(self.program.toStr(), &self.arguments)
+		line.push("\0")
+		val environment = environmentBlock(&self.sets)
+		var directory = String::of(self.place)
+		directory.push("\0")
+		// The list of what it inherits: its three streams.
+		var size: size_t = 0
+		InitializeProcThreadAttributeList(null, 1, 0, &var size)
+		val list = libc::malloc(size)
+		if list.isNull then
+			return .Err(io::IoError::Other(libc::ENOMEM))
+
+		var handles = [streams[0], streams[1], streams[2]]
+		val handleList = addressOf<[i64; 3]>(&var handles) as ptr<i64>
+		if InitializeProcThreadAttributeList(list, 1, 0, &var size) == 0 ||
+			UpdateProcThreadAttribute(
+				list,
+				0,
+				PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+				handleList,
+				24 as size_t,
+				null,
+				null,
+			) ==
+				0 {
+			val failed = io::lastSystemError()
+			libc::free(list)
+			return .Err(failed)
+		}
+		var startup = StartupInfo(
+			flags: STARTF_USESTDHANDLES,
+			input: streams[0],
+			output: streams[1],
+			errors: streams[2],
+			attributes: list as i64,
+		)
+		var information = ProcessInformation()
+		val made = CreateProcessA(
+			null,
+			c::pointerTo(&line.items()),
+			null,
+			null,
+			1,
+			EXTENDED_STARTUPINFO_PRESENT,
+			c::pointerTo(&environment.items()),
+			if self.place.isEmpty() then null else c::pointerTo(&directory.items()),
+			&var startup,
+			&var information,
+		)
+		val failed = io::lastSystemError()
+		DeleteProcThreadAttributeList(list)
+		libc::free(list)
+		if made == 0 then
+			return .Err(failed)
+
+		libc::CloseHandle(information.thread)
+		return (information.process, information.processId as i64)
+	}
+}
+
+/// What `spawn` started: its number and handle, and this program's ends of
+/// its pipes, -1 where there is none.
+struct Started {
+	id: i64
+	handle: i64
+	input: i64
+	output: i64
+	errors: i64
+}
+
+/// Closes each handle that is one.
+fn closeAll(handles: &[i64]) = {
+	for handle in handles do
+		if handle != INVALID_HANDLE then
+			libc::CloseHandle(handle)
+}
+
+/// The command line `CreateProcessA` is given: the program and each
+/// argument, each quoted where it must be, so that Microsoft's C library —
+/// and `CommandLineToArgvW` — read back each as it was.
+fn commandLine(program: str, arguments: &[String]): String = {
+	var line = String()
+	quoteInto(&var line, program)
+	for argument in arguments {
+		line.push(" ")
+		quoteInto(&var line, argument.toStr())
+	}
+	return line
+}
+
+/// `argument` at the end of `line`, as it is where it has no space, tab or
+/// quote, and in quotes otherwise: a quote written `\"`, and the
+/// backslashes before a quote, or before the closing one, doubled, since
+/// only there does a backslash escape.
+fn quoteInto(line: &var String, argument: str) = {
+	val plain =
+		!argument.isEmpty() &&
+		!argument.items().any((byte) => byte is b' ' | b'\t' | b'\n' | 11 | b'"')
+	if plain {
+		line.push(argument)
+		return
+	}
+	line.push("\"")
+	var backslashes = 0
+	for byte in argument {
+		if byte == b'\\' {
+			backslashes += 1
+			continue
+		}
+		val doubled = if byte == b'"' then backslashes * 2 + 1 else backslashes
+		for _ in 0..doubled do
+			line.push("\\")
+
+		backslashes = 0
+		line.pushByte(byte)
+	}
+	for _ in 0..backslashes * 2 do
+		line.push("\\")
+
+	line.push("\"")
+}
+
+/// This program's environment, with each `NAME=value` of `sets` in place of
+/// the variable of that name, in any case, as Windows names them, or added,
+/// and each `NAME` alone left out: each `NAME=value` and a NUL, and a NUL
+/// after the last, as `CreateProcessA` takes it.
+fn environmentBlock(sets: &[String]): Vec<u8> = {
+	var entries: Vec<String> = Vec()
+	val block = libc::GetEnvironmentStringsA()
+	if !block.isNull {
+		var at = 0
+		while block[at] != 0 {
+			var end = at
+			while block[end] != 0 do
+				end += 1
+
+			entries.push(str::fromBytes(&block[at..end]))
+			at = end + 1
+		}
+		libc::FreeEnvironmentStringsA(block)
+	}
+	for set in sets {
+		val removes = set.indexOf("=").isNone()
+		val name = if removes then set.toStr() else set.toStr()[0..set.indexOf("=").unwrapOr(0)]
+		entries.retain((entry) => !sameName(entry.toStr(), name))
+		if !removes then
+			entries.push(set.clone())
+	}
+	var out: Vec<u8> = Vec()
+	for entry in entries {
+		out.pushAll(entry.toStr())
+		out.push(0)
+	}
+	if entries.isEmpty() then
+		out.push(0)
+
+	out.push(0)
+	return out
+}
+
+/// Whether `entry`, `NAME=value`, is of the variable `name`, in any case. A
+/// name may begin with `=`, as Windows' own for each drive's directory do.
+fn sameName(entry: str, name: str): bool = {
+	if entry.len() <= name.len() || entry[name.len()] != b'=' then
+		return false
+
+	return entry[0..name.len()].toAsciiLower() == name.toAsciiLower()
+}
+
+// Reads what is there in either pipe: into `buffer`, with 1 in `which` for
+// standard output and 2 for standard error; and writes what there is room
+// for of `text` from `written` on into `input`, closing it after the last
+// byte. A pipe that ends is closed, and its number set to -1; 0 is answered
+// once both output pipes have ended, and -1 where reading failed. A pipe
+// says what it holds but not when it holds something, so where nothing
+// came, it is looked into again a millisecond later.
+fn readOrWrite(
+	output: &var i64,
+	errors: &var i64,
+	input: &var i64,
+	text: str,
+	written: &var i64,
+	buffer: &var [u8],
+	which: &var i64,
+): i64 = {
+	while true {
+		if output < 0 && errors < 0 {
+			if input >= 0 {
+				libc::close(input as c_int)
+				input = -1
+			}
+			return 0
+		}
+		if input >= 0 then
+			writeSome(&var input, text, &var written)
+
+		for end in [1, 2] {
+			val fd = if end == 1 then output else errors
+			if fd < 0 then
+				continue
+
+			var available: u32 = 0
+			if libc::PeekNamedPipe(
+				libc::handleOf(fd as c_int),
+				null,
+				0,
+				null,
+				&var available,
+				null,
+			) ==
+				0 {
+				// Its writer has gone: what it wrote has been read.
+				libc::close(fd as c_int)
+				if end == 1 then
+					output = -1
+				else
+					errors = -1
+
+				continue
+			}
+			if available == 0 then
+				continue
+
+			val room = (available as i64).min(buffer.len())
+			val got = libc::read(fd as c_int, &var buffer[0..room]) as i64
+			if got < 0 then
+				return -1
+
+			which = end
+			return got
+		}
+		libc::Sleep(1)
+	}
+	return 0
+}
+
+/// Writes what the pipe takes of `text` from `written` on, and closes it
+/// after the last byte, or where the program has stopped reading: then the
+/// rest is dropped.
+fn writeSome(input: &var i64, text: str, written: &var i64) = {
+	if written < text.len() {
+		val handle = libc::handleOf(input as c_int)
+		val rest = text[written..text.len()]
+		var wrote: u32 = 0
+		val count = rest.len().min(65536) as u32
+		if WriteFile(handle, c::pointerTo(&rest.items()), count, &var wrote, null) == 0 then
+			written = text.len()
+		else
+			written += wrote as i64
+	}
+	if written >= text.len() {
+		libc::close(input as c_int)
+		input = -1
+	}
+}
+
+/// Writes all of `text` from `written` on, waiting while the pipe is full,
+/// and closes it.
+fn writeAll(input: &var i64, text: str, written: &var i64) = {
+	while written < text.len() {
+		val wrote = libc::write(input as c_int, &text.items()[written..text.len()]) as i64
+		if wrote <= 0 then
+			break
+
+		written += wrote
+	}
+	libc::close(input as c_int)
+	input = -1
+}
+
+/// Waits for what `spawn` started, and says how it ended; its handle is
+/// closed.
+fn waitFor(started: &Started): Result<Exit, io::IoError> = {
+	val exit = waitOn(started.handle, true)
+	libc::CloseHandle(started.handle)
+	return match exit {
+		.Ok(.Some(code)) => code
+		.Ok(.None) => .Code(-1)
+		.Err(error) => .Err(error)
+	}
+}
+
+/// How a program ended, if it has; waiting for it where `block` says to.
+/// Windows ends a program with a code alone, an exception's included.
+fn waitOn(handle: i64, block: bool): Result<Option<Exit>, io::IoError> = {
+	val waited = libc::WaitForSingleObject(handle, if block then libc::INFINITE else 0)
+	if waited != 0 then
+		return .Ok(.None)
+
+	var code: u32 = 0
+	if GetExitCodeProcess(handle, &var code) == 0 then
+		return .Err(io::lastSystemError())
+
+	return .Ok(.Code(code as i64))
+}
+
+extend Child {
+	/// Its process number.
+	pub fn id(): i64 = self.id
+
+	/// How it ended, if it has, without waiting.
+	pub var fn tryWait(): Option<Exit> = {
+		if self.finished then
+			return .None
+
+		val .Ok(.Some(exit)) = waitOn(self.handle, false) else return .None
+		self.finished = true
+		return exit
+	}
+
+	/// Waits for it, and says how it ended. Asked after `tryWait` said so
+	/// already, it has nothing more to say, and answers `.Code(-1)`.
+	pub move fn wait(): Exit = {
+		var child = self
+		if child.finished then
+			return .Code(-1)
+
+		child.finished = true
+		return match waitOn(child.handle, true) {
+			.Ok(.Some(exit)) => exit
+			_ => .Code(-1)
+		}
+	}
+
+	/// Ends it, as `TerminateProcess` does, with code 1; it is still waited
+	/// for.
+	pub fn kill() = {
+		TerminateProcess(self.handle, 1)
+	}
+}
+
+// Writes all of `bytes` to its standard input, waiting while the pipe is
+// full. A program that has stopped reading, or has ended, answers
+// `.BrokenPipe`, as does writing after `closeInput()`.
+extend Connected: io::Write {
+	var fn writeAll(bytes: &[u8]): Result<void, io::IoError> = {
+		if self.input < 0 then
+			return .Err(.BrokenPipe)
+
+		var written = 0
+		while written < bytes.len() {
+			val wrote = libc::write(self.input as c_int, &bytes[written..bytes.len()]) as i64
+			if wrote < 0 then
+				return .Err(.BrokenPipe)
+
+			written += wrote
+		}
+	}
+}
+
+extend Connected {
+	/// Its process number.
+	pub fn id(): i64 = self.id
+
+	/// Writes all of `text` to its standard input, as `writeAll` writes
+	/// bytes.
+	pub var fn writeText(text: str): Result<void, io::IoError> = self.writeAll(&text)
+
+	/// What it writes on its standard output, read as any `io::Reader` is.
+	pub var fn output(): &var io::Reader = lend self.reading
+
+	/// Closes its standard input: what it reads next is the end.
+	pub var fn closeInput() = {
+		if self.input >= 0 then
+			libc::close(self.input as c_int)
+
+		self.input = -1
+	}
+
+	/// How it ended, if it has, without waiting.
+	pub var fn tryWait(): Option<Exit> = {
+		if self.finished then
+			return .None
+
+		val .Ok(.Some(exit)) = waitOn(self.handle, false) else return .None
+		self.finished = true
+		return exit
+	}
+
+	/// Closes its input, waits for it, and says how it ended.
+	pub move fn wait(): Exit = {
+		var connected = self
+		connected.closeInput()
+		if connected.finished then
+			return .Code(-1)
+
+		connected.finished = true
+		return match waitOn(connected.handle, true) {
+			.Ok(.Some(exit)) => exit
+			_ => .Code(-1)
+		}
+	}
+
+	/// Ends it, as `TerminateProcess` does; it is still waited for.
+	pub fn kill() = {
+		TerminateProcess(self.handle, 1)
+	}
+}
+
+extend Connected: Destroy {
+	/// A dropped program talked to has its input closed, and is waited for.
+	var fn destroy() = {
+		self.closeInput()
+		if !self.finished then
+			waitOn(self.handle, true)
+
+		libc::CloseHandle(self.handle)
+		libc::close(io::descriptorOf(&self.reading) as c_int)
+	}
+}
+
+extend Child: Destroy {
+	/// A dropped child is waited for.
+	var fn destroy() = {
+		if !self.finished then
+			waitOn(self.handle, true)
+
+		libc::CloseHandle(self.handle)
+	}
+}
+
+// This program: where it runs, which file it is, and its number.
+
+/// The directory this program runs in, as an absolute path.
+pub fn currentDir(): Result<String, io::IoError> = {
+	val found = currentDirectory(null, 0)
+	if found.isNull then
+		return .Err(io::lastError())
+
+	var out = String()
+	out.pushBytes(&found[0..libc::strlen(found) as i64])
+	libc::free(found)
+	return out
+}
+
+/// Moves this program into `path`, from which a relative path is read
+/// after.
+pub fn setCurrentDir(path: str): Result<void, io::IoError> = {
+	var named = String::of(path)
+	if SetCurrentDirectoryA(named.toCstring()) == 0 then
+		return .Err(io::lastSystemError())
+
+	return
+}
+
+/// The file this program was started from, as an absolute path.
+pub fn executable(): Result<String, io::IoError> = {
+	var room: Vec<u8> = .filled(32768, 0)
+	val got = GetModuleFileNameA(0, &var room.items())
+	if got == 0 then
+		return .Err(io::lastSystemError())
+
+	return String::of(str::fromBytes(&room[0..got as i64]))
+}
+
+/// This program's number, which the system gives each process.
+pub fn id(): i64 = libc::GetCurrentProcessId() as i64
+
+/// The address of what a reference refers to, for Windows to read.
+@intrinsic
+fn addressOf<T>(value: &var T): ptr<void>

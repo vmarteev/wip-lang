@@ -43,17 +43,32 @@ circle is.
 
 A file whose name ends `.macos.wip`, `.linux.wip`, `.windows.wip`,
 `.ios.wip` — or with an architecture, `.arm64.wip`, `.x86_64.wip`, or with
-`.apple.wip`, which is a Mac's and iOS's together — is compiled only for
-that target, as a `.test.wip` file is compiled only by `wip test`. The two
-compose: `board.linux.test.wip` is a test for Linux. `.macos.wip` is a
-Mac's alone, so what a Mac and an iPad share, as Metal, is `.apple.wip`. A
+`.apple.wip`, which is a Mac's and iOS's together, or `.unix.wip`, which is
+every system but Windows — is compiled only for that target, as a
+`.test.wip` file is compiled only by `wip test`. The two compose:
+`board.linux.test.wip` is a test for Linux. `.macos.wip` is a Mac's alone,
+so what a Mac and an iPad share, as Metal, is `.apple.wip`; and what every
+Unix shares, POSIX's calls, is `.unix.wip`, beside a `.windows.wip`. A
 name whose last piece is not a target the compiler knows says nothing, so
 `v1.2.wip` is an ordinary file.
 
-An item may say the same thing with `@target(os = "linux")`, which [page
-11](11-c.md) shows; a file is for the places where most of it differs. What
+An item may say the same thing with `@target(os = "linux")`, or
+`@target(family = "unix")`, which [page 11](11-c.md) shows; a file is for the places where most of it differs. What
 another target takes is checked by asking for that target: `wip check
 --target linux` on a Mac ([page 12](12-tools.md)).
+
+What is declared only for another target is not there, and a name of it
+is refused as any name that is not; the error says which target has it,
+so that a program built for Windows that reaches for a Unix's `Signals`
+is told that, not only that nothing is there:
+
+```wip,error=E0203
+@target(os = "ios")
+fn vibrate() = {}
+
+// cannot find `vibrate`: it is declared here for `ios` alone
+fn main() = vibrate()
+```
 
 ## Constants a build defines
 

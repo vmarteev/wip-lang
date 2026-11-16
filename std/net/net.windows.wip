@@ -1,0 +1,283 @@
+// Windows' sockets: Winsock's, each a handle, read with `recv`, written
+// with `send` and closed with `closesocket`, and laid out as Linux lays
+// its addresses out. Winsock is started by `WSAStartup` before a call and
+// stopped by `WSACleanup` after, which count: each socket starts it as it
+// is made and stops it as it is closed, and a lookup for as long as it
+// takes, so that it runs while anything needs it.
+//
+// A socket is made not to be inherited by a program started, as a Unix's
+// descriptor is made closed in one.
+
+import std::bytes
+import std::io
+import std::libc
+
+/// A socket: Winsock's handle.
+type Socket = u64
+
+/// What a call that makes a socket answers where it fails: `INVALID_SOCKET`.
+val NO_SOCKET: Socket = 0xFFFFFFFFFFFFFFFF
+
+@link("ws2_32")
+extern "C" {
+	fn WSAStartup(version: u16, data: &var WinsockData): c_int
+	fn WSACleanup(): c_int
+	fn WSASetLastError(code: c_int)
+	fn WSASocketW(
+		family: c_int,
+		kind: c_int,
+		protocol: c_int,
+		information: ptr<u8>,
+		group: u32,
+		flags: u32,
+	): Socket
+	@symbol("bind")
+	fn bindTo(socket: Socket, address: ptr<u8>, length: u32): c_int
+	@symbol("bind")
+	fn bindLocal(socket: Socket, address: &SockAddr, length: u32): c_int
+	@symbol("connect")
+	fn connectTo(socket: Socket, address: ptr<u8>, length: u32): c_int
+	@symbol("connect")
+	fn connectLocal(socket: Socket, address: &SockAddr, length: u32): c_int
+	fn listen(socket: Socket, backlog: c_int): c_int
+	fn accept(socket: Socket, address: &var SockAddr, length: &var u32): Socket
+	fn getsockname(socket: Socket, address: &var SockAddr, length: &var u32): c_int
+	fn getsockopt(
+		socket: Socket,
+		level: c_int,
+		name: c_int,
+		value: &var c_int,
+		length: &var u32,
+	): c_int
+	fn shutdown(socket: Socket, how: c_int): c_int
+	/// A count is an `int` here, so no more than fits in one is given.
+	fn send(socket: Socket, bytes: &[u8], flags: c_int): c_int
+	fn recv(socket: Socket, into: &var [u8], flags: c_int): c_int
+	fn closesocket(socket: Socket): c_int
+	fn ioctlsocket(socket: Socket, command: c_int, argument: &var u32): c_int
+	fn getaddrinfo(
+		host: cstring,
+		service: cstring,
+		hints: &AddrInfo,
+		answers: &var ptr<AddrInfo>,
+	): c_int
+	/// The same with no host: its pointer is null.
+	@symbol("getaddrinfo")
+	fn getaddrinfoLocal(
+		host: ptr<u8>,
+		service: cstring,
+		hints: &AddrInfo,
+		answers: &var ptr<AddrInfo>,
+	): c_int
+	fn freeaddrinfo(answers: ptr<AddrInfo>)
+}
+
+@link("kernel32")
+extern "C" {
+	fn SetHandleInformation(handle: u64, mask: u32, flags: u32): c_int
+}
+
+/// `WSADATA`: what Winsock says of itself, which nothing here reads.
+extern struct WinsockData {
+	words: [u64; 51] = [0; 51]
+}
+
+/// `ADDRINFOA`, whose length is a `size_t`: its low half, then its high,
+/// which an address's length never reaches.
+extern struct AddrInfo {
+	flags: c_int
+	family: c_int
+	socktype: c_int
+	protocol: c_int
+	addressLength: u32
+	addressLengthHigh: u32 = 0
+	canonicalName: ptr<u8>
+	address: ptr<u8>
+	next: ptr<AddrInfo>
+}
+
+/// Winsock 2.2, which every Windows has.
+val WINSOCK_VERSION: u16 = 0x0202
+
+/// `WSASocketW`: a socket a program started does not inherit, which
+/// overlaps, as `socket` makes one.
+val WSA_FLAG_OVERLAPPED: u32 = 0x1
+val WSA_FLAG_NO_HANDLE_INHERIT: u32 = 0x80
+val HANDLE_FLAG_INHERIT: u32 = 0x1
+
+/// `ioctlsocket`: whether a socket waits. `0x8004667E`, its bits read as an `int`.
+val FIONBIO: c_int = -2147195266
+
+/// A connection begun on a socket that does not wait, still being made.
+val WSAEWOULDBLOCK: c_int = 10035
+val WSAETIMEDOUT: c_int = 10060
+
+val AF_INET6: c_int = 23
+
+val SOL_SOCKET: c_int = 0xffff
+
+/// What a socket's connection that did not wait failed with, once it is
+/// done.
+val SO_ERROR: c_int = 0x1007
+
+val SOMAXCONN: c_int = 0x7fffffff
+
+val AI_NUMERICSERV: c_int = 0x8
+
+/// What `getaddrinfo` answers for a host it cannot find: `WSAHOST_NOT_FOUND`.
+val EAI_NONAME: c_int = 11001
+
+/// The longest path a Unix-domain socket may have, without its NUL.
+val UNIX_PATH_MOST: i64 = 107
+
+/// The most bytes one call is given: what an `int` holds.
+val MOST_A_CALL: i64 = 0x7fffffff
+
+/// Winsock, started for as long as this is kept.
+struct Sockets
+
+extend Sockets {
+	static fn started(): Result<Sockets, io::IoError> = {
+		var data = WinsockData()
+		val failed = WSAStartup(WINSOCK_VERSION, &var data)
+		if failed != 0 then
+			return .Err(io::systemError(failed as u32))
+
+		return Sockets()
+	}
+}
+
+extend Sockets: Destroy {
+	var fn destroy() = {
+		WSACleanup()
+	}
+}
+
+/// Winsock started for a socket that `made` makes, and stopped again
+/// where it made none, its error kept for the caller.
+fn withWinsock(made: &var () => Socket): Socket = {
+	var data = WinsockData()
+	val failed = WSAStartup(WINSOCK_VERSION, &var data)
+	if failed != 0 {
+		WSASetLastError(failed)
+		return NO_SOCKET
+	}
+	val socket = made()
+	if socket == NO_SOCKET {
+		val error = libc::GetLastError()
+		WSACleanup()
+		WSASetLastError(error as c_int)
+	}
+	return socket
+}
+
+fn openSocket(family: c_int, kind: c_int, protocol: c_int): Socket = withWinsock(() => WSASocketW(
+	family,
+	kind,
+	protocol,
+	null,
+	0,
+	WSA_FLAG_OVERLAPPED | WSA_FLAG_NO_HANDLE_INHERIT,
+))
+
+/// A connection accepted, which is inherited where the listener is, and
+/// is made not to be.
+fn accepted(socket: Socket, address: &var SockAddr, length: &var u32): Socket = {
+	val got = withWinsock(() => accept(socket, &var address, &var length))
+	if got != NO_SOCKET then
+		SetHandleInformation(got, HANDLE_FLAG_INHERIT, 0)
+
+	return got
+}
+
+fn closeSocket(socket: Socket) = {
+	closesocket(socket)
+	WSACleanup()
+}
+
+/// What has come, read into `into`: how many bytes, 0 at the end, and
+/// below 0 where it failed.
+fn received(socket: Socket, into: &var [u8]): i64 =
+	recv(socket, &var into[0..into.len().min(MOST_A_CALL)], 0) as i64
+
+/// What the connection takes now of `bytes`: how many, below 0 where it
+/// failed.
+fn sent(socket: Socket, bytes: &[u8]): i64 =
+	send(socket, &bytes[0..bytes.len().min(MOST_A_CALL)], 0) as i64
+
+/// Why the last call on a socket failed: Winsock's error, which is the
+/// thread's last.
+fn socketError(): io::IoError = io::lastSystemError()
+
+/// Whether something comes to read on `socket`, or its other end closes,
+/// within `millis`.
+fn readableWithin(socket: Socket, millis: c_int): Result<bool, io::IoError> = {
+	var sockets = [libc::PollSocket(socket:, events: libc::POLLRDNORM)]
+	val ready = libc::WSAPoll(&var sockets, millis)
+	if ready < 0 then
+		return .Err(io::lastSystemError())
+
+	return ready > 0
+}
+
+/// The number an event queue is given: the handle's value, which Windows
+/// keeps within 32 bits.
+fn descriptorOf(socket: Socket): i32 = socket as i32
+
+/// Nothing: Windows listens on an address again while the last connection
+/// on it waits out its end, and `SO_REUSEADDR` there would let a second
+/// listener take an address another listens on.
+fn reusable(_: Socket) = {}
+
+/// A new connection's socket, which needs nothing: Windows has no
+/// `SIGPIPE`.
+fn quiet(_: Socket) = {}
+
+/// `socket` connected to `address`, waiting at most `millis`: the
+/// connection begun without waiting, then waited for with `WSAPoll`. Where
+/// it fails, or takes longer, the thread's last error says why.
+fn connectWithin(socket: Socket, address: ptr<u8>, length: u32, millis: c_int): bool = {
+	if setBlockingOf(socket, false).isErr() then
+		return false
+
+	if connectTo(socket, address, length) != 0 {
+		if libc::GetLastError() != WSAEWOULDBLOCK as u32 then
+			return false
+
+		var sockets = [libc::PollSocket(socket:, events: libc::POLLWRNORM)]
+		val ready = libc::WSAPoll(&var sockets, millis)
+		if ready < 0 then
+			return false
+
+		if ready == 0 {
+			WSASetLastError(WSAETIMEDOUT)
+			return false
+		}
+		var failed: c_int = 0
+		var size: u32 = 4
+		if getsockopt(socket, SOL_SOCKET, SO_ERROR, &var failed, &var size) != 0 then
+			return false
+
+		if failed != 0 {
+			WSASetLastError(failed)
+			return false
+		}
+	}
+	return setBlockingOf(socket, true).isOk()
+}
+
+fn setBlockingOf(socket: Socket, blocking: bool): Result<void, io::IoError> = {
+	var nonBlocking: u32 = if blocking then 0 else 1
+	if ioctlsocket(socket, FIONBIO, &var nonBlocking) != 0 then
+		return .Err(io::lastSystemError())
+
+	return
+}
+
+/// The family's place: an address starts with two bytes of family.
+fn setFamily(address: &var SockAddr, family: c_int, _: u8) = {
+	address.bytes[0] = family as u8
+	address.bytes[1] = 0
+}
+
+fn familyOf(address: &SockAddr): c_int = bytes::u16le(&address.bytes, 0) as c_int

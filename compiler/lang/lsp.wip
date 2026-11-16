@@ -5,7 +5,9 @@
 // what the editor has not saved in place of the disk; a program of
 // thousands of lines is checked in milliseconds, so nothing is kept from one
 // check to the next. Messages that arrive together are answered together,
-// and the program is checked once after them.
+// and the program is checked once after them: once the editor has been
+// quiet a moment, so that a word typed is checked once and not at every
+// key, and at the latest a while after the first edit not yet checked.
 
 import std::collections::{Map, Set}
 import std::future::{Future, channel}
@@ -13,7 +15,17 @@ import std::io
 import std::json
 import std::json::{Json}
 import std::libc
+import std::time::{Duration, Instant}
 import hir::{Program}
+
+/// How long the editor is quiet, in milliseconds, before what it sent is
+/// checked: longer than the time between two keys of a word, shorter than
+/// a person notices.
+val QUIET_MILLIS: i64 = 150
+
+/// How long an edit waits to be checked at most, while the editor is never
+/// quiet that long.
+val LONGEST_MILLIS: i64 = 750
 
 /// Runs the server until the editor says `exit`, and ends the process with
 /// the code it ends with: the thread that reads may be waiting for input
@@ -28,11 +40,29 @@ pub fn serve(threads: i64): never = {
 	var server = Server(threads:)
 	while messages.receive() is .Some(message) {
 		var next: Option<Json> = message
+		// When the first edit not yet checked came.
+		var unchecked: Option<Instant> = .None
 		while next.take() is .Some(one) {
 			if server.handle(one) is .Some(code) then
 				libc::exit(code as c_int)
 
-			next = match messages.tryReceive() {
+			// What is queued is taken at once; where an edit waits to be
+			// checked, the next message is waited for a quiet moment, or
+			// until the edit has waited long enough.
+			if !server.dirty then
+				unchecked = .None
+			else if unchecked.isNone() then
+				unchecked = Instant::now()
+
+			val waited = match unchecked {
+				.Some(since) => since.elapsed()
+				.None => Duration::nanos(0)
+			}
+			val wait = Duration::millis(QUIET_MILLIS.min(LONGEST_MILLIS - waited.asMillis()))
+			val received =
+				if server.dirty && wait > Duration::nanos(0) then messages.receiveWithin(wait)
+				else messages.tryReceive()
+			next = match move received {
 				.Value(more) => more
 				_ => .None
 			}
@@ -293,7 +323,7 @@ extend Server {
 		val file = canonicalFile(document.path)
 		var base: Option<u32> = .None
 		for (name, _, start) in loaded.sources.entries() do
-			if base.isNone() && name.startsWith("/") && canonicalFile(name) == file then
+			if base.isNone() && onDisk(name) && canonicalFile(name) == file then
 				base = start
 
 		val .Some(start) = base else return .None

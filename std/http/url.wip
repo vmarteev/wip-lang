@@ -1,10 +1,13 @@
-// A URL as the client sends to it: a scheme, a host, a port, and the path
-// and query, which are sent as written. A fragment is the reader's, and is
-// not sent; credentials in a URL are refused rather than sent in the clear.
+// Where a request goes, as the client sends to it: a `Url` asked for its
+// scheme, `http` or `https`, its host, its port, and its path and query,
+// which are sent as written. A fragment is the reader's, and is not sent;
+// credentials in a URL are refused rather than sent in the clear.
+
+import std::url::{Url}
 
 /// Where a request goes.
 @derive(Eq, Clone)
-struct Url {
+struct Target {
 	/// `https`, where `http` is not.
 	secure: bool
 	/// A name, or an address; an IPv6 one without its brackets.
@@ -14,7 +17,7 @@ struct Url {
 	target: String
 }
 
-extend Url {
+extend Target {
 	/// What `Host` says: the host, in brackets where it is an IPv6 address,
 	/// and the port where it is not the scheme's.
 	fn hostHeader(): String = {
@@ -30,75 +33,50 @@ extend Url {
 	fn key(): String = "\(if self.secure then "https" else "http")://\(self.hostHeader())"
 }
 
-/// `text` taken apart, or why it cannot be sent to.
-fn parseUrl(text: str): Result<Url, HttpError> = {
-	val lower = text.toAsciiLower()
-	val (secure, rest) =
-		if lower.startsWith("http://") then (false, text[7..])
-		else if lower.startsWith("https://") then (true, text[8..])
-		else return .Err(.InvalidUrl("`\(text)` is not an http or https URL"))
-	var end = rest.len()
-	for at in 0..rest.len() {
-		val byte = rest[at]
-		if byte == b'/' || byte == b'?' || byte == b'#' {
-			end = at
-			break
-		}
+/// Where `url` leads, or why it cannot be sent to.
+fn target(url: &Url): Result<Target, HttpError> = {
+	val text = url.toStr()
+	val secure = match url.scheme() {
+		.Some(scheme) if scheme.toAsciiLower() == "http" => false
+		.Some(scheme) if scheme.toAsciiLower() == "https" => true
+		_ => return .Err(.InvalidUrl("`\(text)` is not an http or https URL"))
 	}
-	val authority = rest[0..end]
-	if authority.contains("@") then
+	if url.userInfo().isSome() then
 		return .Err(.InvalidUrl("credentials in a URL are not sent: `\(text)`"))
 
-	var host = authority
+	val host = match url.host() {
+		.Some(host) if !host.isEmpty() => host
+		_ => return .Err(.InvalidUrl("no host: `\(text)`"))
+	}
 	var port: u16 = if secure then 443 else 80
-	var portText = ""
-	if authority.startsWith("[") {
-		val .Some(close) = authority.indexOf("]") else {
-			return .Err(.InvalidUrl("an IPv6 address with no `]`: `\(text)`"))
-		}
-		host = authority[1..close]
-		val after = authority[close + 1..]
-		if !after.isEmpty() {
-			val .Some(digits) = after.stripPrefix(":") else {
-				return .Err(.InvalidUrl("`\(after)` after an IPv6 address: `\(text)`"))
-			}
-			portText = digits
-		}
-	} else if authority.indexOf(":") is .Some(colon) {
-		host = authority[0..colon]
-		portText = authority[colon + 1..]
+	if url.portText() is .Some(written) && !written.isEmpty() {
+		val .Some(number) = url.port() else return .Err(.InvalidUrl("port `\(written)`"))
+		if number < 1 then
+			return .Err(.InvalidUrl("port `\(written)`"))
+
+		port = number
 	}
-	if host.isEmpty() then
-		return .Err(.InvalidUrl("no host: `\(text)`"))
+	var path = String::of(url.path())
+	if path.isEmpty() then
+		path.push("/")
 
-	if !portText.isEmpty() {
-		val .Ok(number) = portText.toInt() else return .Err(.InvalidUrl("port `\(portText)`"))
-		if number < 1 || number > 65535 then
-			return .Err(.InvalidUrl("port `\(portText)`"))
-
-		port = number as u16
+	if url.query() is .Some(query) {
+		path.push("?")
+		path.push(query)
 	}
-	var target = rest[end..]
-	if target.indexOf("#") is .Some(hash) then
-		target = target[0..hash]
-
-	val path =
-		if target.isEmpty() then String::of("/")
-		else if target.startsWith("?") then "/\(target)"
-		else target
-	return Url(secure:, host:, port:, target: path)
+	return Target(secure:, host:, port:, target: path)
 }
 
 /// Where a redirect's `Location` leads from `base`: a URL of its own, one
 /// with no scheme, a path on the same host, or a path beside `base`'s.
-fn resolve(base: &Url, location: str): Result<Url, HttpError> = {
+fn resolve(base: &Target, location: str): Result<Target, HttpError> = {
 	val lower = location.toAsciiLower()
 	if lower.startsWith("http://") || lower.startsWith("https://") then
-		return parseUrl(location)
+		return target(parsed(location)?)
 
 	val scheme = if base.secure then "https" else "http"
 	if location.startsWith("//") then
-		return parseUrl("\(scheme):\(location)")
+		return target(parsed("\(scheme):\(location)")?)
 
 	var moved = base.clone()
 	if location.startsWith("/") then
@@ -119,4 +97,10 @@ fn resolve(base: &Url, location: str): Result<Url, HttpError> = {
 		moved.target = moved.target.toStr()[0..hash]
 
 	return moved
+}
+
+/// A `Location` read as a URL, or why it is not one.
+fn parsed(location: str): Result<Url, HttpError> = match Url::parse(location) {
+	.Ok(url) => url
+	.Err(error) => .Err(.InvalidUrl("`\(location)`: \(error)"))
 }

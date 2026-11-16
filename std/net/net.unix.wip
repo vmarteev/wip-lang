@@ -1,0 +1,155 @@
+// A Unix's sockets: each a descriptor, read and written as a file is, and
+// closed as one.
+
+import std::io
+import std::libc
+
+/// A socket: its descriptor.
+type Socket = c_int
+
+/// What a call that makes a socket answers where it fails.
+val NO_SOCKET: Socket = -1
+
+/// The system's sockets, started for as long as this is kept: which a
+/// Unix needs nothing to start or to stop.
+struct Sockets
+
+extend Sockets {
+	static fn started(): Result<Sockets, io::IoError> = Sockets()
+}
+
+extend Sockets: Destroy {
+	var fn destroy() = {}
+}
+
+fn closeSocket(socket: Socket) = {
+	libc::close(socket)
+}
+
+/// What has come, read into `into`: how many bytes, 0 at the end, and
+/// below 0 where it failed.
+fn received(socket: Socket, into: &var [u8]): i64 = libc::read(socket, &var into) as i64
+
+/// What the connection takes now of `bytes`: how many, below 0 where it
+/// failed.
+fn sent(socket: Socket, bytes: &[u8]): i64 = send(socket, &bytes, SEND_FLAGS) as i64
+
+/// Why the last call on a socket failed.
+fn socketError(): io::IoError = io::lastError()
+
+/// Whether something comes to read on `socket`, or its other end closes,
+/// within `millis`: a wait a signal cuts short is waited again.
+fn readableWithin(socket: Socket, millis: c_int): Result<bool, io::IoError> = {
+	var fds = [libc::PollFd(fd: socket, events: libc::POLLIN, answered: 0)]
+	while true {
+		val ready = libc::poll(&var fds, millis)
+		if ready >= 0 then
+			return ready > 0
+
+		if io::lastError() != .Interrupted then
+			return .Err(io::lastError())
+	}
+	return false
+}
+
+/// The number an event queue is given.
+fn descriptorOf(socket: Socket): i32 = socket
+
+/// A listener's address may be listened on again at once, while the last
+/// connection on it waits out its end.
+fn reusable(socket: Socket) = setOption(socket, SO_REUSEADDR)
+
+val F_GETFL: c_int = 3
+
+// A socket and a connection accepted are closed in a program started,
+// from the moment they are made: Linux marks them so as it makes them; a
+// Mac marks them once made, and starts a program with every descriptor
+// closed but those it is given, so no program another thread starts in
+// between is given them.
+
+extern "C" {
+	fn socket(family: c_int, kind: c_int, protocol: c_int): c_int
+	@symbol("bind")
+	fn bindTo(fd: c_int, address: ptr<u8>, length: u32): c_int
+	@symbol("bind")
+	fn bindLocal(fd: c_int, address: &SockAddr, length: u32): c_int
+	@symbol("connect")
+	fn connectTo(fd: c_int, address: ptr<u8>, length: u32): c_int
+	@symbol("connect")
+	fn connectLocal(fd: c_int, address: &SockAddr, length: u32): c_int
+	fn listen(fd: c_int, backlog: c_int): c_int
+	fn accept(fd: c_int, address: &var SockAddr, length: &var u32): c_int
+	fn getsockname(fd: c_int, address: &var SockAddr, length: &var u32): c_int
+	fn setsockopt(fd: c_int, level: c_int, name: c_int, value: &c_int, length: u32): c_int
+	fn getsockopt(fd: c_int, level: c_int, name: c_int, value: &var c_int, length: &var u32): c_int
+	fn shutdown(fd: c_int, how: c_int): c_int
+	fn send(fd: c_int, bytes: &[u8], flags: c_int): ssize_t
+	fn getaddrinfo(
+		host: cstring,
+		service: cstring,
+		hints: &AddrInfo,
+		answers: &var ptr<AddrInfo>,
+	): c_int
+	/// The same with no host: its pointer is null.
+	@symbol("getaddrinfo")
+	fn getaddrinfoLocal(
+		host: ptr<u8>,
+		service: cstring,
+		hints: &AddrInfo,
+		answers: &var ptr<AddrInfo>,
+	): c_int
+	fn freeaddrinfo(answers: ptr<AddrInfo>)
+}
+
+/// `fd` connected to `address`, waiting at most `millis`: the connection
+/// begun without waiting, then waited for with `poll`. Where it fails, or
+/// takes longer, `errno` says why.
+fn connectWithin(fd: c_int, address: ptr<u8>, length: u32, millis: c_int): bool = {
+	if setBlockingOf(fd, false).isErr() then
+		return false
+
+	if connectTo(fd, address, length) != 0 {
+		if libc::errno() != EINPROGRESS then
+			return false
+
+		var fds = [libc::PollFd(fd:, events: libc::POLLOUT, answered: 0)]
+		var ready = libc::poll(&var fds, millis)
+		while ready < 0 && libc::errno() == libc::EINTR do
+			ready = libc::poll(&var fds, millis)
+
+		if ready < 0 then
+			return false
+
+		if ready == 0 {
+			libc::errnoAt()[0] = libc::ETIMEDOUT
+			return false
+		}
+		var failed: c_int = 0
+		var size: u32 = 4
+		if getsockopt(fd, SOL_SOCKET, SO_ERROR, &var failed, &var size) != 0 then
+			return false
+
+		if failed != 0 {
+			libc::errnoAt()[0] = failed
+			return false
+		}
+	}
+	return setBlockingOf(fd, true).isOk()
+}
+
+fn setOption(fd: c_int, name: c_int) = {
+	val on = 1
+	setsockopt(fd, SOL_SOCKET, name, &on, 4)
+}
+
+fn setBlockingOf(fd: c_int, blocking: bool): Result<void, io::IoError> = {
+	val flags = libc::fcntl(fd, F_GETFL, 0)
+	if flags < 0 then
+		return .Err(io::lastError())
+
+	val wanted = if blocking then flags & !libc::O_NONBLOCK else flags | libc::O_NONBLOCK
+	if libc::fcntl(fd, libc::F_SETFL, wanted) < 0 then
+		return .Err(io::lastError())
+
+	return
+}
