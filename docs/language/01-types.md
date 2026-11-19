@@ -432,8 +432,9 @@ fn main() = {
 }
 ```
 
-A slice is a reference, so it is passed to a function rather than kept in a
-variable: references are second-class, which is [page 7](07-references.md).
+A slice is a reference: it is lent to a call, and may be kept in a local
+as a view is, while what it views does not change
+([page 7](07-references.md#a-reference-kept-as-a-view)).
 
 A container whose elements lie one after another — a `Vec`, a `String` as
 its bytes, anything that implements `Items` — is lent as them where a call

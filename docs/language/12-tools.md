@@ -21,15 +21,16 @@ tools written in Wip that it builds the first time they are asked for.
 It finds them from where `bin/wip` is, its links followed: the nearest
 directory above it that holds `std/`. `WIP_HOME` names another.
 
-Each version is published as such a directory for each system, archived:
-unpacked anywhere, with its `bin` on the `PATH`, it is installed. From a
-checkout of Wip's repository, `scripts/bootstrap.sh --out DIR`
-builds it into `DIR` with a `clang` 15 or newer and nothing of Wip's: the
-repository keeps the compiler, which is written in Wip, as LLVM's bitcode
-for each system, and `clang` compiles that into a first `wip`, which
-builds the compiler from its source. `scripts/build.sh --release --with
-WIP --out DIR` builds it from its source with a `wip` there is already.
-The `std/` and `tools/` beside either are links to the checkout's own.
+Each version is a tag of Wip's repository, its source and a seed for each
+system, and `wip` is built from a checkout of it:
+`scripts/bootstrap.sh --out DIR` builds it into `DIR` with a `clang` 15 or
+newer and nothing of Wip's, and on Windows `scripts\bootstrap.ps1 -Out
+DIR` does, with Visual Studio's. The seed is the compiler, which is
+written in Wip, as LLVM's bitcode, and `clang` compiles that into a first
+`wip`, which builds the compiler from its source. `scripts/build.sh
+--release --with WIP --out DIR` builds it from its source with a `wip`
+there is already. The `std/` and `tools/` beside either are links to the
+checkout's own, so the checkout stays where it is.
 
 ## What is compiled
 
@@ -68,9 +69,8 @@ program is run from, and a directory `-o` wrote is all a program handed to
 someone needs.
 
 The standard library is beside the compiler, so nothing is fetched. There
-is no package manager and no build file: the
-directories are the build, and a `package.wip` only names a package and
-says which others it uses.
+is no package manager and no build file: the directories are the build, and
+a `package.wip` only names a package and says which others it uses.
 
 ## The commands
 
@@ -99,18 +99,19 @@ many as are given, which sets a constant that says `@define` ([page
 
 A program is built for the machine `wip` runs on, or from a Mac for iOS
 ([below](#ios)), and may be checked for any target the standard library is
-written for: `wip check --target linux` reads the items under
-`@target(os = "linux")` and the `.linux.wip` files ([page 2](02-modules.md))
-on a Mac, and checks them as Linux would. The names are `macos-arm64`,
+written for: `wip check --target linux` reads the items under `@target(os =
+"linux")` and the `.linux.wip` files ([page 2](02-modules.md)) on a Mac,
+and checks them as Linux would. The names are `macos-arm64`,
 `macos-x86_64`, `linux-arm64`, `linux-x86_64`, `ios-arm64` and
 `ios-arm64-simulator`, and `windows-arm64` and `windows-x86_64`, whose
-library is being written module by module; `macos` and `linux` alone are
-on this machine's processor, and `ios` is the device; `all` is every one
-but the simulator, which answers as the device does, and Windows, and
-`--target` may be given more than once. A mistake several targets find is said once, and one that not every
-target finds says which did. What a check cannot see is what only the
-target's machine knows — how its C lays a struct out, which symbols its
-libraries have.
+library is a Unix's but for `std::users`, signals and `fork`, a Unix's
+alone, and `std::compress`, which needs a zlib Windows does not have;
+`macos`, `linux` and `windows` alone are on this machine's processor, and
+`ios` is the device; `all` is every one but the simulator, which answers as
+the device does, and `--target` may be given more than once. A mistake
+several targets find is said once, and one that not every target finds says
+which did. What a check cannot see is what only the target's machine knows
+— how its C lays a struct out, which symbols its libraries have.
 
 ### iOS
 
@@ -131,13 +132,12 @@ wip test --target ios-arm64-simulator game       # its tests, on iOS
   runs on, the A10, or the Mac's, for the simulator. The program, its C
   and its libraries are built for it; a library linked must have been
   built for iOS too.
-- **A package that says `@app`** ([page 2](02-modules.md)) is an app:
-  `wip build` writes `game/game.app`, or where `-o` says, a bundle holding
-  the program, its `Info.plist`, its icons, and every package's `@files`
-  beside the program, as on a Mac, where `package::besideProgram` finds
-  them. A device
-  runs only an app; the simulator runs a program that is not one as a
-  command, which is what `wip test` builds.
+- **A package that says `@app`** ([page 2](02-modules.md)) is an app: `wip
+  build` writes `game/game.app`, or where `-o` says, a bundle holding the
+  program, its `Info.plist`, its icons, and every package's `@files` beside
+  the program, as on a Mac, where `package::besideProgram` finds them. A
+  device runs only an app; the simulator runs a program that is not one as
+  a command, which is what `wip test` builds.
 - **Signed:** for the simulator, as every program a Mac builds is. For a
   device, by the developer's identity, under a provisioning profile that
   names the app's `id`, which `wip` finds among those Xcode keeps and puts
@@ -157,12 +157,11 @@ and, where it was built from a git checkout, the commit and its day:
 `wip 0.1.0 (a1b2c3d4e5f6 2026-10-05)`.
 
 `wip build`, `wip run` and `wip test` make a **debug build** unless
-`--release` asks for a **release build**. A debug build
-is not optimised, compiles a module's C `-O0 -g`, and checks moves;
-a release build is optimised, compiles the C `-O2 -g`,
-and does not check moves. The program does the same either way: arithmetic
-that overflows, an index out of bounds and an `assert` that fails panic in
-both.
+`--release` asks for a **release build**. A debug build is not optimised,
+compiles a module's C `-O0 -g`, and checks moves; a release build is
+optimised, compiles the C `-O2 -g`, and does not check moves. The program
+does the same either way: arithmetic that overflows, an index out of bounds
+and an `assert` that fails panic in both.
 
 Every build's code is **LLVM's**, which a `clang` of version 15 or newer
 compiles — the one `WIP_CLANG` names, or `clang`. On Windows, where Visual
@@ -189,34 +188,32 @@ what no call reaches once that is inlined: it runs some two times faster,
 and takes some seconds to build. The program does the same either
 way, and a panic lists the same calls.
 
-Every build is for a **processor**, which `--cpu` names.
-By default it is the baseline of the target's kind — x86-64-v2, which
-every x86-64 processor since 2008's Nehalem and 2011's Bulldozer has; the
-M1 on a Mac with Apple silicon, and for the simulator; the A10 for an
-iPad; and Armv8.0 elsewhere, which is a Raspberry Pi 4 — so that a program
-built on one machine runs on another.
-`--cpu native` builds for this machine alone, with every feature it has,
-and a level may be named, as `x86-64-v3` or `armv8.1`. The program does
-the same on each, only faster where the processor has an instruction for
-what it would otherwise do in several, or call C for; its C is compiled
+Every build is for a **processor**, which `--cpu` names. By default it is
+the baseline of the target's kind — x86-64-v2, which every x86-64 processor
+since 2008's Nehalem and 2011's Bulldozer has; the M1 on a Mac with Apple
+silicon, and for the simulator; the A10 for an iPad; and Armv8.0 elsewhere,
+which is a Raspberry Pi 4 — so that a program built on one machine runs on
+another. `--cpu native` builds for this machine alone, with every feature
+it has, and a level may be named, as `x86-64-v3` or `armv8.1`. The program
+does the same on each, only faster where the processor has an instruction
+for what it would otherwise do in several, or call C for; its C is compiled
 for the same processor.
 
-Both builds write **debug information**: the line each
-piece of code was written at, and each function's name and place, so that
-lldb and gdb stop at `main.wip:12`, step by line, and name the function
-and line of every frame, and a profiler gives time to lines. A debug build
-describes its variables and parameters too, with their types: each is
-kept in memory while it is in scope, where the debugger shows it and may
-change it. A release build describes every one of them as well,
-where the optimised code keeps them: a variable whose value is in a
-register for part of its scope is shown there, one LLVM computed away is
-`<optimized out>`, and so is one it kept only in part — a `String` whose
-length it kept and whose bytes' address it did not. A value held in
-several pieces, as a `Vec` or a `Map` is, may be shown as it was rather
-than as it is: where the optimised code keeps a piece in a register and
-never stores it back, LLVM may still say the piece is in memory, and the
-debugger reads what was stored there last. Optimised C and C++ carry the
-same caveat; a debug build has none.
+Both builds write **debug information**: the line each piece of code was
+written at, and each function's name and place, so that lldb and gdb stop
+at `main.wip:12`, step by line, and name the function and line of every
+frame, and a profiler gives time to lines. A debug build describes its
+variables and parameters too, with their types: each is kept in memory
+while it is in scope, where the debugger shows it and may change it. A
+release build describes every one of them as well, where the optimised code
+keeps them: a variable whose value is in a register for part of its scope
+is shown there, one LLVM computed away is `<optimized out>`, and so is one
+it kept only in part — a `String` whose length it kept and whose bytes'
+address it did not. A value held in several pieces, as a `Vec` or a `Map`
+is, may be shown as it was rather than as it is: where the optimised code
+keeps a piece in a register and never stores it back, LLVM may still say
+the piece is in memory, and the debugger reads what was stored there last.
+Optimised C and C++ carry the same caveat; a debug build has none.
 
 `wip debug program` starts the debugger with **formatters**, small scripts
 the compiler carries, that show a value as Wip means it rather than as it
@@ -242,9 +239,9 @@ and a `Deque` their elements, and an enum the variant it holds. An editor's
 debugger loads the same scripts: `wip debug --scripts` prints where they
 are, for lldb's `command script import` or gdb's `source`. On a Mac it is
 gathered into `program.dSYM`, beside the program, where lldb looks for it.
-On Linux a debug build keeps it in the program, and a release build moves it
-into `program.debug`, beside the program, which the program names and gdb
-reads; it takes `objcopy`, which comes with the C toolchain.
+On Linux a debug build keeps it in the program, and a release build moves
+it into `program.debug`, beside the program, which the program names and
+gdb reads; it takes `objcopy`, which comes with the C toolchain.
 
 `--no-debug-info` writes none, as `cc -g0` does: the program does what it
 does, and is smaller, but a panic says where it was without the calls
@@ -377,13 +374,13 @@ wip fmt - --stdin-path src/main.wip < buffer.wip
 ## Documentation
 
 `wip doc` writes a program's documentation as pages, from what its source
-says of itself: every `pub` item's declaration as it is
-written, and the `///` lines above it. A page is a module's, or a type's
-with its methods — those of every `extend` block for it — and the
-interfaces it implements; a module's files are its sections, each with
-the `//` paragraph the file begins with. A type's name in a declaration
-links to its page. The pages are plain HTML, read from the disk, with an
-index of every module and every item by name.
+says of itself: every `pub` item's declaration as it is written, and the
+`///` lines above it. A page is a module's, or a type's with its methods —
+those of every `extend` block for it — and the interfaces it implements; a
+module's files are its sections, each with the `//` paragraph the file
+begins with. A type's name in a declaration links to its page. The pages
+are plain HTML, read from the disk, with an index of every module and every
+item by name.
 
 A comment is prose: a blank `///` line parts paragraphs, `` `code` `` is
 code, and a line indented four spaces more is an example. Nothing else is
@@ -412,25 +409,24 @@ documentation.
 
 ## Editors
 
-`wip lsp` is a language server, which the Zed extension
-and the Neovim plugin in `editors/` start. It shows what `wip check`
-would as you type, in the files you have not saved too; offers a
-diagnostic's fix where it has one; formats as `wip fmt` does; gives each
-file an outline of its declarations; shows what a name is, with the `///`
-comment above its declaration; goes to where it was declared, in the
-standard library's sources too; and completes what you are typing: a
-value's fields and methods after `.`, a module's items after `::`, what
-the type expected has after a leading `.` (an enum's variants, and, in a
-value, the type's functions that answer it), and the names in scope. It finds every reference to a name, across the
-packages that use it, renames one everywhere it is written, and shows a
-call's signature as its arguments are typed.
+`wip lsp` is a language server, which the Zed extension and the Neovim
+plugin in `editors/` start. It shows what `wip check` would as you type, in
+the files you have not saved too; offers a diagnostic's fix where it has
+one; formats as `wip fmt` does; gives each file an outline of its
+declarations; shows what a name is, with the `///` comment above its
+declaration; goes to where it was declared, in the standard library's
+sources too; and completes what you are typing: a value's fields and
+methods after `.`, a module's items after `::`, what the type expected has
+after a leading `.` (an enum's variants, and, in a value, the type's
+functions that answer it), and the names in scope. It finds every reference
+to a name, across the packages that use it, renames one everywhere it is
+written, and shows a call's signature as its arguments are typed.
 
-A file is checked as part of its program: the package whose
-`package.wip` is nearest above it; or else the program of the highest
-directory above it whose modules import the file's, which is its own
-directory when none does. Every edit checks that program again,
-whole. A file no program reaches, such as one of the standard library's,
-is only parsed.
+A file is checked as part of its program: the package whose `package.wip`
+is nearest above it; or else the program of the highest directory above it
+whose modules import the file's, which is its own directory when none does.
+Every edit checks that program again, whole. A file no program reaches,
+such as one of the standard library's, is only parsed.
 
 ## Tests
 
@@ -710,14 +706,14 @@ take a comment out of the loop's words; one between the vector and its
 loop goes into the list.
 
 One error's fix is made too: a reference passed to a call by its name
-without the `&` that lends it (E0476), which `&` makes the program its
-code meant before a call asked for it — what moving code written then
-takes. A program with other errors is left as it is; the fixes of errors,
-and of the warnings whose fix changes what a program does, are offered in
-an editor and made by hand. `--check` writes nothing, and fails where something
-would change. `--target`, as `wip check` takes it, fixes what each target
-it names finds, so that code for another system is fixed with the rest:
-`wip fix --target all`.
+without the `&` that lends it (E0476), which `&` makes the program its code
+meant before a call asked for it — what moving code written then takes. A
+program with other errors is left as it is; the fixes of errors, and of the
+warnings whose fix changes what a program does, are offered in an editor
+and made by hand. `--check` writes nothing, and fails where something would
+change. `--target`, as `wip check` takes it, fixes what each target it
+names finds, so that code for another system is fixed with the rest: `wip
+fix --target all`.
 
 ### The checked program
 
@@ -755,9 +751,9 @@ constants first, each with its value once its code has run, as `--dump-hir`
 writes a value; then every function of the program's own modules, called or
 not, and every instance it made of a generic function, each as the build
 compiles it, with each `@inline` call spliced in; then the function that
-drops each type those drop, each once. The standard library's own
-functions are the same in every program and are left out, unless
-`--library` asks for them too. A debug build drops a struct by a
-call to the function that drops its type; with `--release`, what a release
-build compiles: each field dropped where it is, and a small struct's fields
-kept apart. A program with errors writes them, and no IR.
+drops each type those drop, each once. The standard library's own functions
+are the same in every program and are left out, unless `--library` asks for
+them too. A debug build drops a struct by a call to the function that drops
+its type; with `--release`, what a release build compiles: each field
+dropped where it is, and a small struct's fields kept apart. A program with
+errors writes them, and no IR.

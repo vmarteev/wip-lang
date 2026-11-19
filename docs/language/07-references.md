@@ -839,8 +839,9 @@ fn main() = {}
 ```
 
 `keeps` names parameters that are not `&var`, in a function that has a
-`&var` parameter to keep them in. A method's receiver is named `self`, where it is `&` or a value — a `fn`
-or a `move fn`, not a `var fn`, whose receiver is lent for writing: a
+`&var` parameter to keep them in. A method's receiver is named `self`,
+where it is `&` or a value — a `fn` or a `move fn`, not a `var fn`, whose
+receiver is lent for writing: a
 method that fills a list with views of what it holds keeps `self`, and
 the list then borrows the receiver. An interface's method says what it
 keeps, and an implementation keeps no more; a call through a function

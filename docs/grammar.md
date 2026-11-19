@@ -135,8 +135,8 @@ The built-in type names are **not** keywords: `i8` `i16` `i32` `i64` `i128`
 `isize` `u8` `u16` `u32` `u64` `u128` `usize` `f32` `f64` `bool` `str`
 `cstring` `void` `never`, and C's own names `c_char` `c_schar` `c_uchar`
 `c_short` `c_ushort` `c_int` `c_uint` `c_long` `c_ulong` `c_longlong`
-`c_ulonglong` `c_float` `c_double` `size_t`, which stand for the integer
-types C uses on the target. They are identifiers that name built-in types;
+`c_ulonglong` `c_float` `c_double` `size_t` `ssize_t` `intptr_t`
+`uintptr_t`, which stand for the types C uses on the target. They are identifiers that name built-in types;
 declaring a type with one of those names is an error.
 
 ### Punctuation
@@ -325,9 +325,10 @@ extendType  = path generics?              (* a type of this module, or an
 
 interfaceDecl = "interface" IDENT generics?
                 "{" ( ifaceMethod ( lsep ifaceMethod )* lsep? )? "}" ;
-ifaceMethod = ( "var" | "move" | "static" )? "fn" IDENT generics?
-              "(" params? ")" ( ":" type )? ( "=" expr )? ;
-            (* `= expr` is a default body *)
+ifaceMethod = ( "var" | "move" | "static" )? fnSig ( "=" expr )? ;
+            (* a signature as a function's, and `= expr` a default body; no
+               `lend`, since an interface asks for one half of a lending
+               pair alone *)
 
 member      = field | variant | method | typeConst ;   (* in any order *)
 typeConst   = annotation* "pub"? valDecl ;   (* a constant of the type,
@@ -339,8 +340,9 @@ method      = annotation* "pub"? ( "var" | "move" | "static" | "lend" )? fnDecl 
                                             method does with its receiver;
                                             `lend` both ways *)
 
-fnDecl      = "fn" IDENT generics? "(" params? ")" ( ":" type ( "as" IDENT )? lendsFrom? )? keeps?
-              "empties"? assertExpr* "=" expr ;
+fnDecl      = fnSig "=" expr ;
+fnSig       = "fn" IDENT generics? "(" params? ")" ( ":" type ( "as" IDENT )? lendsFrom? )? keeps?
+              "empties"? assertExpr* ;
                                          (* `empties`: a call leaves the
                                             receiver, a `var fn`'s, holding no
                                             view; a word here alone *)
@@ -418,14 +420,18 @@ type        = "own" "<" type ">"           (* `own<(…) => R>` is an owned
                                               closure *)
             | "ptr" "<" type ">"           (* a C pointer; `ptr<void>` is
                                               `void *` *)
-            | "&" "var"? type             (* parameters only;
-                                              `&(…) => R` is a closure, lent for
-                                              one call *)
+            | "&" "var"? type             (* `&var` a parameter's, or a
+                                              projection's result; `&` also
+                                              kept as a view is, in a local,
+                                              a view's field or a type
+                                              argument; `&(…) => R` is a
+                                              closure, lent for one call *)
             | "[" type ";" ( INT | IDENT ) "]"
                                            (* a length is a literal, a
                                               constant or a length parameter;
                                               no arithmetic *)
-            | "[" type "]"                 (* a slice: only behind "&" *)
+            | "[" type "]"                 (* a slice: only behind "&" or
+                                              "own", `own<[T]>` a buffer *)
             | "dyn" path typeArgs?         (* some type that implements the interface:
                                               only behind "&" *)
             | "(" ( param ( "," param )* ","? )? ")" "=>" type
@@ -519,9 +525,13 @@ postfix     = primary ( "." fieldName typeArgs? | "." INT | "(" args? ")" | "[" 
                function type; `Type::name(…)` a static function *)
             (* typeArgs after a fieldName where R7 allows: the method's own,
                `x.decode<T>(…)` *)
-index       = expr | ".." expr? | expr ".." | "..=" expr ;  (* a range must be borrowed: &xs[lo..hi];
-                                           on a type of one's own, `x[i]` calls the
-                                           `at` of `Index` *)
+index       = expr | ".." expr? | expr ".." | "..=" expr ;
+                                         (* a range of elements is lent where
+                                           it is used: `&xs[lo..hi]` to a
+                                           call, and as it stands to a loop,
+                                           a comparison or a method; on a
+                                           type of one's own, `x[i]` calls
+                                           the `at` of `Index` *)
 primary     = lambda
             | INT | FLOAT | STRING | CHAR | BYTE | INTERP | "true" | "false"
             | pathExpr
@@ -580,7 +590,7 @@ pathExpr    = "." IDENT | exprPath ;    (* "." names a variant of the type
                                            module *)
 exprPath    = IDENT typeArgs? ( "::" IDENT typeArgs? )* ;
             (* at most one typeArgs, after the generic item's name, and only
-               where R7 allows: f<i64>(x), Pair<A, B> { … }, Option<i64>::None *)
+               where R7 allows: f<i64>(x), Pair<A, B>(…), Option<i64>::None *)
 
 arrayLit    = "[" ( element ( ";" expr | ( "," element )* ","? ) )? "]" ;
 element     = expr | forElement ;
@@ -675,7 +685,7 @@ From tightest to loosest. All binary operators are left-associative except
 |---|---|---|
 | 1 | postfix `.f`  `f(…)`  `a[i]` | left |
 | 2 | prefix `-`  `!`  `&`  `move`  `own` | right (prefix) |
-| 3 | `as` | left |
+| 3 | `as`  `as%` | left |
 | 4 | `*`  `/`  `%`  `*%` | left |
 | 5 | `+`  `-`  `+%`  `-%` | left |
 | 6 | `<<`  `>>` | left |
@@ -762,12 +772,12 @@ parentheses.
 
 ### R8 — `(` before `=>`
 
-A `(` whose matching `)` is followed by `=>`, or by `:` and then `=>`
-after a type, begins a lambda; any other `(` begins parentheses or a
-tuple. In a match arm's guard, and in a `when` arm's condition, the `=>`
-after a `)` at its top level is the arm's, so its `( … )` is parentheses
-there, even around one name: `n if (n < 5) => …`, `(ready) => go()`. A lambda inside the guard's
-parentheses, brackets or arguments is still one: `_ if
+A `(` whose matching `)` is followed by `=>`, or by `:` and then `=>` after
+a type, begins a lambda; any other `(` begins parentheses or a tuple. In a
+match arm's guard, and in a `when` arm's condition, the `=>` after a `)` at
+its top level is the arm's, so its `( … )` is parentheses there, even
+around one name: `n if (n < 5) => …`, `(ready) => go()`. A lambda inside
+the guard's parentheses, brackets or arguments is still one: `_ if
 values.any((v) => v > 0) => …`.
 
 Otherwise `<` is a comparison. The parser looks ahead no further than the

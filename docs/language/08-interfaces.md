@@ -355,15 +355,14 @@ the copy leaves the original as it was. What owns no memory — a number,
 a `bool`, a `char`, a `str`, a plain struct, a tuple or an array of them —
 is its own clone without being told: its clone is a copy, and it is taken
 where `Clone` is asked for. `@derive(Clone)` on such a type says nothing,
-and is warned of with the fix that takes it away; a generic type keeps
-it where some argument it may take owns memory. A generic type clones where its
-fields do, so a `Vec<T>` field clones where `T` does.
-Each field is cloned as a value of its own type —
-`cloneOf(&self.field)`, which the prelude has — so a view's field that is
-a `&T` is the reference copied, which asks nothing of `T`, and what the
-view owns is cloned.
-A field whose type does not clone — an `own<T>` of what does not, among
-them — is reported where it is written:
+and is warned of with the fix that takes it away; a generic type keeps it
+where some argument it may take owns memory. A generic type clones where
+its fields do, so a `Vec<T>` field clones where `T` does. Each field is
+cloned as a value of its own type — `cloneOf(&self.field)`, which the
+prelude has — so a view's field that is a `&T` is the reference copied,
+which asks nothing of `T`, and what the view owns is cloned. A field whose
+type does not clone — an `own<T>` of what does not, among them — is
+reported where it is written:
 
 ```wip,run
 @derive(Clone)
@@ -591,8 +590,9 @@ fn main() = {
 }
 ```
 
-`&dyn` is a reference, so it is second-class like any other: it is passed to
-a call and not kept ([page 7](07-references.md)). A generic parameter is the
+`&dyn` is a reference like any other: lent to a call, or kept as a view
+is, in a local, a view's field or a type's arguments, while what it points
+at stays as it is ([page 7](07-references.md)). A generic parameter is the
 other way to write the same thing, and compiles to a direct call per type;
 `&dyn` compiles to one function for all of them.
 
@@ -683,6 +683,9 @@ interface Measured {
 | `IntoIterator<type Iter>` | a container that gives its elements up, as the iterator `Iter`: `for x in move container` ([page 4](04-expressions.md)) |
 | `Sequence<type Item>` | `len()` and `at(i)`, both constant time: `x[i]` and `for` |
 | `Index<K, type V>` | a lookup whose key is not a position |
+| `Collect<T>` | a collection a list literal makes where one is expected ([page 1](01-types.md#arrays-and-slices)) |
+| `Template` | what an interpolated literal builds where one is expected ([page 4](04-expressions.md#what-a-literal-builds)) |
+| `Encode`, `Decode` | a value written to a format and read back, through an `Encoder` and a `Decoder` (above) |
 | `From<T>` | a value made from another, which `?` uses ([page 9](09-errors.md)) |
 | `Add`, `Subtract`, `Multiply`, `Divide`, `Remainder` | `+`, `-`, `*`, `/` and `%`, with what is on the other side and what the answer is: every number has them, and a type of a program's own may |
 | `Negate`, `Not` | `-x` and `!x`: every signed number and float negates |

@@ -3,6 +3,17 @@
 The library is in two halves: the **prelude**, which every file sees without
 an import, and the modules under `std`, which are imported. The prelude's
 names are reserved, so `Option` means the same type in every program.
+The prelude and the collections are on this page, and the rest of `std`
+on three more:
+
+- [10.1. Threads](10-library-threads.md): `std::future`, and work that
+  borrows — `both`, `each`, `map` — and `std::sync`.
+- [10.2. The system](10-library-system.md): arguments, logs, time,
+  random numbers, other programs, files and directories, watching them,
+  files embedded, and what the target is.
+- [10.3. Connections and formats](10-library-formats.md): `std::net`,
+  HTTP and TLS, compression, JSON, bytes, base64, hex and URLs, HTML and
+  XML, regular expressions, secrets and digests.
 
 ## `Option` and `Result`
 
@@ -97,11 +108,12 @@ fn main() = {
 ```
 
 `at(i)` is the lending pair behind `v[i]`, and `get(i)` the element or
-nothing where `v[i]` would panic; `items()` lends the whole as a slice, and `v[a..b]` is a range of that slice, as an array's is. A
-container whose `x[i]` is a position and which lends its elements as one
-slice — a `Sequence` and an `Items` — is ranged so: a `Set` by the order
-its keys went in, and a type of a program's own. `truncate`, `clear` and
-`reserve` are there, and a `Vec` ends what it holds when it ends.
+nothing where `v[i]` would panic; `items()` lends the whole as a slice, and
+`v[a..b]` is a range of that slice, as an array's is. A container whose
+`x[i]` is a position and which lends its elements as one slice — a
+`Sequence` and an `Items` — is ranged so: a `Set` by the order its keys
+went in, and a type of a program's own. `truncate`, `clear` and `reserve`
+are there, and a `Vec` ends what it holds when it ends.
 
 `last()` answers the last value, or nothing; `atLast()` lends it where it
 lies, to read or to write, as the top of a stack is, and an empty vector
@@ -191,25 +203,25 @@ fn main() = {
 ```
 
 `map`, `flatMap`, `fold`, `indexWhere` and `lastIndexWhere`, `take` and
-`skip` work on any elements. An array has these methods too, and its
-`map` answers an array of its length, allocating nothing: `[1, 2,
-3].map((n) => n * 10)` is an `[i64; 3]`; a part of it, `xs[0..2]`, maps
-to a vector, as a slice does. A slice's methods answer by what they do:
-what picks an element where it lies lends it — `first`, `last`, `find`,
-`minBy` and `maxBy`, the element whose key is least or greatest, the first
-of equals, and `take` and `skip`, a part of the slice — for any elements;
-what works out a value answers it — `min` and `max` a clone, `sum` and
-`product` of plain data, `count`, `countWhere`. `find` answers what it finds, and a
-position is `indexOf`, on a slice, text, a `Map` and a `Set` alike. `sum` and `product`
-add up and multiply elements that implement `Add` and `Zero`, or
-`Multiply` and `One`, as every number does: nothing sums to zero and
-multiplies to one. `filter`, `partition`, `min` and `max` clone the
-elements they answer, as `toVec` does, so they are there for any element
-that clones: plain data is copied, and a value that owns memory cloned; a
-vector that would clone none keeps what it wants in place with `retain`. `join` writes each
-element as text, and `joinTo(&var out, separator)` writes them onto a
-`String` there is; every sequence has `joinToBy`, which writes each element
-as a closure says — a `Deque`, a map's values, a slice of pairs.
+`skip` work on any elements. An array has these methods too, and its `map`
+answers an array of its length, allocating nothing: `[1, 2, 3].map((n) =>
+n * 10)` is an `[i64; 3]`; a part of it, `xs[0..2]`, maps to a vector, as a
+slice does. A slice's methods answer by what they do: what picks an element
+where it lies lends it — `first`, `last`, `find`, `minBy` and `maxBy`, the
+element whose key is least or greatest, the first of equals, and `take` and
+`skip`, a part of the slice — for any elements; what works out a value
+answers it — `min` and `max` a clone, `sum` and `product` of plain data,
+`count`, `countWhere`. `find` answers what it finds, and a position is
+`indexOf`, on a slice, text, a `Map` and a `Set` alike. `sum` and `product`
+add up and multiply elements that implement `Add` and `Zero`, or `Multiply`
+and `One`, as every number does: nothing sums to zero and multiplies to
+one. `filter`, `partition`, `min` and `max` clone the elements they answer,
+as `toVec` does, so they are there for any element that clones: plain data
+is copied, and a value that owns memory cloned; a vector that would clone
+none keeps what it wants in place with `retain`. `join` writes each element
+as text, and `joinTo(&var out, separator)` writes them onto a `String`
+there is; every sequence has `joinToBy`, which writes each element as a
+closure says — a `Deque`, a map's values, a slice of pairs.
 
 A list is made from what is walked without a loop: an
 iterator's `toVec()` collects what it hands out, and a slice's clones its
@@ -345,9 +357,9 @@ bytes back as a `str`; `toCstring()` makes the zero-terminated kind C wants
 
 A `String` is lent as a `str` wherever its text is read for a call: an
 argument where a `str` or a `&str` is expected, the receiver of a method
-`str` has, a slice of it, and a side of a comparison with text. Nowhere else
-— a `str` kept in a variable or a field would outlive the bytes — so there
-it is written `toStr()`:
+`str` has, a slice of it, and a side of a comparison with text. Nowhere
+else: a `str` kept in a variable or a field borrows the `String`, and is
+written `toStr()`, which says where the bytes are looked at:
 
 ```wip,run
 val KNOWN = ["open", "edit"]
@@ -502,17 +514,17 @@ fn main() = {
 ### Reading text from the front: `std::text::Scanner`
 
 A parser reads its text through a `Scanner`: the text and `at`, the byte
-offset of what is read next. `peek()` is the byte there, or nothing at
-the end, and `peekAt(n)` one further on; `next()` takes it; `take(byte)`
-and `takeText(text)` take what comes next only where it is that, and say
-whether they did, and `takeTextAnyCase(text)` where it is that in any
-case, as `startsWithAnyCase` compares. `skipWhile(test)` goes past the bytes a test holds for,
-and `takeWhile(test)` answers them; `since(start)` is the text from a
-position to here, the token just read, and `rest()` what is left.
-`peekChar()` and `nextChar()` read a character, where a format lets one be
-anything, and `peekCharAt(n)`, `takeChar(c)`, `skipWhileChar(test)` and
-`takeWhileChar(test)` are the byte operations' twins in characters, for a
-name or a text that may hold any. `peekCharAt(n)` counts characters, and
+offset of what is read next. `peek()` is the byte there, or nothing at the
+end, and `peekAt(n)` one further on; `next()` takes it; `take(byte)` and
+`takeText(text)` take what comes next only where it is that, and say
+whether they did, and `takeTextAnyCase(text)` where it is that in any case,
+as `startsWithAnyCase` compares. `skipWhile(test)` goes past the bytes a
+test holds for, and `takeWhile(test)` answers them; `since(start)` is the
+text from a position to here, the token just read, and `rest()` what is
+left. `peekChar()` and `nextChar()` read a character, where a format lets
+one be anything, and `peekCharAt(n)`, `takeChar(c)`, `skipWhileChar(test)`
+and `takeWhileChar(test)` are the byte operations' twins in characters, for
+a name or a text that may hold any. `peekCharAt(n)` counts characters, and
 reads the ones before it to find it. The byte operations read a syntax of
 ASCII faster, since they decode nothing. What these answer borrows the
 text, not the scanner, so a token is kept while reading goes on, and `at`
@@ -564,9 +576,8 @@ fn main() = {
 ## Walking: `Items`, `Iterator` and the adapters
 
 A container that can be walked as a slice implements `Items<T>`, which is
-what `for x in container` uses. Values that come
-one at a time implement `Iterator<T>`, whose adapters and consumers are in
-the prelude:
+what `for x in container` uses. Values that come one at a time implement
+`Iterator<T>`, whose adapters and consumers are in the prelude:
 
 ```wip,run
 fn main() = {
@@ -614,20 +625,18 @@ fn main() = {
 `copies()` hands out copies, so its elements are plain data, which is what
 `sum` and arithmetic on them want; `forwards()` and `backwards()` lend
 them, `&T`, so they walk any list, from the first element or from the last;
-`indexed()` lends them from the first, each in a pair with its position from
-0, `(i64, &T)`. It is the walk `forwards().enumerate()` makes, which is
-warned of on a list, with the fix that writes `indexed()` (E0482); an
+`indexed()` lends them from the first, each in a pair with its position
+from 0, `(i64, &T)`. It is the walk `forwards().enumerate()` makes, which
+is warned of on a list, with the fix that writes `indexed()` (E0482); an
 `enumerate()` after `backwards()` or `copies()` counts what they hand out,
-and stays.
-Over values that own memory, `copies()` is refused, and names `forwards()`.
-Three walks, then, by what they do: they lend, they copy, or — `for x in
-move c` and `intoIterator()` — they take.
+and stays. Over values that own memory, `copies()` is refused, and names
+`forwards()`. Three walks, then, by what they do: they lend, they copy, or
+— `for x in move c` and `intoIterator()` — they take.
 
-The adapters are `map`, `filter`, `filterMap` — what a closure makes of
-an element, where it makes something — `flatMap`, `flatten` where the
-elements are iterators, `enumerate`, `take`,
-`takeWhile`, `skip`, `chain`, `zip` and `peekable`. The consumers are
-`count`, `toVec`, `find`, `findMap`,
+The adapters are `map`, `filter`, `filterMap` — what a closure makes of an
+element, where it makes something — `flatMap`, `flatten` where the elements
+are iterators, `enumerate`, `take`, `takeWhile`, `skip`, `chain`, `zip` and
+`peekable`. The consumers are `count`, `toVec`, `find`, `findMap`,
 `position`, `nth`, `last`, `any`, `all`, `fold`, `forEach`, `minBy` and
 `maxBy`. `nth` passes over the elements before the one it answers, and the
 iterator goes on after it.
@@ -764,733 +773,6 @@ An iterator of a program's own is most easily a generator: a loop that
 yields where a value stands, or a function that answers `Iterator<T>`
 ([page 4](04-expressions.md#generators)).
 
-## Work on another thread: `std::future`
-
-`Future::run` runs an owned closure on a thread of its own, and hands
-back a `Future<T>` of what it answers: `get()` waits for it, `poll()`
-takes it if it is there without waiting, `pollWithin(duration)` waits for
-it that long at most, and `isDone()` says whether the work has finished.
-A channel moves values between threads; its receiver is an `Iterator`,
-which a loop reads until every sender is gone. `tryReceive()` answers a
-`Received` — a `Value`, `Empty` or `Closed` — without waiting, and
-`receiveWithin(duration)` the same once a value comes or the time is up:
-
-```wip,run
-import std::future::{Future, channel}
-
-fn main() = {
-    val data = Vec::of([1, 2, 3, 4])
-    val sum = Future::run(own () => {
-        var total = 0
-        for x in data do
-            total += x
-
-        total
-    })
-    assert(sum.get() == 10)
-
-    val (tx, rx) = channel<String>()
-    val producer = Future::run(own () => {
-        for i in 0..3 do
-            tx.send("line \(i)")
-    })
-    var lines = 0
-    for line in move rx do
-        lines += 1
-
-    assert(lines == 3)
-}
-```
-
-What the closure captured is moved into it, and is the thread's alone: an
-owned closure cannot hold a reference or a view, so nothing two threads
-could both reach is ever shared, and nothing needs a lock. A future that is
-dropped waits for its thread, so work never outlives what started it.
-
-## Work that borrows: `both`, `each`, `map` and `std::sync`
-
-Work may also borrow what is around it, where the call that runs it waits
-for it. `future::both(first, second)` runs `first` on
-a thread of its own and `second` on this one, and answers both results
-once both are done; `future::each(items, work)` and `future::map(items,
-work)` split a slice among the processors, as many as `future::cores()`
-says are working. The closures are lent for the
-call, so what they capture is checked as the call's arguments are: what
-one writes, no other touches, and several may read one place. `each` and
-`map` call one closure from every thread at once, so it reads,
-`&(…) => R`, and one that writes is refused there.
-
-Two types change through a `&`, safely from any number of threads:
-`std::sync::Atomic<T>` — `load`, `store`, `swap`, `add`, `subtract` and
-`replaceIf`, each one step no thread sees half of — for `bool`, the
-integers and floats, and C pointers, and `Mutex<T>`, whose `lock` lends what is inside as a `&var`
-for its call alone, and whose `lockWhen` waits until it is ready:
-
-```wip,run
-import std::future
-import std::sync::{Atomic, Mutex}
-
-fn sum(values: &[i64]): i64 = {
-    var total = 0
-    for value in values do
-        total += value
-
-    return total
-}
-
-fn main() = {
-    val numbers = [1, 2, 3, 4, 5, 6, 7, 8]
-    val (low, high) = future::both(
-        () => sum(&numbers[0..4]),
-        () => sum(&numbers[4..]),
-    )
-    assert(low + high == 36)
-
-    val counted = Atomic::of(0 as i64)
-    var cells = [1, 1, 1, 1]
-    future::each(&var cells, (cell) => {
-        cell *= 2
-        counted.add(1)
-    })
-    assert(counted.load() == 4 && cells[0] == 2)
-    assert(future::cores() >= 1)
-
-    val names: Mutex<Vec<String>> = Mutex::of(Vec())
-    future::both(
-        () => names.lock((all) => all.push("ann")),
-        () => names.lock((all) => all.push("bob")),
-    )
-    assert(names.lock((all) => all.len()) == 2)
-}
-```
-
-A wait may give up. `lockWhenWithin(ready, duration, body)` waits as
-`lockWhen` does, for that long at most, and answers what `body` answered,
-or nothing where it was not ready in time; a wait woken before its time,
-and still not ready, waits out the rest. The time is measured on the clock
-that only goes forward, so setting the time of day changes no wait.
-`tryLock(body)` runs `body` only where no other thread holds the lock, for
-a thread that has other work meanwhile. `sync::Lazy<T>` is a value made
-by the first thread that asks for it, by the closure it was made with,
-and lent to every thread after: a field of what the threads share, made
-only where one of them needs it. `get()` answers it, and `made()` answers
-it only where it is made already:
-
-```wip,run
-import std::future
-import std::sync::{Lazy, Mutex}
-import std::time::{Duration}
-
-struct Shared {
-    words: Lazy<Vec<String>>
-}
-
-fn main() = {
-    val queue: Mutex<Vec<i64>> = Mutex::of(Vec())
-    val waited = queue.lockWhenWithin(
-        (jobs) => !jobs.isEmpty(),
-        Duration::millis(10),
-        (jobs) => jobs.pop(),
-    )
-    assert(waited.isNone())
-    assert(queue.tryLock((jobs) => jobs.len()) == .Some(0))
-
-    val shared = Shared(
-        words: Lazy::of(own () => {
-            var words: Vec<String> = Vec()
-            for word in "a b c".split(" ") do
-                words.push(word)
-
-            return words
-        }),
-    )
-    assert(shared.words.made().isNone())
-    val (first, second) = future::both(
-        () => shared.words.get().len(),
-        () => shared.words.get().len(),
-    )
-    assert(first == 3 && second == 3)
-}
-```
-
-An atomic operation is sequentially consistent unless it is given an
-order: every thread agrees on one order of every such operation, which is
-what a counter or a flag needs and the easiest to get right. Code written
-lock-free names the weaker order it relies on, which costs less where the
-processor orders less by itself — on x86-64 a sequentially consistent
-store is a locked exchange, and a release store a plain one. A load takes
-a `LoadOrder` — `.Relaxed`, `.Acquire` or `.SeqCst` — a store a
-`StoreOrder` — `.Relaxed`, `.Release` or `.SeqCst` — and the rest an
-`Order`, any of the five, `.AcqRel` among them; an order an operation
-cannot take is a type error. `sync::fence(order)` orders this thread's
-reads and writes against other threads' atomics with nothing read or
-written. An `Atomic` also holds `f32` and `f64`, added to and taken from
-as floats, and a C pointer, `ptr<T>`; `replaceIf` compares what it holds
-bit for bit, so a NaN is the NaN it was:
-
-```wip,run
-import std::future
-import std::sync::{Atomic}
-
-// One writer and one reader: the writer fills the slot, then publishes it
-// with a release store; the reader acquires the count, then reads the slot.
-struct Mailbox {
-    slot: Atomic<i64> = Atomic::of(0)
-    sent: Atomic<i64> = Atomic::of(0)
-    read: Atomic<i64> = Atomic::of(0)
-}
-
-extend Mailbox {
-    fn send(value: i64) = {
-        val count = self.sent.load(order: .Relaxed)
-        while self.read.load(order: .Acquire) != count {}
-        self.slot.store(value, order: .Relaxed)
-        self.sent.store(count + 1, order: .Release)
-    }
-
-    fn receive(): i64 = {
-        val count = self.read.load(order: .Relaxed)
-        while self.sent.load(order: .Acquire) == count {}
-        val value = self.slot.load(order: .Relaxed)
-        self.read.store(count + 1, order: .Release)
-        return value
-    }
-}
-
-fn main() = {
-    val mailbox = Mailbox()
-    val (_, total) = future::both(
-        () => {
-            for i in 1..101 do
-                mailbox.send(i)
-        },
-        () => {
-            var total = 0
-            for _ in 0..100 do
-                total += mailbox.receive()
-
-            return total
-        },
-    )
-    assert(total == 5050)
-
-    val seconds = Atomic::of(0.0)
-    var frames = [0.25, 0.5, 0.25, 1.0]
-    future::each(&var frames, (frame) => { seconds.add(frame) })
-    assert(seconds.load() == 2.0)
-    assert(!seconds.replaceIf(-2.0, 0.0) && seconds.replaceIf(2.0, 0.0))
-}
-```
-
-A thread that must never wait — an audio callback, which a late answer
-makes a click — is handed its work through a ring, `sync::ring<T>(capacity)`:
-a fixed number of slots, allocated once, between one thread that fills it
-and one that drains it, answered as the two ends, a `Filler<T>` and a
-`Drainer<T>`. `push` puts a value in, or, where every slot is full, hands
-it back as `Err(value)`; `pop` takes the oldest, or answers nothing; and
-neither waits, locks or allocates, so a channel, which does all three, is
-for what may wait. Neither end is copied or shared, and both `push` and
-`pop` take their end `var`, so one thread at a time fills and one drains;
-the values still in the ring end with it, once both ends are gone:
-
-```wip,run
-import std::future
-import std::sync
-
-fn main() = {
-    var (sounds, mixer) = sync::ring<String>(2)
-    assert(sounds.push("coin").isOk() && sounds.push("door").isOk())
-    assert(sounds.push("step") == .Err("step")) // full
-    assert(mixer.pop() == String::of("coin") && mixer.len() == 1)
-
-    var (samples, played) = sync::ring<i64>(8)
-    val (_, total) = future::both(
-        () => {
-            for i in 1..1001 {
-                while samples.push(i).isErr() {}
-            }
-        },
-        () => {
-            var total = 0
-            var heard = 0
-            while heard < 1000 {
-                if played.pop() is .Some(sample) {
-                    total += sample
-                    heard += 1
-                }
-            }
-            return total
-        },
-    )
-    assert(total == 500500)
-}
-```
-
-A slice lends two parts of itself at once, which do not overlap, with
-`split(at, (first, second) => …)`: what `each` gives each thread.
-
-`future::each` and `future::map` start a thread for each part of every
-call, some tens of microseconds a call, which a game that splits its work
-every frame pays every frame. A `future::Pool` starts its threads once and
-keeps them: its `each` and `map` take and answer what the functions do,
-under the same rules on what the closures borrow, and hand the parts to
-threads that are already waiting, spinning a while before they sleep. Its
-end tells its threads to stop, and waits for them:
-
-```wip,run
-import std::future
-import std::future::{Pool}
-
-struct Body {
-    height: f64
-    speed: f64
-}
-
-fn main() = {
-    val pool = Pool::of(future::cores() - 1)
-    var bodies: Vec<Body> = Vec()
-    for i in 0..100 do
-        bodies.push(Body(height: i as f64, speed: 0.0))
-
-    for _ in 0..60 do
-        pool.each(&var bodies.items(), (body) => {
-            body.speed -= 9.8 / 60.0
-            body.height += body.speed / 60.0
-        })
-
-    val heights = pool.map(&bodies.items(), (body) => body.height)
-    assert(heights.len() == 100 && heights[99] < 99.0)
-}
-```
-
-## Logs: `std::log`
-
-A `Log` is the least level a program keeps, `Level`'s `.Debug`, `.Info`,
-`.Warn` or `.Error`, and where what it keeps goes. A function that logs
-takes the program's log as an implicit parameter named `log`, `implicit
-log: &Log` ([page 3](03-functions.md)), and is given it by every call that
-has one, so its signature says that it logs, and a library and a program
-that both name it `log` meet with nothing to set up. There is no global
-log. A log is lent shared, so one serves every thread it is lent to.
-
-`debug`, `info`, `warn` and `error` each make a `Record`, its level, its
-text, the place of the call and the time, where the level is kept, and
-give it to where the log's records go:
-
-- **`Log::toStderr(least)`** writes each as a line on standard error, its
-  time in UTC, its level and its text, in one write, so two threads' lines
-  do not mix.
-- **`Log::toSystem(least)`** gives each to the system's log, through
-  `syslog`, under the program's name: Console shows it on a Mac, and
-  `journalctl` on Linux.
-- **`Log::to(least, write)`** gives each to `write`, a closure that may be
-  called from several threads at once: a line of the program's own, JSON,
-  or what a test keeps.
-- **`Log::none()`** keeps nothing, for a caller that needs no log.
-
-```wip,run
-import std::log::{Log}
-
-fn served(path: str, implicit log: &Log) = {
-    log.info("served \(path)")
-    log.debug("not kept: below the least level")
-}
-
-fn main() = {
-    implicit val log = Log::toStderr(least: .Info)
-    served("/index.html")
-    assert(log.enabled(.Warn) && !log.enabled(.Debug))
-}
-```
-
-A message is made before the call, so `log.debug("\(tree)")` writes the
-tree's text even where `.Debug` is not kept. Where that costs, ask first:
-`if log.enabled(.Debug) then log.debug("\(tree)")`.
-
-The library's own modules log nothing. They answer what went wrong, and
-what of it to log is the program's to decide.
-
-## A program's arguments: `std::args`
-
-`main(args: &[cstring])` is given the program's arguments, and
-`Arguments::of(&args)` reads them one at a time, from the one after the
-program's name: each is a short option, a long one, or a positional
-argument, and the program says what each means in a `match`, asking for an
-option's value where it takes one:
-
-```wip,run
-import std::args::{ArgumentError, Arguments}
-
-// What the options say; it holds names from the arguments, so it is a view.
-view struct Options {
-    count: i64 = 10
-    verbose: bool = false
-    files: Vec<str> = Vec()
-}
-
-fn options(args: &[cstring]): Result<Options, ArgumentError> = {
-    var options = Options()
-    var arguments = Arguments::of(&args)
-    while arguments.next()? is .Some(argument) {
-        match argument {
-            .Short('n') | .Long("lines") => options.count = arguments.int()?
-            .Short('v') | .Long("verbose") => options.verbose = true
-            .Positional(file) => options.files.push(file)
-            _ => return .Err(argument.unexpected())
-        }
-    }
-    return options
-}
-
-fn main() = {
-    // What `main` would be given for `lines -vn 5 a.txt --lines=3`.
-    val given: [cstring; 5] = ["lines", "-vn", "5", "a.txt", "--lines=3"]
-    val .Ok(read) = options(&given) else return
-    assert(read.count == 3 && read.verbose && read.files.len() == 1)
-    val wrong: [cstring; 2] = ["lines", "-x"]
-    assert(options(&wrong) is .Err(.UnknownOption(..)))
-}
-```
-
-It reads them as `getopt_long` does: `-abc` is `-a`, `-b` and `-c`;
-`-ofile` and `-o file` are one option with its value, as are
-`--output=file` and `--output file`; `--` ends the options, and `-` alone
-is positional; options and positional arguments come in any order. A
-value is the next argument whatever it looks like, so `-o -` and `-n -5`
-are values.
-
-`value()` answers an option's value, and `int()` and `float()` read it as
-a number; `optionalValue()` takes only a value written onto its option,
-`--color=always`; `rest()` answers every argument not read yet, as it is,
-for a program that hands them on; `program()` is the name it was run by.
-An `ArgumentError` says what is wrong — "`-n` needs a value", "`--verbose`
-takes no value, and was given `yes`" — and `main` that answers one prints
-it after `error: ` and exits with 1. A subcommand is a positional argument,
-after which the same `Arguments` reads its own options. The usage message
-is the program's own, written as text and printed where it matches `-h`.
-
-## Random numbers: `std::random`
-
-`Random` is a generator of numbers for what is not cryptography — a game's
-dice, a test's input, a shuffled deck. What it answers next follows from
-what it has answered, so it is not fit to make a key or a password.
-`Random::seeded(seed)` answers the same numbers on every machine and every
-run, for a test or a game played again; `Random::fromEntropy()` is seeded
-by the system, and differs on every run:
-
-```wip,run
-import std::random::{Random}
-
-fn main() = {
-    var rng = Random::seeded(42)
-    val roll = rng.below(6) + 1
-    assert(roll >= 1 && roll <= 6)
-    val point = rng.inRange(-10, 10)
-    assert(point >= -10 && point < 10)
-    val chance = rng.float()
-    assert(chance >= 0.0 && chance < 1.0)
-    var deck = [1, 2, 3, 4, 5]
-    rng.shuffle(&var deck)
-    var again = Random::seeded(42)
-    assert(again.below(6) + 1 == roll, "the same seed, the same numbers")
-}
-```
-
-`below(count)` is a number from 0 up to the count, and `inRange(low, high)`
-one from `low` up to `high`, leaving `high` out as a range does; each
-number is as likely as any other, and an empty range panics. `next()` is
-64 random bits, `float()` is from 0.0 up to 1.0, `bool()` is either, and
-`shuffle` puts a slice's elements in any order, each as likely. The
-generator is xoshiro256\*\*, with a seed spread through SplitMix64.
-
-What a game draws is there too: `floatIn(low, high)`, `f32()` and
-`f32In(low, high)`; `onCircle()` and `inDisk()` as `std::math`'s `Vec2`,
-and `onSphere()` and `inSphere()` as its `Vec3`, each point as likely as
-any other; `pick(&items)`, one of them, `.None` where there are none;
-`weighted(&weights)`, an index chosen as often as its weight is of their
-sum; and `gaussian(mean, deviation)`, a number from the bell curve:
-
-```wip,run
-import std::random::{Random}
-
-fn main() = {
-    var rng = Random::seeded(7)
-    val spark = rng.onSphere()
-    assert((spark.length() - 1.0).abs() < 0.0001, "a direction")
-    val drop = rng.f32In(-0.5, 0.5)
-    assert(drop >= -0.5 && drop < 0.5)
-    val loot = ["coin", "gem", "map"]
-    val .Some(found) = rng.pick(&loot) else panic("there is loot")
-    assert(found.len() >= 3)
-    val rare = rng.weighted([90.0, 9.0, 1.0]).unwrap()
-    assert(rare >= 0 && rare < 3)
-    val height = rng.gaussian(mean: 170.0, deviation: 8.0)
-    assert(height > 100.0 && height < 240.0)
-}
-```
-
-## Secrets and signatures: `std::secret` and `std::digest`
-
-What an attacker must not guess — a key, a session's token, a salt — is
-made by `std::secret`, from the system's generator for secrets:
-`secret::bytes(count)` is that many bytes, and `secret::fill(&var key)`
-fills an array. `Random` is never the answer, however it is seeded.
-
-A signature is checked with `secret::equal(a, b)`, never `==`: `==` stops
-at the first byte that differs, so how long it takes says how many were
-right, and a signature can be found a byte at a time. `equal` looks at
-every byte whatever they hold, in a time that depends on their lengths
-alone, and the optimiser is kept from ending it early.
-
-`std::digest` has SHA-256, SHA-512 and SHA-1, each a function of bytes in
-hand and a type written in pieces, and HMAC over each, a digest under a
-key: `hmacSha256(key, message)`, `hmacSha512` and `hmacSha1`. SHA-1 is
-broken for signatures, since two inputs with one digest are made at will,
-and is there for the formats that name data by it, as git and WebSocket's
-handshake do; HMAC-SHA1, a one-time code's, is not broken by it. A webhook
-signed as GitHub signs one, with the HMAC in hex after `sha256=`:
-
-```wip,run
-import std::digest
-import std::hex
-import std::secret
-
-/// Whether `body` was signed with `key`, as the header says.
-fn signed(body: &[u8], header: str, key: &[u8]): bool = {
-    val .Some(("sha256", given)) = header.splitOnce("=") else return false
-    val .Ok(sent) = hex::decode(given) else return false
-    return secret::equal(&sent, digest::hmacSha256(&key, &body))
-}
-
-fn main() = {
-    val key = secret::bytes(32)
-    val body = "{\"action\": \"opened\"}"
-    val header = "sha256=\(hex::encode(digest::hmacSha256(&key, &body)))"
-    assert(signed(&body, header.toStr(), &key))
-    assert(!signed(&body, "sha256=00", &key))
-    val token = hex::encode(secret::bytes(16))
-    assert(token.len() == 32)
-}
-```
-
-## Other programs: `std::process`
-
-A `Command` names a program and its arguments, which no shell reads: each
-is one argument, whatever it holds. `run()` gives it this program's
-terminal and waits for it, `output()` keeps what it printed, `start()`
-keeps it running as a `Child`, which is waited for where it is dropped,
-and `launch()` lets it go:
-
-```wip,run,unix
-import std::process::{Command}
-
-fn main() = {
-    val .Ok(said) = Command::of("printf").args([
-        "%s",
-        "a;$(rm x) b",
-    ]).output() else {
-        assert(false, "printf is there")
-        return
-    }
-    assert(said.stdout == "a;$(rm x) b")
-    assert(said.exit.success())
-
-    assert(Command::of("false").run() == .Code(1))
-    assert(Command::of("no-such-program").run() is .Err(.NotFound))
-}
-```
-
-An app on iOS may not start another program: there, `Command` answers the
-error the system gives, as it answers any refusal; and iOS has none of the
-programs a shell has, `printf` and `false` among them, even in the
-simulator, which allows a start.
-
-A program that ends with a code other than 0 has answered, not failed:
-`exit.success()` asks. Failing to start is an `IoError`.
-
-It is given this program's environment and directory unless its command
-says otherwise: `env(name, value)` sets a variable, `unset(name)` leaves
-one out, each in the order written, and `directory(path)` is where it
-starts. It is given none of the files, sockets and pipes this program has
-open, only its standard streams:
-
-```wip,run,unix
-import std::process::{Command}
-
-fn main() = {
-    val script = "echo $GREETING ${HOME-nowhere}"
-    val command = Command::of("sh").env("GREETING", "hello").unset("HOME")
-    val .Ok(said) = command.args(["-c", script]).output() else {
-        assert(false, "sh is there")
-        return
-    }
-    assert(said.stdout == "hello nowhere\n")
-}
-```
-
-The program's own environment is `std::io`'s. `io::env(name)` reads one
-variable, copied, and `io::environment()` lists every one, as name and
-value. `io::setEnv(name, value)` and `io::unsetEnv(name)` change it for
-what reads it from then on: this program, the C it links, which is told
-some things only by a variable, `TZ` among them, and every program it
-starts. They panic where the process runs a second thread, since C's
-library does not make a change safe beside another thread's read, and a
-thread a C library started reads too. So the environment is changed
-before the first thread starts, and a program started is given a
-variable of its own by its `Command`, which changes nothing here:
-
-```wip,run
-import std::io
-
-fn main() = {
-    io::setEnv("GREETING", "hello")
-    assert(io::env("GREETING") is .Some(said) && said == "hello")
-    var seen = 0
-    for (name, value) in io::environment() do
-        if name == "GREETING" && value == "hello" then
-            seen += 1
-
-    assert(seen == 1)
-    io::unsetEnv("GREETING")
-    assert(io::env("GREETING").isNone())
-}
-```
-
-`connect()` starts it to be talked to as it runs: what this program writes
-with `writeText`, it reads on its standard input, and what it writes this
-program reads through `output()`, an `io::Reader`, by lines, by length or
-to the end. Its standard error is this program's. `closeInput()` ends its
-input, which is how many programs know to finish, and `wait()` closes it
-and waits; dropped, it is closed and waited for too. Writing to a program
-that has stopped reading answers `.BrokenPipe`. A `Reader` — this one, a
-file's or standard input — may be told how long a read waits for
-something to come, `setTimeout(.Some(Duration::seconds(5)))`, after which
-it answers `.WouldBlock`; what it had read is appended where it was asked
-for, so that asking again with the same `String` goes on from there:
-
-```wip,run,unix
-import std::io
-import std::process::{Command}
-import std::time::{Duration}
-
-fn main() = {
-    var echo = Command::of("cat").connect().unwrap()
-    var line = String()
-    echo.writeText("one\n").unwrap()
-    echo.output().readLine(&var line).unwrap()
-    echo.writeText("\(line), two\n").unwrap() // the next, from what came back
-    line.clear()
-    echo.output().readLine(&var line).unwrap()
-    assert(line == "one, two")
-
-    echo.output().setTimeout(Duration::millis(50))
-    assert(echo.output().readLine(&var line) == .Err(io::IoError::WouldBlock))
-    assert(echo.wait().success())
-}
-```
-
-`input(text)` gives it text to read on its standard input, which
-`output()` writes while it reads what the program prints and `run()`
-writes before it waits. A program that stops reading ends the writing,
-and the rest is dropped:
-
-```wip,run,unix
-import std::process::{Command}
-
-fn main() = {
-    val .Ok(sorted) = Command::of("sort").input("b\na\n").output() else {
-        assert(false, "sort is there")
-        return
-    }
-    assert(sorted.stdout == "a\nb\n")
-}
-```
-
-A program catches signals with `Signals::catch`: Ctrl-C at its terminal,
-`.Interrupt`; a request to end, `.Terminate`, as `kill` sends; its
-terminal gone, `.Hangup`; Ctrl-\\, `.Quit`; and a program it started
-ending, `.Child`. A signal caught ends nothing: the system keeps it, and
-`received()` answers what came since it was last asked, without waiting,
-as a program in a terminal asks each turn of its loop, to save before it
-quits, and `wait()` waits for the next. `number()` is what the system
-numbers one, which `libc::kill` sends to pass it on. `descriptor()` is ready while one waits, for an event queue.
-No handler runs at a moment of the system's choosing, so what a program
-does about a signal is ordinary code. Where the `Signals` ends, each is as
-it was; a program started meanwhile handles them as it would have. On
-Linux a signal is held back in the thread that catches it and those it
-starts after, so a program catches what it wants as it begins:
-
-```wip,run,unix
-import std::libc
-import std::process
-import std::process::{Signal, Signals}
-
-fn main() = {
-    var signals = Signals::catch([Signal::Interrupt, .Terminate]).unwrap()
-    assert(signals.received().isEmpty())
-    libc::kill(process::id() as c_int, libc::SIGINT) // as Ctrl-C would
-    assert(signals.wait() == .Interrupt) // and the program goes on
-}
-```
-
-A server that starts as root takes what it needs of root's and then gives
-it up, and `std::process` has each step. `userId()` and `groupId()` are
-whom the program acts as, 0 for root; `std::users` finds a `User` or a
-`Group` by name or by number, `User::named("www")`, with its `id`, its
-group, its home and its shell, or nothing where the system has none.
-`fs::setOwner(path, user, group)` gives a file to them, and `fs::meta`
-says whose a file is, `meta.user` and `meta.group`; `fs::setMode(path,
-0o644)` sets its permission bits. `limit(resource)` and
-`setLimit(resource, limit)` read and set how much the program may hold —
-`.OpenFiles`, `.Processes`, `.CoreFile`, `.Stack` — as a `Limit` of what
-it holds to now, `current`, and the most it may raise that to, `most`,
-each nothing for no limit; any program may lower either, and only root
-raise the most. Users and groups by number, the limits, `fork` and the
-rest of this are a Unix's: Windows names its users otherwise, and a
-program built for it that uses them is told they are a Unix's.
-
-`fork()` copies the program: it answers `.Parent(child)` here, the copy
-a `Child` as a program started is, and `.Child` in the copy, which goes
-on from the same place. Only the thread that asks goes on in the copy,
-so a program forks before it starts any. `newGroup()` makes the program
-a group of its own, and `sendToGroup(signal)` passes a signal on to every
-process in it. Then, in the copy that will serve, `changeRoot(path)`
-makes a directory the program's `/`, moving into it, and
-`becomeUser(user, group)` goes on as that user of that group alone, for
-good, in the order that works; each is root's to do, and is refused
-otherwise with `.Denied`:
-
-```wip,run,unix
-import std::fs
-import std::libc
-import std::process
-import std::process::{Resource}
-import std::users::{User}
-
-fn main() = {
-    val root = User::named("root").unwrap()
-    assert(root.id == 0 && User::withId(0).unwrap().name == "root")
-    val me = User::withId(process::userId()).unwrap()
-
-    val dir = fs::TempDir::new().unwrap()
-    val note = dir.join("note")
-    assert(fs::writeFile(&note, "x").isOk())
-    assert(fs::meta(&note).unwrap().user == me.id)
-    assert(fs::setMode(&note, 0o600).isOk())
-    assert(fs::meta(&note).unwrap().mode == 0o600)
-
-    val files = process::limit(Resource::OpenFiles).unwrap()
-    assert(process::setLimit(Resource::OpenFiles, files.clone()).isOk())
-
-    match process::fork().unwrap() {
-        .Parent(copy) => assert(copy.wait() == .Code(3))
-        .Child => libc::exitAtOnce(3)
-    }
-    if me.id != 0 then
-        assert(process::becomeUser(0, 0) == .Err(.Denied))
-}
-```
-
 ## `std::collections`
 
 `Map<K, V>` and `Set<K>` keep what they hold in the order it went in, and
@@ -1564,15 +846,15 @@ fn main() = {
 }
 ```
 
-Each collection that holds what an iterator hands out is made from one by
-a static function of one name, `collect`, which takes any iterator of its
+Each collection that holds what an iterator hands out is made from one by a
+static function of one name, `collect`, which takes any iterator of its
 elements: `Vec`, `Set`, `SortedSet`, `Deque`, `String` of `char`, and
-`Map`, `SortedMap` and `PriorityQueue` of pairs. They are the method of the prelude's
-`Collect<T>`, which a type of a program's own implements to be collected
-too. Where the type is expected, the call is `.collect(items)`, and a list
-written there is that collection, made through it. A `Set` keeps the
-first of equals and a `Map` the later value of a key, as `add` and `put`
-do. `iter.toVec()` is `Vec::collect(iter)` at the end of a chain.
+`Map`, `SortedMap` and `PriorityQueue` of pairs. They are the method of the
+prelude's `Collect<T>`, which a type of a program's own implements to be
+collected too. Where the type is expected, the call is `.collect(items)`,
+and a list written there is that collection, made through it. A `Set` keeps
+the first of equals and a `Map` the later value of a key, as `add` and
+`put` do. `iter.toVec()` is `Vec::collect(iter)` at the end of a chain.
 
 ```wip,run
 import std::collections::{Deque, Map, Set}
@@ -1627,12 +909,12 @@ fn main() = {
 ```
 
 `Arena<T>` holds values that link to each other — a tree's parents, a list
-linked both ways, a graph — where no one owner could hold the links.
-`add` answers a `Handle<T>`, a slot and a generation:
-plain data, kept in a field, a `Vec` or a map, and not taken where a
-handle of another type is. `arena[handle]` lends the value to read or to
-write, and panics where the value was removed, even once another has taken
-its slot; `get` and `contains` ask instead:
+linked both ways, a graph — where no one owner could hold the links. `add`
+answers a `Handle<T>`, a slot and a generation: plain data, kept in a
+field, a `Vec` or a map, and not taken where a handle of another type is.
+`arena[handle]` lends the value to read or to write, and panics where the
+value was removed, even once another has taken its slot; `get` and
+`contains` ask instead:
 
 ```wip,run
 import std::collections::{Arena, Handle}
@@ -1679,12 +961,11 @@ makes every handle stale, and `clone()` copies the values under the same
 handles. A handle is not tied to its arena: one from another arena of the
 same type may name a value there.
 
-`Arena<T>` is `Arena<T, K = T>`, and its handles are `Handle<K>`.
-Where the code that keeps handles cannot name the values'
-type — a game's rules, which know a ball by its handle, in a module below
-the one that says what a ball is — the second type is one that code can
-name: `Arena<Ball, Balls>` gives `Handle<Balls>`, with `Balls` declared
-beside the rules.
+`Arena<T>` is `Arena<T, K = T>`, and its handles are `Handle<K>`. Where the
+code that keeps handles cannot name the values' type — a game's rules,
+which know a ball by its handle, in a module below the one that says what a
+ball is — the second type is one that code can name: `Arena<Ball, Balls>`
+gives `Handle<Balls>`, with `Balls` declared beside the rules.
 
 `PriorityQueue<T, P>` takes the value of the smallest priority first, of
 any `P` that is `Ord`, a float among them: what finding a path, a queue of
@@ -1714,13 +995,13 @@ fn main() = {
 ## Values several owners hold: `std::shared`
 
 `Shared<T>` is a value on the heap that several owners hold and read.
-`share()` makes another owner, and is the one place a
-count goes up; `value()` lends the value to read; the last owner to let go
-drops it. `edit()` writes it where `T` clones: in place where nothing else
-holds it, and otherwise a copy first, which the editing owner holds alone.
-A `Weak<T>` links to the value without keeping it, as a child to its
-parent: `upgrade()` answers an owner while one remains. The counts are
-atomic, so owners may be on different threads.
+`share()` makes another owner, and is the one place a count goes up;
+`value()` lends the value to read; the last owner to let go drops it.
+`edit()` writes it where `T` clones: in place where nothing else holds it,
+and otherwise a copy first, which the editing owner holds alone. A
+`Weak<T>` links to the value without keeping it, as a child to its parent:
+`upgrade()` answers an owner while one remains. The counts are atomic, so
+owners may be on different threads.
 
 ```wip,run
 import std::shared::{Shared, Weak}
@@ -1738,919 +1019,6 @@ fn main() = {
     assert(link.upgrade().isNone())
 }
 ```
-
-## Connections: `std::net`
-
-A `Listener` listens on a port or a Unix-domain socket and accepts
-connections; a `Stream` is one connection, accepted or made; an `Address`
-says where one is, and prints as `127.0.0.1:8080` or `[::1]:8080`.
-Each owns its descriptor and closes it where it ends, and
-what fails is an `io::IoError`, as a file's failures are.
-
-```wip,run
-import std::future
-import std::net::{Address, Listener, Stream}
-
-fn main() = {
-    // Port 0: the system chooses one, and `localAddress` says which.
-    val listener = Listener::tcp("127.0.0.1", 0).unwrap()
-    val .Ok(.V4(port: port, ..)) = listener.localAddress() else return
-    val (_, answer) = future::both(
-        () => {
-            var (stream, from) = listener.accept().unwrap()
-            var request: [u8; 64] = [0; 64]
-            val count = stream.read(&var request).unwrap()
-            stream.writeText("got \(count) bytes from \(from.host())").unwrap()
-        },
-        () => {
-            var stream = Stream::tcp("127.0.0.1", port).unwrap()
-            stream.writeText("hello").unwrap()
-            var reply: [u8; 64] = [0; 64]
-            val count = stream.read(&var reply).unwrap()
-            return String::of(str::fromBytes(&reply[0..count]))
-        },
-    )
-    assert(answer == "got 5 bytes from 127.0.0.1")
-}
-```
-
-`Listener::tcp(.None, port)` listens on the loopback, and `"0.0.0.0"` or
-`"::"` on every address. `Stream::tcp` waits as long as the system does
-for a host to answer, and `Stream::tcpWithin(host, port, duration)` at
-most that long for each of its addresses, answering `.TimedOut`. A
-`Stream` is an `io::Read` and an `io::Write`: `read` answers `0` once the
-other end has closed, and `writeAll` and `writeText` write all they are
-given, each through `var`, as a file's do; `write` may write fewer
-bytes, and takes `&self`. A write to a connection the other end has
-closed answers `.BrokenPipe`, and no signal ends the program.
-`setBlocking(false)` makes `accept`, `read` and `write` answer
-`.WouldBlock` where they would wait, and `descriptor()` is the number an
-event queue watches. `accept` takes `&self`, so several threads may
-accept from one listener.
-
-An `io::EventQueue` serves many connections on one thread: it is given
-each descriptor a program waits on — a listener, its connections, a
-watcher's — with what it waits for, `.Read`, `.Write` or `.Both`, and a
-`token`, a `u64` of the program's own, such as a slot; `wait(timeout,
-&var events)` sleeps until one is ready, or the timeout passes — `.None`
-waits as long as it takes, and no time only looks — and fills `events`
-with each that is: its `token`, whether it is `readable` and `writable`,
-and whether it is `closed`, the other end gone or the descriptor failed.
-A descriptor is told of while it is ready, every wait, until it is read
-or written to `.WouldBlock`, so one read a wait is never left unread.
-`change` waits on one for something else, and `remove` no longer. It is
-kqueue on a Mac and on iOS, and epoll on Linux:
-
-```wip,run
-import std::io
-import std::net::{Listener, Stream}
-import std::time::{Duration}
-
-fn main() = {
-    val listener = Listener::tcp("127.0.0.1", 0).unwrap()
-    val .Ok(.V4(port: port, ..)) = listener.localAddress() else return
-    var queue = io::EventQueue::new().unwrap()
-    assert(queue.add(listener.descriptor(), .Read, 0).isOk())
-    var events: Vec<io::Event> = Vec()
-
-    var client = Stream::tcp("127.0.0.1", port).unwrap()
-    assert(queue.wait(Duration::seconds(5), &var events).isOk())
-    assert(events[0].token == 0 && events[0].readable) // a connection came
-    val (served, _) = listener.accept().unwrap()
-    assert(queue.add(served.descriptor(), .Read, 1).isOk())
-
-    client.writeText("hi").unwrap()
-    assert(queue.wait(Duration::seconds(5), &var events).isOk())
-    assert(events.len() == 1 && events[0].token == 1 && events[0].readable)
-    assert(queue.wait(Duration::millis(0), &var events).isOk())
-    assert(events.len() == 1) // told again, while it is unread
-}
-```
-
-## HTTP: `std::http`
-
-`http::get(url)` fetches a URL and answers its `Response`: its `status`,
-its `headers`, its `body`, `text()` and `json<T>()`, and `header(name)`,
-which finds a header in any case. A status is an answer, not an error:
-a `404` is a `Response`, and an `HttpError` is what kept an answer from
-coming — a URL it cannot send to, the connection, TLS, a timeout, too
-many redirects, or an answer that is not HTTP.
-
-Every request is sent to a `Url` (`std::url`, below), lent. A literal is
-one where it is expected, `http::get("https://example.com/")`, its holes
-encoded by their places; text from outside is read first, with
-`Url::parse(text)?`. What only HTTP refuses of a URL is refused as it is
-sent: a scheme other than `http` and `https`, credentials, a port that is
-not a number.
-
-A `Client` sends any `Request` — `Request::get(url)`, `post`, `put`,
-`patch`, `delete`, `head`, each given `.header(name, value)` and a body
-of `.body(bytes)`, `.text(text)`, `.json(&value)` or `.file(path)` — and
-keeps a connection to each host between requests, follows redirects up
-to its `redirects`, ten unless set, and stops waiting after its
-`timeout`, where one is set. It asks for gzip, and undoes a body sent so;
-on Windows, which has no zlib, it asks for the body as it is.
-`https` is the system's TLS, which refuses a server whose certificate it
-does not trust; `Client::overUnix(path)` sends every request over one
-Unix-domain socket. `client.open(request)` answers once the status and
-the headers have come, with the body an `io::Read` that comes as it is
-read, so that a body larger than memory is never held whole;
-`client.upload(request, &var source)` sends a body read from any
-`io::Read` as it is sent:
-
-```wip,run
-import std::future
-import std::http::{Client, Request}
-import std::net::{Listener}
-import std::url::{Url}
-
-fn main() = {
-    val listener = Listener::tcp("127.0.0.1", 0).unwrap()
-    val .Ok(.V4(port: port, ..)) = listener.localAddress() else return
-    val (_, response) = future::both(
-        () => {
-            var (stream, _) = listener.accept().unwrap()
-            var room = [0 as u8; 4096]
-            stream.read(&var room).unwrap()
-            val reply =
-                "HTTP/1.1 201 Created\r\nContent-Length: 7\r\n\r\n[1,2,3]"
-            stream.writeText(reply).unwrap()
-        },
-        () => {
-            var client = Client()
-            val item = [1, 2, 3]
-            val url: Url = "http://127.0.0.1:\(port)/items"
-            return client.send(Request::post(&url).json(&item)).unwrap()
-        },
-    )
-    assert(response.status == 201 && response.isSuccess())
-    val numbers: Vec<i64> = response.json().unwrap()
-    assert(numbers == [1, 2, 3])
-}
-```
-
-`std::tls` is the connection under `https`, for any protocol: a
-`TlsStream::connect(host, port)` is an `io::Read` and an `io::Write`, the
-server's certificate checked against the system's roots and the host's
-name, and a `TlsError` says what refused it — the connection, the
-certificate, or the handshake. It is OpenSSL on Linux, and
-Network.framework on a Mac and iOS:
-
-```wip
-import std::io
-import std::tls::{TlsStream}
-
-fn firstLine(host: str): String = {
-    val .Ok(stream) = TlsStream::connect(host, 443) else return String()
-    var secure = stream
-    val request = "HEAD / HTTP/1.1\r\nHost: \(host)\r\nConnection: close\r\n\r\n"
-    if secure.writeAll(&request).isErr() then
-        return String()
-
-    var room = [0 as u8; 64]
-    val got = secure.read(&var room).unwrapOr(0)
-    return str::fromBytes(&room[0..got])
-}
-
-fn main() = io::println(firstLine("example.com"))
-```
-
-## Compression: `std::compress`
-
-`compress::gzip(bytes)` compresses as a `.gz` file holds, and
-`gunzip(bytes)` undoes it; `zlib` and `unzlib` are zlib's wrapping, which
-a PNG and HTTP's `deflate` hold, and `deflate` and `inflate` none. What
-cannot be undone answers a `CompressError`: cut short, or not the format.
-An `Inflater` and a `Deflater` take bytes in pieces, appending what each
-makes to a `Vec<u8>`, so that nothing larger than a piece is held. It is
-the system's zlib, which Windows does not have: there the module declares
-nothing, and its names are refused as a Unix's:
-
-```wip,run,unix
-import std::compress
-
-fn main() = {
-    val text = "the same words, the same words, the same words"
-    val packed = compress::gzip(&text)
-    assert(packed[0] == 31 && packed[1] == 139)
-    assert(str::fromBytes(compress::gunzip(&packed).unwrap()) == text)
-    assert(compress::gunzip(&packed[0..10]).isErr())
-}
-```
-
-## Watching files: `std::watch`
-
-A `Watcher` is told by the system when what it watches changes, and
-answers which, when it is asked: `watch(path)` watches a directory for
-what is made, written, renamed or removed in it — not what is deeper — or
-a file for itself, written or replaced under its name, as an editor saves;
-`changed()` answers each watched path that changed since it was last
-asked, once, as it was given, and never waits; `pending()` says whether it
-would answer anything; `unwatch(path)` lets one go. Writing a file is many
-changes, and they are told once or twice, not once each; what changed a
-moment before a path was watched may be told of too. `descriptor()` is
-ready to read while a change waits, for an event queue. It is FSEvents on
-a Mac, inotify on Linux and `ReadDirectoryChangesW` on Windows; on iOS,
-which lets an app watch nothing,
-`Watcher::new()` answers `.Unsupported`:
-
-```wip,run
-import std::fs
-import std::time::{Duration, Instant, sleep}
-import std::watch::{Watcher}
-
-fn main() = {
-    val .Ok(var watcher) = Watcher::new() else return // iOS
-    val dir = fs::TempDir::new().unwrap()
-    assert(watcher.watch(dir.path).isOk())
-    sleep(Duration::millis(200))
-    watcher.changed() // what came just before
-    assert(fs::writeFile(dir.join("level.txt"), "o..o").isOk())
-    val began = Instant::now()
-    while !watcher.pending() && began.elapsed() < Duration::seconds(5) do
-        sleep(Duration::millis(10))
-
-    assert(watcher.changed() == [dir.path.clone()].toVec())
-}
-```
-
-## Regular expressions: `std::regex`
-
-A pattern is compiled once and then matched, searched and replaced with.
-Matching takes time in proportion to the text times the pattern, whatever
-either holds: no pattern backtracks without end.
-
-`Regex` is a template: where one is expected, a literal is its pattern,
-checked while the program is compiled and compiled where the literal
-runs. A hole's value is matched as the text it is, each character that
-means something in a pattern escaped, so `tar.gz` from outside matches
-`tar.gz` and not `tarXgz`; and a hole of a `Regex` is its pattern, joined
-as a group that does not capture, its groups counted after those before
-it. `Regex::new(text)` compiles a pattern that comes from outside, and
-answers what is wrong with it.
-
-```wip,run
-import std::regex::{Regex}
-
-fn main() = {
-    val numbered: Regex = "(\\d+)"
-    assert(numbered.isMatch("img12.jpg"))
-    assert(numbered.replaceAll("img12-3.jpg", "<$1>") == "img<12>-<3>.jpg")
-    val .Some(found) = numbered.find("a1b22") else return
-    assert(found.start == 1 && found.group(1) == .Some((1, 2)))
-
-    val extension = "tar.gz"
-    val ending: Regex = "\\.\(extension)$"
-    assert(ending.isMatch("logs.tar.gz") && !ending.isMatch("logs.tarXgz"))
-    val pair: Regex = "^\(numbered)-\(numbered)$"
-    assert(pair.groups() == 2 && pair.isMatch("12-3"))
-
-    assert(Regex::new("(unclosed").isErr())
-}
-```
-
-A literal that is not a pattern is an error at the byte that stops it,
-and a hole is refused where a value cannot be text: inside a class,
-`[…]`, inside a repetition's braces, `{…}`, and after a `\`.
-
-```wip,error=E0486
-import std::regex::{Regex}
-
-fn main() = {
-    val line: Regex = "// \\[((java|c) line (\\d+)\\] (Error.*)"
-}
-```
-
-The syntax is Rust's, in part: `.`, classes such as `[a-z]`, `[^0-9]`,
-`\d`, `\w` and `\s`, the anchors `^` and `$`, groups `(…)` and `(?:…)`,
-`|`, and `*`, `+`, `?` and `{n,m}`, with a `?` after them for as few as can
-be. A replacement names what matched as `$0` and a group as `$1` or
-`${1}`. What is not a pattern is a `RegexError`, which says what and at
-which byte. `Regex::anyCase(pattern)` compiles one that matches ASCII
-letters in either case, as POSIX's `REG_ICASE` does, so a host name
-matches however it is written; a pattern cannot say so, so one is not
-joined into another. `regex::escape(text)` is what a hole writes, for a
-pattern built another way.
-
-## JSON: `std::json`
-
-`json::parse(text)` reads a whole document into a `Json`, and a `Json`
-interpolated is its JSON, compact.
-
-```wip,run
-import std::json
-import std::json::{Json}
-
-fn main() = {
-    val .Ok(doc) = json::parse(
-        "{\"name\": \"wip\", \"tags\": [1, 2.5, null]}",
-    ) else {
-        return
-    }
-    assert("\(doc)" == "{\"name\":\"wip\",\"tags\":[1,2.5,null]}")
-    val .Object(fields) = doc else return
-    assert(fields[0].0 == "name" && fields[0].1 == .Text("wip"))
-    assert(fields[1].0 == "tags" && "\(fields[1].1)" == "[1,2.5,null]")
-
-    val .Err(error) = json::parse("[1,\n 2,]") else return
-    assert("\(error)" == "expected a value, at line 2, column 4")
-
-    // A field and an element, by reference, and what a value is.
-    assert(doc.get("name").flatMap((name) => name.asText()) == "wip")
-    val second = doc.get("tags").flatMap((tags) => tags.item(1))
-    assert(second.flatMap((tag) => tag.asFloat()) == 2.5)
-    assert(doc.get("size").isNone())
-}
-```
-
-`json::encode(&value)` writes any value that implements `Encode` as JSON's
-text, and `json::decode<T>(text)` reads one that implements `Decode`,
-answering a `json::DecodeError` that says what was wrong and at which
-field ([page 8](08-interfaces.md)); `toJson` and `fromJson` do the same
-with a `Json` tree. A record is an object of its fields, an `Option` that
-is nothing a field left out, a map an object of its keys as text, and a
-variant its name, or an object of its name and its fields.
-
-A number is an `Int` where it is written without a fraction or an
-exponent and fits an `i64`, and a `Float` otherwise; a `Float` is written
-with a `.0` where it would read back as an `Int`, and one that is not a
-number or is infinite is written `null`. An object keeps its fields in
-the order written, a name written twice included. What is not JSON is a
-`JsonError`, which says what, and where by line and column; arrays and
-objects nested deeper than `json::MOST_NESTED`, 512, are one.
-
-What is there is read with `get(name)`, a field of an object, and
-`item(index)`, an element of an array, each by reference or nothing,
-and with `asText`, `asInt`, `asFloat`, `asBool`,
-`asArray` and `isNull`, which answer where the value is of that kind. A
-name written twice answers the one written last.
-
-## Bytes: `std::bytes`
-
-A model's file, a texture's header, a save and a packet are numbers laid
-out in bytes in a known order, little-endian (`le`) or big-endian (`be`).
-`bytes::u32le(&header, 4)` reads the number at a place —
-`u16le`, `i16be`, `u32be`, `f32le` and the rest — and
-`bytes::putU32le(&var header, 4, size)` writes one there; each panics
-where its bytes are not all there, as an index past the end does, and
-checks once, where an index for each byte would check each. A
-`bytes::Reader` reads them from a slice in turn, `u8` and the same
-numbers, each answering nothing past the end, and `seek`s; a
-`bytes::Writer` appends them to a `Vec<u8>`, which `take()` hands over.
-
-`bytes::encode(&value)` writes any value that implements `Encode` in a
-binary format of its own, and `bytes::decode<T>(&bytes)` reads it back,
-answering a `BinaryError` that says what was wrong and at which byte. It
-holds what JSON does — a record keeps its fields' names, read in any
-order, so a save written by one version of a program loads in the next,
-which has a field more or one less — in less room, with whole numbers and
-lengths in as few bytes as they need, each field's and each variant's name
-spelled once and said after by where it was, and with no text to parse.
-Bytes written before names were spelled once are read as they were:
-
-```wip,run
-import std::bytes
-import std::bytes::{Reader, Writer}
-
-@derive(Encode)
-struct SaveBefore {
-    name: String
-    lives: i64
-}
-
-@derive(Decode)
-struct Save {
-    name: String
-    level: i64 = 1
-}
-
-fn main() = {
-    var out = Writer()
-    out.u32le(0x46424C47)
-    out.f32le(0.5)
-    out.u16be(300)
-    val written = out.take()
-    var read = Reader::of(&written.items())
-    assert(read.u32le() == 0x46424C47 && read.f32le() == 0.5)
-    assert(read.u16be() == 300 && read.u8().isNone())
-
-    var header = [0 as u8; 8]
-    bytes::putU16be(&var header, 2, 300)
-    bytes::putF32le(&var header, 4, 0.5)
-    assert(header[2] == 1 && header[3] == 44)
-    assert(bytes::u16be(&header, 2) == 300 && bytes::f32le(&header, 4) == 0.5)
-    assert(bytes::u32le(&written, 0) == 0x46424C47)
-
-    val old = bytes::encode(SaveBefore(name: "ann", lives: 3))
-    val loaded = bytes::decode<Save>(&old.items()).unwrap()
-    assert(loaded.name == "ann" && loaded.level == 1)
-    assert(bytes::decode<Save>(&old.items()[0..4]).isErr())
-}
-```
-
-## HTML and XML: `std::markup`
-
-`Html` and `Xml` are templates: where one is expected, an interpolated
-literal builds it, its own text as written and each value escaped as its
-place in the page needs. A value of `Html` in a hole is joined as it is,
-so a page is built from functions that answer `Html`, and a title, a name
-or a number is text, escaped with no call to say so:
-
-```wip,run
-import std::markup::{Html}
-
-fn row(id: i64, name: str): Html = {
-    val href = "/users/\(id)"
-    return "<li><a href=\"\(href)\">\(name)</a></li>"
-}
-
-fn page(title: str, rows: Html): Html = {
-    return "<title>\(title)</title><ul>\(rows)</ul>"
-}
-
-fn main() = {
-    var rows = Html()
-    rows.push(row(1, "Ada & Bob"))
-    rows.push(row(2, "<script>"))
-    val written = page("Users", rows)
-    assert(
-        written.toStr() ==
-            "<title>Users</title><ul><li><a href=\"/users/1\">Ada &amp; Bob</a></li><li><a href=\"/users/2\">&lt;script&gt;</a></li></ul>",
-    )
-}
-```
-
-`Html` reads where each hole is from the text written before it, as a
-browser's tokenizer does, tag and attribute names in any case. Between
-tags, in `<title>` and `<textarea>`, and in a quoted attribute's value, a
-value's `&`, `<`, `>`, `"` and `'` are written as entities. In a link's
-value — `href`, `src`, `action`, `formaction`, `cite`, `poster`, `data` and
-`manifest` — a `:` a value writes before the link's scheme is known is
-written `%3A` unless the scheme is `http`, `https` or `mailto`, so that
-`javascript:` from outside is a relative path, which runs nothing and
-still names the file it spells.
-
-Anywhere else a value is not written safely by entities, and a hole there
-is refused: inside `<script>` or `<style>`; in `style`, `srcset`, `srcdoc`
-and any attribute whose name starts `on`; in an attribute's value with no
-quotes; in a tag, between its attributes or in its name; and in a comment
-or a doctype. Where a hole is follows from the literal's own text, so
-`Html`'s `refusal` reads each literal as it reads a page, and the compiler
-asks it of every literal that builds `Html`: a refused hole is an error
-where it is written, whether or not the program ever writes the page.
-
-```wip,error=E0486
-import std::markup::{Html}
-
-fn greeting(name: str): Html = "<script>const user = \"\(name)\";</script>"
-
-fn main() = {
-    val page = greeting("Ada")
-}
-```
-
-A script is given its data in an attribute, escaped, and an attribute that
-is there or not is two literals:
-
-```wip,run
-import std::markup::{Html}
-
-fn link(href: str): Html = "<a href=\"\(href)\">link</a>"
-
-fn checkbox(done: bool): Html =
-    if done then "<input type=\"checkbox\" checked>"
-    else "<input type=\"checkbox\">"
-
-fn main() = {
-    assert(
-        link("javascript:go()").toStr() ==
-            "<a href=\"javascript%3Ago()\">link</a>",
-    )
-    assert(
-        link("https://example.com").toStr() ==
-            "<a href=\"https://example.com\">link</a>",
-    )
-    val user = "Ada"
-    val data: Html = "<main data-user=\"\(user)\"><script src=\"app.js\"></script>"
-    assert(data.toStr().contains("data-user=\"Ada\""))
-    assert(checkbox(true).toStr().contains("checked"))
-}
-```
-
-`Html` is joined only between tags, and only `Html` that ends there. A
-hole of `Html` anywhere else in a literal is refused with the rest, while
-the program is compiled; a piece left inside a tag, a comment or a
-`<script>` is refused as the page is written, with a panic where it is
-joined, since where a piece ends depends on how it was built. So a
-function's piece cannot leave its caller's page in a place it does not
-know of. `push` adds `Html` at the end, `Html::joined(&pieces,
-", ")` puts a separator between pieces, and `Html::trusted(text)` is HTML
-another writer made, a renderer's or a sanitizer's, which the caller vouches
-for. Written out, through `Text`, `Html` is its text as it is, and a
-`String` put back into a hole is text again.
-
-`Xml` is the same without what is HTML's alone: a value between tags or in
-a quoted attribute's value is escaped, and a hole in a tag, in an
-unquoted value, a comment, CDATA or a processing instruction is refused.
-A `<script>` in XML is an element like any other. A value given to
-`pushValue` by name, not in a literal, is refused as the page is written,
-with a panic at the call.
-
-## Bytes as text: `std::base64`, `std::hex` and `std::url`
-
-Bytes that must travel as text — in JSON, a header, a URL, a line a
-person copies — are written in one of three ways. `base64::encode(bytes)`
-writes each three bytes as four characters, as RFC 4648 has it, with
-`alphabet: .Url` for the alphabet a URL and a file name hold, and
-`padded: false` where a format leaves out the `=`; `base64::decode(text)`
-reads it, with its padding or without. `hex::encode(bytes)` writes two
-digits a byte, in lower case unless `upper: true`, and `hex::decode`
-reads either case. `url::encode(text)` writes every byte of `text` but
-letters, digits, `-`, `.`, `_` and `~` as `%` and two digits, so that it
-may stand in any part of a URL; what is passed as `keep` is left, a
-path's `/`. `url::decode` undoes it, and leaves a `+` as it is. Each
-decoding answers an error that says where the text went wrong:
-
-```wip,run
-import std::base64
-import std::base64::{Base64Error}
-import std::hex
-import std::url
-
-fn main() = {
-    val token = base64::encode("wip:secret")
-    assert(token == "d2lwOnNlY3JldA==")
-    val back = base64::decode(&token).unwrap()
-    assert(str::fromBytes(&back) == "wip:secret")
-    val ends = [251 as u8, 255]
-    assert(base64::encode(&ends, alphabet: .Url, padded: false) == "-_8")
-    assert(base64::decode("d2lw OnNl") == .Err(Base64Error::NotInAlphabet(4)))
-
-    assert(hex::encode([0 as u8, 15, 255]) == "000fff")
-    assert(hex::decode("CAFE").unwrap() == [202 as u8, 254])
-
-    val query = "q=\(url::encode("crème brûlée & tea"))"
-    assert(query == "q=cr%C3%A8me%20br%C3%BBl%C3%A9e%20%26%20tea")
-    assert(url::encode("/a b/c", keep: "/") == "/a%20b/c")
-    assert(url::decode("cr%C3%A8me") == String::of("crème"))
-}
-```
-
-`Url` is a URL's text and its parts: `scheme`, `host`, without an IPv6
-address's brackets, `port`, `path`, `query` and `fragment`, each as
-written, and `userInfo`. It may be relative, as a link is.
-`Url::parse(text)` reads one, or answers the byte where the text is not
-a URL: a scheme that is not a letter and then letters, digits, `+`, `-`
-or `.`, a port that is not a number, a `%` without its two digits, a `[`
-with no `]`, a space.
-
-`Url` is a template: where one is expected, a literal is a URL, checked
-while the program is compiled, and each hole's value is percent-encoded
-as the part it stands in needs, so that it is always that part. In a path
-it cannot add a segment, in a query it cannot add a parameter, and in a
-host it cannot become a path; a port's value keeps only its digits as
-they are. A hole in the scheme or inside a `%` and its digits is refused.
-A `Url` in a hole is joined only at the start, as the URL the rest goes
-on from, and adds to whatever part it ended in:
-
-```wip,run
-import std::url::{Url}
-
-fn main() = {
-    val api: Url = "https://api.example.com/v1"
-    val user = "../admin"
-    val tag = "a&admin=true"
-    val posts: Url = "\(api)/users/\(user)/posts?tag=\(tag)"
-    assert(
-        posts.toStr() ==
-            "https://api.example.com/v1/users/..%2Fadmin/posts?tag=a%26admin%3Dtrue",
-    )
-    assert(
-        posts.host() == "api.example.com" &&
-            posts.query() == "tag=a%26admin%3Dtrue",
-    )
-
-    val .Ok(read) = Url::parse("http://[::1]:8080/a?b=1#c") else return
-    assert(read.host() == "::1" && read.port() == .Some(8080 as u16))
-    assert(Url::parse("http://example.com:80a/").isErr())
-}
-```
-
-## Files and directories
-
-`std::fs` reads and writes a whole file, lists a directory, and answers
-what the filesystem says about a path. `struct stat` and `struct dirent`
-are laid out differently on every system, so neither reaches Wip: what
-comes back is a `Meta` and a `Vec<Entry>`.
-
-```wip,run
-import std::fs
-
-fn main() = {
-    val .Ok(entries) = fs::readDir("std/collections") else {
-        // Run from somewhere else, there is nothing to list.
-        return
-    }
-    assert(entries.len() >= 2)
-    for entry in entries.items() do
-        assert(entry.kind == .File || entry.isDirectory())
-
-    val .Ok(about) = fs::meta("std/prelude/option.wip") else return
-    assert(about.isFile())
-    assert(about.size > 0)
-    assert(about.modified > 0) // seconds since 1970
-    assert(about.modifiedNanos < 1000000000) // and the nanoseconds past them
-    assert(about.mode > 0) // the permission bits, as `chmod` writes them
-    assert(about.inode > 0) // with `device`, which file it is, whatever its name
-}
-```
-
-A `Meta`'s and an `Entry`'s `kind` is a `File`, a `Directory`, a `Link`,
-or one of the special files — a `Pipe`, a `Socket`, a `CharDevice`, a
-`BlockDevice` — or `Other`; `kind.isSpecial()` says whether it is none of
-the first three. `meta` follows a symbolic link and `linkMeta` looks at
-the link itself; `exists` asks whether there is anything there;
-`readBytes` reads a whole file that need not be text, as a `Vec<u8>`;
-`removeFile` removes a file and refuses a directory; `makeDir` makes a
-directory and fails where one already is, and `File::createNew` makes a
-file the same way, where `File::create` would empty one that is there. An
-open `File` reads by lines, whole, or exactly so many bytes,
-`readExact(count, &var into)`, which a message whose header gave its
-length is read by, and `readAt(offset, into)` reads from where it is asked
-without moving where the next read starts, as C's `pread` does; `size()`
-says how long the file is. A `Meta`'s `device` and `inode` say which file
-a path names, so a program can tell, before it acts, that a name it listed
-still means what it did. Entries come in the order the filesystem gives
-them, without `.` and `..`, and sorting is the caller's. `realPath`
-answers where a path really is: absolute, with no `.`, `..` or link on the
-way.
-
-`fs::walk(dir)` is every entry under a directory, at any depth, each an
-`Entry` whose `name` is its path from `dir`, `lang/main.wip`: depth first,
-a directory before what it holds. A link is an entry and is not
-followed. Its second argument says which directories it enters, and one
-it does not enter is still an entry. It fails only where `dir` cannot be
-read; a directory under it that cannot be is an entry with nothing under
-it:
-
-```wip,run
-import std::fs
-import std::path
-
-/// A directory to go into: one that is not hidden.
-fn shown(entry: &fs::Entry): bool = !path::name(entry.name).startsWith(".")
-
-fn main() = {
-    // The library's sources, but not what is in a hidden directory.
-    val .Ok(walked) = fs::walk("std", shown) else {
-        // Run from somewhere else, there is nothing to walk.
-        return
-    }
-    val sources: Vec<String> = [
-        for entry in walked do
-            if entry.kind == .File && path::matches("**/*.wip", entry.name) then
-                yield path::join("std", entry.name)
-    ]
-    assert(sources.any((file) => file == "std/path/path.wip"))
-    assert(walked.any((entry) => entry.name == "prelude"))
-}
-```
-
-Bytes as they come are `std::io`'s two interfaces. `io::Read` is what
-bytes are read from: an open `File`, standard input and a program's output
-(`io::Reader`), a connection (`net::Stream`); its `read(&var into)` puts
-what comes next at the start of `into` and answers how many bytes, 0 only
-at the end. A `File` and an `io::Reader` read bytes from the same buffer
-they read lines from, so the two may follow each other. `io::Write` is
-what bytes are written to — a `File`, a connection, a program's input,
-and standard output and standard error as `io::stdout()` and
-`io::stderr()` give them, which write through the buffer `print` writes
-through, in order with it — and its `writeAll(bytes)` writes all of
-them, carrying on where a write was cut short. A function that reads or writes without knowing which
-takes a `&var dyn io::Read` or a `&var dyn io::Write`, and
-`io::copy(&var from, &var to)` writes everything one reads to the other,
-as it comes, and answers how many bytes:
-
-```wip,run
-import std::fs
-import std::io
-
-/// How many bytes are left to read, whatever they are read from.
-fn counted(from: &var dyn io::Read): i64 = {
-    var room = [0 as u8; 4]
-    var total = 0
-    while true {
-        val got = from.read(&var room).unwrap()
-        if got == 0 then
-            break
-
-        total += got
-    }
-    return total
-}
-
-fn main() = {
-    val dir = fs::TempDir::new().unwrap()
-    var first = fs::File::create(dir.join("first")).unwrap()
-    assert(first.writeAll([1 as u8, 2, 3, 4, 5, 6, 7]).isOk())
-    var from = fs::File::open(dir.join("first")).unwrap()
-    var to = fs::File::create(dir.join("second")).unwrap()
-    assert(io::copy(&var from, &var to) == 7)
-    var again = fs::File::open(dir.join("second")).unwrap()
-    assert(counted(&var again) == 7)
-    var out = io::stdout()
-    assert(out.writeAll("done\n").isOk())
-}
-```
-
-`makeDirs` makes a directory and every one above it that is missing, with
-none an error where it is there already; `removeDir` removes an empty
-directory, and `removeAll` a directory and everything in it, or a file;
-`rename` moves a path within its filesystem; `copy` writes a file's bytes
-and its permission bits to another, and answers how many bytes;
-`makeLink(target, at)` makes a symbolic link, which `removeAll` removes
-without what it names.
-
-`writeFile` writes text as the whole of a file and `writeBytes` bytes
-that need not be text, each making the file or emptying it first. A file
-that must never be found half written — a save, a document — is replaced
-with `replaceFile` or `replaceBytes` instead: the new file is written
-beside it, handed to the disk, and renamed into its place at once, so that
-whoever opens it, and a program started after a crash, finds the old one
-or the new one; it keeps the old one's permission bits, and where the path
-is a symbolic link, the file the link names is replaced and the link
-kept. A `TempDir` is a new directory of the system's temporary files,
-named for the program and readable by its owner alone, removed with
-everything in it where the value ends; `temporaryRoot()` is where such
-directories are made, `$TMPDIR` or `/tmp`:
-
-```wip,run
-import std::fs
-
-fn main() = {
-    val dir = fs::TempDir::new().unwrap()
-    val picture = dir.join("picture")
-    assert(fs::writeBytes(picture, [0 as u8, 255, 0]).isOk())
-    assert(fs::readBytes(picture).unwrap().len() == 3)
-
-    val save = dir.join("save.json")
-    assert(fs::replaceFile(save, "{\"coins\": 1}").isOk())
-    assert(fs::replaceFile(save, "{\"coins\": 2}").isOk())
-    assert(fs::readFile(save) == String::of("{\"coins\": 2}"))
-    assert(fs::readDir(dir.path).unwrap().len() == 2) // nothing left beside
-    assert(dir.path.startsWith(fs::temporaryRoot().trimEndMatches("/")))
-}
-```
-
-`std::process` answers the program's own `currentDir()`, `executable()` —
-the absolute path of the file it was started from — `besideProgram(path)`,
-where `path` is beside that file, which is where the files a package names
-with `@files` are, each package's code finding its own with
-`package::besideProgram` ([page 12](12-tools.md)); this one is for what
-is beside the program that no package names — and `id()`, and
-`std::io` whether a stream is a terminal, `io::isTerminal(.Output)`, which
-is what decides whether to colour what is written:
-
-```wip,run
-import std::fs
-import std::io
-import std::path
-import std::process
-
-fn main() = {
-    val root = "target/docs-\(process::id())"
-    assert(fs::makeDirs("\(root)/a/b").isOk())
-    assert(fs::writeFile("\(root)/a/b/note", "hi").isOk())
-    assert(fs::copy("\(root)/a/b/note", "\(root)/copy") == 2)
-    assert(fs::rename("\(root)/copy", "\(root)/moved").isOk())
-    assert(fs::makeLink("a", "\(root)/link").isOk())
-    assert(fs::readFile("\(root)/link/b/note") == String::of("hi"))
-    assert(fs::removeAll(root).isOk() && !fs::exists(root))
-    assert(process::executable().isOk())
-    assert(path::name(process::besideProgram("levels")) == "levels")
-    val colour = io::isTerminal(.Output)
-    assert(colour || !colour)
-}
-```
-
-`std::path` takes a path apart and puts one together, as text: a `str`
-of names between `/`s, which is what `std::fs` takes. Nothing in it reads
-the disk. `clean` writes a path plainly, its `.`, `..` and doubled `/`s
-worked out by the text alone, so a `..` after a link is taken as the
-name's parent, where `fs::realPath` would follow the link. `relative`
-answers a path from a directory it is within, and nothing for one it is
-not. `withExtension` replaces a name's extension, or adds one. On Windows a
-path's names are between `\`s, and a `/` is read as one too; `root` is
-what a path begins at — `/` on a Unix, a drive's `C:\` or a share's
-`\\server\share\` on Windows — and nothing of a relative path; `join`
-puts the system's separator between, and `joinAsWritten` the one the
-directory is written with, so that a path a person gave as `game/levels`
-is echoed back as they wrote it:
-
-```wip,run,unix
-import std::path
-
-fn main() = {
-    assert(path::join("/a", "b") == "/a/b")
-    assert(path::joinAsWritten("a/b", "c") == path::join("a/b", "c"))
-    assert(path::root("/a/b") == "/" && path::root("a/b").isEmpty())
-    assert(path::name("/a/b/c.tar.gz") == "c.tar.gz")
-    assert(path::parent("/a/b/c.tar.gz") == "/a/b")
-    assert(path::parent("c") == ".")
-    assert(path::extension("c.tar.gz") == "gz")
-    assert(path::extension(".bashrc").isNone())
-    assert(path::stem("c.tar.gz") == "c.tar")
-    assert(path::isWithin("/a/b", "/a") && !path::isWithin("/ab", "/a"))
-
-    assert(path::clean("/a/./b//c/../d/") == "/a/b/d")
-    assert(path::clean("../a/../../b") == "../../b")
-    assert(path::relative("/a/b/c.txt", "/a") == "b/c.txt")
-    assert(path::relative("/ab/c", "/a").isNone())
-    assert(path::withExtension("a/b.wip", "o") == "a/b.o")
-}
-```
-
-`path::matches(pattern, path)` says whether a whole path matches a glob,
-as git matches the patterns of a `.gitignore`: `*` is any run of what is
-not `/`, `?` one character but `/`, `[…]` one character of a set, with
-ranges, and `[!…]` one outside it, and `**`, alone between `/`s or at an
-end, any number of whole directories, none among them. `\` takes the
-character after it as it is:
-
-```wip,run
-import std::path
-
-fn main() = {
-    assert(path::matches("*.wip", "main.wip"))
-    assert(!path::matches("*.wip", "lang/main.wip"))
-    assert(path::matches("**/*.wip", "lang/main.wip"))
-    assert(path::matches("**/*.wip", "main.wip"))
-    assert(path::matches("src/**/test_?.c", "src/a/b/test_1.c"))
-    assert(path::matches("[!.]*", "shown"))
-    assert(!path::matches("[!.]*", ".hidden"))
-}
-```
-
-## Files embedded: `std::embed`
-
-`embed::bytes(path)` and `embed::text(path)` read a file when the program
-is compiled, and its contents are a constant of the program, kept once in
-memory nothing writes: a `&[u8]`, or a `str`, which must be UTF-8.
-The path is a string literal, relative to the directory
-of the module that names it, and may not leave the package — `..` past its
-root, a whole path, or a link that leads out of it is refused. They are
-written where a constant's value is worked out, a top-level `val` or
-`assert`, and a function reads the file through that constant, which
-stands for the bytes as a reference parameter does: `FONT.len()`,
-`FONT[0]`, `FONT.toVec()`. A program built this way carries its assets in
-itself:
-
-```wip,ignore
-import std::embed
-
-val FONT: &[u8] = embed::bytes("assets/font.png")
-val HELP: str = embed::text("help.txt")
-
-@comptime
-val LEVELS: [Level; 12] = parseLevels(embed::text("levels.txt"))
-
-assert(FONT.len() > 0)
-```
-
-`embed::textOr(path, otherwise)` is the text of a file that may not be
-there: what a build writes beside a module, a commit or a date, which a
-copy of the source does not have. Where the file is not there it is
-`otherwise`, a string literal too; anything else wrong with the path is
-refused as `embed::text` refuses it:
-
-```wip,ignore
-import std::embed
-
-val BUILT: str = embed::textOr("built.txt", "")
-```
-
-## What the target is
-
-Four constants the compiler writes say what machine the program is being
-compiled for: `TARGET_OS` is `macos`, `linux`,
-`windows` or `ios`, which the simulator is too; `TARGET_ARCH` is `arm64` or
-`x86_64`; `TARGET_VENDOR` is `apple` on a Mac and on iOS, and empty
-elsewhere; and `TARGET_FAMILY` is `windows` on Windows and `unix` on every
-other system.
-
-```wip,run
-fn main() = {
-    val separator = if TARGET_FAMILY == "windows" then "\\" else "/"
-    assert(separator == "/" || TARGET_OS == "windows")
-    assert(TARGET_VENDOR == "apple" || TARGET_OS != "macos")
-    assert(TARGET_FAMILY == "unix" || TARGET_OS == "windows")
-}
-```
-
-They are for the places where splitting an item with `@target` is more than
-the difference is worth. The branch that cannot be taken is folded away,
-but it still has to compile — which is the opposite trade to `@target`, and
-the reason both exist.
 
 ## Vectors, matrices and rotations: `std::math`
 
@@ -2748,41 +1116,46 @@ fn main() = {
 }
 ```
 
-## The other modules
+## Every module
 
-| Module | What is in it |
-|---|---|
-| `std::args` | `Arguments`, `Argument` and `ArgumentError`: the program's arguments, read as options |
-| `std::io` | `print`, `println`, `printInt`, `eprintln`, `flush`, `stdin`, `Reader`, `env`, `environment`, `setEnv`, `unsetEnv`, `isTerminal`, `IoError`; `Read` and `Write`, what bytes are read from and written to, `copy`, and `stdout`, `stderr` and their `Printer`; and `EventQueue` with its `Interest` and `Event` |
-| `std::fs` | whole files, written, read and replaced; reading a directory, and walking the tree under one; what the filesystem says about a path, its owner among it; a path's mode and owner set; directories for a while |
-| `std::process` | `Command`, `Child` and `Exit`: other programs started and waited for; the program's own `currentDir`, `setCurrentDir`, `executable`, `besideProgram` and `id`; `Signals` and `Signal`: Ctrl-C and its like, caught; `fork`, `newGroup` and `sendToGroup`; `userId`, `becomeUser` and `changeRoot`; `limit` and `setLimit` |
-| `std::users` | `User` and `Group`: the system's users and groups, found by name or by number, a Unix's |
-| `std::path` | a path joined, and taken apart: its name, parent, extension and stem; cleaned, made relative, its extension replaced; matched by a glob |
-| `std::mem` | `replace`, a place's value taken out with another left in, and `swap`, two places' values exchanged |
-| `std::digest` | `sha256(bytes)`, `sha512(bytes)` and `sha1(bytes)`, digests of bytes in hand, and `Sha256`, `Sha512` and `Sha1`, written in pieces and then finished; `hmacSha256`, `hmacSha512` and `hmacSha1`, a digest under a key; `crc32(bytes)` and `adler32(bytes)`, the checksums gzip, zip, PNG and zlib end their data with, and `Crc32` and `Adler32`, written in pieces and read after any |
-| `std::c` | a value lent to C as a callback's `void *`, and had back in the callback; `Pinned`, a value C holds until it lets go; a slice's address for C to read; C's `sizeof` and `_Alignof` |
-| `std::embed` | a file's bytes or text, read when the program is compiled, as a constant |
-| `std::watch` | `Watcher`: which files and directories changed, as the system tells |
-| `std::sync` | `Atomic<T>` and `Mutex<T>`: what several threads may change at once, with waits that give up and a lock only tried; `Lazy<T>`, a value made once, by the first thread that asks; `ring`, its `Filler` and `Drainer`: values handed between two threads without waiting |
-| `std::shared` | `Shared<T>` and `Weak<T>`: a value several owners hold and read |
-| `std::random` | `Random`: numbers seeded or from the system, not for cryptography |
-| `std::markup` | `Html` and `Xml`: templates an interpolated literal builds, each value escaped as its place in the page needs, and a hole refused where it cannot be; `push`, `joined` and `trusted` |
-| `std::secret` | `bytes` and `fill`, from the system's generator for secrets; `equal`, two secrets compared in a time that does not say where they differ |
-| `std::net` | `Listener`, `Stream` and `Address`: TCP and Unix-domain connections |
-| `std::tls` | `TlsStream` and `TlsError`: a TLS connection, the server's certificate checked by the system |
-| `std::http` | `get`, `Client`, `Request`, `Response` and `Incoming`: HTTP/1.1 requests, a body read whole or as it comes, undone where it was sent gzipped, sent from bytes, a file or any `io::Read` |
-| `std::compress` | `gzip` and `gunzip`, `zlib` and `unzlib`, `deflate` and `inflate`, and `Inflater` and `Deflater` for bytes in pieces: deflate, through the system's zlib, a Unix's alone |
-| `std::math` | `PI`, `TAU` and `E`, and the vectors, matrices, rotations and shapes above; the functions are methods of `f64` and `f32`, `x.sin()`, written in Wip so that a `@comptime` constant computes the program's bits |
-| `std::text` | `Scanner` and `Position`, above; `ParseError`, and the `Split`, `Lines` and `Chars` types the prelude's methods answer |
-| `std::iter` | `Walk`, `Forwards`, `Backwards`, `Taking` (what a `Vec` gives up to `for x in move v`), and the adapter types `Mapped`, `Filtered`, `FilterMapped`, `FlatMapped`, `Chained`, `Enumerated`, `Taken`, `TakenWhile`, `Skipped`, `Zipped`, `Peekable` |
-| `std::collections` | `Map`, `Set`, `MapEntry`, `SortedMap`, `SortedSet`, `Deque`, `PriorityQueue`, and `Arena` with its `Handle`, `ArenaEntry` and `ArenaValues` |
-| `std::log` | `Log`, `Level` and `Record`: what a program says as it runs, kept from a least level, to standard error, the system's log or a closure of the program's |
-| `std::time` | `Duration`, a length of time; `Instant`, a moment on a clock that only goes forward; `sleep`; `FixedStep`, a game's updates at a steady rate; `now`, the date it is; `Utc`, a moment as a calendar has it, and `Local`, as it has it where the program runs |
-| `std::bytes` | numbers read and written at a place in bytes, `u32le` and `putU32le`; `Reader` and `Writer`, the same in turn; and a binary format for `Encode` and `Decode` |
-| `std::base64` | `encode` and `decode`, in the standard alphabet or the one for URLs, padded or not, and `Base64Error` |
-| `std::hex` | `encode` and `decode`, two digits a byte, and `HexError` |
-| `std::url` | `Url`, a URL's text and its parts, read with `parse` or built by a literal, each hole encoded as its part needs; `encode` and `decode`, percent-encoding for any part of a URL, and `UrlError` |
-| `std::libc` | the C library as std calls it: `printf`, `fwrite`, `stdout`, `read`, `open` and its flags, `getentropy`, `errno()` — C's, promising nothing C does not |
+Each of `std`'s modules, and the page that describes it:
+
+| Module | What is in it | Page |
+|---|---|---|
+| `std::args` | `Arguments`, `Argument` and `ArgumentError`: the program's arguments, read as options | [10.2](10-library-system.md) |
+| `std::io` | `print`, `println`, `printInt`, `eprintln`, `flush`, `stdin`, `Reader`, `env`, `environment`, `setEnv`, `unsetEnv`, `isTerminal`, `IoError`; `Read` and `Write`, what bytes are read from and written to, `copy`, and `stdout`, `stderr` and their `Printer`; and `EventQueue` with its `Interest` and `Event` | [10.2](10-library-system.md), [10.3](10-library-formats.md) |
+| `std::fs` | whole files, written, read and replaced; reading a directory, and walking the tree under one; what the filesystem says about a path, its owner among it; a path's mode and owner set; directories for a while | [10.2](10-library-system.md) |
+| `std::process` | `Command`, `Child` and `Exit`: other programs started and waited for; the program's own `currentDir`, `setCurrentDir`, `executable`, `besideProgram` and `id`; `Signals` and `Signal`: Ctrl-C and its like, caught; `fork`, `newGroup` and `sendToGroup`; `userId`, `becomeUser` and `changeRoot`; `limit` and `setLimit` | [10.2](10-library-system.md) |
+| `std::users` | `User` and `Group`: the system's users and groups, found by name or by number, a Unix's | [10.2](10-library-system.md) |
+| `std::path` | a path joined, and taken apart: its name, parent, extension and stem; cleaned, made relative, its extension replaced; matched by a glob | [10.2](10-library-system.md) |
+| `std::mem` | `replace`, a place's value taken out with another left in, and `swap`, two places' values exchanged; `using` and `onHeap`, where a call's allocations come from: an `Arena`, a `Custom` one of a program's own `Allocator`, or the heap | [6](06-ownership.md#where-memory-comes-from-memusing) |
+| `std::digest` | `sha256(bytes)`, `sha512(bytes)` and `sha1(bytes)`, digests of bytes in hand, and `Sha256`, `Sha512` and `Sha1`, written in pieces and then finished; `hmacSha256`, `hmacSha512` and `hmacSha1`, a digest under a key; `crc32(bytes)` and `adler32(bytes)`, the checksums gzip, zip, PNG and zlib end their data with, and `Crc32` and `Adler32`, written in pieces and read after any | [10.3](10-library-formats.md) |
+| `std::c` | a value lent to C as a callback's `void *`, and had back in the callback; `Pinned`, a value C holds until it lets go; a slice's address for C to read; C's `sizeof` and `_Alignof` | [11](11-c.md) |
+| `std::embed` | a file's bytes or text, read when the program is compiled, as a constant | [10.2](10-library-system.md) |
+| `std::watch` | `Watcher`: which files and directories changed, as the system tells | [10.2](10-library-system.md) |
+| `std::sync` | `Atomic<T>` and `Mutex<T>`: what several threads may change at once, with waits that give up and a lock only tried; `Lazy<T>`, a value made once, by the first thread that asks; `ring`, its `Filler` and `Drainer`: values handed between two threads without waiting | [10.1](10-library-threads.md) |
+| `std::future` | `Future`, work run on a thread of its own and waited for; `both`, `each` and `map`, work that borrows, across threads; `Pool`, threads started once for them; `channel`, its `Sender` and `Receiver` | [10.1](10-library-threads.md) |
+| `std::shared` | `Shared<T>` and `Weak<T>`: a value several owners hold and read | above |
+| `std::random` | `Random`: numbers seeded or from the system, not for cryptography | [10.2](10-library-system.md) |
+| `std::markup` | `Html` and `Xml`: templates an interpolated literal builds, each value escaped as its place in the page needs, and a hole refused where it cannot be; `push`, `joined` and `trusted` | [10.3](10-library-formats.md) |
+| `std::secret` | `bytes` and `fill`, from the system's generator for secrets; `equal`, two secrets compared in a time that does not say where they differ | [10.3](10-library-formats.md) |
+| `std::net` | `Listener`, `Stream` and `Address`: TCP and Unix-domain connections | [10.3](10-library-formats.md) |
+| `std::tls` | `TlsStream` and `TlsError`: a TLS connection, the server's certificate checked by the system | [10.3](10-library-formats.md) |
+| `std::http` | `get`, `Client`, `Request`, `Response` and `Incoming`: HTTP/1.1 requests, a body read whole or as it comes, undone where it was sent gzipped, sent from bytes, a file or any `io::Read` | [10.3](10-library-formats.md) |
+| `std::compress` | `gzip` and `gunzip`, `zlib` and `unzlib`, `deflate` and `inflate`, and `Inflater` and `Deflater` for bytes in pieces: deflate, through the system's zlib, a Unix's alone | [10.3](10-library-formats.md) |
+| `std::math` | `PI`, `TAU` and `E`, and the vectors, matrices, rotations and shapes above; the functions are methods of `f64` and `f32`, `x.sin()`, written in Wip so that a `@comptime` constant computes the program's bits | above |
+| `std::text` | `Scanner` and `Position`, above; `ParseError`, and the `Split`, `Lines` and `Chars` types the prelude's methods answer | above |
+| `std::iter` | `Walk`, `Forwards`, `Backwards`, `Taking` (what a `Vec` gives up to `for x in move v`), and the adapter types `Mapped`, `Filtered`, `FilterMapped`, `FlatMapped`, `Chained`, `Enumerated`, `Taken`, `TakenWhile`, `Skipped`, `Zipped`, `Peekable` | above |
+| `std::collections` | `Map`, `Set`, `MapEntry`, `SortedMap`, `SortedSet`, `Deque`, `PriorityQueue`, and `Arena` with its `Handle`, `ArenaEntry` and `ArenaValues` | above |
+| `std::log` | `Log`, `Level` and `Record`: what a program says as it runs, kept from a least level, to standard error, the system's log or a closure of the program's | [10.2](10-library-system.md) |
+| `std::time` | `Duration`, a length of time; `Instant`, a moment on a clock that only goes forward; `sleep`; `FixedStep`, a game's updates at a steady rate; `now`, the date it is; `Utc`, a moment as a calendar has it, and `Local`, as it has it where the program runs | [10.2](10-library-system.md) |
+| `std::bytes` | numbers read and written at a place in bytes, `u32le` and `putU32le`; `Reader` and `Writer`, the same in turn; and a binary format for `Encode` and `Decode` | [10.3](10-library-formats.md) |
+| `std::json` | `Json`, `parse`, `encode` and `decode`, and `JsonError`: JSON read into a tree or into a type that derives `Decode`, and written from one | [10.3](10-library-formats.md) |
+| `std::regex` | `Regex`, `Found`, `escape` and `RegexError`: regular expressions, compiled once and matched, searched and replaced | [10.3](10-library-formats.md) |
+| `std::base64` | `encode` and `decode`, in the standard alphabet or the one for URLs, padded or not, and `Base64Error` | [10.3](10-library-formats.md) |
+| `std::hex` | `encode` and `decode`, two digits a byte, and `HexError` | [10.3](10-library-formats.md) |
+| `std::url` | `Url`, a URL's text and its parts, read with `parse` or built by a literal, each hole encoded as its part needs; `encode` and `decode`, percent-encoding for any part of a URL, and `UrlError` | [10.3](10-library-formats.md) |
+| `std::libc` | the C library as std calls it: `printf`, `fwrite`, `stdout`, `read`, `open` and its flags, `getentropy`, `errno()` — C's, promising nothing C does not | [11](11-c.md) |
 
 ```wip,run
 import std::digest
@@ -2800,132 +1173,5 @@ fn main() = {
     assert(digest::sha256(&text)[0] == 0xBA)
     assert(digest::crc32(&text) == 0x352441C2)
     assert(digest::adler32(&text) == 0x024D0127)
-}
-```
-
-`std::time` measures and waits: a `Duration` is made in
-any unit and read back in any, adds and compares, and is written in the
-largest unit it fills; an `Instant` is a moment on a clock that only goes
-forward, which means nothing alone and something against another:
-
-```wip,run
-import std::time::{Duration, Instant, sleep}
-
-fn main() = {
-    val start = Instant::now()
-    sleep(Duration::millis(5))
-    assert(start.elapsed() >= Duration::millis(5))
-    assert("\(Duration::millis(1500))" == "1.5s")
-}
-```
-
-A game updates its world at a steady rate, whatever rate it draws at, so
-that its physics is the same on a fast machine and a slow one. A
-`FixedStep` adds up real time with `advance()` once a frame; `due()`
-answers whether another update fits in what it has added up, and takes it;
-and `alpha()` is how far the frame is into the next update, from 0 to 1,
-which the drawing goes between the last two by. A frame adds at most a
-quarter of a second, so a stall — a breakpoint, a window dragged — runs
-no long catch-up after it. `advanceBy(duration)` adds a given time, as a
-test or a replay does:
-
-```wip,run
-import std::time::{Duration, FixedStep}
-
-fn main() = {
-    var step = FixedStep::of(60)
-    var height = 10.0
-    var updates = 0
-    step.advanceBy(Duration::millis(40))
-    while step.due() {
-        height -= 9.8 * step.seconds() * step.seconds()
-        updates += 1
-    }
-    assert(updates == 2 && step.alpha() > 0.39 && step.alpha() < 0.41)
-    step.advanceBy(Duration::seconds(3))
-    var caught = 0
-    while step.due() do
-        caught += 1
-
-    assert(caught == 15, "a quarter of a second, and no more")
-}
-```
-
-The date it is is another clock: `time::now()` answers the seconds since
-1970 as the system says, which may be set back, and a `Utc` is such a
-moment as a calendar has it — year, month, day, hour, minute, second and
-weekday, in UTC, with no time zone and no leap second. `Utc::of` makes
-one from its seconds, and `Utc::at` from its date and time of day, or
-answers nothing for a day the month does not have, the 30th of February,
-or an hour past 23. It is written as HTTP and as ISO 8601 write it, and
-both are read back: `parseIso` reads RFC 3339's form, the one `iso()`
-writes, with `Z` or any offset, and a fraction of a second left out:
-
-```wip,run
-import std::time
-import std::time::{Utc}
-
-fn main() = {
-    assert(time::now() > 0)
-    val moment = Utc::at(
-        year: 1994,
-        month: 11,
-        day: 6,
-        hour: 8,
-        minute: 49,
-        second: 37,
-    ).unwrap()
-    assert(moment.seconds() == 784111777 && moment.weekday() == 0)
-    assert(Utc::at(year: 2100, month: 2, day: 29).isNone(), "not a leap year")
-    assert(moment.httpDate() == "Sun, 06 Nov 1994 08:49:37 GMT")
-    assert(moment.iso() == "1994-11-06T08:49:37Z")
-    assert(Utc::parseHttpDate("Sun, 06 Nov 1994 08:49:37 GMT") == moment)
-    assert(Utc::parseIso("1994-11-06T01:49:37.250-07:00") == moment)
-    assert(Utc::parseIso("1994-11-06").isNone(), "a date alone")
-}
-```
-
-A `Utc` is moved and measured by a `Duration`, as an `Instant` is, with
-`after`, `before` and `since`, in whole seconds. A calendar's arithmetic
-is its own: `addDays` keeps the time of day, `addMonths` keeps the day
-of the month, or takes the month's last where it is shorter, and
-`daysSince` counts the dates between two moments, not their hours:
-
-```wip,run
-import std::time::{Duration, Utc}
-
-fn main() = {
-    val due = Utc::at(year: 2026, month: 1, day: 31, hour: 9).unwrap()
-    val next = due.addMonths(1)
-    assert(next.month() == 2 && next.day() == 28 && next.hour() == 9)
-    assert(due.addDays(1).month() == 2 && due.addDays(1).day() == 1)
-    val later = due.after(Duration::seconds(90))
-    assert(later.since(&due) == Duration::seconds(90))
-    assert(next.daysSince(&due) == 28)
-}
-```
-
-A `Local` is a moment in the time zone the program runs in, as the
-system's database of zones says, `TZ` naming the zone where it is set: the
-moment, the zone's offset from UTC then, in seconds and negative west of
-Greenwich, and the zone's name then, `PDT` or `CET`, which says whether
-summer time is kept. It reads as a `Utc` does, what the zone's clocks read
-at that moment, and is written as ISO 8601 writes a moment with its offset,
-`2026-10-10T11:26:03-07:00`. A date as a person reads it is written with
-interpolation's widths:
-
-```wip,run
-import std::time
-import std::time::{Local, Utc}
-
-fn main() = {
-    val now = time::now()
-    val here = Local::of(now)
-    assert(here.utc() == Utc::of(now))
-    // What the zone's clocks read is UTC's, moved by the offset.
-    val clock = Utc::of(now + here.offset())
-    assert(here.day() == clock.day() && here.hour() == clock.hour())
-    val day = "\(here.year())-\(here.month(), width: 2, fill: '0')-\(here.day(), width: 2, fill: '0')"
-    assert(day.len() == 10 && "\(here)".startsWith(day.toStr()))
 }
 ```

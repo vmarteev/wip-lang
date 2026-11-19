@@ -29,7 +29,10 @@ words mean: a value *answers*, a place is *lent*, a call *keeps*.
 | [7. References and lending](07-references.md) | `&` and `&var`, second-class references, projections, `lend fn`, views |
 | [8. Interfaces](08-interfaces.md) | `interface`, `extend`, `@derive`, constraints, `&dyn`, conditional implementations |
 | [9. Failure](09-errors.md) | `Result` and `?`, `panic`, `assert`, `never` |
-| [10. The standard library](10-library.md) | the prelude, `Vec`, `String`, collections, iterators, `std::io` |
+| [10. The standard library](10-library.md) | the prelude, `Vec`, `String`, iterators, collections, `std::math`, and every module in a table |
+| [10.1. Threads](10-library-threads.md) | `std::future`, `both`, `each` and `map`, `std::sync` |
+| [10.2. The system](10-library-system.md) | arguments, logs, time, random numbers, other programs, files, `std::embed`, the target |
+| [10.3. Connections and formats](10-library-formats.md) | `std::net`, HTTP and TLS, compression, JSON, bytes, base64, HTML and XML, regular expressions, secrets |
 | [11. C](11-c.md) | `extern` blocks, `@link` and `@header`, C files in a module and their settings, `cstring` |
 | [12. The tools](12-tools.md) | `wip build`, `run`, `test`, `check`, `mir`, and what they read from disk |
 | [Cheat sheet](cheat-sheet.md) | the language on one page, an example for each part |
@@ -51,6 +54,11 @@ true. The fence says what is expected:
   shows what the language does not allow.
 - **`wip,ignore`** — a fragment that stands for something rather than a
   program.
+
+`,unix` after the others, `wip,run,unix`, marks an example of what only a
+Unix has — its programs, its signals, its users: it is run on a Unix, and
+on Windows checked as Linux's. `,apple` marks one of what only Apple's
+systems have, run on them and checked elsewhere as a Mac's.
 
 Each example is also laid out as `wip fmt --spaces 4 --width 80` lays it
 out, so that it fits a page. `wip fmt` with its defaults indents with a

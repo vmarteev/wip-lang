@@ -53,9 +53,10 @@ name whose last piece is not a target the compiler knows says nothing, so
 `v1.2.wip` is an ordinary file.
 
 An item may say the same thing with `@target(os = "linux")`, or
-`@target(family = "unix")`, which [page 11](11-c.md) shows; a file is for the places where most of it differs. What
-another target takes is checked by asking for that target: `wip check
---target linux` on a Mac ([page 12](12-tools.md)).
+`@target(family = "unix")`, which [page 11](11-c.md) shows; a file is for
+the places where most of it differs. What another target takes is checked
+by asking for that target: `wip check --target linux` on a Mac
+([page 12](12-tools.md)).
 
 What is declared only for another target is not there, and a name of it
 is refused as any name that is not; the error says which target has it,
@@ -299,10 +300,10 @@ pub fn size(): i64 = 10
   own may not begin with a dependency's name, the directory beside it
   that is the dependency's. A path written out to
   `package::besideProgram` must be one `@files` names, or below one. A
-  file read when the program is compiled is embedded instead ([page
-  10](10-library.md)): what is part of the code, as a table it is written
-  against; a file, for what is changed apart from the code, as a game's
-  pictures and shaders.
+  file read when the program is compiled is embedded instead
+  ([page 10.2](10-library-system.md#files-embedded-stdembed)): what is
+  part of the code, as a table it is written against; a file, for what is
+  changed apart from the code, as a game's pictures and shaders.
 - **`@app(id = "com.example.game", name = "The Game")`** says the package
   is an app, which a build for iOS makes a bundle of
   ([page 12](12-tools.md#ios)): `id`, which it must say, is its
@@ -311,7 +312,7 @@ pub fn size(): i64 = 10
   `orientation` is `landscape`, `portrait` or `any`; `icon` is a square
   PNG of the package, which the build makes each size of; `minimum` is the
   least iOS version it runs on, `"17.0"` if not said. Its version is the
-  package's `@version`. A build for a Mac or Linux does not read it.
+  package's `@version`. A build for any other system does not read it.
 - **`wip build game`** builds the package whose root is `game/`, with what
   it depends on, from source, into one program; `wip test game` runs
   `game`'s own tests. A package with a `main` is a program, and one
@@ -323,13 +324,14 @@ pub fn size(): i64 = 10
 
 Some names are in scope in every file without an import: the types
 `Option`, `Result`, `Ordering`, `Vec`, `String`, `InlineVec`, `Range`,
-`Hasher`, `Align`, `InRadix`, `WithPrecision` and the tuple structs; the
-interfaces `Eq`, `Ord`, `Hash`, `Text`, `Clone`, `Items`, `Iterator`,
-`IntoIterator`, `Sequence`, `Index`, `Destroy` and `From`, the operators'
-`Add`, `Subtract`, `Multiply`, `Divide`, `Remainder`, `Negate` and `Not`,
-the numbers' `Zero` and `One`, and `Encode`, `Decode`, `Encoder` and
-`Decoder`; the functions `destroy` and `cloneOf`; and `assert` and
-`panic` as forms of the language.
+`Hasher`, `Align`, `InRadix`, `WithPrecision`, `Location`, `Refusal` and
+the tuple structs; the interfaces `Eq`, `Ord`, `Hash`, `Text`, `Clone`,
+`Items`, `Iterator`, `IntoIterator`, `Sequence`, `Index`, `Collect`,
+`Template`, `Destroy` and `From`, the operators' `Add`, `Subtract`,
+`Multiply`, `Divide`, `Remainder`, `Negate` and `Not`, the numbers' `Zero`
+and `One`, and `Encode`, `Decode`, `Encoder` and `Decoder`; the functions
+`destroy`, `cloneOf`, `unbox` and `madeBy`; and `assert` and `panic` as
+forms of the language.
 
 The prelude is the outermost scope, read only for a name found nowhere
 nearer: a name a module declares, or imports, is the module's own, of
@@ -488,9 +490,10 @@ so it cannot be an array's length.
 A constant may belong to a type: a `val` written among the type's
 members — in its body, beside its fields and methods, or in an `extend`
 block — is reached through the type, `Type::NAME`, as a static function
-is, as the numbers' limits are, `i64::MAX`. It is a constant as one at the top level is, with the same rules,
-`pub` to be used outside its module. Its name is one of the type's
-members, which no method, static function or variant of it may share:
+is, as the numbers' limits are, `i64::MAX`. It is a constant as one at the
+top level is, with the same rules, `pub` to be used outside its module.
+Its name is one of the type's members, which no method, static function
+or variant of it may share:
 
 ```wip,run
 struct Money {

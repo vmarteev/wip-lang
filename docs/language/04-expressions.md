@@ -575,7 +575,7 @@ hole, as its `pushValue` writes it. An option a type's `pushValue` does not
 take is refused at the hole, and so is a value it does not take. Where no
 type is written, a literal is a `String`: `val row = "<li>\(name)</li>"`
 is text, and `val row: Html = …` says it is HTML, which `std::markup`
-builds (page 10).
+builds ([page 10.3](10-library-formats.md#html-and-xml-stdmarkup)).
 
 A template may say what it refuses in a literal, from the literal's own
 text, by a static function of its own, `refusal`. The compiler runs it
@@ -638,7 +638,7 @@ A template may also finish what a literal built, by a method of its own,
 `move fn finished(): Self`: the literal's block ends by giving it what the
 pieces built, and its answer is the literal's value, with a `Location` it
 takes the literal's. `Regex` compiles its pattern there, once it is
-whole (page 10).
+whole ([page 10.3](10-library-formats.md#regular-expressions-stdregex)).
 
 ## `is`
 
@@ -723,10 +723,10 @@ branch of one expression is after `then`: a call, an assignment, a
 would in braces — a `?` leaves the function, and `break` and `continue`
 are the loop's. The body goes on the line below the `do`, one deeper, and
 a blank line follows it, ending it where a `}` would have; a statement's
-`then` is written the same way. A body of more than one statement is written in braces; so is
-one that is itself a loop, whose words on one line would not say which
-loop is the outer, an `if` with an `else`, and a `match` (E0101, with
-the fix that writes the braces):
+`then` is written the same way. A body of more than one statement is
+written in braces; so is one that is itself a loop, whose words on one
+line would not say which loop is the outer, an `if` with an `else`, and a
+`match` (E0101, with the fix that writes the braces):
 
 ```wip,run
 val words = ["a", "bc", "def"]
@@ -891,7 +891,7 @@ runs until the first value is asked for:
 fn words(text: str): Iterator<str> = {
     var start = 0
     for i in 0..text.len() {
-        if text[i] == 32 {
+        if text[i] == b' ' {
             yield text[start..i]
             start = i + 1
         }

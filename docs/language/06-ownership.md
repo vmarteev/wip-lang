@@ -299,8 +299,9 @@ fn main() = {
 ## What this adds up to
 
 - A value is freed exactly once, where its owner ends.
-- Nothing is freed while something still refers to it, because references
-  are second-class and cannot outlive the call they are lent for — which is
+- Nothing is freed while something still refers to it: a `&var` lives
+  only for the call it is lent to, and a `&` kept in a view is used only
+  while what it points into stays as it is — which is
   [page 7](07-references.md).
 - No garbage collector, no `free` written by hand, and no reference
   counting but where a program shares a value with `share()`.

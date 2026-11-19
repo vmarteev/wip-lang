@@ -2,6 +2,27 @@
 
 Each version published, newest first.
 
+## 0.17.4 — 2026-11-18
+
+- **A method called through a `&dyn` reached through a reference** — an
+  element of a `Vec<&dyn T>`, a map's value, a `& &dyn T` parameter —
+  stopped the compiler while it wrote the program. The call reads the
+  method's table from the `&dyn` it reaches.
+- **`Log::toSystem` on Windows** gives its records to the Event Log, under
+  the program's name, where it called `syslog`, which Windows does not
+  have, and a program that used it did not link.
+- **`--target all` checks Windows,** on arm64 and on x86-64, beside the
+  Macs, Linux and iOS; `--help` names the Windows targets.
+- **The reference:** the standard library's page is four, the prelude
+  and the collections, threads, the system, and connections and formats;
+  the table of modules says where each is. What had stopped being true is
+  corrected — a `&` kept as a view, a slice and a `&dyn` among them, and
+  how Wip is installed — and what was missing added, among it the
+  prelude's `Collect`, `Template` and `Location`.
+- **The README** installs on Windows with one PowerShell block, and says
+  how Windows is checked.
+- **CI** checks out with `actions/checkout` v5.
+
 ## 0.17.3 — 2026-11-16
 
 - **The character tables' scripts** read and write their files as UTF-8,
