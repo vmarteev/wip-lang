@@ -56,9 +56,42 @@ fn missing(): String = match io::env("WIP_CLANG") {
 /// `clang` 15 reads by default and 14 does not: 15 is the version whose
 /// bitcode the backend writes. Apple counts its versions as LLVM does not, so
 /// the module answers rather than the number.
-fn readsTheIr(clang: str, identity: &[u8]): bool = {
+fn readsTheIr(clang: str, identity: &[u8]): bool = compilesModule(
+	clang,
+	&identity,
+	"reads the LLVM backend's IR",
+	"probe.ll",
+	&"define ptr @probe(ptr %p) {\n  ret ptr %p\n}\n".items(),
+)
+
+/// How the IR marks a local's life for the `clang` that compiles it,
+/// `found`: without its size where `found` compiles bitcode that marks it
+/// so, as `clang` 22 and later do, and with it otherwise, as 15 to 21 take
+/// the marks. A later `clang` reads the sized marks too, but through an
+/// upgrade that leaves its text and its bitcode read otherwise. Where there
+/// is no `clang`, the IR asked for is written as every `clang` from 15
+/// reads it. `WIP_LLVM_LIFETIMES` says `sized` or `unsized` instead: a seed,
+/// which any `clang` from 15 builds, is written `sized`.
+pub fn lifetimesOf(found: &Result<FoundClang, String>): llvm::Lifetimes = {
+	if io::env("WIP_LLVM_LIFETIMES") is .Some(said) then
+		return if said == "unsized" then .Unsized else .Sized
+
+	if found is .Ok(clang) {
+		val probe = llvm::unsizedLifetimeProbe()
+		val asked = "compiles, optimised, bitcode that marks a life without its size"
+		if compilesModule(&clang.path, &clang.identity, asked, "probe.bc", &probe.items()) then
+			return .Unsized
+	}
+	return .Sized
+}
+
+/// Whether `clang` compiles the module `probe`, written to a file `name`,
+/// which says whether it does what `asked` names: at `-O2`, where `clang`
+/// checks the module it is given, which at `-O0` it may compile unchecked.
+/// The answer is kept in the cache under the question and the `clang`, so
+/// that it is asked once.
+fn compilesModule(clang: str, identity: &[u8], asked: str, name: str, probe: &[u8]): bool = {
 	var key = Sha256()
-	val asked = "reads the LLVM backend's IR"
 	field(&var key, &asked)
 	field(&var key, &identity)
 	val answer = path::join(cache(), hex(key.finish()))
@@ -66,11 +99,11 @@ fn readsTheIr(clang: str, identity: &[u8]): bool = {
 		return known.toStr() == "yes"
 
 	val .Ok(dir) = fs::TempDir::new() else return false
-	val module = dir.join("probe.ll")
+	val module = dir.join(name)
 	val object = dir.join("probe.o")
-	val probe = "define ptr @probe(ptr %p) {\n  ret ptr %p\n}\n"
 	val compiles = Command::of(clang).args([
 		"-c",
+		"-O2",
 		"-x",
 		"ir",
 		"-Wno-override-module",
@@ -78,8 +111,9 @@ fn readsTheIr(clang: str, identity: &[u8]): bool = {
 		"-o",
 		object.toStr(),
 	])
+	// Bitcode is bytes, which a `str` holds as any others.
 	val reads =
-		fs::writeFile(module, probe).isOk() &&
+		fs::writeFile(module, str::fromBytes(&probe)).isOk() &&
 		compiles.output() is .Ok(output) &&
 		output.exit.success()
 	// Only an answer from a `clang` that was there, and said its version, is
@@ -102,7 +136,7 @@ fn isAppleClang(identity: &[u8]): bool = {
 	return false
 }
 
-/// The objects `clang` makes of the LLVM backend's IR, its parts compiled at
+/// The objects `found` makes of the LLVM backend's IR, its parts compiled at
 /// once, with the tables a panic reads its calls from, which the program's
 /// DWARF says the contents of, and the list of them. A release build's part
 /// has its table in its object; a debug build's one table is an object of
@@ -112,14 +146,11 @@ fn isAppleClang(identity: &[u8]): bool = {
 /// when nothing has changed.
 pub fn llvmObjects(
 	ir: &Ir,
+	found: &FoundClang,
 	options: &BuildOptions,
 	optimize: bool,
 	unique: &Unique,
 ): Result<Vec<Vec<u8>>, BuildError> = {
-	val found = match findClang(&unique) {
-		.Ok(found) => found
-		.Err(message) => return .Err(.Link(message))
-	}
 	val llvm = Clang::new(&found, &options, optimize, &unique)
 	return if optimize then llvm.optimized(&ir.modules, &ir.files)
 	else llvm.parts(&ir.modules, &ir.files)

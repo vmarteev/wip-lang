@@ -301,7 +301,11 @@ the library exports to C, and nothing else. The header `--header` writes
 begins with what the library is to be linked with, where it is anything.
 
 `--emit llvm-ir` writes what the compiler hands LLVM, as text, and stops
-there: no `clang` is run, so it works on a machine without one. A build is
+there: nothing is compiled, so it works on a machine without a `clang`.
+The IR is written for the `clang` a build would use, which marks where a
+local's life starts and ends with its size from 15 to 21, and without it
+from 22; with none, or with `WIP_LLVM_LIFETIMES=sized`, it is written as
+every `clang` from 15 reads it. A build is
 cut into parts that are compiled at once, and writes each, `main.ll` and
 beside it `main.1.ll`, `main.2.ll` and on; a small program is one part.
 `--emit llvm-bc` writes the same modules as LLVM's bitcode, which is what

@@ -2,6 +2,26 @@
 
 Each version published, newest first.
 
+## 0.18.1 — 2026-11-25
+
+What CI on Windows' new runners found, whose `clang` is 22.
+
+- **A local's life is marked as the build's `clang` reads it:** `clang`
+  22 takes the marks without their size, and read the sized ones only
+  through an upgrade that left a module's text and its bitcode read
+  otherwise. The backend asks the `clang` once, and keeps its answer, and
+  writes the marks without their size for 22 and later and with it for 15
+  to 21. IR written with no `clang` there, `--emit llvm-ir` or `llvm-bc`,
+  and with `WIP_LLVM_LIFETIMES=sized`, is read by every `clang` from 15.
+- **The tests of reading a float** check each halfway point between two
+  floats, and the text a digit either side of it, against the float it is
+  nearest, not against C: Windows' C library reads no more than 768
+  digits of a number, and read the text a digit above a halfway point as
+  the tie. Wip read it right. Where the halfway point is a whole number,
+  the text below it is now one less than it, where it was not.
+- **`scripts\verify.ps1`** checks the table of powers of ten, as
+  `scripts/verify.sh` does.
+
 ## 0.18.0 — 2026-11-24
 
 **Breaking:** what the checker accepted and the build then got wrong is

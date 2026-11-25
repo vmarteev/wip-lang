@@ -16,7 +16,8 @@
 # and otherwise, and in the guests, the one that system's seed builds — and
 # that compiler writes its own bitcode, a release build without debug
 # information, which a seed has no use for: in parts, as a release build
-# is. The three are then joined each into one module by `llvm-link-15` and
+# is, and as `clang-15` reads it, `WIP_LLVM_LIFETIMES=sized`, whatever
+# `clang` is there. The three are then joined each into one module by `llvm-link-15` and
 # optimised for size by `clang-15`, the oldest `clang` Wip builds with, in
 # the arm64 guest: LLVM reads bitcode older versions wrote, so every `clang`
 # it supports reads a seed, on every system.
@@ -83,7 +84,7 @@ make_raw() {
     chmod +x "$out/cc.sh"
     CC="$out/cc.sh" WIP_CACHE_DIR="$out/cache" scripts/build.sh --release ${with:+--with "$with"} --out "$out/stage"
     mkdir -p "$raw/$name"
-    WIP_HOME="$PWD" "$out/stage/bin/wip" build --release --no-debug-info --emit llvm-bc \
+    WIP_LLVM_LIFETIMES=sized WIP_HOME="$PWD" "$out/stage/bin/wip" build --release --no-debug-info --emit llvm-bc \
         compiler/main.wip -o "$raw/$name/wip.bc"
     # The link is the last call: past `-o <program>` and the objects, the
     # libraries and frameworks, one a line; not what the linker is told to do
@@ -110,7 +111,7 @@ make_windows_raw() {
     out=$(mktemp -d)
     WIP_CACHE_DIR="$out/cache" scripts/build.sh --release ${with:+--with "$with"} --out "$out/stage"
     mkdir -p "$raw/$name"
-    WIP_HOME="$PWD" "$out/stage/bin/wip" build --release --no-debug-info --emit llvm-bc \
+    WIP_LLVM_LIFETIMES=sized WIP_HOME="$PWD" "$out/stage/bin/wip" build --release --no-debug-info --emit llvm-bc \
         --target "$name" compiler/main.wip -o "$raw/$name/wip.bc"
     WIP_HOME="$PWD" "$out/stage/bin/wip" build --release --target "$name" --emit objects \
         compiler/main.wip -o "$out/objects"

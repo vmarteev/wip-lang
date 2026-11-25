@@ -130,6 +130,14 @@ foreach ($table in 'widths', 'category', 'case') {
 		Say "character $table" 'FAILED' $step; Get-Content "$out\$table"; $failed = $true
 	}
 }
+$step = Get-Date
+if (-not $python) {
+	Say 'powers of ten' 'skipped: no Python' $null
+} elseif (Ran $python.Source @('scripts\float-powers.py', '--check') "$out\powers") {
+	Say 'powers of ten' 'ok' $step
+} else {
+	Say 'powers of ten' 'FAILED' $step; Get-Content "$out\powers"; $failed = $true
+}
 Say "editors' grammar" 'skipped: checked on a Unix' $null
 Say 'citations' 'skipped: checked on a Unix' $null
 
