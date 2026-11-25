@@ -58,6 +58,24 @@ extend Parser {
 		// takes the whole expression after it, like `return`.
 		if self.at(.Lend) {
 			val start = self.bump()
+			// What `lend` hands back is a place, and a `lend` is not one: it
+			// hands its place to the caller and ends there, as `return` does.
+			if self.at(.Lend) {
+				val again = self.span()
+				self.report(
+					Diagnostic::error(
+						EXPECTED,
+						"expected a place to lend, found `lend`",
+						again,
+						"a second `lend`",
+					).withFix("take out the second `lend`", [
+						Edit::replace(start.to(again), "lend"),
+					]).withNote(
+						"`lend` hands a place to the caller and ends there, as `return` does, so what follows it is the place",
+					),
+				)
+				self.bump()
+			}
 			val value = self.expr()
 			val span = start.to(self.exprSpan(value))
 			return self.allocExpr(.Lend(value:), span)
@@ -86,11 +104,31 @@ extend Parser {
 		return self.exprBp(0)
 	}
 
-	/// Precedence climbing over `infixBindingPower`. A complete expression
-	/// stops at a significant line break.
+	/// Precedence climbing over `infixBindingPower`, one level deeper. A
+	/// complete expression stops at a significant line break.
 	var fn exprBp(minBp: i64): ExprId = {
+		if self.deeper() then
+			return self.allocExpr(.Error, self.span())
+
+		val e = self.climbed(minBp)
+		self.shallower()
+		return e
+	}
+
+	var fn climbed(minBp: i64): ExprId = {
 		var lhs = self.prefix()
+		// Each operator of a chain is a level of the tree it makes, counted
+		// once it has made it.
+		var steps = 0
+		var counted = lhs
 		while true {
+			if lhs != counted {
+				counted = lhs
+				if self.deeper() then
+					break
+
+				steps += 1
+			}
 			if self.lineBreak() then
 				break
 
@@ -189,6 +227,7 @@ extend Parser {
 			}
 			lhs = self.allocExpr(kind, span)
 		}
+		self.nesting -= steps
 		return lhs
 	}
 
@@ -293,7 +332,18 @@ extend Parser {
 
 	var fn postfix(): ExprId = {
 		var e = self.primary()
+		// Each call, field or index of a chain is a level of the tree it
+		// makes, counted once it has made it.
+		var steps = 0
+		var counted = e
 		while true {
+			if e != counted {
+				counted = e
+				if self.deeper() then
+					break
+
+				steps += 1
+			}
 			var kind: Option<ExprKind> = .None
 			val next = self.peek()
 			// A `.` that starts a line begins a variant instead,
@@ -413,6 +463,7 @@ extend Parser {
 			if lineDot && field then
 				self.ast.lineDots.add(e)
 		}
+		self.nesting -= steps
 		return e
 	}
 
@@ -936,22 +987,11 @@ extend Parser {
 	/// is `token`. It is what tells a lambda from a parenthesized
 	/// expression, and a function type from a tuple.
 	var fn parenBefore(token: TokenKind): bool = {
-		var depth = 0
-		var n = 0
-		while true {
-			match self.nth(n) {
-				.LParen | .LBracket | .LBrace => depth += 1
-				.RParen | .RBracket | .RBrace => {
-					depth -= 1
-					if depth == 0 then
-						break
-				}
-				.Eof => return false
-				_ => {}
-			}
-			n += 1
-		}
-		return self.nth(n + 1) == token
+		if self.tooDeep || self.pos >= self.closers.len() then
+			return false
+
+		val close = self.closers[self.pos]
+		return close >= 0 && self.nth(close - self.pos + 1) == token
 	}
 
 	/// `pair.0`, and `pair.0.1` — which the lexer reads as one float,
@@ -1315,10 +1355,20 @@ extend Parser {
 
 	var fn ifExpr(): ExprId = self.ifInForm()
 
+	/// An `if`, one level deeper, as each `else if` of a chain is.
+	var fn ifInForm(): ExprId = {
+		if self.deeper() then
+			return self.allocExpr(.Error, self.span())
+
+		val e = self.ifWritten()
+		self.shallower()
+		return e
+	}
+
 	/// `if c { … } else { … }`, or `if c then a else b`, or each branch in
 	/// its own form: one expression after `then` or `else`, statements in
 	/// braces.
-	var fn ifInForm(): ExprId = {
+	var fn ifWritten(): ExprId = {
 		val start = self.bump()
 		val cond = self.cond()
 		val thenAt: Option<Span> = if self.at(.Then) then self.span() else .None

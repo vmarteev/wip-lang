@@ -1,0 +1,124 @@
+// The checker's fuzzer, `tests/fuzz`: its own tests, and the fuzzer built
+// by the `wip` it checks and run for two rounds of a fixed seed. Every case
+// the checker accepts must run with its moves, its leaks and its memory
+// checked, the last by the address sanitizer, and must end each of its
+// tracked values once, in its blocks' order; and the compiler must say why
+// it refuses each it refuses. Then a round of `--mutate`, seed 1: every
+// case and example changed in a few places and checked, which must accept
+// it or refuse it with an error's code, never panic. And a round of
+// `--engines`, seed 1: functions of numbers worked out by the evaluator,
+// while the program is compiled, and by a debug build and a release one,
+// which must answer the same, or panic alike. Its findings say what
+// failed. It builds its cases' runner from their objects, which Windows'
+// linker takes differently, and checks through a shell, so it is skipped
+// there; CI's Windows jobs run the rest.
+
+import std::path
+import std::process::{Command}
+import check::{Checked, Gate, run, wrong}
+
+pub fn check(gate: &Gate): Checked = {
+	val rounds = gate.takes("two rounds of seed 1")
+	val mutated = gate.takes("a round of the programs changed")
+	val engines = gate.takes("a round of the engines compared")
+	if !rounds && !mutated && !engines then
+		return Checked::of(0, Vec())
+
+	if TARGET_FAMILY == "windows" then
+		return Checked::of(0, Vec())
+
+	// Its own tests: what it reads of a case's log.
+	val tested = gate.wip(".", ["test", "--color", "never", "tests/fuzz/main.wip"])
+	if !tested.exit.success() || !tested.stdout.contains(" tests passed") then
+		return Checked::of(1, [wrong("the fuzzer's own tests", &tested).unwrapOr(String())])
+
+	val exe = path::join(gate.work.path, "fuzz")
+	val built = gate.wip(".", [
+		"build",
+		"--color",
+		"never",
+		"tests/fuzz/main.wip",
+		"-o",
+		exe.toStr(),
+	])
+	if !built.exit.success() then
+		return Checked::of(1, [wrong("the fuzzer does not build", &built).unwrapOr(String())])
+
+	val work = path::join(gate.work.path, "fuzz-work")
+	var failures: Vec<String> = Vec()
+	var count = 0
+	if rounds {
+		count += 1
+		if fuzzedOnce(exe.toStr(), gate.program.toStr(), work.toStr()) is .Some(failure) then
+			failures.push(failure)
+	}
+	if mutated {
+		count += 1
+		val changed = run(
+			Command::of(exe.toStr()).args([
+				gate.program.toStr(),
+				"--mutate",
+				"--rounds",
+				"1",
+				"--seed",
+				"1",
+				"--work",
+				path::join(gate.work.path, "mutate-work").toStr(),
+			]),
+		)
+		if !changed.exit.success() then
+			failures.push(
+				wrong(
+					"a round of the programs changed found what the checker panics on",
+					&changed,
+				).unwrapOr(String()),
+			)
+	}
+	if engines {
+		count += 1
+		val compared = run(
+			Command::of(exe.toStr()).args([
+				gate.program.toStr(),
+				"--engines",
+				"--rounds",
+				"1",
+				"--cases",
+				"100",
+				"--seed",
+				"1",
+				"--work",
+				path::join(gate.work.path, "engines-work").toStr(),
+			]),
+		)
+		if !compared.exit.success() then
+			failures.push(
+				wrong(
+					"a round of the engines compared found them answering otherwise",
+					&compared,
+				).unwrapOr(String()),
+			)
+	}
+	return Checked::of(count, failures)
+}
+
+/// Two rounds of seed 1, run by the fuzzer `exe` with the `wip` checked,
+/// in `work`: what they found, where they found anything.
+fn fuzzedOnce(exe: str, wip: str, work: str): Option<String> = {
+	val fuzzed = run(
+		Command::of(exe).args([
+			wip,
+			"--rounds",
+			"2",
+			"--cases",
+			"100",
+			"--seed",
+			"1",
+			"--work",
+			work,
+		]),
+	)
+	if !fuzzed.exit.success() then
+		return wrong("two rounds of seed 1 found what the checker let through", &fuzzed)
+
+	return .None
+}

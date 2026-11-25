@@ -1,0 +1,333 @@
+// What a run keeps of what it finds: each kind of finding once, the first
+// found, made as small as it stays that finding, and every other of its
+// kind counted; and how a case is made small — its statements left out,
+// and each use of a variable tried as a plain value written where it is.
+
+import std::collections::{Map}
+import std::fs
+import std::path
+
+/// A kind of finding: what says it is the same one, where the first of it
+/// is kept, and how many the run found.
+struct Group {
+	key: String
+	dir: String
+	count: i64
+}
+
+/// The run's findings, by kind, in the order each kind was first found.
+pub struct Groups {
+	all: Vec<Group> = Vec()
+}
+
+extend Groups {
+	/// Whether a finding of `key` is kept already, which then counts it.
+	pub var fn again(key: str): bool = {
+		for index in 0..self.all.len() {
+			if self.all[index].key == key {
+				self.all[index].count += 1
+				return true
+			}
+		}
+		return false
+	}
+
+	/// The first finding of `key`, kept in `dir`.
+	pub var fn first(key: str, dir: str) = self.all.push(Group(key:, dir:, count: 1))
+
+	/// How many kinds were found.
+	pub fn kinds(): i64 = self.all.len()
+
+	/// How many findings there were, of every kind.
+	pub fn found(): i64 = (
+		for group in self.all do
+			yield group.count
+	).sum()
+
+	/// Each kind, how many of it there were and where the first is kept,
+	/// written to `summary.txt` in `findings`, where any was found.
+	pub fn summarized(findings: str) = {
+		if self.all.isEmpty() then
+			return
+
+		var text = String()
+		for group in self.all do
+			text.push("\(group.count)\t\(group.key)\n\tkept in \(group.dir)\n")
+
+		val to = path::join(findings, "summary.txt")
+		if fs::makeDirs(findings).isErr() || fs::writeFile(to, text).isErr() then
+			told("cannot write `\(to)`")
+	}
+}
+
+/// What says two findings are one: `text` with each run of digits made
+/// `N`, as what differs between two of one kind is a count, a case's
+/// number or a variable's.
+pub fn keyOf(text: str): String = {
+	var out = String()
+	var digits = false
+	for index in 0..text.len() {
+		val byte = byteAt(text, index)
+		if byte.isDigit() {
+			if !digits then
+				out.push("N")
+
+			digits = true
+		} else {
+			digits = false
+			out.push(text[index..index + 1])
+		}
+	}
+	return out
+}
+
+/// The statement of the batch `batch` that what a case said names first,
+/// by its line in the cases' file: where a run finding is, as its shape.
+/// Nothing where it names none, as a release build's report does not.
+pub fn statementNamed(said: str, batch: str): String = {
+	val .Some(at) = said.indexOf("cases.test.wip:") else return String()
+	val rest = said[at + 15..said.len()]
+	var count = 0
+	while byteAt(rest, count).isDigit() do
+		count += 1
+
+	val .Ok(line) = rest[0..count].toInt() else return String()
+	var index = 1
+	for text in batch.lines() {
+		if index == line then
+			return text.trim()
+
+		index += 1
+	}
+	return String()
+}
+
+/// The form of a statement a failure names, which two of one kind share
+/// whatever they hold: an assignment's place, `vN = …`, or what a call
+/// calls, `destroy(…)`.
+pub fn formOf(statement: str): String = {
+	val assigned = statement.indexOf(" = ")
+	val called = statement.indexOf("(")
+	return match (assigned, called) {
+		(.Some(at), .None) => "\(statement[0..at]) = …"
+		(.Some(at), .Some(call)) if at < call => "\(statement[0..at]) = …"
+		(_, .Some(call)) => "\(statement[0..call])(…)"
+		_ => statement
+	}
+}
+
+/// `body` as small as it stays the finding `what`: its statements left out
+/// while it does; then each block tried as one of its bodies alone, and
+/// each use of a variable as a plain value of the variable's type, which
+/// lets go of what made the variable; and each that is the same finding
+/// kept, and the statements left out again.
+fn smallest(bench: &Bench, body: &[Stmt], what: &Found): Vec<Stmt> = {
+	val kinds = declaredKinds(&body)
+	var small = leftOut(&bench, &body, &what)
+	var trying = 0
+	while true {
+		val trial = match unwrapped(&small, trying) {
+			.Some(trial) => trial
+			.None => match replacedUse(&small, trying - choices(&small), &kinds) {
+				.Some(trial) => trial
+				.None => break
+			}
+		}
+		if same(&bench, &trial, &what) {
+			small = leftOut(&bench, &trial, &what)
+			trying = 0
+		} else
+			trying += 1
+	}
+	return small
+}
+
+/// How many ways `body`'s blocks can be tried as one of their bodies: one
+/// for each body of each block, at every depth.
+fn choices(body: &[Stmt]): i64 = {
+	var count = 0
+	for stmt in body {
+		if stmt is .Block(bodies, ..) {
+			count += bodies.len()
+			for inner in bodies do
+				count += choices(&inner)
+		}
+	}
+	return count
+}
+
+/// `body` with the block and body that `choice` counts to, in `choices`'
+/// order, written as that body's statements alone, where the block was;
+/// nothing where there are fewer choices.
+fn unwrapped(body: &[Stmt], choice: i64): Option<Vec<Stmt>> = {
+	var left = choice
+	val out = unwrappedWithin(&body, &var left)
+	return if left < 0 then out else .None
+}
+
+fn unwrappedWithin(body: &[Stmt], left: &var i64): Vec<Stmt> = {
+	var out: Vec<Stmt> = Vec()
+	for stmt in body {
+		match stmt {
+			.Line(text) => out.push(.Line(text.clone()))
+			.Block(heads, bodies, end) => {
+				if left >= 0 && left < bodies.len() {
+					for inner in bodies[left] do
+						out.push(inner.clone())
+
+					left = -1
+					continue
+				}
+				if left >= 0 then
+					left -= bodies.len()
+
+				val inner: Vec<Vec<Stmt>> = [
+					for each in bodies do
+						yield unwrappedWithin(&each, &var left)
+				]
+				out.push(.Block(heads: heads.clone(), bodies: inner, end: end.clone()))
+			}
+		}
+	}
+	return out
+}
+
+/// `body` without every statement it can lose and still be the same
+/// finding: each tried in turn, from the last, and left out where the case
+/// without it still builds and fails the same way.
+fn leftOut(bench: &Bench, body: &[Stmt], what: &Found): Vec<Stmt> = {
+	var small: Vec<Stmt> = body.toVec()
+	var changed = true
+	while changed {
+		changed = false
+		var skip = counted(&small) - 1
+		while skip >= 0 {
+			val trial = without(&small, skip)
+			if same(&bench, &trial, &what) {
+				small = trial
+				changed = true
+			}
+			skip -= 1
+		}
+	}
+	return small
+}
+
+/// The kind of each variable `body` declares with its type, `val v3:
+/// Pair = …`, by its name.
+fn declaredKinds(body: &[Stmt]): Map<String, Kind> = {
+	var kinds: Map<String, Kind> = Map()
+	for text in texts(&body) {
+		val .Some(rest) = text.stripPrefix("val ").orElse(() => text.stripPrefix("var ")) else {
+			continue
+		}
+		val .Some((name, after)) = rest.splitOnce(": ") else continue
+		val .Some((written, _)) = after.splitOnce(" = ") else continue
+		for kind in KINDS do
+			if kind.written() == written then
+				kinds.put(name, kind)
+	}
+	return kinds
+}
+
+/// Every line and every block's head of `body`, in its order.
+fn texts(body: &[Stmt]): Vec<String> = {
+	var out: Vec<String> = Vec()
+	for stmt in body {
+		match stmt {
+			.Line(text) => out.push(text.clone())
+			.Block(heads, bodies, ..) => {
+				for head in heads do
+					out.push(head.clone())
+
+				for inner in bodies {
+					for text in texts(&inner) do
+						out.push(text)
+				}
+			}
+		}
+	}
+	return out
+}
+
+/// `body` with its use `use` of a variable `kinds` knows, counted in its
+/// order from 0, written as a plain value of the variable's type; nothing
+/// where it has no such use.
+fn replacedUse(body: &[Stmt], use: i64, kinds: &Map<String, Kind>): Option<Vec<Stmt>> = {
+	var seen = 0
+	val out = replacedWithin(&body, use, &kinds, &var seen)
+	return if seen > use then out else .None
+}
+
+fn replacedWithin(body: &[Stmt], use: i64, kinds: &Map<String, Kind>, seen: &var i64): Vec<Stmt> = {
+	var out: Vec<Stmt> = Vec()
+	for stmt in body {
+		match stmt {
+			.Line(text) => out.push(.Line(replacedText(text, use, &kinds, &var seen)))
+			.Block(heads, bodies, end) => {
+				// In the order they are written: each head, then its body.
+				val newHeads: Vec<String> = [
+					for head in heads do
+						yield replacedText(head, use, &kinds, &var seen)
+				]
+				val newBodies: Vec<Vec<Stmt>> = [
+					for inner in bodies do
+						yield replacedWithin(&inner, use, &kinds, &var seen)
+				]
+				out.push(.Block(heads: newHeads, bodies: newBodies, end: end.clone()))
+			}
+		}
+	}
+	return out
+}
+
+/// `text` with the use numbered `use` of a variable written as a plain
+/// value, counting its uses from `seen`: a name `kinds` knows, not where it
+/// is declared or given a new value, nor a field's or a method's name.
+fn replacedText(text: str, use: i64, kinds: &Map<String, Kind>, seen: &var i64): String = {
+	var out = String()
+	var at = 0
+	while at < text.len() {
+		val starts =
+			isWordByte(byteAt(text, at)) &&
+			(at == 0 || !isWordByte(byteAt(text, at - 1)) && byteAt(text, at - 1) != b'.')
+		if !starts {
+			out.push(text[at..at + 1])
+			at += 1
+			continue
+		}
+		var end = at
+		while end < text.len() && isWordByte(byteAt(text, end)) do
+			end += 1
+
+		val word = text[at..end]
+		if kinds.get(word) is .Some(kind) && isUse(text, at, end) {
+			if seen == use {
+				val next = byteAt(text, end)
+				val plain = kind.plain()
+				if next == b'.' || next == b'(' || next == b'[' then
+					out.push("(\(plain))")
+				else
+					out.push(plain)
+			} else
+				out.push(word)
+
+			seen += 1
+		} else
+			out.push(word)
+
+		at = end
+	}
+	return out
+}
+
+/// Whether the name at `at` to `end` of `text` is a use of its variable:
+/// not where it is declared, nor given a new value.
+fn isUse(text: str, at: i64, end: i64): bool = {
+	val before = text[0..at].trimEnd()
+	if before == "val" || before == "var" then
+		return false
+
+	val after = text[end..text.len()].trimStart()
+	return !after.startsWith("=") || after.startsWith("==")
+}

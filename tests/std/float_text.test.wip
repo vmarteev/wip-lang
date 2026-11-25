@@ -1,0 +1,373 @@
+// A float written as text and read from it by the library, against C,
+// which wrote it before, `%.6g`, `%.7g` and on until `strtod` read it back,
+// and `%.<n>f`, and which read it, `strtod`. Every value of random bits,
+// values beside every power of two and of ten, the subnormals and the
+// largest, as an `f64` and as an `f32`; and read, every halfway point
+// between two floats written out exactly, and the text either side of it.
+
+import std::libc
+import std::random::{Random}
+
+/// `value` as C's `%.<precision>g` writes it.
+fn cG(value: f64, precision: i64): String = {
+	var format = String::of("%.")
+	format.pushInt(precision)
+	format.push("g")
+	var out: Vec<u8> = Vec::filled(64, 0)
+	val length = libc::formatDouble(value, format.toCstring(), &var out)
+	var text = String()
+	text.pushBytes(&out.items()[0..length])
+	return text
+}
+
+/// Whether `text` reads back as `value`, as an `f32` where `single`.
+fn cReadsBack(text: &String, value: f64, single: bool): bool = {
+	var copy = text.clone()
+	val back =
+		if single then libc::strtof(copy.toCstring(), null) as f64
+		else libc::strtod(copy.toCstring(), null)
+	return back == value
+}
+
+/// `value` written as C wrote it before: the fewest digits from six that
+/// read back, and fewer than six for a value written with an exponent.
+fn cWritten(value: f64, single: bool): String = {
+	val most = if single then 9 else 17
+	for precision in 6..most + 1 {
+		val text = cG(value, precision)
+		if !(cReadsBack(&text, value, single) || precision == most) then
+			continue
+
+		if precision == 6 && text.contains("e") {
+			for fewer in 1..6 {
+				val shorter = cG(value, fewer)
+				if cReadsBack(&shorter, value, single) then
+					return shorter
+			}
+		}
+		return text
+	}
+	return String()
+}
+
+/// `value` as C's `%.<digits>f` writes it.
+fn cFixed(value: f64, digits: i64): String = {
+	var format = String::of("%.")
+	format.pushInt(digits)
+	format.push("f")
+	var out: Vec<u8> = Vec::filled(digits + 320, 0)
+	val length = libc::formatDouble(value, format.toCstring(), &var out)
+	var text = String()
+	text.pushBytes(&out.items()[0..length])
+	return text
+}
+
+/// Where the library writes `value` otherwise than C: what each wrote.
+fn differs(value: f64, single: bool): Option<String> = {
+	val ours = if single then "\(value as f32)" else "\(value)"
+
+	val theirs = cWritten(value, single)
+	if ours != theirs then
+		return "bits \(value.toBits()): C writes `\(theirs)`, the library `\(ours)`"
+
+	return .None
+}
+
+/// `value`, where it is a positive float, and the floats either side of it.
+fn besides(values: &var Vec<f64>, value: f64) = {
+	if !value.isFinite() || value <= 0.0 then
+		return
+
+	values.push(value)
+	values.push(f64::fromBits(value.toBits() + 1))
+	if value.toBits() > 1 then
+		values.push(f64::fromBits(value.toBits() - 1))
+}
+
+/// Values beside every power of two and of ten an `f64` holds, the
+/// subnormals' edges among them, and the largest.
+fn edges(): Vec<f64> = {
+	var values: Vec<f64> = [
+		0.0,
+		-0.0,
+		5e-324,
+		1e-323,
+		2.2250738585072009e-308,
+		2.2250738585072014e-308,
+		1.7976931348623157e308,
+		0.1,
+		0.2,
+		0.3,
+		1.0 / 3.0,
+		123456.0,
+		1234567.0,
+		9.5,
+		0.5,
+		2.5,
+	]
+	// Every power of two, from its bits: the subnormal ones a bit each,
+	// the normal ones an exponent each; and every power of ten.
+	for bit in 0..52 do
+		besides(&var values, f64::fromBits((1 as u64) << (bit as u64)))
+
+	for biased in 1..2047 do
+		besides(&var values, f64::fromBits((biased as u64) << 52))
+
+	for exponent in -323..309 do
+		besides(&var values, (10.0).pow(exponent as f64))
+
+	return values
+}
+
+@test
+fn aFloatIsWrittenAsCWritesItAtEveryEdge() = {
+	for value in edges() {
+		if value.isFinite() {
+			if differs(value, false) is .Some(why) then
+				panic(why.toStr())
+
+			if differs(-value, false) is .Some(why) then
+				panic(why.toStr())
+		}
+	}
+}
+
+@test
+fn aFloatOfRandomBitsIsWrittenAsCWritesIt() = {
+	var random = Random::seeded(1)
+	for _ in 0..20000 {
+		val value = f64::fromBits(random.next())
+		if value.isFinite() && differs(value, false) is .Some(why) then
+			panic(why.toStr())
+	}
+}
+
+@test
+fn anF32IsWrittenAsCWritesIt() = {
+	var random = Random::seeded(2)
+	for _ in 0..20000 {
+		val value = f32::fromBits(random.next() as% u32) as f64
+		if value.isFinite() && differs(value, true) is .Some(why) then
+			panic(why.toStr())
+	}
+	for value in [1.1, 16777217.0, 1e-45, 3.4028235e38, 1.17549435e-38, 0.1] do
+		if differs(value as f32 as f64, true) is .Some(why) then
+			panic(why.toStr())
+}
+
+@test
+fn aFloatWithAPrecisionIsWrittenAsCWritesIt() = {
+	var random = Random::seeded(3)
+	for i in 0..4000 {
+		// Random bits, and values near what people print, ties among them.
+		val value =
+			if i % 2 == 0 then f64::fromBits(random.next())
+			else (random.below(2000000) as f64 - 1000000.0) / 8.0
+		if !value.isFinite() then
+			continue
+
+		val digits = random.below(20)
+		val theirs = cFixed(value, digits)
+		val ours = "\(value, precision: digits)"
+		if ours != theirs then
+			panic("bits \(value.toBits()), \(digits) digits: C writes `\(theirs)`, the library `\(ours)`")
+	}
+}
+
+@test
+fn aNanIsNanWhateverItsSign() = {
+	assert(
+		"\(f64::NAN)" == "nan" && "\(-f64::NAN)" == "nan" && "\(-f64::NAN, precision: 2)" == "nan",
+	)
+}
+
+@test
+fn aFloatsTextIsWorkedOutWhileTheProgramIsCompiled() = {
+	assert(WRITTEN_PI == 17 && WRITTEN_TINY == 6)
+}
+
+/// A float's text, worked out while the program is compiled.
+@comptime
+val WRITTEN_PI: i64 = "\(3.141592653589793)".len()
+
+@comptime
+val WRITTEN_TINY: i64 = "\(5e-324)".len()
+
+/// The float C reads `text` as, and whether it is finite, which `toFloat`
+/// answers `TooLarge` where it is not.
+fn cRead(text: &String): f64 = {
+	var copy = text.clone()
+	return libc::strtod(copy.toCstring(), null)
+}
+
+/// Where the library reads `text` otherwise than C: what each read.
+fn readDiffers(text: &String): Option<String> = {
+	val theirs = cRead(&text)
+	val ours = text.toStr().toFloat()
+	val same = match ours {
+		.Ok(value) => value.toBits() == theirs.toBits()
+		.Err(.TooLarge) => !theirs.isFinite()
+		.Err(_) => false
+	}
+	if !same then
+		return "`\(text)`: C reads \(theirs.toBits()), the library \(ours)"
+
+	return .None
+}
+
+/// Two numbers written with a point and as many digits after it, added.
+fn added(a: &String, b: &String): String = {
+	// As long as each other, with zeros before the shorter.
+	val length = a.len().max(b.len())
+	val digitOf = (text: &String, at: i64) => {
+		val k = at - (length - text.len())
+		return if k < 0 then b'0' else text.toStr()[k]
+	}
+	var backwards: Vec<u8> = Vec()
+	var carry = 0
+	var at = length
+	while at > 0 {
+		at -= 1
+		val x = digitOf(&a, at)
+		if x == b'.' {
+			backwards.push(b'.')
+			continue
+		}
+		val sum = (x - b'0') as i64 + (digitOf(&b, at) - b'0') as i64 + carry
+		backwards.push(b'0' + (sum % 10) as% u8)
+		carry = sum / 10
+	}
+	if carry > 0 then
+		backwards.push(b'1')
+
+	var text = String()
+	for k in 0..backwards.len() do
+		text.pushByte(backwards[backwards.len() - 1 - k])
+
+	return text
+}
+
+/// The halfway point between `value` and the float above it, exactly, and
+/// the text a digit either side of it: C writes each float's exact value
+/// with 1,100 digits after the point, which every one takes.
+fn halfway(value: f64): Vec<String> = {
+	val step = f64::fromBits(value.toBits() + 1) - value
+	val mid = added(cFixed(value, 1100), cFixed(step / 2.0, 1100))
+	// Its last digit not zero: a five, for a fraction that halves.
+	var shown = mid.len()
+	while mid.toStr()[shown - 1] == b'0' do
+		shown -= 1
+
+	var cut = String()
+	cut.push(mid.toStr()[0..shown])
+	var above = cut.clone()
+	above.push("000001")
+	var below = String()
+	below.push(cut.toStr()[0..shown - 1])
+	below.push("49999999")
+	return [cut, above, below]
+}
+
+@test
+fn aHalfwayPointIsReadAsCReadsIt() = {
+	var random = Random::seeded(4)
+	var values: Vec<f64> = [
+		1.0,
+		f64::fromBits(0x4340000000000000),
+		f64::fromBits(0x0020000000000000),
+		1.7976931348623155e308,
+		5e-324 * 3.0,
+	]
+	for _ in 0..300 do
+		values.push(f64::fromBits(random.next() >> 1))
+
+	for value in values {
+		// Past the largest, and below the least whose step halves, there
+		// is no halfway point between floats.
+		if !value.isFinite() || value >= f64::MAX || value.toBits() < 0x0010000000000000 then
+			continue
+
+		for text in halfway(value) do
+			if readDiffers(&text) is .Some(why) then
+				panic(why.toStr())
+	}
+}
+
+@test
+fn aFloatsTextIsReadAsCReadsIt() = {
+	var random = Random::seeded(5)
+	for _ in 0..3000 {
+		val value = f64::fromBits(random.next())
+		if !value.isFinite() then
+			continue
+
+		for precision in [1, 3, 9, 15, 16, 17, 18, 25, 40] {
+			val text = cG(value, precision)
+			if readDiffers(&text) is .Some(why) then
+				panic(why.toStr())
+		}
+	}
+	for value in edges() {
+		val text = cG(value, 17)
+		if readDiffers(&text) is .Some(why) then
+			panic(why.toStr())
+	}
+}
+
+@test
+fn digitsOfEveryLengthAreReadAsCReadsThem() = {
+	var random = Random::seeded(6)
+	for i in 0..3000 {
+		var text = String()
+		if i % 3 == 0 then
+			text.pushByte(b'-')
+
+		// Up to 1,000 digits, a point among them, and a power of ten that
+		// may take the value past either end of a float.
+		val digits = 1 + random.below(if i % 10 == 0 then 1000 else 30)
+		val point = random.below(digits + 1)
+		for k in 0..digits {
+			if k == point then
+				text.pushByte(b'.')
+
+			text.pushByte(b'0' + random.below(10) as% u8)
+		}
+		if i % 2 == 0 {
+			text.pushByte(b'e')
+			text.pushInt(random.below(700) - 350)
+		}
+		if readDiffers(&text) is .Some(why) then
+			panic(why.toStr())
+	}
+	for text in [
+		"0",
+		"-0",
+		"0.0e999999999999",
+		"1e999999999999",
+		"1e-999999999999",
+		"00000.00001",
+		"4.9e-324",
+		"2.4703282292062328e-324",
+		"2.4703282292062327e-324",
+		"1.7976931348623158e308",
+		"1.7976931348623159e308",
+		"9007199254740993",
+		"123456789012345678e-5",
+		"1e23",
+		"8.98846567431158e307",
+	] do
+		if readDiffers(String::of(text)) is .Some(why) then
+			panic(why.toStr())
+}
+
+@test
+fn aFloatIsReadWhileTheProgramIsCompiled() = {
+	assert(READ_TENTH == 0.1 && READ_HALFWAY == 9007199254740992.0)
+}
+
+@comptime
+val READ_TENTH: f64 = "0.1".toFloat().unwrapOr(0.0)
+
+/// 2^53 + 1, halfway between two floats: the even one.
+@comptime
+val READ_HALFWAY: f64 = "9007199254740993".toFloat().unwrapOr(0.0)

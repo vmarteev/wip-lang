@@ -390,8 +390,11 @@ fn main() = {
 A constant may be a table: an array, a struct or tuple, or a variant, of
 constants, to any depth. It cannot own memory. The
 program keeps a table once, in memory nothing writes, and a use of it
-reads it where it lies, so a large table costs nothing to use. It is
-indexed, searched and lent as any array is; to change one, copy it first:
+reads it where it lies, so a large table costs nothing to use. Every
+element is worked out while the program is compiled, so a table holds at
+most 16,777,216 of them (E0488); a larger one is made when the program
+runs, `own [0; n]`. It is indexed, searched and lent as any array is; to
+change one, copy it first:
 
 ```wip,run
 val DIRECTIONS: [(i64, i64); 4] = [(0, 1), (1, 0), (1, 1), (1, -1)]
@@ -450,7 +453,11 @@ says so with `@comptime`, which such a constant needs and one known where it
 is written may not have. Any function may be run — generic ones, closures, a
 `Vec` or a `String` built and dropped on the way — but not C: printing, the
 time, files and threads are refused, each an error at the constant. A panic
-while it runs is a compile error, with the calls that led to it.
+while it runs is a compile error, with the calls that led to it. So is one
+that runs too long (E0443): a constant or an assert may run a hundred
+million steps, its calls nested ten thousand deep, and use 512 MiB, and a
+recursion that never ends is stopped there, its error naming the innermost
+calls and counting the rest.
 
 ```wip,run
 @comptime

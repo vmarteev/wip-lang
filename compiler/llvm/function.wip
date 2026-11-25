@@ -40,8 +40,6 @@ enum Panics {
 	Check(kind: CheckKind, at: Span)
 	/// An answer that does not fit, and which arithmetic it was.
 	Overflow(which: i64, at: Span)
-	/// LLVM's trap.
-	Trap
 	/// C's `abort`.
 	Abort
 }
@@ -714,6 +712,19 @@ extend FnGen {
 		self.callVoid(callee, values)
 	}
 
+	/// The start or the end of a local's life, on its slot: nothing for one
+	/// that has no slot of its own, an aggregate parameter or result. The size
+	/// is said, as every `clang` from 15 reads it; one that no longer takes it
+	/// reads the call as it was.
+	var fn lifetime(m: &var Llvm, name: str, local: Local) = {
+		val slot = self.storage[local.index].clone()
+		if slot !is .Slot(..) then
+			return
+
+		val size = m.layout(self.body.local(local).ty).size.max(1)
+		self.intrinsicVoid(&var m, name, [Val::of(.Int(size as i64), .I(64)), Val::of(slot, .Ptr)])
+	}
+
 	var fn memset(m: &var Llvm, addr: Value, byte: u8, size: u32) = {
 		if size == 0 then
 			return
@@ -764,6 +775,8 @@ extend FnGen {
 			self.memset(&var m, addr, POISON as% u8, size)
 		}
 		.CheckMoved(place, at) => self.checkMoved(&var m, &place, at)
+		.StorageLive(local) => self.lifetime(&var m, "@llvm.lifetime.start.p0", local)
+		.StorageDead(local) => self.lifetime(&var m, "@llvm.lifetime.end.p0", local)
 		.ErrorStep(made, function, at) => self.errorStep(&var m, made, function, at)
 		.Call(callee, args, dest) => self.call(&var m, &callee, &args, &dest)
 		.Alloc(dest, ty) => {
@@ -785,16 +798,25 @@ extend FnGen {
 			val given = self.operand(&var m, &count)
 			val counted = Val(v: self.coerce(&given, .I(64)), t: .I(64))
 			val stride = m.layout(elem).stride()
-			// More bytes than an `i64` counts is more than memory holds.
+			// More bytes than an `i64` counts is more than memory holds: the
+			// allocator is asked for the most there is, which it says it
+			// cannot give, as it says of any size memory does not hold.
 			val both = self.intrinsicValue(
 				&var m,
 				"@llvm.smul.with.overflow.i64",
 				withFlag(.I(64)),
 				[counted.clone(), Val::of(.Int(stride), .I(64))],
 			)
-			val size = self.value(.ExtractValue(aggregate: both.clone(), index: 0), .I(64))
+			val product = self.value(.ExtractValue(aggregate: both.clone(), index: 0), .I(64))
 			val over = self.value(.ExtractValue(aggregate: both, index: 1), .I(1))
-			self.trapIf(&var m, over.v)
+			val size = self.value(
+				.Select(own Select(
+					condition: over.v,
+					ifTrue: Val::of(.Int(i64::MAX), .I(64)),
+					ifFalse: product,
+				)),
+				.I(64),
+			)
 			val elemAlign = m.layout(elem).align
 			var values = Vec::of([size])
 			val alloc = if elemAlign > 16 {
@@ -1039,17 +1061,11 @@ extend FnGen {
 			[Val::of(.Int(which as i64), .I(64))],
 			at,
 		)
-		.Trap => {
-			val trap = m.intrinsic("@llvm.trap", .Void, Vec())
-			self.callVoid(trap, Vec())
-		}
 		.Abort => {
 			val abort = m.abort()
 			self.callVoid(abort, Vec())
 		}
 	}
-
-	var fn trapIf(m: &var Llvm, flag: Value) = self.checkI1(&var m, flag, .Trap)
 
 	/// A call of a runtime panic: its own numbers, then the file, the line and
 	/// the column.

@@ -137,7 +137,10 @@ wip test --target ios-arm64-simulator game       # its tests, on iOS
   program, its `Info.plist`, its icons, and every package's `@files` beside
   the program, as on a Mac, where `package::besideProgram` finds them. A
   device runs only an app; the simulator runs a program that is not one as
-  a command, which is what `wip test` builds.
+  a command, which is what `wip test` builds. `--emit static` writes the
+  package's library instead, as for any package, for a project of
+  Xcode's to link into the app it makes: what it exports with
+  `@export("C")` is what that project's `main` calls.
 - **Signed:** for the simulator, as every program a Mac builds is. For a
   device, by the developer's identity, under a provisioning profile that
   names the app's `id`, which `wip` finds among those Xcode keeps and puts
@@ -167,8 +170,9 @@ Every build's code is **LLVM's**, which a `clang` of version 15 or newer
 compiles — the one `WIP_CLANG` names, or `clang`. On Windows, where Visual
 Studio does not put its `clang` on the path, it is the one Visual Studio's
 installer says it has, where none is on the path: its Build Tools, with
-the C++ tools and Clang. A program there is linked by Microsoft's linker
-through that `clang`, `main.exe` with its debug information in
+the C++ tools and Clang. A module's C and C++ are compiled there by the
+same `clang`, where `CC` names no other, and the program is linked by
+Microsoft's linker through it, `main.exe` with its debug information in
 `main.pdb` beside it. Where there is no `clang`, the build says so before
 it reads the program:
 
@@ -257,9 +261,37 @@ that led there, and a debugger sees only the names of functions.
 | `--header board.h` | write the C declarations of what the library exports |
 | `--cpu baseline\|native\|level` | the processor it is for, as above |
 | `--no-debug-info` | write no debug information, as above |
+| `--sanitize address\|thread` | build with a sanitizer, below |
 | `--time` | print how long each phase took |
 
-`--cpu` goes with `wip run` and `wip test` too, as `--release` does.
+`--cpu` and `--sanitize` go with `wip run` and `wip test` too, as
+`--release` does.
+
+`--sanitize address` builds the program, the C it carries and its link with
+`clang`'s AddressSanitizer, in a debug build or a release one. The program
+then stops, with the sanitizer's report of where and what, where it reads
+or writes memory that is not alive: freed heap memory, memory past the end
+of an allocation, and a variable after the block it was declared in has
+ended, which a pointer from C, or kept by C, can still reach. Wip's own
+checks see none of these where a raw pointer or C is involved, so the
+sanitizer is for a program that leans on C, and for the compiler's own
+checks of what Wip promises. A sanitized build is slower and larger, and is
+cached apart from the other. `ASAN_OPTIONS` in the environment tunes it, as
+`clang`'s documentation says. Windows on arm64 has no runtime for it, and
+the flag is refused there.
+
+`--sanitize thread` builds it with ThreadSanitizer instead, which reports
+two threads that reach one place, one of them writing, with nothing that
+orders the two: no `Atomic`, no `Mutex`, no channel, no thread started or
+joined between them. Wip's own checks keep what one thread changes from
+another, but not what a raw pointer or C shares, and not what a type built
+on atomics gets wrong. It keeps no more than 65,536 calls of a thread, and
+a program that recurses deeper stops with it; `TSAN_OPTIONS` tunes it.
+Windows has no runtime for it, and the flag is refused there.
+
+What a build is sanitized with, the prelude's `SANITIZER` says: `address`,
+`thread`, or empty where it is none, as a build defines it, for a test that
+needs what a sanitizer does not give, as more of the stack.
 
 `--emit static` writes an archive C links against, `libboard.a`, or on
 Windows `board.lib`, made with `llvm-lib`, which comes with Visual Studio's

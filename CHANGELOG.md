@@ -2,6 +2,83 @@
 
 Each version published, newest first.
 
+## 0.18.0 — 2026-11-24
+
+**Breaking:** what the checker accepted and the build then got wrong is
+refused. An `if` whose value is wanted, with a branch that answers
+nothing — empty, or ending in a statement — is mismatched, as a block
+that answers nothing is. `lend lend x` is refused, and so are empty
+angle brackets, `Vec<>` and `fn f<>()`; a list passed where a `&Vec<T>`,
+a `&Set<T>` or an `own<…>` of one is expected is a list, and the types do
+not match. A program nested more than 10,000 levels deep is refused,
+E0137, and a constant table of more than 16,777,216 elements, E0488.
+
+**Sanitizers.** `wip build`, `run` and `test` take `--sanitize address`,
+which stops a program that reads or writes memory it does not own —
+past an end, after a free, or a variable after its block ends, which
+every build now tells LLVM — and `--sanitize thread`, which reports two
+threads that reach one place, one writing, with nothing to order them.
+A sanitized build's C and its link are the backend's `clang`'s. The
+prelude's `SANITIZER` says which a build has. Windows has neither
+runtime on arm64, nor the thread one at all.
+
+**The language**
+
+- **A float's text, and a float read from text, are worked out in Wip,**
+  where C's `snprintf` and `strtod` did: the same text as before, byte for
+  byte, `%g` with the digits it takes to read back and `precision:` as
+  `%.<n>f`, and the same nearest float read; but the same on every
+  system — a negative `NaN` is `nan` on Linux too — and in a `@comptime`
+  constant, which could neither write nor read one. The compiler reads a
+  program's float literals the same way. Reading is faster than `strtod`.
+- **A program nested deeply compiles:** every phase runs on a stack of 1
+  GiB, where about 600 parentheses or 2,000 `else if`s overflowed it. A
+  constant whose calls nest more than 10,000 deep stops, E0443, naming the
+  ten innermost.
+
+**The library**
+
+- **`future::withStack(bytes, body)`** runs `body` on a thread with that
+  much stack, and a thread `std::future` starts has as much as the thread
+  that starts it, 8 MB to 1 GiB.
+- **`std::tls` on a Mac** reads and writes a connection's state in one
+  step, where the thread Network.framework calls and the program's raced.
+
+**Fixes**
+
+- **A match arm's binding** was read and written after its life had
+  ended, in a release build, where its value was copied out of it, and
+  where each alternative of an arm binds it.
+- **A struct with a field moved out of it, given a new value whole,**
+  dropped its old value whole, the field moved out with it.
+- **A release build of a program with a constant whose debug information
+  is a signed number nine bytes long** stopped the compiler.
+- **The checker panicked** on a lambda in a top-level `assert`, a `for`
+  over a type that leaves out a method of its `Sequence`, a C struct that
+  holds itself, a C function with nothing before its `...`, and arguments
+  in each other's places with one too many.
+- **A buffer of more bytes than an `i64` counts** says it is more than
+  memory holds, as any allocation memory cannot meet does.
+- **The formatter** keeps a comment above the one statement of a branch,
+  and writes `...` where it stands.
+- **On Windows,** a module's C and C++ are compiled by the backend's
+  `clang` where `CC` names none; and a package that says `@app`, built as
+  a library for iOS, is written as a library.
+
+**Tests**
+
+- **`tests/fuzz`, the checker's fuzzer:** cases of moves, lends, views,
+  branches and loops by the thousand, run with every value's end checked,
+  sanitized, in a debug build and a release one; `--mutate`, every case
+  and example changed and checked, built, run, formatted and asked of the
+  language server; `--engines`, functions of numbers worked out while the
+  program is compiled and as it runs, in both builds. The gate runs a few
+  rounds of each.
+- **`scripts/sanitized.sh`** builds the compiler with `--sanitize address`
+  and runs the gate's checks and its own tests with it, `--ports` each
+  port's tests too, `--threads` the library's and the compiler's with
+  `--sanitize thread`.
+
 ## 0.17.4 — 2026-11-18
 
 - **A method called through a `&dyn` reached through a reference** — an

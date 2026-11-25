@@ -1,0 +1,234 @@
+// `--mutate`'s last stage: the language server asked about each change, as
+// an editor asks about what is being typed. A server is started for each
+// share of the programs and opens each changed file in turn; at each place
+// changed it is asked for what is there, what completes it, the signature
+// around it, its definition, its references, a rename and the fixes there,
+// and of the whole file for its symbols, its hints and its layout. It must
+// answer each, an error among the answers it may give, and go on: a server
+// that ends, hangs, or says what is not a message is a finding, and a new
+// one takes its place.
+
+import std::fs
+import std::json
+import std::json::{Json}
+import std::path
+import std::process::{Command, Connected}
+import std::time::{Duration}
+
+/// How long an answer is waited for before the server counts as hung.
+val PATIENCE: i64 = 30
+
+/// A server, talked to.
+struct Server {
+	server: Connected
+	next: i64
+}
+
+/// A text as JSON writes it.
+fn quotedJson(text: str): String = "\(Json::Text(text:))"
+
+extend Server {
+	/// `wip lsp`, started and told it is.
+	static fn started(wip: str): Result<Server, String> = {
+		var server = match Command::of(wip).arg("lsp").connect() {
+			.Ok(server) => server
+			.Err(error) => return .Err("`wip lsp` does not start: \(error)")
+		}
+		server.output().setTimeout(Duration::seconds(PATIENCE))
+		var started = Server(server:, next: 1)
+		started.asked("initialize", "{\"capabilities\":{}}")?
+		started.notify("initialized", "{}")?
+		return started
+	}
+
+	var fn send(message: str): Result<void, String> = {
+		val framed = "Content-Length: \(message.len())\r\n\r\n\(message)"
+		if self.server.writeText(framed) is .Err(error) then
+			return .Err("the server reads no more: \(error)")
+
+		return
+	}
+
+	var fn notify(
+		method: str,
+		params: str,
+	): Result<void, String> = self.send("{\"jsonrpc\":\"2.0\",\"method\":\(quotedJson(method)),\"params\":\(params)}")
+
+	/// A request, answered: a result or an error, either of which the server
+	/// may give; that it answers is what is asked.
+	var fn asked(method: str, params: str): Result<void, String> = {
+		val id = self.next
+		self.next += 1
+		self.send("{\"jsonrpc\":\"2.0\",\"id\":\(id),\"method\":\(quotedJson(method)),\"params\":\(params)}")?
+		while true {
+			val message = self.read()?
+			if message.get("id") == .Some(&Json::Int(value: id)) then
+				return
+		}
+		return
+	}
+
+	/// One message: a header that says the length of the body after it.
+	var fn read(): Result<Json, String> = {
+		var length = -1
+		while true {
+			var line = String()
+			match self.server.output().readLine(&var line) {
+				.Ok(true) => {}
+				.Ok(false) => return .Err("the server ended before it answered")
+				.Err(
+					.WouldBlock,
+				) => return .Err("the server has not answered in \(PATIENCE) seconds")
+				.Err(error) => return .Err("the server cannot be read: \(error)")
+			}
+			val header = line.trimEnd()
+			if header.isEmpty() then
+				break
+
+			if header.stripPrefix("Content-Length:") is .Some(count) then
+				length = count.trim().toInt().unwrapOr(-1)
+		}
+		if length < 0 then
+			return .Err("the server sent a message without its length")
+
+		var body = String()
+		match self.server.output().readExact(length, &var body) {
+			.Ok(read) if read == length => {}
+			.Ok(_) => return .Err("the server ended within a message")
+			.Err(error) => return .Err("a message cannot be read: \(error)")
+		}
+		return match json::parse(body) {
+			.Ok(message) => message
+			.Err(error) => .Err("the server sent what is not JSON, \(error): \(body)")
+		}
+	}
+
+	/// Told to end, as an editor ends it; what it does then is not asked.
+	move fn ended() = {
+		var server = self
+		server.asked("shutdown", "null")
+		server.notify("exit", "null")
+		server.server.wait()
+	}
+}
+
+/// What one request asks, and of where.
+fn place(
+	uri: str,
+	line: i64,
+	character: i64,
+): String = "\"textDocument\":{\"uri\":\(quotedJson(uri))},\"position\":{\"line\":\(line),\"character\":\(character)}"
+
+/// The requests about a change at `line` and `character` of the document
+/// `uri`, each its method and its parameters.
+fn requestsAt(uri: str, line: i64, character: i64): Vec<(str, String)> = {
+	val at = place(uri, line, character)
+	val range = "{\"start\":{\"line\":\(line),\"character\":\(character)},\"end\":{\"line\":\(line),\"character\":\(character + 1)}}"
+	return [
+		("textDocument/hover", "{\(at)}"),
+		("textDocument/completion", "{\(at)}"),
+		("textDocument/signatureHelp", "{\(at)}"),
+		("textDocument/definition", "{\(at)}"),
+		("textDocument/references", "{\(at),\"context\":{\"includeDeclaration\":true}}"),
+		("textDocument/rename", "{\(at),\"newName\":\"renamed\"}"),
+		(
+			"textDocument/codeAction",
+			"{\"textDocument\":{\"uri\":\(quotedJson(uri))},\"range\":\(range),\"context\":{\"diagnostics\":[]}}",
+		),
+	]
+}
+
+/// The requests about the whole document `uri`.
+fn requestsOf(uri: str): Vec<(str, String)> = {
+	val document = "{\"textDocument\":{\"uri\":\(quotedJson(uri))}}"
+	return [
+		("textDocument/documentSymbol", document),
+		(
+			"textDocument/inlayHint",
+			"{\"textDocument\":{\"uri\":\(quotedJson(uri))},\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":100000,\"character\":0}}}",
+		),
+		(
+			"textDocument/formatting",
+			"{\"textDocument\":{\"uri\":\(quotedJson(uri))},\"options\":{\"tabSize\":4,\"insertSpaces\":false}}",
+		),
+	]
+}
+
+/// Each of `requests` sent to `server`, written down in `asked` as it is:
+/// why one was not answered, where one was not.
+fn askedAll(
+	server: &var Server,
+	requests: &[(str, String)],
+	asked: &var Vec<String>,
+): Option<String> = {
+	for (method, params) in requests {
+		asked.push("\(method) \(params)")
+		val sent =
+			if method == "textDocument/didOpen" then server.notify(method, params)
+			else server.asked(method, params)
+		if sent is .Err(why) then
+			return why.clone()
+	}
+	return .None
+}
+
+/// The server, asked about each of the programs `indices` names, their
+/// copies holding their changes: for each that ended or hung it, what was
+/// asked, and why it failed. A server that failed is ended and another
+/// started for the next program.
+fn askedAbout(
+	wip: str,
+	programs: &[Program],
+	mutants: &[Mutant],
+	indices: &[i64],
+): Vec<(i64, String, String)> = {
+	var faults: Vec<(i64, String, String)> = Vec()
+	if indices.isEmpty() then
+		return faults
+
+	var server = match Server::started(wip) {
+		.Ok(started) => started
+		.Err(why) => return [(indices[0], "the language server does not start", why)]
+	}
+	for index in indices {
+		val program = &programs[index]
+		val mutant = &mutants[index]
+		val file = path::join(program.copy, program.sources[mutant.file].0)
+		val real = fs::realPath(file).unwrapOr(file)
+		val uri = "file://\(real)"
+		var requests: Vec<(str, String)> = [
+			(
+				"textDocument/didOpen",
+				"{\"textDocument\":{\"uri\":\(quotedJson(uri)),\"languageId\":\"wip\",\"version\":1,\"text\":\(quotedJson(mutant.text))}}",
+			),
+		]
+		for (line, character) in mutant.places {
+			for request in requestsAt(uri, line, character) do
+				requests.push(request)
+		}
+		for request in requestsOf(uri) do
+			requests.push(request)
+
+		var asked: Vec<String> = Vec()
+		if askedAll(&var server, &requests, &var asked) is .Some(why) {
+			val kind =
+				if why.contains("has not answered") then "the language server hangs"
+				else "the language server ends"
+			faults.push((index, kind, "\(why)\n\nasked, in order:\n\(asked.join("\n"))"))
+			// Ended, as one that hangs would not end of itself, and another in
+			// its place.
+			server.server.kill()
+			server = match Server::started(wip) {
+				.Ok(started) => started
+				.Err(why) => {
+					faults.push((index, "the language server does not start", why))
+					return faults
+				}
+			}
+			continue
+		}
+		server.notify("textDocument/didClose", "{\"textDocument\":{\"uri\":\(quotedJson(uri))}}")
+	}
+	server.ended()
+	return faults
+}

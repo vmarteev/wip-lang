@@ -154,7 +154,7 @@ fi
 # formatter rewrites — trailing commas, line breaks, comments — and on text
 # that does not parse.
 step=$SECONDS
-if ! "$wip" fmt --check std tests/std tests/gate examples tools/bindgen compiler >"$out/wip-fmt" 2>&1; then
+if ! "$wip" fmt --check std tests/std tests/gate tests/fuzz examples tools/bindgen compiler >"$out/wip-fmt" 2>&1; then
     say "wip fmt" "FAILED" $((SECONDS - step))
     cat "$out/wip-fmt"
     failed=1
@@ -162,8 +162,16 @@ else
     say "wip fmt" "ok" $((SECONDS - step))
 fi
 
-# The tables of character widths, letters and numbers, and case are what
-# their scripts write.
+# The tables of character widths, letters and numbers, and case, and the
+# powers of ten a float is read with, are what their scripts write.
+step=$SECONDS
+if ! python3 scripts/float-powers.py --check >"$out/powers" 2>&1; then
+    say "powers of ten" "FAILED" $((SECONDS - step))
+    cat "$out/powers"
+    failed=1
+else
+    say "powers of ten" "ok" $((SECONDS - step))
+fi
 for table in widths category case; do
     step=$SECONDS
     if ! python3 "scripts/char-$table.py" --check >"$out/$table" 2>&1; then

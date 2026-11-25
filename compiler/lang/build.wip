@@ -108,6 +108,55 @@ pub struct BuildOptions {
 	/// for the machine the compiler runs on.
 	pub var target: Target = .host()
 	pub var targetFlags: Vec<String> = Vec()
+	/// What checks the program's memory as it runs, where a build asks.
+	pub var sanitize: Option<Sanitizer> = .None
+}
+
+/// A sanitizer `clang` builds a program with: AddressSanitizer, which faults
+/// on a read or write of memory that was freed — a slot of the stack whose
+/// variable's life ended among it — or that was never the program's; and
+/// ThreadSanitizer, which reports two threads reaching one place, one of
+/// them writing, with nothing between them that orders the two.
+pub enum Sanitizer {
+	Address
+	Thread
+}
+
+extend Sanitizer {
+	/// The sanitizer `name` says, as `--sanitize` takes it.
+	pub static fn parse(name: str): Option<Sanitizer> = match name {
+		"address" => Sanitizer::Address
+		"thread" => Sanitizer::Thread
+		_ => .None
+	}
+
+	/// What the backend instruments every function for.
+	pub fn sanitized(): llvm::Sanitized = match self {
+		.Address => .Address
+		.Thread => .Thread
+	}
+
+	/// What every `clang` of the build is given: the program's IR, its C and
+	/// its link, which brings the sanitizer's runtime in. A frame keeps its
+	/// pointer, so what it reports names each call.
+	pub fn flags(): Vec<String> = match self {
+		.Address => ["-fsanitize=address", "-fno-omit-frame-pointer"]
+		.Thread => ["-fsanitize=thread", "-fno-omit-frame-pointer"]
+	}
+
+	/// Why `target` cannot be built with it, where it cannot: its `clang` has
+	/// no runtime for it.
+	pub fn refusal(target: &Target): Option<String> = {
+		return match self {
+			.Address if target.os == .Windows && target.arch == .Arm64 => String::of(
+				"the address sanitizer has no runtime for Windows on arm64",
+			)
+			.Thread if target.os == .Windows => String::of(
+				"the thread sanitizer has no runtime for Windows",
+			)
+			_ => .None
+		}
+	}
 }
 
 /// Why a build did not finish: what is wrong in the program, or what went
@@ -180,6 +229,7 @@ fn writeBinary(
 		loaded.threads,
 		arch,
 		options.target.os == .Windows,
+		options.sanitize.map((sanitizer) => sanitizer.sanitized()).unwrapOr(.Unchecked),
 	)
 	if !options.debugInfo then
 		ir.dropDebugInfo()
@@ -254,6 +304,7 @@ fn linkProgram(
 		cpu: &options.cpu,
 		target: &options.target,
 		targetFlags: &options.targetFlags,
+		sanitized: options.sanitize.isSome(),
 	)
 	if options.emit == Emit::Objects then
 		return writeObjects(&objects, &linking, output)
@@ -436,6 +487,7 @@ pub fn buildTests(
 		cpu: options.cpu,
 		target: options.target,
 		targetFlags: options.targetFlags.clone(),
+		sanitize: options.sanitize,
 	)
 	writeBinary(&loaded, &program, .Tests(tests), output, &written, &unique, &var timings)?
 	return (diagnostics, count)
@@ -678,6 +730,9 @@ view struct Linking {
 	cpu: &Cpu
 	target: &Target
 	targetFlags: &[String]
+	/// Whether it is built with a sanitizer, whose `clang` compiles its C and
+	/// links it.
+	sanitized: bool
 }
 
 /// The C the compiler writes for the calls it cannot make itself: the ones
@@ -765,6 +820,7 @@ fn link(
 		linking.target,
 		linking.targetFlags,
 		&unique,
+		linking.sanitized,
 	) {
 		.Ok(compiled) => compiled
 		.Err(message) => return .Err(.Link(message))
@@ -843,7 +899,7 @@ fn link(
 			args.push("-Wl,-z,start-stop-gc")
 		}
 	}
-	val cc = compiler()
+	val cc = compilerFor(linking.sanitized)
 	run(cc, strs(&args))?
 	// Apple's linker leaves the debug information in the objects and names
 	// them in the program; the program's objects go when this returns, so it
@@ -927,7 +983,7 @@ fn linkWindows(
 	for option in windowsOptions(linking.profile) do
 		args.push("-Wl,\(option)")
 
-	run(compiler(), strs(&args))?
+	run(compilerFor(linking.sanitized), strs(&args))?
 	if program then
 		return movedInto(written, output)
 

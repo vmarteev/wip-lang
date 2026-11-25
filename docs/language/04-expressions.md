@@ -74,6 +74,14 @@ A `val` may not be assigned to, and the compiler says so rather than letting
 it pass. The type may be written where the value does not say enough:
 `val count: u8 = 3`.
 
+A program may nest ten thousand levels deep: each expression, `else if`,
+type and pattern inside another is a level, and so is each call, field,
+index or operator of a chain. That is far past what is written or
+generated, and every phase of the compiler walks a program as deeply as it
+nests; one that goes past it is refused (E0137), once, where it does, and
+what follows is not read. A deep part is named, a `val` before it or a
+function, and the rest goes on from there.
+
 ## Everything answers something
 
 A block is an expression: its value is its last expression, unless that ends

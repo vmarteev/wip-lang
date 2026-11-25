@@ -823,6 +823,10 @@ Each has its own diagnostic rather than a generic "unexpected token"
 - `var` before a name in a pattern after `var` (E0136), with a fix that
   takes it out; `var` before anything but a name (E0101).
 - The R4 diagnostic (E0104), and a struct written with braces (E0133).
+- A program nested more than 10,000 levels deep (E0137): each expression,
+  `else if`, type and pattern inside another is a level, and so is each
+  call, field, index or operator of a chain. It is said once, where the
+  limit is passed, and the rest of the file is not read.
 
 Left to later phases: whether an assignment target is a place, whether
 `move` is applied to a place, integer literal range, and every rule about

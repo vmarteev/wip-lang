@@ -4,18 +4,21 @@
 # "answer 5"), a milestone of the plan ("plan M7"), a review or the plan by
 # name, or a path to any of them. They are not published, so the pointer
 # would point at nothing. A comment, a message or a document says why in
-# words.
+# words. Nor is a port named, a program of a checkout's own beside it,
+# which `scripts/ports.txt` lists where the checkout has one, or
+# `$WIP_PORTS`.
 #
 #   scripts/citations.sh [DIR]    check DIR, this repository by default
 #
 # It prints each line that points at one, and fails where there is any.
 set -uo pipefail
+ports=${WIP_PORTS:-$(cd "$(dirname "$0")" && pwd)/ports.txt}
 cd "${1:-$(dirname "$0")/..}"
 
 published=(README.md CHANGELOG.md THIRD-PARTY-NOTICES.md docs/language docs/grammar.md
     compiler bootstrap std tools tests editors examples scripts .github)
 skip=(--exclude-dir=target --exclude-dir=node_modules --exclude-dir=bench
-    --exclude=publish.sh --exclude=speed.sh --exclude=citations.sh)
+    --exclude=publish.sh --exclude=speed.sh --exclude=citations.sh --exclude=ports.txt)
 
 # A record by its number. "Answers 1", what a function gives, is not one.
 numbered='[Dd]ecisions?|[Aa]nswer|[Qq]uestions?'
@@ -28,6 +31,11 @@ found=$(
     # not a word that ends a sentence.
     grep -rIn -A1 -E "\\b($numbered)[^A-Za-z0-9.]*\$" "${published[@]}" "${skip[@]}" 2>/dev/null |
         grep -E '^[^:]+-[0-9]+-[^A-Za-z0-9]*[0-9]+\b'
+    # A port by the name of its directory, `../name/…` in the list.
+    if [ -f "$ports" ]; then
+        names=$(sed -n 's|^\.\./\([^/ ]*\).*|\1|p' "$ports")
+        [ -n "$names" ] && grep -rInwF "$names" "${published[@]}" "${skip[@]}" 2>/dev/null
+    fi
 )
 if [ -n "$found" ]; then
     echo "$found"

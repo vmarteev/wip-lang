@@ -9,6 +9,7 @@
 import std::c
 import std::io
 import std::libc
+import std::sync::{Atomic}
 import std::time::{Duration}
 
 pub struct TlsStream {
@@ -92,11 +93,16 @@ val RECEIVE_MOST: i64 = 65536
 /// What the handlers and the calls share: two semaphores, one for the
 /// connection's state and one for each receive or send, and what each
 /// handler last said. The handlers write before they signal, and the calls
-/// read after they wait.
-extern struct Link {
+/// read after they wait; but the state, which the handler may write as a
+/// call reads it, is read and written in one step. Only the handlers, which
+/// are Wip's, reach it, so it is laid out as Wip lays out a struct.
+struct Link {
 	stateSignal: ptr<u8>
 	ioSignal: ptr<u8>
-	state: u32
+	/// Written by the state handler, on the connection's queue, and read
+	/// on this program's thread, before a wait as well as after one, so
+	/// read and written in one step.
+	state: Atomic<u32>
 	errorDomain: c_int
 	errorCode: c_int
 	/// Room for what a receive brings, and how much it brought.
@@ -113,7 +119,7 @@ fn toldState(
 	state: u32,
 	error: ptr<u8>,
 ) = {
-	link.state = state
+	link.state.store(state)
 	if !error.isNull {
 		link.errorDomain = nw_error_get_error_domain(error)
 		link.errorCode = nw_error_get_error_code(error)
@@ -209,7 +215,7 @@ fn connected(host: str, port: u16, within: Option<Duration>): Result<TlsStream, 
 	nw_connection_start(connection)
 	val millis = millisOf(within)
 	val timedOut = dispatch_semaphore_wait(link.stateSignal, deadline(millis)) != 0
-	val state = link.state
+	val state = link.state.load()
 	val stream = TlsStream(connection:, link:, timeout: millis)
 	if !timedOut && state == READY then
 		return stream
@@ -334,7 +340,7 @@ extend TlsStream: Destroy {
 		nw_connection_cancel(self.connection)
 		// Once it says it is cancelled, no handler is called again, and the
 		// link may go; a receive left waiting is answered first.
-		while self.link.state != CANCELLED do
+		while self.link.state.load() != CANCELLED do
 			dispatch_semaphore_wait(self.link.stateSignal, deadline(-1))
 
 		nw_release(self.connection)

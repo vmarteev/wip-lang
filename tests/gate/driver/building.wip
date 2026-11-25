@@ -39,6 +39,162 @@ fn namesIn(root: str, name: str): String = {
 /// `text` as a Wip string literal says it.
 fn literal(text: str): String = "\"\(text.replace("\\", by: "\\\\").replace("\"", by: "\\\""))\""
 
+/// `--sanitize address`, on `run`, in a debug build and a release one: a
+/// program that reads a variable through a pointer after the block it was
+/// declared in ended is stopped where it reads, by the sanitizer, which
+/// names what it found and whose slot it is; one that reads only what is
+/// alive runs as it would — among it a `match` arm's value read from what
+/// its pattern bound, and a binding each of an arm's alternatives makes. A
+/// sanitizer that is not one is refused; Windows on arm64, which has no
+/// runtime for it, refuses the flag; on Windows on x86-64 it is not tried.
+fn sanitized(gate: &Gate, root: str): Option<String> = {
+	write(
+		root,
+		"dead/main.wip",
+		"import std::c\nimport std::io\n\nfn main() = {\n    var kept: ptr<i64> = null\n    {\n        val inner: [i64; 1] = [42]\n        kept = c::pointerTo(&inner)\n        io::println(\"inside \\(kept[0])\")\n    }\n    io::println(\"after \\(kept[0])\")\n}\n",
+	)
+	write(
+		root,
+		"alive/main.wip",
+		"import std::io\n\nenum Value {\n    Integer(n: i64)\n    Text(s: String)\n}\n\nenum Change {\n    Rename(from: String)\n    Trash(path: String)\n    MakeFile(path: String)\n}\n\n// An arm's value read from what its pattern bound, and a binding each\n// alternative makes: read and written while the binding lives.\nfn integerAt(v: &Option<Value>): i64 = match v {\n    .Some(.Integer(n)) => n\n    _ => -1\n}\n\nfn subject(c: &Change): String = match c {\n    .Rename(from) => from.clone()\n    .Trash(path) | .MakeFile(path) => path.clone()\n}\n\nfn main() = {\n    val words: Vec<String> = [\n        for i in 0..3 do\n            yield \"word \\(i)\"\n    ]\n    io::println(words.join(\", \"))\n    val five: Option<Value> = .Some(.Integer(5))\n    val made = Change::MakeFile(path: \"m\")\n    io::println(\"\\(integerAt(&five)) \\(subject(&made))\")\n}\n",
+	)
+	if TARGET_OS == "windows" {
+		if TARGET_ARCH != "arm64" then
+			return .None
+
+		val refused = gate.wip(root, ["run", "--sanitize", "address", "alive/main.wip"])
+		if refused.exit.success() || !refused.stderr.contains("no runtime for Windows on arm64") {
+			return wrong("`wip run --sanitize address`, on Windows on arm64", &refused)
+		}
+
+		return .None
+	}
+	for profile in [Vec::of(["--sanitize", "address"]), ["--sanitize", "address", "--release"]] {
+		var args = Vec::of(["run"])
+		args.pushAll(&profile)
+		var dead = args.clone()
+		dead.push("dead/main.wip")
+		val stopped = gate.wip(root, &dead)
+		// What it printed before is in a buffer the sanitizer may end the
+		// program with, unwritten where the output is a pipe; its report says
+		// what was read, and that it is a variable's slot.
+		if stopped.exit.success() ||
+			stopped.stdout.contains("after") ||
+			!stopped.stderr.contains("stack-use-after-scope") ||
+			!stopped.stderr.contains("is inside this variable") {
+			return wrong("`wip \(dead.join(" "))`", &stopped)
+		}
+		var alive = args.clone()
+		alive.push("alive/main.wip")
+		val ran = gate.wip(root, &alive)
+		if !ran.exit.success() || ran.stdout != "word 0, word 1, word 2\n5 m\n" then
+			return wrong("`wip \(alive.join(" "))`", &ran)
+	}
+	val unknown = gate.wip(root, ["run", "--sanitize", "memory", "alive/main.wip"])
+	if unknown.exit != .Code(2) || !unknown.stderr.contains("[possible values: address, thread]") {
+		return wrong("`wip run --sanitize memory`", &unknown)
+	}
+
+	return .None
+}
+
+/// A program nested nine thousand levels deep, within what the compiler
+/// takes — parentheses one inside another, and a chain of as many
+/// additions — built and run in a debug build and a release one: every
+/// phase walks it as deeply as it nests, on the stack the compiler works
+/// on. And one ten thousand and one deep, refused where it passes the
+/// limit, once. Each is written here, as a case's syntax tree, kept as its
+/// snapshot, would be megabytes long, and a case is cut up a line at a
+/// time by the compiler's own tests.
+fn nestedDeeply(gate: &Gate, root: str): Option<String> = {
+	var deep = String::of("fn main() = {\n    val x =\n")
+	for _ in 0..10001 do
+		deep.push("        (\n")
+
+	deep.push("        1\n")
+	for _ in 0..10001 do
+		deep.push("        )\n")
+
+	deep.push("}\n")
+	write(root, "deeper/main.wip", deep)
+	val refused = gate.wip(root, ["check", "--color", "never", "deeper/main.wip"])
+	val said = "\(refused.stdout)\(refused.stderr)"
+	if refused.exit != .Code(1) ||
+		!said.contains("[E0137] Error: this nests more than 10000 levels deep") ||
+		said.split("Error").count() != 2 {
+		return wrong("`wip check` of a program nested ten thousand and one deep", &refused)
+	}
+
+	var text = String::of("import std::io\n\nfn main() = {\n    val nested =\n")
+	for _ in 0..9000 do
+		text.push("        (\n")
+
+	text.push("        1\n")
+	for _ in 0..9000 do
+		text.push("        )\n")
+
+	text.push("    io::printInt(nested)\n    val chained =\n")
+	for _ in 0..8999 do
+		text.push("        1 +\n")
+
+	text.push("        1\n    io::printInt(chained)\n}\n")
+	write(root, "deep/main.wip", text)
+	for profile in [Vec::of(["run"]), ["run", "--release"]] {
+		var args = profile.clone()
+		args.push("deep/main.wip")
+		val ran = gate.wip(root, &args)
+		if !ran.exit.success() || ran.stdout != "1\n9000\n" then
+			return wrong("`wip \(args.join(" "))` of a program nested nine thousand deep", &ran)
+	}
+	return .None
+}
+
+/// `--sanitize thread`, on `run`, in a debug build and a release one: two
+/// threads that write one place through a pointer, with nothing to order
+/// them, are reported where they write; two that count with an `Atomic`
+/// and a `Mutex` are not; and the prelude's `SANITIZER` says which. Windows
+/// has no runtime for it, and refuses the flag.
+fn threadSanitized(gate: &Gate, root: str): Option<String> = {
+	write(
+		root,
+		"racing/main.wip",
+		"import std::c\nimport std::future\n\nfn main() = {\n    var counts: [i64; 1] = [0]\n    val at: ptr<i64> = c::pointerTo(&counts)\n    future::both(\n        () => {\n            var mine = at\n            for _ in 0..100000 do\n                mine[0] = mine[0] + 1\n        },\n        () => {\n            var mine = at\n            for _ in 0..100000 do\n                mine[0] = mine[0] + 1\n        },\n    )\n}\n",
+	)
+	write(
+		root,
+		"ordered/main.wip",
+		"import std::future\nimport std::io\nimport std::sync::{Atomic, Mutex}\n\nfn main() = {\n    val count = Atomic::of(0)\n    val total = Mutex::of(0)\n    future::both(\n        () => {\n            for _ in 0..1000 {\n                count.add(1)\n                total.lock((n) => { n += 1 })\n            }\n        },\n        () => {\n            for _ in 0..1000 {\n                count.add(1)\n                total.lock((n) => { n += 1 })\n            }\n        },\n    )\n    io::println(\"\\(SANITIZER) \\(count.load()) \\(total.lock((n) => n))\")\n}\n",
+	)
+	if TARGET_OS == "windows" {
+		val refused = gate.wip(root, ["run", "--sanitize", "thread", "ordered/main.wip"])
+		if refused.exit.success() || !refused.stderr.contains("no runtime for Windows") then
+			return wrong("`wip run --sanitize thread`, on Windows", &refused)
+
+		return .None
+	}
+	for profile in [Vec::of(["--sanitize", "thread"]), ["--sanitize", "thread", "--release"]] {
+		var args = Vec::of(["run"])
+		args.pushAll(&profile)
+		var racing = args.clone()
+		racing.push("racing/main.wip")
+		val reported = gate.wip(root, &racing)
+		if reported.exit.success() ||
+			!reported.stderr.contains("WARNING: ThreadSanitizer: data race") {
+			return wrong("`wip \(racing.join(" "))`", &reported)
+		}
+
+		var ordered = args.clone()
+		ordered.push("ordered/main.wip")
+		val ran = gate.wip(root, &ordered)
+		if !ran.exit.success() ||
+			ran.stdout != "thread 2000 2000\n" ||
+			ran.stderr.contains("ThreadSanitizer") {
+			return wrong("`wip \(ordered.join(" "))`", &ran)
+		}
+	}
+	return .None
+}
+
 /// A program of Wip alone compiles no C: the runtime is Wip, and `cc` is
 /// asked once, to link.
 fn wipAloneCompilesNoC(gate: &Gate, root: str): Option<String> = {

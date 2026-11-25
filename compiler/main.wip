@@ -13,6 +13,8 @@ import std::process
 import std::process::{Command}
 import lang::{
 	BuildOptions,
+	STACK,
+	Sanitizer,
 	Cpu,
 	Debugger,
 	Emit,
@@ -59,7 +61,10 @@ import lang::{
 }
 import syntax::{Diagnostic, Interner, Span, dump, dumpAst, lex}
 
-fn main(args: &[cstring]): i64 = {
+fn main(args: &[cstring]): i64 = future::withStack(STACK, () => commanded(&args))
+
+/// What the command `args` says done, and the code the compiler exits with.
+fn commanded(args: &[cstring]): i64 = {
 	var arguments = Arguments::of(&args)
 	var command: Option<str> = .None
 	// What follows the command: a file, or for `fmt` any number of paths.
@@ -88,6 +93,7 @@ fn main(args: &[cstring]): i64 = {
 	// is, and the processor it is built for.
 	var search = Search()
 	var cpuOption = "baseline"
+	var sanitizeOption: Option<str> = .None
 	// An option only `build`, `run` and `test` take, given to another
 	// command.
 	var runOption: Option<str> = .None
@@ -217,6 +223,16 @@ fn main(args: &[cstring]): i64 = {
 				match arguments.value() {
 					.Ok(value) if include => search.includes.push(value)
 					.Ok(value) => search.libraryPaths.push(value)
+					.Err(error) => {
+						io::eprintln("error: \(error)")
+						return 2
+					}
+				}
+			}
+			.Long("sanitize") => {
+				runOption = "--sanitize"
+				sanitizeOption = match arguments.value() {
+					.Ok(value) => value
 					.Err(error) => {
 						io::eprintln("error: \(error)")
 						return 2
@@ -563,6 +579,10 @@ fn main(args: &[cstring]): i64 = {
 					return 2
 				}
 			}
+			// The prelude's `SANITIZER` says which, as a build defines it.
+			if sanitizeOption is .Some(name) then
+				defines.push(("SANITIZER", name))
+
 			val options = BuildOptions(
 				search:,
 				emit: move emit,
@@ -575,6 +595,16 @@ fn main(args: &[cstring]): i64 = {
 				debugInfo: !noDebugInfoOption,
 				defines:,
 				target:,
+				sanitize: match sanitizeOption {
+					.Some(name) => match Sanitizer::parse(name) {
+						.Some(sanitizer) => sanitizer
+						.None => {
+							io::eprintln("error: invalid value '\(name)' for '--sanitize <SANITIZER>' [possible values: address, thread]")
+							return 2
+						}
+					}
+					.None => .None
+				},
 			)
 			match command {
 				.Some("run") => runCommand(path, &options, &shipping, &programArgs, color, threads)
@@ -859,13 +889,26 @@ fn forTarget(options: &BuildOptions, loaded: &Loaded): Option<BuildOptions> = {
 			return .None
 		}
 	}
+	// A sanitizer is every `clang`'s, as the target is.
+	if options.sanitize is .Some(sanitizer) {
+		if sanitizer.refusal(&options.target) is .Some(why) {
+			io::eprintln("error: \(why)")
+			return .None
+		}
+		for flag in sanitizer.flags() do
+			made.targetFlags.push(flag)
+	}
 	return made
 }
 
-/// The app the program's package says it is, where it is built for iOS: an
-/// app means nothing to a Mac's or Linux's build yet.
+/// The app an iOS build makes, of a package that says it is one: only where
+/// the build is a program. A library of the package, `--emit static`, is
+/// what a project of Xcode's links into an app it makes, and is written as
+/// any library is.
 fn appOf(loaded: &Loaded, options: &BuildOptions): Option<lang::App> =
-	if options.target.os == Os::Ios then loaded.packages[0].app.clone() else .None
+	if options.target.os == Os::Ios && options.emit == Emit::Program then
+		loaded.packages[0].app.clone()
+	else .None
 
 /// `run`: the program, built in a directory of its own and run with what
 /// followed its file, its exit code this command's. For iOS, on the

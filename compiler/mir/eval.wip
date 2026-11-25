@@ -33,6 +33,15 @@ import syntax::{
 val STEPS: u64 = 100000000
 /// How many bytes of memory it may use.
 val BYTES: u64 = 512 << 20
+
+/// How deeply the calls of a constant or an assert may nest: each is a call
+/// of the compiler's own, on its stack, and one that never returns runs out
+/// of it rather than of its steps.
+val MOST_CALLS: i64 = 10000
+
+/// How many of the calls a failure happened in its error names, innermost
+/// first; the rest are counted.
+val SHOWN_CALLS: i64 = 10
 /// The first address of memory: below it, as at run time, is no value's.
 val BASE: u64 = 0x10000
 /// Where the addresses of functions begin: never memory, only a number a call
@@ -501,12 +510,22 @@ extend Machine {
 				"\(working) took too \(what)",
 				span,
 				"stopped while the program was compiled",
-			).withNote("a constant or an assert may run \(self.budget) steps and use \(BYTES >> 20) MiB")
+			).withNote("a constant or an assert may run \(self.budget) steps, its calls \(MOST_CALLS) deep, and use \(BYTES >> 20) MiB")
 		}
+		// The innermost calls, and how many more there were out to the first:
+		// a recursion that never ends is ten thousand of one call.
 		var noted = diagnostic
-		for (function, at) in failure.calls {
+		val calls = &failure.calls
+		for index in 0..calls.len().min(SHOWN_CALLS) {
+			val (function, at) = calls[index]
 			val (file, line, _) = locate(at)
 			noted = noted.withNote("in \(function) (\(file):\(line))")
+		}
+		if calls.len() > SHOWN_CALLS {
+			val (function, at) = calls[calls.len() - 1]
+			val (file, line, _) = locate(at)
+			val more = calls.len() - SHOWN_CALLS
+			noted = noted.withNote("and \(more) calls more, out to \(function) (\(file):\(line))")
 		}
 		return noted
 	}
@@ -807,6 +826,9 @@ extend Machine {
 				.Fn(id) => self.program.fns[id].span
 				_ => Span::at(0)
 			}
+			if self.calls.len() >= MOST_CALLS then
+				return .Err(.Budget("many calls deep"))
+
 			self.calls.push((name, at))
 			var frame = Frame(body: body.share(), locals: Vec(), owned: Vec())
 			var next = 0
@@ -1107,7 +1129,8 @@ extend Machine {
 			}
 			// What the program is compiled with hides nothing from the
 			// evaluator: the place holds its value.
-			.Fence(..) | .Opaque(..) => {}
+			// The evaluator's locals are values, not slots.
+			.Fence(..) | .Opaque(..) | .StorageLive(..) | .StorageDead(..) => {}
 			.Check(fails, kind, at) => {
 				if self.scalar(&frame, &fails)? == 0 then
 					return

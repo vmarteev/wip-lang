@@ -1,0 +1,472 @@
+// The bench: a batch of cases written beside the world, compiled by the
+// `wip` under test into a runner's objects, linked, and each case run in a
+// process of its own, as `wip test` runs a test, with the program's checks
+// on: its moves, its leaks, and its memory — by the address sanitizer,
+// which faults on a read or write of memory freed, the heap's or a slot of
+// the stack whose variable's life ended; or, where asked, by Guard Malloc
+// on a Mac, which puts each allocation on pages of its own and takes them
+// away when it is freed, and sees the heap alone.
+
+import std::collections::{Map}
+import std::fs
+import std::io
+import std::path
+import std::process::{Command}
+
+/// What the system's Guard Malloc is, where the system has it.
+val GUARD_MALLOC = "/usr/lib/libgmalloc.dylib"
+
+/// What a run of a sanitized case ends with where the sanitizer reports,
+/// apart from a panic's and a leak's.
+val REPORTED: i64 = 86
+
+/// What checks a case's memory as it runs: one allocator each, so one at a
+/// time.
+pub enum Memory {
+	Sanitizer
+	Guard
+	Unchecked
+}
+
+pub struct Bench {
+	pub wip: String
+	/// Where the batch is written and built.
+	pub dir: String
+	clang: String
+	memory: Memory
+}
+
+/// A case as the batch holds it: its name and its text.
+pub struct Written {
+	pub name: String
+	pub text: String
+}
+
+/// What the checker said of a case it refused.
+pub struct Refusal {
+	/// The case, by its place in the batch; nothing where what was refused
+	/// is not one, which is the generator's fault.
+	pub var case: Option<i64>
+	pub code: String
+	pub var said: String
+}
+
+pub enum Built {
+	/// The runners, linked: a debug build's, and a release build's.
+	Runner(exe: String, release: String)
+	Refused(refusals: Vec<Refusal>)
+	/// The compiler ended without saying why the program is wrong: a
+	/// crash, a panic, or an error of its own.
+	Crashed(said: String)
+	/// The link failed, which is a fault of the bench or the compiler.
+	Unlinked(said: String)
+}
+
+/// How a case ended when it ran.
+pub enum Outcome {
+	Passed
+	Panicked(said: String)
+	Leaked(said: String)
+	/// The sanitizer's report: what it found, as it names it, and all it said.
+	Reported(error: String, said: String)
+	/// The log of `Tracked` values says one ended other than once, or out of
+	/// its block's order: what went wrong, and where.
+	Misended(what: String, said: String)
+	/// The release build failed where the debug build passed: how, as the
+	/// debug build's failure would be said, and what it said.
+	Release(kind: String, said: String)
+	/// The two builds both passed, and printed otherwise.
+	Differs(said: String)
+	/// It ran out of the time a case has, which a cut that leaves a loop
+	/// without its step does as a wrong build would.
+	Hung(said: String)
+	Ended(how: String, said: String)
+}
+
+extend Outcome {
+	/// What kind of failure it is, for keeping the same one while a case
+	/// is made smaller.
+	pub fn kind(): String = match self {
+		.Passed => "passed"
+		.Panicked(said) => {
+			if said.contains("dropped after it was moved") then
+				return "a value dropped after it was moved"
+
+			"a panic: \(firstLine(said))"
+		}
+		.Leaked(_) => "a leak"
+		.Reported(error, ..) => "the sanitizer: \(error)"
+		.Misended(what, ..) => "the ends: \(what)"
+		.Release(kind, ..) => "in a release build, \(kind)"
+		.Differs(..) => "the two builds print otherwise"
+		.Hung(_) => "it did not end in the time a case has"
+		.Ended(how, ..) => "ended: \(how)"
+	}
+
+	pub fn said(): str = match self {
+		.Passed => ""
+		.Panicked(said) | .Leaked(said) => said.toStr()
+		.Reported(said, ..) | .Misended(said, ..) | .Release(said, ..) | .Hung(said)
+		| .Ended(said, ..) => said.toStr()
+		.Differs(said) => said.toStr()
+	}
+}
+
+fn firstLine(text: str): str = match text.splitOnce("\n") {
+	.Some((first, _)) => first
+	.None => text
+}
+
+extend Bench {
+	/// A bench for `wip`, building in `dir`; Guard Malloc where `guard`
+	/// asks and the system has it, and otherwise the sanitizer.
+	pub static fn of(wip: String, dir: String, guard: bool): Bench = {
+		val clang = io::env("WIP_CLANG").unwrapOr("clang")
+		val memory =
+			if !guard then Memory::Sanitizer
+			else if TARGET_VENDOR == "apple" && fs::exists(GUARD_MALLOC) then Memory::Guard
+			else Memory::Unchecked
+		return Bench(wip:, dir:, clang:, memory:)
+	}
+
+	/// What checks its cases' memory, said as a run's first line says it.
+	pub fn memory(): str = match self.memory {
+		.Sanitizer => "the address sanitizer"
+		.Guard => "Guard Malloc"
+		.Unchecked => "nothing"
+	}
+
+	/// The batch written with `world` and built; a refused case named by
+	/// its place in `cases`.
+	pub fn built(world: str, cases: &[Written]): Built = {
+		if fs::makeDirs(self.dir) is .Err(error) then
+			return .Crashed("cannot make `\(self.dir)`: \(error)")
+
+		var text = String::of(HEADER)
+		// Where each case begins and ends in the file, by its lines.
+		var starts: Vec<i64> = Vec()
+		var line = 1 + HEADER.split("\n").count() - 1
+		for case in cases {
+			starts.push(line)
+			text.push(case.text)
+			text.push("\n")
+			line += case.text.split("\n").count()
+		}
+		starts.push(line)
+		val main = path::join(self.dir, "main.wip")
+		val tests = path::join(self.dir, "cases.test.wip")
+		if fs::writeFile(main, world) is .Err(error) then
+			return .Crashed("cannot write `\(main)`: \(error)")
+
+		if fs::writeFile(tests, text) is .Err(error) then
+			return .Crashed("cannot write `\(tests)`: \(error)")
+
+		val debug = match self.compiled(main.toStr(), "objects", false, &starts) {
+			.Some(failed) => return failed
+			.None => self.linked(path::join(self.dir, "objects").toStr(), "runner")
+		}
+		val .Runner(exe, ..) = debug else return debug
+		// The release build, of what the debug build accepted: it refuses
+		// nothing the other did not, and a failure is the compiler's.
+		val release = match self.compiled(main.toStr(), "objects-release", true, &starts) {
+			.Some(
+				.Refused(refusals),
+			) => return .Crashed("the release build refuses what the debug build accepts:\n\(refusals.map((r) => r.said.clone()).join("\n"))")
+			.Some(failed) => return failed
+			.None => self.linked(path::join(self.dir, "objects-release").toStr(), "runner-release")
+		}
+		val .Runner(exe: released, ..) = release else return release
+		return .Runner(exe: exe.clone(), release: released.clone())
+	}
+
+	/// The batch at `main` compiled into the objects in `dir`, a release
+	/// build where `release` says so; what went wrong, where something did.
+	fn compiled(main: str, dir: str, release: bool, starts: &[i64]): Option<Built> = {
+		val objects = path::join(self.dir, dir)
+		var compiling = Command::of(self.wip).args([
+			"test",
+			"--color",
+			"never",
+			"--emit",
+			"objects",
+			"-o",
+			objects.toStr(),
+		])
+		if self.memory is .Sanitizer then
+			compiling = compiling.args(["--sanitize", "address"])
+
+		if release then
+			compiling = compiling.arg("--release")
+
+		val compiled = compiling.arg(main).output()
+		val ran = match move compiled {
+			.Ok(ran) => ran
+			.Err(error) => return .Crashed("cannot run `\(self.wip)`: \(error)")
+		}
+		val said = "\(ran.stdout)\(ran.stderr)"
+		if !ran.exit.success() {
+			val refusals = refused(&said, &starts)
+			// A compiler that refuses says why, with an error's code; one
+			// that ends otherwise has failed.
+			if refusals.isEmpty() || said.contains("panicked") then
+				return .Crashed("\(ran.exit)\n\(said)")
+
+			return .Refused(refusals)
+		}
+		return .None
+	}
+
+	/// The runner's objects linked, as `link.txt` beside them lists them,
+	/// into `name` beside the batch.
+	fn linked(objects: str, name: str): Built = {
+		val listed = match fs::readFile(path::join(objects, "link.txt")) {
+			.Ok(listed) => listed
+			.Err(error) => return .Unlinked("cannot read the objects' list: \(error)")
+		}
+		val exe = path::join(self.dir, name)
+		var args: Vec<String> = Vec()
+		for line in listed.lines() {
+			match line.splitOnce(" ") {
+				.Some(("object", name)) => args.push(path::join(objects, name))
+				.Some(("library", name)) => args.push("-l\(name)")
+				.Some(("option", option)) => args.push(option)
+				_ => {}
+			}
+		}
+		// What links a sanitized program brings its runtime in.
+		if self.memory is .Sanitizer then
+			args.push("-fsanitize=address")
+
+		args.push("-o")
+		args.push(exe.clone())
+		var command = Command::of(self.clang)
+		for arg in args do
+			command = command.arg(arg)
+
+		val linking = match command.output() {
+			.Ok(ran) => ran
+			.Err(error) => return .Unlinked("cannot run `\(self.clang)`: \(error)")
+		}
+		if !linking.exit.success() then
+			return .Unlinked("\(linking.stdout)\(linking.stderr)")
+
+		return .Runner(exe:, release: String())
+	}
+
+	/// The case `name`, run in the debug build `exe` and then the release
+	/// build `release`: how the first failed, where it did; and otherwise how
+	/// the second did, or whether it printed otherwise. A panic's message and
+	/// the calls it lists differ between the two by design, and are compared
+	/// only as the kind of failure they are.
+	pub fn judged(exe: str, release: str, name: str): Outcome = {
+		val (debug, log) = self.ran(exe, name)
+		if debug !is .Passed then
+			return debug
+
+		val (released, said) = self.ran(release, name)
+		if released !is .Passed then
+			return .Release(kind: released.kind(), said: released.said())
+
+		if said != log then
+			return .Differs("a debug build printed:\n\(log)\na release build printed:\n\(said)")
+
+		return .Passed
+	}
+
+	/// The case `name` of the runner `exe`, run alone with every check on:
+	/// how it ended, and what it printed.
+	fn ran(exe: str, name: str): (Outcome, String) = {
+		var command = Command::of(exe).env("WIP_TEST", name).env("WIP_CHECK_LEAKS", "1")
+		match self.memory {
+			// A slot of a frame that returned is the sanitizer's to see too;
+			// what leaks the program counts itself.
+			.Sanitizer =>
+				command = command.env("ASAN_OPTIONS", "detect_stack_use_after_return=1:detect_leaks=0:exitcode=\(REPORTED)")
+			.Guard => command = command.env("DYLD_INSERT_LIBRARIES", GUARD_MALLOC)
+			.Unchecked => {}
+		}
+
+		val output = match command.output() {
+			.Ok(output) => output
+			.Err(error) => return (.Ended(how: "not started", said: "\(error)"), String())
+		}
+		val said = withoutGuard(&output.stderr)
+		val outcome = match output.exit {
+			.Code(0) => match misended(&output.stdout) {
+				.Some((what, said)) => .Misended(what:, said:)
+				.None => .Passed
+			}
+			.Code(101) => Outcome::Panicked(said)
+			.Code(70) => .Leaked(said)
+			.Code(code) if code == REPORTED => .Reported(error: reportedError(&said), said:)
+			.Signal(signal) if signal == ALARMED => .Hung(said)
+			ended => .Ended(how: "\(ended)", said:)
+		}
+		return (outcome, output.stdout)
+	}
+}
+
+/// What the log a case wrote says went wrong with the ends of its `Tracked`
+/// values, and where, if anything did: a value ended more often than it was
+/// made, or not as often; or, after a block's mark, the values it names
+/// ending in another order, or not ending there. The mark names each by its
+/// number, newest first, a group each, whose own ends may come in any order;
+/// a number not alive at the mark is passed over, as a case made smaller
+/// may no longer make it, and an end the mark does not name is someone
+/// else's.
+fn misended(log: str): Option<(String, String)> = {
+	val lines: Vec<str> = [
+		for line in log.lines() do
+			yield line
+	]
+	var made: Map<i64, i64> = Map()
+	var ended: Map<i64, i64> = Map()
+	for at in 0..lines.len() {
+		val line = lines[at]
+		if line.startsWith("made ") {
+			val .Ok(id) = line["made ".len()..].toInt() else continue
+			made.atOrPut(id, 0) += 1
+			continue
+		}
+		if line.startsWith("ended ") {
+			val .Ok(id) = line["ended ".len()..].toInt() else continue
+			ended.atOrPut(id, 0) += 1
+			if ended.get(&id).unwrapOr(0) > made.get(&id).unwrapOr(0) then
+				return (
+					"a value ended more often than it was made",
+					"\(id), at line \(at + 1)\n\(log)",
+				)
+
+			continue
+		}
+		val .Some((head, expected)) = line.splitOnce(": ") else continue
+		if !head.startsWith("end of ") || expected == "?" || expected.isEmpty() then
+			continue
+
+		// The groups, of what is alive.
+		var groups: Vec<Vec<i64>> = Vec()
+		for text in expected.split(" | ") {
+			val group: Vec<i64> = [for number in text.split(",") {
+				val .Ok(id) = number.toInt() else continue
+				if made.get(&id).unwrapOr(0) > ended.get(&id).unwrapOr(0) then
+					yield id
+			}]
+			if !group.isEmpty() then
+				groups.push(group)
+		}
+		// The ends that follow the mark, of what it names.
+		var named: Vec<i64> = Vec()
+		var next = at + 1
+		while next < lines.len() && lines[next].startsWith("ended ") {
+			if lines[next]["ended ".len()..].toInt() is .Ok(id) &&
+				groups.any((group) => group.contains(&id)) {
+				named.push(id)
+			}
+			next += 1
+		}
+		var taken = 0
+		for group in groups {
+			if taken + group.len() > named.len() then
+				return ("a value did not end with its block", "\(line), at line \(at + 1)\n\(log)")
+
+			var want = group.clone()
+			var got = named[taken..taken + group.len()].toVec()
+			want.sort()
+			got.sort()
+			if want != got then
+				return (
+					"values ended out of their block's order",
+					"\(line), at line \(at + 1)\n\(log)",
+				)
+
+			taken += group.len()
+		}
+	}
+	for entry in made do
+		if ended.get(&entry.key).unwrapOr(0) != entry.value then
+			return ("a value never ended", "\(entry.key)\n\(log)")
+
+	return .None
+}
+
+/// What the sanitizer found, as its report names it: `stack-use-after-scope`
+/// in `ERROR: AddressSanitizer: stack-use-after-scope on address …`.
+fn reportedError(said: str): String = {
+	val marker = "AddressSanitizer: "
+	val .Some(at) = said.indexOf(marker) else return "a report"
+	val rest = said[at + marker.len()..]
+	return match rest.indexOf(" ") {
+		.Some(end) => rest[..end]
+		.None => firstLine(rest)
+	}
+}
+
+/// What a program wrote, without the lines Guard Malloc writes as it
+/// starts.
+fn withoutGuard(written: str): String = {
+	var out = String()
+	for line in written.lines() {
+		if line.startsWith("GuardMalloc[") then
+			continue
+
+		out.push(line)
+		out.push("\n")
+	}
+	return out
+}
+
+/// The errors the compiler wrote, each with the case it is in: an error is
+/// a line `[E0404] Error: …`, and the lines after it say where, `╭─[
+/// cases.test.wip:18:10 ]`, the first of them in a case the one it is in;
+/// an error may point at the world's declaration first.
+fn refused(said: str, starts: &[i64]): Vec<Refusal> = {
+	var out: Vec<Refusal> = Vec()
+	var error = false
+	for line in said.lines() {
+		if line.startsWith("[E") {
+			val code = line[1..line.indexOf("]").unwrapOr(1)]
+			// A warning is said and passed by, and ends the error before it.
+			error = line.contains("] Error:")
+			if error then
+				out.push(Refusal(case: .None, code:, said: line))
+
+			continue
+		}
+		if !error || out.isEmpty() then
+			continue
+
+		val last = out.len() - 1
+		out[last].said.push("\n")
+		out[last].said.push(line)
+		val .Some(at) = line.indexOf("─[ ") else continue
+		if out[last].case.isSome() then
+			continue
+
+		val rest = line[at + "─[ ".len()..]
+		val place = match rest.indexOf(" ") {
+			.Some(end) => rest[..end]
+			.None => rest
+		}
+		out[last].case = caseAt(place, &starts)
+	}
+	return out
+}
+
+/// The case a place `cases.test.wip:LINE:COLUMN` is in, by where each
+/// begins.
+fn caseAt(place: str, starts: &[i64]): Option<i64> = {
+	val .Some((file, rest)) = place.splitOnce(":") else return .None
+	if !file.endsWith("cases.test.wip") then
+		return .None
+
+	val number = match rest.splitOnce(":") {
+		.Some((number, _)) => number
+		.None => rest
+	}
+	val .Ok(line) = number.toInt() else return .None
+	for index in 0..starts.len() - 1 do
+		if line >= starts[index] && line < starts[index + 1] then
+			return index
+
+	return .None
+}

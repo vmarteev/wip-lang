@@ -437,8 +437,28 @@ fn main() = {
 ```
 
 A float is written as C's `%g` writes it, with as many digits as it
-takes to read back as the same value, and six at the least; `toFloat()`
-answers the nearest `f64` to the text.
+takes to read back as the same value, and six at the least, a `NaN` as
+`nan` whatever its sign. `toFloat()` answers the nearest `f64` to the
+text, the one whose significand is even where the text is halfway between
+two, `TooLarge` past the largest, and zero below half the least. The
+library works out both itself, from the float's bits and the text's
+digits, so each is the same on every system, and in a `@comptime`
+constant as when the program runs.
+
+```wip,run
+@comptime
+val WRITTEN: i64 = "\(0.1 + 0.2)".len()
+
+/// 2^53 + 1, halfway between 2^53 and the float above it.
+@comptime
+val HALFWAY: f64 = "9007199254740993".toFloat().unwrapOr(0.0)
+
+fn main() = {
+    assert(WRITTEN == 19 && "\(0.1 + 0.2)" == "0.30000000000000004")
+    assert("\(1e20)" == "1e+20" && "\(5e-324)" == "5e-324" && "\(-0.0)" == "-0")
+    assert(HALFWAY == 9007199254740992.0 && "1e-400".toFloat() == 0.0)
+}
+```
 
 A text's length is in bytes, and its characters are counted by `chars()`;
 what it takes on a terminal is a third number. `width()` answers it, for a

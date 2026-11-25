@@ -237,7 +237,40 @@ view struct Parser {
 	typeArgs: i64
 	/// The `=` left over where a `>=` closed a list of type arguments.
 	halfEq: Option<Span>
+	/// How deeply what is being read nests: each expression, `else if`,
+	/// type and pattern inside another, and each call or operator of a
+	/// chain, as each is a level of the tree that every phase walks.
+	nesting: i64 = 0
+	/// Set once it nests more deeply than `MOST_NESTED`: the error is
+	/// reported, and the rest of the file is read as its end.
+	tooDeep: bool = false
+	/// For each token that opens a bracket, the one that closes it, by
+	/// their places; -1 for every other, and for one never closed. What
+	/// follows a group is looked up here, not counted to, which would read
+	/// a deep group once for each level of it.
+	closers: Vec<i64> = Vec()
 }
+
+/// For each of `tokens` that opens a bracket, `(`, `[` or `{`, the place of
+/// the one that closes it, as the brackets pair whatever their kind; -1 for
+/// every other.
+fn closersOf(tokens: &[Token]): Vec<i64> = {
+	var closers: Vec<i64> = Vec::filled(tokens.len(), -1)
+	var open: Vec<i64> = Vec()
+	for index in 0..tokens.len() {
+		match tokens[index].kind {
+			.LParen | .LBracket | .LBrace => open.push(index)
+			.RParen | .RBracket | .RBrace => { if open.pop() is .Some(at) then closers[at] = index }
+			_ => {}
+		}
+	}
+	return closers
+}
+
+/// How deeply a program may nest, far past what one is written or
+/// generated with, and well within the stack the compiler works on, where
+/// a phase that walks the tree recurses once for each level.
+pub val MOST_NESTED: i64 = 10000
 
 extend Parser {
 	/// A parser at the start of `lexed`'s tokens of `src`, whose spans
@@ -262,11 +295,16 @@ extend Parser {
 		fuel: 0,
 		typeArgs: 0,
 		halfEq: .None,
+		closers: closersOf(&lexed.tokens),
 	)
 
 	// ---- tokens ----
 
 	var fn nth(n: i64): TokenKind = {
+		// What is past a program nested too deeply is not read.
+		if self.tooDeep then
+			return TokenKind::Eof
+
 		val fuel = self.fuel + 1
 		if fuel >= 50000 then
 			panic("parser made no progress at token \(self.pos)")
@@ -411,6 +449,37 @@ extend Parser {
 	// ---- node construction ----
 
 	var fn allocExpr(kind: ExprKind, span: Span): ExprId = self.ast.exprs.add(Expr(kind:, span:))
+
+	/// One level deeper, where the program may nest so deeply: false, which
+	/// `shallower` undoes. Past `MOST_NESTED`, true, once the error is
+	/// reported, and the rest of the file is read as its end.
+	var fn deeper(): bool = {
+		if self.tooDeep then
+			return true
+
+		if self.nesting < MOST_NESTED {
+			self.nesting += 1
+			return false
+		}
+		self.report(
+			Diagnostic::error(
+				NESTED_TOO_DEEPLY,
+				"this nests more than \(MOST_NESTED) levels deep",
+				self.span(),
+				"nested too deeply",
+			).withHelp(
+				"give a part of it a name of its own: a `val` before it, or a function",
+			).withNote(
+				"each bracket, block and `else if` inside another is a level, and so is each call or operator of a chain; a program that nests more deeply is refused rather than run the compiler out of stack",
+			),
+		)
+		self.tooDeep = true
+		self.pos = self.tokens.len() - 1
+		return true
+	}
+
+	/// One level back out, after `deeper` let the parser in.
+	var fn shallower() = self.nesting -= 1
 
 	var fn allocStmt(kind: StmtKind, span: Span): StmtId = self.ast.stmts.add(Stmt(kind:, span:))
 

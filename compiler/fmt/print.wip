@@ -500,16 +500,23 @@ extend Printer {
 
 	var fn fnSig(keyword: str, isPub: bool, sig: &FnSig): Doc = {
 		var params: Vec<Doc> = Vec()
+		// `...` where it is written: last, or before what is refused after it,
+		// which the formatter does not move.
+		var dotsLast = sig.variadic.isSome()
 		for p in sig.params {
+			if sig.variadic is .Some(dots) && dotsLast && p.span.lo > dots.hi {
+				params.push(text("..."))
+				dotsLast = false
+			}
 			val lead = self.leading(p.span.lo)
 			params.push(concat([lead, self.field(&p)]))
 		}
-		if sig.variadic.isSome() then
+		if dotsLast then
 			params.push(text("..."))
 
 		var parts = Vec::of([
 			text("\(pubWord(isPub))\(keyword) \(self.sym(sig.name.sym))\(self.generics(&sig.generics))"),
-			self.listEnding("(", params, ")", sig.variadic.isNone()),
+			self.listEnding("(", params, ")", !dotsLast),
 		])
 		if sig.ret is .Some(ret) {
 			parts.push(text(": "))
@@ -1071,8 +1078,16 @@ extend Printer {
 		val doc =
 			if all then self.thenChain(&branches, marked, marked)
 			else self.mixedChain(&branches, &forms, marked, marked)
+		val afterForm = self.next
 		self.next = next
 		val braced = self.bracedChain(&branches, statement)
+		// A comment before a branch's one statement has a place in that form
+		// and none in braces, which would leave it for later and write it
+		// twice: that form is the one written.
+		if self.next != afterForm {
+			self.next = afterForm
+			return (InForm(doc: doc.clone(), opensBlock: !forms[0], hasBlock: !all), doc)
+		}
 		return (InForm(doc:, opensBlock: !forms[0], hasBlock: !all), braced)
 	}
 
@@ -1113,6 +1128,7 @@ extend Printer {
 			}
 			if one {
 				val only = b.stmts[0]
+				val (commented, lead) = self.leadingBranch(only)
 				val branch = match self.ast.stmts[only].kind {
 					.Expr(e) => self.expr(e)
 					_ => self.stmt(only)
@@ -1121,16 +1137,19 @@ extend Printer {
 				match cond {
 					.Some(cond) if below => {
 						parts.push(rigid(concat([text("if "), self.expr(cond), text(" then")])))
-						parts.push(indent(concat([.Hard, mark.clone(), branch])))
+						parts.push(indent(concat([.Hard, mark.clone(), lead, branch])))
 					}
-					.None if below => parts.push(indent(concat([.Hard, mark.clone(), branch])))
-					.Some(cond) if beforeBlock => parts.push(
+					.None if below => parts.push(
+						indent(concat([.Hard, mark.clone(), lead, branch])),
+					)
+					.Some(cond) if beforeBlock && !commented => parts.push(
 						rigid(concat([text("if "), self.expr(cond), text(" then "), branch])),
 					)
 					.Some(cond) => {
 						parts.push(rigid(concat([text("if "), self.expr(cond), text(" then")])))
-						parts.push(group(indent(concat([.Line, branch]))))
+						parts.push(group(indent(concat([.Line, lead, branch]))))
 					}
+					.None if commented => parts.push(indent(concat([.Hard, lead, branch])))
 					.None => parts.push(branch)
 				}
 			} else {
@@ -1292,6 +1311,7 @@ extend Printer {
 				panic("one expression")
 
 			val only = b.stmts[0]
+			val (commented, lead) = self.leadingBranch(only)
 			val branch = match self.ast.stmts[only].kind {
 				.Expr(e) => self.expr(e)
 				_ => self.stmt(only)
@@ -1300,15 +1320,24 @@ extend Printer {
 				.Some(cond) => {
 					parts.push(rigid(concat([text("if "), self.expr(cond), text(" then")])))
 					if below then
-						parts.push(indent(concat([.Hard, mark.clone(), branch])))
+						parts.push(indent(concat([.Hard, mark.clone(), lead, branch])))
 					else
-						parts.push(group(indent(concat([.Line, branch]))))
+						parts.push(group(indent(concat([.Line, lead, branch]))))
 				}
-				.None if below => parts.push(indent(concat([.Hard, branch])))
+				.None if below || commented => parts.push(indent(concat([.Hard, lead, branch])))
 				.None => parts.push(branch)
 			}
 		}
 		return group(concat(parts))
+	}
+
+	/// The comments before the statement of a branch of one, which a branch
+	/// begins at its statement and so does not hold: whether there are any,
+	/// and them, each on its line, the statement on the line after.
+	var fn leadingBranch(only: StmtId): (bool, Doc) = {
+		val at = self.ast.stmts[only].span.lo
+		val commented = self.next < self.comments.len() && self.comments[self.next].at < at
+		return (commented, self.leading(at))
 	}
 
 	/// Whether a block is one expression, or one `yield`,

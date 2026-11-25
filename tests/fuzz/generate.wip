@@ -1,0 +1,1445 @@
+// The generator: a test case of the world, a function of statements that
+// make values that own memory, move them, lend them, keep views of them,
+// change them and end them, in branches, loops and blocks.
+//
+// It keeps a model of what each variable holds — all of its value, none of
+// it, or perhaps some — and of which views are still good, and writes
+// mostly what the model says is sound, so that most cases are accepted and
+// run; now and then, as often as `risk` says, it ignores the model, and the
+// checker must refuse the case where what it wrote is not sound. The model
+// is deliberately simpler than the language: where it is wrong, a sound
+// case is refused, which costs a case, or one that is not sound is
+// written, which is what the checker is for.
+
+import std::mem
+import std::random::{Random}
+
+/// What a generated variable holds.
+pub enum Kind {
+	Text
+	List
+	Maybe
+	Pair
+	Shape
+	Boxed
+	Node
+	/// A list of boxes.
+	Boxes
+	/// An owned closure, which owns what it captured.
+	Owner
+	/// A `Tracked`, whose end is written down.
+	Tag
+	/// A map of pairs by a text.
+	Table
+	/// A set of texts.
+	Names
+}
+
+val KINDS: [Kind; 12] = [
+	.Text,
+	.List,
+	.Maybe,
+	.Pair,
+	.Shape,
+	.Boxed,
+	.Node,
+	.Boxes,
+	.Owner,
+	.Tag,
+	.Table,
+	.Names,
+]
+
+extend Kind {
+	/// The type it is written as.
+	pub fn written(): str = match self {
+		.Text => "String"
+		.List => "Vec<String>"
+		.Maybe => "Option<String>"
+		.Pair => "Pair"
+		.Shape => "Shape"
+		.Boxed => "own<Node>"
+		.Node => "Node"
+		.Boxes => "Vec<own<Node>>"
+		.Owner => "own<() => i64>"
+		.Tag => "Tracked"
+		.Table => "Map<String, Pair>"
+		.Names => "Set<String>"
+	}
+
+	/// A value of it that needs nothing around it, its type written out where
+	/// it could be in question: what a variable's use is tried as when a
+	/// finding is made smaller.
+	pub fn plain(): str = match self {
+		.Text => "made(0)"
+		.List => "Vec<String>()"
+		.Maybe => "Option<String>::None"
+		.Pair => "Pair(a: made(0), b: Vec<String>(), tag: Tracked::of(0))"
+		.Shape => "Shape::Empty"
+		.Boxed => "own Node(name: made(0), next: .None, tag: Tracked::of(0))"
+		.Node => "Node(name: made(0), next: .None, tag: Tracked::of(0))"
+		.Boxes => "Vec<own<Node>>()"
+		.Owner => "own () => 0"
+		.Tag => "Tracked::of(0)"
+		.Table => "Map<String, Pair>()"
+		.Names => "Set<String>()"
+	}
+
+	/// How many of its fields are moved out alone: a pair's three, a node's
+	/// name and tag.
+	fn parts(): i64 = match self {
+		.Pair => 3
+		.Node => 2
+		_ => 0
+	}
+
+	/// Which of its parts is its tag, where it has one.
+	fn tagPart(): Option<i64> = match self {
+		.Pair => 2
+		.Node => 1
+		_ => .None
+	}
+}
+
+/// What the model says a variable, or a field moved alone, holds.
+enum State {
+	Live
+	Moved
+	Perhaps
+}
+
+fn merged(a: State, b: State): State = if a == b then a else .Perhaps
+
+@derive(Clone)
+struct Var {
+	name: String
+	kind: Kind
+	mutable: bool
+	state: State
+	/// Each field moved out alone, as `parts` counts them.
+	parts: Vec<State>
+	/// The numbers of the `Tracked` values it holds, its tag first; nothing
+	/// where the model cannot say.
+	held: Option<Vec<i64>>
+}
+
+extend Var {
+	/// Whether it holds all of its value.
+	fn whole(): bool = self.state == .Live && self.parts.all((part) => part == .Live)
+}
+
+/// How a view sees what it borrows.
+enum Sight {
+	/// `x.toStr()`, of a `String`.
+	Text
+	/// `&x`.
+	Lent
+	/// `firstOf(&x)`, of a list.
+	First
+	/// `Seen(pair: &x)`, of a pair.
+	Seen
+	/// `() => x.len()`, a closure that reads it.
+	Reader
+	/// `() => grown(&var x)`, a closure that writes it, which holds it from
+	/// where it is made to its last use: nothing else may read it between.
+	Writer
+	/// `x.get("k1")`, a pair a map lends.
+	Lookup
+}
+
+@derive(Clone)
+struct View {
+	name: String
+	sight: Sight
+	/// The variable it borrows, by its place in the model.
+	of: i64
+	/// Whether what it borrows was changed or moved since it was made.
+	stale: bool
+}
+
+@derive(Clone)
+struct Model {
+	vars: Vec<Var> = Vec()
+	views: Vec<View> = Vec()
+}
+
+/// A statement, a line or a block: a block's heads, each followed by its
+/// body, and the line that ends it.
+@derive(Clone)
+pub enum Stmt {
+	Line(text: String)
+	Block(heads: Vec<String>, bodies: Vec<Vec<Stmt>>, end: String)
+}
+
+pub struct Generator {
+	random: Random
+	/// How often a choice ignores the model.
+	risk: f64
+	model: Model = Model()
+	names: i64 = 0
+	depth: i64 = 0
+	/// The variables and views from before the innermost loop, which its
+	/// body uses as the model allows only where it moves nothing of them
+	/// and reads no view of them: a later turn would see what it did.
+	loopVars: i64 = 0
+	loopViews: i64 = 0
+	loops: i64 = 0
+	/// Variables a `for` walks, which its body must not change.
+	walked: Vec<i64> = Vec()
+	/// The variables from before the innermost arena, which its body never
+	/// writes, whatever the risk: what it would put in them is the arena's,
+	/// and outlives it, which the arena, not the checker, refuses as it is
+	/// reset.
+	sealed: i64 = 0
+	/// The places of the case where a `Tracked` is made, counted.
+	sites: i64 = 0
+	/// The blocks marked, counted.
+	blocks: i64 = 0
+	/// The numbers of the `Tracked` values the value being written holds, and
+	/// whether one of them is one the model cannot say.
+	collected: Vec<i64> = Vec()
+	unknown: bool = false
+	/// The labels of the loops around, innermost last, `break` takes.
+	labels: Vec<String> = Vec()
+	/// Whether the statements are a closure's, which has no `return` of
+	/// the case's.
+	inClosure: bool = false
+}
+
+extend Generator {
+	pub static fn new(seed: u64, risk: f64): Generator = Generator(
+		random: Random::seeded(seed),
+		risk:,
+	)
+
+	/// A case's body: what it declares, and then does, with what it has.
+	pub var fn case(): Vec<Stmt> = {
+		self.model = Model()
+		self.names = 0
+		self.depth = 0
+		self.loopVars = 0
+		self.loopViews = 0
+		self.loops = 0
+		self.walked = Vec()
+		self.sealed = 0
+		self.sites = 0
+		self.blocks = 0
+		self.labels = Vec()
+		self.inClosure = false
+		var body = self.body(10 + self.random.below(20))
+		// What the case worked out is said before its mark, which the ends
+		// of its variables must follow.
+		body.push(.Line("finished(sum)"))
+		self.marked(&var body, 0)
+		return body
+	}
+
+	/// A value of `kind` for a statement, and the numbers of the `Tracked`
+	/// values it holds, or nothing where the model cannot say.
+	var fn valued(kind: Kind): (String, Option<Vec<i64>>) = {
+		self.collected = Vec()
+		self.unknown = false
+		val text = self.value(kind, 0)
+		val held: Option<Vec<i64>> = if self.unknown then .None else self.collected.clone()
+		return (text, held)
+	}
+
+	/// What a value taken from the variable `index` brings, numbered as
+	/// `shift` says: its clone's are its own and 100000 more.
+	var fn bring(index: i64, shift: i64) = match self.model.vars[index].held.clone() {
+		.Some(ids) => {
+			for id in ids do
+				self.collected.push(id + shift)
+		}
+		.None => self.unknown = true
+	}
+
+	/// The mark at the end of `body`, a block whose variables are those from
+	/// `first` on: the `Tracked` values they hold, which must end as the block
+	/// does, newest first, a group each; `?` where the model cannot say what
+	/// one holds, or whether it holds it.
+	var fn marked(body: &var Vec<Stmt>, first: i64) = {
+		self.blocks += 1
+		var groups: Vec<String> = Vec()
+		var known = true
+		var index = self.model.vars.len() - 1
+		while index >= first {
+			val v = &self.model.vars[index]
+			index -= 1
+			if v.kind !is .Tag | .Pair | .Node | .Boxed | .Boxes | .Table || v.state == .Moved then
+				continue
+
+			if v.state == .Perhaps || v.parts.any((part) => part == .Perhaps) {
+				known = false
+				break
+			}
+			match v.held {
+				.Some(ids) => {
+					if !ids.isEmpty() then groups.push(ids.map((id) => id.toString()).join(","))
+				}
+				.None => {
+					known = false
+					break
+				}
+			}
+		}
+		val expected = if known then groups.join(" | ") else "?"
+		body.push(.Line("mark(\(self.blocks), \"\(expected)\")"))
+	}
+
+	var fn body(count: i64): Vec<Stmt> = {
+		var out: Vec<Stmt> = Vec()
+		for _ in 0..count do
+			self.statement(&var out)
+
+		return out
+	}
+
+	var fn chance(share: f64): bool = self.random.float() < share
+
+	var fn risky(): bool = self.chance(self.risk)
+
+	/// Whether the variable `index` may be given a new value, or one of its
+	/// own changed: a `var`, from inside the innermost arena.
+	fn writable(index: i64): bool = self.model.vars[index].mutable && index >= self.sealed
+
+	var fn fresh(prefix: str): String = {
+		self.names += 1
+		return "\(prefix)\(self.names)"
+	}
+
+	var fn kind(): Kind = KINDS[self.random.below(KINDS.len())]
+
+	/// One of `indices`, or nothing where there is none.
+	var fn one(indices: &[i64]): Option<i64> = {
+		if indices.isEmpty() then
+			return .None
+
+		return indices[self.random.below(indices.len())]
+	}
+
+	/// A variable of `kind` used whole: one the model says holds all of it,
+	/// and that `moving` it or `writing` it leaves sound; or, as often as
+	/// `risk` says, any of the kind, which the checker must judge.
+	var fn whole(kind: Kind, moving: bool, writing: bool): Option<i64> = {
+		val risky = self.risky()
+		var found: Vec<i64> = Vec()
+		for index in 0..self.model.vars.len() {
+			val v = &self.model.vars[index]
+			// A `val` written is a type's error, not the checker's.
+			if v.kind != kind || writing && !self.writable(index) then
+				continue
+
+			if !risky {
+				if !v.whole() || (moving || writing) && self.walked.contains(&index) then
+					continue
+
+				if moving && index < self.loopVars then
+					continue
+			}
+			found.push(index)
+		}
+		return self.chosen(&found)
+	}
+
+	/// A variable of `kind` whose field `part` is used alone.
+	var fn part(kind: Kind, part: i64, moving: bool): Option<i64> = {
+		val risky = self.risky()
+		var found: Vec<i64> = Vec()
+		for index in 0..self.model.vars.len() {
+			val v = &self.model.vars[index]
+			if v.kind != kind then
+				continue
+
+			if !risky {
+				if v.state != .Live || v.parts[part] != .Live then
+					continue
+
+				if moving && (index < self.loopVars || self.walked.contains(&index)) then
+					continue
+			}
+			found.push(index)
+		}
+		return self.chosen(&found)
+	}
+
+	/// One of `indices`, a variable about to be used, which a closure that
+	/// writes it may not be used after: it held the variable until then.
+	var fn chosen(indices: &[i64]): Option<i64> = {
+		val .Some(index) = self.one(&indices) else return .None
+		for at in 0..self.model.views.len() do
+			if self.model.views[at].of == index && self.model.views[at].sight == .Writer then
+				self.model.views[at].stale = true
+
+		return index
+	}
+
+	var fn name(index: i64): String = self.model.vars[index].name.clone()
+
+	var fn stale(index: i64) = {
+		for at in 0..self.model.views.len() do
+			if self.model.views[at].of == index then
+				self.model.views[at].stale = true
+	}
+
+	var fn moved(index: i64) = {
+		self.model.vars[index].state = .Moved
+		self.stale(index)
+	}
+
+	var fn movedPart(index: i64, part: i64) = {
+		self.model.vars[index].parts[part] = .Moved
+		self.stale(index)
+	}
+
+	var fn restored(index: i64) = {
+		self.model.vars[index].state = .Live
+		for part in 0..self.model.vars[index].parts.len() do
+			self.model.vars[index].parts[part] = .Live
+
+		self.stale(index)
+	}
+
+	/// A value of `kind`: taken from a variable, or made.
+	var fn value(kind: Kind, depth: i64): String = {
+		if depth < 2 && self.chance(0.45) {
+			if self.taken(kind) is .Some(text) then
+				return text
+		}
+		return self.made(kind, depth)
+	}
+
+	/// A value of `kind` taken from a variable: moved, cloned, moved out of
+	/// a field, or taken out of a list, an option or a box.
+	var fn taken(kind: Kind): Option<String> = {
+		val roll = self.random.below(5)
+		// Given to a generic function, and given back.
+		if roll == 3 {
+			val .Some(index) = self.whole(kind, true, false) else return .None
+			val name = self.name(index)
+			self.bring(index, 0)
+			self.moved(index)
+			return "back(\(name))"
+		}
+		if roll == 0 {
+			val .Some(index) = self.whole(kind, true, false) else return .None
+			val name = self.name(index)
+			self.bring(index, 0)
+			self.moved(index)
+			return name
+		}
+		if roll == 1 {
+			val .Some(index) = self.whole(kind, false, false) else return .None
+			self.bring(index, 100000)
+			// A method called on a box is what it holds', so its clone is
+			// boxed again.
+			if kind == .Boxed then
+				return "own \(self.name(index)).clone()"
+
+			// A closure has no clone.
+			if kind == .Owner then
+				return .None
+
+			return "\(self.name(index)).clone()"
+		}
+		return match kind {
+			.Text => match self.random.below(6) {
+				0 => self.movedOut(.Pair, 0, "a")
+				1 => self.movedOut(.Node, 0, "name")
+				2 => {
+					val .Some(index) = self.whole(.List, false, true) else return .None
+					self.stale(index)
+					"\(self.name(index)).pop().unwrapOr(made(\(self.random.below(9))))"
+				}
+				3 => {
+					val .Some(index) = self.whole(.Maybe, true, false) else return .None
+					self.moved(index)
+					"\(self.name(index)).unwrapOr(made(\(self.random.below(9))))"
+				}
+				// A pair taken apart by a method of its own.
+				4 => {
+					val .Some(index) = self.whole(.Pair, true, false) else return .None
+					self.moved(index)
+					"\(self.name(index)).joined()"
+				}
+				_ => {
+					val .Some(index) = self.whole(.Boxed, true, false) else return .None
+					self.moved(index)
+					"{\n\t\tval node = unbox(\(self.name(index)))\n\t\tnode.name\n\t}"
+				}
+			}
+			.List => {
+				if self.chance(0.5) then
+					return self.movedOut(.Pair, 1, "b")
+
+				val .Some(index) = self.whole(.List, false, true) else return .None
+				self.stale(index)
+				"emptied(&var \(self.name(index)))"
+			}
+			.Maybe => {
+				val .Some(index) = self.whole(.List, false, true) else return .None
+				self.stale(index)
+				"\(self.name(index)).pop()"
+			}
+			// Which box is taken the model does not say.
+			.Boxed => {
+				val .Some(index) = self.whole(.Boxes, false, true) else return .None
+				self.stale(index)
+				self.unknown = true
+				self.model.vars[index].held = .None
+				"\(self.name(index)).pop().unwrapOr(\(self.made(.Boxed, 1)))"
+			}
+			.Tag =>
+				if self.chance(0.5) then self.movedOut(.Pair, 2, "tag")
+				else self.movedOut(.Node, 1, "tag")
+			_ => .None
+		}
+	}
+
+	/// The field `field`, which is part `part` of a `kind`, moved out.
+	var fn movedOut(kind: Kind, part: i64, field: str): Option<String> = {
+		val .Some(index) = self.part(kind, part, true) else return .None
+		val name = self.name(index)
+		// A tag moved out is its first number, which the rest no longer holds.
+		if kind.tagPart() == part {
+			val held = self.model.vars[index].held.clone()
+			if held is .Some(ids) && !ids.isEmpty() {
+				self.collected.push(ids[0])
+				self.model.vars[index].held = ids[1..].toVec()
+			} else {
+				self.unknown = true
+				self.model.vars[index].held = .None
+			}
+		}
+		self.movedPart(index, part)
+		return "\(name).\(field)"
+	}
+
+	/// A value of `kind` made where it is written.
+	var fn made(kind: Kind, depth: i64): String = match kind {
+		.Text => "made(\(self.random.below(9)))"
+		.List => {
+			val count = self.random.below(3)
+			if count == 0 then
+				return "Vec<String>()"
+
+			var out = String::of("[")
+			for index in 0..count {
+				if index > 0 then
+					out.push(", ")
+
+				out.push(self.value(.Text, depth + 1))
+			}
+			out.push("]")
+			out
+		}
+		.Maybe => if self.chance(0.3) then ".None" else ".Some(\(self.value(.Text, depth + 1)))"
+		.Pair => {
+			val a = self.value(.Text, depth + 1)
+			val b = self.value(.List, depth + 1)
+			"Pair(a: \(a), b: \(b), tag: \(self.value(.Tag, depth + 1)))"
+		}
+		.Shape => match self.random.below(3) {
+			0 => ".Text(\(self.value(.Text, depth + 1)))"
+			1 => ".Many(\(self.value(.List, depth + 1)))"
+			_ => ".Empty"
+		}
+		.Boxed => {
+			val name = self.value(.Text, depth + 1)
+			"own Node(name: \(name), next: .None, tag: \(self.value(.Tag, depth + 1)))"
+		}
+		// The tag first, as the model keeps a node's numbers.
+		.Node => {
+			val name = self.value(.Text, depth + 1)
+			val tag = self.value(.Tag, depth + 1)
+			if self.chance(0.5) then
+				"Node(name: \(name), next: .None, tag: \(tag))"
+			else
+				"Node(name: \(name), next: .Some(\(self.value(.Boxed, depth + 1))), tag: \(tag))"
+		}
+		.Tag => {
+			self.sites += 1
+			self.collected.push(self.sites)
+			"Tracked::of(\(self.sites))"
+		}
+		.Table => "Map<String, Pair>()"
+		.Names => "Set<String>()"
+		.Boxes => {
+			val count = self.random.below(3)
+			if count == 0 then
+				return "Vec<own<Node>>()"
+
+			var out = String::of("[")
+			for index in 0..count {
+				if index > 0 then
+					out.push(", ")
+
+				out.push(self.value(.Boxed, depth + 1))
+			}
+			out.push("]")
+			out
+		}
+		// What it captures is moved into it.
+		.Owner => {
+			if depth < 2 && self.chance(0.6) {
+				val captured = if self.chance(0.5) then Kind::Text else Kind::List
+				if self.whole(captured, true, false) is .Some(index) {
+					val name = self.name(index)
+					self.moved(index)
+					return "own () => \(name).len()"
+				}
+			}
+			"own () => \(self.random.below(9))"
+		}
+	}
+
+	/// A new variable of `kind`, holding all of its value.
+	var fn declared(kind: Kind, mutable: bool, held: Option<Vec<i64>>): String = {
+		val name = self.fresh("v")
+		self.model.vars.push(Var(
+			name: name.clone(),
+			kind:,
+			mutable:,
+			state: .Live,
+			parts: [
+				for _ in 0..kind.parts() do
+					yield State::Live
+			],
+			held:,
+		))
+		return name
+	}
+
+	var fn line(out: &var Vec<Stmt>, text: String) = out.push(.Line(text))
+
+	/// One statement, of a kind chosen by weight.
+	var fn statement(out: &var Vec<Stmt>) = {
+		val nested = self.depth < 3
+		val roll = self.random.below(108)
+		if roll >= 100 && nested then
+			return match roll {
+				100 | 101 => self.whileLoop(&var out)
+				102 | 103 => self.walkEach(&var out)
+				104 | 105 => self.arena(&var out)
+				_ => self.counted(&var out)
+			}
+
+		if roll < 20 then
+			self.declare(&var out)
+		else if roll < 27 then
+			self.reassign(&var out)
+		else if roll < 31 then
+			self.assignPart(&var out)
+		else if roll < 40 then
+			self.consume(&var out)
+		else if roll < 50 then
+			self.read(&var out)
+		else if roll < 59 then
+			self.change(&var out)
+		else if roll < 66 then
+			self.makeView(&var out)
+		else if roll < 73 then
+			self.useView(&var out)
+		else if roll < 76 then
+			self.moveAndRestore(&var out)
+		else if roll < 78 then
+			self.destroyOne(&var out)
+		else if roll < 80 then
+			self.returnEarly(&var out)
+		else if roll < 82 && self.loops > 0 then
+			self.leaveLoop(&var out)
+		else if roll < 83 then
+			self.deferred(&var out)
+		else if !nested then
+			self.read(&var out)
+		else if roll < 88 then
+			self.branch(&var out)
+		else if roll < 92 then
+			self.counted(&var out)
+		else if roll < 94 then
+			self.walk(&var out)
+		else if roll < 96 then
+			self.walkMoving(&var out)
+		else if roll < 99 then
+			self.matchMoving(&var out)
+		else
+			self.block(&var out)
+	}
+
+	var fn declare(out: &var Vec<Stmt>) = {
+		val kind = self.kind()
+		// A closure is kept in a `val`.
+		val mutable = kind != .Owner && self.chance(0.75)
+		// The value first: what it is made from is not the new variable.
+		val (value, held) = self.valued(kind)
+		val name = self.declared(kind, mutable, held)
+		val keyword = if mutable then "var" else "val"
+		self.line(&var out, "\(keyword) \(name): \(kind.written()) = \(value)")
+	}
+
+	var fn reassign(out: &var Vec<Stmt>) = {
+		val kind = self.kind()
+		val found: Vec<i64> = [for index in 0..self.model.vars.len() {
+			val v = &self.model.vars[index]
+			if v.kind == kind &&
+				self.writable(index) &&
+				(self.risky() || !self.walked.contains(&index)) {
+				yield index
+			}
+		}]
+		val .Some(index) = self.one(&found) else return
+		val (value, held) = self.valued(kind)
+		self.line(&var out, "\(self.name(index)) = \(value)")
+		self.restored(index)
+		self.model.vars[index].held = held
+	}
+
+	var fn assignPart(out: &var Vec<Stmt>) = {
+		val (kind, part, field, of) = match self.random.below(5) {
+			0 => (Kind::Pair, 0, "a", Kind::Text)
+			1 => (Kind::Pair, 1, "b", Kind::List)
+			2 => (Kind::Pair, 2, "tag", Kind::Tag)
+			3 => (Kind::Node, 1, "tag", Kind::Tag)
+			_ => (Kind::Node, 0, "name", Kind::Text)
+		}
+		// The value first: it may move what holds the field, which then
+		// holds nothing to give a field to.
+		val (value, given) = self.valued(of)
+		val risky = self.risky()
+		val found: Vec<i64> = [for index in 0..self.model.vars.len() {
+			val v = &self.model.vars[index]
+			if v.kind == kind &&
+				self.writable(index) &&
+				(risky || v.state == .Live && !self.walked.contains(&index)) {
+				yield index
+			}
+		}]
+		val .Some(index) = self.chosen(&found) else return
+		self.line(&var out, "\(self.name(index)).\(field) = \(value)")
+		// A new tag is the first number of what it holds.
+		if of == .Tag {
+			// Where the tag is still there, the new one takes its place; where
+			// it was moved out, the rest is after it.
+			val wasLive = self.model.vars[index].parts[part] == .Live
+			val held = self.model.vars[index].held.clone()
+			self.model.vars[index].held = .None
+			if held is .Some(ids) && given is .Some(tag) && (!wasLive || !ids.isEmpty()) {
+				var now = tag.clone()
+				for at in (if wasLive then 1 else 0)..ids.len() do
+					now.push(ids[at])
+
+				self.model.vars[index].held = now
+			}
+		}
+		self.model.vars[index].parts[part] = .Live
+		self.stale(index)
+	}
+
+	var fn consume(out: &var Vec<Stmt>) = {
+		val text = match self.random.below(7) {
+			// Its type said, which a value written as `.None` does not say.
+			5 => {
+				val kind = self.kind()
+				"dropped<\(kind.written())>(\(self.value(kind, 0)))"
+			}
+			// Its `?` leaves with a field moved out, where the sum is odd.
+			6 => "sum += tagged(\(self.value(.Pair, 0)), sum % 2 == 0).unwrapOr(0)"
+			0 => "sum += taken(\(self.value(.Text, 0)))"
+			1 => "sum += summed(\(self.value(.Pair, 0)))"
+			2 => "sum += calledOnce(\(self.value(.Owner, 0)))"
+			3 => "sum += given(\(self.value(.Tag, 0)))"
+			_ => "sum += \(self.value(.List, 0)).len()"
+		}
+		self.line(&var out, text)
+	}
+
+	var fn read(out: &var Vec<Stmt>) = {
+		val kind = self.kind()
+		val text: String = match kind {
+			.Pair => match self.random.below(4) {
+				0 => {
+					val .Some(index) = self.part(.Pair, 0, false) else return
+					"sum += \(self.name(index)).a.len()"
+				}
+				2 => {
+					val .Some(index) = self.part(.Pair, 2, false) else return
+					"sum += \(self.name(index)).tag.id"
+				}
+				1 => {
+					val .Some(index) = self.part(.Pair, 1, false) else return
+					"sum += \(self.name(index)).b.len()"
+				}
+				_ => {
+					val .Some(index) = self.whole(.Pair, false, false) else return
+					"sum += first(&\(self.name(index))).len()"
+				}
+			}
+			.Node => {
+				if self.chance(0.3) {
+					val .Some(index) = self.part(.Node, 1, false) else return
+					"sum += \(self.name(index)).tag.id"
+				} else if self.chance(0.5) {
+					val .Some(index) = self.part(.Node, 0, false) else return
+					"sum += \(self.name(index)).name.len()"
+				} else {
+					val .Some(index) = self.whole(.Node, false, false) else return
+					"if \(self.name(index)).next is .Some(b) { sum += b.name.len() }"
+				}
+			}
+			_ => {
+				val .Some(index) = self.whole(kind, false, false) else return
+				val name = self.name(index)
+				// What a pattern binds of a value matched where it is is the
+				// value's, and is read; moving it out must be refused.
+				val use = if self.risky() then "sum += taken(s)" else "sum += s.len()"
+				match kind {
+					.Text =>
+						if self.chance(0.5) then "sum += size(&\(name))" else "sum += \(name).len()"
+					.List | .Boxes => "sum += \(name).len()"
+					.Maybe => "if \(name) is .Some(s) { \(use) }"
+					.Shape => {
+						if self.chance(0.5) then
+							return out.push(.Block(
+								heads: ["match \(name) {"],
+								bodies: [
+									[
+										.Line(".Text(s) => \(use)"),
+										.Line(".Many(l) => sum += l.len()"),
+										.Line(".Empty => {}"),
+									],
+								],
+								end: "}",
+							))
+
+						"if \(name) is .Text(s) { \(use) }"
+					}
+					.Owner => "sum += \(name)()"
+					.Tag => "sum += \(name).id"
+					.Table => {
+						if self.chance(0.5) then
+							return out.push(.Block(
+								heads: ["for entry in \(name) {"],
+								bodies: [[.Line("sum += entry.value.a.len()")]],
+								end: "}",
+							))
+
+						"if \(name).get(\"k\(self.random.below(self.sites + 1))\") is .Some(p) { sum += p.a.len() }"
+					}
+					.Names => "if \(name).contains(made(\(self.random.below(9)))) { sum += 1 }"
+					_ => "sum += \(name).name.len()"
+				}
+			}
+		}
+		self.line(&var out, text)
+	}
+
+	var fn change(out: &var Vec<Stmt>) = {
+		// A map is changed more often than its share, as most of what it does
+		// is put and taken out.
+		val kind = if self.chance(0.15) then Kind::Table else self.kind()
+		val text: String = match kind {
+			.Text => {
+				val .Some(index) = self.whole(.Text, false, true) else return
+				self.stale(index)
+				if self.chance(0.5) then
+					"grown(&var \(self.name(index)))"
+				else
+					"replaced(&var \(self.name(index)), \(self.random.below(9)))"
+			}
+			.List => {
+				val .Some(index) = self.whole(.List, false, true) else return
+				val value = self.value(.Text, 0)
+				self.stale(index)
+				if self.chance(0.2) then
+					"\(self.name(index)).clear()"
+				else
+					"\(self.name(index)).push(\(value))"
+			}
+			// The whole pair given a new value, or its first text, through a
+			// reference to it.
+			.Pair if self.chance(0.4) => {
+				val .Some(index) = self.whole(.Pair, false, true) else return
+				val name = self.name(index)
+				val cycled = self.chance(0.5)
+				val text =
+					if cycled then "cycled(&var \(name))"
+					else "\(name).refreshed(\(self.value(.Text, 0)))"
+				// What `cycled` puts in is the world's, numbered 0.
+				if cycled then
+					self.model.vars[index].held = Vec::of([0 as i64])
+
+				self.stale(index)
+				text
+			}
+			.Pair => {
+				val part = self.random.below(2)
+				val .Some(index) = self.part(.Pair, part, false) else return
+				if !self.writable(index) || self.walked.contains(&index) then
+					return
+
+				val name = self.name(index)
+				val text =
+					if part == 0 then "grown(&var \(name).a)"
+					else "\(name).b.push(\(self.value(.Text, 0)))"
+				self.stale(index)
+				text
+			}
+			.Node => {
+				val .Some(index) = self.whole(.Node, false, true) else return
+				val name = self.name(index)
+				if self.chance(0.5) {
+					self.stale(index)
+					"grown(&var \(name).name)"
+				} else {
+					// The node's tag, then what its new box holds.
+					val (boxed, given) = self.valued(.Boxed)
+					val held = self.model.vars[index].held.clone()
+					self.model.vars[index].held = .None
+					if held is .Some(ids) && given is .Some(next) && !ids.isEmpty() {
+						var now = Vec::of([ids[0]])
+						now.pushAll(&next)
+						self.model.vars[index].held = now
+					}
+					self.stale(index)
+					"\(name).next = .Some(\(boxed))"
+				}
+			}
+			.Boxed => {
+				val .Some(index) = self.whole(.Boxed, false, true) else return
+				self.stale(index)
+				"grown(&var \(self.name(index)).name)"
+			}
+			// A pair put under a key of its own, whose numbers the map holds
+			// then; or one taken out by a key that may hold none.
+			.Table => {
+				val .Some(index) = self.whole(.Table, false, true) else return
+				val name = self.name(index)
+				self.stale(index)
+				if self.chance(0.6) {
+					val (pair, given) = self.valued(.Pair)
+					self.sites += 1
+					val held = self.model.vars[index].held.clone()
+					self.model.vars[index].held = .None
+					if held is .Some(ids) && given is .Some(more) {
+						var now = ids.clone()
+						now.pushAll(&more)
+						self.model.vars[index].held = now
+					}
+					"\(name).put(\"k\(self.sites)\", \(pair))"
+				} else {
+					self.model.vars[index].held = .None
+					return out.push(.Block(
+						heads: [
+							"match \(name).remove(\"k\(self.random.below(self.sites + 1))\") {",
+						],
+						bodies: [[.Line(".Some(p) => sum += summed(p)"), .Line(".None => {}")]],
+						end: "}",
+					))
+				}
+			}
+			.Names => {
+				val .Some(index) = self.whole(.Names, false, true) else return
+				self.stale(index)
+				val word = if self.chance(0.6) then "add" else "remove"
+				"\(self.name(index)).\(word)(made(\(self.random.below(9))))"
+			}
+			.Boxes => {
+				val .Some(index) = self.whole(.Boxes, false, true) else return
+				val (value, given) = self.valued(.Boxed)
+				self.model.vars[index].held = match (self.model.vars[index].held.clone(), given) {
+					(.Some(ids), .Some(more)) => {
+						var held = ids
+						held.pushAll(&more)
+						held
+					}
+					_ => .None
+				}
+				self.stale(index)
+				"\(self.name(index)).push(\(value))"
+			}
+			_ => return
+		}
+		self.line(&var out, text)
+	}
+
+	var fn makeView(out: &var Vec<Stmt>) = {
+		val (kind, sight) = match self.random.below(8) {
+			6 => (Kind::Table, Sight::Lookup)
+			0 => (Kind::Text, Sight::Text)
+			1 => (Kind::Text, Sight::Lent)
+			2 => (Kind::Pair, Sight::Lent)
+			3 => (Kind::List, Sight::First)
+			4 => (Kind::Pair, Sight::Seen)
+			5 => (if self.chance(0.5) then Kind::Text else Kind::List, Sight::Writer)
+			_ => (if self.chance(0.5) then Kind::Text else Kind::List, Sight::Reader)
+		}
+		val writes = sight == .Writer
+		val .Some(index) = self.whole(kind, false, writes) else return
+		// A closure that writes holds the variable: the views of it before
+		// are not used while it is.
+		if writes then
+			self.stale(index)
+
+		val target = self.name(index)
+		val name = self.fresh("w")
+		val made = match sight {
+			.Text => "\(target).toStr()"
+			.Lent => "&\(target)"
+			.First => "firstOf(&\(target))"
+			.Seen => "Seen(pair: &\(target))"
+			.Reader => "() => \(target).len()"
+			.Writer =>
+				if kind == .Text then "() => grown(&var \(target))"
+				else "() => \(target).push(\"w\")"
+			.Lookup => "\(target).get(\"k\(self.random.below(self.sites + 1))\")"
+		}
+		self.line(&var out, "val \(name) = \(made)")
+		self.model.views.push(View(name:, sight:, of: index, stale: false))
+	}
+
+	/// Whether the view `index` may be used here: not one that writes a
+	/// variable an arena around has sealed.
+	fn callable(index: i64): bool = {
+		val view = &self.model.views[index]
+		return view.sight != .Writer || view.of >= self.sealed
+	}
+
+	var fn useView(out: &var Vec<Stmt>) = {
+		val risky = self.risky()
+		val found: Vec<i64> = [
+			for index in 0..self.model.views.len() {
+				if self.callable(index) &&
+					(risky || !self.model.views[index].stale && index >= self.loopViews) {
+					yield index
+				}
+			}
+		]
+
+		val .Some(index) = self.one(&found) else return
+		val view = self.model.views[index].clone()
+		val kind = self.model.vars[view.of].kind
+		val text = match view.sight {
+			.Text => "sum += \(view.name).len()"
+			.Lent =>
+				if kind == .Pair then "sum += \(view.name).a.len()" else "sum += \(view.name).len()"
+			.First => "if \(view.name) is .Some(s) { sum += s.len() }"
+			.Seen => "sum += \(view.name).pair.a.len()"
+			.Reader => "sum += \(view.name)()"
+			.Writer => "\(view.name)()"
+			.Lookup => "if \(view.name) is .Some(p) { sum += p.a.len() }"
+		}
+		// What it wrote leaves the other views of the variable stale.
+		if view.sight == .Writer {
+			for at in 0..self.model.views.len() do
+				if at != index && self.model.views[at].of == view.of then
+					self.model.views[at].stale = true
+		}
+		self.line(&var out, text)
+	}
+
+	/// A variable given away and given a new value at once, which a loop's
+	/// body may do to one from before it.
+	var fn moveAndRestore(out: &var Vec<Stmt>) = {
+		val kind = self.kind()
+		val found: Vec<i64> = [for index in 0..self.model.vars.len() {
+			val v = &self.model.vars[index]
+			if v.kind == kind &&
+				self.writable(index) &&
+				v.whole() &&
+				!self.walked.contains(&index) {
+				yield index
+			}
+		}]
+		val .Some(index) = self.one(&found) else return
+		val name = self.name(index)
+		self.line(&var out, if kind == .Text then "sum += taken(\(name))" else "destroy(\(name))")
+		self.moved(index)
+		val (value, held) = self.valued(kind)
+		self.line(&var out, "\(name) = \(value)")
+		self.restored(index)
+		self.model.vars[index].held = held
+	}
+
+	var fn destroyOne(out: &var Vec<Stmt>) = {
+		val .Some(index) = self.whole(self.kind(), true, false) else return
+		self.line(&var out, "destroy(\(self.name(index)))")
+		self.moved(index)
+	}
+
+	/// A `return` taken on some runs, which ends every value then held.
+	var fn returnEarly(out: &var Vec<Stmt>) = {
+		// A closure's `return` is its own, and answers what it answers.
+		if self.inClosure then
+			return
+
+		out.push(.Block(
+			heads: ["if sum % 5 == \(self.random.below(5)) {"],
+			bodies: [[.Line("return")]],
+			end: "}",
+		))
+	}
+
+	var fn leaveLoop(out: &var Vec<Stmt>) = {
+		var word: String = if self.chance(0.5) then "break" else "continue"
+		// Out of a loop further out, by its label.
+		if !self.labels.isEmpty() && self.chance(0.6) then
+			word = "break \(self.labels[self.random.below(self.labels.len())])"
+
+		out.push(.Block(
+			heads: ["if sum % 3 == \(self.random.below(3)) {"],
+			bodies: [[.Line(word)]],
+			end: "}",
+		))
+	}
+
+	var fn deferred(out: &var Vec<Stmt>) = {
+		// Reading a variable when the block ends, which the checker must
+		// hold it alive for.
+		if self.risky() {
+			if self.whole(.Text, false, false) is .Some(index) {
+				self.line(&var out, "defer sum += \(self.name(index)).len()")
+				return
+			}
+		}
+		// A value given away when the block ends: the model says it perhaps
+		// holds it from here, so nothing moves it, and its end is the
+		// block's to say.
+		if self.chance(0.4) {
+			if self.whole(.Text, true, false) is .Some(index) {
+				self.line(&var out, "defer sum += taken(\(self.name(index)))")
+				self.model.vars[index].state = .Perhaps
+				return
+			}
+		}
+		self.line(&var out, "defer sum += 1")
+	}
+
+	/// A body in a block of its own: what it declares ends with it.
+	var fn scoped(count: i64): Vec<Stmt> = {
+		val vars = self.model.vars.len()
+		val views = self.model.views.len()
+		self.depth += 1
+		var body = self.body(count)
+		self.marked(&var body, vars)
+		self.depth -= 1
+		self.model.vars.truncate(vars)
+		self.model.views.truncate(views)
+		return body
+	}
+
+	/// The model after one of two ways: each variable holds what both say,
+	/// or perhaps holds it, and a view stale in either is stale.
+	var fn joined(first: &Model) = {
+		for index in 0..self.model.vars.len() {
+			val other = &first.vars[index]
+			self.model.vars[index].state = merged(self.model.vars[index].state, other.state)
+			if self.model.vars[index].held != other.held then
+				self.model.vars[index].held = .None
+
+			for part in 0..other.parts.len() do
+				self.model.vars[index].parts[part] = merged(
+					self.model.vars[index].parts[part],
+					other.parts[part],
+				)
+		}
+		for index in 0..self.model.views.len() do
+			if first.views[index].stale then
+				self.model.views[index].stale = true
+	}
+
+	var fn branch(out: &var Vec<Stmt>) = {
+		val before = self.model.clone()
+		val yes = self.scoped(1 + self.random.below(4))
+		if self.chance(0.4) {
+			self.joined(&before)
+			out.push(.Block(heads: ["if sum % 2 == 0 {"], bodies: [yes], end: "}"))
+			return
+		}
+		val after = self.model.clone()
+		self.model = before
+		val no = self.scoped(1 + self.random.below(4))
+		self.joined(&after)
+		out.push(.Block(heads: ["if sum % 2 == 0 {", "} else {"], bodies: [yes, no], end: "}"))
+	}
+
+	/// A loop's body, run none or several times: what it does to the
+	/// variables before it is judged against what they held before it.
+	/// `bound`, where the loop binds an element: its name, its kind, whether
+	/// it is the list's, walked where it is, and whether the body's first line
+	/// gives it away.
+	var fn looped(count: i64, bound: Option<(String, Kind, bool, bool)>): Vec<Stmt> = {
+		val before = self.model.clone()
+		val (vars, views) = (self.loopVars, self.loopViews)
+		self.loopVars = self.model.vars.len()
+		self.loopViews = self.model.views.len()
+		self.loops += 1
+		self.depth += 1
+		if bound is .Some((name, kind, lent, given)) {
+			// An element walked where it is is the list's, and is read.
+			if lent then
+				self.walked.push(self.model.vars.len())
+
+			self.model.vars.push(Var(
+				name: name.clone(),
+				kind:,
+				mutable: false,
+				state: if given then .Moved else .Live,
+				parts: Vec(),
+				held: Vec(),
+			))
+		}
+		var body = self.body(count)
+		self.marked(&var body, self.loopVars)
+		if bound is .Some((_, _, lent, _)) && lent then
+			self.walked.pop()
+
+		self.depth -= 1
+		self.loops -= 1
+		self.model.vars.truncate(self.loopVars)
+		self.model.views.truncate(self.loopViews)
+		self.loopVars = vars
+		self.loopViews = views
+		self.joined(&before)
+		return body
+	}
+
+	var fn counted(out: &var Vec<Stmt>) = {
+		val turns = self.random.below(4)
+		// A loop with a label, which a loop inside may break out of.
+		val label = if self.chance(0.4) then self.fresh("outer") else String()
+		if !label.isEmpty() then
+			self.labels.push(label.clone())
+
+		val body = self.looped(1 + self.random.below(4), .None)
+		if !label.isEmpty() then
+			self.labels.pop()
+
+		val head =
+			if label.isEmpty() then "for i in 0..\(turns) {" else "\(label): for i in 0..\(turns) {"
+		out.push(.Block(heads: [head], bodies: [body], end: "}"))
+	}
+
+	/// A `while` loop, its counter stepped first, so that a `continue` steps
+	/// it too.
+	var fn whileLoop(out: &var Vec<Stmt>) = {
+		val counter = self.fresh("turns")
+		self.line(&var out, "var \(counter) = 0")
+		var body = self.looped(self.random.below(4), .None)
+		body.insert(0, .Line("\(counter) += 1"))
+		out.push(.Block(
+			heads: ["while \(counter) < \(self.random.below(4)) {"],
+			bodies: [body],
+			end: "}",
+		))
+	}
+
+	/// A list walked by a generator, which lends each element, its view kept
+	/// across each `yield`: the list must stay as it is while it is walked.
+	var fn walkEach(out: &var Vec<Stmt>) = {
+		val .Some(index) = self.whole(.List, false, false) else return
+		val name = self.fresh("x")
+		self.walked.push(index)
+		var body = self.looped(self.random.below(3), (name.clone(), Kind::Text, true, false))
+		self.walked.pop()
+		body.insert(0, .Line("sum += \(name).len()"))
+		out.push(.Block(
+			heads: ["for \(name) in each(&\(self.name(index))) {"],
+			bodies: [body],
+			end: "}",
+		))
+	}
+
+	/// A body under an arena, as a closure `mem::using` runs: what it makes
+	/// is the arena's, and ends before the arena is reset. Nothing from
+	/// outside is moved or changed in it but the sum, which it may write,
+	/// and it has no `return`, `break` or `continue` of the case's.
+	var fn arena(out: &var Vec<Stmt>) = {
+		val name = self.fresh("arena")
+		self.line(&var out, "var \(name) = Arena::of(65536)")
+		val (vars, views, loops, closure) = (
+			self.loopVars,
+			self.loopViews,
+			self.loops,
+			self.inClosure,
+		)
+		val sealed = self.sealed
+		val walked = self.walked.len()
+		for index in 0..self.model.vars.len() do
+			self.walked.push(index)
+
+		self.loopVars = self.model.vars.len()
+		self.loopViews = self.model.views.len()
+		self.loops = 0
+		self.inClosure = true
+		self.sealed = self.model.vars.len()
+		val labels = mem::replace(&var self.labels, Vec())
+		var body = self.scoped(1 + self.random.below(4))
+		body.push(.Line("return 0"))
+		self.labels = labels
+		self.inClosure = closure
+		self.sealed = sealed
+		self.loops = loops
+		self.loopVars = vars
+		self.loopViews = views
+		self.walked.truncate(walked)
+		out.push(.Block(
+			heads: ["sum += mem::using(&var \(name), () => {"],
+			bodies: [body],
+			end: "})",
+		))
+		self.line(&var out, "\(name).reset()")
+	}
+
+	/// A list walked, its elements looked at where they are.
+	var fn walk(out: &var Vec<Stmt>) = {
+		val .Some(index) = self.whole(.List, false, false) else return
+		// A walk of a `var` lends it to be written through its elements, so
+		// a second walk of it inside the first is refused.
+		if self.walked.contains(&index) && !self.risky() then
+			return
+
+		// A walk of a `var` lends it to be written through its elements: a
+		// view of it kept from before is stale.
+		if self.model.vars[index].mutable then
+			self.stale(index)
+
+		val name = self.fresh("x")
+		self.walked.push(index)
+		var body = self.looped(self.random.below(3), (name.clone(), Kind::Text, true, false))
+		self.walked.pop()
+		body.insert(0, .Line("sum += \(name).len()"))
+		out.push(.Block(heads: ["for \(name) in \(self.name(index)) {"], bodies: [body], end: "}"))
+	}
+
+	/// A list walked and taken apart, each element the body's.
+	var fn walkMoving(out: &var Vec<Stmt>) = {
+		val .Some(index) = self.whole(.List, true, false) else return
+		val list = self.name(index)
+		self.moved(index)
+		val name = self.fresh("x")
+		val given = self.chance(0.5)
+		var body = self.looped(self.random.below(3), (name.clone(), Kind::Text, false, given))
+		body.insert(0, .Line(if given then "sum += taken(\(name))" else "sum += \(name).len()"))
+		out.push(.Block(heads: ["for \(name) in move \(list) {"], bodies: [body], end: "}"))
+	}
+
+	/// An arm's body, with what its pattern binds.
+	var fn arm(binds: Option<(String, Kind)>): Vec<Stmt> = {
+		val vars = self.model.vars.len()
+		if binds is .Some((name, kind)) then
+			self.model.vars.push(Var(
+				name: name.clone(),
+				kind:,
+				mutable: false,
+				state: .Live,
+				parts: Vec(),
+				held: Vec(),
+			))
+
+		val body = self.scoped(self.random.below(3))
+		self.model.vars.truncate(vars)
+		return body
+	}
+
+	/// A shape or an option taken apart by `match move`, each arm a way.
+	var fn matchMoving(out: &var Vec<Stmt>) = {
+		val shape = self.chance(0.5)
+		val kind = if shape then Kind::Shape else Kind::Maybe
+		val .Some(index) = self.whole(kind, true, false) else return
+		val name = self.name(index)
+		self.moved(index)
+		val text = self.fresh("t")
+		val list = self.fresh("l")
+		val arms: Vec<(String, Option<(String, Kind)>)> =
+			if shape then
+				[
+					(".Text(\(text)) => {", (text, Kind::Text)),
+					(".Many(\(list)) => {", (list, Kind::List)),
+					(".Empty => {", .None),
+				]
+			else [(".Some(\(text)) => {", (text, Kind::Text)), (".None => {", .None)]
+		val before = self.model.clone()
+		var after: Option<Model> = .None
+		var blocks: Vec<Stmt> = Vec()
+		for (head, binds) in arms {
+			self.model = before.clone()
+			val body = self.arm(binds.clone())
+			match after {
+				.Some(other) => self.joined(&other)
+				.None => {}
+			}
+			after = self.model.clone()
+			blocks.push(.Block(heads: [head.clone()], bodies: [body], end: "}"))
+		}
+		out.push(.Block(heads: ["match move \(name) {"], bodies: [blocks], end: "}"))
+	}
+
+	var fn block(out: &var Vec<Stmt>) = {
+		val body = self.scoped(1 + self.random.below(4))
+		out.push(.Block(heads: ["{"], bodies: [body], end: "}"))
+	}
+}
+
+/// The test `name`, whose body is `body`, as its file holds it.
+pub fn rendered(name: str, body: &[Stmt]): String = {
+	var out = String::of("@test\nfn \(name)() = {\n\tvar sum = limited()\n")
+	written(&body, 1, &var out)
+	out.push("\tassert(sum >= 0)\n}\n")
+	return out
+}
+
+fn written(body: &[Stmt], depth: i64, out: &var String) = {
+	val indent = "\t".repeat(depth)
+	for stmt in body {
+		match stmt {
+			.Line(text) => out.push("\(indent)\(text)\n")
+			.Block(heads, bodies, end) => {
+				for index in 0..heads.len() {
+					out.push("\(indent)\(heads[index])\n")
+					written(&bodies[index], depth + 1, &var out)
+				}
+				out.push("\(indent)\(end)\n")
+			}
+		}
+	}
+}
+
+/// How many statements `body` holds, at every depth.
+pub fn counted(body: &[Stmt]): i64 = {
+	var count = 0
+	for stmt in body {
+		count += 1
+		if stmt is .Block(bodies, ..) {
+			for inner in bodies do
+				count += counted(&inner)
+		}
+	}
+	return count
+}
+
+/// `body` without the statement `skip` of its walk in order, the first 0,
+/// and what that statement holds.
+pub fn without(body: &[Stmt], skip: i64): Vec<Stmt> = {
+	var at = 0
+	return dropped(&body, skip, &var at)
+}
+
+fn dropped(body: &[Stmt], skip: i64, at: &var i64): Vec<Stmt> = {
+	var out: Vec<Stmt> = Vec()
+	for stmt in body {
+		val here = at
+		at += 1
+		match stmt {
+			.Line(text) => { if here != skip then out.push(.Line(text.clone())) }
+			.Block(heads, bodies, end) => {
+				val inner: Vec<Vec<Stmt>> = [
+					for body in bodies do
+						yield dropped(&body, skip, &var at)
+				]
+				if here != skip then
+					out.push(.Block(heads: heads.clone(), bodies: inner, end: end.clone()))
+			}
+		}
+	}
+	return out
+}

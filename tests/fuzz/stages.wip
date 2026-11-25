@@ -1,0 +1,247 @@
+// What `--mutate` does with a change past checking it: the program built
+// with the address sanitizer and run, where the checker accepted it; and
+// the changed file formatted, accepted or not. Each is a stage, and a
+// failure at one is a finding of that stage, made smaller by trying the
+// stage again.
+
+import std::fs
+import std::path
+import std::process::{Command}
+import std::time
+import std::time::{Duration, Instant}
+
+/// The seconds of a processor a program built from a change has, and the
+/// seconds it may take whatever it does: a loop that a change made endless
+/// is ended, and so is a wait for what never comes.
+val RUN_SECONDS: i64 = 5
+val RUN_WALL_SECONDS: i64 = 15
+
+/// What a run of a program is checked with: its leaks are its own, and a
+/// report of the sanitizer's is its own exit code.
+val RUN_SANITIZER = "detect_leaks=0:detect_stack_use_after_return=1:exitcode=86"
+
+/// What a program's source says that makes its memory its own to get wrong,
+/// or its run another's to wait on: such a program is built, and not run.
+val UNRUN: [str; 7] = [
+	"extern \"C\"",
+	"ptr<",
+	"std::c",
+	"@export",
+	"std::net",
+	"std::process",
+	"@app",
+]
+
+/// What the sanitizer may report of a program that is only what Wip lets it
+/// be: it recursed too deeply, or asked for more memory than there is.
+val ALLOWED_REPORTS: [str; 4] = [
+	"stack-overflow",
+	"allocation-size-too-big",
+	"requested allocation size",
+	"out of memory",
+]
+
+/// A stage a change goes through.
+pub enum Stage {
+	Checked
+	Ran
+	Formatted
+	Asked
+}
+
+extend Stage {
+	/// The stage, as a finding's directory is named by it.
+	fn named(): str = match self {
+		.Checked => "checked"
+		.Ran => "ran"
+		.Formatted => "formatted"
+		.Asked => "asked"
+	}
+}
+
+/// A failure of a stage: what kind, for keeping the same one while it is
+/// made smaller, and what was said.
+pub struct Fault {
+	stage: Stage
+	kind: String
+	said: String
+}
+
+/// Whether `program` is one a change of is run, as well as built.
+fn runnable(program: &Program): bool = {
+	for (_, text) in program.sources {
+		for word in UNRUN do
+			if text.contains(word) then
+				return false
+	}
+
+	return true
+}
+
+/// The program at `entry` built by `wip` with the address sanitizer and
+/// run, given nothing, for as long as it may: how that failed, where it
+/// did in a way a program of Wip cannot.
+fn ran(wip: str, entry: str): Option<(String, String)> = {
+	val dir = path::parent(entry)
+	val exe = path::join(dir, "mutant")
+	val built = Command::of("/bin/sh").arg("-c")
+		.arg("ulimit -t \(CHECK_SECONDS); exec \"$0\" build --color never --threads 1 --sanitize address \"$1\" -o \"$2\"")
+		.arg(wip)
+		.arg(entry)
+		.arg(exe)
+		.output()
+	val output = match move built {
+		.Ok(output) => output
+		.Err(error) => return ("not built", "\(error)")
+	}
+	val said = "\(output.stdout)\(output.stderr)"
+	match output.exit {
+		.Code(0) => {}
+		// A build that refuses with an error's code is a refusal still: what
+		// only a build works out, a constant's code among it.
+		.Code(1) if codeOf(said).isSome() => return .None
+		.Code(101) => return ("the build of an accepted change panics: \(panicOf(said))", said)
+		.Signal(signal) if signal == OUT_OF_TIME => return .None
+		ended => return ("the build of an accepted change \(ended)", said)
+	}
+	val log = path::join(dir, "mutant.log")
+	// Run through a shell that limits its processor time, and with its
+	// output in a file, so that it may be waited for no longer than it may
+	// take, and ended.
+	val started = Command::of("/bin/sh").arg("-c")
+		.arg("ulimit -t \(RUN_SECONDS); exec ./mutant > mutant.log 2>&1 < /dev/null")
+		.env("ASAN_OPTIONS", RUN_SANITIZER)
+		.directory(dir)
+		.start()
+	var child = match move started {
+		.Ok(child) => child
+		.Err(error) => return ("not run", "\(error)")
+	}
+	val deadline = Instant::now().after(Duration::seconds(RUN_WALL_SECONDS))
+	var exit = child.tryWait()
+	while exit.isNone() && Instant::now() < deadline {
+		time::sleep(Duration::millis(20))
+		exit = child.tryWait()
+	}
+	val .Some(ended) = exit else {
+		child.kill()
+		child.wait()
+		return .None
+	}
+	val printed = fs::readFile(log).unwrapOr(String())
+	if printed.indexOf("ERROR: AddressSanitizer: ") is .Some(at) {
+		val report = firstLine(printed[at + 25..printed.len()])
+		for allowed in ALLOWED_REPORTS do
+			if report.contains(allowed) then
+				return .None
+
+		val what = report.splitOnce(" ").map((parts) => parts.0).unwrapOr(report)
+		return ("an accepted change reads or writes what it does not own: \(what)", printed)
+	}
+	return match ended {
+		// Its own ends: a panic, an exit, its time run out, an abort a
+		// panic of the runtime's is.
+		.Code(_) => .None
+		.Signal(signal) if signal == OUT_OF_TIME || signal == 6 || signal == 9 => .None
+		.Signal(signal) => ("an accepted change ends by signal \(signal)", printed)
+	}
+}
+
+/// `text`, the file `path` with a change in it, formatted, and its output
+/// formatted again: how that failed, where it did. The formatter may refuse
+/// what does not parse, and must not panic; what it writes must be what it
+/// writes again, and hold every token the text held, but for what its own
+/// layout writes otherwise: commas and semicolons, and the braces of a body
+/// of one statement, which it writes after `then` or `do`.
+fn formatted(wip: str, path: str, text: str): Option<(String, String)> = {
+	val once = match formattedOnce(wip, path, text) {
+		.Ok(once) => once
+		.Err(fault) => return fault
+	}
+	val .Some(first) = move once else return .None
+	val twice = match formattedOnce(wip, path, first) {
+		.Ok(twice) => twice
+		.Err(fault) => return fault
+	}
+	val .Some(second) = move twice else return ("the formatter refuses what it wrote", first)
+	if second != first then
+		return (
+			"the formatter's text, formatted again, changes",
+			"once:\n\(first)\ntwice:\n\(second)",
+		)
+
+	val before = solidTexts(text)
+	val after = solidTexts(first)
+	if before != after {
+		var at = 0
+		while at < before.len() && at < after.len() && before[at] == after[at] do
+			at += 1
+
+		val was = if at < before.len() then before[at].clone() else "the end"
+		val now = if at < after.len() then after[at].clone() else "the end"
+		return ("the formatter changes a token", "`\(was)` is written `\(now)`:\n\(first)")
+	}
+	return .None
+}
+
+/// `text` formatted as the file `path`: what it writes, nothing where it
+/// refuses what does not parse, or how it failed.
+fn formattedOnce(
+	wip: str,
+	path: str,
+	text: str,
+): Result<Option<String>, Option<(String, String)>> = {
+	val ran = Command::of("/bin/sh").arg("-c")
+		.arg("ulimit -t \(CHECK_SECONDS); exec \"$0\" fmt --color never --stdin-path \"$1\" -")
+		.arg(wip)
+		.arg(path)
+		.input(text)
+		.output()
+	val output = match move ran {
+		.Ok(output) => output
+		.Err(error) => return .Err(("the formatter is not run", "\(error)"))
+	}
+	return match output.exit {
+		.Code(0) => .Ok(output.stdout)
+		.Code(1) => .Ok(.None)
+		.Code(101) => .Err(("the formatter panics: \(panicOf(&output.stderr))", output.stderr))
+		.Signal(signal) if signal == OUT_OF_TIME => .Err(
+			("the formatter did not end in its time", String()),
+		)
+		ended => .Err(("the formatter \(ended)", "\(output.stdout)\(output.stderr)"))
+	}
+}
+
+/// What the formatter writes as its layout says, which a token of the text
+/// may become or be left out for.
+val LAID_OUT: [str; 6] = [",", ";", "{", "}", "then", "do"]
+
+/// The tokens of `text` that are not space, a comment or what the
+/// formatter lays out.
+fn solidTexts(text: str): Vec<String> = [for token in tokens(text) {
+	if token.class == .Blank || LAID_OUT.contains(token.text.toStr()) then
+		continue
+
+	// `>=` after a type's arguments is `>` and `=`, which the formatter
+	// writes apart: `Maybe<i64>= x` is `Maybe<i64> = x`.
+	if token.text == ">=" {
+		yield ">"
+		yield "="
+	} else
+		yield indentless(&token.text)
+}]
+
+/// A text block's lines with what indents each set aside: the formatter
+/// indents a block as deeply as where it is, and what it holds is measured
+/// from its closing quotes, so its indentation is the layout's. Any other
+/// token, as it is.
+fn indentless(text: &String): String = {
+	if !text.startsWith("\"\"\"") then
+		return text.clone()
+
+	val lines: Vec<str> = [
+		for line in text.lines() do
+			yield line.trimStart()
+	]
+	return lines.join("\n")
+}

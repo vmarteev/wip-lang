@@ -5,7 +5,7 @@
 # here are the checkout's own. Every script that builds the compiler builds
 # it here, so that each is the same build.
 #
-#   scripts/build.sh [--release] [--with WIP] [--out DIR]
+#   scripts/build.sh [--release] [--sanitize SANITIZER] [--with WIP] [--out DIR]
 #
 # `--with` names the `wip` that builds it: a `wip` installed, or one built
 # before. Where none is named it is the one `scripts/bootstrap.sh` builds
@@ -13,7 +13,8 @@
 # the seed is newer than it: a `wip` older than the source may not compile
 # it, and the seed's always does. `--out` is where the directory goes,
 # `$WIP_TARGET_DIR/wip` where none is named, `$WIP_TARGET_DIR` being
-# `target` unless it says otherwise.
+# `target` unless it says otherwise. `--sanitize` builds it with a
+# sanitizer, as `wip build` takes one: what `scripts/sanitized.sh` runs.
 #
 # Before the build it writes the commit checked out and its day to
 # `compiler/lang/commit.txt`, which git ignores and the compiler embeds, so
@@ -24,11 +25,16 @@ cd "$(dirname "$0")/.."
 
 target=${WIP_TARGET_DIR:-target}
 release=""
+sanitize=()
 with=""
 out=$target/wip
 while [ $# -gt 0 ]; do
     case $1 in
     --release) release=--release ;;
+    --sanitize)
+        sanitize=(--sanitize "$2")
+        shift
+        ;;
     --with)
         with=$2
         shift
@@ -38,7 +44,7 @@ while [ $# -gt 0 ]; do
         shift
         ;;
     *)
-        echo "usage: scripts/build.sh [--release] [--with WIP] [--out DIR]" >&2
+        echo "usage: scripts/build.sh [--release] [--sanitize SANITIZER] [--with WIP] [--out DIR]" >&2
         exit 2
         ;;
     esac
@@ -74,4 +80,4 @@ done
 
 # The compiler that builds it is told that its library is the checkout's,
 # which the source is written against, rather than its own.
-WIP_HOME="$PWD" "$with" build $release compiler/main.wip -o "$out/bin/wip"
+WIP_HOME="$PWD" "$with" build $release ${sanitize[@]+"${sanitize[@]}"} compiler/main.wip -o "$out/bin/wip"

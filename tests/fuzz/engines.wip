@@ -1,0 +1,587 @@
+// The fuzzer's third mode, `--engines`: functions of numbers written by the
+// thousand, each worked out three ways — by the evaluator, in a `@comptime`
+// constant, while the program is compiled; when the program runs, given
+// inputs the compiler cannot see; and when it runs, given the same inputs
+// written where it is called, which a release build's optimizer may work
+// out itself — in a debug build and in a release one. All must answer the
+// same, a `NaN` as any other; where the evaluator panics, the program must
+// panic too, and say the same. A case the checker refuses was the
+// generator's mistake, and is counted and left out.
+
+import std::collections::{Map}
+import std::fs
+import std::mem
+import std::path
+import std::process::{Command}
+import std::random::{Random}
+
+/// A number type a case works in.
+enum Num {
+	I8
+	I16
+	I32
+	I64
+	U8
+	U16
+	U32
+	U64
+	F64
+}
+
+val NUMS: [Num; 9] = [.I8, .I16, .I32, .I64, .U8, .U16, .U32, .U64, .F64]
+
+extend Num {
+	/// The type it is written as.
+	fn written(): str = match self {
+		.I8 => "i8"
+		.I16 => "i16"
+		.I32 => "i32"
+		.I64 => "i64"
+		.U8 => "u8"
+		.U16 => "u16"
+		.U32 => "u32"
+		.U64 => "u64"
+		.F64 => "f64"
+	}
+
+	fn isSigned(): bool = self is .I8 | .I16 | .I32 | .I64
+}
+
+/// What each case is given, written as its call writes it.
+val AS: [str; 11] = [
+	"0",
+	"1",
+	"-1",
+	"7",
+	"-128",
+	"255",
+	"65536",
+	"i64::MAX",
+	"i64::MIN",
+	"4294967296",
+	"-9",
+]
+val BS: [str; 7] = ["0", "1", "255", "4294967295", "u64::MAX", "18446744073709551614", "12345"]
+val CS: [str; 10] = [
+	"0.0",
+	"-0.0",
+	"1.5",
+	"-2.5",
+	"f64::NAN",
+	"f64::INFINITY",
+	"1e300",
+	"5e-324",
+	"0.1",
+	"-1e10",
+]
+val DS: [str; 6] = ["0", "1", "7", "8", "200", "255"]
+
+/// The operators of two numbers of one type, beside `<<` and `>>`.
+val ARITHMETIC: [str; 11] = ["+", "-", "*", "/", "%", "+%", "-%", "*%", "&", "|", "^"]
+val FLOATING: [str; 4] = ["+", "-", "*", "/"]
+val COMPARED: [str; 6] = ["<", "<=", "==", "!=", ">", ">="]
+
+/// A case: its number, its type, its body, and what it is given.
+@derive(Clone)
+pub struct EngineCase {
+	index: i64
+	ty: Num
+	body: String
+	inputs: Vec<String>
+}
+
+/// What writes the cases: a random source, which the seed decides.
+struct Writer {
+	random: Random
+}
+
+extend Writer {
+	var fn below(count: i64): i64 = self.random.below(count)
+
+	var fn one(words: &[str]): str = words[self.random.below(words.len())]
+
+	var fn integer(): Num = NUMS[self.random.below(8)]
+
+	var fn number(): Num = NUMS[self.random.below(9)]
+
+	/// The case numbered `index`.
+	var fn case(index: i64): EngineCase = {
+		val ty = self.number()
+		// An operation at the top: a case of a constant alone says nothing.
+		val body = if ty == .F64 then self.float(3) else self.int(ty, 3)
+		val inputs: Vec<String> = [self.one(&AS), self.one(&BS), self.one(&CS), self.one(&DS)]
+		return EngineCase(index:, ty:, body:, inputs:)
+	}
+
+	/// An expression of type `ty`, nested `depth` deep at most.
+	var fn expr(ty: Num, depth: i64): String = {
+		if depth <= 0 || self.below(4) == 0 then
+			return self.leaf(ty)
+
+		return if ty == .F64 then self.float(depth - 1) else self.int(ty, depth - 1)
+	}
+
+	/// A value of `ty` that holds nothing else: a parameter, a constant, a
+	/// literal.
+	var fn leaf(ty: Num): String = {
+		val t = ty.written()
+		if ty == .F64 then
+			return match self.below(5) {
+				0 | 1 => "c"
+				2 => "f64::\(self.one(["MAX", "MIN", "INFINITY", "NAN", "EPSILON"]))"
+				3 =>
+					"(\(self.one(["0.0", "-0.0", "1.0", "-1.5", "0.1", "2.5", "1e308", "5e-324", "-7.25", "3.0"])))"
+				_ => "(\(self.one(["a", "b", "d"])) as f64)"
+			}
+
+		return match self.below(7) {
+			0 => "\(t)::MAX"
+			1 => "\(t)::MIN"
+			2 => "(\(self.one(["0", "1", "2", "3", "7", "8", "63", "64", "100"])) as \(t))"
+			3 =>
+				if ty.isSigned() then "(-\(self.one(["1", "2", "100"])) as \(t))"
+				else "(255 as% \(t))"
+			4 => "(c as \(t))"
+			_ => "(\(self.one(["a", "b", "d"])) as% \(t))"
+		}
+	}
+
+	/// An integer of `ty` made of others.
+	var fn int(ty: Num, depth: i64): String = {
+		val t = ty.written()
+		return match self.below(15) {
+			0 | 1 | 2 =>
+				"(\(self.expr(ty, depth)) \(self.one(&ARITHMETIC)) \(self.expr(ty, depth)))"
+			3 => "(\(self.expr(ty, depth)) \(self.one(["<<", ">>"])) \(self.expr(ty, depth)))"
+			4 =>
+				if ty.isSigned() then "(-\(self.expr(ty, depth)))" else "(!\(self.expr(ty, depth)))"
+			5 => "(!\(self.expr(ty, depth)))"
+			6 =>
+				"\(self.expr(ty, depth)).\(self.one(["countOnes", "leadingZeros", "trailingZeros", "swapBytes", "reverseBits"]))()"
+			7 => {
+				val method = self.one([
+					"rotateLeft",
+					"rotateRight",
+					"min",
+					"max",
+					"saturatingAdd",
+					"saturatingSub",
+					"saturatingMul",
+				])
+				"\(self.expr(ty, depth)).\(method)(\(self.expr(ty, depth)))"
+			}
+			8 => {
+				val method = self.one([
+					"checkedAdd",
+					"checkedSub",
+					"checkedMul",
+					"checkedDiv",
+					"checkedRem",
+				])
+				"\(self.expr(ty, depth)).\(method)(\(self.expr(ty, depth))).unwrapOr(\(self.expr(ty, depth)))"
+			}
+			9 | 10 => {
+				val from = self.integer()
+				"(\(self.expr(from, depth)) \(self.one(["as", "as%"])) \(t))"
+			}
+			11 => "(\(self.expr(.F64, depth)) as \(t))"
+			12 =>
+				"(if \(self.compared(depth)) then \(self.expr(ty, depth)) else \(self.expr(ty, depth)))"
+			// What a number's text is, compared as the bytes it is.
+			13 => "(hashed(\"\\(\(self.expr(self.number(), depth)))\") as% \(t))"
+			_ => if ty.isSigned() then "\(self.expr(ty, depth)).abs()" else self.leaf(ty)
+		}
+	}
+
+	/// A float made of others.
+	var fn float(depth: i64): String = match self.below(9) {
+		0 | 1 | 2 => "(\(self.expr(.F64, depth)) \(self.one(&FLOATING)) \(self.expr(.F64, depth)))"
+		3 =>
+			"\(self.expr(.F64, depth)).\(self.one(["sqrt", "floor", "ceil", "round", "trunc", "abs"]))()"
+		4 => "\(self.expr(.F64, depth)).\(self.one(["min", "max"]))(\(self.expr(.F64, depth)))"
+		5 =>
+			"\(self.expr(.F64, depth)).mulAdd(\(self.expr(.F64, depth)), \(self.expr(.F64, depth)))"
+		6 => "f64::fromBits(\(self.expr(.U64, depth)))"
+		7 => "(\(self.expr(self.integer(), depth)) as f64)"
+		_ =>
+			"(if \(self.compared(depth)) then \(self.expr(.F64, depth)) else \(self.expr(.F64, depth)))"
+	}
+
+	/// Two numbers of one type compared.
+	var fn compared(depth: i64): String = {
+		val ty = self.number()
+		return "\(self.expr(ty, depth)) \(self.one(&COMPARED)) \(self.expr(ty, depth))"
+	}
+}
+
+/// What a case's constant did while the program was compiled: answered, or
+/// panicked, saying what.
+@derive(Clone)
+enum Compiled {
+	Answered
+	Panicked(message: String)
+}
+
+/// The program of `cases`, each with what its constant did, `compiled`:
+/// the functions, the constants of those that answered, and `main`, which
+/// prints, for the case its argument names, the constant, the call given
+/// its inputs where the compiler cannot see them, and the call they are
+/// written in; or, for a case whose constant panicked, only the call its
+/// argument asks for, `K` or `K+`, which must panic too.
+pub fn engineProgram(cases: &[EngineCase], compiled: &[Compiled]): String = {
+	var out = String::of(
+		"import std::io\n\n/// The bytes of `text`, hashed: a number's text compared as what it is.\nfn hashed(text: str): u64 = {\n\tvar hash: u64 = 14695981039346656037\n\tfor byte in text.items() do\n\t\thash = (hash ^ (byte as u64)) *% 1099511628211\n\n\treturn hash\n}\n\n/// A float's bits, and every `NaN` alike, as its bits differ from one\n/// machine's to another's.\nfn shown(x: f64): String = if x.isNaN() then \"nan\" else \"\\(x.toBits())\"\n\n",
+	)
+	for index in 0..cases.len() {
+		val case = &cases[index]
+		val t = case.ty.written()
+		val args = "\(case.inputs[0]), \(case.inputs[1]), \(case.inputs[2]), \(case.inputs[3])"
+		out.push("fn case\(case.index)(a: i64, b: u64, c: f64, d: u8): \(t) = \(case.body)\n\n")
+		if compiled[index] is .Answered then
+			out.push("@comptime\nval COMPUTED\(case.index): \(t) = case\(case.index)(\(args))\n\n")
+	}
+	out.push(
+		"fn main(args: &[cstring]): i64 = {\n\t// Zero, and one, from how many arguments there are, which the\n\t// compiler cannot see: one, always.\n\tval zero = args.len() as i64 - 2\n\tval which = args[1].toStr()\n",
+	)
+	for index in 0..cases.len() {
+		val case = &cases[index]
+		val n = case.index
+		val given = "case\(n)(\(case.inputs[0]) ^ zero, \(case.inputs[1]) ^ (zero as% u64), \(case.inputs[2]) * (1.0 + (zero as f64)), \(case.inputs[3]) ^ (zero as% u8))"
+		val written = "case\(n)(\(case.inputs[0]), \(case.inputs[1]), \(case.inputs[2]), \(case.inputs[3]))"
+		val show = (value: str) => if case.ty == .F64 then "\\(shown(\(value)))" else "\\(\(value))"
+		match compiled[index] {
+			.Answered => out.push("\tif which == \"\(n)\" then\n\t\tio::println(\"\(n) \(show("COMPUTED\(n)")) \(show(given)) \(show(written))\")\n\n")
+			.Panicked(_) => {
+				out.push("\tif which == \"\(n)\" then\n\t\tio::println(\"\(show(given))\")\n\n")
+				out.push("\tif which == \"\(n)+\" then\n\t\tio::println(\"\(show(written))\")\n\n")
+			}
+		}
+	}
+	out.push("\treturn 0\n}\n")
+	return out
+}
+
+/// What the rounds found, counted.
+pub struct Engined {
+	pub generated: i64 = 0
+	pub accepted: i64 = 0
+	pub passed: i64 = 0
+	/// The cases whose constant panicked, and whose program did too.
+	pub panicked: i64 = 0
+	pub refused: Map<String, i64> = Map()
+	pub findings: i64 = 0
+	pub again: i64 = 0
+}
+
+/// A diagnostic of `wip check --dump-diagnostics`: its code, its message,
+/// and the line it is at.
+struct Dumped {
+	code: String
+	message: String
+	line: i64
+}
+
+/// The errors `dumped` says, each with the line of its primary label.
+fn errorsOf(dumped: str): Vec<Dumped> = {
+	var out: Vec<Dumped> = Vec()
+	var pending: Option<(String, String)> = .None
+	for line in dumped.lines() {
+		if line.stripPrefix("error ") is .Some(rest) {
+			pending = match rest.splitOnce(" ") {
+				.Some((code, message)) => (code, message)
+				.None => (rest, "")
+			}
+			continue
+		}
+		val .Some(primary) = line.trim().stripPrefix("primary ") else continue
+		val .Some((code, message)) = mem::replace(&var pending, .None) else continue
+		// `path:line:column-line:column what it says`.
+		val place = primary.splitOnce(" ").map((parts) => parts.0).unwrapOr(primary)
+		val pieces: Vec<str> = [
+			for piece in place.split(":") do
+				yield piece
+		]
+		var at = -1
+		if pieces.len() >= 3 then
+			at = pieces[pieces.len() - 3].toInt().unwrapOr(-1)
+
+		out.push(Dumped(code:, message:, line: at))
+	}
+	return out
+}
+
+/// `rounds` rounds from seed `first`, each of `count` cases, written and
+/// worked out by `wip` in `work`, each refused printed with its case where
+/// `verbose` says; what they found, or why they could not be run.
+pub fn enginesRun(
+	wip: str,
+	work: str,
+	first: u64,
+	rounds: i64,
+	count: i64,
+	verbose: bool,
+): Result<Engined, String> = {
+	told("comparing the engines of \(wip): \(rounds) rounds of \(count) cases from seed \(first)")
+	val dir = path::join(work, "engines")
+	val findings = path::join(work, "findings")
+	if fs::makeDirs(dir) is .Err(error) then
+		return .Err("cannot make `\(dir)`: \(error)")
+
+	var groups = Groups()
+	var tally = Engined()
+	for round in 0..rounds {
+		val seed = first + round as u64
+		var writer = Writer(random: Random::seeded(seed))
+		var cases: Vec<EngineCase> = [
+			for index in 0..count do
+				yield writer.case(index)
+		]
+		tally.generated += count
+		var compiled: Vec<Compiled> = [
+			for _ in cases do
+				yield Compiled::Answered
+		]
+		val main = path::join(dir, "main.wip")
+		// Checked until the checker accepts every case left: a constant that
+		// panicked is a case of its own, and any other error the generator's.
+		var settled = false
+		for _ in 0..20 {
+			fs::writeFile(main, engineProgram(&cases, &compiled)).mapErr((error) =>
+				"cannot write `\(main)`: \(error)")?
+			val checked = Command::of(wip).args([
+				"check",
+				"--color",
+				"never",
+				"--dump-diagnostics",
+				main.toStr(),
+			]).output()
+			val ran = match move checked {
+				.Ok(ran) => ran
+				.Err(error) => return .Err("cannot run `\(wip)`: \(error)")
+			}
+			if ran.exit.success() {
+				settled = true
+				break
+			}
+			if ran.exit != .Code(1) {
+				told("seed \(seed): the compiler fails as it checks the cases:\n\(firstLines("\(ran.stdout)\(ran.stderr)"))")
+				break
+			}
+			val errors = errorsOf(&ran.stdout)
+			if errors.isEmpty() {
+				told("seed \(seed): refused with no error named:\n\(firstLines("\(ran.stdout)\(ran.stderr)"))")
+				break
+			}
+			val program = engineProgram(&cases, &compiled)
+			var dropped: Vec<i64> = Vec()
+			for error in errors {
+				val .Some(at) = engineCaseAt(&program, error.line) else continue
+				val place = indexOf(&cases, at)
+				val .Some(place) = place else continue
+				if error.code == "E0441" &&
+					compiled[place] is .Answered &&
+					error.message.contains("`COMPUTED\(at)` panicked: ") {
+					val .Some((_, message)) = error.message.splitOnce("panicked: ") else continue
+					compiled[place] = .Panicked(message)
+				} else if !dropped.contains(&place) {
+					if verbose then
+						told("refused case\(at): \(error.code) \(error.message)\n\(cases[place].body)")
+
+					dropped.push(place)
+					tally.refused.put(
+						error.code.clone(),
+						tally.refused.get(&error.code).unwrapOr(0) + 1,
+					)
+				}
+			}
+			dropped.sort()
+			for place in dropped.backwards() {
+				cases.remove(place)
+				compiled.remove(place)
+			}
+		}
+		if !settled then
+			continue
+
+		tally.accepted += cases.len()
+		// Both builds of the same program.
+		var exes: Vec<String> = Vec()
+		for release in [false, true] {
+			val exe = path::join(dir, if release then "release" else "debug")
+			var build = Command::of(wip).args(["build", "--color", "never"])
+			if release then
+				build = build.arg("--release")
+
+			val built = build.args([main.toStr(), "-o", exe.toStr()]).output()
+			val ok = match built {
+				.Ok(ran) => ran.exit.success()
+				.Err(_) => false
+			}
+			if !ok {
+				val said = match built {
+					.Ok(ran) => "\(ran.stdout)\(ran.stderr)"
+					.Err(error) => "\(error)"
+				}
+				val kind = "the compiler fails as it builds what it checked"
+				if !groups.again(keyOf(kind)) {
+					val kept =
+						keptEngines(
+							findings,
+							seed,
+							-1,
+							kind,
+							&said,
+							engineProgram(&cases, &compiled),
+						)?
+					groups.first(keyOf(kind), kept)
+					tally.findings += 1
+				} else
+					tally.again += 1
+
+				// What it left there is an earlier round's, and is not run.
+				break
+			}
+			exes.push(exe)
+		}
+		if exes.len() < 2 then
+			continue
+
+		for place in 0..cases.len() {
+			val case = &cases[place]
+			val .Some((kind, said)) = judgedCase(&exes, &case, &compiled[place]) else {
+				if compiled[place] is .Panicked(_) then
+					tally.panicked += 1
+				else
+					tally.passed += 1
+
+				continue
+			}
+			val key = keyOf("\(kind), of `\(case.ty.written())`")
+			if groups.again(key) {
+				told("seed \(seed), case \(case.index): \(kind), found before")
+				tally.again += 1
+				continue
+			}
+			val alone = engineProgram([case.clone()], [compiled[place].clone()])
+			val kept = keptEngines(findings, seed, case.index, kind, &said, &alone)?
+			groups.first(key, kept)
+			tally.findings += 1
+		}
+		told("seed \(seed): \(count) cases, \(cases.len()) accepted")
+	}
+	groups.summarized(findings.toStr())
+	return tally
+}
+
+/// The number of the case whose lines hold `line` in `program`: the last
+/// `fn caseN` or `val COMPUTEDN` at or before it.
+fn engineCaseAt(program: &String, line: i64): Option<i64> = {
+	var found: Option<i64> = .None
+	var index = 1
+	for text in program.lines() {
+		if index > line then
+			break
+
+		val named = text.stripPrefix("fn case").orElse(() => text.stripPrefix("val COMPUTED"))
+		if named is .Some(rest) {
+			var digits = 0
+			while byteAt(rest, digits).isDigit() do
+				digits += 1
+
+			if digits > 0 then
+				found = match rest[0..digits].toInt() {
+					.Ok(n) => n
+					.Err(_) => .None
+				}
+		}
+		index += 1
+	}
+	return found
+}
+
+/// Where the case numbered `n` is among `cases`.
+fn indexOf(cases: &[EngineCase], n: i64): Option<i64> = {
+	for index in 0..cases.len() do
+		if cases[index].index == n then
+			return index
+
+	return .None
+}
+
+/// What is wrong with `case` in the builds `exes`, debug and release: its
+/// kind and what was said, or nothing where all agree.
+fn judgedCase(exes: &[String], case: &EngineCase, compiled: &Compiled): Option<(String, String)> = {
+	val n = case.index
+	match compiled {
+		.Answered => {
+			var lines: Vec<String> = Vec()
+			for exe in exes {
+				val .Ok(ran) = Command::of(exe).arg("\(n)").output() else {
+					return engineFinding("not run", "")
+				}
+				if !ran.exit.success() then
+					return engineFinding("the evaluator answers and the program panics", "\(ran.stdout)\(ran.stderr)")
+
+				val line = ran.stdout.trim()
+				val parts: Vec<str> = [
+					for part in line.split(" ") do
+						yield part
+				]
+				if parts.len() != 4 then
+					return engineFinding("the program says what it should not", line)
+
+				if parts[1] != parts[2] then
+					return engineFinding("the evaluator and the program answer otherwise", "\(exe): \(line)")
+
+				if parts[2] != parts[3] then
+					return engineFinding("the call given its inputs and the call written with them answer otherwise", "\(exe): \(line)")
+
+				lines.push(line)
+			}
+			if lines[0] != lines[1] then
+				return engineFinding("a release build answers otherwise", "debug: \(lines[0])\nrelease: \(lines[1])")
+
+			return .None
+		}
+		.Panicked(message) => {
+			for exe in exes {
+				for asked in ["\(n)", "\(n)+"] {
+					val .Ok(ran) = Command::of(exe).arg(asked).output() else {
+						return engineFinding("not run", "")
+					}
+					if ran.exit != .Code(101) then
+						return engineFinding("the evaluator panics and the program does not", "\(exe) \(asked): \(ran.stdout)\(ran.stderr)\nthe evaluator: \(message)")
+
+					if !ran.stderr.contains(message) then
+						return engineFinding("the evaluator and the program panic otherwise", "\(exe) \(asked): \(ran.stderr)\nthe evaluator: \(message)")
+				}
+			}
+			return .None
+		}
+	}
+}
+
+/// A finding of `kind`, and what was said of it.
+fn engineFinding(kind: str, said: str): Option<(String, String)> = (kind, said)
+
+/// A finding, kept in `findings`: the program of its case alone, or of the
+/// round where it is the build's, and what was found; where it is kept.
+fn keptEngines(
+	findings: str,
+	seed: u64,
+	index: i64,
+	kind: str,
+	said: &String,
+	program: &String,
+): Result<String, String> = {
+	val name = if index < 0 then "engines-\(seed)" else "engines-\(seed)-\(index)"
+	val dir = path::join(findings, name)
+	fs::makeDirs(dir).mapErr((error) => "cannot make `\(dir)`: \(error)")?
+	fs::writeFile(path::join(dir, "main.wip"), program).mapErr((error) =>
+		"cannot write in `\(dir)`: \(error)")?
+	val text = "\(kind)\n\nseed \(seed), case \(index); `wip run main.wip -- \(index)` there shows it again\n\n\(said)\n"
+	fs::writeFile(path::join(dir, "found.txt"), text).mapErr((error) =>
+		"cannot write in `\(dir)`: \(error)")?
+	told("seed \(seed), case \(index): \(kind); kept in \(dir)")
+	return dir
+}

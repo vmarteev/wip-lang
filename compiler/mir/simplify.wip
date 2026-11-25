@@ -16,7 +16,10 @@
 // Both are kept only for places written **once** in the body, so there is no
 // question of which write a read sees; a copy is kept only when what it copied
 // is written once too and its address is never taken, since a call may write
-// through an address it was given.
+// through an address it was given. A variable whose life is marked holds what
+// it was given only until `StorageDead` ends it, so a copy of one names it
+// only in the block the copy is made in, until it ends there: a read of the
+// copy after that, which is why the copy was made, stays a read of the copy.
 
 import std::collections::{Map, Set}
 import std::mem
@@ -24,16 +27,20 @@ import hir::{Program, isAggregate}
 
 /// Rewrites the places of `body` to the ones they stand for.
 pub fn simplify(program: &Program, body: &var Body) = {
-	var facts = Facts(known: facts(&program, &body))
+	val (known, bounded) = facts(&program, &body)
+	var facts = Facts(known:, bounded:)
 	if facts.known.isEmpty() then
 		return
 
 	for b in 0..body.blocks.len() {
 		val statements = mem::replace(&var body.blocks[b].statements, Vec())
-		val rewritten: Vec<Statement> = [
-			for statement in move statements do
-				yield rewriteStatement(statement, &var facts)
-		]
+		facts.block = b
+		var rewritten: Vec<Statement> = Vec()
+		for statement in move statements {
+			facts.at = rewritten.len()
+			rewritten.push(rewriteStatement(statement, &var facts))
+		}
+		facts.at = rewritten.len()
 		body.blocks[b].statements = rewritten
 		val terminator = mem::replace(&var body.blocks[b].terminator, .Unreachable)
 		body.blocks[b].terminator = rewriteTerminator(terminator, &var facts)
@@ -81,8 +88,21 @@ fn writtenOnce(writes: &Map<Local, Vec<Vec<Projection>>>, place: &Place): bool =
 	return count <= 1
 }
 
-/// The facts a body makes, which is everything this pass knows.
-fn facts(program: &Program, body: &Body): Map<(Local, Vec<Projection>), Fact> = {
+/// Where a copy of a variable whose life is marked names it: in the block the
+/// copy is made in, from the statement after the copy up to the one that ends
+/// the variable's life there, or to the block's end and its terminator.
+struct Lives {
+	block: i64
+	from: i64
+	until: i64
+}
+
+/// The facts a body makes, which is everything this pass knows, and where
+/// each copy of a variable whose life is marked holds.
+fn facts(
+	program: &Program,
+	body: &Body,
+): (Map<(Local, Vec<Projection>), Fact>, Map<(Local, Vec<Projection>), Lives>) = {
 	// Every write, so that a fact is kept only about a place written once. A
 	// parameter arrives with a value, so a write to one is its second:
 	// `x = p; zero(p)` is a move, and `x` is not another name for `p`. Each
@@ -98,9 +118,16 @@ fn facts(program: &Program, body: &Body): Map<(Local, Vec<Projection>), Fact> = 
 	// through it: all of them are unknown then, which is found once, at the
 	// end, not at each write and each call.
 	var throughAddresses = false
-	var candidates: Vec<((Local, Vec<Projection>), Fact)> = Vec()
-	for block in body.blocks {
-		for statement in block.statements {
+	var candidates: Vec<((Local, Vec<Projection>), Fact, i64, i64)> = Vec()
+	// The variables whose life is marked: what each holds ends there.
+	var marked: Set<Local> = Set()
+	for b in 0..body.blocks.len() {
+		val block = &body.blocks[b]
+		for index in 0..block.statements.len() {
+			val statement = &block.statements[index]
+			if statement is .StorageDead(local) then
+				marked.add(local)
+
 			if writtenPlace(&statement) is .Some(dest) {
 				match factKey(&dest) {
 					.Some((local, path)) => writes.atOrPut(local, Vec()).push(path)
@@ -132,7 +159,7 @@ fn facts(program: &Program, body: &Body): Map<(Local, Vec<Projection>), Fact> = 
 					.AddressOf(target) => .Address(target.clone())
 					_ => continue
 				}
-				candidates.push((key, fact))
+				candidates.push((key, fact, b, index))
 			}
 		}
 	}
@@ -141,7 +168,8 @@ fn facts(program: &Program, body: &Body): Map<(Local, Vec<Projection>), Fact> = 
 			unknown.add(local)
 	}
 	var facts: Map<(Local, Vec<Projection>), Fact> = Map()
-	for (dest, fact) in move candidates {
+	var bounded: Map<(Local, Vec<Projection>), Lives> = Map()
+	for (dest, fact, block, index) in move candidates {
 		val named = Place(local: dest.0, projections: dest.1.clone())
 		if !writtenOnce(&writes, &named) || unknown.contains(&dest.0) then
 			continue
@@ -159,10 +187,25 @@ fn facts(program: &Program, body: &Body): Map<(Local, Vec<Projection>), Fact> = 
 					!unknown.contains(&source.local) &&
 					!isAggregate(&program, placeTy(&program, &body, &named))
 		}
-		if keep then
-			facts.put(dest, fact)
+		if !keep then
+			continue
+
+		// A copy of a variable whose life is marked names it only until its
+		// life ends, in the block the copy is in.
+		if fact is .Copied(source) && marked.contains(&source.local) {
+			val statements = &body.blocks[block].statements
+			var until = statements.len() + 1
+			for later in index + 1..statements.len() {
+				if statements[later] is .StorageDead(local) && local == source.local {
+					until = later
+					break
+				}
+			}
+			bounded.put(dest.clone(), Lives(block:, from: index + 1, until:))
+		}
+		facts.put(dest, fact)
 	}
-	return facts
+	return (facts, bounded)
 }
 
 /// Whether a place is reached through a pointer before any element of the
@@ -201,9 +244,13 @@ fn writtenPlace(statement: &Statement): Option<Place> = match statement {
 	_ => .None
 }
 
-/// What the pass knows, as it rewrites.
+/// What the pass knows, as it rewrites, and where it is: the block, and the
+/// statement, its terminator counted as one past the last.
 struct Facts {
 	known: Map<(Local, Vec<Projection>), Fact>
+	bounded: Map<(Local, Vec<Projection>), Lives>
+	block: i64 = 0
+	at: i64 = 0
 }
 
 extend Facts {
@@ -249,6 +296,12 @@ extend Facts {
 			taken -= 1
 			val key = (place.local, place.projections[0..taken].toVec())
 			if self.known.get(&key) is .Some(.Copied(source)) {
+				// A copy of a variable whose life has ended, or may have, is the
+				// copy.
+				if self.bounded.get(&key) is .Some(span) &&
+					(span.block != self.block || self.at < span.from || self.at >= span.until) {
+					return .None
+				}
 				var folded = source.clone()
 				folded.projections.pushAll(&place.projections[taken..])
 				return folded

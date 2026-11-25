@@ -853,7 +853,9 @@ Four constants the compiler writes say what machine the program is being
 compiled for: `TARGET_OS` is `macos`, `linux`, `windows` or `ios`, which
 the simulator is too; `TARGET_ARCH` is `arm64` or `x86_64`; `TARGET_VENDOR`
 is `apple` on a Mac and on iOS, and empty elsewhere; and `TARGET_FAMILY` is
-`windows` on Windows and `unix` on every other system.
+`windows` on Windows and `unix` on every other system. A fifth, `SANITIZER`,
+says what the build is sanitized with, `address` or `thread`, and is empty
+where it is none.
 
 ```wip,run
 fn main() = {
@@ -861,6 +863,7 @@ fn main() = {
     assert(separator == "/" || TARGET_OS == "windows")
     assert(TARGET_VENDOR == "apple" || TARGET_OS != "macos")
     assert(TARGET_FAMILY == "unix" || TARGET_OS == "windows")
+    assert(SANITIZER == "" || SANITIZER == "address" || SANITIZER == "thread")
 }
 ```
 

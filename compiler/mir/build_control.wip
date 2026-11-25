@@ -54,7 +54,7 @@ extend Builder {
 					self.storeExpr(value, place.clone())
 					Value::Place(place)
 				}
-				.None => self.expr(value)
+				.None => self.outlived(self.expr(value), self.hir.exprs[value].ty)
 			}
 			_ => Value::Unit
 		}
@@ -67,6 +67,36 @@ extend Builder {
 		return value
 	}
 
+	/// A block's value, where it is a variable of the block: copied out
+	/// before the block ends, since the variable's life ends with it and its
+	/// slot may then be another's.
+	var fn outlived(value: Value, ty: Ty): Value = match move value {
+		.Place(place) => {
+			if !self.endsHere(&place) then
+				return .Place(place)
+
+			val copy = Place::of(self.temp(ty))
+			self.assign(copy.clone(), .Use(.Copy(place)))
+			Value::Place(copy)
+		}
+		// A scalar read from such a variable is read before its life ends, too.
+		.Scalar(.Copy(place)) => {
+			if !self.endsHere(&place) then
+				return .Scalar(.Copy(place))
+
+			val copy = Place::of(self.temp(ty))
+			self.assign(copy.clone(), .Use(.Copy(place)))
+			Value::Scalar(.Copy(copy))
+		}
+		other => other
+	}
+
+	/// Whether `place` is in a variable whose life the innermost scope ends.
+	fn endsHere(place: &Place): bool = {
+		val last = self.scopes.len() - 1
+		return self.scopes[last].any((cleanup) => cleanup is .Dead(local) && local == place.local)
+	}
+
 	var fn stmt(id: StmtId) = {
 		self.revive()
 		self.at(self.hir.stmts[id].span)
@@ -77,6 +107,7 @@ extend Builder {
 		match hir.stmts[id].kind {
 			.Let(local, init) => {
 				val variable = self.sourceLocal(local, .Var)
+				self.begun(variable)
 				self.storeExpr(init, Place::of(variable))
 				// What a loop walks is made where the loop is written, and what
 				// that made lives as long as the loop: the statement the loop
@@ -630,7 +661,8 @@ extend Builder {
 					self.storeExpr(arm.body, place.clone())
 					Value::Place(place.clone())
 				}
-				.None => self.expr(arm.body)
+				// Read before the arm's bindings end, as a block's value is.
+				.None => self.outlived(self.expr(arm.body), self.hir.exprs[arm.body].ty)
 			}
 			self.seenUntil.pop()
 			if self.dead {
@@ -678,6 +710,10 @@ extend Builder {
 		var scope: Vec<Cleanup> = Vec()
 		for local in locals {
 			val variable = self.sourceLocal(local, .Var)
+			if self.generatorState.isNone() {
+				self.push(.StorageLive(variable))
+				scope.push(.Dead(variable))
+			}
 			self.push(.Zero(Place::of(variable)))
 			self.vars.put(local, variable)
 			scope.push(.Drop(local))
@@ -1152,6 +1188,8 @@ extend Builder {
 	var fn bindRest(local: LocalId, elements: &Place, len: Operand, prefix: u64, suffix: u64) = {
 		val made = self.vars.contains(&local)
 		val variable = if made then self.varOf(local) else self.sourceLocal(local, .Var)
+		self.beganOnPath(local, variable, made)
+
 		val first = self.localOf(Builder::int(prefix, I64), I64)
 		val start = self.value(PTR_U8, .AddressOf(elements.project(.Index(first))))
 		val count = self.value(I64, .Binary(
@@ -1437,11 +1475,28 @@ extend Builder {
 	/// An alias binding holds the address of its field. Any other binding
 	/// takes the field, a reference included, leaving zeros behind so that it
 	/// is not dropped twice.
+	/// The life of the variable a binding writes, begun: where it is made,
+	/// with its end; and where another alternative of its pattern binds it
+	/// on a path of its own, which the first's beginning did not reach, begun
+	/// again there, ending once with the arm.
+	var fn beganOnPath(local: LocalId, variable: Local, made: bool) = {
+		if !made {
+			self.begun(variable)
+			self.bound.add(local)
+		} else if self.bound.contains(&local) &&
+			self.generatorState.isNone() &&
+			!self.scopes.isEmpty() {
+			self.push(.StorageLive(variable))
+		}
+	}
+
 	var fn bindLocal(local: LocalId, field: Place, ty: Ty) = {
 		// The binding of an `is` test already has its variable, and its
 		// cleanup.
 		val made = self.vars.contains(&local)
 		val variable = if made then self.varOf(local) else self.sourceLocal(local, .Var)
+		self.beganOnPath(local, variable, made)
+
 		if self.hir.aliasBindings.contains(&local) then
 			self.assign(Place::of(variable), .AddressOf(field))
 		else {

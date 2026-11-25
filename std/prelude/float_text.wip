@@ -1,0 +1,562 @@
+// A float written as text and read from it, worked out in Wip: written as
+// C's `%g` writes it, with as many digits as it takes to read back as the
+// same float and six at the least, and as C's `%.<n>f` writes it, the value
+// it holds rounded once; read as the float nearest what is written. It is
+// the same on every system, and while a program is compiled as when it
+// runs.
+//
+// A float is an integer times a power of two, so its value is exact as a
+// fraction of two natural numbers; its digits are made from that fraction a
+// digit at a time, as Steele and White's and Burger and Dybvig's printers
+// make them, with the halfway points to the floats either side beside it,
+// which say which decimals read back as it. A decimal is a fraction too,
+// and the float nearest it is found by dividing it out to a few bits more
+// than a float holds. A number of a few thousand bits holds every fraction
+// either makes.
+
+/// A finite float as an integer times a power of two, `significand ×
+/// 2^exponent`, and whether the float below it is half as far as the one
+/// above, as at a power of two but the least: what decides which decimals
+/// read back as it.
+struct Binary {
+	significand: u64
+	exponent: i64
+	narrowBelow: bool
+}
+
+/// `value`'s significand and power of two, as an `f32`'s where `single`.
+fn binaryOf(value: f64, single: bool): Binary = {
+	if single {
+		val bits = (value as f32).toBits()
+		val biased = ((bits >> 23) & 0xFF) as i64
+		val fraction = (bits & 0x7FFFFF) as u64
+		if biased == 0 then
+			return Binary(significand: fraction, exponent: -149, narrowBelow: false)
+
+		return Binary(
+			significand: fraction | 0x800000,
+			exponent: biased - 150,
+			narrowBelow: fraction == 0 && biased > 1,
+		)
+	}
+	val bits = value.toBits()
+	val biased = ((bits >> 52) & 0x7FF) as i64
+	val fraction = bits & 0xFFFFFFFFFFFFF
+	if biased == 0 then
+		return Binary(significand: fraction, exponent: -1074, narrowBelow: false)
+
+	return Binary(
+		significand: fraction | 0x10000000000000,
+		exponent: biased - 1075,
+		narrowBelow: fraction == 0 && biased > 1,
+	)
+}
+
+/// A value's first decimal digits, exactly, from the first that is not
+/// zero; the power of ten of that first; and, for each count of them from
+/// one, whether the value rounded to that many digits rounds up, and
+/// whether what it rounds to reads back as the value. They stop at the
+/// first count from six that reads back.
+struct Digits {
+	digits: Vec<u8>
+	exponent: i64
+	roundsUp: Vec<bool>
+	readsBack: Vec<bool>
+}
+
+/// The first `count` digits of `binary`'s value, which is not zero. The
+/// value is `r / s`, and the halfway points to the floats either side are
+/// `high / s` above it and `low / s` below; all four are scaled by ten as
+/// each digit is taken, so that what is left after a digit, `r / s` of its
+/// unit, is weighed against the halfway points in the same unit. A decimal
+/// on a halfway point reads back as the float whose significand is even,
+/// as reading rounds a tie.
+fn digitsOf(binary: &Binary, count: i64): Digits = {
+	val m = binary.significand
+	val e = binary.exponent
+	var r = Natural::of(m)
+	var s = Natural::of(1)
+	var high = Natural::of(1)
+	var low = Natural::of(1)
+	if e >= 0 {
+		r.shiftedUp(e + if binary.narrowBelow then 2 else 1)
+		s = Natural::of(if binary.narrowBelow then 4 else 2)
+		high.shiftedUp(e + if binary.narrowBelow then 1 else 0)
+		low.shiftedUp(e)
+	} else {
+		r.shiftedUp(if binary.narrowBelow then 2 else 1)
+		s.shiftedUp(-e + if binary.narrowBelow then 2 else 1)
+		if binary.narrowBelow then
+			high = Natural::of(2)
+	}
+	// The power of ten of the first digit, guessed from the power of two
+	// and then made right: `10^exponent ≤ value < 10^(exponent + 1)`.
+	val bits = 64 - m.leadingZeros() as i64
+	var exponent = (((bits - 1 + e) as f64) * 0.30102999566398119521).floor() as i64
+	if exponent >= 0 then
+		s.timesTenTo(exponent)
+	else {
+		r.timesTenTo(-exponent)
+		high.timesTenTo(-exponent)
+		low.timesTenTo(-exponent)
+	}
+
+	while r.compare(&s) < 0 {
+		r.times(10)
+		high.times(10)
+		low.times(10)
+		exponent -= 1
+	}
+	var tens = s.clone()
+	tens.times(10)
+	while r.compare(&tens) >= 0 {
+		s.times(10)
+		tens.times(10)
+		exponent += 1
+	}
+	val even = m % 2 == 0
+	var digits: Vec<u8> = Vec()
+	var roundsUp: Vec<bool> = Vec()
+	var readsBack: Vec<bool> = Vec()
+	for _ in 0..count {
+		var digit: u8 = 0
+		while r.compare(&s) >= 0 {
+			r.minus(&s)
+			digit += 1
+		}
+		digits.push(digit)
+		// Rounded here: up where what is left is more than half a unit, and
+		// on half to the even digit.
+		val half = r.compareTwice(&s)
+		val up = half > 0 || half == 0 && digit % 2 == 1
+		roundsUp.push(up)
+		// Down reads back where what is left is within the halfway point
+		// below; up, where the rest of the unit is within the one above.
+		val below = r.compare(&low)
+		// `s - r` against `high`, which is `s` against `r + high` the other
+		// way about.
+		val above = -r.compareSum(&high, &s)
+		val reads = if up then above < 0 || even && above == 0 else below < 0 || even && below == 0
+		readsBack.push(reads)
+		// Six digits or more that read back are all `%g` wants.
+		if reads && digits.len() >= 6 then
+			break
+
+		r.times(10)
+		high.times(10)
+		low.times(10)
+	}
+	return Digits(digits:, exponent:, roundsUp:, readsBack:)
+}
+
+/// The first `precision` digits of `found` rounded as it says, and the
+/// power of ten of the first, which a rounding up from nines raises.
+fn rounded(found: &Digits, precision: i64): (Vec<u8>, i64) = {
+	var digits: Vec<u8> = Vec()
+	for i in 0..precision do
+		digits.push(found.digits[i])
+
+	var exponent = found.exponent
+	if found.roundsUp[precision - 1] {
+		var at = precision
+		var carried = true
+		while carried && at > 0 {
+			at -= 1
+			if digits[at] == 9 then
+				digits[at] = 0
+			else {
+				digits[at] += 1
+				carried = false
+			}
+		}
+		if carried {
+			digits[0] = 1
+			exponent += 1
+		}
+	}
+	return (digits, exponent)
+}
+
+extend String {
+	/// The float, as C's `%g` writes it, with as many digits as it takes
+	/// to read back as the same `f64`, and six at the least: `0.1`,
+	/// `1e+20`, `0.30000000000000004`.
+	pub var fn pushFloat(value: f64) = self.pushFewestDigits(value, false)
+
+	/// An `f32` the same way, with the digits it takes to read back as the
+	/// same `f32`, which are at most 9.
+	var fn pushFloat32(value: f32) = self.pushFewestDigits(value as f64, true)
+
+	/// `%.6g`, `%.7g` and on, until what is written reads back as `value`:
+	/// 17 digits always do for an `f64`, and 9 for an `f32`. Six or fewer
+	/// are written as `%g` always wrote them, but for a value written with
+	/// an exponent that fewer still read back as: a subnormal's. A `NaN` is
+	/// `nan`, whatever its sign.
+	var fn pushFewestDigits(value: f64, single: bool) = {
+		if value.isNaN() {
+			self.push("nan")
+			return
+		}
+		if value.toBits() >> 63 == 1 then
+			self.pushByte(b'-')
+
+		if !value.isFinite() {
+			self.push("inf")
+			return
+		}
+		if value == 0.0 {
+			self.pushByte(b'0')
+			return
+		}
+		val most = if single then 9 else 17
+		val found = digitsOf(binaryOf(value, single), most)
+		var precision = most
+		for p in 6..most {
+			if p <= found.readsBack.len() && found.readsBack[p - 1] {
+				precision = p
+				break
+			}
+		}
+		// Six digits written with an exponent may be more than the value
+		// has: a subnormal keeps fewer bits, and `5e-324` reads back as
+		// well as `4.94066e-324`. Fewer digits than six cannot move the
+		// exponent to a point, so the first of them that reads back is
+		// shorter text of the same kind.
+		if precision == 6 {
+			val (_, exponent) = rounded(&found, 6)
+			if exponent < -4 || exponent >= 6 {
+				for fewer in 1..6 {
+					if found.readsBack[fewer - 1] {
+						precision = fewer
+						break
+					}
+				}
+			}
+		}
+		self.pushLaidOut(&found, precision)
+	}
+
+	/// `found` rounded to `precision` digits, laid out as `%g` lays them
+	/// out: with an exponent where it is less than -4 or not less than the
+	/// precision, at least two digits of it after its sign, and otherwise
+	/// with a point; no zeros at the end of what follows the point, and no
+	/// point where nothing does.
+	var fn pushLaidOut(found: &Digits, precision: i64) = {
+		val (digits, exponent) = rounded(&found, precision)
+		var used = precision
+		while used > 1 && digits[used - 1] == 0 do
+			used -= 1
+
+		if exponent < -4 || exponent >= precision {
+			self.pushByte(b'0' + digits[0])
+			if used > 1 {
+				self.pushByte(b'.')
+				for i in 1..used do
+					self.pushByte(b'0' + digits[i])
+			}
+			self.pushByte(b'e')
+			self.pushByte(if exponent < 0 then b'-' else b'+')
+			val size = exponent.abs()
+			if size < 10 then
+				self.pushByte(b'0')
+
+			self.pushInt(size)
+			return
+		}
+		if exponent < 0 {
+			self.push("0.")
+			for _ in 0..-exponent - 1 do
+				self.pushByte(b'0')
+
+			for i in 0..used do
+				self.pushByte(b'0' + digits[i])
+
+			return
+		}
+		for i in 0..exponent + 1 do
+			self.pushByte(if i < used then b'0' + digits[i] else b'0')
+
+		if used > exponent + 1 {
+			self.pushByte(b'.')
+			for i in exponent + 1..used do
+				self.pushByte(b'0' + digits[i])
+		}
+	}
+
+	/// A finite `value` with `digits` digits after its point, the value it
+	/// holds exactly rounded once to that many, a tie to the even digit, as
+	/// C's `%.<digits>f` writes it: a `-` where it is negative, even where
+	/// it rounds to zero, and no point where there are no digits.
+	var fn pushFixed(value: f64, digits: i64) = {
+		if value.toBits() >> 63 == 1 then
+			self.pushByte(b'-')
+
+		val binary = binaryOf(value, false)
+		// The value times 10^digits, an integer times a power of two: a
+		// shift up, or a shift down rounded by the bits it lets go.
+		var scaled = Natural::of(binary.significand)
+		scaled.timesTenTo(digits)
+		if binary.exponent >= 0 then
+			scaled.shiftedUp(binary.exponent)
+		else {
+			val dropped = -binary.exponent
+			val half = scaled.bitAt(dropped - 1)
+			val more = scaled.anyBelow(dropped - 1)
+			scaled.shiftedDown(dropped)
+			if half && (more || scaled.isOdd()) then
+				scaled.plusOne()
+		}
+
+		var text = scaled.decimal()
+		// As many digits as the point needs before it, one at the least.
+		while text.len() < digits + 1 do
+			text.insert(0, b'0')
+
+		val point = text.len() - digits
+		for i in 0..point do
+			self.pushByte(text[i])
+
+		if digits > 0 {
+			self.pushByte(b'.')
+			for i in point..text.len() do
+				self.pushByte(text[i])
+		}
+	}
+}
+
+/// The most digits of a decimal it is read with, from its first that is
+/// not zero. A float's halfway point takes 767 to tell from a decimal
+/// beside it; past them, a digit that is not zero says only that the value
+/// is a little more, which a one after them says as well.
+val MOST_READ = 800
+
+/// 10 to the 0th through 22nd, each exactly an `f64`.
+fn exactTen(power: i64): f64 = {
+	var ten = 1.0
+	for _ in 0..power do
+		ten = ten * 10.0
+
+	return ten
+}
+
+/// The float nearest a decimal, a tie to the even significand, and
+/// infinite where it is too large for one: the decimal's digits, the
+/// `whole` of them at `start` in `text` before a point and the `fraction`
+/// after it, times 10^`exponent`.
+fn floatOf(text: str, start: i64, whole: i64, fraction: i64, exponent: i64, negative: bool): f64 = {
+	val count = whole + fraction
+	// The `k`th digit, past the point where there is one.
+	val digitAt = (k: i64) => (text[start + k + if k >= whole then 1 else 0] - b'0') as u64
+	var first = 0
+	while first < count && digitAt(first) == 0 do
+		first += 1
+
+	var last = count - 1
+	while last >= first && digitAt(last) == 0 do
+		last -= 1
+
+	val signed = (value: f64) => if negative then -value else value
+	if first > last then
+		return signed(0.0)
+
+	// The value is `digits × 10^power`, its digits from the first to the
+	// last that is not zero.
+	val digits = last - first + 1
+	val power = exponent - fraction + (count - 1 - last)
+	// At least 10^309, more than the largest float; less than 10^-325,
+	// less than half the least.
+	if power + digits - 1 > 308 then
+		return signed(f64::INFINITY)
+
+	if power + digits < -324 then
+		return signed(0.0)
+
+	// Fifteen digits or fewer are an `f64` exactly, and so is a power of
+	// ten to the 22nd: one product or quotient of two exact floats is
+	// rounded once, to the nearest.
+	if digits <= 15 {
+		var small: u64 = 0
+		for k in first..last + 1 do
+			small = small * 10 + digitAt(k)
+
+		if power >= 0 && power <= 22 then
+			return signed(small as f64 * exactTen(power))
+
+		if power < 0 && power >= -22 then
+			return signed(small as f64 / exactTen(-power))
+
+		// Some of a larger power, while the digits stay fifteen at most.
+		if power > 22 && power <= 22 + 15 - digits then
+			return signed(small as f64 * exactTen(power - 22) * exactTen(22))
+	}
+	// Nineteen digits or fewer are a `u64`, and the value is near enough
+	// from 10^power's 128 bits; more, and it lies between the first
+	// nineteen and one more than them, which say it where they agree.
+	val kept = digits.min(19)
+	var leading: u64 = 0
+	for k in first..first + kept do
+		leading = leading * 10 + digitAt(k)
+
+	val scaled = power + (digits - kept)
+	if quickly(leading, scaled) is .Some(value) {
+		if kept == digits then
+			return signed(value)
+
+		if quickly(leading + 1, scaled) is .Some(above) && above.toBits() == value.toBits() then
+			return signed(value)
+	}
+	return signed(nearestOf(text, start, whole, first, last, power))
+}
+
+/// The float nearest `w × 10^q`, from the table's 128 bits of 10^q, where
+/// they are enough to say, as Eisel and Lemire read a float: none where the
+/// value is so near a halfway point between floats that what the table cut
+/// off might move it past one. The product of `w` and the 128 bits is
+/// exact, and less than `w × 10^q` by less than `w`, which is less than
+/// 2^64, but where the bits are 10^q exactly.
+fn quickly(w: u64, q: i64): Option<f64> = {
+	if q < LEAST_POWER || q > MOST_POWER then
+		return .None
+
+	val at = (q - LEAST_POWER) * 2
+	val high = POWERS_OF_TEN[at]
+	val low = POWERS_OF_TEN[at + 1]
+	// `w` with its highest bit at the top, and the product's three words,
+	// `p2` the highest: 2^190 at the least.
+	val zeros = w.leadingZeros() as i64
+	val n = w << (zeros as u64)
+	val upper = (n as u128) * (high as u128)
+	val lower = (n as u128) * (low as u128)
+	val p0 = lower as% u64
+	val middle = (upper as% u64 as u128) + (lower >> 64)
+	val p1 = middle as% u64
+	val p2 = ((upper >> 64) + (middle >> 64)) as% u64
+	// The value is the product times 2^power2. Kept to 53 bits, or to a
+	// subnormal's unit, 2^-1074, the bits below `dropped` go.
+	val bits = 128 + 64 - p2.leadingZeros() as i64
+	val power2 = ((q * 217706) >> 16) - 127 - zeros
+	var dropped = bits - 53
+	if dropped + power2 < -1074 then
+		dropped = -1074 - power2
+
+	if dropped >= 190 then
+		return .None
+
+	// The bit worth half the unit, in `p2`, and those below it there.
+	val halfAt = (dropped - 1 - 128) as u64
+	val half = (p2 >> halfAt) & 1 == 1
+	val mask = ((1 as u64) << halfAt) - 1
+	val below = p2 & mask
+	val exactly = q >= 0 && q <= 55
+	if !exactly {
+		// On the halfway point, or below it by less than 2^64: the value
+		// may be either side.
+		if half && below == 0 && p1 == 0 && p0 == 0 then
+			return .None
+
+		if !half && below == mask && p1 == 0xFFFFFFFFFFFFFFFF then
+			return .None
+	}
+	val significand = p2 >> (halfAt + 1)
+	val more = below != 0 || p1 != 0 || p0 != 0
+	val up = half && (more || significand & 1 == 1)
+	return floatFrom(significand + if up then 1 else 0, dropped + power2)
+}
+
+/// The float `significand × 2^unit`, the significand 2^53 at the most and
+/// the unit -1074 at the least: infinite where it is too large for one.
+fn floatFrom(significand: u64, unit: i64): f64 = {
+	// Rounded up to 2^53, it is 2^52 of the next unit.
+	if significand == (1 as u64) << 53 then
+		return floatFrom((1 as u64) << 52, unit + 1)
+
+	if unit > 971 then
+		return f64::INFINITY
+
+	// A subnormal's power is the least, which its bits say with none.
+	if significand < (1 as u64) << 52 then
+		return f64::fromBits(significand)
+
+	return f64::fromBits(((unit + 1075) as u64) << 52 | (significand & 0xFFFFFFFFFFFFF))
+}
+
+/// The float nearest `digits × 10^power` exactly: the decimal as a fraction
+/// `numerator / denominator` of two natural numbers, one scaled by a power
+/// of two until the quotient has 55 bits, and that quotient, with whether
+/// anything is left, rounded to the 53 bits of a float, or to fewer where
+/// it is subnormal. Its digits are the `first` to the `last` of those at
+/// `start` in `text`, a point after the `whole` of them.
+fn nearestOf(text: str, start: i64, whole: i64, first: i64, last: i64, power: i64): f64 = {
+	val digitAt = (k: i64) => (text[start + k + if k >= whole then 1 else 0] - b'0') as u32
+	// Past the most read, a one says what is left, which is not zero, as
+	// the last digit is not.
+	var shown = last
+	var scale = power
+	var sticky = false
+	if last - first + 1 > MOST_READ {
+		shown = first + MOST_READ - 1
+		scale = power + (last - shown) - 1
+		sticky = true
+	}
+	var numerator = Natural::of(0)
+	var k = first
+	while k <= shown {
+		var chunk: u32 = 0
+		var size = 0
+		while k <= shown && size < 9 {
+			chunk = chunk * 10 + digitAt(k)
+			size += 1
+			k += 1
+		}
+		numerator.timesTenTo(size)
+		numerator.plus(Natural::of(chunk as u64))
+	}
+	if sticky {
+		numerator.times(10)
+		numerator.plus(Natural::of(1))
+	}
+	var denominator = Natural::of(1)
+	if scale >= 0 then
+		numerator.timesTenTo(scale)
+	else
+		denominator.timesTenTo(-scale)
+
+	// Scaled by 2^shift, so that the quotient is 2^54 to 2^56.
+	val shift = 55 - (numerator.bitLength() - denominator.bitLength())
+	if shift >= 0 then
+		numerator.shiftedUp(shift)
+	else
+		denominator.shiftedUp(-shift)
+
+	// The quotient a bit at a time, from its 56th.
+	var quotient: u64 = 0
+	denominator.shiftedUp(56)
+	var bit = 56
+	while bit >= 0 {
+		if numerator.compare(&denominator) >= 0 {
+			numerator.minus(&denominator)
+			quotient = quotient | (1 as u64) << (bit as u64)
+		}
+		denominator.shiftedDown(1)
+		bit -= 1
+	}
+	val rest = !numerator.isZero()
+	// The value is `quotient × 2^-shift`, and a little more where `rest`.
+	// Kept to 53 bits, its unit is 2^unit; a subnormal's is 2^-1074 and
+	// keeps fewer.
+	val bits = 64 - quotient.leadingZeros() as i64
+	var dropped = bits - 53
+	var unit = dropped - shift
+	if unit < -1074 {
+		dropped += -1074 - unit
+		unit = -1074
+	}
+	if dropped >= 64 then
+		return 0.0
+
+	val significand = quotient >> (dropped as u64)
+	val half = (quotient >> ((dropped - 1) as u64)) & 1 == 1
+	val below = quotient & (((1 as u64) << ((dropped - 1) as u64)) - 1) != 0 || rest
+	val up = half && (below || significand & 1 == 1)
+	return floatFrom(significand + if up then 1 else 0, unit)
+}

@@ -1,0 +1,811 @@
+// The fuzzer's other mode, `--mutate`: the programs the repository
+// keeps — the language's cases, those it runs and those it refuses, and
+// the examples — each changed in one to three places and checked by
+// `wip check`, as the language server checks what is being typed. A token
+// is dropped, doubled, swapped with the next, or put in the place of
+// another of its kind: a name by another the file uses, a keyword by one
+// near it in meaning, a literal by another, a mark by another. Whatever
+// the text, the check must end by accepting it or by refusing it with an
+// error's code; one that panics, is ended by a signal, runs out of its
+// time, or refuses without saying why is a finding, made as small as it
+// stays one and kept.
+
+import std::collections::{Map}
+import std::fs
+import std::future
+import std::path
+import std::process::{Command}
+import std::random::{Random}
+
+/// The seconds of a processor a check has, far more than one takes: past
+/// them the system ends it with `SIGXCPU`, numbered `OUT_OF_TIME` on a Mac
+/// and on Linux.
+val CHECK_SECONDS: i64 = 20
+val OUT_OF_TIME: i64 = 24
+
+/// How many rounds it takes to ask the language server of every program:
+/// each round asks of one in so many.
+val ASKED_EVERY: u64 = 8
+
+/// The programs `--sources` adds, from the checkout `root`: the tool, and
+/// each directory `scripts/ports.txt` lists first on a line, where it is
+/// there and holds a program. The list is a checkout's own, and may be
+/// missing.
+fn sourcesOf(root: str): Vec<String> = {
+	var places: Vec<String> = ["tools/bindgen"]
+	val listed = path::join(root, "scripts/ports.txt")
+	val .Ok(text) = fs::readFile(listed.toStr()) else return places
+	for line in text.lines() {
+		val written = line.trim()
+		if written.isEmpty() || written.startsWith("#") then
+			continue
+
+		val dir = if written.indexOf(" ") is .Some(at) then written[0..at] else written
+		places.push(dir)
+	}
+	return places
+}
+
+/// What a copy of a program leaves out: its history and what was built,
+/// and a file larger than this, as an image or a sound is, which no check
+/// reads.
+val LEFT_OUT: [str; 3] = [".git", "target", "xcode"]
+val LARGEST_COPIED: i64 = 2 * 1024 * 1024
+
+/// Where the programs are, from the checkout.
+val PLACES: [str; 3] = ["tests/cases/ok", "tests/cases/err", "examples"]
+
+/// The language's keywords, in groups of those near one another in
+/// meaning: one is put in the place of another of its group.
+val KINDRED =
+	"val var|if while when|for in do|break continue return become|true false null|move lend own|fn static|struct enum interface extend type|dyn implicit|is as|then else|pub import extern|keeps empties from|defer assert match"
+
+/// The marks, longest first, as the lexer takes the longest it can.
+val MARKS =
+	"..= :: => -> == != <= >= && || .. += -= *= /= %= & * + - / % ( ) { } [ ] , . : ; = ? ! < > | @"
+
+/// What a mark is put in the place of: a mark, or a lend that writes.
+val MARKED = "& &var * + - ( ) { } [ ] , . : :: ; = == => -> ? ! < > .. ..= | @"
+
+/// What a number is put in the place of: the edges of the types, a float,
+/// and the forms a number is written in.
+val NUMBERS =
+	"0 1 -1 2 255 256 65536 2147483648 9223372036854775807 9223372036854775808 18446744073709551616 1.5 0.0 1e308 0x10 0b1 1_000"
+
+/// What a text or a character is put in the place of.
+val QUOTED: [str; 6] = ["\"\"", "\"a\"", "\"\\(0)\"", "'a'", "b'a'", "\"\"\"\n\ta\n\t\"\"\""]
+
+/// What a token of a program is, as far as changing it goes.
+pub enum Class {
+	/// Space and comments, kept as they are and never changed.
+	Blank
+	Name
+	Keyword
+	Number
+	/// A text or a character, its quotes with it.
+	Quoted
+	Mark
+}
+
+@derive(Clone)
+pub struct Token {
+	text: String
+	class: Class
+}
+
+/// A program changed: its directory, its files of Wip, which are changed,
+/// read once, and the files it has besides, copied once.
+struct Program {
+	/// Its directory from the checkout, which names it:
+	/// `tests/cases/ok/252_constants_run`.
+	name: String
+	/// Its files of Wip but its tests', named from its directory, and what
+	/// each holds.
+	sources: Vec<(String, String)>
+	/// Where it is checked: its copy, under the work's `mutants`.
+	copy: String
+}
+
+/// A program as one round changed it: which of its files, how, and what
+/// the file holds then.
+struct Mutant {
+	program: i64
+	file: i64
+	text: String
+	changes: Vec<String>
+	/// Where each change was made, its line and character, from 0.
+	places: Vec<(i64, i64)>
+}
+
+/// How a check ended.
+enum Verdict {
+	Accepted
+	/// Refused, by the error named first.
+	Refused(code: String)
+	/// A finding: what kind, for keeping the same one while it is made
+	/// smaller, and all the check said.
+	Failed(kind: String, said: String)
+}
+
+/// What the rounds found, counted.
+pub struct Mutated {
+	pub checked: i64 = 0
+	pub accepted: i64 = 0
+	pub refused: i64 = 0
+	/// The programs refused, by the code of the error each names first.
+	pub codes: Map<String, i64> = Map()
+	/// The findings kept, one of each kind.
+	pub findings: i64 = 0
+	/// The findings of a kind kept already, which are counted and not kept.
+	pub again: i64 = 0
+	/// The accepted changes built and run, and the changes formatted and
+	/// asked of the language server.
+	pub run: i64 = 0
+	pub formatted: i64 = 0
+	pub asked: i64 = 0
+}
+
+/// What a change of a program came to: the check's verdict, and every stage
+/// that failed, the check's among them.
+struct Examined {
+	verdict: Verdict
+	faults: Vec<Fault>
+	run: bool
+	formatted: bool
+}
+
+/// The change `mutant` of `program`, its copy holding it: checked; where it
+/// is accepted, built and run; and formatted.
+fn examined(wip: str, program: &Program, mutant: &Mutant): Examined = {
+	val entry = path::join(program.copy, "main.wip")
+	val verdict = checked(wip, entry)
+	var faults: Vec<Fault> = Vec()
+	if verdict is .Failed(kind, said) then
+		faults.push(Fault(stage: .Checked, kind: kind.clone(), said: said.clone()))
+
+	var run = false
+	if verdict is .Accepted && runnable(&program) {
+		run = true
+		if ran(wip, entry) is .Some((kind, said)) then
+			faults.push(Fault(stage: .Ran, kind:, said:))
+	}
+	val file = path::join(program.copy, program.sources[mutant.file].0)
+	if formatted(wip, file, mutant.text) is .Some((kind, said)) then
+		faults.push(Fault(stage: .Formatted, kind:, said:))
+
+	return Examined(verdict:, faults:, run:, formatted: true)
+}
+
+/// The kind of failure `stage` comes to on the program `program`, the file
+/// `file` of its copy holding `text`, where it fails.
+fn failureAt(
+	wip: str,
+	program: &Program,
+	file: i64,
+	text: str,
+	stage: Stage,
+): Result<Option<String>, String> = {
+	placed(&program, file, text)?
+	val entry = path::join(program.copy, "main.wip")
+	val found: Option<String> = match stage {
+		.Checked => match checked(wip, entry) {
+			.Failed(kind, ..) => kind
+			_ => .None
+		}
+		.Ran => match checked(wip, entry) {
+			.Accepted => ran(wip, entry).map((found) => found.0)
+			_ => .None
+		}
+		// What the server was asked of is where the change was, which a
+		// line left out moves: such a finding is kept as it was found.
+		.Asked => .None
+		.Formatted => formatted(
+			wip,
+			path::join(program.copy, program.sources[file].0),
+			text,
+		).map((found) => found.0)
+	}
+	return found
+}
+
+/// `rounds` rounds from seed `first`, each changing every program of the
+/// checkout at `root` once and checking it with `wip`, in `work`; what they
+/// found, or why they could not be run.
+pub fn mutating(
+	wip: str,
+	root: str,
+	work: str,
+	first: u64,
+	rounds: i64,
+	sources: bool,
+): Result<Mutated, String> = {
+	val programs = gathered(root, path::join(work, "mutants").toStr(), sources)?
+	told("mutating for \(wip): \(rounds) rounds of \(programs.len()) programs from seed \(first)")
+	val findings = path::join(work, "findings")
+	var groups = Groups()
+	var tally = Mutated()
+	for round in 0..rounds {
+		val seed = first + round as u64
+		val mutants: Vec<Mutant> = [
+			for index in 0..programs.len() do
+				yield mutant(&programs[index], index, seed)
+		]
+		for mutant in mutants do
+			placed(&programs[mutant.program], mutant.file, mutant.text)?
+
+		val indices: Vec<i64> = [
+			for index in 0..programs.len() do
+				yield index
+		]
+		val examinations = future::map(&indices, (index) => examined(
+			wip,
+			&programs[index],
+			&mutants[index],
+		))
+		var failed = 0
+		for index in 0..examinations.len() {
+			val examination = &examinations[index]
+			tally.checked += 1
+			if examination.run then
+				tally.run += 1
+
+			if examination.formatted then
+				tally.formatted += 1
+
+			match examination.verdict {
+				.Accepted => tally.accepted += 1
+				.Refused(code) => {
+					tally.refused += 1
+					tally.codes.put(code.clone(), tally.codes.get(&code).unwrapOr(0) + 1)
+				}
+				.Failed(..) => {}
+			}
+			for fault in examination.faults {
+				failed += 1
+				val program = &programs[index]
+				val key = keyOf("\(fault.stage.named()): \(fault.kind)")
+				if groups.again(key) {
+					told("seed \(seed), \(program.name): \(fault.kind), found before")
+					tally.again += 1
+					continue
+				}
+				val dir = keptFault(wip, &program, &mutants[index], seed, &fault, findings.toStr())?
+				groups.first(key, dir)
+				tally.findings += 1
+			}
+			// What making a finding smaller left in the copy, the next stage
+			// does not see: the change is put back.
+			placed(&programs[index], mutants[index].file, mutants[index].text)?
+		}
+		// The language server, asked of an eighth of the changes, a different
+		// eighth each round, as opening a file checks its whole program: a
+		// server for each share of them, as many as there are processors.
+		val asking: Vec<i64> = [
+			for index in 0..programs.len() do
+				if (index as u64) % ASKED_EVERY == seed % ASKED_EVERY then
+					yield index
+		]
+		val shareCount = future::cores()
+		val shares: Vec<Vec<i64>> = [
+			for share in 0..shareCount do
+				yield [
+					for at in 0..asking.len() do
+						if at % shareCount == share then
+							yield asking[at]
+				]
+		]
+		val answers = future::map(&shares, (share) => askedAbout(wip, &programs, &mutants, &share))
+		tally.asked += asking.len()
+		for faults in answers {
+			for (index, kind, said) in faults {
+				failed += 1
+				val program = &programs[index]
+				val key = keyOf("asked: \(kind)")
+				if groups.again(key) {
+					told("seed \(seed), \(program.name): \(kind), found before")
+					tally.again += 1
+					continue
+				}
+				val fault = Fault(stage: .Asked, kind: kind.clone(), said: said.clone())
+				val dir = keptFault(wip, &program, &mutants[index], seed, &fault, findings.toStr())?
+				groups.first(key, dir)
+				tally.findings += 1
+				placed(&programs[index], mutants[index].file, mutants[index].text)?
+			}
+		}
+		// The next round changes the programs as they are.
+		for mutant in mutants do
+			placed(
+				&programs[mutant.program],
+				mutant.file,
+				programs[mutant.program].sources[mutant.file].1,
+			)?
+
+		told("seed \(seed): \(programs.len()) programs, \(failed) failed when checked, built and run, formatted or asked")
+	}
+	groups.summarized(findings)
+	return tally
+}
+
+/// Every program at `root`'s places, sorted by name so that a seed changes
+/// the same ones the same way, each copied under `copies`.
+fn gathered(root: str, copies: str, sources: bool): Result<Vec<Program>, String> = {
+	var programs: Vec<Program> = Vec()
+	if sources {
+		for place in sourcesOf(root) {
+			val from = path::join(root, place)
+			if !fs::exists(path::join(from, "main.wip")) then
+				continue
+
+			val copy = path::join(copies, "\(programs.len())")
+			programs.push(copied(place, from.toStr(), copy.toStr())?)
+		}
+	}
+	for place in PLACES {
+		val dir = path::join(root, place)
+		var names: Vec<String> = match fs::readDir(dir) {
+			.Ok(entries) => [
+				for entry in entries do
+					if entry.isDirectory() then
+						yield entry.name.clone()
+			]
+			.Err(error) => return .Err("cannot read `\(dir)`: \(error)")
+		}
+		names.sortBy((a, b) => a < b)
+		for name in names {
+			val from = path::join(dir, name)
+			if !fs::exists(path::join(from, "main.wip")) then
+				continue
+
+			val copy = path::join(copies, "\(programs.len())")
+			programs.push(copied(path::join(place, name).toStr(), from.toStr(), copy.toStr())?)
+		}
+	}
+	return programs
+}
+
+/// The program in `from`, its files copied to `copy` but its snapshots,
+/// and its sources read.
+fn copied(name: str, from: str, copy: str): Result<Program, String> = {
+	val entries = match fs::walk(from, (entry) => !LEFT_OUT.contains(path::name(entry.name))) {
+		.Ok(entries) => entries
+		.Err(error) => return .Err("cannot read `\(from)`: \(error)")
+	}
+	var sources: Vec<(String, String)> = Vec()
+	for entry in entries {
+		if entry.isDirectory() || entry.name.endsWith(".snap") || entry.name.endsWith(".snap.new") {
+			continue
+		}
+		val size = fs::meta(path::join(from, entry.name)).map((meta) => meta.size).unwrapOr(0)
+		if size > LARGEST_COPIED then
+			continue
+
+		val to = path::join(copy, entry.name)
+		if fs::makeDirs(path::parent(to)) is .Err(error) then
+			return .Err("cannot make the directory of `\(to)`: \(error)")
+
+		if fs::copy(path::join(from, entry.name), to) is .Err(error) then
+			return .Err("cannot copy `\(entry.name)` of `\(from)`: \(error)")
+
+		if entry.name.endsWith(".wip") && !entry.name.endsWith(".test.wip") {
+			// A file that is not text is a case of the lexer's, which is
+			// checked as it is.
+			if fs::readFile(to) is .Ok(text) then
+				sources.push((entry.name.clone(), text))
+		}
+	}
+	// The file checked first, as most changes are to it.
+	sources.sortBy((a, b) =>
+		if (a.0 == "main.wip") != (b.0 == "main.wip") then a.0 == "main.wip" else a.0 < b.0)
+	return Program(name:, sources:, copy:)
+}
+
+/// The file `file` of `program`'s copy, holding `text`.
+fn placed(program: &Program, file: i64, text: str): Result<void, String> = {
+	val to = path::join(program.copy, program.sources[file].0)
+	if fs::writeFile(to, text) is .Err(error) then
+		return .Err("cannot write `\(to)`: \(error)")
+
+	return
+}
+
+/// The program `index` as seed `seed` changes it: its first file most often,
+/// in one to three places.
+fn mutant(program: &Program, index: i64, seed: u64): Mutant = {
+	var random = Random::seeded(seed * 4096 + index as u64)
+	val count = program.sources.len()
+	val file = if count == 1 || random.below(3) > 0 then 0 else random.below(count)
+	var tokens = tokens(program.sources[file].1)
+	var places: Vec<(i64, i64)> = Vec()
+	val changes: Vec<String> = [
+		for _ in 0..1 + random.below(3) do
+			if changed(&var tokens, &var random, &var places) is .Some(change) then
+				yield change
+	]
+
+	return Mutant(program: index, file:, text: joined(&tokens), changes:, places:)
+}
+
+/// Where the token `at` of `tokens` begins: its line and its character in
+/// the line, from 0, as the language server is asked about a place.
+fn placeOf(tokens: &[Token], at: i64): (i64, i64) = {
+	var line = 0
+	var character = 0
+	for index in 0..at {
+		val text = tokens[index].text.toStr()
+		for i in 0..text.len() {
+			val byte = byteAt(text, i)
+			// A line's end, or a character's first byte, not one that
+			// continues it.
+			if byte == b'\n' {
+				line += 1
+				character = 0
+			} else if byte & 0xC0 != 0x80 then
+				character += 1
+		}
+	}
+	return (line, character)
+}
+
+/// One token of `tokens` changed: dropped, doubled, swapped with the next,
+/// or put in the place of another of its kind; what was done, and where.
+fn changed(
+	tokens: &var Vec<Token>,
+	random: &var Random,
+	places: &var Vec<(i64, i64)>,
+): Option<String> = {
+	val solid: Vec<i64> = [
+		for index in 0..tokens.len() do
+			if tokens[index].class != .Blank then
+				yield index
+	]
+	if solid.isEmpty() then
+		return .None
+
+	val pick = random.below(solid.len())
+	val at = solid[pick]
+	val text = tokens[at].text.clone()
+	places.push(placeOf(&tokens, at))
+	val line =
+		1 +
+		(
+			for index in 0..at do
+				yield tokens[index].text.split("\n").count() - 1
+		).sum()
+	// Mostly a token put in the place of another of its kind, which more
+	// often parses, and is the checker's to judge.
+	return match random.below(10) {
+		0 | 1 => {
+			tokens.remove(at)
+			"`\(text)` dropped, at line \(line)"
+		}
+		2 => {
+			val again = tokens[at].clone()
+			tokens.insert(at, again)
+			"`\(text)` doubled, at line \(line)"
+		}
+		3 | 4 => {
+			if pick + 1 >= solid.len() then
+				return .None
+
+			val next = solid[pick + 1]
+			val after = tokens[next].clone()
+			tokens[next] = tokens[at].clone()
+			tokens[at] = after
+			"`\(text)` and `\(tokens[at].text)` swapped, at line \(line)"
+		}
+		_ => {
+			val with = replacement(&tokens, at, &var random)
+			val class = tokens[at].class
+			tokens[at] = Token(text: with.clone(), class:)
+			"`\(text)` made `\(with)`, at line \(line)"
+		}
+	}
+}
+
+/// What the token `at` of `tokens` is changed into: another of its kind.
+fn replacement(tokens: &[Token], at: i64, random: &var Random): String = {
+	val text = tokens[at].text.toStr()
+	return match tokens[at].class {
+		.Name => {
+			val names: Vec<str> = [
+				for token in tokens do
+					if token.class == .Name then
+						yield token.text.toStr()
+			]
+			names[random.below(names.len())]
+		}
+		.Keyword => {
+			for group in KINDRED.split("|") {
+				val words: Vec<str> = [
+					for word in group.split(" ") do
+						yield word
+				]
+				if words.contains(&text) then
+					return words[random.below(words.len())]
+			}
+			text
+		}
+		.Number => one(NUMBERS, &var random)
+		.Quoted => QUOTED[random.below(QUOTED.len())]
+		_ => one(MARKED, &var random)
+	}
+}
+
+/// One of the words of `words`, chosen by `random`.
+fn one(words: str, random: &var Random): String = {
+	val all: Vec<str> = [
+		for word in words.split(" ") do
+			yield word
+	]
+	return all[random.below(all.len())]
+}
+
+/// `source` cut into tokens, roughly as the lexer cuts it: enough to change
+/// one where it is, with nothing lost, so that the tokens put together are
+/// `source` again. A run of bytes past ASCII is part of a name, so a token
+/// begins and ends where a character does.
+pub fn tokens(source: str): Vec<Token> = {
+	var out: Vec<Token> = Vec()
+	val end = source.len()
+	var at = 0
+	while at < end {
+		val start = at
+		val first = byteAt(source, at)
+		var class = Class::Mark
+		if isBlank(first) {
+			class = .Blank
+			while at < end && isBlank(byteAt(source, at)) do
+				at += 1
+		} else if source[at..end].startsWith("//") {
+			class = .Blank
+			while at < end && byteAt(source, at) != b'\n' do
+				at += 1
+		} else if first.isDigit() {
+			class = .Number
+			while at < end && (isWordByte(byteAt(source, at)) || isFraction(source, at)) do
+				at += 1
+		} else if isWordByte(first) {
+			while at < end && isWordByte(byteAt(source, at)) do
+				at += 1
+
+			class = if isKeyword(source[start..at]) then Class::Keyword else Class::Name
+		} else if source[at..end].startsWith("\"\"\"") {
+			class = .Quoted
+			at = match source[at + 3..end].indexOf("\"\"\"") {
+				.Some(offset) => at + 3 + offset + 3
+				.None => end
+			}
+		} else if first == b'"' || first == b'\'' {
+			class = .Quoted
+			at = quoteEnd(source, at)
+		} else
+			at += markLength(source[at..end])
+
+		out.push(Token(text: source[start..at], class:))
+	}
+	return out
+}
+
+/// The tokens put together again, with a space between two words that
+/// would otherwise run into one.
+pub fn joined(tokens: &[Token]): String = {
+	var out = String()
+	for token in tokens {
+		if !out.isEmpty() &&
+			!token.text.isEmpty() &&
+			isWordByte(byteAt(out, out.len() - 1)) &&
+			isWordByte(byteAt(token.text, 0)) {
+			out.push(" ")
+		}
+		out.push(token.text)
+	}
+	return out
+}
+
+fn byteAt(text: str, at: i64): u8 = text.get(at).unwrapOr(0)
+
+fn isBlank(byte: u8): bool = byte == b' ' || byte == b'\t' || byte == b'\n' || byte == b'\r'
+
+/// A byte of a name or a number: a letter, a digit, `_`, or one of a
+/// character past ASCII.
+fn isWordByte(byte: u8): bool = byte.isAsciiAlphanumeric() || byte == b'_' || byte >= 128
+
+/// Whether the `.` at `at` is a number's, with a digit after it, and not a
+/// range's.
+fn isFraction(text: str, at: i64): bool = byteAt(text, at) == b'.' && byteAt(text, at + 1).isDigit()
+
+fn isKeyword(word: str): bool = {
+	for group in KINDRED.split("|") {
+		for keyword in group.split(" ") do
+			if keyword == word then
+				return true
+	}
+
+	return false
+}
+
+/// Where the text or character that begins at `at` ends: after its closing
+/// quote, the line's end for a character never closed, or the source's.
+fn quoteEnd(source: str, at: i64): i64 = {
+	val quote = byteAt(source, at)
+	var index = at + 1
+	while index < source.len() {
+		val byte = byteAt(source, index)
+		if byte == b'\\' then
+			index += 2
+		else if byte == quote then
+			return index + 1
+		else if byte == b'\n' && quote == b'\'' then
+			return index
+		else
+			index += 1
+	}
+	return source.len()
+}
+
+/// How long the mark at the start of `rest` is: the longest of `MARKS` it
+/// starts with, or one byte.
+fn markLength(rest: str): i64 = {
+	for mark in MARKS.split(" ") do
+		if rest.startsWith(mark) then
+			return mark.len()
+
+	return 1
+}
+
+/// How `wip check` ended on `entry`, given the time a check has.
+fn checked(wip: str, entry: str): Verdict = {
+	val ran = Command::of("/bin/sh").arg("-c")
+		.arg("ulimit -t \(CHECK_SECONDS); exec \"$0\" check --color never --threads 1 \"$1\"")
+		.arg(wip)
+		.arg(entry)
+		.output()
+	val output = match move ran {
+		.Ok(output) => output
+		.Err(error) => return .Failed(kind: "not started", said: "\(error)")
+	}
+	val said = "\(output.stdout)\(output.stderr)"
+	return match output.exit {
+		.Code(0) => Verdict::Accepted
+		.Code(1) => match codeOf(said) {
+			.Some(code) => .Refused(code:)
+			.None => .Failed(kind: "refused without an error's code", said:)
+		}
+		.Code(101) => .Failed(kind: "a panic: \(panicOf(said))", said:)
+		.Signal(signal) if signal == OUT_OF_TIME => .Failed(
+			kind: "it did not end in the time a check has",
+			said:,
+		)
+		ended => .Failed(kind: "\(ended)", said:)
+	}
+}
+
+/// The code of the first error `said` names, as `[E0101] Error` names
+/// it; a warning's is passed over.
+fn codeOf(said: str): Option<String> = {
+	var rest = said
+	while rest.indexOf("[E") is .Some(at) {
+		val digits = rest[at + 2..rest.len()]
+		var count = 0
+		while byteAt(digits, count).isDigit() do
+			count += 1
+
+		if count > 0 && digits[count..digits.len()].startsWith("] Error") then
+			return "E\(digits[0..count])"
+
+		rest = digits
+	}
+	return .None
+}
+
+/// What a panic says, and where it was: its message's line, the first
+/// place it names in the compiler's own code — not the library's, where
+/// many panics share a line, as every index out of bounds does — and the
+/// first function of the compiler that called the one there, as one helper
+/// is called from many places, each a panic of its own.
+fn panicOf(said: str): String = {
+	val lines: Vec<str> = [
+		for line in said.lines() do
+			yield line.trim()
+	]
+	for index in 0..lines.len() {
+		val .Some(message) = lines[index].stripPrefix("panicked: ") else continue
+		var place = ""
+		var function = ""
+		var caller = ""
+		for at in index + 1..lines.len() {
+			val line = lines[at]
+			if !line.startsWith("at ") && !line.startsWith("in ") then
+				break
+
+			if !line.contains("compiler/") then
+				continue
+
+			if place.isEmpty() then
+				place = line
+
+			val .Some(call) = line.stripPrefix("in ") else continue
+			val name = call.splitOnce(" (").map((parts) => parts.0).unwrapOr(call)
+			if function.isEmpty() then
+				function = name
+			else if name != function {
+				caller = call
+				break
+			}
+		}
+		return if caller.isEmpty() then "\(message), \(place)"
+		else "\(message), \(place), from \(caller)"
+	}
+	return firstLine(said)
+}
+
+/// A finding made as small as it stays one — the changed file's lines left
+/// out, many at a time and then one at a time, where the stage that failed
+/// fails the same way without them — and kept in `findings`: the program as
+/// it is then, and what was found.
+fn keptFault(
+	wip: str,
+	program: &Program,
+	mutant: &Mutant,
+	seed: u64,
+	fault: &Fault,
+	findings: str,
+): Result<String, String> = {
+	val kind = fault.kind.toStr()
+	val said = fault.said.toStr()
+	told("seed \(seed), \(program.name): \(kind); making it smaller")
+	var lines: Vec<String> = [
+		for line in mutant.text.split("\n") do
+			yield line
+	]
+	var chunk = lines.len() / 2
+	while chunk >= 1 {
+		var start = lines.len() - chunk
+		while start >= 0 {
+			val trial: Vec<String> = [
+				for index in 0..lines.len() do
+					if index < start || index >= start + chunk then
+						yield lines[index].clone()
+			]
+			val again = failureAt(wip, &program, mutant.file, trial.join("\n"), fault.stage)?
+			if again is .Some(found) && keyOf(found) == keyOf(kind) then
+				lines = trial
+
+			start -= chunk
+		}
+		chunk /= 2
+	}
+	val small = lines.join("\n")
+	placed(&program, mutant.file, small)?
+	val dir = path::join(findings, "mutate-\(fault.stage.named())-\(seed)-\(program.name.replace("/", "-"))")
+	if fs::makeDirs(dir) is .Err(error) then
+		return .Err("cannot make `\(dir)`: \(error)")
+
+	// The program as its copy holds it now, the file changed made small.
+	val entries = match fs::walk(program.copy) {
+		.Ok(entries) => entries
+		.Err(error) => return .Err("cannot read `\(program.copy)`: \(error)")
+	}
+	for entry in entries {
+		// What the run of a change built is not the program's.
+		if entry.isDirectory() || entry.name.startsWith("mutant") then
+			continue
+
+		val to = path::join(dir, entry.name)
+		if fs::makeDirs(path::parent(to)) is .Err(error) then
+			return .Err("cannot make the directory of `\(to)`: \(error)")
+
+		if fs::copy(path::join(program.copy, entry.name), to) is .Err(error) then
+			return .Err("cannot copy `\(entry.name)`: \(error)")
+	}
+	val found = path::join(dir, "found.txt")
+	val changes = mutant.changes.join("\n")
+	val file = program.sources[mutant.file].0.toStr()
+	val text = "\(kind)\n\n\(program.name), seed \(seed): in `\(file)`,\n\(changes)\n\nmade \(lines.len()) lines of \(mutant.text.split("\n").count())\n\n\(said)"
+	if fs::writeFile(found, text) is .Err(error) then
+		return .Err("cannot write `\(found)`: \(error)")
+
+	told("  kept in \(dir): \(lines.len()) lines")
+	return dir
+}

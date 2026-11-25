@@ -114,7 +114,7 @@ if (Ran $wip @('build', '--release', 'tests\gate\main.wip', '-o', "$out\gate.exe
 }
 
 $step = Get-Date
-if (Ran $wip @('fmt', '--check', 'std', 'tests\std', 'tests\gate', 'examples', 'tools\bindgen', 'compiler') "$out\wip-fmt") {
+if (Ran $wip @('fmt', '--check', 'std', 'tests\std', 'tests\gate', 'tests\fuzz', 'examples', 'tools\bindgen', 'compiler') "$out\wip-fmt") {
 	Say 'wip fmt' 'ok' $step
 } else {
 	Say 'wip fmt' 'FAILED' $step; Get-Content "$out\wip-fmt"; $failed = $true

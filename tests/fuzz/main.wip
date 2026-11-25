@@ -1,0 +1,408 @@
+// The checker's fuzzer: cases generated in the thousands, each a test of
+// values that own memory moved, lent, viewed, changed and ended in
+// branches and loops; those the `wip` under test accepts are run with
+// every check a program has — its moves, its leaks, and its memory, by the
+// address sanitizer — in a debug build and a release one, which must print
+// the same; and a case that is accepted and then fails one is a finding,
+// as is a compiler that ends without saying why it refused. Each finding is
+// made as small as it stays one, and kept with its seed.
+//
+//     wip build --release tests/fuzz/main.wip -o target/fuzz
+//     target/fuzz target/wip/bin/wip --rounds 20
+//
+// A round is one batch, built once. The same seed writes the same cases,
+// so a finding is found again by its round's seed.
+
+import std::args::{ArgumentError, Arguments}
+import std::collections::{Map}
+import std::fs
+import std::io
+import std::path
+import std::random::{Random}
+
+val USAGE = """
+	usage: target/fuzz <wip> [--rounds N] [--cases N] [--seed N] [--risk R] [--work DIR] [--verbose] [--guard]
+	       target/fuzz <wip> --mutate [--sources] [--rounds N] [--seed N] [--work DIR]
+	       target/fuzz <wip> --engines [--rounds N] [--cases N] [--seed N] [--work DIR]
+
+	Generates cases for the checker, builds them with the `wip` it is given,
+	and runs those it accepts with their moves, their leaks and freed memory
+	checked. With `--mutate`, changes each program of the checkout it is run
+	in — the language's cases and the examples — in a few places each round,
+	and checks it with `wip check`, which must accept it or refuse it with
+	an error's code. With `--engines`, writes functions of numbers and works
+	each out while the program is compiled and as it runs, in a debug build
+	and a release one, which must all answer the same.
+
+	  --rounds N   how many batches, 10 unless said
+	  --cases N    how many cases a batch holds, 200 unless said
+	  --seed N     the first round's seed; each round's is the one before
+	               and one, and a seed of the clock's unless said
+	  --risk R     how often a choice ignores what is sound, 0.08 unless said
+	  --work DIR   where batches are built and findings kept, target/fuzz
+	  --verbose    print each refusal, with the case it refused
+	  --guard      check memory with Guard Malloc, on a Mac, rather than the
+	               address sanitizer, which sees the stack too
+	  --mutate     check the checkout's programs, changed, rather than run
+	               cases generated
+	  --engines    compare the evaluator with both builds, on functions of
+	               numbers
+	  --sources    with `--mutate`, change the tool's and the ports' programs
+	               too, where they are beside the checkout
+	  -h, --help   print this
+	"""
+
+struct Asked {
+	wip: String = String()
+	rounds: i64 = 10
+	cases: i64 = 200
+	seed: Option<u64> = .None
+	risk: f64 = 0.08
+	work: String = "target/fuzz"
+	verbose: bool = false
+	guard: bool = false
+	mutate: bool = false
+	engines: bool = false
+	sources: bool = false
+}
+
+fn asked(args: &[cstring]): Result<Option<Asked>, ArgumentError> = {
+	var asked = Asked()
+	var arguments = Arguments::of(&args)
+	while arguments.next()? is .Some(argument) {
+		match argument {
+			.Long("rounds") => asked.rounds = number(arguments.value()?)?
+			.Long("cases") => asked.cases = number(arguments.value()?)?
+			.Long("seed") => asked.seed = number(arguments.value()?)? as u64
+			.Long("risk") => {
+				val text = arguments.value()?
+				asked.risk = match text.toFloat() {
+					.Ok(risk) => risk
+					.Err(_) => return .Err(.UnexpectedArgument(text:))
+				}
+			}
+			.Long("work") => asked.work = arguments.value()?
+			.Long("verbose") => asked.verbose = true
+			.Long("guard") => asked.guard = true
+			.Long("mutate") => asked.mutate = true
+			.Long("engines") => asked.engines = true
+			.Long("sources") => asked.sources = true
+			.Short('h') | .Long("help") => return .Ok(.None)
+			.Positional(text) if asked.wip.isEmpty() => asked.wip = text
+			_ => return .Err(argument.unexpected())
+		}
+	}
+	return .Ok(asked)
+}
+
+fn number(text: String): Result<i64, ArgumentError> = match text.toInt() {
+	.Ok(value) if value >= 0 => value
+	_ => .Err(.UnexpectedArgument(text:))
+}
+
+/// What the rounds found, counted.
+struct Tally {
+	generated: i64 = 0
+	accepted: i64 = 0
+	passed: i64 = 0
+	/// The cases refused, by the error's code.
+	refused: Map<String, i64> = Map()
+	/// What failed, by kind.
+	groups: Groups = Groups()
+}
+
+fn main(args: &[cstring]): i64 = {
+	val asked = match asked(&args) {
+		.Ok(.Some(asked)) => asked
+		.Ok(.None) => {
+			io::println(USAGE)
+			return 0
+		}
+		.Err(error) => {
+			io::eprintln("error: \(error)")
+			io::eprintln(USAGE)
+			return 2
+		}
+	}
+	if asked.wip.isEmpty() {
+		io::eprintln(USAGE)
+		return 2
+	}
+	val wip = match fs::realPath(asked.wip) {
+		.Ok(path) => path
+		.Err(error) => {
+			io::eprintln("error: `\(asked.wip)`: \(error)")
+			return 2
+		}
+	}
+	val first = match asked.seed {
+		.Some(seed) => seed
+		.None => Random::fromEntropy().next() >> 16
+	}
+	if asked.engines {
+		val engined = match enginesRun(
+			wip,
+			asked.work,
+			first,
+			asked.rounds,
+			asked.cases,
+			asked.verbose,
+		) {
+			.Ok(engined) => engined
+			.Err(error) => {
+				io::eprintln("error: \(error)")
+				return 2
+			}
+		}
+		told("\(engined.generated) cases: \(engined.accepted) accepted, \(engined.passed) agreed, \(engined.panicked) panicked alike, \(engined.findings) findings, \(engined.again) found again")
+		refusedBy(&engined.refused)
+		return if engined.findings > 0 then 1 else 0
+	}
+	if asked.mutate {
+		val mutated = match mutating(wip, ".", asked.work, first, asked.rounds, asked.sources) {
+			.Ok(mutated) => mutated
+			.Err(error) => {
+				io::eprintln("error: \(error)")
+				return 2
+			}
+		}
+		told("\(mutated.checked) checked: \(mutated.accepted) accepted, \(mutated.refused) refused, \(mutated.findings) findings, \(mutated.again) found again; \(mutated.run) built and run, \(mutated.formatted) formatted, \(mutated.asked) asked of the language server")
+		refusedBy(&mutated.codes)
+		return if mutated.findings > 0 then 1 else 0
+	}
+	val bench = Bench::of(wip.clone(), path::join(asked.work, "batch"), asked.guard)
+	val findings = path::join(asked.work, "findings")
+	told("fuzzing \(wip): \(asked.rounds) rounds of \(asked.cases) cases from seed \(first), risk \(asked.risk), memory checked by \(bench.memory())")
+	var tally = Tally()
+	for round in 0..asked.rounds {
+		val seed = first + round as u64
+		if !fuzzed(&bench, seed, &asked, findings.toStr(), &var tally) then
+			return 2
+	}
+	val kinds = tally.groups.kinds()
+	io::println("\(tally.generated) cases: \(tally.accepted) accepted, \(tally.passed) passed, \(kinds) findings, \(tally.groups.found() - kinds) found again")
+	refusedBy(&tally.refused)
+	tally.groups.summarized(findings)
+	return if kinds > 0 then 1 else 0
+}
+
+/// How many were refused by each error's code, the most first, where any
+/// were.
+fn refusedBy(codes: &Map<String, i64>) = {
+	var counted: Vec<(String, i64)> = [
+		for entry in codes do
+			yield (entry.key.clone(), entry.value)
+	]
+	counted.sortBy((a, b) => b.1 < a.1)
+	val said = counted.map((entry) => "\(entry.0) \(entry.1)").join(", ")
+	if !said.isEmpty() then
+		io::println("refused: \(said)")
+}
+
+/// One round: its batch generated from `seed`, built, and run. False where
+/// the bench itself failed, which ends the run.
+fn fuzzed(bench: &Bench, seed: u64, asked: &Asked, findings: str, tally: &var Tally): bool = {
+	val count = asked.cases
+	var generator = Generator::new(seed, asked.risk)
+	val bodies: Vec<Vec<Stmt>> = [
+		for _ in 0..count do
+			yield generator.case()
+	]
+
+	tally.generated += count
+	// The cases still in the batch, by their place in `bodies`.
+	var kept: Vec<i64> = [
+		for index in 0..count do
+			yield index
+	]
+	var exe = String()
+	var release = String()
+	for attempt in 0..20 {
+		val written: Vec<Written> = [
+			for index in kept do
+				yield Written(name: "case\(index)", text: rendered("case\(index)", &bodies[index]))
+		]
+		match bench.built(WORLD, &written) {
+			.Runner(exe: runner, release: released) => {
+				exe = runner
+				release = released
+				break
+			}
+			.Refused(refusals) => {
+				var out: Vec<i64> = Vec()
+				for refusal in refusals {
+					val .Some(at) = refusal.case else {
+						io::eprintln("seed \(seed): the generator wrote what is refused outside a case:\n\(refusal.said)")
+						return false
+					}
+					if !out.contains(&at) {
+						out.push(at)
+						if asked.verbose then
+							io::println("refused case\(kept[at]):\n\(refusal.said)\n\(rendered("case\(kept[at])", &bodies[kept[at]]))")
+
+						tally.refused.atOrPut(refusal.code.clone(), 0) += 1
+					}
+				}
+				val left: Vec<i64> = [
+					for place in 0..kept.len() do
+						if !out.contains(&place) then
+							yield kept[place]
+				]
+
+				kept = left
+			}
+			.Crashed(said) => {
+				val .Some(place) = crashing(&bench, &bodies, &kept) else {
+					io::eprintln("seed \(seed): the compiler fails on the batch, and on no case of it alone:\n\(said)")
+					return false
+				}
+				val index = kept[place]
+				val key = keyOf("the compiler fails: \(panicOf(said))")
+				if tally.groups.again(key) then
+					told("seed \(seed), case \(index): the compiler fails, found before")
+				else {
+					val dir = found(&bench, findings, seed, index, &bodies[index], .Compiler(
+						said: firstLines(&said),
+					))
+					tally.groups.first(key, dir)
+				}
+
+				kept.remove(place)
+			}
+			.Unlinked(said) => {
+				io::eprintln("seed \(seed): the runner does not link:\n\(said)")
+				return false
+			}
+		}
+		if attempt == 19 {
+			io::eprintln("seed \(seed): the batch is still refused after 20 builds")
+			return false
+		}
+	}
+	tally.accepted += kept.len()
+	var failed: Vec<(i64, Outcome)> = Vec()
+	for index in kept {
+		val outcome = bench.judged(exe, release, "case\(index)")
+		if outcome is .Passed then
+			tally.passed += 1
+		else
+			failed.push((index, outcome))
+	}
+	// The batch as it was run, which making a finding smaller writes over:
+	// each failure is of the kind it is and at the statement it names.
+	val batch = fs::readFile(path::join(bench.dir, "cases.test.wip")).unwrapOr(String())
+	for (index, outcome) in failed {
+		val kind = outcome.kind()
+		val statement = statementNamed(outcome.said(), batch)
+		val named =
+			if statement.isEmpty() then kind.clone() else "\(kind), at `\(formOf(statement))`"
+		val key = keyOf(named)
+		if tally.groups.again(key) {
+			told("seed \(seed), case \(index): \(kind), found before")
+			continue
+		}
+		val dir = found(&bench, findings, seed, index, &bodies[index], .Run(
+			kind:,
+			said: outcome.said(),
+		))
+		tally.groups.first(key, dir)
+	}
+	told("seed \(seed): \(count) cases, \(kept.len()) accepted, \(failed.len()) failed when run")
+	return true
+}
+
+fn firstLines(text: str): String = {
+	var out = String()
+	var count = 0
+	for line in text.lines() {
+		if count == 30 then
+			break
+
+		out.push(line)
+		out.push("\n")
+		count += 1
+	}
+	return out
+}
+
+/// The case of `kept`, by its place there, that the compiler fails on
+/// alone; nothing where it fails on none alone.
+fn crashing(bench: &Bench, bodies: &[Vec<Stmt>], kept: &[i64]): Option<i64> = {
+	for place in 0..kept.len() {
+		val index = kept[place]
+		if crashes(&bench, &bodies[index]) then
+			return place
+	}
+	return .None
+}
+
+fn crashes(bench: &Bench, body: &[Stmt]): bool =
+	bench.built(WORLD, [Written(name: "case0", text: rendered("case0", &body))]) is .Crashed(_)
+
+/// What a finding is: the compiler failing, or a case accepted and then
+/// failing as it ran, of a kind, and what it said.
+enum Found {
+	Compiler(said: String)
+	Run(kind: String, said: String)
+}
+
+/// The finding of case `index` of `seed`'s round made as small as it stays
+/// the same finding, and kept in `findings`: the world, the case as a test,
+/// and what it found; where it is kept.
+fn found(
+	bench: &Bench,
+	findings: str,
+	seed: u64,
+	index: i64,
+	body: &[Stmt],
+	what: Found,
+): String = {
+	val kind = match what {
+		.Compiler(_) => String::of("the compiler fails")
+		.Run(kind, ..) => kind.clone()
+	}
+	told("seed \(seed), case \(index): \(kind); making it smaller")
+	val small = smallest(&bench, &body, &what)
+	val dir = path::join(findings, "\(seed)-\(index)")
+	if fs::makeDirs(dir) is .Err(error) {
+		io::eprintln("cannot make `\(dir)`: \(error)")
+		return dir
+	}
+	val said = match what {
+		.Compiler(said) => said.clone()
+		.Run(said, ..) => said.clone()
+	}
+	kept(path::join(dir, "main.wip"), WORLD)
+	kept(path::join(dir, "cases.test.wip"), "\(HEADER)\(rendered("case0", &small))")
+	kept(
+		path::join(dir, "found.txt"),
+		"\(kind)\n\nseed \(seed), case \(index), \(counted(&body)) statements, made \(counted(&small))\n\n\(said)",
+	)
+	told("  kept in \(dir): \(counted(&small)) statements of \(counted(&body))")
+	return dir
+}
+
+/// A line of how the run goes, written out at once: where the output is a
+/// file, read while the run goes on, it is not kept back until the end.
+pub fn told(line: str) = {
+	io::println(line)
+	io::flush()
+}
+
+/// `text` written to `path`, or why it could not be.
+fn kept(path: str, text: str) = {
+	if fs::writeFile(path, text) is .Err(error) then
+		io::eprintln("cannot write `\(path)`: \(error)")
+}
+
+/// Whether `body`, built and run alone, is the finding `what` again.
+fn same(bench: &Bench, body: &[Stmt], what: &Found): bool = {
+	val built = bench.built(WORLD, [Written(name: "case0", text: rendered("case0", &body))])
+	return match what {
+		.Compiler(_) => built is .Crashed(_)
+		.Run(kind, ..) => {
+			val .Runner(exe, release) = built else return false
+			bench.judged(exe, release, "case0").kind() == kind
+		}
+	}
+}
