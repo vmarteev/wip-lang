@@ -9,6 +9,7 @@ import syntax::{
 	NEEDLESS_STRING_OF,
 	NEEDLESS_VEC_OF,
 	NEEDLESS_WRAPPER,
+	OWNED_DYN_VIEW,
 	REFERENCE_PASSED_ON,
 	Span,
 	UNSATISFIED_CONSTRAINT
@@ -328,6 +329,36 @@ extend Lowerer {
 			}
 			return self.alloc(.DynRef(value:, interfaceId:), expected, span)
 		}
+		// An owned value becomes an owned `dyn`: the pointer, with the table of
+		// its type's methods, and its type's drop after them.
+		if self.kind(expected) is .Own(target) &&
+			self.kind(target) is .Dyn(interfaceId, args: dynArgs) &&
+			self.kind(actual) is .Own(pointee) &&
+			self.kind(pointee) !is .Dyn(..) {
+			val span = self.state.body.exprs[id].span
+			val wanted = Constraint(interfaceId:, args: dynArgs)
+			if !self.implementsWith(pointee, wanted) {
+				val name = self.constraintName(wanted, pointee)
+				self.report(
+					Diagnostic::error(
+						UNSATISFIED_CONSTRAINT,
+						"\(self.tyName(pointee)) does not implement `\(name)`",
+						span,
+						"`own<dyn \(name)>` expected here",
+					).withNote("a type implements an interface by `extend …: \(name)`"),
+				)
+				return self.errorExpr(span)
+			}
+			if self.program.mayHoldView(pointee) {
+				self.ownedDynView(pointee, span)
+				return self.errorExpr(span)
+			}
+			// Its table's drop is called as any drop function is, whose type
+			// the code generator asks for.
+			val address = self.program.types.internList([PTR_U8])
+			self.intern(.Fn(params: address, ret: UNIT))
+			return self.alloc(.DynOwn(value: id, interfaceId:), expected, span)
+		}
 		// An array on the heap becomes a buffer: its length moves from the type
 		// into the value.
 		if self.kind(expected) is .Own(target) &&
@@ -340,6 +371,27 @@ extend Lowerer {
 		}
 		self.mismatch(id, expected, context)
 		return id
+	}
+
+	/// Reports an owned `dyn` made of a type that holds a view, or may: what
+	/// it borrows would be kept where nothing says what that is.
+	var fn ownedDynView(pointee: Ty, span: Span) = {
+		val name = self.tyName(pointee)
+		val label =
+			if self.program.holdsView(pointee) then "\(name) holds a view"
+			else "\(name) may hold a view, in an instance that makes it one"
+		self.report(
+			Diagnostic::error(
+				OWNED_DYN_VIEW,
+				"an owned `dyn` cannot hold a view",
+				span,
+				label,
+			).withNote(
+				"an owned `dyn` is kept where the type it was made of is no longer known, so nothing would say what a view inside it borrows, or keep that alive",
+			).withHelp(
+				"own what the view reads, or lend it as a `&dyn` for the call that needs it",
+			),
+		)
 	}
 
 	/// What a value is where the prelude's `Option` or `Result` is expected:
@@ -517,7 +569,7 @@ extend Lowerer {
 			return .None
 
 		val span = self.state.body.exprs[id].span
-		return self.alloc(.LendClosure(id), expected, span)
+		return self.alloc(.LendPair(id), expected, span)
 	}
 
 	/// Whether `id` is an array written in a constant's value, outside any

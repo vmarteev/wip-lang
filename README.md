@@ -1,12 +1,20 @@
 # Wip
 
-A systems language, and its compiler, written in itself.
+[![CI](https://github.com/vmarteev/wip-lang/actions/workflows/ci.yml/badge.svg)](https://github.com/vmarteev/wip-lang/actions/workflows/ci.yml)
 
-Wip asks how much of what a borrow checker buys can be had without
-lifetimes. Writing is second-class: a `&var` exists only while a call
-runs. Reading borrows are tracked by the compiler and never written down.
-Ownership is decided where a value is written, and nothing is counted at
-run time unless a program shares a value and says so.
+Wip is a compiled systems language with memory safety and no garbage
+collector, and no lifetimes to write. Its compiler is written in Wip.
+
+The question it explores is how much of what a borrow checker gives can be
+had without lifetime annotations:
+
+- **Writing is second-class.** A `&var` exists only while a call runs, so
+  two writers of one place can only be two arguments of one call.
+- **Reading is tracked for you.** A `&x` may be kept, in a local or an
+  `Option<&Node>`, and the compiler works out what it borrows from where
+  it came from. Nothing outlives what it points at.
+- **Ownership is decided where a value is written.** Nothing is counted at
+  run time unless a program shares a value and says so.
 
 ```wip,run
 struct Board {
@@ -42,59 +50,72 @@ fn main() = {
 }
 ```
 
-## Where it stands
+## Features
 
-Wip is young — the language may still change from one version to the
-next — and complete enough to write real programs in. The compiler
-type-checks, move-checks and borrow-checks, generates native code through
-LLVM with a `clang` 15 or newer, links C, and compiles a program in a
-fraction of a second; a release build is optimised across the whole
-program. It has been tried by porting programs to it: a C++23 game —
-raylib built from source with it, a frame identical to the C++ build's,
-pixel for pixel, compiled in **0.19 s** — a file manager, a web server,
-a Lox interpreter, and miniz's compressor, whose output is byte for byte
-the C library's.
+- **Borrow checking without lifetimes**, as above.
+- **Ownership without a garbage collector.** A value is freed where its
+  owner ends, decided at compile time; `Destroy` says what else to do. A
+  value with several owners is a `std::shared::Shared<T>`, counted only
+  where a line calls `share()`.
+- **Lending pairs.** `lend fn at(i): &T` declares the reading and the
+  writing half from one body, so `v[i]` and `v[i] = x` come from one place.
+- **Errors are values:** `Result`, `?`, and conversions only where a
+  program wrote a `From`. A panic is for mistakes, not for failures the
+  caller should handle.
+- **Diagnostics that explain themselves:** a code, a place, a fix, and a
+  note saying why the rule exists.
+- **Fast builds.** Native code through LLVM. A debug build of ten
+  thousand lines takes half a second, and a release build is optimised
+  across the whole program.
+- **C, directly.** Call C libraries, compile a module's C and C++ beside
+  it, export functions to C, and generate bindings from a header with
+  `wip bindgen`.
+- **No build files.** A program's directory is its module and every
+  directory it imports is another; there is no manifest and nothing is
+  downloaded.
+- **Tools included:** a formatter, a test runner, a fixer for what the
+  warnings point out, and a language server for Zed and Neovim.
 
-What it does not have yet:
+## Status
 
-- **Targets** beyond Apple arm64 — a Mac, and from a Mac an iPad, an
-  iPhone and the iOS simulator — Linux on arm64 and x86-64, and Windows
-  on arm64 and x86-64.
+Wip is young: the language may still change from one version to the next.
+It is complete enough for real programs, and has been tried by porting
+existing ones to it: a C++23 game, built with raylib compiled from source,
+which draws frames identical to the C++ build's, pixel for pixel, and
+compiles in 0.19 s; a file manager; a web server; an interpreter; and a
+compressor whose output matches the C original's byte for byte.
+
+Not there yet:
+
+- **Platforms** other than those under [Install](#install).
 - **Packages fetched from anywhere:** a program depends on another by its
-  path, and nothing is downloaded.
-- **Asynchronous input and output:** threads, futures and an event queue,
-  which waits on many connections at once, are there; a runtime that runs
-  tasks on them is not, nor UDP.
+  path.
+- **Asynchronous I/O:** threads, futures and an event queue that waits on
+  many connections are there; a runtime that runs tasks on them is not,
+  and neither is UDP.
 
-## Installing
+See [`CHANGELOG.md`](CHANGELOG.md) for what each version changed.
 
-Wip runs on macOS on Apple silicon, on Linux on arm64 and x86-64, and on
-Windows on arm64 and x86-64, and builds from a Mac for iOS, where Xcode is
-installed. Every program it builds goes through a `clang` 15 or newer,
-which it looks for as `clang`, or as `WIP_CLANG` names it, and is linked
-by the system's C compiler, `cc`, or on Windows by Microsoft's linker. On
-a Mac, the Command Line Tools have both
-(`xcode-select --install`); Debian 12's own `clang` is 14, so install
-`clang-15` or newer there and set `WIP_CLANG=clang-15`.
-On Linux, a program that imports `std::tls`, `std::http` or
-`std::compress` links the system's OpenSSL 3 and zlib, which the linker
-finds on Debian once `libssl-dev` and `zlib1g-dev` are installed; a Mac
-has both.
+## Install
 
-On Windows, Wip builds with Visual Studio's Build Tools, with the C++
-tools and their Clang ("C++ Clang Compiler for Windows"), whose `clang`
-it finds through Visual Studio's installer, and links with Microsoft's
-linker. Windows has no zlib, so `std::compress` is not there, and
-`std::http` asks for a body as it is; `std::users` and a Unix's signals
-and `fork` are a Unix's alone.
+Wip is built from source with `clang`, in a few minutes; no binaries are
+published. It runs on:
 
-`wip` is a directory: `bin/wip`, and beside it the standard library,
-`std/`, and the tools, `tools/`, which it finds from where `bin/wip` is.
-Keep the three together; a link to `bin/wip` from elsewhere on the `PATH`
-works, a copy of it alone does not.
+| System | What it needs |
+|---|---|
+| macOS on Apple silicon | the Command Line Tools: `xcode-select --install` |
+| iOS, iPadOS and the simulator | built from a Mac with Xcode |
+| Linux on arm64 and x86-64 | `clang` 15 or newer and a C compiler, `cc`; for `std::tls`, `std::http` and `std::compress`, OpenSSL 3 and zlib (`libssl-dev`, `zlib1g-dev` on Debian) |
+| Windows on arm64 and x86-64 | Visual Studio's Build Tools, with the C++ tools and "C++ Clang Compiler for Windows" |
 
-Wip is built from a checkout of this repository, with nothing but
-`clang`; each version is a tag, `v<version>`:
+Wip uses the `clang` on the `PATH`, or the one `WIP_CLANG` names. Debian 12
+ships `clang` 14, so install `clang-15` or newer and set
+`WIP_CLANG=clang-15`. On Windows, Wip finds Visual Studio's `clang` itself
+and links with Microsoft's linker. Windows has no zlib, so `std::compress`
+is not available there and `std::http` asks for bodies uncompressed;
+`std::users`, Unix signals and `fork` are Unix-only.
+
+### macOS and Linux
 
 ```sh
 git clone https://github.com/vmarteev/wip-lang && cd wip-lang
@@ -103,8 +124,9 @@ scripts/bootstrap.sh --out ~/wip
 echo 'export PATH="$HOME/wip/bin:$PATH"' >> ~/.zshrc   # ~/.bashrc for bash
 ```
 
-On Windows, in PowerShell, with `-ExecutionPolicy Bypass`, since Windows
-runs no script it was not told to:
+### Windows
+
+In PowerShell:
 
 ```powershell
 git clone https://github.com/vmarteev/wip-lang; cd wip-lang
@@ -112,29 +134,27 @@ git checkout (git describe --tags --abbrev=0)
 powershell -ExecutionPolicy Bypass -File scripts\bootstrap.ps1 -Out $HOME\wip
 ```
 
-Then add `wip\bin` in your home directory to the `Path`, in the system's
-settings.
+Then add `wip\bin` in your home directory to the `Path` in the system's
+settings. `-ExecutionPolicy Bypass` is needed because Windows runs no
+script it was not told to.
 
-The compiler is written in Wip, and `bootstrap/` holds it for each system
-as LLVM's bitcode, which `clang` compiles into a first `wip`; that one
-builds the compiler from its source, and the compiler built builds itself
-again, a few minutes in all. The `std/` and `tools/` it leaves beside
-`bin/wip` are links to the checkout's own, so a change to the library is
-seen by the next build of a program, and the checkout must stay where it
-is. After pulling a change to the compiler, build it again from its
-source:
+### What the install is
 
-```sh
-scripts/build.sh --release --out ~/wip
-```
+`bootstrap/` holds the compiler for each system as LLVM bitcode. `clang`
+compiles it into a first `wip`, which builds the compiler from source, and
+that compiler builds itself once more.
 
-On Windows, run `scripts\bootstrap.ps1` again, which builds it from its
-source too.
+The result is a directory: `bin/wip`, with the standard library, `std/`,
+and the tools, `tools/`, beside it. Keep them together: a link to
+`bin/wip` from elsewhere on the `PATH` works, a copy of it alone does not.
+`std/` and `tools/` link back to the checkout, so leave the checkout where
+it is; a change to the library is seen by the next build.
 
-`wip --version` says which you have: its version, and the commit it was
-built from and that commit's day.
+To update, pull, then rebuild from source: `scripts/build.sh --release
+--out ~/wip`, or `scripts\bootstrap.ps1` again on Windows. `wip --version`
+gives the version, the commit it was built from, and that commit's date.
 
-## Try it
+## Quick start
 
 ```wip
 // hello.wip
@@ -147,136 +167,54 @@ fn main() = {
 ```
 
 ```sh
-wip run hello.wip     # compile a program and run it
+wip run hello.wip     # compile and run
 wip build hello.wip   # write an executable
 wip test hello.wip    # run the program's tests
-wip check hello.wip   # report everything wrong, write nothing
-wip fmt hello.wip     # lay the file out in the one way Wip is written
-wip fix hello.wip     # take out a needless clone() or move, as the warnings say
+wip check hello.wip   # report every error, write nothing
+wip fmt hello.wip     # format the file
+wip fix hello.wip     # remove a needless clone() or move, as the warnings say
 ```
 
-The entry file's directory is the program's module, and every directory it
-imports is another: there is no build file, no manifest and no module
-manager. The standard library is read from beside the compiler, so
-nothing is fetched.
+`wip --help` lists every command and option. For highlighting, errors as
+you type, hover, go to definition, completion and rename in Zed and
+Neovim, see [editors](editors/README.md).
 
-For Zed and Neovim — highlighting, and a language server with errors as
-you type, hover, definitions, completion and rename — see
-[editors](editors/README.md).
+## Documentation
 
-## What is here
+- **[The cheat sheet](docs/language/cheat-sheet.md):** the language on one
+  page.
+- **[The language reference](docs/language/README.md):** twelve pages, by
+  topic, each rule with an example that runs, and a
+  [glossary](docs/language/glossary.md) of the words they use in a sense
+  of their own.
+- **[The grammar](docs/grammar.md):** exactly what the parser accepts.
+- **[The examples](examples/README.md):** whole programs, from options and
+  files to JSON, threads, a web server, packages and C.
+
+Every Wip example in the reference and in this README is compiled with
+each change to the compiler, so they stay true.
+
+## Repository layout
 
 | Directory | What is in it |
 |---|---|
-| `compiler/` | the compiler, in Wip, a module a phase — `syntax`, `hir` (checking), `analysis` (moves and borrows), `mir`, `llvm` (LLVM's IR and bitcode, through `clang`), `fmt` — and `lang`, the driver and the language server; `main.wip` is the `wip` command |
-| `bootstrap/` | the compiler as LLVM's bitcode, for each system: what builds the first `wip` with `clang` |
-| `std/` | the standard library, in Wip, which the compiler reads from beside it |
-| `tools/` | tools written in Wip that `wip` carries and builds when first asked: `wip bindgen`, a Wip module from a C header |
-| `editors/` | Zed and Neovim: a Tree-sitter grammar, and the language server `wip lsp` |
-| `tests/cases/` | the language's own test programs, each with its output or its diagnostics as a snapshot |
-| `tests/std/` | the standard library's own tests, written in Wip |
-| `tests/gate/` | checks of the `wip` command, written in Wip: given a `wip`, it runs it as a reader does: the cases against their snapshots, every example in the documents, calls across the C boundary, packages, the driver and the debugger |
-| `docs/language/` | the language reference, by topic |
-| `docs/grammar.md` | the syntax specification the parser must agree with |
-| `examples/` | small, complete programs, each in a directory of its own, from `hello` to a web server and a C library |
-| `scripts/` | everything done to the repository: the gate, snapshots, Linux and Windows, the editors' grammar |
+| `compiler/` | the compiler, in Wip: `syntax`, `hir` (type checking), `analysis` (moves and borrows), `mir`, `llvm`, `fmt`, and `lang`, the driver and the language server; `main.wip` is the `wip` command |
+| `bootstrap/` | the compiler as LLVM bitcode for each system, which builds the first `wip` |
+| `std/` | the standard library |
+| `tools/` | tools `wip` builds when first asked, such as `wip bindgen` |
+| `editors/` | Zed and Neovim support, and the Tree-sitter grammar |
+| `examples/` | small, complete programs |
+| `docs/` | the language reference and the grammar |
+| `tests/` | the language's test cases, the standard library's tests, and the gate that checks `wip` |
+| `scripts/` | building, testing and releasing |
 
-## Reading it
+## Contributing
 
-Start with **[the cheat sheet](docs/language/cheat-sheet.md)**, the
-language on one page, then **[the language reference](docs/language/README.md)** —
-twelve pages that say what the language is, by topic, the library's in
-four parts, each rule with an example that runs, and a [glossary](docs/language/glossary.md) of the
-words they use in a sense of their own. Then
-**[the grammar](docs/grammar.md)** for exactly what the parser accepts.
-
-**[The examples](examples/README.md)** are whole programs, each showing a
-part of the language at work: options, files, JSON, threads, a web server,
-dynamic dispatch, packages, and C.
-
-## A few things that make it what it is
-
-- **Second-class writing, tracked reading.** `&var x` is written at a call
-  and lives for that call, so two writers of one place are only ever two
-  arguments of one call. A `&x` may also be kept where a view is —
-  `Option<&Node>`, a local — and what it borrows is worked out from where
-  it came from and what the types can hold, so nothing outlives what it
-  points at, and there are no lifetimes.
-- **Ownership without a garbage collector.** A value is freed where its
-  owner ends, decided while compiling; `Destroy` says what else to do. A
-  value several owners read is a `std::shared::Shared<T>`, counted where a
-  line calls `share()`, and never otherwise.
-- **Lending pairs.** `lend fn at(i): &T` declares the reading and the
-  writing half from one body, so `v[i]` and `v[i] = x` come from one place.
-- **Errors are values.** `Result`, `?`, and conversions only where a
-  program wrote a `From`. A panic is for mistakes, not for failure the
-  caller should handle.
-- **The compiler explains itself.** Diagnostics carry a code, a place, a
-  fix, and a note that says why the rule is there.
-
-## Development
-
-Everything you can do with the language is `wip --help`; everything you can
-do to the repository is a script in `scripts/`:
-
-```sh
-scripts/bootstrap.sh           # build the compiler from the seed, with clang
-scripts/build.sh [--release]   # build it from its source, into target/wip
-scripts/verify.sh              # the gate: the compiler built twice, formatting, every check
-scripts/verify.sh --fast       # just the language's own cases, in a second
-scripts/snapshots.sh [filter]  # regenerate what the cases expect, then read the diff
-scripts/linux.sh [--fast]      # the same verification on Linux, in a container
-scripts/windows.sh gate        # the same on a Windows machine, over ssh
-scripts/clangs.sh              # the LLVM backend through clang 15, 16 and 19, on Linux
-scripts/tree-sitter.sh         # the editors' grammar: regenerate, test, parse everything
-```
-
-`scripts/verify.sh` is the definition of green: it must print `ALL OK`
-before a commit. It builds the compiler from its source with the `wip` the
-seed builds, has the compiler built build itself, the two writing the same
-bitcode for it, and runs `tests/gate` with the second, a program in Wip
-that checks `wip` by running it: the case programs and their snapshots, the standard library's
-own tests, the driver, the compiler's own tests — among them a robustness
-pass over mutilated input — and every example in this file and in the
-language reference, each of which must compile and be laid out as `wip
-fmt` lays it out. A `run` example must run to a successful end
-and an `error=` example must be refused with the code it names, so a
-document that stops being true fails the build.
-
-The scripts are the interface: a script that says what it does outlives
-whichever tool is underneath it.
-
-Apple arm64 is what this is developed on, and Linux is tested beside it:
-`scripts/linux.sh` runs the same verification in a container. That is where
-the differences that bite turn up — the C ABI, the width of `c_long`, what
-the linker wants. It uses [Apple's
-`container`](https://github.com/apple/container) where that is installed and
-Docker otherwise, builds into a volume of the guest's own so the host's
-artifacts are untouched and a second run is warm, and takes
-`WIP_LINUX_ARCH=amd64` for an x86-64 guest instead of the arm64 one — the
-other ABI, through Rosetta. One run at a time: the build volume attaches to
-one guest, and a second run is told so rather than failing inside the
-virtual machine.
-
-Windows has the same verification in PowerShell, `scripts\verify.ps1`:
-the compiler built from the seed by `scripts\bootstrap.ps1`, its stages
-compared, and every check of the gate but the iOS simulator's and the
-debugger's. `scripts/windows.sh gate` runs it on a Windows machine over
-ssh, the one `WIP_WINDOWS_HOST` names. GitHub's CI runs the gate on each
-push: `verify.sh` on Linux on x86-64 and on a Mac, and `verify.ps1` on
-Windows on arm64 and on x86-64.
-
-A release build is LLVM's where there is a `clang` 15 or newer, and a
-check stands beside the gate for it, too slow to be in it:
-`scripts/clangs.sh` runs the cases' release builds and the C ABI's corpus
-through every `clang` the backend claims, in the Linux guest. It runs
-before a change to the backend is committed.
-
-`wip bindgen`'s test asks clang for a header's syntax tree, and says it
-skipped where clang is not installed.
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) for how to build the compiler,
+run the tests, and check a change on Linux and Windows.
 
 ## License
 
-MIT; see [`LICENSE`](LICENSE). Some of the standard library is translated
-from others' work, under the licenses in
+MIT; see [`LICENSE`](LICENSE). Parts of the standard library are
+translated from others' work, under the licenses in
 [`THIRD-PARTY-NOTICES.md`](THIRD-PARTY-NOTICES.md).

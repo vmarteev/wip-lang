@@ -477,6 +477,85 @@ fn main() = {
 }
 ```
 
+What a reader takes for one character may be several: a letter and its
+accent, a flag's two regional indicators, a family of emoji joined by
+U+200D, a consonant and a vowel sign. `graphemes()` hands out each, a
+`str` into the text, by Unicode's extended grapheme clusters, for a `str`
+or a `String`. A text field steps its caret by them: `nextGrapheme(at)` is
+where the one after byte `at` ends, and `previousGrapheme(at)` where the
+one before it begins — the text's end and start where there is no more,
+and a grapheme's edge from inside it. Each reads only as far as the rules
+ask, so a caret moved through a long text does not walk it from the
+start. `popGrapheme()` takes the last off a `String`, as one Backspace
+erases it.
+
+```wip,run
+fn main() = {
+    val text = "a🇫🇷e\u{301}"
+    assert(text.chars().count() == 5)
+    assert(text.graphemes().count() == 3)
+    assert(text.nextGrapheme(1) == 9 && text.previousGrapheme(text.len()) == 9)
+    assert(text.previousGrapheme(5) == 1, "from inside the flag, its start")
+
+    var typed = "né".toString()
+    assert(typed.popGrapheme() == "é".toString() && typed == "n")
+}
+```
+
+A text's words are Unicode's too. `wordSegments()` hands out every piece
+between two word boundaries, in order, each a `WordSegment`: its `text`, a
+`str` into the text; `at`, where it begins; and `isWord`, whether it holds
+a letter or a number of any script rather than only spaces, punctuation
+or symbols, which is what a double-click selects. `can't` and `3.14` are
+each one word, and `e.g.` a word and a full stop. A script written without
+spaces between its words is cut as the default rules cut it, each
+ideograph one, since finding its words needs a dictionary. An editor's
+Ctrl+Arrow moves by `nextWordBoundary(at)` and `previousWordBoundary(at)`,
+skipping the pieces that are not words as it chooses.
+
+```wip,run
+fn main() = {
+    val text = "can't stop 3.14"
+    val words: Vec<str> = [
+        for piece in text.wordSegments() do
+            if piece.isWord then
+                yield piece.text
+    ]
+    assert(words == ["can't", "stop", "3.14"])
+    assert(text.nextWordBoundary(0) == 5 && text.previousWordBoundary(5) == 0)
+    assert("日本".wordSegments().count() == 2, "an ideograph each")
+}
+```
+
+Where a line may break is the third answer. `lineBreaks()` hands out
+each place a line may begin, in order, as a `LineBreak`: `at`, the byte
+offset, and `mandatory`, whether a line must begin there, after a newline
+or a line or paragraph separator, rather than may. The text's end is the
+last, and must. The rules are Unicode's defaults: a line may break after
+spaces, but not before `!`, `)` or `,`, nor after `(`; anywhere between two
+ideographs, but not before `。`; not inside `-2.5` or `$(12.35)`. Nothing
+is measured or hyphenated: a layout shapes the text, and takes, of the
+places where a line too wide may be cut, the last that fits. Scripts that
+need a dictionary to find where their words end, Thai and its
+neighbours, break as letters do, nowhere inside a run of them.
+
+```wip,run
+fn main() = {
+    val text = "Wrap (this) line.\nNext"
+    val breaks: Vec<i64> = [
+        for brk in text.lineBreaks() do
+            yield brk.at
+    ]
+    assert(breaks == [5, 12, 18, 22])
+    val musts: Vec<i64> = [
+        for brk in text.lineBreaks() do
+            if brk.mandatory then
+                yield brk.at
+    ]
+    assert(musts == [18, 22], "after the newline, and at the end")
+}
+```
+
 A character's case is Unicode's, one character to one: `toLowercase()`
 and `toUppercase()`, for a `char` or a `str`, and `isUppercase()` and
 `isLowercase()` for a `char`. A character whose other case is several —
@@ -981,6 +1060,57 @@ makes every handle stale, and `clone()` copies the values under the same
 handles. A handle is not tied to its arena: one from another arena of the
 same type may name a value there.
 
+What holds an arena may need one of its values and itself at once, to
+change a value with the rest at hand: a part of a program's state, which
+asks the others. A `&var` to the value and one to what holds it would be
+two writers of one place, so the value leaves the arena for the call.
+`lease(handle)` takes it out as a `Leased`, whose `value` is lent beside
+the owner, and `giveBack(leased)` puts it back under the same handle, so
+every handle kept to it still names it:
+
+```wip,run
+import std::collections::{Arena, Handle}
+
+struct Counter {
+    count: i64
+}
+
+struct App {
+    counters: Arena<Counter> = Arena()
+    changes: i64 = 0
+}
+
+extend App {
+    /// `body` changes the counter `handle` names, with the app at hand.
+    var fn update(
+        handle: Handle<Counter>,
+        body: &var (counter: &var Counter, app: &var App) => void,
+    ) = {
+        var leased = self.counters.lease(handle)
+        body(&var leased.value, &var self)
+        self.counters.giveBack(leased)
+    }
+}
+
+fn main() = {
+    var app = App()
+    val first = app.counters.add(Counter(count: 0))
+    app.update(first, (counter, app) => {
+        counter.count += 1
+        app.changes += 1
+    })
+    assert(app.counters[first].count == 1 && app.changes == 1)
+}
+```
+
+While a value is out, it is not in the arena: `get` and `contains` answer
+as for a value away, a walk and `len` leave it out, and `arena[handle]`,
+`remove` and a second `lease` panic, saying it is out on lease, which is
+how a call that asks for the value it is changing is caught where it asks.
+A `Leased` dropped without being given back panics too. `pair` is for two
+values of the arena at once; a lease is for one value and the arena's
+owner.
+
 `Arena<T>` is `Arena<T, K = T>`, and its handles are `Handle<K>`. Where the
 code that keeps handles cannot name the values' type — a game's rules,
 which know a ball by its handle, in a module below the one that says what a
@@ -1143,7 +1273,7 @@ Each of `std`'s modules, and the page that describes it:
 | Module | What is in it | Page |
 |---|---|---|
 | `std::args` | `Arguments`, `Argument` and `ArgumentError`: the program's arguments, read as options | [10.2](10-library-system.md) |
-| `std::io` | `print`, `println`, `printInt`, `eprintln`, `flush`, `stdin`, `Reader`, `env`, `environment`, `setEnv`, `unsetEnv`, `isTerminal`, `IoError`; `Read` and `Write`, what bytes are read from and written to, `copy`, and `stdout`, `stderr` and their `Printer`; and `EventQueue` with its `Interest` and `Event` | [10.2](10-library-system.md), [10.3](10-library-formats.md) |
+| `std::io` | `print`, `println`, `printInt`, `eprintln`, `flush`, `stdin`, `Reader`, `env`, `environment`, `setEnv`, `unsetEnv`, `isTerminal`, `IoError`; `Read` and `Write`, what bytes are read from and written to, `copy`, and `stdout`, `stderr` and their `Printer`; and `EventQueue` with its `Interest`, `Event` and `Waker` | [10.2](10-library-system.md), [10.3](10-library-formats.md) |
 | `std::fs` | whole files, written, read and replaced; reading a directory, and walking the tree under one; what the filesystem says about a path, its owner among it; a path's mode and owner set; directories for a while | [10.2](10-library-system.md) |
 | `std::process` | `Command`, `Child` and `Exit`: other programs started and waited for; the program's own `currentDir`, `setCurrentDir`, `executable`, `besideProgram` and `id`; `Signals` and `Signal`: Ctrl-C and its like, caught; `fork`, `newGroup` and `sendToGroup`; `userId`, `becomeUser` and `changeRoot`; `limit` and `setLimit` | [10.2](10-library-system.md) |
 | `std::users` | `User` and `Group`: the system's users and groups, found by name or by number, a Unix's | [10.2](10-library-system.md) |
@@ -1164,11 +1294,11 @@ Each of `std`'s modules, and the page that describes it:
 | `std::http` | `get`, `Client`, `Request`, `Response` and `Incoming`: HTTP/1.1 requests, a body read whole or as it comes, undone where it was sent gzipped, sent from bytes, a file or any `io::Read` | [10.3](10-library-formats.md) |
 | `std::compress` | `gzip` and `gunzip`, `zlib` and `unzlib`, `deflate` and `inflate`, and `Inflater` and `Deflater` for bytes in pieces: deflate, through the system's zlib, a Unix's alone | [10.3](10-library-formats.md) |
 | `std::math` | `PI`, `TAU` and `E`, and the vectors, matrices, rotations and shapes above; the functions are methods of `f64` and `f32`, `x.sin()`, written in Wip so that a `@comptime` constant computes the program's bits | above |
-| `std::text` | `Scanner` and `Position`, above; `ParseError`, and the `Split`, `Lines` and `Chars` types the prelude's methods answer | above |
+| `std::text` | `Scanner` and `Position`, above; `ParseError`, and the `Split`, `Lines`, `Chars`, `Graphemes`, `WordSegments` and `LineBreaks` types the prelude's methods answer, and `WordSegment` and `LineBreak` | above |
 | `std::iter` | `Walk`, `Forwards`, `Backwards`, `Taking` (what a `Vec` gives up to `for x in move v`), and the adapter types `Mapped`, `Filtered`, `FilterMapped`, `FlatMapped`, `Chained`, `Enumerated`, `Taken`, `TakenWhile`, `Skipped`, `Zipped`, `Peekable` | above |
 | `std::collections` | `Map`, `Set`, `MapEntry`, `SortedMap`, `SortedSet`, `Deque`, `PriorityQueue`, and `Arena` with its `Handle`, `ArenaEntry` and `ArenaValues` | above |
 | `std::log` | `Log`, `Level` and `Record`: what a program says as it runs, kept from a least level, to standard error, the system's log or a closure of the program's | [10.2](10-library-system.md) |
-| `std::time` | `Duration`, a length of time; `Instant`, a moment on a clock that only goes forward; `sleep`; `FixedStep`, a game's updates at a steady rate; `now`, the date it is; `Utc`, a moment as a calendar has it, and `Local`, as it has it where the program runs | [10.2](10-library-system.md) |
+| `std::time` | `Duration`, a length of time; `Instant`, a moment on a clock that only goes forward; `sleep`; `FixedStep`, a game's updates at a steady rate; `Timers`, values kept until they are due; `now`, the date it is; `Utc`, a moment as a calendar has it, and `Local`, as it has it where the program runs | [10.2](10-library-system.md) |
 | `std::bytes` | numbers read and written at a place in bytes, `u32le` and `putU32le`; `Reader` and `Writer`, the same in turn; and a binary format for `Encode` and `Decode` | [10.3](10-library-formats.md) |
 | `std::json` | `Json`, `parse`, `encode` and `decode`, and `JsonError`: JSON read into a tree or into a type that derives `Decode`, and written from one | [10.3](10-library-formats.md) |
 | `std::regex` | `Regex`, `Found`, `escape` and `RegexError`: regular expressions, compiled once and matched, searched and replaced | [10.3](10-library-formats.md) |

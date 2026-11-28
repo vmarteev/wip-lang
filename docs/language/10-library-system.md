@@ -240,6 +240,32 @@ fn main() = {
 }
 ```
 
+`Timers<T>` keeps values, each with the `Instant` it is due at: a caret's
+blink, a tooltip after half a second, a request given up on. `add(at,
+value)` keeps one and answers its `Timer`, which `cancel` takes it out by
+before it is due; `due(now)` takes out every value due by `now`, in the
+order they are due, those due at one moment in the order they were added;
+and `untilNext(now)` is how long a loop may sleep before the next, none
+where nothing is kept, which is a wait's timeout. It reads no clock but the
+moments it is given and keeps no thread, so a loop uses it whatever it
+waits on. A timer that repeats is added again when it fires, from the
+moment it was due, so it does not drift:
+
+```wip,run
+import std::time::{Duration, Instant, Timers}
+
+fn main() = {
+    val start = Instant::now()
+    var timers: Timers<str> = Timers()
+    timers.add(start.after(Duration::millis(500)), "tooltip")
+    val blink = timers.add(start.after(Duration::millis(530)), "blink")
+    assert(timers.untilNext(start) == .Some(Duration::millis(500)))
+    assert(timers.cancel(blink) == .Some("blink"))
+    assert(timers.due(start.after(Duration::seconds(1))) == ["tooltip"])
+    assert(timers.untilNext(start).isNone())
+}
+```
+
 ## Random numbers: `std::random`
 
 `Random` is a generator of numbers for what is not cryptography — a game's

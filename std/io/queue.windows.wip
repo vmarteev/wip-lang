@@ -2,9 +2,67 @@
 // itself, and `WSAPoll`, asked of them all at each wait, which tells of a
 // socket while it is ready, as `poll` does. Windows waits so on sockets
 // alone: a descriptor is a socket's, as `net`'s `descriptor()` answers it.
+//
+// A waker is a socket pair over the loopback, since Windows has no
+// `socketpair`: a byte sent to one end makes the other readable, which the
+// queue waits on, and reads empty once it is told of.
 
 import std::libc
+import std::shared::{Shared}
 import std::time::{Duration, Instant}
+
+@link("ws2_32")
+extern "C" {
+	fn WSAStartup(version: u16, data: &var WinsockData): c_int
+	fn WSACleanup(): c_int
+	fn WSASocketW(
+		family: c_int,
+		kind: c_int,
+		protocol: c_int,
+		information: ptr<u8>,
+		group: u32,
+		flags: u32,
+	): u64
+	fn bind(socket: u64, address: &Loopback, length: c_int): c_int
+	fn listen(socket: u64, backlog: c_int): c_int
+	fn getsockname(socket: u64, address: &var Loopback, length: &var c_int): c_int
+	fn connect(socket: u64, address: &Loopback, length: c_int): c_int
+	fn accept(socket: u64, address: &var Loopback, length: &var c_int): u64
+	fn send(socket: u64, bytes: &[u8], flags: c_int): c_int
+	fn recv(socket: u64, into: &var [u8], flags: c_int): c_int
+	fn closesocket(socket: u64): c_int
+	fn ioctlsocket(socket: u64, command: c_int, argument: &var u32): c_int
+}
+
+@link("kernel32")
+extern "C" {
+	fn SetHandleInformation(handle: u64, mask: u32, flags: u32): c_int
+}
+
+/// `WSADATA`: what Winsock says of itself, which nothing here reads.
+extern struct WinsockData {
+	words: [u64; 51] = [0; 51]
+}
+
+/// `sockaddr_in` of the loopback, `127.0.0.1`: its address and its port in
+/// the network's order, as the bytes are laid out.
+extern struct Loopback {
+	family: u16 = 2
+	port: u16 = 0
+	address: u32 = 0x0100007F
+	zero: u64 = 0
+}
+
+val WINSOCK_VERSION: u16 = 0x0202
+val AF_INET: c_int = 2
+val SOCK_STREAM: c_int = 1
+val IPPROTO_TCP: c_int = 6
+val NO_SOCKET: u64 = 0xFFFFFFFFFFFFFFFF
+val WSA_FLAG_OVERLAPPED: u32 = 0x1
+val WSA_FLAG_NO_HANDLE_INHERIT: u32 = 0x80
+val HANDLE_FLAG_INHERIT: u32 = 0x1
+/// `ioctlsocket`: whether a socket waits. `0x8004667E`, its bits read as an `int`.
+val FIONBIO: c_int = -2147195266
 
 /// A socket waited on: its number, what for, and the program's token.
 struct Watched {
@@ -16,11 +74,24 @@ struct Watched {
 /// The sockets a program waits on.
 pub struct EventQueue {
 	watched: Vec<Watched>
+	/// Each waker's token and its end, whose reading socket a wait that
+	/// tells of it reads empty.
+	wakers: Vec<(u64, Shared<WakeEnd>)> = Vec()
 }
 
 extend EventQueue {
 	/// A queue waiting on nothing.
-	pub static fn new(): Result<EventQueue, IoError> = EventQueue(Vec())
+	pub static fn new(): Result<EventQueue, IoError> = EventQueue(watched: Vec())
+
+	/// A waker for the queue, which tells of it by `token`.
+	pub var fn waker(token: u64): Result<Waker, IoError> = {
+		val made = pairOpened()?
+		val reading = made.reading
+		val end = Shared::of(made)
+		self.watched.push(Watched(descriptor: reading as i32, interest: .Read, token:))
+		self.wakers.push((token, end.share()))
+		return Waker(end:)
+	}
 
 	/// Waits on `descriptor` for `interest`, and tells of it by `token`.
 	pub var fn add(descriptor: i32, interest: Interest, token: u64): Result<void, IoError> = {
@@ -103,7 +174,111 @@ extend EventQueue {
 				closed: socket.answered & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0,
 			))
 		}
+		// A waker told of is ready again for the next wake.
+		for (token, end) in self.wakers do
+			if into.any((event) => event.token == token) then
+				drained(&end.value())
 	}
+}
+
+/// A waker's end: the socket a byte is sent to, and the one the queue reads
+/// it from, each closed where the last holder lets it go, and Winsock with
+/// them.
+struct WakeEnd {
+	writing: u64
+	reading: u64
+}
+
+extend WakeEnd: Destroy {
+	var fn destroy() = {
+		closesocket(self.writing)
+		closesocket(self.reading)
+		WSACleanup()
+	}
+}
+
+/// A socket that is not inherited by a program started, as a Unix's
+/// descriptor is made closed in one.
+fn tcpSocket(): u64 = WSASocketW(
+	AF_INET,
+	SOCK_STREAM,
+	IPPROTO_TCP,
+	null,
+	0,
+	WSA_FLAG_OVERLAPPED | WSA_FLAG_NO_HANDLE_INHERIT,
+)
+
+/// A socket pair over the loopback, both ends not waiting: a listener on
+/// a port the system chooses, a connection to it, and the connection it
+/// accepts that is the one made, by its address, not another's.
+fn pairOpened(): Result<WakeEnd, IoError> = {
+	var data = WinsockData()
+	val started = WSAStartup(WINSOCK_VERSION, &var data)
+	if started != 0 then
+		return .Err(systemError(started as u32))
+
+	val listener = tcpSocket()
+	if listener == NO_SOCKET {
+		val error = lastSystemError()
+		WSACleanup()
+		return .Err(error)
+	}
+	defer closesocket(listener)
+	var at = Loopback()
+	var length: c_int = 16
+	val writing = tcpSocket()
+	val listening =
+		bind(listener, &at, length) == 0 &&
+		listen(listener, 1) == 0 &&
+		getsockname(listener, &var at, &var length) == 0 &&
+		writing != NO_SOCKET &&
+		connect(writing, &at, length) == 0
+	if !listening {
+		val error = lastSystemError()
+		if writing != NO_SOCKET then
+			closesocket(writing)
+
+		WSACleanup()
+		return .Err(error)
+	}
+	var made = Loopback()
+	var madeLength: c_int = 16
+	getsockname(writing, &var made, &var madeLength)
+	while true {
+		var from = Loopback()
+		var fromLength: c_int = 16
+		val reading = accept(listener, &var from, &var fromLength)
+		if reading == NO_SOCKET {
+			val error = lastSystemError()
+			closesocket(writing)
+			WSACleanup()
+			return .Err(error)
+		}
+		if from.port != made.port || from.address != made.address {
+			closesocket(reading)
+			continue
+		}
+		SetHandleInformation(reading, HANDLE_FLAG_INHERIT, 0)
+		var on: u32 = 1
+		ioctlsocket(reading, FIONBIO, &var on)
+		ioctlsocket(writing, FIONBIO, &var on)
+		return WakeEnd(writing:, reading:)
+	}
+	return .Err(.Unsupported)
+}
+
+/// Sends a byte, which makes the reading end readable; where the bytes
+/// already sent fill what the system holds, the send does not wait, and
+/// the wakes are one.
+fn woken(end: &WakeEnd) = {
+	send(end.writing, [1], 0)
+}
+
+/// Reads what was sent until there is nothing, so that the next wake is
+/// told of.
+fn drained(end: &WakeEnd) = {
+	var room: [u8; 64] = [0; 64]
+	while recv(end.reading, &var room, 0) > 0 {}
 }
 
 /// What `WSAPoll` is asked of a socket for `interest`.

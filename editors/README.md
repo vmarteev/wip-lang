@@ -14,11 +14,10 @@ shows a call's signature as you type its arguments.
 ## The `wip` command
 
 Both editors start the server as `wip lsp`, so `wip` must be on the
-`PATH` your editor sees: install it as [the README's "Installing"
-says](../README.md#installing), from a release or from a checkout, and
-check with `wip --version`. Zed takes the `PATH` from your shell, and
-Neovim from the terminal it starts in, so set it in your shell's profile
-rather than in one terminal.
+`PATH` your editor sees: install it as [the README's "Install"
+says](../README.md#install), and check with `wip --version`. Zed takes
+the `PATH` from your shell, and Neovim from the terminal it starts in, so
+set it in your shell's profile rather than in one terminal.
 
 After the compiler changes in a checkout, build it again, so the editors
 serve the new one:
@@ -122,5 +121,5 @@ scripts/tree-sitter.sh
 
 It regenerates the parser, runs the grammar's tests, parses every `.wip`
 file in the repository, and copies the queries to both editors. The gate,
-`scripts/verify.sh`, checks the same where `tree-sitter` is installed. Commit the result, then set `rev` in
-`zed/extension.toml` to that commit.
+`scripts/verify.sh`, checks the same where `tree-sitter` is installed.
+Commit the result, then set `rev` in `zed/extension.toml` to that commit.

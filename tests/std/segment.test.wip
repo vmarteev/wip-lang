@@ -1,0 +1,297 @@
+// A text cut where Unicode says: its graphemes and its words, read forward
+// and stepped through both ways, and where its lines may break, against
+// every case of Unicode's own tests, which are kept in `unicode/`; a caret
+// stepped through each kind of cluster; which pieces are words; and which
+// breaks a line must take.
+
+import std::embed
+
+/// Unicode's grapheme tests: a line is characters, by their numbers, with
+/// `÷` where a grapheme ends and `×` where it does not.
+val GRAPHEME_TESTS: str = embed::text("unicode/GraphemeBreakTest.txt")
+
+/// Unicode's word tests, written the same way.
+val WORD_TESTS: str = embed::text("unicode/WordBreakTest.txt")
+
+/// Unicode's line tests, written the same way, a `÷` where a line may
+/// break.
+val LINE_TESTS: str = embed::text("unicode/LineBreakTest.txt")
+
+/// A test's text, and the byte offsets where its graphemes end, its start
+/// among them.
+struct Case {
+	text: String
+	ends: Vec<i64>
+}
+
+/// The cases of a file of Unicode's break tests, each with its line.
+fn casesOf(file: str): Vec<(i64, Case)> = {
+	var out: Vec<(i64, Case)> = Vec()
+	for (at, line) in file.lines().enumerate() {
+		val data = match line.splitOnce("#") {
+			.Some((before, _)) => before.trim()
+			.None => line.trim()
+		}
+		if data.isEmpty() then
+			continue
+
+		var text = String()
+		var ends: Vec<i64> = Vec()
+		for field in data.splitWhitespace() {
+			if field == "÷" then
+				ends.push(text.len())
+			else if field != "×" then
+				text.pushChar(char::fromInt(field.toInt(radix: 16).unwrap()).unwrap())
+		}
+		out.push((at + 1, Case(text:, ends:)))
+	}
+	return out
+}
+
+@test
+fn everyOneOfUnicodesGraphemeTestsIsReadForward() = {
+	val cases = casesOf(GRAPHEME_TESTS)
+	assert(cases.len() == 1093, "every line read")
+	for (line, case) in cases {
+		val pieces: Vec<str> = [
+			for g in case.text.graphemes() do
+				yield g
+		]
+		val expected: Vec<str> = [
+			for at in 1..case.ends.len() do
+				yield case.text.toStr()[case.ends[at - 1]..case.ends[at]]
+		]
+		assert(pieces == expected, "line \(line): \(pieces) for \(expected)")
+	}
+}
+
+@test
+fn everyOneOfUnicodesGraphemeTestsIsSteppedThroughBothWaysFromEachCharacter() = {
+	for (line, case) in casesOf(GRAPHEME_TESTS) {
+		val text = case.text.toStr()
+		var at = 0
+		while at <= text.len() {
+			var next = text.len()
+			var last = 0
+			for end in case.ends {
+				if end < at then
+					last = end
+				else if end > at && next == text.len() then
+					next = end
+			}
+			assert(text.nextGrapheme(at) == next, "line \(line): the next from \(at)")
+			assert(text.previousGrapheme(at) == last, "line \(line): the last from \(at)")
+			at += if at < text.len() then text.charAt(at).1 else 1
+		}
+	}
+}
+
+/// The places a caret stops in `text`, stepped forward and back.
+fn carets(text: str): (Vec<i64>, Vec<i64>) = {
+	var forward: Vec<i64> = Vec()
+	var at = 0
+	forward.push(at)
+	while at < text.len() {
+		at = text.nextGrapheme(at)
+		forward.push(at)
+	}
+	var back: Vec<i64> = Vec()
+	back.push(at)
+	while at > 0 {
+		at = text.previousGrapheme(at)
+		back.push(at)
+	}
+
+	return (forward, back)
+}
+
+@test
+fn aCaretStepsOverEachKindOfClusterWhole() = {
+	// A letter and its accent, a flag, a family, a syllable as its jamo, a
+	// consonant and its vowel sign, a CR and an LF, and a conjunct.
+	val clusters = ["e\u{301}", "🇫🇷", "👩‍👩‍👧", "\u{1112}\u{1161}\u{11AB}", "नि", "\r\n", "क्ष"]
+	var text = String()
+	var ends: Vec<i64> = Vec()
+	ends.push(0)
+	for cluster in clusters {
+		text.push("a")
+		ends.push(text.len())
+		text.push(cluster)
+		ends.push(text.len())
+	}
+	val (forward, back) = carets(text.toStr())
+	assert(forward == ends)
+	ends.reverse()
+	assert(back == ends)
+	val pieces: Vec<str> = [
+		for g in text.graphemes() do
+			yield g
+	]
+	assert(pieces.len() == clusters.len() * 2)
+}
+
+@test
+fn aCaretInsideAClusterStepsToItsEdges() = {
+	val text = "a👩‍👩‍👧b"
+	// Inside the family: after its first person, and inside that person's
+	// bytes.
+	for at in [5, 7, 2] {
+		assert(text.nextGrapheme(at) == 19)
+		assert(text.previousGrapheme(at) == 1)
+	}
+	assert(text.nextGrapheme(-3) == 1 && text.previousGrapheme(-3) == 0)
+	assert(text.nextGrapheme(40) == 20 && text.previousGrapheme(40) == 19)
+	assert("".nextGrapheme(0) == 0 && "".previousGrapheme(0) == 0)
+	assert("".graphemes().count() == 0)
+}
+
+@test
+fn flagsPairInOrderHoweverManyThereAre() = {
+	val text = "🇫🇷🇩🇪🇯"
+	val (forward, back) = carets(text)
+	assert(forward == [0, 8, 16, 20])
+	assert(back == [20, 16, 8, 0])
+	// From inside the second flag, between its letters.
+	assert(text.nextGrapheme(12) == 16 && text.previousGrapheme(12) == 8)
+}
+
+@test
+fn bytesThatAreNotUtf8AreEachOneSteppedOverAlike() = {
+	// A lead byte with too few after it, a byte that follows nothing, and a
+	// character's first bytes before an accent.
+	val bytes: [u8; 9] = [0x61, 0xE2, 0x82, 0x80, 0xCC, 0x81, 0xF0, 0x9F, 0x61]
+	val text = str::fromBytes(&bytes)
+	val (forward, back) = carets(text)
+	var reversed = back.clone()
+	reversed.reverse()
+	assert(reversed == forward)
+	val pieces: Vec<str> = [
+		for g in text.graphemes() do
+			yield g
+	]
+	val starts: Vec<i64> = [
+		for at in 0..forward.len() - 1 do
+			yield forward[at]
+	]
+	assert(pieces.len() == starts.len())
+}
+
+@test
+fn aStringTakesOffItsLastGraphemes() = {
+	var text = "ae\u{301}🇫🇷".toString()
+	assert(text.popGrapheme() == "🇫🇷".toString())
+	assert(text.popGrapheme() == "e\u{301}".toString())
+	assert(text.popGrapheme() == "a".toString())
+	assert(text.popGrapheme() == .None && text.isEmpty())
+}
+
+@test
+fn everyOneOfUnicodesWordTestsIsReadForward() = {
+	val cases = casesOf(WORD_TESTS)
+	assert(cases.len() == 1826, "every line read")
+	for (line, case) in cases {
+		val text = case.text.toStr()
+		val pieces: Vec<str> = [
+			for piece in text.wordSegments() do
+				yield piece.text
+		]
+		val starts: Vec<i64> = [
+			for piece in text.wordSegments() do
+				yield piece.at
+		]
+		val expected: Vec<str> = [
+			for at in 1..case.ends.len() do
+				yield text[case.ends[at - 1]..case.ends[at]]
+		]
+		assert(pieces == expected, "line \(line): \(pieces) for \(expected)")
+		assert(starts.len() == 0 || starts[0] == 0, "line \(line): where each begins")
+		for at in 1..starts.len() do
+			assert(
+				starts[at] == starts[at - 1] + pieces[at - 1].len(),
+				"line \(line): where each begins",
+			)
+	}
+}
+
+@test
+fn everyOneOfUnicodesWordTestsIsSteppedThroughBothWaysFromEachCharacter() = {
+	for (line, case) in casesOf(WORD_TESTS) {
+		val text = case.text.toStr()
+		var at = 0
+		while at <= text.len() {
+			var next = text.len()
+			var last = 0
+			for end in case.ends {
+				if end < at then
+					last = end
+				else if end > at && next == text.len() then
+					next = end
+			}
+			assert(text.nextWordBoundary(at) == next, "line \(line): the next from \(at)")
+			assert(text.previousWordBoundary(at) == last, "line \(line): the last from \(at)")
+			at += if at < text.len() then text.charAt(at).1 else 1
+		}
+	}
+}
+
+/// The pieces of `text`, each marked `*` where it is a word.
+fn piecesOf(text: str): Vec<String> = [
+	for piece in text.wordSegments() do
+		yield if piece.isWord then "*\(piece.text)" else piece.text.toString()
+]
+
+@test
+fn wordsAreTheirLettersAndNumbersAndTheRestIsNot() = {
+	assert(piecesOf("can't stop 3.14") == ["*can't", " ", "*stop", " ", "*3.14"])
+	assert(piecesOf("e.g. a_b, x") == ["*e.g", ".", " ", "*a_b", ",", " ", "*x"])
+	assert(piecesOf("日本語 ok") == ["*日", "*本", "*語", " ", "*ok"], "an ideograph each")
+	assert(piecesOf("👍🏽!") == ["👍🏽", "!"], "an emoji is no word")
+	assert(piecesOf("a\r\n\r\nb") == ["*a", "\r\n", "\r\n", "*b"])
+	assert("".wordSegments().count() == 0)
+}
+
+@test
+fn aCaretJumpsByWordBoundariesFromInsideOne() = {
+	val text = "one two"
+	assert(text.nextWordBoundary(1) == 3 && text.previousWordBoundary(2) == 0)
+	assert(text.nextWordBoundary(3) == 4 && text.previousWordBoundary(4) == 3)
+	assert(text.nextWordBoundary(-1) == 3 && text.previousWordBoundary(99) == 4)
+	val accented = "née"
+	assert(accented.nextWordBoundary(2) == accented.len(), "from inside a character")
+}
+
+@test
+fn everyOneOfUnicodesLineTestsBreaksWhereItSays() = {
+	val cases = casesOf(LINE_TESTS)
+	assert(cases.len() == 16672, "every line read")
+	for (line, case) in cases {
+		val breaks: Vec<i64> = [
+			for brk in case.text.lineBreaks() do
+				yield brk.at
+		]
+		assert(breaks == case.ends, "line \(line): \(breaks) for \(case.ends)")
+	}
+}
+
+/// The lines of `text`, `!` after each a line must end, `/` after each it
+/// may.
+fn breaksOf(text: str): String = {
+	var out = String()
+	var from = 0
+	for brk in text.lineBreaks() {
+		out.push(text[from..brk.at])
+		out.push(if brk.mandatory then "!" else "/")
+		from = brk.at
+	}
+	return out
+}
+
+@test
+fn aLineMayBreakAfterSpacesAndMustAfterNewlines() = {
+	assert(breaksOf("one two") == "one /two!")
+	assert(breaksOf("a\nb\r\nc") == "a\n!b\r\n!c!")
+	assert(breaksOf("wait (for it)!") == "wait /(for /it)!!", "not before `!` nor after `(`")
+	assert(breaksOf("-2.5 or $3.14") == "-2.5 /or /$3.14!", "a number whole")
+	assert(breaksOf("中文。好") == "中/文。/好!", "not before `。`")
+	assert(breaksOf("") == "")
+}

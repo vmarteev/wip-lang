@@ -1,0 +1,358 @@
+// A text cut where Unicode says, by its default rules: into graphemes,
+// what a reader takes for one character — a letter with its accents, a
+// flag, a family of emoji — by UAX #29's extended grapheme clusters. The
+// methods are the prelude's; the rules, the generator and its type are
+// here, and the table they read beside them.
+//
+// Each rule is of the two characters either side of a place, but three,
+// which look further back: two regional indicators join where the run of
+// them before is odd; a joiner joins a pictograph after it where a
+// pictograph is before it, with nothing but extending marks between; and
+// an Indic consonant joins one after a virama. Going forward, what is
+// behind is kept as the text is read; asked of one place, it is read back
+// from there, as far as the rule asks.
+
+/// The graphemes of `text`, one at a time, each a `str` into it: what
+/// `text.graphemes()` answers.
+pub fn graphemes(text: str): Iterator<str> as Graphemes = {
+	if text.isEmpty() then
+		return
+
+	var start = 0
+	var behind = Behind()
+	val (first, width) = text.charAt(0)
+	var before = propertiesOf(first)
+	behind.take(before)
+	var at = width
+	while at < text.len() {
+		val (c, width) = text.charAt(at)
+		val after = propertiesOf(c)
+		if !joined(before, after, &behind) {
+			yield text[start..at]
+			start = at
+		}
+		behind.take(after)
+		before = after
+		at += width
+	}
+	yield text[start..text.len()]
+}
+
+/// Where the grapheme after byte `at` of `text` ends: what
+/// `text.nextGrapheme(at)` answers.
+pub fn nextGrapheme(text: str, at: i64): i64 = {
+	if at >= text.len() then
+		return text.len()
+
+	var from = startOf(text, at.max(0))
+	// Two ASCII characters are two graphemes, but a CR and an LF.
+	if text[from] < 0x80 &&
+		text[from] != b'\r' &&
+		(from + 1 == text.len() || text[from + 1] < 0x80) {
+		return from + 1
+	}
+
+	val (first, width) = text.charAt(from)
+	var before = propertiesOf(first)
+	from += width
+	while from < text.len() {
+		val (c, width) = text.charAt(from)
+		val after = propertiesOf(c)
+		if !joinedAt(text, from, before, after) then
+			return from
+
+		before = after
+		from += width
+	}
+	return text.len()
+}
+
+/// Where the grapheme before byte `at` of `text` begins: what
+/// `text.previousGrapheme(at)` answers.
+pub fn previousGrapheme(text: str, at: i64): i64 = {
+	if at <= 0 then
+		return 0
+
+	// A place inside a character is taken for its end, whose grapheme
+	// before is the one the character is in.
+	var to = at.min(text.len())
+	if to < text.len() {
+		val start = startOf(text, to)
+		if start < to then
+			to = start + text.charAt(start).1
+	}
+	if text[to - 1] < 0x80 &&
+		(to == 1 || text[to - 2] < 0x80) &&
+		!(to >= 2 && text[to - 2] == b'\r' && text[to - 1] == b'\n') {
+		return to - 1
+	}
+
+	var from = startBefore(text, to)
+	var after = propertiesOf(text.charAt(from).0)
+	while from > 0 {
+		val start = startBefore(text, from)
+		val before = propertiesOf(text.charAt(start).0)
+		if !joinedAt(text, from, before, after) then
+			return from
+
+		after = before
+		from = start
+	}
+	return 0
+}
+
+// A character's grapheme properties, a byte: its class in the low four
+// bits, by `Grapheme_Cluster_Break`; 16 where it is a pictograph,
+// `Extended_Pictographic`; and its class in an Indic conjunct in the two
+// above, by `Indic_Conjunct_Break`. What the table holds.
+
+val OTHER: u8 = 0
+val CR: u8 = 1
+val LF: u8 = 2
+val CONTROL: u8 = 3
+val EXTEND: u8 = 4
+val ZWJ: u8 = 5
+val REGIONAL: u8 = 6
+val PREPEND: u8 = 7
+val SPACING_MARK: u8 = 8
+val L: u8 = 9
+val V: u8 = 10
+val T: u8 = 11
+val LV: u8 = 12
+val LVT: u8 = 13
+val PICTOGRAPHIC: u8 = 0x10
+val CONSONANT: u8 = 1
+val CONJUNCT_EXTEND: u8 = 2
+val LINKER: u8 = 3
+
+fn classOf(properties: u8): u8 = properties & 0x0F
+
+fn isPictographic(properties: u8): bool = properties & PICTOGRAPHIC != 0
+
+fn conjunctOf(properties: u8): u8 = properties >> 5
+
+/// A character's grapheme properties: ASCII's and the Hangul syllables'
+/// worked out, the rest read from the table.
+fn propertiesOf(c: char): u8 = {
+	val code = c as u32
+	if code < 0x80 then
+		return match code {
+			0x0D => CR
+			0x0A => LF
+			0..0x20 | 0x7F => CONTROL
+			_ => OTHER
+		}
+
+	// A syllable is an LV where it has no final consonant, every 28th.
+	if code >= 0xAC00 && code <= 0xD7A3 then
+		return if (code - 0xAC00) % 28 == 0 then LV else LVT
+
+	var lo = 0
+	var hi = GRAPHEMES.len() - 1
+	while lo <= hi {
+		val middle = (lo + hi) / 2
+		val (first, last, properties) = GRAPHEMES[middle]
+		if code < first then
+			hi = middle - 1
+		else if code > last then
+			lo = middle + 1
+		else
+			return properties
+	}
+	return OTHER
+}
+
+/// What the two characters either side of a place say of it: that a
+/// grapheme ends there, or goes on, or that it goes on where what is
+/// behind them is a run of regional indicators that is odd, a pictograph
+/// before a joiner, or a consonant before a virama.
+enum Pair {
+	Breaks
+	Joins
+	Regional
+	Pictograph
+	Conjunct
+}
+
+/// UAX #29's rules for the place between two characters, by their
+/// properties, in its order.
+fn pairOf(before: u8, after: u8): Pair = {
+	val was = classOf(before)
+	val now = classOf(after)
+	if was == CR && now == LF then
+		return .Joins
+
+	if was == CR || was == LF || was == CONTROL then
+		return .Breaks
+
+	if now == CR || now == LF || now == CONTROL then
+		return .Breaks
+
+	// Hangul: a leading consonant before any part of a syllable, a vowel
+	// before a vowel or a trailing consonant, a trailing one before another.
+	if was == L && (now == L || now == V || now == LV || now == LVT) then
+		return .Joins
+
+	if (was == LV || was == V) && (now == V || now == T) then
+		return .Joins
+
+	if (was == LVT || was == T) && now == T then
+		return .Joins
+
+	if now == EXTEND || now == ZWJ || now == SPACING_MARK || was == PREPEND then
+		return .Joins
+
+	if conjunctOf(after) == CONSONANT &&
+		(conjunctOf(before) == CONJUNCT_EXTEND || conjunctOf(before) == LINKER) {
+		return .Conjunct
+	}
+
+	if was == ZWJ && isPictographic(after) then
+		return .Pictograph
+
+	if was == REGIONAL && now == REGIONAL then
+		return .Regional
+
+	return .Breaks
+}
+
+/// What is behind a place, kept as a text is read forward: whether the
+/// characters before it end in an odd run of regional indicators, in a
+/// pictograph and its marks or those and a joiner, and in a consonant and
+/// the marks and viramas after it.
+struct Behind {
+	regionalOdd: bool = false
+	pictograph: Pictograph = .None
+	conjunct: Conjunct = .None
+}
+
+/// A pictograph behind: none, one with extending marks after it, or those
+/// and a joiner, which a pictograph after joins.
+enum Pictograph {
+	None
+	Marked
+	Joined
+}
+
+/// A consonant behind: none, one with marks after it, or with marks and a
+/// virama among them, which a consonant after joins.
+enum Conjunct {
+	None
+	Marked
+	Linked
+}
+
+extend Behind {
+	/// What is behind once a character of `properties` is read.
+	var fn take(properties: u8) = {
+		val class = classOf(properties)
+		self.regionalOdd = class == REGIONAL && !self.regionalOdd
+		self.pictograph = if isPictographic(properties) then .Marked
+		else if class == EXTEND && self.pictograph is .Marked then .Marked
+		else if class == ZWJ && self.pictograph is .Marked then .Joined
+		else .None
+		val conjunct = conjunctOf(properties)
+		self.conjunct = if conjunct == CONSONANT then .Marked
+		else if self.conjunct is .None then .None
+		else if conjunct == LINKER then .Linked
+		else if conjunct == CONJUNCT_EXTEND then self.conjunct
+		else .None
+	}
+}
+
+/// Whether the grapheme goes on from `before` to `after`, what is behind
+/// as it was kept.
+fn joined(before: u8, after: u8, behind: &Behind): bool = match pairOf(before, after) {
+	.Breaks => false
+	.Joins => true
+	.Regional => behind.regionalOdd
+	.Pictograph => behind.pictograph is .Joined
+	.Conjunct => behind.conjunct is .Linked
+}
+
+/// Whether the grapheme goes on across byte `at` of `text`, from `before`
+/// to `after`, the characters either side, what is behind read back from
+/// there as far as the rule asks.
+fn joinedAt(text: str, at: i64, before: u8, after: u8): bool = match pairOf(before, after) {
+	.Breaks => false
+	.Joins => true
+	.Regional => {
+		// The regional indicators that end at `at`, counted.
+		var count = 0
+		var from = at
+		while from > 0 {
+			val start = startBefore(text, from)
+			if classOf(propertiesOf(text.charAt(start).0)) != REGIONAL then
+				break
+
+			count += 1
+			from = start
+		}
+		count % 2 == 1
+	}
+	.Pictograph => {
+		// Before the joiner, extending marks, then a pictograph.
+		var from = startBefore(text, at)
+		var found = false
+		while from > 0 {
+			val start = startBefore(text, from)
+			val properties = propertiesOf(text.charAt(start).0)
+			if isPictographic(properties) {
+				found = true
+				break
+			}
+			if classOf(properties) != EXTEND then
+				break
+
+			from = start
+		}
+		found
+	}
+	.Conjunct => {
+		// Before it, marks and viramas, a virama among them, then a
+		// consonant.
+		var from = at
+		var linked = false
+		var found = false
+		while from > 0 {
+			val start = startBefore(text, from)
+			val conjunct = conjunctOf(propertiesOf(text.charAt(start).0))
+			if conjunct == CONSONANT {
+				found = linked
+				break
+			}
+			if conjunct == LINKER then
+				linked = true
+			else if conjunct != CONJUNCT_EXTEND then
+				break
+
+			from = start
+		}
+		found
+	}
+}
+
+/// Where the character that ends at byte `at` of `text`, which is more
+/// than 0, begins: at most four bytes back, all but the first of the form
+/// `10xxxxxx`, and only one where those are not a character, which is
+/// what reading the text forward finds there.
+fn startBefore(text: str, at: i64): i64 = {
+	var start = at - 1
+	while start > 0 && at - start < 4 && text[start] & 0xC0 == 0x80 do
+		start -= 1
+
+	return if start + text.charAt(start).1 == at then start else at - 1
+}
+
+/// Where the character that byte `at` of `text` is in begins: `at` where
+/// it begins one, or is a byte of none.
+fn startOf(text: str, at: i64): i64 = {
+	if text[at] & 0xC0 != 0x80 then
+		return at
+
+	var start = at
+	while start > 0 && at - start < 3 && text[start] & 0xC0 == 0x80 do
+		start -= 1
+
+	return if start + text.charAt(start).1 > at then start else at
+}

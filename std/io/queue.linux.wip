@@ -1,5 +1,8 @@
-// Linux: an epoll instance.
+// Linux: an epoll instance; and a waker an `eventfd` in it, written from
+// any thread and read back once it is told of.
 
+import std::libc
+import std::shared::{Shared}
 import std::time::{Duration}
 
 extern "C" {
@@ -7,6 +10,7 @@ extern "C" {
 	fn epoll_ctl(queue: c_int, operation: c_int, fd: c_int, event: &RawEvent): c_int
 	/// The room for events, and how long to wait, in milliseconds, or -1.
 	fn epoll_wait(queue: c_int, events: &var [RawEvent], timeout: c_int): c_int
+	fn eventfd(initial: u32, flags: c_int): c_int
 }
 
 // `struct epoll_event` is packed on x86-64, where the token starts four
@@ -48,6 +52,8 @@ val EPOLLHUP: u32 = 0x10
 /// The other end shut its writing down.
 val EPOLLRDHUP: u32 = 0x2000
 val EPOLL_CLOEXEC: c_int = 0o2000000
+val EFD_CLOEXEC: c_int = 0o2000000
+val EFD_NONBLOCK: c_int = 0o4000
 val EPOLL_CTL_ADD: c_int = 1
 val EPOLL_CTL_DEL: c_int = 2
 val EPOLL_CTL_MOD: c_int = 3
@@ -105,3 +111,31 @@ fn eventOf(raw: &RawEvent): Event = Event(
 	writable: (raw.events & EPOLLOUT) != 0,
 	closed: (raw.events & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) != 0,
 )
+
+/// A waker's end: an `eventfd`, which the epoll instance waits on to read.
+struct WakeEnd {
+	counter: Closing
+}
+
+fn wakeEndOf(queue: &Shared<Closing>, _: u64, token: u64): Result<WakeEnd, IoError> = {
+	val fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK)
+	if fd < 0 then
+		return .Err(lastError())
+
+	val counter = Closing(fd:)
+	added(queue.value().fd, fd, .Read, token)?
+	return WakeEnd(counter:)
+}
+
+/// Adds one to the counter, which makes it readable; where it is already,
+/// it stays so, and the wakes are one.
+fn woken(end: &WakeEnd) = {
+	val one: [u8; 8] = [1, 0, 0, 0, 0, 0, 0, 0]
+	libc::write(end.counter.fd, &one)
+}
+
+/// Reads the counter back to zero, so that the next wake is told of.
+fn drained(end: &WakeEnd) = {
+	var count: [u8; 8] = [0; 8]
+	libc::read(end.counter.fd, &var count)
+}

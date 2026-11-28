@@ -1,0 +1,329 @@
+// A text cut into words where Unicode says, by UAX #29's word boundaries
+// and their default rules: `can't`, `3.14` and `e.g` are each one, a space
+// another, and each ideograph one, as there is no dictionary here to find
+// the words of a script written without spaces. The methods are the
+// prelude's; the rules, the generator and its types are here.
+//
+// A rule is of the characters either side of a place, its marks and format
+// characters left out, and some look one further either way: a `.` joins
+// two letters, or two digits, only where one is after it too. Two regional
+// indicators join where the run of them before is odd, which going forward
+// is kept as the text is read, and asked of one place is read back.
+
+/// A piece of a text between two of its word boundaries: what
+/// `text.wordSegments()` hands out.
+pub view struct WordSegment {
+	/// The piece, a `str` into the text.
+	pub text: str
+	/// Where it begins, in bytes.
+	pub at: i64
+	/// Whether it holds a letter or a number of any script — a word, a
+	/// number, a kana, an ideograph — rather than only spaces, punctuation
+	/// and symbols, as a double-click selects a word and not the space
+	/// beside it.
+	pub isWord: bool
+}
+
+/// The pieces of `text` between each two of its word boundaries, in order:
+/// what `text.wordSegments()` answers.
+pub fn wordSegments(text: str): Iterator<WordSegment> as WordSegments = {
+	if text.isEmpty() then
+		return
+
+	var start = 0
+	var behind = WordsBehind()
+	val (first, width) = text.charAt(0)
+	behind.take(wordPropertiesOf(first))
+	var isWord = first.isLetter() || first.isNumeric()
+	var at = width
+	while at < text.len() {
+		val (c, width) = text.charAt(at)
+		val joins = match wordRuleAt(text, at) {
+			.Breaks => false
+			.Joins => true
+			.Regional => behind.regionalOdd
+		}
+		if !joins {
+			yield WordSegment(text: text[start..at], at: start, isWord:)
+			start = at
+			isWord = false
+		}
+		isWord = isWord || c.isLetter() || c.isNumeric()
+		behind.take(wordPropertiesOf(c))
+		at += width
+	}
+	yield WordSegment(text: text[start..text.len()], at: start, isWord:)
+}
+
+/// The first word boundary after byte `at` of `text`: what
+/// `text.nextWordBoundary(at)` answers.
+pub fn nextWordBoundary(text: str, at: i64): i64 = {
+	if at >= text.len() then
+		return text.len()
+
+	val from = startOf(text, at.max(0))
+	var place = from + text.charAt(from).1
+	while place < text.len() {
+		if !wordJoinedAt(text, place) then
+			return place
+
+		place += text.charAt(place).1
+	}
+	return text.len()
+}
+
+/// The last word boundary before byte `at` of `text`: what
+/// `text.previousWordBoundary(at)` answers.
+pub fn previousWordBoundary(text: str, at: i64): i64 = {
+	if at <= 0 then
+		return 0
+
+	// A place inside a character is taken for its end.
+	var to = at.min(text.len())
+	if to < text.len() {
+		val start = startOf(text, to)
+		if start < to then
+			to = start + text.charAt(start).1
+	}
+	var place = startBefore(text, to)
+	while place > 0 {
+		if !wordJoinedAt(text, place) then
+			return place
+
+		place = startBefore(text, place)
+	}
+	return 0
+}
+
+// A character's word properties, a byte: its class in the low five bits,
+// by `Word_Break`, 0 for `Other`, and 32 where it is a pictograph,
+// `Extended_Pictographic`. What the table holds.
+
+val WORD_CR: u8 = 1
+val WORD_LF: u8 = 2
+val WORD_NEWLINE: u8 = 3
+val WORD_EXTEND: u8 = 4
+val WORD_ZWJ: u8 = 5
+val WORD_REGIONAL: u8 = 6
+val WORD_FORMAT: u8 = 7
+val WORD_KATAKANA: u8 = 8
+val WORD_HEBREW: u8 = 9
+val WORD_LETTER: u8 = 10
+val WORD_SINGLE_QUOTE: u8 = 11
+val WORD_DOUBLE_QUOTE: u8 = 12
+val WORD_MID_NUM_LET: u8 = 13
+val WORD_MID_LETTER: u8 = 14
+val WORD_MID_NUM: u8 = 15
+val WORD_NUMERIC: u8 = 16
+val WORD_EXTEND_NUM_LET: u8 = 17
+val WORD_SPACE: u8 = 18
+val WORD_PICTOGRAPHIC: u8 = 0x20
+/// No character: before the text's start, or after its end.
+val WORD_NONE: u8 = 0xFF
+
+/// A character's word properties, read from the table.
+fn wordPropertiesOf(c: char): u8 = {
+	val code = c as u32
+	var lo = 0
+	var hi = WORDS.len() - 1
+	while lo <= hi {
+		val middle = (lo + hi) / 2
+		val (first, last, properties) = WORDS[middle]
+		if code < first then
+			hi = middle - 1
+		else if code > last then
+			lo = middle + 1
+		else
+			return properties
+	}
+	return 0
+}
+
+fn wordClassOf(properties: u8): u8 = properties & 0x1F
+
+/// The class of the character that begins at byte `at` of `text`.
+fn wordClassAt(text: str, at: i64): u8 = wordClassOf(wordPropertiesOf(text.charAt(at).0))
+
+/// Marks, format characters and joiners, which a rule looks past: they
+/// belong to the character before them.
+fn isIgnored(class: u8): bool = class == WORD_EXTEND || class == WORD_FORMAT || class == WORD_ZWJ
+
+fn isNewline(class: u8): bool = class == WORD_CR || class == WORD_LF || class == WORD_NEWLINE
+
+/// A letter, Hebrew's among them: `AHLetter`.
+fn isLetterClass(class: u8): bool = class == WORD_LETTER || class == WORD_HEBREW
+
+/// What may join two letters: `MidLetter` and `MidNumLetQ`.
+fn isMidLetter(class: u8): bool =
+	class == WORD_MID_LETTER || class == WORD_MID_NUM_LET || class == WORD_SINGLE_QUOTE
+
+/// What may join two numbers: `MidNum` and `MidNumLetQ`.
+fn isMidNum(class: u8): bool =
+	class == WORD_MID_NUM || class == WORD_MID_NUM_LET || class == WORD_SINGLE_QUOTE
+
+/// The character before byte `at` of `text`, the marks after it left out:
+/// its class and where it begins. Marks after a newline, or at the text's
+/// start, belong to nothing, and are themselves what is before. Nothing
+/// where `at` is the start.
+fn wordBefore(text: str, at: i64): (u8, i64) = {
+	if at <= 0 then
+		return (WORD_NONE, 0)
+
+	val last = startBefore(text, at)
+	val lastClass = wordClassAt(text, last)
+	var start = last
+	var class = lastClass
+	while isIgnored(class) && start > 0 {
+		start = startBefore(text, start)
+		class = wordClassAt(text, start)
+	}
+	if isIgnored(class) || (isIgnored(lastClass) && isNewline(class)) then
+		return (lastClass, last)
+
+	return (class, start)
+}
+
+/// The class of the first character after the one that begins at byte
+/// `at` of `text`, the marks between left out; nothing at the end.
+fn wordAfter(text: str, at: i64): u8 = {
+	var place = at + text.charAt(at).1
+	while place < text.len() {
+		val class = wordClassAt(text, place)
+		if !isIgnored(class) then
+			return class
+
+		place += text.charAt(place).1
+	}
+	return WORD_NONE
+}
+
+/// What UAX #29's word rules say of a place: a boundary, none, or none
+/// where the run of regional indicators before it is odd.
+enum WordRule {
+	Breaks
+	Joins
+	Regional
+}
+
+/// The rules for byte `at` of `text`, inside it, in UAX #29's order.
+fn wordRuleAt(text: str, at: i64): WordRule = {
+	val before = wordPropertiesOf(text.charAt(startBefore(text, at)).0)
+	val after = wordPropertiesOf(text.charAt(at).0)
+	val was = wordClassOf(before)
+	val now = wordClassOf(after)
+	// Newlines, a joiner and a pictograph, spaces, and marks, by the two
+	// characters as they are.
+	if was == WORD_CR && now == WORD_LF then
+		return .Joins
+
+	if isNewline(was) || isNewline(now) then
+		return .Breaks
+
+	if was == WORD_ZWJ && after & WORD_PICTOGRAPHIC != 0 then
+		return .Joins
+
+	if was == WORD_SPACE && now == WORD_SPACE then
+		return .Joins
+
+	if isIgnored(now) then
+		return .Joins
+
+	// The rest by the characters with their marks left out, and one either
+	// side of those.
+	val (left, leftStart) = wordBefore(text, at)
+	if isLetterClass(left) && isLetterClass(now) then
+		return .Joins
+
+	if isLetterClass(left) && isMidLetter(now) && isLetterClass(wordAfter(text, at)) then
+		return .Joins
+
+	if isMidLetter(left) && isLetterClass(now) && isLetterClass(wordBefore(text, leftStart).0) then
+		return .Joins
+
+	if left == WORD_HEBREW && now == WORD_SINGLE_QUOTE then
+		return .Joins
+
+	if left == WORD_HEBREW && now == WORD_DOUBLE_QUOTE && wordAfter(text, at) == WORD_HEBREW then
+		return .Joins
+
+	if left == WORD_DOUBLE_QUOTE &&
+		now == WORD_HEBREW &&
+		wordBefore(text, leftStart).0 == WORD_HEBREW {
+		return .Joins
+	}
+
+	if (isLetterClass(left) || left == WORD_NUMERIC) &&
+		(isLetterClass(now) || now == WORD_NUMERIC) {
+		return .Joins
+	}
+
+	if isMidNum(left) && now == WORD_NUMERIC && wordBefore(text, leftStart).0 == WORD_NUMERIC then
+		return .Joins
+
+	if left == WORD_NUMERIC && isMidNum(now) && wordAfter(text, at) == WORD_NUMERIC then
+		return .Joins
+
+	if left == WORD_KATAKANA && now == WORD_KATAKANA then
+		return .Joins
+
+	val joinsAJoiner =
+		isLetterClass(left) ||
+		left == WORD_NUMERIC ||
+		left == WORD_KATAKANA ||
+		left == WORD_EXTEND_NUM_LET
+	if joinsAJoiner && now == WORD_EXTEND_NUM_LET then
+		return .Joins
+
+	if left == WORD_EXTEND_NUM_LET &&
+		(isLetterClass(now) || now == WORD_NUMERIC || now == WORD_KATAKANA) {
+		return .Joins
+	}
+
+	if left == WORD_REGIONAL && now == WORD_REGIONAL then
+		return .Regional
+
+	return .Breaks
+}
+
+/// Whether there is no word boundary at byte `at` of `text`, what is
+/// behind read back from there as far as the rule asks.
+fn wordJoinedAt(text: str, at: i64): bool = match wordRuleAt(text, at) {
+	.Breaks => false
+	.Joins => true
+	.Regional => {
+		// The regional indicators that end at `at`, their marks left out,
+		// counted.
+		var count = 0
+		var place = at
+		while place > 0 {
+			val (class, start) = wordBefore(text, place)
+			if class != WORD_REGIONAL then
+				break
+
+			count += 1
+			place = start
+		}
+		count % 2 == 1
+	}
+}
+
+/// What is behind a place, kept as a text is read forward: the class of
+/// the last character that marks do not belong to, and whether the
+/// characters end in an odd run of regional indicators.
+struct WordsBehind {
+	last: u8 = WORD_NONE
+	regionalOdd: bool = false
+}
+
+extend WordsBehind {
+	/// What is behind once a character of `properties` is read: a mark
+	/// belongs to the character before it, but a newline, or nothing.
+	var fn take(properties: u8) = {
+		val class = wordClassOf(properties)
+		if isIgnored(class) && self.last != WORD_NONE && !isNewline(self.last) then
+			return
+
+		self.last = class
+		self.regionalOdd = class == WORD_REGIONAL && !self.regionalOdd
+	}
+}

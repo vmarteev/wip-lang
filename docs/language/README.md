@@ -8,7 +8,7 @@ questions:
 |---|---|
 | this reference | what the language is now |
 | [`../grammar.md`](../grammar.md) | what the parser accepts, exactly |
-| [the README](../../README.md#where-it-stands) | what it cannot do yet |
+| [the README](../../README.md#status) | what it cannot do yet |
 
 Each page states the rule and shows it in an example. Only the rule that
 holds today is written down, not how it came to be. The
@@ -33,8 +33,8 @@ words mean: a value *answers*, a place is *lent*, a call *keeps*.
 | [10.1. Threads](10-library-threads.md) | `std::future`, `both`, `each` and `map`, `std::sync` |
 | [10.2. The system](10-library-system.md) | arguments, logs, time, random numbers, other programs, files, `std::embed`, the target |
 | [10.3. Connections and formats](10-library-formats.md) | `std::net`, HTTP and TLS, compression, JSON, bytes, base64, HTML and XML, regular expressions, secrets |
-| [11. C](11-c.md) | `extern` blocks, `@link` and `@header`, C files in a module and their settings, `cstring` |
-| [12. The tools](12-tools.md) | `wip build`, `run`, `test`, `check`, `mir`, and what they read from disk |
+| [11. C](11-c.md) | `extern` blocks, `@link` and `@header`, C's types and `cstring`, C files in a module and their settings, C calling Wip |
+| [12. The tools](12-tools.md) | what is compiled, the commands, `wip fmt`, documentation, the editors, tests, exit codes, the cache, diagnostics and fixes |
 | [Cheat sheet](cheat-sheet.md) | the language on one page, an example for each part |
 | [Glossary](glossary.md) | the words these pages use in a sense of their own |
 

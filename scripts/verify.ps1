@@ -3,9 +3,10 @@
 # kept; stage 1, the compiler built by it; stage 2, built by stage 1, the
 # two writing the same bitcode, and stage 1 warning of nothing as it builds
 # stage 2, since a warning there is one in the source — on Windows, in code
-# no other system compiles; the gate built; `wip fmt`; the character
-# tables, where there is Python; and the gate's checks on stage 2, every
-# one, or those named, but iOS's, which needs a Mac, and the debugger's.
+# no other system compiles; the gate built; `wip fmt`; Unicode's tables;
+# the powers of ten, where there is Python; and the gate's checks on stage
+# 2, every one, or those named, but iOS's, which needs a Mac, and the
+# debugger's.
 # The editors' grammar and the citations are bash's, and the same answer
 # everywhere: a Unix checks them. Prints ALL OK when they all pass.
 #
@@ -114,22 +115,13 @@ if (Ran $wip @('build', '--release', 'tests\gate\main.wip', '-o', "$out\gate.exe
 }
 
 $step = Get-Date
-if (Ran $wip @('fmt', '--check', 'std', 'tests\std', 'tests\gate', 'tests\fuzz', 'examples', 'tools\bindgen', 'compiler') "$out\wip-fmt") {
+if (Ran $wip @('fmt', '--check', 'std', 'tests\std', 'tests\gate', 'tests\fuzz', 'examples', 'tools\bindgen', 'tools\unicode', 'compiler') "$out\wip-fmt") {
 	Say 'wip fmt' 'ok' $step
 } else {
 	Say 'wip fmt' 'FAILED' $step; Get-Content "$out\wip-fmt"; $failed = $true
 }
 
 $python = Get-Command python, python3 -ErrorAction SilentlyContinue | Select-Object -First 1
-foreach ($table in 'widths', 'category', 'case') {
-	$step = Get-Date
-	if (-not $python) { Say "character $table" 'skipped: no Python' $null; continue }
-	if (Ran $python.Source @("scripts\char-$table.py", '--check') "$out\$table") {
-		Say "character $table" 'ok' $step
-	} else {
-		Say "character $table" 'FAILED' $step; Get-Content "$out\$table"; $failed = $true
-	}
-}
 $step = Get-Date
 if (-not $python) {
 	Say 'powers of ten' 'skipped: no Python' $null
@@ -137,6 +129,12 @@ if (-not $python) {
 	Say 'powers of ten' 'ok' $step
 } else {
 	Say 'powers of ten' 'FAILED' $step; Get-Content "$out\powers"; $failed = $true
+}
+$step = Get-Date
+if (Ran $wip @('run', 'tools\unicode\main.wip', '--check') "$out\unicode") {
+	Say "Unicode's tables" 'ok' $step
+} else {
+	Say "Unicode's tables" 'FAILED' $step; Get-Content "$out\unicode"; $failed = $true
 }
 Say "editors' grammar" 'skipped: checked on a Unix' $null
 Say 'citations' 'skipped: checked on a Unix' $null

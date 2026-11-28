@@ -94,6 +94,38 @@ fn main() = {
 }
 ```
 
+A thread that has done work for a loop wakes it with an `io::Waker`:
+`queue.waker(token)` makes one, which may be given to the thread, and
+cloned for each, and `wake()` makes the queue's next wait, or the one it is
+in, answer an event with that token. The answer itself goes by a channel,
+or anything else threads share; the waker only says to look, so one
+serves every channel a loop drains. Wakes before the queue waits again are
+one event, and a wake after it is answered is another, so none is lost.
+One whose queue has ended wakes nothing. It is a kqueue's user filter on a
+Mac and iOS, an `eventfd` on Linux, and a socket pair over the loopback on
+Windows:
+
+```wip,run
+import std::future
+import std::future::{Future}
+import std::io
+
+fn main() = {
+    var queue = io::EventQueue::new().unwrap()
+    val waker = queue.waker(1).unwrap()
+    val (answers, inbox) = future::channel<i64>()
+    val worker = Future::run(own () => {
+        answers.send(6 * 7)
+        waker.wake()
+    })
+    var events: Vec<io::Event> = Vec()
+    assert(queue.wait(.None, &var events).isOk()) // until the wake
+    assert(events[0].token == 1)
+    assert(inbox.tryReceive() is .Value(found) && found == 42)
+    worker.get()
+}
+```
+
 ## HTTP: `std::http`
 
 `http::get(url)` fetches a URL and answers its `Response`: its `status`,

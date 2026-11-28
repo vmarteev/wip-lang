@@ -596,9 +596,9 @@ at stays as it is ([page 7](07-references.md)). A generic parameter is the
 other way to write the same thing, and compiles to a direct call per type;
 `&dyn` compiles to one function for all of them.
 
-A `dyn` is only ever behind `&` or `&var`, wherever a type is written, a
-type's arguments included. A value of unknown type has no size of its own,
-so neither `dyn Shape` nor `own<dyn Shape>` can be stored:
+A `dyn` is only ever behind `&`, `&var` or `own`, wherever a type is
+written. A value of unknown type has no size of its own, so a `dyn Shape`
+alone cannot be stored:
 
 ```wip,error=E0344
 interface Shape {
@@ -606,12 +606,101 @@ interface Shape {
 }
 
 struct Scene {
-    shapes: Vec<own<dyn Shape>>
+    shape: dyn Shape
 }
 ```
 
-Values of several kinds are kept as an enum of the kinds, and a `match`
-over it is checked for the kinds it leaves out.
+## An owned `dyn`
+
+`own<dyn Interface>` is a value on the heap, of some type that implements
+the interface, which it owns: a pointer to the value and the table of its
+type's methods, and that type's drop beside them. It is kept wherever an
+`own` is — a field, a vector, an `Option`, a map — so a program can keep
+things it knows only by what they do:
+
+```wip,run
+interface Output {
+    var fn write(line: str)
+    fn written(): i64
+}
+
+struct Counted {
+    count: i64 = 0
+}
+
+extend Counted: Output {
+    var fn write(line: str) = self.count += 1
+    fn written(): i64 = self.count
+}
+
+struct Kept {
+    lines: Vec<String> = Vec()
+}
+
+extend Kept: Output {
+    var fn write(line: str) = self.lines.push(line)
+    fn written(): i64 = self.lines.len()
+}
+
+struct Logger {
+    outputs: Vec<own<dyn Output>>
+}
+
+fn writtenBy(output: &dyn Output): i64 = output.written()
+
+fn main() = {
+    var logger = Logger(outputs: Vec())
+    logger.outputs.push(own Counted())
+    logger.outputs.push(own Kept())
+    for output in logger.outputs do
+        output.write("started")
+
+    logger.outputs[1].write("again")
+    assert(writtenBy(&logger.outputs[0]) == 1)
+    assert(writtenBy(&logger.outputs[1]) == 2)
+}
+```
+
+- **It is made from an `own<T>`** where an `own<dyn Interface>` is
+  expected, as a `&T` becomes a `&dyn`: the box stays where it is, and the
+  table joins it.
+- **It is called as a `&dyn` is,** each method through the table, a `var
+  fn` where the owned `dyn` is in a place that may be written; and `&` or
+  `&var` of it is the `&dyn` or `&var dyn` a call takes.
+- **It ends as an `own` of its type does,** that type's `Destroy` run
+  through the table, wherever the owned `dyn` ends.
+- **It holds no view.** A type that borrows, or a type parameter, which an
+  instance may make one, is refused (E0505): the owned `dyn` is kept where
+  the type it was made of is no longer known, and nothing would say what
+  the view borrows.
+- **What can be called through it is what `&dyn` calls:** no `static fn`,
+  no `move fn`, no method with type parameters of its own or `Self` in its
+  signature (E0343). So it does not clone; comparing two of them is a
+  method of the interface's own.
+
+```wip,error=E0505
+interface Shape {
+    fn area(): i64
+}
+
+view struct Label {
+    text: str
+}
+
+extend Label: Shape {
+    fn area(): i64 = self.text.len()
+}
+
+fn main() = {
+    val text = "abc"
+    val label: own<dyn Shape> = own Label(text:)
+}
+```
+
+Which to write: an enum, where the kinds are known — a `match` over it is
+checked for the kinds it leaves out, and its calls are direct; a type
+parameter, where the caller chooses one kind; and an owned `dyn`, where
+the kinds are left open, for code not yet written to add to.
 
 ## Another module's interface
 

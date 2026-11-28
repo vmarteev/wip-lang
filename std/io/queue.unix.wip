@@ -3,22 +3,32 @@
 
 import std::collections::{Map}
 import std::libc
+import std::shared::{Shared}
 import std::time::{Duration}
 
-/// The descriptors a program waits on, closed where it ends.
-pub struct EventQueue {
+/// A descriptor, closed where its last holder lets it go.
+struct Closing {
 	fd: c_int
+}
+
+extend Closing: Destroy {
+	var fn destroy() = {
+		libc::close(self.fd)
+	}
+}
+
+/// The descriptors a program waits on, closed where it ends and where its
+/// wakers do.
+pub struct EventQueue {
+	fd: Shared<Closing>
 	/// Room for what one wait answers, as the system lays it out.
 	raw: Vec<RawEvent>
 	/// What it waits on each descriptor for: what kqueue's filters are
 	/// added and taken away by.
 	interests: Map<i32, Interest> = Map()
-}
-
-extend EventQueue: Destroy {
-	var fn destroy() = {
-		libc::close(self.fd)
-	}
+	/// Each waker's token and its end, which a wait that tells of it reads
+	/// back where the system asks.
+	wakers: Vec<(u64, Shared<WakeEnd>)> = Vec()
 }
 
 extend EventQueue {
@@ -28,12 +38,12 @@ extend EventQueue {
 		if fd < 0 then
 			return .Err(lastError())
 
-		return EventQueue(fd:, raw: Vec())
+		return EventQueue(fd: Shared::of(Closing(fd:)), raw: Vec())
 	}
 
 	/// Waits on `descriptor` for `interest`, and tells of it by `token`.
 	pub var fn add(descriptor: i32, interest: Interest, token: u64): Result<void, IoError> = {
-		added(self.fd, descriptor, interest, token)?
+		added(self.fd.value().fd, descriptor, interest, token)?
 		self.interests.put(descriptor, interest)
 	}
 
@@ -43,7 +53,7 @@ extend EventQueue {
 			.Some(known) => known
 			.None => interest
 		}
-		changed(self.fd, descriptor, was, interest, token)?
+		changed(self.fd.value().fd, descriptor, was, interest, token)?
 		self.interests.put(descriptor, interest)
 	}
 
@@ -53,7 +63,7 @@ extend EventQueue {
 			.Some(known) => known
 			.None => Interest::Both
 		}
-		removed(self.fd, descriptor, was)?
+		removed(self.fd.value().fd, descriptor, was)?
 		self.interests.remove(&descriptor)
 		return
 	}
@@ -64,11 +74,11 @@ extend EventQueue {
 	/// signal cuts short answers nothing.
 	pub var fn wait(timeout: Option<Duration>, into: &var Vec<Event>): Result<void, IoError> = {
 		into.clear()
-		val room = (self.interests.len() * 2).max(16)
+		val room = (self.interests.len() * 2 + self.wakers.len()).max(16)
 		while self.raw.len() < room do
 			self.raw.push(blank())
 
-		val count = waited(self.fd, &var self.raw.items(), timeout)
+		val count = waited(self.fd.value().fd, &var self.raw.items(), timeout)
 		if count < 0 {
 			if lastError() == .Interrupted then
 				return
@@ -88,5 +98,17 @@ extend EventQueue {
 				.None => into.push(event)
 			}
 		}
+		// A waker told of is ready again for the next wake.
+		for (token, end) in self.wakers do
+			if into.any((event) => event.token == token) then
+				drained(&end.value())
+	}
+
+	/// A waker for the queue, which tells of it by `token`.
+	pub var fn waker(token: u64): Result<Waker, IoError> = {
+		val made = wakeEndOf(&self.fd, self.wakers.len() as u64 + 1, token)?
+		val end = Shared::of(made)
+		self.wakers.push((token, end.share()))
+		return Waker(end:)
 	}
 }

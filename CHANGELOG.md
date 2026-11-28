@@ -2,6 +2,75 @@
 
 Each version published, newest first.
 
+## 0.19.0 — 2026-11-28
+
+**Text cut where Unicode says,** by the default rules of Unicode 16:
+
+- **Graphemes:** `graphemes()`, `nextGrapheme(at)` and
+  `previousGrapheme(at)` on `str` and `String`, and
+  `String.popGrapheme()` — what a reader takes for one character, a
+  letter and its accents, a flag, a family of emoji, a Hangul syllable as
+  its jamo, an Indic conjunct — so a caret steps over each whole, from
+  any byte.
+- **Words:** `wordSegments()` hands out each piece between two word
+  boundaries as a `WordSegment`, its text, where it begins, and
+  `isWord`, whether it holds a letter or a number of any script;
+  `nextWordBoundary(at)` and `previousWordBoundary(at)` are a caret's
+  jumps. `can't`, `3.14` and `e.g` are each one word.
+- **Line breaks:** `lineBreaks()` hands out each place a line may begin,
+  as a `LineBreak`, and whether a line must begin there; it measures
+  nothing and hyphenates nothing.
+- Each passes every case of Unicode's own tests, which the library's
+  tests read. The types are `std::text`'s.
+
+**The language**
+
+- **An owned `dyn`:** `own<dyn I>` is allowed wherever an `own<T>` is, a
+  value on the heap of any type that implements `I`, lent as a `&dyn I`,
+  and an `own<T>` becomes one where it is expected, as a `&T` becomes a
+  `&dyn`. A type that holds a view, or a type parameter, behind one is
+  refused, E0505. The reference's interfaces page says when to write an
+  enum, a type parameter or an owned `dyn`.
+
+**The library**
+
+- **`Arena.lease(handle)`** takes a value out as a `Leased`, whose
+  `value` is lent beside the arena's owner, and `giveBack` puts it back
+  under the same handle. While it is out, `get` and `contains` see it
+  away, and a walk and `len` leave it out; `arena[handle]`, `remove`, a
+  second lease and a `Leased` dropped without being given back panic,
+  saying it is out.
+- **`queue.waker(token)`** makes an `io::Waker`, whose `wake()`, from any
+  thread, makes the queue's wait answer an event with that token: a
+  kqueue's user filter on a Mac and iOS, an `eventfd` on Linux, a socket
+  pair over the loopback on Windows. Wakes before a wait are one event,
+  and none is lost; a waker that outlives its queue wakes nothing.
+- **`time::Timers<T>`** keeps values by when each is due: `add` answers a
+  `Timer`, `cancel` takes it out, `due` takes out what is due in order,
+  and `untilNext` is any loop's timeout.
+
+**Fixes**
+
+- **`Vec::withCapacity` given a negative count** made a vector that
+  wrote past its end at its first push; it panics where the vector is
+  made, its trace naming the call.
+
+**Tests and tools**
+
+- **Unicode's tables** — the case, width and category tables and the
+  segmentation tables — are written by `tools/unicode`, a program in Wip,
+  from Unicode's files kept beside it, where Python scripts wrote three of
+  them. The tables are the same bytes. The gate checks them with the
+  compiler it has just built, on every system, Windows too, and no longer
+  skips the check where Python's Unicode is another version.
+- **The fuzzer** is built as `target/fuzzer`, beside the `target/fuzz`
+  it works in, and reads a text block's lines without the space that ends
+  them.
+- **The README** is in the usual order — what Wip is and an example,
+  its features and status, how to install it, a quick start — and how to
+  build, test and check a change is in `CONTRIBUTING.md`. Every link and
+  anchor in a published document resolves.
+
 ## 0.18.1 — 2026-11-25
 
 What CI on Windows' new runners found, whose `clang` is 22.

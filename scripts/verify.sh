@@ -149,12 +149,13 @@ else
 fi
 
 # The Wip that is ours to lay out is in `wip fmt`'s layout: the standard
-# library and its tests, the gate, the examples, bindgen, and the compiler.
+# library and its tests, the gate, the examples, bindgen, the program that
+# writes Unicode's tables, and the compiler.
 # Not the cases in tests/cases, which test the parser on layouts the
 # formatter rewrites — trailing commas, line breaks, comments — and on text
 # that does not parse.
 step=$SECONDS
-if ! "$wip" fmt --check std tests/std tests/gate tests/fuzz examples tools/bindgen compiler >"$out/wip-fmt" 2>&1; then
+if ! "$wip" fmt --check std tests/std tests/gate tests/fuzz examples tools/bindgen tools/unicode compiler >"$out/wip-fmt" 2>&1; then
     say "wip fmt" "FAILED" $((SECONDS - step))
     cat "$out/wip-fmt"
     failed=1
@@ -162,8 +163,8 @@ else
     say "wip fmt" "ok" $((SECONDS - step))
 fi
 
-# The tables of character widths, letters and numbers, and case, and the
-# powers of ten a float is read with, are what their scripts write.
+# The powers of ten a float is read with are what their script writes,
+# with Python's integers, which are exact.
 step=$SECONDS
 if ! python3 scripts/float-powers.py --check >"$out/powers" 2>&1; then
     say "powers of ten" "FAILED" $((SECONDS - step))
@@ -172,16 +173,19 @@ if ! python3 scripts/float-powers.py --check >"$out/powers" 2>&1; then
 else
     say "powers of ten" "ok" $((SECONDS - step))
 fi
-for table in widths category case; do
-    step=$SECONDS
-    if ! python3 "scripts/char-$table.py" --check >"$out/$table" 2>&1; then
-        say "character $table" "FAILED" $((SECONDS - step))
-        cat "$out/$table"
-        failed=1
-    else
-        say "character $table" "ok" $((SECONDS - step))
-    fi
-done
+
+# The tables of Unicode's — what a character is, its width, its case, and
+# what segmentation reads — are what tools/unicode writes from Unicode's
+# files, kept in the repository: a program in Wip, run with the compiler
+# just built, so they are checked wherever the gate runs.
+step=$SECONDS
+if ! "$wip" run tools/unicode/main.wip --check >"$out/unicode" 2>&1; then
+    say "Unicode's tables" "FAILED" $((SECONDS - step))
+    cat "$out/unicode"
+    failed=1
+else
+    say "Unicode's tables" "ok" $((SECONDS - step))
+fi
 
 # The editors' grammar parses every file, where tree-sitter is installed.
 step=$SECONDS

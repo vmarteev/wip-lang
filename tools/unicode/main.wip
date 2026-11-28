@@ -1,0 +1,180 @@
+// `wip run tools/unicode/main.wip`, in the checkout: writes the library's
+// tables of Unicode's from Unicode's own files, kept beside this program
+// for one version — what a character is, its width and its case, in
+// `std/prelude`, and the properties segmentation reads, in `std/text` —
+// so that the library answers from one Unicode. With `--check` it writes
+// nothing, and fails where a table is not what it would write, or a file
+// kept is not of that version.
+//
+// It reads no table it writes, so a table written wrong still builds the
+// program that writes it right.
+
+import std::args::{ArgumentError, Arguments}
+import std::fs
+import std::io
+
+val USAGE = """
+	usage: wip run tools/unicode/main.wip [--check]
+
+	Writes the library's tables of Unicode's from Unicode's files in
+	tools/unicode/, run in the checkout.
+
+	      --check   write nothing, and fail where a table is not what would
+	                be written
+	  -h, --help    print this
+	"""
+
+/// The version of Unicode whose files are kept.
+val VERSION = "16.0.0"
+
+/// Unicode's tests, kept with the library's, which embed them.
+val TESTS: [str; 3] = ["GraphemeBreakTest", "WordBreakTest", "LineBreakTest"]
+
+/// What went wrong: a file not read, or not what it should be.
+struct Failure {
+	message: String
+}
+
+extend Failure: Text {
+	fn toString(): String = self.message.clone()
+}
+
+extend Failure: From<ArgumentError> {
+	static fn from(error: ArgumentError): Failure = Failure(message: "\(error)")
+}
+
+fn main(args: &[cstring]): Result<i64, Failure> = {
+	var checking = false
+	var arguments = Arguments::of(&args)
+	while arguments.next()? is .Some(argument) {
+		match argument {
+			.Long("check") => checking = true
+			.Short('h') | .Long("help") => {
+				io::print(USAGE)
+				return 0
+			}
+			_ => return .Err(Failure::from(argument.unexpected()))
+		}
+	}
+
+	// Unicode's tests, which the library's tests read, are of it too.
+	for name in TESTS do
+		ofThisVersion("tests/std/unicode/\(name).txt", name)?
+
+	val categories = generalCategories()?
+	val pictographs = pictographsOf()?
+	val tables: Vec<(str, String)> = [
+		("std/prelude/category.wip", categoryFile(&categories)),
+		("std/prelude/width.wip", widthFile(&categories)?),
+		("std/prelude/case.wip", caseFile(&categories)?),
+		(
+			"std/text/segment_table.wip",
+			segmentFile(
+				graphemeTable(&pictographs)?,
+				wordTable(&pictographs)?,
+				lineTable(&pictographs, &categories)?,
+			),
+		),
+	]
+	var stale = 0
+	for (path, written) in tables {
+		if checking {
+			if read(path)? != written {
+				io::eprintln("\(path) is not what tools/unicode/main.wip writes: run it")
+				stale += 1
+			}
+			continue
+		}
+		match fs::writeFile(path, written.toStr()) {
+			.Ok(_) => io::println("wrote \(path)")
+			.Err(error) => return .Err(Failure(message: "\(path): \(error)"))
+		}
+	}
+	if stale > 0 then
+		return 1
+
+	if checking then
+		io::println("\(tables.len()) tables as written, Unicode \(VERSION)")
+
+	return 0
+}
+
+/// The text of the file at `path`.
+fn read(path: str): Result<String, Failure> = match fs::readFile(path) {
+	.Ok(text) => text
+	.Err(error) => .Err(Failure(message: "\(path): \(error)"))
+}
+
+/// The text of Unicode's file `name`, kept here.
+fn unicodeFile(name: str): Result<String, Failure> = ofThisVersion(
+	"tools/unicode/\(VERSION)/\(name).txt",
+	name,
+)
+
+/// The text of the file at `path`, Unicode's `name`, which names this
+/// version in its first lines: as `Name-16.0.0.txt`, or, the emoji's,
+/// `Emoji Version 16.0`.
+fn ofThisVersion(path: str, name: str): Result<String, Failure> = {
+	val text = read(path)?
+	val minor = VERSION.stripSuffix(".0").unwrapOr(VERSION)
+	var header = String()
+	for line in text.lines() {
+		if !line.startsWith("#") then
+			break
+
+		header.push(line)
+		header.push("\n")
+	}
+	if !header.contains("\(name)-\(VERSION).txt") &&
+		!header.contains("Emoji Version \(minor)\n") &&
+		!header.contains("Emoji Version \(minor) ") {
+		return .Err(Failure(message: "\(path) is not Unicode \(VERSION)'s"))
+	}
+	return text
+}
+
+/// A line of a property file: the characters from `first` to `last`, and
+/// the fields after them, `property` and, where there is one, `value`.
+struct Entry {
+	first: u32
+	last: u32
+	property: String
+	value: String
+}
+
+/// The lines of a property file, its comments and blank lines left out.
+fn entries(text: str, path: str): Result<Vec<Entry>, Failure> = {
+	var out: Vec<Entry> = Vec()
+	for (at, line) in text.lines().enumerate() {
+		val data = match line.splitOnce("#") {
+			.Some((before, _)) => before.trim()
+			.None => line.trim()
+		}
+		if data.isEmpty() then
+			continue
+
+		val fields: Vec<str> = [
+			for field in data.split(";") do
+				yield field.trim()
+		]
+		val wrong = Failure(message: "\(path):\(at + 1): not a property's line")
+		if fields.len() < 2 then
+			return .Err(wrong)
+
+		val (first, last) = match fields[0].splitOnce("..") {
+			.Some((first, last)) => (first.toU64(radix: 16), last.toU64(radix: 16))
+			.None => (fields[0].toU64(radix: 16), fields[0].toU64(radix: 16))
+		}
+		val (.Ok(first), .Ok(last)) = (first, last) else return .Err(wrong)
+		if first > last || last > 0x10FFFF then
+			return .Err(wrong)
+
+		out.push(Entry(
+			first: first as u32,
+			last: last as u32,
+			property: fields[1].toString(),
+			value: if fields.len() > 2 then fields[2].toString() else String(),
+		))
+	}
+	return out
+}

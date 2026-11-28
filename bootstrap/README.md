@@ -38,11 +38,11 @@ compiles this system's seed with `clang` into a `wip` (stage A), which
 builds the compiler from `compiler/` (stage B), which builds it again
 (stage C). B and C must write the same bitcode for the compiler: that is
 the compiler compiling itself faithfully. C is the `wip` it leaves, in
-`target/bootstrap/bin/wip`, beside the library it reads (`target\bootstrap\bin\wip.exe` on Windows);
-`--out`, or `-Out`, puts it elsewhere. A seed may be older than the source; stage B is always the
-source's own compiler. `scripts/build.sh` and the gate build the compiler
-with it where they are given no other `wip`, and build it first where it
-is not there.
+`target/bootstrap/bin/wip` (`target\bootstrap\bin\wip.exe` on Windows),
+beside the library it reads; `--out`, or `-Out`, puts it elsewhere. A seed
+may be older than the source; stage B is always the source's own compiler.
+`scripts/build.sh` and the gate build the compiler with it where they are
+given no other `wip`, and build it first where it is not there.
 
 ## Making them again
 

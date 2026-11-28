@@ -21,12 +21,20 @@
 // Handles are not tied to the arena they came from: a `Handle<Node>` from
 // one arena of nodes, used on another, may name a value there. They do name
 // the same values in the arena's `clone()`.
+//
+// A value may be leased: taken out, to be lent beside what holds the arena,
+// and given back under its handle. While it is out its slot keeps its
+// generation and says where the value is not: a third state, beside holding
+// a value and being free.
 
 import std::iter::{Taking}
 
 /// The value of a slot's `place` that stands for no slot at all: the end of
 /// the free list.
 val NO_SLOT: u32 = u32::MAX
+
+/// The `place` of a slot whose value is out on lease.
+val LEASED: u32 = u32::MAX - 1
 
 /// The last generation a slot can have. A slot that reaches it is retired
 /// when its value is removed, rather than starting again at 1, where a
@@ -53,17 +61,37 @@ pub struct Handle<T> {
 pub struct ArenaEntry<T, K = T> {
 	/// The handle that names the value.
 	pub handle: Handle<K>
-	pub value: T
+	pub var value: T
 }
 
 // One slot of the table.
 struct Slot {
-	// Odd while the slot holds a value, even while it is free, and 0 once
-	// it is retired.
+	// Odd while the slot holds a value, or its value is out on lease, even
+	// while it is free, and 0 once it is retired.
 	generation: u32
-	// Where the value is among the entries while the slot holds one; the
-	// next free slot while it does not.
+	// Where the value is among the entries while the slot holds one;
+	// `LEASED` while its value is out; the next free slot while it is free.
 	place: u32
+}
+
+/// A value taken out of an arena by `lease`, and the handle it is given
+/// back under by `giveBack`: what lets the arena's owner lend the value and
+/// itself to one call, as two places. It is not plain data; one dropped
+/// without being given back panics, since its slot would be out for ever.
+pub struct Leased<T, K = T> {
+	/// The value, to read and to write while it is out.
+	pub var value: T
+	handle: Handle<K>
+	given: bool = false
+}
+
+extend Leased<T, K> {
+	/// The handle it was leased by, and is given back under.
+	pub fn handle(): Handle<K> = self.handle
+}
+
+extend Leased<T, K>: Destroy {
+	var fn destroy() = if !self.given then panic("\(self.handle) was leased and never given back")
 }
 
 /// Values of type `T`, named by `Handle<K>`, where `K` is `T` unless it is
@@ -117,9 +145,7 @@ extend Arena<T, K>: IntoIterator<Taking<ArenaEntry<T, K>>> {
 extend Arena<T, K>: Index<Handle<K>, T> {
 	@inline
 	lend fn at(handle: Handle<K>): &T = {
-		val .Some(position) = self.find(handle) else {
-			panic("\(handle) names a value removed from the arena")
-		}
+		val .Some(position) = self.find(handle) else panic(self.missing(handle))
 		lend self.row.entries.at(position).value
 	}
 }
@@ -168,9 +194,15 @@ extend Arena<T, K> {
 	/// Takes out the value `handle` names, or nothing where it was removed
 	/// already. Every handle to it is stale from here on. The last value
 	/// moves into its place, so this is quick whatever the size, and the
-	/// order a walk visits is no longer the order the values went in.
+	/// order a walk visits is no longer the order the values went in. A
+	/// value out on lease is given back before it is removed, and panics.
 	pub var fn remove(handle: Handle<K>): Option<T> = {
-		val .Some(position) = self.find(handle) else return .None
+		val .Some(position) = self.find(handle) else {
+			if self.isLeased(handle) then
+				panic("\(handle) is out on lease, and is given back before it is removed")
+
+			return .None
+		}
 		val last = self.row.entries.len() - 1
 		if position != last {
 			val moved = self.row.entries.at(last).handle.slot as i64
@@ -198,8 +230,9 @@ extend Arena<T, K> {
 		}
 	}
 
-	/// Ends every value. Every handle given out is stale from here on; the
-	/// memory is kept.
+	/// Ends every value. Every handle given out is stale from here on, but
+	/// a lease's, whose value is not in the arena and is given back as it
+	/// would be; the memory is kept.
 	pub var fn clear() empties = {
 		for at in 0..self.row.entries.len() do
 			self.vacate(self.row.entries[at].handle.slot)
@@ -218,10 +251,8 @@ extend Arena<T, K> {
 		if first == second then
 			panic("\(first) is lent twice by `pair`")
 
-		val .Some(at) = self.find(first) else panic("\(first) names a value removed from the arena")
-		val .Some(to) = self.find(second) else {
-			panic("\(second) names a value removed from the arena")
-		}
+		val .Some(at) = self.find(first) else panic(self.missing(first))
+		val .Some(to) = self.find(second) else panic(self.missing(second))
 		// The slice is split before the later of the two, which begins the
 		// second half.
 		if at < to then
@@ -236,16 +267,65 @@ extend Arena<T, K> {
 		))
 	}
 
+	/// Takes the value `handle` names out, to be given back under the same
+	/// handle by `giveBack`: what lends a value and the arena's owner to one
+	/// call at once, as two places. While it is out, `get` and `contains`
+	/// answer as for a value away, a walk and `len` leave it out, and
+	/// `arena[handle]`, `remove` and a second lease panic, saying it is out.
+	/// The last value moves into its place, as `remove` moves it.
+	pub var fn lease(handle: Handle<K>): Leased<T, K> = {
+		val .Some(position) = self.find(handle) else panic(self.missing(handle))
+		val last = self.row.entries.len() - 1
+		if position != last {
+			val moved = self.row.entries.at(last).handle.slot as i64
+			self.slots[moved].place = position as u32
+		}
+		self.slots[handle.slot as i64].place = LEASED
+		val entry = self.row.entries.swapRemove(position)
+		return Leased(value: entry.value, handle:)
+	}
+
+	/// Puts a leased value back under the handle it was leased by, at the
+	/// end of a walk's order. One that is not out on lease from this arena —
+	/// given back already, or another arena's — panics.
+	pub var fn giveBack(leased: Leased<T, K>) keeps leased = {
+		var back = leased
+		val handle = back.handle
+		if !self.isLeased(handle) then
+			panic("\(handle) is not out on lease from this arena")
+
+		back.given = true
+		val value = match move back {
+			(value, ..) => value
+		}
+		self.slots[handle.slot as i64].place = self.row.entries.len() as u32
+		self.row.entries.push(ArenaEntry(handle:, value:))
+	}
+
 	// Where the value `handle` names is among the entries, or nothing
-	// where it was removed.
+	// where it was removed or is out on lease.
 	@inline
 	fn find(handle: Handle<K>): Option<i64> = {
 		val slot = handle.slot as i64
 		if slot >= self.slots.len() || self.slots[slot].generation != handle.generation then
 			return .None
 
-		return .Some(self.slots[slot].place)
+		val place = self.slots[slot].place
+		return if place == LEASED then .None else .Some(place)
 	}
+
+	// Whether the value `handle` names is out on lease.
+	fn isLeased(handle: Handle<K>): bool = {
+		val slot = handle.slot as i64
+		return slot < self.slots.len() &&
+			self.slots[slot].generation == handle.generation &&
+			self.slots[slot].place == LEASED
+	}
+
+	// Why `handle` names no value here: it is out on lease, or was removed.
+	fn missing(handle: Handle<K>): String =
+		if self.isLeased(handle) then "\(handle) is out on lease"
+		else "\(handle) names a value removed from the arena"
 
 	// Frees a slot whose value is going: its generation turns even, and it
 	// heads the free list; or, where it has had its last generation, it is

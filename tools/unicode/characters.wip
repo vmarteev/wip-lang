@@ -1,0 +1,627 @@
+// The tables of what a character is: its general category, letter or
+// number, in `category.wip`; how many columns it takes on a terminal, in
+// `width.wip`; and its case, in `case.wip`, each with the code that reads
+// it, all in `std/prelude`.
+
+/// The general categories, as Unicode writes them, `Cn` first: what a
+/// character's category is the index of.
+val CATEGORIES: [str; 30] = [
+	"Cn",
+	"Lu",
+	"Ll",
+	"Lt",
+	"Lm",
+	"Lo",
+	"Mn",
+	"Mc",
+	"Me",
+	"Nd",
+	"Nl",
+	"No",
+	"Pc",
+	"Pd",
+	"Ps",
+	"Pe",
+	"Pi",
+	"Pf",
+	"Po",
+	"Sm",
+	"Sc",
+	"Sk",
+	"So",
+	"Zs",
+	"Zl",
+	"Zp",
+	"Cc",
+	"Cf",
+	"Cs",
+	"Co",
+]
+
+/// Each character's general category, an index into `CATEGORIES`: `Cn`,
+/// not assigned, where the file lists it nowhere.
+fn generalCategories(): Result<Vec<u8>, Failure> = {
+	var out: Vec<u8> = Vec::filled(0x110000, 0)
+	val name = "DerivedGeneralCategory"
+	for entry in entries(unicodeFile(name)?, name)? {
+		val .Some(at) = CATEGORIES.indexOf(entry.property.toStr()) else {
+			return .Err(Failure(message: "\(name): a category unknown, \(entry.property)"))
+		}
+		for code in entry.first..=entry.last do
+			out[code as i64] = at as u8
+	}
+	return out
+}
+
+/// The general category of `code`, by `categories`.
+fn categoryOf(categories: &[u8], code: i64): str = CATEGORIES[categories[code] as i64]
+
+/// The characters `test` holds for, as runs: the first and the last.
+fn setOf(test: &(code: i64) => bool): Vec<(u32, u32)> = {
+	var found: Vec<(u32, u32)> = Vec()
+	for code in 0..0x110000 {
+		if !test(code) then
+			continue
+
+		if found.last() is .Some((first, last)) && last as i64 == code - 1 then
+			found[found.len() - 1] = (first, code as u32)
+		else
+			found.push((code as u32, code as u32))
+	}
+	return found
+}
+
+/// A table of runs, `name`, said to be `what`.
+fn setTable(name: str, table: &[(u32, u32)], what: str): String = {
+	var out = String()
+	out.push("/// \(what): the first and the last of each run.\n")
+	out.push("val \(name): [(u32, u32); \(table.len())] = [\n")
+	for (first, last) in table do
+		out.push("\t(0x\(first, radix: 16, upper: true), 0x\(last, radix: 16, upper: true)),\n")
+
+	out.push("]\n")
+	return out
+}
+
+/// A function, `name`, that answers whether a character is in one of
+/// `table`'s runs, said to be `what`.
+fn tester(name: str, table: str, count: i64, what: str): String = """
+	/// \(what): in one of \(table)'s runs.
+	fn \(name)(c: char): bool = {
+		val code = c as u32
+		var lo = 0
+		var hi = \(count) - 1
+		while lo <= hi {
+			val middle = (lo + hi) / 2
+			val (first, last) = \(table)[middle]
+			if code < first then
+				hi = middle - 1
+			else if code > last then
+				lo = middle + 1
+			else
+				return true
+		}
+		return false
+	}
+
+	"""
+
+/// `std/prelude/category.wip`: a letter is of a category `L…`, a number
+/// of one `N…`.
+fn categoryFile(categories: &[u8]): String = {
+	val letters = setOf((code) => categoryOf(&categories, code).startsWith("L"))
+	val numbers = setOf((code) => categoryOf(&categories, code).startsWith("N"))
+	var out = String()
+	out.push("""
+		// Whether a character is a letter or a number, by Unicode's general
+		// categories: a letter is `L…`, a number `N…`.
+		// Written by tools/unicode/main.wip from Unicode \(VERSION); edit that, not this.
+
+		extend char {
+			/// Whether it is a letter of any script: `a`, `é`, `я`, `中`. Not a
+			/// digit, nor a mark that goes with a letter. ASCII is answered without
+			/// the table, since most text a program reads is.
+			pub fn isLetter(): bool = if self.isAscii() then self.isAsciiLetter() else inLetters(self)
+
+			/// Whether it is a number of any script: `7`, `٣`, `Ⅻ`, `½`. What a
+			/// program parsing a number asks is `isDigit`, `0` to `9`.
+			pub fn isNumeric(): bool = if self.isAscii() then self.isDigit() else inNumbers(self)
+
+			/// Whether it is a letter or a number.
+			pub fn isAlphanumeric(): bool =
+				if self.isAscii() then self.isAsciiAlphanumeric() else inLetters(self) || inNumbers(self)
+		}
+
+
+		""")
+	out.push(tester("inLetters", "LETTERS", letters.len(), "Whether `c` is a letter"))
+	out.push("\n")
+	out.push(tester("inNumbers", "NUMBERS", numbers.len(), "Whether `c` is a number"))
+	out.push("\n")
+	out.push(setTable("LETTERS", &letters, "The letters"))
+	out.push("\n")
+	out.push(setTable("NUMBERS", &numbers, "The numbers"))
+	return out
+}
+
+// A character's width: 0 where it draws nothing of its own — a combining
+// mark, a format character, a control, the medial and final Hangul jamo —
+// 2 where Unicode says it is wide (East Asian Width W or F), and 1
+// otherwise. Where termbox2's table, which some terminal libraries draw by,
+// said otherwise for a printable character, its answer is taken, so that
+// what is laid out is what is drawn: the format characters that show a
+// mark, eight circled numbers, and the Hangul fillers.
+
+/// Format characters that show a mark, and so take a column.
+fn isShownFormat(code: i64): bool =
+	[0xAD, 0x6DD, 0x70F, 0x8E2, 0x110BD, 0x110CD, 0x890, 0x891, 0xFFF9, 0xFFFA, 0xFFFB].contains(
+		&code,
+	) ||
+	(code >= 0x600 && code < 0x606) ||
+	(code >= 0x13430 && code < 0x13440)
+
+/// Circled numbers on black squares, drawn wide.
+fn isWideAmbiguous(code: i64): bool = code >= 0x3248 && code < 0x3250
+
+/// Fillers, which draw nothing.
+fn isFiller(code: i64): bool = code == 0x3164 || code == 0xFFA0
+
+/// How many columns `code` takes.
+fn widthOf(code: i64, categories: &[u8], wide: &[bool]): i64 = {
+	val category = categoryOf(&categories, code)
+	if code < 0x20 || (code >= 0x7F && code < 0xA0) then
+		return 0
+
+	if isFiller(code) || category == "Mn" || category == "Me" then
+		return 0
+
+	if category == "Cf" && !isShownFormat(code) then
+		return 0
+
+	if (code >= 0x1160 && code <= 0x11FF) || (code >= 0xD7B0 && code <= 0xD7FF) then
+		return 0
+
+	if category == "Cn" then
+		return 1
+
+	return if wide[code] || isWideAmbiguous(code) then 2 else 1
+}
+
+/// `std/prelude/width.wip`: the characters from U+0300 whose width is not
+/// 1, as runs.
+fn widthFile(categories: &[u8]): Result<String, Failure> = {
+	var wide: Vec<bool> = Vec::filled(0x110000, false)
+	val widths = "EastAsianWidth"
+	for entry in entries(unicodeFile(widths)?, widths)? {
+		if entry.property != "W" && entry.property != "F" then
+			continue
+
+		for code in entry.first..=entry.last do
+			wide[code as i64] = true
+	}
+	var table: Vec<(u32, u32, i64)> = Vec()
+	var start = 0x300
+	var current = widthOf(0x300, &categories, &wide)
+	for code in 0x301..0x110001 {
+		val columns = if code < 0x110000 then widthOf(code, &categories, &wide) else -1
+		if columns == current then
+			continue
+
+		if current != 1 then
+			table.push((start as u32, (code - 1) as u32, current))
+
+		start = code
+		current = columns
+	}
+	var out = String()
+	out.push("""
+		// How many columns a character takes on a terminal: 0
+		// where it draws nothing of its own, 2 where it is wide, 1 otherwise.
+		// Written by tools/unicode/main.wip from Unicode \(VERSION); edit that, not this.
+
+		extend char {
+			/// How many columns it takes on a terminal: 0 for a combining mark, a
+			/// format character or a control, 2 for a wide one — most of Chinese,
+			/// Japanese and Korean, and emoji — and 1 for the rest. A cluster of
+			/// several, as a flag or a family, is not counted as one.
+			pub fn width(): i64 = {
+				val code = self as u32
+				// Everything before the combining marks is one column, but the
+				// controls, which a terminal does not show.
+				if code < 0x300 then
+					return if code < 0x20 || (code >= 0x7F && code < 0xA0) then 0 else 1
+
+				var lo = 0
+				var hi = \(table.len()) - 1
+				while lo <= hi {
+					val middle = (lo + hi) / 2
+					val (first, last, columns) = WIDTHS[middle]
+					if code < first then
+						hi = middle - 1
+					else if code > last then
+						lo = middle + 1
+					else
+						return columns
+				}
+				return 1
+			}
+		}
+
+		extend str {
+			/// How many columns it takes on a terminal: its characters' widths
+			/// together.
+			pub fn width(): i64 = self.chars().map((c) => c.width()).sum()
+		}
+
+		/// The characters from U+0300 whose width is not 1: the first and the last
+		/// of each run, and the width.
+		val WIDTHS: [(u32, u32, i64); \(table.len())] = [
+
+		""")
+	for (first, last, columns) in table do
+		out.push("\t(0x\(first, radix: 16, upper: true), 0x\(last, radix: 16, upper: true), \(columns)),\n")
+
+	out.push("]\n")
+	return out
+}
+
+// A character's case: Unicode's mappings, one character to one, as a
+// program's text would be mapped a character at a time. A character whose
+// lower or upper case is several — `İ`, `ß` — keeps itself. `folded` puts
+// together every character that the mappings join, as Rust's regular
+// expressions do without case: `K`, `k` and the Kelvin sign fold alike,
+// and so do `Σ`, `σ` and `ς`. What a class folds to is the lower case of
+// its capital — `σ` — as Unicode's own folding has it.
+
+/// What each character is in lower case and in upper case, where that is
+/// one other character: by `SpecialCasing.txt` where it says, with no
+/// condition, and by `UnicodeData.txt` otherwise. -1 where it is none.
+struct Cases {
+	lower: Vec<i64>
+	upper: Vec<i64>
+}
+
+/// The one character `field` names, a list of numbers; -1 where it is
+/// none, or several.
+fn single(field: str): i64 = {
+	val codes: Vec<str> = [
+		for code in field.splitWhitespace() do
+			yield code
+	]
+	if codes.len() != 1 then
+		return -1
+
+	return codes[0].toInt(radix: 16).unwrapOr(-1)
+}
+
+/// The cases, from `UnicodeData.txt` and `SpecialCasing.txt`. The first
+/// says no version of its own: each character it lists is checked to be
+/// of the category `categories` gives it, which are of this version.
+fn casesOf(categories: &[u8]): Result<Cases, Failure> = {
+	var lower: Vec<i64> = Vec::filled(0x110000, -1)
+	var upper: Vec<i64> = Vec::filled(0x110000, -1)
+	val data = "UnicodeData"
+	val path = "tools/unicode/\(VERSION)/\(data).txt"
+	val text = read(path)?
+	for (at, line) in text.lines().enumerate() {
+		if line.isEmpty() then
+			continue
+
+		val fields: Vec<str> = [
+			for field in line.split(";") do
+				yield field
+		]
+		val .Ok(code) = fields[0].toInt(radix: 16) else {
+			return .Err(Failure(message: "\(data):\(at + 1): not a character's line"))
+		}
+		if fields.len() < 15 then
+			return .Err(Failure(message: "\(data):\(at + 1): not a character's line"))
+
+		if code > 0x10FFFF || fields[2] != categoryOf(&categories, code) then
+			return .Err(Failure(message: "\(path) is not Unicode \(VERSION)'s: U+\(fields[0])'s category"))
+
+		if !fields[12].isEmpty() then
+			upper[code] = single(fields[12])
+
+		if !fields[13].isEmpty() then
+			lower[code] = single(fields[13])
+	}
+	val special = "SpecialCasing"
+	val specials = unicodeFile(special)?
+	for (at, line) in specials.lines().enumerate() {
+		val data = match line.splitOnce("#") {
+			.Some((before, _)) => before.trim()
+			.None => line.trim()
+		}
+		if data.isEmpty() then
+			continue
+
+		val fields: Vec<str> = [
+			for field in data.split(";") do
+				yield field.trim()
+		]
+		// A condition — a language's, a place in a word — is not a
+		// character's alone.
+		if fields.len() > 4 && !fields[4].isEmpty() then
+			continue
+
+		val .Ok(code) = fields[0].toInt(radix: 16) else {
+			return .Err(Failure(message: "\(special):\(at + 1): not a character's line"))
+		}
+		lower[code] = single(fields[1])
+		upper[code] = single(fields[3])
+	}
+	for code in 0..0x110000 {
+		if lower[code] == code then
+			lower[code] = -1
+
+		if upper[code] == code then
+			upper[code] = -1
+	}
+	return Cases(lower:, upper:)
+}
+
+/// Each character that is a member of `classes` of the same case, and what
+/// it folds to.
+fn foldsOf(cases: &Cases, uppercase: &[bool], lowercase: &[bool]): Vec<i64> = {
+	// The classes the mappings join, each named by its least member.
+	var parent: Vec<i64> = [
+		for code in 0..0x110000 do
+			yield code
+	]
+	for code in 0..0x110000 {
+		for other in [cases.lower[code], cases.upper[code]] {
+			if other < 0 then
+				continue
+
+			var a = code
+			while parent[a] != a do
+				a = parent[a]
+
+			var b = other
+			while parent[b] != b do
+				b = parent[b]
+
+			if a != b then
+				parent[a.max(b)] = a.min(b)
+		}
+	}
+	var root: Vec<i64> = Vec::filled(0x110000, 0)
+	var size: Vec<i64> = Vec::filled(0x110000, 0)
+	for code in 0..0x110000 {
+		var r = code
+		while parent[r] != r do
+			r = parent[r]
+
+		root[code] = r
+		size[r] += 1
+	}
+	// What each class folds to: the least of the lower cases of its
+	// capitals, or else its least lower case member, or else its least.
+	var capital: Vec<i64> = Vec::filled(0x110000, -1)
+	var small: Vec<i64> = Vec::filled(0x110000, -1)
+	for code in 0..0x110000 {
+		val r = root[code]
+		if size[r] < 2 then
+			continue
+
+		if uppercase[code] &&
+			cases.lower[code] >= 0 &&
+			(capital[r] < 0 || cases.lower[code] < capital[r]) {
+			capital[r] = cases.lower[code]
+		}
+
+		if lowercase[code] && small[r] < 0 then
+			small[r] = code
+	}
+	var folds: Vec<i64> = Vec::filled(0x110000, -1)
+	for code in 0..0x110000 {
+		val r = root[code]
+		if size[r] < 2 then
+			continue
+
+		val target = if capital[r] >= 0 then capital[r] else if small[r] >= 0 then small[r] else r
+		if code != target then
+			folds[code] = target
+	}
+	return folds
+}
+
+/// A mapping, -1 where a character maps to none, as runs: the first and the
+/// last, the difference each maps by, and the step between them — 1, or 2
+/// where upper and lower case alternate, as in Latin Extended-A.
+fn mappingRuns(mapping: &[i64]): Vec<(u32, u32, i64, i64)> = {
+	// The step of a run is 0 until it has two members.
+	var found: Vec<(i64, i64, i64, i64)> = Vec()
+	for code in 0..0x110000 {
+		if mapping[code] < 0 then
+			continue
+
+		val delta = mapping[code] - code
+		if found.last() is .Some((first, last, by, step)) && by == delta {
+			val gap = code - last
+			if (step == 0 && (gap == 1 || gap == 2)) || (step != 0 && gap == step) {
+				found[found.len() - 1] = (first, code, by, gap)
+				continue
+			}
+		}
+		found.push((code, code, delta, 0))
+	}
+	return [
+		for (first, last, by, step) in found do
+			yield (first as u32, last as u32, by, if step == 0 then 1 else step)
+	]
+}
+
+/// A table of a mapping's runs, `name`, said to be `what`.
+fn mappingTable(name: str, table: &[(u32, u32, i64, i64)], what: str): String = {
+	var out = String()
+	out.push("/// \(what): the first and the last of each run, what each maps by, and\n")
+	out.push("/// the step between them.\n")
+	out.push("val \(name): [(u32, u32, i64, i64); \(table.len())] = [\n")
+	for (first, last, by, step) in table do
+		out.push("\t(0x\(first, radix: 16, upper: true), 0x\(last, radix: 16, upper: true), \(by), \(step)),\n")
+
+	out.push("]\n")
+	return out
+}
+
+/// A function, `name`, that maps a character by `table`'s runs, said to be
+/// `what`.
+fn mapper(name: str, table: str, count: i64, what: str): String = """
+	/// \(what), by \(table)'s runs.
+	fn \(name)(c: char): char = {
+		val code = c as u32
+		var lo = 0
+		var hi = \(count) - 1
+		while lo <= hi {
+			val middle = (lo + hi) / 2
+			val (first, last, delta, step) = \(table)[middle]
+			when {
+				code < first => hi = middle - 1
+				code > last => lo = middle + 1
+				else => {
+					if ((code - first) as i64) % step != 0 then
+						return c
+
+					return char::fromScalar(((code as i64) + delta) as u32)
+				}
+			}
+		}
+		return c
+	}
+
+	"""
+
+/// `std/prelude/case.wip`: the mappings, the fold, and which characters
+/// are upper and lower case, by `Uppercase` and `Lowercase`.
+fn caseFile(categories: &[u8]): Result<String, Failure> = {
+	val cases = casesOf(&categories)?
+	var uppercase: Vec<bool> = Vec::filled(0x110000, false)
+	var lowercase: Vec<bool> = Vec::filled(0x110000, false)
+	val derived = "DerivedCoreProperties"
+	for entry in entries(unicodeFile(derived)?, derived)? {
+		val isUpper = entry.property == "Uppercase"
+		if !isUpper && entry.property != "Lowercase" then
+			continue
+
+		for code in entry.first..=entry.last {
+			if isUpper then
+				uppercase[code as i64] = true
+			else
+				lowercase[code as i64] = true
+		}
+	}
+	val lowers = mappingRuns(&cases.lower)
+	val uppers = mappingRuns(&cases.upper)
+	val folded = mappingRuns(foldsOf(&cases, &uppercase, &lowercase))
+	val upperSet = setOf((code) => uppercase[code])
+	val lowerSet = setOf((code) => lowercase[code])
+	var out = String()
+	out.push("""
+		// A character's case: Unicode's simple mappings, one
+		// character to one, and a fold that puts together the characters they
+		// join, for comparing without case.
+		// Written by tools/unicode/main.wip from Unicode \(VERSION); edit that, not this.
+
+		extend char {
+			/// Its lower case: `A` is `a`, `Σ` is `σ`. A character whose lower
+			/// case is several, as `İ`'s is, and one that has none, are themselves.
+			pub fn toLowercase(): char = lowered(self)
+
+			/// Its upper case: `a` is `A`, `ς` is `Σ`. A character whose upper
+			/// case is several, as `ß`'s is, and one that has none, are themselves.
+			pub fn toUppercase(): char = uppered(self)
+
+			/// What it is without its case, for comparing two without it: `K`, `k`
+			/// and `K` (the Kelvin sign) fold alike, and so do `Σ`, `σ` and `ς`.
+			pub fn folded(): char = foldedChar(self)
+
+			/// Whether it is an upper case letter, or another character Unicode
+			/// counts as upper case, as `Ⓐ`.
+			pub fn isUppercase(): bool = inUppercase(self)
+
+			/// Whether it is a lower case letter, or another character Unicode
+			/// counts as lower case, as `ª`.
+			pub fn isLowercase(): bool = inLowercase(self)
+		}
+
+		extend str {
+			/// Each of its characters in lower case.
+			pub fn toLowercase(): String = {
+				var out = String()
+				for c in self.chars() do
+					out.pushChar(c.toLowercase())
+
+				return out
+			}
+
+			/// Each of its characters in upper case.
+			pub fn toUppercase(): String = {
+				var out = String()
+				for c in self.chars() do
+					out.pushChar(c.toUppercase())
+
+				return out
+			}
+
+			/// Whether the two are the same text in any case: what
+			/// `self.folded() == other.folded()` answers, a character at a time,
+			/// making nothing.
+			pub fn equalsAnyCase(other: str): bool = {
+				var theirs = other.chars()
+				for c in self.chars() {
+					val .Some(d) = theirs.next() else return false
+					if c.folded() != d.folded() then
+						return false
+				}
+				return theirs.next().isNone()
+			}
+
+			/// Whether it begins with `prefix` in any case, character by character
+			/// as `equalsAnyCase` compares: an HTTP header's name, a keyword C
+			/// writes in either case.
+			pub fn startsWithAnyCase(prefix: str): bool = {
+				var mine = self.chars()
+				for c in prefix.chars() {
+					val .Some(d) = mine.next() else return false
+					if c.folded() != d.folded() then
+						return false
+				}
+				return true
+			}
+
+			/// Each of its characters folded, for comparing without case:
+			/// `a.folded() == b.folded()`.
+			pub fn folded(): String = {
+				var out = String()
+				for c in self.chars() do
+					out.pushChar(c.folded())
+
+				return out
+			}
+		}
+
+
+		""")
+	out.push(mapper("lowered", "LOWER", lowers.len(), "What `c` is in lower case"))
+	out.push("\n")
+	out.push(mapper("uppered", "UPPER", uppers.len(), "What `c` is in upper case"))
+	out.push("\n")
+	out.push(mapper("foldedChar", "FOLD", folded.len(), "What `c` folds to"))
+	out.push("\n")
+	out.push(tester("inUppercase", "UPPERCASE", upperSet.len(), "Whether `c` is upper case"))
+	out.push("\n")
+	out.push(tester("inLowercase", "LOWERCASE", lowerSet.len(), "Whether `c` is lower case"))
+	out.push("\n")
+	out.push(mappingTable("LOWER", &lowers, "Lower case, where it is another character"))
+	out.push("\n")
+	out.push(mappingTable("UPPER", &uppers, "Upper case, where it is another character"))
+	out.push("\n")
+	out.push(mappingTable("FOLD", &folded, "What a character folds to, where it is another"))
+	out.push("\n")
+	out.push(setTable("UPPERCASE", &upperSet, "The upper case characters"))
+	out.push("\n")
+	out.push(setTable("LOWERCASE", &lowerSet, "The lower case characters"))
+	return out
+}

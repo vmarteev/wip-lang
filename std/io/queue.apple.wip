@@ -1,6 +1,8 @@
 // A Mac and iOS: a kqueue, each descriptor with a filter for reading
-// and one for writing, the one not waited for disabled.
+// and one for writing, the one not waited for disabled; and a waker a
+// user filter, triggered from any thread and cleared as it is told of.
 
+import std::shared::{Shared}
 import std::time::{Duration}
 
 extern "C" {
@@ -38,9 +40,13 @@ extern struct Timespec {
 
 val EVFILT_READ: i16 = -1
 val EVFILT_WRITE: i16 = -2
+val EVFILT_USER: i16 = -10
 val EV_ADD: u16 = 0x1
 val EV_DELETE: u16 = 0x2
 val EV_ENABLE: u16 = 0x4
+/// Told of once, and quiet again until triggered again.
+val EV_CLEAR: u16 = 0x20
+val NOTE_TRIGGER: u32 = 0x01000000
 val EV_ERROR: u16 = 0x4000
 val EV_EOF: u16 = 0x8000
 
@@ -116,7 +122,37 @@ fn waited(queue: c_int, room: &var [RawEvent], timeout: Option<Duration>): i64 =
 
 fn eventOf(raw: &RawEvent): Event = Event(
 	token: raw.udata,
-	readable: raw.filter == EVFILT_READ,
+	readable: raw.filter == EVFILT_READ || raw.filter == EVFILT_USER,
 	writable: raw.filter == EVFILT_WRITE,
 	closed: (raw.flags & (EV_EOF | EV_ERROR)) != 0,
 )
+
+/// A waker's end: the kqueue, kept open while the waker is, the number its
+/// user filter goes by, and the token it tells of, which each trigger gives
+/// again, since a change to a filter sets what it tells of too.
+struct WakeEnd {
+	queue: Shared<Closing>
+	ident: u64
+	token: u64
+}
+
+fn wakeEndOf(queue: &Shared<Closing>, ident: u64, token: u64): Result<WakeEnd, IoError> = {
+	val filter = RawEvent(ident:, filter: EVFILT_USER, flags: EV_ADD | EV_CLEAR, udata: token)
+	applied(queue.value().fd, [filter])?
+	return WakeEnd(queue: queue.share(), ident:, token:)
+}
+
+/// Triggers the user filter; a kqueue that nothing waits on is told, and
+/// nothing comes of it.
+fn woken(end: &WakeEnd) = {
+	val trigger = RawEvent(
+		ident: end.ident,
+		filter: EVFILT_USER,
+		fflags: NOTE_TRIGGER,
+		udata: end.token,
+	)
+	applied(end.queue.value().fd, [trigger])
+}
+
+/// Nothing: a user filter told of is cleared as it is told.
+fn drained(_: &WakeEnd) = {}

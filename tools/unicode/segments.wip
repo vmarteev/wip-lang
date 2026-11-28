@@ -1,0 +1,346 @@
+// The tables Unicode's segmentation reads each character by, for
+// graphemes, words and line breaks, in `std/text/segment_table.wip`.
+
+// A character's grapheme properties, as one byte: its class, by
+// `Grapheme_Cluster_Break`, in the low four bits, 0 for `Other`; whether
+// it is `Extended_Pictographic`; and its `Indic_Conjunct_Break`, 0 for
+// `None`, in the two bits above. `segment.wip` reads them so.
+
+/// The classes of `Grapheme_Cluster_Break` but `Other`, from 1.
+val CLASSES: [str; 13] = [
+	"CR",
+	"LF",
+	"Control",
+	"Extend",
+	"ZWJ",
+	"Regional_Indicator",
+	"Prepend",
+	"SpacingMark",
+	"L",
+	"V",
+	"T",
+	"LV",
+	"LVT",
+]
+val LV: u8 = 12
+val LVT: u8 = 13
+val PICTOGRAPHIC: u8 = 0x10
+
+/// The values of `Indic_Conjunct_Break` but `None`, from 1, shifted by 5.
+val CONJUNCTS: [str; 3] = ["Consonant", "Extend", "Linker"]
+
+/// The first and the last of the Hangul syllables, an `LV` where it is a
+/// multiple of 28 from the first, an `LVT` otherwise: worked out, not kept.
+val SYLLABLES_FIRST: u32 = 0xAC00
+val SYLLABLES_LAST: u32 = 0xD7A3
+
+/// Whether each character is `Extended_Pictographic`, which graphemes
+/// and words both ask.
+fn pictographsOf(): Result<Vec<bool>, Failure> = {
+	var out: Vec<bool> = Vec::filled(0x110000, false)
+	val emoji = "emoji-data"
+	for entry in entries(unicodeFile(emoji)?, emoji)? {
+		if entry.property != "Extended_Pictographic" then
+			continue
+
+		for code in entry.first..=entry.last do
+			out[code as i64] = true
+	}
+	return out
+}
+
+/// Each character's class by the property file `name`, the index in
+/// `classes` and 1, or 0 where the file gives it none.
+fn classesOf(name: str, classes: &[str]): Result<Vec<u8>, Failure> = {
+	var out: Vec<u8> = Vec::filled(0x110000, 0)
+	for entry in entries(unicodeFile(name)?, name)? {
+		val .Some(at) = classes.indexOf(entry.property.toStr()) else {
+			return .Err(Failure(message: "\(name): a class unknown, \(entry.property)"))
+		}
+		for code in entry.first..=entry.last do
+			out[code as i64] = (at + 1) as u8
+	}
+	return out
+}
+
+/// The characters from `from` whose properties are not 0, as runs of the
+/// same, those from `first` to `last` left out.
+fn runsOf(properties: &[u8], from: i64, first: u32, last: u32): Vec<(u32, u32, u8)> = {
+	var runs: Vec<(u32, u32, u8)> = Vec()
+	for code in from..0x110000 {
+		val value = properties[code]
+		if value == 0 || (code >= first as i64 && code <= last as i64) then
+			continue
+
+		if runs.last() is .Some((_, end, was)) && end as i64 == code - 1 && was == value {
+			val at = runs.len() - 1
+			runs[at] = (runs[at].0, code as u32, value)
+		} else
+			runs.push((code as u32, code as u32, value))
+	}
+	return runs
+}
+
+/// Each character's grapheme properties, as runs from U+0080 of those that
+/// have any, the Hangul syllables left out: ASCII and the syllables are
+/// worked out, and checked here to be what Unicode says.
+fn graphemeTable(pictographs: &[bool]): Result<Vec<(u32, u32, u8)>, Failure> = {
+	var properties = classesOf("GraphemeBreakProperty", &CLASSES)?
+	for code in 0..0x110000 do
+		if pictographs[code] then
+			properties[code] |= PICTOGRAPHIC
+
+	val derived = "DerivedCoreProperties"
+	for entry in entries(unicodeFile(derived)?, derived)? {
+		if entry.property != "InCB" then
+			continue
+
+		val .Some(at) = CONJUNCTS.indexOf(entry.value.toStr()) else {
+			return .Err(Failure(message: "\(derived): a conjunct class unknown, \(entry.value)"))
+		}
+		for code in entry.first..=entry.last do
+			properties[code as i64] |= ((at + 1) as u8) << 5
+	}
+
+	// ASCII: CR, LF, the other controls, and nothing else.
+	for code in 0..0x80 {
+		val expected: u8 = match code {
+			0x0D => 1
+			0x0A => 2
+			0..0x20 | 0x7F => 3
+			_ => 0
+		}
+		if properties[code] != expected then
+			return .Err(Failure(message: "U+\(code, radix: 16, upper: true) is not what ASCII is taken for"))
+	}
+	for code in SYLLABLES_FIRST..=SYLLABLES_LAST {
+		val expected = if (code - SYLLABLES_FIRST) % 28 == 0 then LV else LVT
+		if properties[code as i64] != expected then
+			return .Err(Failure(message: "U+\(code, radix: 16, upper: true) is not the syllable it is taken for"))
+	}
+	return runsOf(&properties, 0x80, SYLLABLES_FIRST, SYLLABLES_LAST)
+}
+
+// A character's word properties, as one byte: its class, by
+// `Word_Break`, in the low five bits, 0 for `Other`, and 32 where it is
+// `Extended_Pictographic`. `segment.wip` reads them so.
+
+/// The classes of `Word_Break` but `Other`, from 1.
+val WORD_CLASSES: [str; 18] = [
+	"CR",
+	"LF",
+	"Newline",
+	"Extend",
+	"ZWJ",
+	"Regional_Indicator",
+	"Format",
+	"Katakana",
+	"Hebrew_Letter",
+	"ALetter",
+	"Single_Quote",
+	"Double_Quote",
+	"MidNumLet",
+	"MidLetter",
+	"MidNum",
+	"Numeric",
+	"ExtendNumLet",
+	"WSegSpace",
+]
+val WORD_PICTOGRAPHIC: u8 = 0x20
+
+/// Each character's word properties, as runs of those that have any, ASCII
+/// among them.
+fn wordTable(pictographs: &[bool]): Result<Vec<(u32, u32, u8)>, Failure> = {
+	var properties = classesOf("WordBreakProperty", &WORD_CLASSES)?
+	for code in 0..0x110000 do
+		if pictographs[code] then
+			properties[code] |= WORD_PICTOGRAPHIC
+
+	return runsOf(&properties, 0, 1, 0)
+}
+
+// A character's line properties, as 16 bits: its class, by `Line_Break`
+// as UAX #14's first rule resolves it, in the low six bits, 0 for `AL`;
+// 64 where it is East Asian, by `East_Asian_Width`, fullwidth, wide or
+// halfwidth; 128 for a quotation mark that opens, `Pi`, and 256 for one
+// that closes, `Pf`; and 512 for a pictograph not yet assigned, which may
+// become an emoji. `lines.wip` reads them so.
+
+/// The classes of `Line_Break` as resolved, from 0, `AL` first.
+val LINE_CLASSES: [str; 43] = [
+	"AL",
+	"BK",
+	"CR",
+	"LF",
+	"NL",
+	"SP",
+	"ZW",
+	"WJ",
+	"ZWJ",
+	"CM",
+	"GL",
+	"BA",
+	"HY",
+	"B2",
+	"BB",
+	"CL",
+	"CP",
+	"EX",
+	"IN",
+	"NS",
+	"OP",
+	"QU",
+	"IS",
+	"NU",
+	"PO",
+	"PR",
+	"SY",
+	"AK",
+	"AP",
+	"AS",
+	"CB",
+	"EB",
+	"EM",
+	"H2",
+	"H3",
+	"HL",
+	"ID",
+	"JL",
+	"JT",
+	"JV",
+	"RI",
+	"VF",
+	"VI",
+]
+val LINE_EAST_ASIAN: u16 = 0x40
+val LINE_OPENING: u16 = 0x80
+val LINE_CLOSING: u16 = 0x100
+val LINE_POSSIBLE_EMOJI: u16 = 0x200
+
+/// Whether `category` is a mark that takes a place, `Mn` or `Mc`.
+fn isMark(category: str): bool = category == "Mn" || category == "Mc"
+
+/// Each character's line properties, as runs of those that are not a
+/// plain `AL`, the Hangul syllables left out: they are an `H2` every 28th,
+/// an `H3` otherwise, and wide, which is worked out, and checked here to
+/// be what Unicode says. `AI`, `SG` and `XX` are resolved as `AL`; `SA` as
+/// `CM` where it is a mark, and as `AL` otherwise; and `CJ` as `NS`, as the
+/// first rule does where nothing else decides.
+fn lineTable(pictographs: &[bool], categories: &[u8]): Result<Vec<(u32, u32, u16)>, Failure> = {
+	var properties: Vec<u16> = Vec::filled(0x110000, 0)
+	val breaks = "LineBreak"
+	for entry in entries(unicodeFile(breaks)?, breaks)? {
+		for code in entry.first..=entry.last {
+			val written = entry.property.toStr()
+			val resolved = match written {
+				"AI" | "SG" | "XX" => "AL"
+				"SA" => if isMark(categoryOf(&categories, code as i64)) then "CM" else "AL"
+				"CJ" => "NS"
+				_ => written
+			}
+			val .Some(class) = LINE_CLASSES.indexOf(&resolved) else {
+				return .Err(Failure(message: "\(breaks): a class unknown, \(written)"))
+			}
+			properties[code as i64] = class as u16
+		}
+	}
+	val widths = "EastAsianWidth"
+	for entry in entries(unicodeFile(widths)?, widths)? {
+		if entry.property != "F" && entry.property != "W" && entry.property != "H" then
+			continue
+
+		for code in entry.first..=entry.last do
+			properties[code as i64] |= LINE_EAST_ASIAN
+	}
+	val quotation = LINE_CLASSES.indexOf("QU").unwrap() as u16
+	for code in 0..0x110000 {
+		if properties[code] & 0x3F == quotation {
+			if categoryOf(&categories, code) == "Pi" then
+				properties[code] |= LINE_OPENING
+			else if categoryOf(&categories, code) == "Pf" then
+				properties[code] |= LINE_CLOSING
+		}
+		if pictographs[code] && categoryOf(&categories, code) == "Cn" then
+			properties[code] |= LINE_POSSIBLE_EMOJI
+	}
+
+	val h2 = LINE_CLASSES.indexOf("H2").unwrap() as u16
+	val h3 = LINE_CLASSES.indexOf("H3").unwrap() as u16
+	for code in SYLLABLES_FIRST..=SYLLABLES_LAST {
+		val class = if (code - SYLLABLES_FIRST) % 28 == 0 then h2 else h3
+		if properties[code as i64] != class | LINE_EAST_ASIAN then
+			return .Err(Failure(message: "U+\(code, radix: 16, upper: true) is not the syllable it is taken for"))
+	}
+
+	var runs: Vec<(u32, u32, u16)> = Vec()
+	for code in 0..0x110000 {
+		val value = properties[code]
+		if value == 0 || (code >= SYLLABLES_FIRST as i64 && code <= SYLLABLES_LAST as i64) then
+			continue
+
+		if runs.last() is .Some((_, end, was)) && end as i64 == code - 1 && was == value {
+			val at = runs.len() - 1
+			runs[at] = (runs[at].0, code as u32, value)
+		} else
+			runs.push((code as u32, code as u32, value))
+	}
+	return runs
+}
+
+/// `std/text/segment_table.wip`: its header, and each table.
+fn segmentFile(
+	graphemes: &[(u32, u32, u8)],
+	words: &[(u32, u32, u8)],
+	lines: &[(u32, u32, u16)],
+): String = {
+	var out = String()
+	out.push("""
+		// The properties Unicode's segmentation reads each character by, from
+		// its files: a grapheme's class, whether it is a pictograph, and its
+		// class in an Indic conjunct; a word's class; and a line's class.
+		// Written by tools/unicode/main.wip from Unicode \(VERSION); edit that, not this.
+
+		/// Each character's grapheme properties from U+0080, but the Hangul
+		/// syllables, which are worked out: the first and the last of each run,
+		/// and its properties, as a byte — the class, by
+		/// `Grapheme_Cluster_Break`, in the low four bits; 16 where it is
+		/// `Extended_Pictographic`; and the class in a conjunct, by
+		/// `Indic_Conjunct_Break`, in the two bits above.
+		val GRAPHEMES: [(u32, u32, u8); \(graphemes.len())] = [
+
+		""")
+	written(&var out, &graphemes)
+	out.push("""
+		]
+
+		/// Each character's word properties: the first and the last of each run,
+		/// and its properties, as a byte — the class, by `Word_Break`, in the low
+		/// five bits, and 32 where it is `Extended_Pictographic`.
+		val WORDS: [(u32, u32, u8); \(words.len())] = [
+
+		""")
+	written(&var out, &words)
+	out.push("""
+		]
+
+		/// Each character's line properties from U+0000, but the Hangul
+		/// syllables, which are worked out, and every `AL`, which is 0: the
+		/// first and the last of each run, and its properties — the class, by
+		/// `Line_Break` as resolved, in the low six bits; 64 where it is East
+		/// Asian; 128 for a quotation mark that opens and 256 for one that
+		/// closes; and 512 for a pictograph not yet assigned.
+		val LINES: [(u32, u32, u16); \(lines.len())] = [
+
+		""")
+	for (first, last, value) in lines do
+		out.push("\t(0x\(first, radix: 16, upper: true), 0x\(last, radix: 16, upper: true), \(value)),\n")
+
+	out.push("]\n")
+	return out
+}
+
+/// A table's runs, one to a line.
+fn written(out: &var String, runs: &[(u32, u32, u8)]) = {
+	for (first, last, value) in runs do
+		out.push("\t(0x\(first, radix: 16, upper: true), 0x\(last, radix: 16, upper: true), \(value)),\n")
+}

@@ -49,7 +49,8 @@ and `assert`. [Page 12](12-tools.md#the-commands)
 compiler writes those interfaces for a type, field by field. [Page 8](08-interfaces.md#derive)
 
 **`dyn`** — `&dyn Shape`, a reference to a value of some type that
-implements `Shape`, called through a table of that type's methods. [Page 8](08-interfaces.md#dyn)
+implements `Shape`, called through a table of that type's methods; and
+`own<dyn Shape>`, such a value owned. [Page 8](08-interfaces.md#dyn)
 
 **`empties`** — `var fn clear() empties`: the call leaves the receiver
 holding no view, so it borrows nothing until something is put in it again;

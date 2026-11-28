@@ -136,8 +136,9 @@ The built-in type names are **not** keywords: `i8` `i16` `i32` `i64` `i128`
 `cstring` `void` `never`, and C's own names `c_char` `c_schar` `c_uchar`
 `c_short` `c_ushort` `c_int` `c_uint` `c_long` `c_ulong` `c_longlong`
 `c_ulonglong` `c_float` `c_double` `size_t` `ssize_t` `intptr_t`
-`uintptr_t`, which stand for the types C uses on the target. They are identifiers that name built-in types;
-declaring a type with one of those names is an error.
+`uintptr_t`, which stand for the types C uses on the target. They are
+identifiers that name built-in types; declaring a type with one of those
+names is an error.
 
 ### Punctuation
 
@@ -433,7 +434,7 @@ type        = "own" "<" type ">"           (* `own<(…) => R>` is an owned
             | "[" type "]"                 (* a slice: only behind "&" or
                                               "own", `own<[T]>` a buffer *)
             | "dyn" path typeArgs?         (* some type that implements the interface:
-                                              only behind "&" *)
+                                              only behind "&" or "own" *)
             | "(" ( param ( "," param )* ","? )? ")" "=>" type
                                            (* a function type, `=> void` for none;
                                               names are required *)

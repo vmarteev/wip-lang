@@ -1,0 +1,547 @@
+// Where a text's lines may break, by UAX #14's default rules: after a
+// space, not before `!` or `)`, anywhere between two ideographs but not
+// before `。`, not inside `-2.5`, and wherever a newline says a line must.
+// It measures nothing: a layout asks it where it may cut a line that is
+// too wide, and how wide is the shaper's. No dictionary either: the
+// scripts that need one, Thai's and its neighbours', break as letters do,
+// and nothing is hyphenated. The method is the prelude's; the rules, the
+// generator and its types are here.
+//
+// A rule is of the characters either side of a place, each with the marks
+// after it, which take its class, and some look further: past spaces, as
+// `( ` before a word does not break; along a number, as `$(12.35)` is one;
+// and past a quotation mark to what is around it.
+
+/// A place a line may begin: what `text.lineBreaks()` hands out.
+@derive(Eq)
+pub struct LineBreak {
+	/// The byte offset it begins at.
+	pub at: i64
+	/// Whether a line must begin there — after a newline, a paragraph or a
+	/// line separator, and at the text's end — rather than may.
+	pub mandatory: bool
+}
+
+/// Each place a line of `text` may begin, in order, its end the last:
+/// what `text.lineBreaks()` answers.
+pub fn lineBreaks(text: str): Iterator<LineBreak> as LineBreaks = {
+	if text.isEmpty() then
+		return
+
+	var behind = LinesBehind()
+	val (first, width) = text.charAt(0)
+	behind.take(linePropertiesOf(first))
+	var at = width
+	while at < text.len() {
+		val (c, width) = text.charAt(at)
+		match lineRuleAt(text, at) {
+			.Mandatory => yield LineBreak(at:, mandatory: true)
+			.Allowed => yield LineBreak(at:, mandatory: false)
+			.Never => {}
+			.Regional => if !behind.regionalOdd then yield LineBreak(at:, mandatory: false)
+		}
+		behind.take(linePropertiesOf(c))
+		at += width
+	}
+	yield LineBreak(at: text.len(), mandatory: true)
+}
+
+// A character's line properties, 16 bits: its class in the low six, by
+// `Line_Break` as UAX #14's first rule resolves it, 0 for `AL`; 64 where it
+// is East Asian, fullwidth, wide or halfwidth; 128 for a quotation mark
+// that opens and 256 for one that closes; and 512 for a pictograph not yet
+// assigned. What the table holds.
+
+val LINE_AL: u8 = 0
+val LINE_BK: u8 = 1
+val LINE_CR: u8 = 2
+val LINE_LF: u8 = 3
+val LINE_NL: u8 = 4
+val LINE_SP: u8 = 5
+val LINE_ZW: u8 = 6
+val LINE_WJ: u8 = 7
+val LINE_ZWJ: u8 = 8
+val LINE_CM: u8 = 9
+val LINE_GL: u8 = 10
+val LINE_BA: u8 = 11
+val LINE_HY: u8 = 12
+val LINE_B2: u8 = 13
+val LINE_BB: u8 = 14
+val LINE_CL: u8 = 15
+val LINE_CP: u8 = 16
+val LINE_EX: u8 = 17
+val LINE_IN: u8 = 18
+val LINE_NS: u8 = 19
+val LINE_OP: u8 = 20
+val LINE_QU: u8 = 21
+val LINE_IS: u8 = 22
+val LINE_NU: u8 = 23
+val LINE_PO: u8 = 24
+val LINE_PR: u8 = 25
+val LINE_SY: u8 = 26
+val LINE_AK: u8 = 27
+val LINE_AP: u8 = 28
+val LINE_AS: u8 = 29
+val LINE_CB: u8 = 30
+val LINE_EB: u8 = 31
+val LINE_EM: u8 = 32
+val LINE_H2: u8 = 33
+val LINE_H3: u8 = 34
+val LINE_HL: u8 = 35
+val LINE_ID: u8 = 36
+val LINE_JL: u8 = 37
+val LINE_JT: u8 = 38
+val LINE_JV: u8 = 39
+val LINE_RI: u8 = 40
+val LINE_VF: u8 = 41
+val LINE_VI: u8 = 42
+/// No character: before the text's start, or after its end.
+val LINE_NONE: u8 = 0x3F
+
+val LINE_EAST_ASIAN: u16 = 0x40
+val LINE_OPENING: u16 = 0x80
+val LINE_CLOSING: u16 = 0x100
+val LINE_POSSIBLE_EMOJI: u16 = 0x200
+
+/// U+25CC DOTTED CIRCLE, which stands for a letter in a Brahmic syllable.
+val DOTTED_CIRCLE: u32 = 0x25CC
+
+/// A character's line properties: the Hangul syllables' worked out, the
+/// rest read from the table, where an `AL` is not.
+fn linePropertiesOf(c: char): u16 = {
+	val code = c as u32
+	// A syllable is an `H2` where it has no final consonant, every 28th,
+	// and wide.
+	if code >= 0xAC00 && code <= 0xD7A3 {
+		val class = if (code - 0xAC00) % 28 == 0 then LINE_H2 else LINE_H3
+		return class as u16 | LINE_EAST_ASIAN
+	}
+	var lo = 0
+	var hi = LINES.len() - 1
+	while lo <= hi {
+		val middle = (lo + hi) / 2
+		val (first, last, properties) = LINES[middle]
+		if code < first then
+			hi = middle - 1
+		else if code > last then
+			lo = middle + 1
+		else
+			return properties
+	}
+	return 0
+}
+
+fn lineClassOf(properties: u16): u8 = (properties & 0x3F) as u8
+
+/// The newlines and spaces that a mark after does not belong to.
+fn isLineBase(class: u8): bool =
+	class != LINE_BK &&
+	class != LINE_CR &&
+	class != LINE_LF &&
+	class != LINE_NL &&
+	class != LINE_SP &&
+	class != LINE_ZW
+
+/// A character as the rules see it, with the marks after it: its
+/// properties, its code, and where it begins.
+struct Unit {
+	properties: u16
+	code: u32
+	start: i64
+}
+
+extend Unit {
+	fn class(): u8 = lineClassOf(self.properties)
+
+	fn isEastAsian(): bool = self.properties & LINE_EAST_ASIAN != 0
+
+	/// A letter of a Brahmic syllable, or the dotted circle that stands for
+	/// one.
+	fn isAksara(): bool = {
+		val class = self.class()
+		return class == LINE_AK || class == LINE_AS || self.code == DOTTED_CIRCLE
+	}
+}
+
+/// No character, before the start or after the end.
+fn noUnit(at: i64): Unit = Unit(properties: LINE_NONE as u16, code: 0, start: at)
+
+/// A mark that belongs to nothing, after a space or a newline or at the
+/// start, which is taken for a letter, `A`'s.
+fn markAlone(at: i64): Unit = Unit(properties: 0, code: 0x41, start: at)
+
+/// The character before byte `at` of `text`, with the marks after it.
+fn unitBefore(text: str, at: i64): Unit = {
+	if at <= 0 then
+		return noUnit(0)
+
+	var start = startBefore(text, at)
+	var c = text.charAt(start).0
+	var properties = linePropertiesOf(c)
+	var class = lineClassOf(properties)
+	if class != LINE_CM && class != LINE_ZWJ then
+		return Unit(properties:, code: c as u32, start:)
+
+	// Marks: back to what they belong to.
+	var firstMark = start
+	while class == LINE_CM || class == LINE_ZWJ {
+		firstMark = start
+		if start == 0 then
+			return markAlone(firstMark)
+
+		start = startBefore(text, start)
+		c = text.charAt(start).0
+		properties = linePropertiesOf(c)
+		class = lineClassOf(properties)
+	}
+	if !isLineBase(class) then
+		return markAlone(firstMark)
+
+	return Unit(properties:, code: c as u32, start:)
+}
+
+/// The character that begins at byte `at` of `text`, which begins one,
+/// with the marks after it; nothing at the end.
+fn unitAt(text: str, at: i64): Unit = {
+	if at >= text.len() then
+		return noUnit(at)
+
+	val c = text.charAt(at).0
+	val properties = linePropertiesOf(c)
+	val class = lineClassOf(properties)
+	if class == LINE_CM || class == LINE_ZWJ then
+		return markAlone(at)
+
+	return Unit(properties:, code: c as u32, start: at)
+}
+
+/// The character after the one that begins at byte `at` of `text`, the
+/// marks after that one left out; nothing at the end.
+fn unitAfter(text: str, at: i64): Unit = {
+	val c = text.charAt(at).0
+	var place = at + text.charAt(at).1
+	if isLineBase(lineClassOf(linePropertiesOf(c))) {
+		while place < text.len() {
+			val class = lineClassOf(linePropertiesOf(text.charAt(place).0))
+			if class != LINE_CM && class != LINE_ZWJ then
+				break
+
+			place += text.charAt(place).1
+		}
+	}
+	return unitAt(text, place)
+}
+
+/// The character before byte `at` of `text` and the spaces after it.
+fn unitBeforeSpaces(text: str, at: i64): Unit = {
+	var place = at
+	while place > 0 {
+		val start = startBefore(text, place)
+		if lineClassOf(linePropertiesOf(text.charAt(start).0)) != LINE_SP then
+			break
+
+		place = start
+	}
+	return unitBefore(text, place)
+}
+
+/// Whether a number ends at byte `at` of `text`: a digit, then any of `/`,
+/// `,` and `.`.
+fn numberEndsAt(text: str, at: i64): bool = {
+	var place = at
+	while true {
+		val unit = unitBefore(text, place)
+		val class = unit.class()
+		if class == LINE_NU then
+			return true
+
+		if class != LINE_SY && class != LINE_IS then
+			return false
+
+		place = unit.start
+	}
+	return false
+}
+
+fn isOneOf(class: u8, classes: &[u8]): bool = classes.contains(&class)
+
+/// What UAX #14's rules say of a place: that a line must begin there, may,
+/// may not, or may where the run of regional indicators before is even.
+enum LineRule {
+	Mandatory
+	Allowed
+	Never
+	Regional
+}
+
+/// The rules for byte `at` of `text`, inside it, in UAX #14's order.
+fn lineRuleAt(text: str, at: i64): LineRule = {
+	val was = lineClassOf(linePropertiesOf(text.charAt(startBefore(text, at)).0))
+	val now = lineClassOf(linePropertiesOf(text.charAt(at).0))
+	// Newlines, spaces, a zero width space and joiners, by the characters
+	// as they are.
+	if was == LINE_BK then
+		return .Mandatory
+
+	if was == LINE_CR && now == LINE_LF then
+		return .Never
+
+	if was == LINE_CR || was == LINE_LF || was == LINE_NL then
+		return .Mandatory
+
+	if isOneOf(now, [LINE_BK, LINE_CR, LINE_LF, LINE_NL, LINE_SP, LINE_ZW]) then
+		return .Never
+
+	if unitBeforeSpaces(text, at).class() == LINE_ZW then
+		return .Allowed
+
+	if was == LINE_ZWJ then
+		return .Never
+
+	if (now == LINE_CM || now == LINE_ZWJ) && isLineBase(was) then
+		return .Never
+
+	// The rest by the characters with their marks.
+	val left = unitBefore(text, at)
+	val right = unitAt(text, at)
+	val a = left.class()
+	val b = right.class()
+	if a == LINE_WJ || b == LINE_WJ || a == LINE_GL then
+		return .Never
+
+	if b == LINE_GL && a != LINE_SP && a != LINE_BA && a != LINE_HY then
+		return .Never
+
+	if isOneOf(b, [LINE_CL, LINE_CP, LINE_EX, LINE_SY]) then
+		return .Never
+
+	// Opening punctuation, and quotation marks that open and close, even
+	// with spaces between.
+	val beforeSpaces = unitBeforeSpaces(text, at)
+	if beforeSpaces.class() == LINE_OP then
+		return .Never
+
+	if beforeSpaces.class() == LINE_QU && beforeSpaces.properties & LINE_OPENING != 0 {
+		val ahead = unitBefore(text, beforeSpaces.start).class()
+		val opens = [
+			LINE_NONE,
+			LINE_BK,
+			LINE_CR,
+			LINE_LF,
+			LINE_NL,
+			LINE_OP,
+			LINE_QU,
+			LINE_GL,
+			LINE_SP,
+			LINE_ZW,
+		]
+		if isOneOf(ahead, &opens) then
+			return .Never
+	}
+	if b == LINE_QU && right.properties & LINE_CLOSING != 0 {
+		val after = unitAfter(text, at).class()
+		val closes = [
+			LINE_NONE,
+			LINE_SP,
+			LINE_GL,
+			LINE_WJ,
+			LINE_CL,
+			LINE_QU,
+			LINE_CP,
+			LINE_EX,
+			LINE_IS,
+			LINE_SY,
+			LINE_BK,
+			LINE_CR,
+			LINE_LF,
+			LINE_NL,
+			LINE_ZW,
+		]
+		if isOneOf(after, &closes) then
+			return .Never
+	}
+	// A decimal mark after a space begins a number, `.5`; otherwise none
+	// is broken before.
+	if a == LINE_SP && b == LINE_IS && unitAfter(text, at).class() == LINE_NU then
+		return .Allowed
+
+	if b == LINE_IS then
+		return .Never
+
+	if b == LINE_NS && (beforeSpaces.class() == LINE_CL || beforeSpaces.class() == LINE_CP) then
+		return .Never
+
+	if b == LINE_B2 && beforeSpaces.class() == LINE_B2 then
+		return .Never
+
+	if a == LINE_SP then
+		return .Allowed
+
+	// Quotation marks that neither open nor close, which join what is
+	// around them but where it is East Asian.
+	if b == LINE_QU && right.properties & LINE_OPENING == 0 then
+		return .Never
+
+	if a == LINE_QU && left.properties & LINE_CLOSING == 0 then
+		return .Never
+
+	if b == LINE_QU {
+		val after = unitAfter(text, at)
+		if !left.isEastAsian() || after.class() == LINE_NONE || !after.isEastAsian() then
+			return .Never
+	}
+	if a == LINE_QU {
+		val before = unitBefore(text, left.start)
+		if !right.isEastAsian() || before.class() == LINE_NONE || !before.isEastAsian() then
+			return .Never
+	}
+	if a == LINE_CB || b == LINE_CB then
+		return .Allowed
+
+	// A hyphen that begins a word.
+	if b == LINE_AL && (a == LINE_HY || left.code == 0x2010) {
+		val before = unitBefore(text, left.start).class()
+		val starts = [
+			LINE_NONE,
+			LINE_BK,
+			LINE_CR,
+			LINE_LF,
+			LINE_NL,
+			LINE_SP,
+			LINE_ZW,
+			LINE_CB,
+			LINE_GL,
+		]
+		if isOneOf(before, &starts) then
+			return .Never
+	}
+	if b == LINE_BA || b == LINE_HY || b == LINE_NS || a == LINE_BB then
+		return .Never
+
+	if b != LINE_HL &&
+		(a == LINE_HY || (a == LINE_BA && !left.isEastAsian())) &&
+		unitBefore(text, left.start).class() == LINE_HL {
+		return .Never
+	}
+	if a == LINE_SY && b == LINE_HL then
+		return .Never
+
+	if b == LINE_IN then
+		return .Never
+
+	// Letters, numbers, and what goes before and after a number.
+	val letter = [LINE_AL, LINE_HL]
+	if (isOneOf(a, &letter) && b == LINE_NU) || (a == LINE_NU && isOneOf(b, &letter)) then
+		return .Never
+
+	val ideograph = [LINE_ID, LINE_EB, LINE_EM]
+	if (a == LINE_PR && isOneOf(b, &ideograph)) || (isOneOf(a, &ideograph) && b == LINE_PO) then
+		return .Never
+
+	val affix = [LINE_PR, LINE_PO]
+	if (isOneOf(a, &affix) && isOneOf(b, &letter)) || (isOneOf(a, &letter) && isOneOf(b, &affix)) {
+		return .Never
+	}
+
+	if isOneOf(b, &affix) {
+		if (a == LINE_CL || a == LINE_CP) && numberEndsAt(text, left.start) then
+			return .Never
+
+		if numberEndsAt(text, at) then
+			return .Never
+	}
+	if isOneOf(a, &affix) {
+		if b == LINE_NU then
+			return .Never
+
+		if b == LINE_OP {
+			val after = unitAfter(text, at)
+			if after.class() == LINE_NU then
+				return .Never
+
+			if after.class() == LINE_IS &&
+				after.start < text.len() &&
+				unitAfter(text, after.start).class() == LINE_NU {
+				return .Never
+			}
+		}
+	}
+	if (a == LINE_HY || a == LINE_IS) && b == LINE_NU then
+		return .Never
+
+	if b == LINE_NU && numberEndsAt(text, at) then
+		return .Never
+
+	// Korean syllables, which are one, and take what goes after and before
+	// an ideograph.
+	val jamo = [LINE_JL, LINE_JV, LINE_JT, LINE_H2, LINE_H3]
+	if a == LINE_JL && isOneOf(b, [LINE_JL, LINE_JV, LINE_H2, LINE_H3]) then
+		return .Never
+
+	if (a == LINE_JV || a == LINE_H2) && (b == LINE_JV || b == LINE_JT) then
+		return .Never
+
+	if (a == LINE_JT || a == LINE_H3) && b == LINE_JT then
+		return .Never
+
+	if (isOneOf(a, &jamo) && b == LINE_PO) || (a == LINE_PR && isOneOf(b, &jamo)) then
+		return .Never
+
+	if isOneOf(a, &letter) && isOneOf(b, &letter) then
+		return .Never
+
+	// Brahmic orthographic syllables.
+	if a == LINE_AP && right.isAksara() then
+		return .Never
+
+	if left.isAksara() && (b == LINE_VF || b == LINE_VI) then
+		return .Never
+
+	if a == LINE_VI && right.isAksara() && unitBefore(text, left.start).isAksara() then
+		return .Never
+
+	if left.isAksara() && right.isAksara() && unitAfter(text, at).class() == LINE_VF then
+		return .Never
+
+	if a == LINE_IS && isOneOf(b, &letter) then
+		return .Never
+
+	// A word and the brackets around it, but East Asian ones.
+	val word = [LINE_AL, LINE_HL, LINE_NU]
+	if isOneOf(a, &word) && b == LINE_OP && !right.isEastAsian() then
+		return .Never
+
+	if a == LINE_CP && !left.isEastAsian() && isOneOf(b, &word) then
+		return .Never
+
+	if a == LINE_RI && b == LINE_RI then
+		return .Regional
+
+	if b == LINE_EM && (a == LINE_EB || left.properties & LINE_POSSIBLE_EMOJI != 0) then
+		return .Never
+
+	return .Allowed
+}
+
+/// What is behind a place, kept as a text is read forward: the class of
+/// the last character that marks do not belong to, and whether the
+/// characters end in an odd run of regional indicators.
+struct LinesBehind {
+	last: u8 = LINE_NONE
+	regionalOdd: bool = false
+}
+
+extend LinesBehind {
+	/// What is behind once a character of `properties` is read: a mark
+	/// belongs to the character before it, but a space, a newline, or
+	/// nothing, where it is a letter of its own.
+	var fn take(properties: u16) = {
+		val class = lineClassOf(properties)
+		val isMark = class == LINE_CM || class == LINE_ZWJ
+		if isMark && self.last != LINE_NONE && isLineBase(self.last) then
+			return
+
+		self.last = class
+		self.regionalOdd = class == LINE_RI && !self.regionalOdd
+	}
+}

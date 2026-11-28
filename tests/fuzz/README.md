@@ -6,9 +6,12 @@ those the checker accepts with every check a program has. A case the
 checker accepts must run clean; one that does not is a finding.
 
 ```sh
-wip build --release tests/fuzz/main.wip -o target/fuzz
-target/fuzz target/wip/bin/wip --rounds 20
+wip build --release tests/fuzz/main.wip -o target/fuzzer
+target/fuzzer target/wip/bin/wip --rounds 20
 ```
+
+Its work goes in `target/fuzz/` — its cases, mutants and findings — so
+the program is built beside that directory, not as it.
 
 ## What a case is
 
@@ -18,8 +21,7 @@ memory in each way a program's do — a `String`, a `Vec<String>`, an
 holds one, a list of boxes and an owned closure, `own<() => i64>`, which
 owns what it captured — a view, `Seen`, that borrows, and `Tracked`, a
 value with a `destroy` of its own that a pair and a node hold, and a case
-keeps alone too. `generate.wip`
-writes its statements:
+keeps alone too. `generate.wip` writes its statements:
 
 - values made, moved, cloned, and moved out of a field, a list, an option
   and a box; a struct taken apart by a `move fn` of its own; a value moved
@@ -73,7 +75,6 @@ The runner is linked, and each case is run in a process of its own, as
   a variable whose block has ended, which Wip marks in every build. With
   `--guard`, on a Mac, Guard Malloc checks it instead: each allocation on
   pages of its own, taken away when it is freed, which sees the heap alone.
-
 - **every end of a tracked value,** from the log the case writes: making a
   `Tracked` writes `made N`, `N` the place in the case where it is made
   (a clone's is 100000 more), and ending one writes `ended N`. Each must
@@ -84,7 +85,6 @@ The runner is linked, and each case is run in a process of its own, as
   they were declared. A value that may have been moved, or whose contents
   the generator cannot say, is not named, and a block whose values it
   cannot say is marked `?`.
-
 - **both builds:** each batch is built as a test is and again with
   `--release`, and a case that passes in the first must pass in the second,
   with every check above, and print the same: its log, its marks, and the
@@ -136,7 +136,7 @@ than the language, or the checker refuses what it should accept.
 ## The programs changed: `--mutate`
 
 ```sh
-target/fuzz target/wip/bin/wip --mutate --rounds 50
+target/fuzzer target/wip/bin/wip --mutate --rounds 50
 ```
 
 Run in the checkout, it takes every program the repository keeps — each
@@ -152,7 +152,7 @@ language server checks what is being typed, many at once, each given
 twenty seconds of a processor.
 
 Whatever the text, the check must accept it or refuse it with an error's
-code. Past the check, each change goes through two stages more:
+code. Past the check, each change goes through three stages more:
 
 - **built and run,** where the check accepts it: built with
   `--sanitize address` and run, given nothing, with five seconds of a
@@ -167,8 +167,9 @@ code. Past the check, each change goes through two stages more:
   writes, formatted again, must be what it wrote; and it must hold every
   token the text held, but for what the formatter lays out itself —
   commas, semicolons, the braces of a body of one statement it writes
-  after `then` or `do`, a text block's indentation, and a `>=` that
-  closes a type's arguments, which it writes `> =`;
+  after `then` or `do`, a text block's indentation and the space that
+  ends its lines, which is not part of its text, and a `>=` that closes a
+  type's arguments, which it writes `> =`;
 - **asked of the language server,** an eighth of the changes a round, a
   different eighth each, since opening a file checks its whole program: a
   server for each processor's share opens each changed file, and is asked
@@ -185,8 +186,9 @@ places it was asked about.
 With `--sources`, more programs are changed too: the tool,
 `tools/bindgen`, and each directory a checkout lists in
 `scripts/ports.txt`, first on a line, that is there and holds a program,
-copied without its history, what it built, or a file larger than 2 MB. One that panics, is ended by a signal, runs out of its time, or
-refuses without an error's code is a finding: the changed file's lines are
+copied without its history, what it built, or a file larger than 2 MB.
+One that panics, is ended by a signal, runs out of its time, or refuses
+without an error's code is a finding: the changed file's lines are
 left out, many at a time and then one at a time, while the check fails the
 same way, and the program is kept in
 `target/fuzz/findings/mutate-STAGE-SEED-NAME/`
@@ -196,13 +198,14 @@ already in the run is counted and not kept again: a panic is its message,
 with numbers made `N`, the first place in the compiler it names, and the
 first function of the compiler that called the one there, as one helper
 called from many places panics for as many reasons. The run ends with
-`summary.txt`, as the other mode does. The run ends with the refusals counted by their first error's
-code, which says how far into the compiler the changes reach.
+`summary.txt`, as the other mode does, and with the refusals counted by
+their first error's code, which says how far into the compiler the
+changes reach.
 
 ## The engines compared: `--engines`
 
 ```sh
-target/fuzz target/wip/bin/wip --engines --rounds 50
+target/fuzzer target/wip/bin/wip --engines --rounds 50
 ```
 
 A function is worked out by two engines: the evaluator, which runs a

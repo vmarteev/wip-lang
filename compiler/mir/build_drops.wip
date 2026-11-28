@@ -3,7 +3,7 @@
 
 import std::collections::{Set}
 import hir as hir
-import hir::{BOOL, ExprId, I32, I64, LocalId, PTR_U8, Ty, UNIT}
+import hir::{BOOL, ExprId, I32, I64, InterfaceId, LocalId, PTR_U8, Ty, UNIT}
 
 /// A part of a value that needs dropping, and the projection that reaches it.
 type DropPart = (Projection, Ty)
@@ -105,6 +105,12 @@ extend Builder {
 				// it, so its environment carries its drop function.
 				if self.kind(inner) is .Fn(..) {
 					self.dropClosure(&place)
+					return
+				}
+				// Nor does an owned `dyn`'s say which type it holds: its table
+				// carries that type's drop, after the methods.
+				if self.kind(inner) is .Dyn(interfaceId, ..) {
+					self.dropDynOwned(&place, interfaceId)
 					return
 				}
 				val ptr = self.value(ty, .Use(.Copy(place.clone())))
@@ -249,6 +255,30 @@ extend Builder {
 		val ty = self.dropFnTy()
 		val code = self.value(ty, .VTableFn(table: env.clone(), index: 0, methods: false))
 		self.push(.Call(callee: .Value(code), args: [env], dest: .None))
+		self.terminate(.Goto(next))
+		self.switchTo(next)
+		self.push(.Zero(place.clone()))
+	}
+
+	/// Drops an owned `dyn`: the first word of the pair is the value, and the
+	/// second its table, whose entry after the interface's methods is the
+	/// drop of the value's `own`, which ends it and frees it. One that was
+	/// moved out of holds a null value.
+	var fn dropDynOwned(place: &Place, interfaceId: InterfaceId) = {
+		val value = self.value(PTR_U8, .Use(.Copy(place.project(.Field(0)))))
+		val notNull = self.value(BOOL, .Binary(
+			op: .Ne,
+			lhs: value.clone(),
+			rhs: Builder::int(0, PTR_U8),
+		))
+		val drop = self.newBlock()
+		val next = self.newBlock()
+		self.terminate(.Branch(cond: notNull, thenBlock: drop, otherwise: next))
+		self.switchTo(drop)
+		val table = Operand::Copy(place.project(.Field(1)))
+		val index = self.program.interfaces[interfaceId].methods.len() as u32
+		val code = self.value(self.dropFnTy(), .VTableFn(table:, index:, methods: true))
+		self.push(.Call(callee: .Value(code), args: [value], dest: .None))
 		self.terminate(.Goto(next))
 		self.switchTo(next)
 		self.push(.Zero(place.clone()))

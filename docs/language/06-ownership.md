@@ -139,6 +139,9 @@ fn main() = {
 }
 ```
 
+An `own<dyn Interface>` holds a value of any type that implements the
+interface, known only by it, as an owned `dyn` ([page 8](08-interfaces.md#an-owned-dyn)).
+
 A method called on an `own<T>` is `T`'s, and a field read through it is
 `T`'s, as through a reference. An interface is another matter: an
 `own<T>` is not a `T`, so it implements what an `extend own<T>` block
